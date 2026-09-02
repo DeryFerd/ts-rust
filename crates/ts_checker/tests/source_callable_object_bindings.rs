@@ -255,12 +255,12 @@ fn check(argument: &str, error: Option<&str>) {
         .nodes
         .iter()
         .find_map(|&id| {
-            let NodeData::PropertySignatureDeclaration(property) = &parsed.arena.get(id)?.data
+            let NodeData::PropertyDeclaration(property) = &parsed.arena.get(id)?.data
             else {
                 return None;
             };
             named(&parsed, property.name, "children")
-                .then_some((node(&parsed, id), node(&parsed, property.type_)))
+                .then_some((node(&parsed, id), node(&parsed, property.type_.unwrap())))
         })
         .unwrap();
     let [has, add, push, invoke] =

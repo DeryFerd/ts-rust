@@ -76,6 +76,7 @@ use super::{
         excess_object_argument_diagnostic, missing_mapped_index_signature_details,
         this_context_mismatch_diagnostic,
     },
+    relater::argument_error_display_target,
     signatures::{ElementFlags, SignatureFlags, SignatureKind, TypePredicateKind},
     source::{
         CheckedExpressionTypes, PlannedExpression, PlannedExpressionKind,
@@ -6462,12 +6463,15 @@ fn prepare_source_argument_mismatch_diagnostics(
         }
     }
 
+    let display_target =
+        argument_error_display_target(store, global_types, argument_type, parameter_type)
+            .map_err(SourceCheckError::RelationUnavailable)?;
     let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
         store,
         host,
         global_types,
         argument_type,
-        parameter_type,
+        display_target,
         flags,
     )?;
     let code = if exact_optional_mismatch { 2379 } else { 2345 };

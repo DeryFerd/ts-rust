@@ -2178,7 +2178,19 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
         let Some(parent) = self.ast.get(node_id).and_then(|node| node.parent) else {
             return true;
         };
-        if self.is_statement_condition(node_id, parent) || self.is_logical_condition(parent) {
+        // A logical assignment parent must join its RHS before writing the target.
+        let parent_is_logical_expression = match self.ast.get(parent).map(|node| &node.data) {
+            Some(NodeData::BinaryExpression(data)) => matches!(
+                self.node_kind(data.operator_token),
+                Some(
+                    SyntaxKind::AmpersandAmpersandToken
+                        | SyntaxKind::BarBarToken
+                        | SyntaxKind::QuestionQuestionToken
+                )
+            ),
+            _ => false,
+        };
+        if self.is_statement_condition(node_id, parent) || parent_is_logical_expression {
             return false;
         }
         !self.is_optional_chain_node(parent)

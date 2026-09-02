@@ -64,6 +64,31 @@ fn child(parsed: &ParseResult, parent: NodeRef, id: NodeId) -> NodeRef {
     node(parsed, id)
 }
 
+fn rejected_arrow_node(
+    source: &str,
+    parsed: &ParseResult,
+    declaration: NodeRef,
+    body: NodeRef,
+) -> NodeRef {
+    let NodeData::ArrowFunction(arrow) = &parsed.arena.get(declaration.node).unwrap().data else {
+        panic!("the stored callable must be the actual arrow");
+    };
+    match arrow.modifiers.as_ref() {
+        None => body,
+        Some(modifiers) => {
+            let [modifier_id] = modifiers.list.nodes.as_slice() else {
+                panic!("expected one async modifier");
+            };
+            let modifier = child(parsed, declaration, *modifier_id);
+            let record = parsed.arena.get(modifier.node).unwrap();
+            assert_eq!(record.kind, SyntaxKind::AsyncKeyword);
+            assert!(matches!(&record.data, NodeData::Token(_)));
+            assert_eq!(text_at(source, parsed, modifier), "async");
+            modifier
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Binding {
     declaration: NodeRef,
@@ -1147,7 +1172,9 @@ fn statement_composition_keeps_unreleased_headers_statements_and_call_effects_re
         let run = callable(&parsed, "run");
         let mut checker = context(&parsed);
         let before = publication(&checker, &parsed);
-        let error = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(run.body));
+        let error = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(
+            rejected_arrow_node(source, &parsed, run.declaration, run.body),
+        ));
         for _ in 0..2 {
             assert_eq!(checker.recheck_source_file(FILE), Err(error), "{source}");
             assert_eq!(publication(&checker, &parsed), before);

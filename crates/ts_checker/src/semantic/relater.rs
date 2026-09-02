@@ -3097,37 +3097,12 @@ impl<'store> RelaterSession<'store> {
         if let Some(types) = self.validated_unions.get(&type_id) {
             return Ok(types.clone());
         }
-        let enum_literal = self
-            .store
-            .type_payload(type_id)
-            .ok_or(RelationUnavailable::Type(type_id))?
-            .flags()
-            .intersects(TypeFlags::ENUM_LITERAL);
-        if enum_literal {
-            if !enums::is_canonical_enum_union(self.store, type_id) {
-                return Err(RelationUnavailable::MalformedUnion(type_id));
-            }
-        } else {
-            let validation = match self.global_types {
-                Some(global_types) => self.store.validate_union_constituent_with_array_targets(
-                    global_types.array_targets,
-                    type_id,
-                ),
-                None => self.store.validate_union_constituent(type_id),
-            };
-            validation.map_err(|error| union_validation_unavailable(type_id, error))?;
-        }
-        let record = self
-            .store
-            .type_payload(type_id)
-            .ok_or(RelationUnavailable::Type(type_id))?;
-        if !record.flags().intersects(TypeFlags::UNION) {
-            return Err(RelationUnavailable::MalformedUnion(type_id));
-        }
-        let TypeData::Union(data) = record.data() else {
-            return Err(RelationUnavailable::MalformedUnion(type_id));
-        };
-        let types = data.union.types.clone();
+        let types = validated_relation_union_types(
+            self.store,
+            self.global_types.map(|globals| globals.array_targets),
+            type_id,
+        )?
+        .to_vec();
         self.validated_unions.insert(type_id, types.clone());
         Ok(types)
     }
@@ -3362,36 +3337,8 @@ impl<'store> RelaterSession<'store> {
             && target_flags.intersects(TypeFlags::UNION)
         {
             let target_types = self.union_types(target)?;
-            let candidate = match target_types.as_slice() {
-                [nullable, candidate]
-                    if self
-                        .store
-                        .type_flags(*nullable)?
-                        .intersects(TypeFlags::NULLABLE) =>
-                {
-                    Some(*candidate)
-                }
-                [first_nullable, second_nullable, candidate]
-                    if self
-                        .store
-                        .type_flags(*first_nullable)?
-                        .intersects(TypeFlags::NULLABLE)
-                        && self
-                            .store
-                            .type_flags(*second_nullable)?
-                            .intersects(TypeFlags::NULLABLE) =>
-                {
-                    Some(*candidate)
-                }
-                _ => None,
-            };
-            if let Some(candidate) = candidate
-                && !self
-                    .store
-                    .type_flags(candidate)?
-                    .intersects(TypeFlags::NULLABLE)
-            {
-                target = self.store.regular_type_if_fresh(candidate)?;
+            if let Some(candidate) = non_nullable_union_target(self.store, &target_types)? {
+                target = candidate;
                 if source == target {
                     return Ok(Ternary::True);
                 }
@@ -13861,6 +13808,96 @@ const fn supports_structured_object_relation(
     _strict_function_types: Option<bool>,
 ) -> bool {
     supports_property_object_relation(relation) || relation.is_identity()
+}
+
+/// Uses the relation's nullable-target reduction for display without losing an alias.
+pub(super) fn argument_error_display_target(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    source: TypeId,
+    target: TypeId,
+) -> Result<TypeId, RelationUnavailable> {
+    let source = store.regular_type_if_fresh(source)?;
+    let target_record = store
+        .type_payload(target)
+        .ok_or(RelationUnavailable::Type(target))?;
+    if !store
+        .type_flags(source)?
+        .intersects(TypeFlags::DEFINITELY_NON_NULLABLE)
+        || !target_record.flags().intersects(TypeFlags::UNION)
+        || target_record.alias().is_some()
+    {
+        return Ok(target);
+    }
+    let types = validated_relation_union_types(
+        store,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+        target,
+    )?;
+    Ok(non_nullable_union_target(store, types)?.unwrap_or(target))
+}
+
+fn validated_relation_union_types(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    type_id: TypeId,
+) -> Result<&[TypeId], RelationUnavailable> {
+    let enum_literal = store
+        .type_payload(type_id)
+        .ok_or(RelationUnavailable::Type(type_id))?
+        .flags()
+        .intersects(TypeFlags::ENUM_LITERAL);
+    if enum_literal {
+        if !enums::is_canonical_enum_union(store, type_id) {
+            return Err(RelationUnavailable::MalformedUnion(type_id));
+        }
+    } else {
+        let validation = match array_targets {
+            Some(array_targets) => {
+                store.validate_union_constituent_with_array_targets(array_targets, type_id)
+            }
+            None => store.validate_union_constituent(type_id),
+        };
+        validation.map_err(|error| union_validation_unavailable(type_id, error))?;
+    }
+    let record = store
+        .type_payload(type_id)
+        .ok_or(RelationUnavailable::Type(type_id))?;
+    if !record.flags().intersects(TypeFlags::UNION) {
+        return Err(RelationUnavailable::MalformedUnion(type_id));
+    }
+    let TypeData::Union(data) = record.data() else {
+        return Err(RelationUnavailable::MalformedUnion(type_id));
+    };
+    Ok(&data.union.types)
+}
+
+fn non_nullable_union_target(
+    store: &CanonicalTypeMapperStore,
+    types: &[TypeId],
+) -> Result<Option<TypeId>, RelationUnavailable> {
+    let candidate = match types {
+        [nullable, candidate] if store.type_flags(*nullable)?.intersects(TypeFlags::NULLABLE) => {
+            Some(*candidate)
+        }
+        [first_nullable, second_nullable, candidate]
+            if store
+                .type_flags(*first_nullable)?
+                .intersects(TypeFlags::NULLABLE)
+                && store
+                    .type_flags(*second_nullable)?
+                    .intersects(TypeFlags::NULLABLE) =>
+        {
+            Some(*candidate)
+        }
+        _ => None,
+    };
+    if let Some(candidate) = candidate
+        && !store.type_flags(candidate)?.intersects(TypeFlags::NULLABLE)
+    {
+        return store.regular_type_if_fresh(candidate).map(Some);
+    }
+    Ok(None)
 }
 
 pub(super) const fn union_validation_unavailable(
