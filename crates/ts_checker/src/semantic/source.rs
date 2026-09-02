@@ -32922,17 +32922,6 @@ fn plan_default_library_source_callable(
             .parameters
             .iter()
             .any(|parameter| parameter.explicit_type_node().is_none())
-        || callable
-            .parameters
-            .iter()
-            .filter_map(|parameter| parameter.explicit_type_node())
-            .chain(callable.return_type.type_node())
-            .any(|annotation| {
-                !matches!(
-                    host.node(annotation).map(|record| &record.data),
-                    Some(NodeData::KeywordTypeNode(_))
-                )
-            })
     {
         return Err(SourceCheckError::Unsupported(
             UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(declaration)),
