@@ -3382,6 +3382,68 @@ fn check_direct_source_property_with_source_mode(
             .map_err(SourcePropertyQueryError::Source)
         },
     )
+    .inspect_err(|error| {
+        if store.relation_read_observation_is_active() {
+            return;
+        }
+        let rejected = match error {
+            SourcePropertyQueryError::Property(SourcePropertyError::Relation(
+                RelationUnavailable::UnsupportedStructuredType(type_),
+            ))
+            | SourcePropertyQueryError::Source(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::UnsupportedStructuredType(type_),
+            )) => Some(*type_),
+            _ => None,
+        };
+        let describe = |type_| {
+            let record = store.type_payload(type_)?;
+            let target = match record.data() {
+                TypeData::TypeReference(reference) => reference.object.target,
+                TypeData::Interface(interface) => interface.reference.object.target,
+                _ => None,
+            };
+            let owner_record = target
+                .and_then(|target| store.type_payload(target))
+                .unwrap_or(record);
+            let owner = owner_record.symbol().and_then(|owner| store.symbol(owner));
+            let declaration = owner
+                .and_then(|owner| owner.declarations())
+                .and_then(|declarations| declarations.first().copied());
+            let state = match owner_record.data() {
+                TypeData::Interface(interface) => Some((
+                    interface.declared_members_resolved,
+                    interface.base_types_resolved,
+                    interface.declared_members,
+                )),
+                _ => None,
+            };
+            Some((
+                record.data().kind(),
+                record.flags().bits(),
+                record.object_flags().bits(),
+                target,
+                owner.map(|owner| owner.name()),
+                declaration.map(|declaration| {
+                    (
+                        declaration,
+                        store.source_node_kind(declaration),
+                        store.source_node_start(declaration),
+                    )
+                }),
+                state,
+            ))
+        };
+        super::source::observe_call_failure_detail(
+            "property_demand",
+            format_args!(
+                "property={:?} name={:?} receiver={receiver_type:?} rejected={rejected:?} raw_error={error:?} rejected_metadata={:?} receiver_metadata={:?}",
+                plan.node,
+                plan.name,
+                rejected.and_then(describe),
+                describe(receiver_type),
+            ),
+        );
+    })
 }
 
 /// Proves that a method value can use the source-aware Function member lookup.
