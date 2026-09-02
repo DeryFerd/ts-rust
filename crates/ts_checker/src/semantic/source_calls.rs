@@ -5965,7 +5965,7 @@ fn source_new_type_argument_syntax(
     let NodeData::NewExpression(expression) = &record.data else {
         return Err(SourceCheckError::Call(node));
     };
-    if !plan.is_generic_source_class()
+    if !(plan.is_generic_source_class() || plan.is_generic_library_constructor())
         || record.kind != SyntaxKind::NewExpression
         || record.flags.0 != 0
         || expression.facts != 0
