@@ -27,6 +27,8 @@
 //! canonical annotation queries and retain their exact cached types.
 //! Optional named instance-method parameters keep their written annotation and
 //! resolve the separate body value type through the same class query context.
+//! Source constructor annotations also retain empty-object defaults. The ordinary
+//! source checker evaluates each default against its annotation before the body.
 //! Abstract classes retain annotated abstract members and abstract constructors;
 //! invalid abstract methods retain their exact modifier and implementation errors.
 //! Abstract properties read by later field initializers retain both exact errors.
@@ -1627,6 +1629,7 @@ struct SourceClassConstructorPlan {
 enum SourceConstructorDefaultLiteral {
     Number(String),
     String(String),
+    EmptyObject(Box<PropertyObjectPlan>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -11690,7 +11693,11 @@ fn plan_constructor_parameter_with_body_mode(
                     matches!(
                         host.node(node).map(|record| record.kind),
                         Some(SyntaxKind::NumericLiteral | SyntaxKind::StringLiteral)
-                    )
+                    ) || host.node(node).is_some_and(|record| {
+                        record.kind == SyntaxKind::ObjectLiteralExpression
+                            && matches!(&record.data, NodeData::ObjectLiteralExpression(object)
+                                if object.properties.nodes.is_empty())
+                    })
                 }))
         && (!optional
             || property_readonly.is_none() && type_record.kind == SyntaxKind::TypeReference)
@@ -11999,6 +12006,20 @@ fn plan_source_constructor_literal_default(
         {
             SourceConstructorDefaultLiteral::String(literal.text.clone())
         }
+        NodeData::ObjectLiteralExpression(object)
+            if record.kind == SyntaxKind::ObjectLiteralExpression
+                && object.properties.nodes.is_empty()
+                && !object.properties.has_trailing_comma =>
+        {
+            let plan = super::object_members::plan_source_object_literal(store, host, initializer)
+                .map_err(|error| match error {
+                    PropertyObjectError::Capacity(node) => {
+                        invariant(ClassInvariant::Capacity(node))
+                    }
+                    _ => invariant(ClassInvariant::InvalidPropertyTypeCache(initializer)),
+                })?;
+            SourceConstructorDefaultLiteral::EmptyObject(Box::new(plan))
+        }
         _ => return Err(reject()),
     };
     if let Some(source) = host
@@ -12020,6 +12041,8 @@ fn plan_source_constructor_literal_default(
                     })
                     == Some(text.as_str())
             }),
+            // The ordinary object plan checks the real empty member list and owner.
+            SourceConstructorDefaultLiteral::EmptyObject(_) => true,
         };
         if !matches {
             return Err(reject());
@@ -12046,6 +12069,24 @@ fn validate_source_constructor_literal_default_cache(
     {
         return Err(reject());
     }
+    if let SourceConstructorDefaultLiteral::EmptyObject(plan) = &initializer.literal {
+        let state =
+            super::object_members::object_literal_state(store, plan).map_err(|_| reject())?;
+        if required && state.is_none()
+            || store
+                .type_node_links(initializer.node)
+                .is_some_and(|links| {
+                    links
+                        != &(TypeNodeLinks {
+                            resolved_type: state.map(|state| state.type_id()),
+                            ..TypeNodeLinks::default()
+                        })
+                })
+        {
+            return Err(reject());
+        }
+        return Ok(());
+    }
     let Some(links) = store
         .type_node_links(initializer.node)
         .filter(|links| *links != &TypeNodeLinks::default())
@@ -12059,6 +12100,9 @@ fn validate_source_constructor_literal_default_cache(
             bootstrap.cached_number_literal_type(ts_jsnum::from_string(text))
         }
         SourceConstructorDefaultLiteral::String(text) => bootstrap.cached_string_literal_type(text),
+        SourceConstructorDefaultLiteral::EmptyObject(_) => {
+            unreachable!("checked by the object cache")
+        }
     }
     .ok_or_else(reject)?;
     if links
