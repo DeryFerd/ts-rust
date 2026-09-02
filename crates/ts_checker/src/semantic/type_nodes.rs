@@ -24914,14 +24914,36 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 if ordinary_intersection || numeric_intersection {
                     self.validate_cached_react_alias_argument(symbol, default_node, default)?;
                 }
-                let argument = super::instantiate::cached_instantiation_with_vector(
-                    self.store,
-                    default,
-                    &parameters[..arguments.len()],
-                    &arguments,
-                    self.array_targets,
-                    None,
-                )
+                // Replay the source proof used when the default was first mapped.
+                let argument = if let Some(operand) =
+                    self.plan.source_alias_operands.get(&default_node)
+                {
+                    let graph = self.plan.source_alias_operand_graph(
+                        self.store,
+                        self.host,
+                        &operand.source,
+                        default_node,
+                        default,
+                        self.array_targets,
+                    )?;
+                    super::instantiate::cached_source_alias_operand_instantiation(
+                        self.store,
+                        &graph,
+                        default,
+                        &parameters[..arguments.len()],
+                        &arguments,
+                        self.array_targets,
+                    )
+                } else {
+                    super::instantiate::cached_instantiation_with_vector(
+                        self.store,
+                        default,
+                        &parameters[..arguments.len()],
+                        &arguments,
+                        self.array_targets,
+                        None,
+                    )
+                }
                 .map_err(|_| invalid())?
                 .ok_or_else(&invalid)?;
                 arguments.push(argument);
