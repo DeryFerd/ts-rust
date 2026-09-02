@@ -16,24 +16,31 @@ finds the wrong AST variant in their test helper. Its one-line correction
 keeps every TypeScript input and assertion unchanged. Later assertions remain
 unmeasured. The
 [independent result review](../target/wave202-pathe-demo-tests-11-result-review.md)
-is closed. The separate resource check is pending.
+and the separate resource check are closed.
 
 Pathe is not demo-ready. Its latest project run attempted all nine original
 roots and completed none. Every root and the ordinary project attempt stopped
 with an unsupported operation. No internal checker error occurred in this run.
 The evidence reader passed. The independent result review and separate
-resource check are pending for this newest project run.
+resource check are closed for this project run.
+
+The newer compiler build failed with Rust error E0308. A function-body parent
+check compares a `SourceNodeParent` with a `NodeRef`. The small repair must
+wrap the node in `SourceNodeParent::Parent` and retain the identity check.
+The duplicate 510-test build is on hold. It was not submitted.
 
 | Measurement | Result |
 | --- | --- |
-| [Combined tests 11](../target/wave202-pathe-demo-tests-11-result.md), `2f8ae108` | All 500 ran. 425 pass, 75 fail. Four earlier failures fixed, no earlier pass lost. Main result review is closed. Resource review is pending. |
+| [Combined tests 11](../target/wave202-pathe-demo-tests-11-result.md), `2f8ae108` | All 500 ran. 425 pass, 75 fail. Four earlier failures fixed, no earlier pass lost. Main and resource reviews are closed. |
+| [Ordinary compiler build 11](../target/wave202-pathe-demo-bin-11-main-result.md), `84f3a17a` | Build failed with E0308 after 37.648 seconds. No tests or project checks ran. The separate resource check is pending. |
 | [Ordinary compiler build 10](../target/wave202-pathe-demo-bin-10-main-result.md), `c9258a43` | Build passed in 74.660 seconds. Main and separate resource reviews are closed. A build is not a project pass. |
-| [Pathe census 10](../target/wave202-pathe-demo-census-10-result.md), `c9258a43` | Zero of nine roots complete. All nine and the ordinary attempt are unsupported. The oracle stage took 22.584 seconds. Independent main and resource reviews are pending. |
+| [Pathe census 10](../target/wave202-pathe-demo-census-10-result.md), `c9258a43` | Zero of nine roots complete. All nine and the ordinary attempt are unsupported. The oracle stage took 22.584 seconds. Main and resource reviews are closed. |
 | [Previous combined tests 10](../target/wave202-pathe-demo-tests-10-result.md), `c9258a43` | 419 of 496 passed. Main and separate resource reviews are closed. This is the comparison set for Tests11. |
 
 The project run used the older compiler. It does not measure the four fixes
-in the newer test run. The next compiler build will include the next reviewed
-source batch, `84f3a17a`.
+in the newer test run. The failed newer build provides no new typechecking
+result. Its [saved evidence review](../target/wave202-pathe-demo-bin-11-main-result-review.md)
+confirms the compiler failure, not a passing build.
 
 The current project evidence retains the same nine roots, all 277 loaded-file
 identities and all 13 explicit options. The
@@ -67,22 +74,21 @@ route to a complete demo. Neither Pathe nor UFO is a proved near-pass yet.
    still stops in arrows, function bodies, a binary expression, an import and
    cold alias resolution. Check which pending changes address those exact
    paths. Do not infer a cause from the outer error label.
-2. Build and test the closed `84f3a17a` source batch. Its selection retains all
-   500 current tests and adds ten. The stopped 510-test packet has passed
-   independent review. Source capture and execution remain separate steps.
-3. This batch combines eight reviewed changes.
-   They cover typed arrows, loop-local reads, property error recovery,
-   function-expression locals, type-only namespace queries and callable
-   intersection properties. Two changes add failure observations for import
-   aliases and constructor providers. Source review is closed. This batch has
-   no measured test or project result yet.
-4. The nullable-argument diagnostic, nested logical-assignment flow and public
-   AST-helper corrections are combined and reviewed at `76f3f352`. That
-   selection retains all 510 tests and adds six. More repair pairs cover
-   computed-property writes, nullish diagnostic text, optional top-level reads
-   and two test-helper defects. Fresh diagnoses cover counted-loop flow cycles
-   and default parameters. None has a new test result yet. Source review does
-   not establish a test pass.
+2. Fix the parent-node comparison before another build. Keep the failed
+   source and its evidence unchanged. The compiler repair has a separate
+   worktree and a one-line scope.
+3. Prepare the next combined source. The reviewed `d6133d80` batch has 526
+   selected test names. It includes computed-property writes, nullish
+   diagnostic text, optional top-level reads and two test-helper repairs.
+   It also retains the earlier typed-arrow, loop-local, function-expression,
+   namespace and callable-intersection changes. No tests have run on this
+   source. Add the parent-node repair, counted-loop cycle repair and corrected
+   throw-parameter test helper. Keep all existing tests.
+4. Build that source, run its retained tests, then check unchanged Pathe.
+   Import and parameter-default error records will help locate failures
+   that currently lose their inner cause. These records are not semantic
+   fixes. A separate diagnosis also finds an unsupported owner path for
+   nested conditional returns. Template branches remain a separate limit.
 5. After dependency approval, measure unchanged UFO with the pinned Go and
    Rust compilers. Use its actual first failures to confirm or reject it as
    the second demo target.
@@ -96,8 +102,10 @@ Two saved diagnoses guide the remaining new failures.
 The [counted-loop diagnosis](../target/wave202-pathe-tests10-counted-for-diagnosis.md)
 shows that an outer BinaryExpression error can also describe a Logical or
 Element plan. The newer saved run identifies flow-preflight cycle errors in
-three remaining counted-loop cases. The new diagnosis checks whether valid
-loop backedges are rejected. It must preserve errors for malformed flow graphs.
+three remaining counted-loop cases. The repair accepts a repeated path only
+when that exact path contains a valid loop label. It retains errors for
+malformed flow graphs. The committed repair and its eight new controls have
+not run yet.
 
 The [computed-member diagnosis](../target/wave202-pathe-tests10-computed-members-diagnosis.md)
 finds an incomplete positive cache fixture and identifier-only assignment
@@ -126,8 +134,12 @@ Those gaps include review and approval work. They are not all idle time.
 The proposal uses one fixed reviewed program and an immutable input record
 instead of copying and reviewing large programs for each run. It must keep
 all input, output and resource checks. The three-file implementation has
-passed independent source review. Offline checks and a pilot remain pending.
-No current run changes, and no time saving has been measured yet.
+passed independent source review. Its first offline self-check ran once:
+245 checks passed, four failed and one lacked the required historical input.
+These are runner checks, not typechecker tests. The failures cover saved
+command parsing, one negative-test setup and two quote/newline controls.
+The result review and repairs are pending. No compiler pilot has run, no
+current gate changed and no time saving has been measured yet.
 
 ## Demo pass conditions
 
