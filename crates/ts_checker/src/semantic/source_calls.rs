@@ -5731,6 +5731,39 @@ fn resolve_source_call_once(
                 "resolve_direct",
                 format_args!("callee={callee_type:?} receiver={receiver:?} raw_error={error:?}"),
             );
+            if let DirectCallError::Relation(RelationUnavailable::UnsupportedStructuredType(type_)) =
+                error
+                && !store.relation_read_observation_is_active()
+            {
+                let record = store.type_payload(*type_);
+                let owner = record.and_then(TypeRecord::symbol);
+                let declaration = owner
+                    .and_then(|owner| store.symbol(owner))
+                    .and_then(|owner| owner.declarations())
+                    .and_then(|declarations| declarations.first().copied());
+                let reference = record.and_then(|record| match record.data() {
+                    TypeData::TypeReference(reference) => Some((
+                        reference.object.target,
+                        reference.resolved_type_arguments.as_deref(),
+                    )),
+                    TypeData::Interface(interface) => Some((
+                        interface.reference.object.target,
+                        interface.reference.resolved_type_arguments.as_deref(),
+                    )),
+                    _ => None,
+                });
+                observe_call_failure_detail(
+                    "resolve_direct_unsupported_type",
+                    format_args!(
+                        "type={type_:?} kind={:?} flags={:?} object_flags={:?} owner={owner:?} declaration={declaration:?} declaration_kind={:?} declaration_start={:?} reference_target_arguments={reference:?}",
+                        record.map(|record| record.data().kind()),
+                        record.map(TypeRecord::flags),
+                        record.map(TypeRecord::object_flags),
+                        declaration.and_then(|node| store.source_node_kind(node)),
+                        declaration.and_then(|node| store.source_node_start(node)),
+                    ),
+                );
+            }
         }) {
             Ok(resolution) => {
                 let resolved = ResolvedLegacySourceCall {

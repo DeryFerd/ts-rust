@@ -997,14 +997,25 @@ enum SourceDirectCallResolutionState {
     Checking(Arc<SourceDirectCallResolution>),
     Publishing(Arc<SourceDirectCallResolution>),
     Complete(Arc<SourceDirectCallResolution>),
+    PromiseExecutor {
+        proof: Arc<super::source_new::SourcePromiseExecutorProof>,
+        phase: PromiseExecutorPhase,
+    },
     Invalid(NodeArenaRevision),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromiseExecutorPhase {
+    Checking,
+    Publishing,
+    Complete,
 }
 
 impl SourceDirectCallResolutionState {
     fn proof(&self) -> Option<&Arc<SourceDirectCallResolution>> {
         match self {
             Self::Checking(proof) | Self::Publishing(proof) | Self::Complete(proof) => Some(proof),
-            Self::Invalid(_) => None,
+            Self::PromiseExecutor { .. } | Self::Invalid(_) => None,
         }
     }
 
@@ -1013,6 +1024,7 @@ impl SourceDirectCallResolutionState {
             Self::Checking(proof) | Self::Publishing(proof) | Self::Complete(proof) => {
                 proof.revision()
             }
+            Self::PromiseExecutor { proof, .. } => proof.revision(),
             Self::Invalid(revision) => *revision,
         }
     }
@@ -4301,7 +4313,93 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     pub(super) fn source_direct_call_resolution_was_registered(&self, callback: NodeRef) -> bool {
-        self.source_direct_call_resolutions.contains_key(&callback)
+        self.source_direct_call_resolutions.get(&callback).is_some_and(|state| {
+            !matches!(state, SourceDirectCallResolutionState::PromiseExecutor { .. })
+        })
+    }
+
+    pub(super) fn source_promise_executor_resolution(
+        &self,
+        callback: NodeRef,
+    ) -> Option<&super::source_new::SourcePromiseExecutorProof> {
+        let SourceDirectCallResolutionState::PromiseExecutor { proof, .. } =
+            self.source_direct_call_resolutions.get(&callback)?
+        else {
+            return None;
+        };
+        proof.source_is_exact(self).then_some(proof.as_ref())
+    }
+
+    pub(super) fn source_promise_executor_was_registered(&self, callback: NodeRef) -> bool {
+        matches!(self.source_direct_call_resolutions.get(&callback),
+            Some(SourceDirectCallResolutionState::PromiseExecutor { .. }))
+    }
+
+    pub(super) fn source_promise_executor_is_published(&self, callback: NodeRef) -> bool {
+        matches!(self.source_direct_call_resolutions.get(&callback),
+            Some(SourceDirectCallResolutionState::PromiseExecutor {
+                phase: PromiseExecutorPhase::Publishing | PromiseExecutorPhase::Complete, ..
+            }))
+            && self.source_promise_executor_resolution(callback).is_some()
+    }
+
+    pub(super) fn begin_source_promise_executor_resolution(
+        &mut self,
+        proof: super::source_new::SourcePromiseExecutorProof,
+    ) -> Option<bool> {
+        let callback = proof.callback();
+        if !proof.source_is_exact(self) {
+            return None;
+        }
+        if let Some(existing) = self.source_direct_call_resolutions.get(&callback) {
+            return match existing {
+                SourceDirectCallResolutionState::PromiseExecutor { proof: old, phase: PromiseExecutorPhase::Complete }
+                    if old.as_ref() == &proof => Some(false),
+                _ => None,
+            };
+        }
+        self.source_direct_call_resolutions.try_reserve(1).ok()?;
+        self.source_direct_call_resolutions.insert(callback,
+            SourceDirectCallResolutionState::PromiseExecutor { proof: Arc::new(proof), phase: PromiseExecutorPhase::Checking });
+        Some(true)
+    }
+
+    pub(super) fn begin_source_promise_executor_publication(&mut self, callback: NodeRef) -> bool {
+        let Some(SourceDirectCallResolutionState::PromiseExecutor { proof, phase }) =
+            self.source_direct_call_resolutions.get(&callback)
+        else {
+            return false;
+        };
+        if !proof.source_is_exact(self) || *phase == PromiseExecutorPhase::Publishing {
+            return false;
+        }
+        let proof = Arc::clone(proof);
+        self.source_direct_call_resolutions.insert(callback,
+            SourceDirectCallResolutionState::PromiseExecutor { proof, phase: PromiseExecutorPhase::Publishing });
+        true
+    }
+
+    pub(super) fn finish_source_promise_executor_resolution(&mut self, callback: NodeRef) -> bool {
+        let Some(SourceDirectCallResolutionState::PromiseExecutor { proof, phase: PromiseExecutorPhase::Publishing }) =
+            self.source_direct_call_resolutions.get(&callback)
+        else {
+            return false;
+        };
+        if !proof.source_is_exact(self) {
+            return false;
+        }
+        let proof = Arc::clone(proof);
+        self.source_direct_call_resolutions.insert(callback,
+            SourceDirectCallResolutionState::PromiseExecutor { proof, phase: PromiseExecutorPhase::Complete });
+        true
+    }
+
+    pub(super) fn fail_source_promise_executor_resolution(&mut self, callback: NodeRef) {
+        if let Some(state @ SourceDirectCallResolutionState::PromiseExecutor { .. }) =
+            self.source_direct_call_resolutions.get_mut(&callback)
+        {
+            *state = SourceDirectCallResolutionState::Invalid(state.revision());
+        }
     }
 
     pub(super) fn source_direct_call_resolution_is_published(&self, callback: NodeRef) -> bool {
@@ -4319,7 +4417,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         proof: Arc<SourceDirectCallResolution>,
     ) -> Option<bool> {
         let callback = proof.callback();
-        if self.source_files.get(&callback.file) != Some(&proof.source())
+        if matches!(self.source_direct_call_resolutions.get(&callback),
+            Some(SourceDirectCallResolutionState::PromiseExecutor { .. }))
+            || self.source_files.get(&callback.file) != Some(&proof.source())
             || !proof.stored_is_exact(self)
             || self
                 .source_direct_call_resolutions
@@ -13566,6 +13666,17 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         type_: TypeId,
         provenance: &SourceCallableProvenance,
     ) -> bool {
+        let promise_target_is_exact = provenance.family == SourceCallableFamily::ArrowFunction
+            && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+            && provenance.contextual_variable.is_none()
+            && provenance.captured_assignment.is_none()
+            && provenance.contextual_target.is_some_and(|target| {
+                target != type_
+                    && super::source_callables::stored_promise_executor_callable_is_exact(
+                        self, provenance.declaration, provenance.owner_symbol,
+                        provenance.signature, target,
+                    )
+            });
         let expression_target_is_exact = provenance.family == SourceCallableFamily::ArrowFunction
             && provenance.contextual_variable.is_none()
             && provenance.captured_assignment.is_none()
@@ -13683,7 +13794,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             Some(())
         })()
         .is_some();
-        if expression_target_is_exact || sort_target_is_exact {
+        if promise_target_is_exact || expression_target_is_exact || sort_target_is_exact {
             self.set_source_callable_provenance_with_context(type_, provenance, true)
         } else {
             self.set_source_callable_provenance(type_, provenance)

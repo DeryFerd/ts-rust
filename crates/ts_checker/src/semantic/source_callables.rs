@@ -8310,6 +8310,12 @@ fn stored_direct_call_argument_arrow_is_exact(
     owner_symbol: SemanticSymbolId,
     captured_assignment: Option<SourceCapturedLocal>,
 ) -> bool {
+    if store.source_promise_executor_was_registered(declaration) {
+        return captured_assignment.is_none()
+            && store.source_promise_executor_is_published(declaration)
+            && store.source_promise_executor_resolution(declaration)
+                .is_some_and(|proof| proof.is_exact(store, declaration, owner_symbol, proof.target()));
+    }
     if store.source_direct_call_resolution_was_registered(declaration) {
         return captured_assignment.is_none()
             && store.source_declaration_symbol(declaration) == Some(owner_symbol)
@@ -13931,6 +13937,25 @@ pub(super) fn publish_contextual_direct_call_source_callable_with_resolution(
     prepared: &PreparedContextualDirectCallSourceCallable,
 ) -> Result<TypeId, SourceCallableError> {
     let declaration = prepared.declaration;
+    if store.source_promise_executor_was_registered(declaration) {
+        if prepared.captured_assignment.is_some()
+            || store.source_promise_executor_resolution(declaration).is_none_or(|proof| {
+                !proof.is_exact(store, declaration, prepared.owner_symbol, prepared.contextual_target)
+            })
+            || !store.begin_source_promise_executor_publication(declaration)
+        {
+            store.fail_source_promise_executor_resolution(declaration);
+            return Err(invariant(SourceCallableInvariant::InvalidTypeCache(declaration)));
+        }
+        let result = publish_contextual_direct_call_source_callable(store, prepared);
+        if result.is_err() || !store.finish_source_promise_executor_resolution(declaration) {
+            store.fail_source_promise_executor_resolution(declaration);
+            return result.and_then(|_| {
+                Err(invariant(SourceCallableInvariant::InvalidTypeCache(declaration)))
+            });
+        }
+        return result;
+    }
     if !store.source_direct_call_resolution_was_registered(declaration) {
         return publish_contextual_direct_call_source_callable(store, prepared);
     }
@@ -14198,6 +14223,10 @@ fn publish_prepared_contextual_source_callable(
     if !owner_valid
         || !anchor_valid
         || !target_valid
+        || store.source_promise_executor_was_registered(prepared.declaration)
+            && store.source_promise_executor_resolution(prepared.declaration).is_none_or(|proof| {
+                !proof.is_exact(store, prepared.declaration, prepared.owner_symbol, prepared.contextual_target)
+            })
         || !parameters_valid
         || !rest_valid
         || prepared.flags.bits() & !allowed_flags.bits() != 0
@@ -14598,6 +14627,74 @@ fn stored_promise_executor_contextual_target_is_exact(
             .and_then(|constructor| store.symbol(constructor))
             .and_then(|constructor| constructor.declarations())
             .is_some_and(|declarations| declarations.contains(&construction))
+}
+
+pub(super) fn stored_promise_executor_callable_is_exact(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    owner: SemanticSymbolId,
+    signature: SignatureId,
+    target: TypeId,
+) -> bool {
+    let Some(proof) = store.source_promise_executor_resolution(declaration) else {
+        return false;
+    };
+    if !store.source_promise_executor_is_published(declaration)
+        || !proof.is_exact(store, declaration, owner, target)
+    {
+        return false;
+    }
+    let StoredSingleCallableValidation::Valid { callable, .. } =
+        validate_stored_single_callable(store, target)
+    else {
+        return false;
+    };
+    let Some(record) = store.signature(signature) else {
+        return false;
+    };
+    let parameters = record.parameters();
+    if callable.parameters.len() != 2
+        || callable.min_argument_count != 2
+        || callable.rest_parameter.is_some()
+        || parameters.is_empty()
+        || parameters.len() > 2
+        || record.declaration() != Some(declaration)
+        || record.flags() != SignatureFlags::NONE
+        || !record.type_parameters().is_empty()
+        || record.this_parameter().is_some()
+        || usize::try_from(record.min_argument_count()).ok() != Some(parameters.len())
+        || record.resolved_min_argument_count() != -1
+        || record.resolved_return_type().is_none_or(|type_| store.type_payload(type_).is_none())
+        || record.resolved_type_predicate().is_some()
+        || record.target().is_some()
+        || record.mapper().is_some()
+        || record.isolated_signature_type().is_some()
+        || record.composite().is_some()
+    {
+        return false;
+    }
+    parameters.iter().zip(&callable.parameters).enumerate().all(|(index, (&parameter, &expected))| {
+        let Some(symbol) = store.symbol(parameter) else {
+            return false;
+        };
+        let Some(parameter_declaration) = symbol.value_declaration() else {
+            return false;
+        };
+        !parameters[..index].contains(&parameter)
+            && parameter != owner
+            && source_parameter_declarations_are_exact(store, declaration, parameter_declaration, parameter)
+            && symbol.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            && symbol.check_flags() == CheckFlags::NONE
+            && symbol.members().is_none()
+            && symbol.exports().is_none()
+            && symbol.parent().is_none()
+            && symbol.export_symbol().is_none()
+            && store.get_merged_symbol(parameter) == Some(parameter)
+            && store.value_symbol_links(parameter).is_none_or(|links| {
+                links == &ValueSymbolLinks::default()
+                    || links == &ValueSymbolLinks { resolved_type: Some(expected), ..ValueSymbolLinks::default() }
+            })
+    })
 }
 
 /// Publishes the recursive owner cache and structured empty-member barrier.
@@ -16416,6 +16513,17 @@ pub(super) fn validate_stored_source_callable(
                             .source_primitive_type_annotation(*declaration)
                             .is_some()
                     })
+            }))
+    {
+        return StoredSourceCallableValidation::Malformed;
+    }
+    if store.source_promise_executor_was_registered(declaration)
+        && (provenance.contextual_variable.is_some()
+            || provenance.captured_assignment.is_some()
+            || store.source_promise_executor_resolution(declaration).is_none_or(|proof| {
+                provenance.contextual_target.is_none_or(|target| {
+                    !proof.is_exact(store, declaration, owner_symbol, target)
+                })
             }))
     {
         return StoredSourceCallableValidation::Malformed;

@@ -45820,7 +45820,20 @@ fn check_contextual_direct_call_arrow(
     contextual_type: TypeId,
     outer_capture: Option<SourceArrowCaptureContext<'_>>,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
-    let proof = if super::source_callables::source_object_parameter_default_arrow_is_exact(
+    let promise = source_promise_constructor_argument_arrow_is_exact(
+        store, host, arrow.callable.declaration,
+    ).map_err(SourcePlanner::callable_plan_error)?;
+    let promise_introduced = if promise {
+        let proof = super::source_new::SourcePromiseExecutorProof::from_source(
+            store, host, CanonicalArrayTargets::from_global_types(global_types),
+            arrow.callable.declaration, arrow.callable.owner_symbol, contextual_type,
+        ).map_err(|error| SourcePlanner::new_plan_error(arrow.callable.declaration, error))?;
+        store.begin_source_promise_executor_resolution(proof)
+            .ok_or(SourceCheckError::Arrow(arrow.callable.declaration))?
+    } else {
+        false
+    };
+    let proof = if promise || super::source_callables::source_object_parameter_default_arrow_is_exact(
         store,
         host,
         arrow.callable.declaration,
@@ -45864,6 +45877,9 @@ fn check_contextual_direct_call_arrow(
     );
     if result.is_err() && introduced {
         store.fail_source_direct_call_resolution(arrow.callable.declaration);
+    }
+    if result.is_err() && promise_introduced {
+        store.fail_source_promise_executor_resolution(arrow.callable.declaration);
     }
     result
 }

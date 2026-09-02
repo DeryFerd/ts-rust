@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 
 mod global_error;
 
-use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
+use ts_ast::{NodeArena, NodeArenaRevision, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     BoundFile, CanonicalNameResolutionError, CanonicalNameResolver, CanonicalResolutionLocation,
     CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags,
@@ -354,6 +354,173 @@ struct SourceGlobalPromiseConstructorPlan {
     array_targets: Option<CanonicalArrayTargets>,
 }
 
+/// Source-checked constructor context retained by its executor callable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourcePromiseExecutorProof {
+    construction: NodeRef,
+    constructor: NodeRef,
+    symbol: SemanticSymbolId,
+    owner: SemanticSymbolId,
+    revision: NodeArenaRevision,
+    global: SourceGlobalPromiseConstructorPlan,
+    target: TypeId,
+    selected: SignatureId,
+    value_type: TypeId,
+    instance_type: TypeId,
+}
+
+impl SourcePromiseExecutorProof {
+    pub(super) fn from_source(
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        array_targets: CanonicalArrayTargets,
+        declaration: NodeRef,
+        owner: SemanticSymbolId,
+        target: TypeId,
+    ) -> Result<Self, SourceNewError> {
+        let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(declaration));
+        if !source_promise_constructor_argument_arrow_is_exact(store, host, declaration)
+            .map_err(|_| invalid())?
+            || !host.symbol_matches(store, declaration, owner)
+        {
+            return Err(invalid());
+        }
+        let Some(SourceNodeParent::Parent(construction)) = store.source_node_parent(declaration)
+        else {
+            return Err(invalid());
+        };
+        let NodeData::NewExpression(expression) = &host.node(construction).ok_or_else(invalid)?.data
+        else {
+            return Err(invalid());
+        };
+        let constructor = NodeRef::new(construction.arena, construction.file, expression.expression);
+        let symbol = store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Promise"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(invalid)?;
+        let global = plan_global_promise_constructor(
+            store, host, construction, constructor, symbol, declaration, Some(array_targets),
+        )?;
+        let selected = resolved_global_promise_constructor_identity(store, constructor, symbol, &global)?
+            .ok_or_else(invalid)?;
+        let proof = Self {
+            construction,
+            constructor,
+            symbol,
+            owner,
+            revision: host.source(declaration).ok_or_else(invalid)?.0.revision(),
+            global,
+            target,
+            selected: selected.signature,
+            value_type: selected.value_type,
+            instance_type: selected.instance_type,
+        };
+        if !proof.is_exact(store, declaration, owner, target) {
+            return Err(invalid());
+        }
+        Ok(proof)
+    }
+
+    pub(super) fn callback(&self) -> NodeRef {
+        self.global.executor
+    }
+
+    pub(super) fn revision(&self) -> NodeArenaRevision {
+        self.revision
+    }
+
+    pub(super) fn target(&self) -> TypeId {
+        self.target
+    }
+
+    pub(super) fn source_is_exact<TypePayload, MapperPayload>(
+        &self,
+        store: &super::store::SemanticStore<TypePayload, MapperPayload>,
+    ) -> bool {
+        store.source_declaration_symbol(self.global.executor) == Some(self.owner)
+            && store.source_symbol_declarations_match(self.owner)
+            && store.symbol(self.owner).is_some_and(|owner| {
+                owner.flags() == SymbolFlags::FUNCTION
+                    && owner.check_flags() == CheckFlags::NONE
+                    && owner.name() == InternalSymbolName::Function.as_ref()
+                    && owner.declarations() == Some(&[self.global.executor])
+                    && owner.value_declaration() == Some(self.global.executor)
+                    && owner.members().is_none()
+                    && owner.exports().is_none()
+                    && owner.parent().is_none()
+                    && owner.export_symbol().is_none()
+                    && store.get_merged_symbol(self.owner) == Some(self.owner)
+            })
+            && store.source_node_kind(self.global.executor) == Some(SyntaxKind::ArrowFunction)
+            && store.source_node_kind(self.construction) == Some(SyntaxKind::NewExpression)
+            && store.source_node_parent(self.global.executor)
+                == Some(SourceNodeParent::Parent(self.construction))
+            && store.source_node_parent(self.constructor)
+                == Some(SourceNodeParent::Parent(self.construction))
+    }
+
+    pub(super) fn is_exact(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        declaration: NodeRef,
+        owner: SemanticSymbolId,
+        target: TypeId,
+    ) -> bool {
+        if !self.source_is_exact(store)
+            || declaration != self.global.executor
+            || owner != self.owner
+            || target != self.target
+            || store.symbol_node_links(self.constructor).is_some_and(|links| {
+                links.resolved_symbol.is_some_and(|symbol| symbol != self.symbol)
+            })
+            || store.intrinsic_bootstrap()
+                .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                .and_then(|globals| globals.get_source("Promise"))
+                .and_then(|symbol| store.get_merged_symbol(symbol)) != Some(self.symbol)
+        {
+            return false;
+        }
+        let Ok(Some(selected)) = resolved_global_promise_constructor_identity(
+            store, self.constructor, self.symbol, &self.global,
+        ) else {
+            return false;
+        };
+        selected.signature == self.selected
+            && selected.value_type == self.value_type
+            && selected.instance_type == self.instance_type
+            && exact_type_cache(store, self.constructor)
+                .is_ok_and(|cached| cached.is_none_or(|type_| type_ == self.value_type))
+            && exact_type_cache(store, self.construction)
+                .is_ok_and(|cached| cached.is_none_or(|type_| type_ == self.instance_type))
+            && exact_signature_cache(store, self.construction)
+                .is_ok_and(|cached| cached.is_none_or(|signature| signature == self.selected))
+            && resolved_promise_executor_context(store, self.construction, &self.global, self.instance_type)
+                .is_ok_and(|cached| cached == Some(target))
+    }
+}
+
+fn resolved_promise_executor_context(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    global: &SourceGlobalPromiseConstructorPlan,
+    instance_type: TypeId,
+) -> Result<Option<TypeId>, SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(node));
+    let executor = exact_type_cache(store, global.parameter_annotation)
+        .map_err(|()| invalid())?
+        .ok_or_else(invalid)?;
+    let formal = store.declared_type_links(global.type_parameter)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(invalid)?;
+    let instance = validate_direct_generic_reference(store, instance_type)
+        .map_err(|_| invalid())?;
+    super::instantiate::cached_instantiation_with_vector(
+        store, executor, &[formal], &instance.type_arguments, global.array_targets, None,
+    ).map_err(|_| invalid())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SourceGlobalArraySignaturePlan {
     declaration: NodeRef,
@@ -542,25 +709,7 @@ impl SourceDefaultNewPlan {
         let Some(checked) = resolved_global_promise_constructor(store, self, global)? else {
             return Ok(None);
         };
-        let invalid = || invariant(SourceNewInvariant::InvalidExpressionCache(self.node));
-        let executor = exact_type_cache(store, global.parameter_annotation)
-            .map_err(|()| invalid())?
-            .ok_or_else(invalid)?;
-        let formal = store
-            .declared_type_links(global.type_parameter)
-            .and_then(|links| links.declared_type)
-            .ok_or_else(invalid)?;
-        let instance = validate_direct_generic_reference(store, checked.instance_type)
-            .map_err(|_| invalid())?;
-        super::instantiate::cached_instantiation_with_vector(
-            store,
-            executor,
-            &[formal],
-            &instance.type_arguments,
-            global.array_targets,
-            None,
-        )
-        .map_err(|_| invalid())
+        resolved_promise_executor_context(store, self.node, global, checked.instance_type)
     }
 
     fn arguments(&self) -> impl Iterator<Item = &SourceNewArgument> {
@@ -8745,9 +8894,18 @@ fn resolved_global_promise_constructor(
     plan: &SourceDefaultNewPlan,
     global: &SourceGlobalPromiseConstructorPlan,
 ) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
+    resolved_global_promise_constructor_identity(store, plan.constructor, plan.resolved_symbol, global)
+}
+
+fn resolved_global_promise_constructor_identity(
+    store: &CanonicalTypeMapperStore,
+    constructor: NodeRef,
+    resolved_symbol: SemanticSymbolId,
+    global: &SourceGlobalPromiseConstructorPlan,
+) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
     let invalid = || {
         invariant(SourceNewInvariant::InvalidConstructorCache(
-            plan.constructor,
+            constructor,
         ))
     };
     let Some(value_type) = store
@@ -8759,13 +8917,13 @@ fn resolved_global_promise_constructor(
     if exact_type_cache(store, global.annotation)
         .map_err(|()| invalid())?
         .is_some_and(|cached| cached != value_type)
-        || exact_class_value_type(store, plan.resolved_symbol)?
+        || exact_class_value_type(store, resolved_symbol)?
             .is_some_and(|cached| cached != value_type)
     {
         return Err(invalid());
     }
     let Some(promise_target) = store
-        .declared_type_links(plan.resolved_symbol)
+        .declared_type_links(resolved_symbol)
         .and_then(|links| links.declared_type)
     else {
         return Ok(None);
