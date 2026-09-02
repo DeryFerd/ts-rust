@@ -1066,6 +1066,19 @@ pub(super) fn prepare_source_overload_publication(
                     SourceOverloadInvariant::Cache(annotation),
                 ));
             }
+            if parameter.rest
+                && !default_library_overload_rest_parameter_is_exact(
+                    store,
+                    plan.owner_symbol,
+                    declaration.declaration,
+                    parameter.declaration,
+                    annotation,
+                    *base_type,
+                    plan.array_targets,
+                )
+            {
+                return Err(SourceOverloadError::Unsupported(parameter.declaration));
+            }
             let call_type = if strict && parameter.optional {
                 store.literal_union_type_prepared_with_global_types(
                     global_types,
@@ -1115,6 +1128,67 @@ pub(super) fn prepare_source_overload_publication(
         implementation: plan.implementation,
         array_targets: plan.array_targets,
     })
+}
+
+/// Checks the written final array parameter of a merged default-library function.
+pub(super) fn default_library_overload_rest_parameter_is_exact(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    parameter: NodeRef,
+    annotation: NodeRef,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> bool {
+    let Some(targets) = array_targets else {
+        return false;
+    };
+    if !store.source_is_default_library_declaration(declaration)
+        || store
+            .source_global_function_namespace_declarations(owner)
+            .is_none_or(|declarations| !declarations.contains(&declaration))
+        || store.source_node_kind(declaration) != Some(SyntaxKind::FunctionDeclaration)
+        || store.source_node_kind(parameter) != Some(SyntaxKind::Parameter)
+        || store.source_node_parent(parameter) != Some(SourceNodeParent::Parent(declaration))
+        || store.source_direct_type_annotation(parameter) != Some(annotation)
+        || store.source_node_kind(annotation) != Some(SyntaxKind::ArrayType)
+        || !store.source_direct_type_annotation_is_exact(annotation, type_)
+        || store
+            .source_child_with_kind(parameter, SyntaxKind::DotDotDotToken)
+            .is_none()
+        || store
+            .source_child_with_kind(parameter, SyntaxKind::QuestionToken)
+            .is_some()
+        || store
+            .source_direct_children(declaration)
+            .is_none_or(|children| {
+                children
+                    .iter()
+                    .any(|child| store.source_node_kind(*child) == Some(SyntaxKind::TypeParameter))
+                    || children
+                        .into_iter()
+                        .filter(|child| {
+                            store.source_node_kind(*child) == Some(SyntaxKind::Parameter)
+                        })
+                        .last()
+                        != Some(parameter)
+            })
+    {
+        return false;
+    }
+    let Ok(Some(array)) = store.canonical_array_reference_with_targets(targets, type_) else {
+        return false;
+    };
+    let Some(children) = store.source_direct_children(annotation) else {
+        return false;
+    };
+    let [element] = children.as_slice() else {
+        return false;
+    };
+    !array.readonly
+        && !array.array_literal
+        && store.source_node_parent(*element) == Some(SourceNodeParent::Parent(annotation))
+        && store.source_direct_type_annotation_is_exact(*element, array.element_type)
 }
 
 pub(super) fn publish_source_overload_batch(
@@ -1614,7 +1688,14 @@ pub(super) fn validate_stored_source_overload(
             .iter()
             .map(|parameter| parameter.type_parameter)
             .collect::<Vec<_>>();
-        if row.flags.bits() & !SignatureFlags::HAS_LITERAL_TYPES.bits() != 0
+        let has_rest = row.flags.contains(SignatureFlags::HAS_REST_PARAMETER);
+        if row.flags.bits()
+            & !(SignatureFlags::HAS_LITERAL_TYPES | SignatureFlags::HAS_REST_PARAMETER).bits()
+            != 0
+            || has_rest
+                && (row.parameters.is_empty()
+                    || !global_namespace
+                    || !row.type_parameters.is_empty())
             || signature.flags() != row.flags
             || signature.declaration() != Some(row.declaration)
             || signature.type_parameters() != type_parameters.as_slice()
@@ -1723,6 +1804,7 @@ pub(super) fn validate_stored_source_overload(
             usize::try_from(signature.min_argument_count()).expect("the minimum was validated");
         let mut optional_seen = false;
         for (index, parameter) in row.parameters.iter().enumerate() {
+            let rest = has_rest && index + 1 == row.parameters.len();
             let Some(symbol) = store.symbol(parameter.symbol) else {
                 return StoredSourceOverloadValidation::Malformed;
             };
@@ -1761,8 +1843,23 @@ pub(super) fn validate_stored_source_overload(
                         parameter.call_type != parameter.base_type
                     }
                 || !parameter.optional && parameter.call_type != parameter.base_type
-                || optional_seen && !parameter.optional
-                || parameter.optional != (index >= minimum)
+                || optional_seen && !parameter.optional && !rest
+                || parameter.optional != (index >= minimum && !rest)
+                || rest && minimum > index
+                || store
+                    .source_child_with_kind(parameter.declaration, SyntaxKind::DotDotDotToken)
+                    .is_some()
+                    != rest
+                || rest
+                    && !default_library_overload_rest_parameter_is_exact(
+                        store,
+                        owner_symbol,
+                        row.declaration,
+                        parameter.declaration,
+                        parameter.annotation,
+                        parameter.base_type,
+                        provenance.array_targets,
+                    )
             {
                 return StoredSourceOverloadValidation::Malformed;
             }
@@ -1876,15 +1973,21 @@ pub(super) fn source_overload_signature_projection(
         .iter()
         .find(|row| row.signature == signature)?;
     let record = store.signature(signature)?;
+    let mut parameters = row
+        .parameters
+        .iter()
+        .map(|parameter| parameter.call_type)
+        .collect::<Vec<_>>();
+    let rest_parameter = if record.has_rest_parameter() {
+        Some(parameters.pop()?)
+    } else {
+        None
+    };
     Some(super::callables::ValidatedSingleCallable {
         owner: type_,
         signature,
-        parameters: row
-            .parameters
-            .iter()
-            .map(|parameter| parameter.call_type)
-            .collect(),
-        rest_parameter: None,
+        parameters,
+        rest_parameter,
         min_argument_count: usize::try_from(record.min_argument_count()).ok()?,
         return_type: Some(row.return_type),
         strict_variance_exempt: false,

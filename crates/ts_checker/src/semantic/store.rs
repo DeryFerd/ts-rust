@@ -12229,6 +12229,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                 return None;
             }
             for signature in &group.signatures {
+                let has_rest = signature.flags.contains(SignatureFlags::HAS_REST_PARAMETER);
                 if !declarations.insert(signature.declaration)
                     || self.source_node_kind(signature.declaration)
                         != Some(SyntaxKind::FunctionDeclaration)
@@ -12243,7 +12244,14 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                     || self
                         .source_overload_types_by_declaration
                         .contains_key(&signature.declaration)
-                    || signature.flags.bits() & !SignatureFlags::HAS_LITERAL_TYPES.bits() != 0
+                    || signature.flags.bits()
+                        & !(SignatureFlags::HAS_LITERAL_TYPES | SignatureFlags::HAS_REST_PARAMETER)
+                            .bits()
+                        != 0
+                    || has_rest
+                        && (signature.parameters.is_empty()
+                            || !global_namespace
+                            || signature.query_evidence.is_some())
                     || signature.min_argument_count < 0
                     || usize::try_from(signature.min_argument_count)
                         .map_or(true, |minimum| minimum > signature.parameters.len())
@@ -12333,7 +12341,8 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                     }
                 }
                 let mut optional_seen = false;
-                for parameter in &signature.parameters {
+                for (index, parameter) in signature.parameters.iter().enumerate() {
+                    let rest = has_rest && index + 1 == signature.parameters.len();
                     let symbol = self.symbol(parameter.symbol)?;
                     if !parameter_declarations.insert(parameter.declaration)
                         || !parameter_symbols.insert(parameter.symbol)
@@ -12356,7 +12365,24 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                         || !self.contains_node_ref(parameter.annotation)
                         || self.type_payload(parameter.base_type).is_none()
                         || self.type_payload(parameter.call_type).is_none()
-                        || optional_seen && !parameter.optional
+                        || optional_seen && !parameter.optional && !rest
+                        || rest
+                            && (parameter.optional
+                                || usize::try_from(signature.min_argument_count).ok()? > index)
+                        || self
+                            .source_child_with_kind(parameter.declaration, SyntaxKind::DotDotDotToken)
+                            .is_some()
+                            != rest
+                        || rest
+                            && !super::source_overloads::default_library_overload_rest_parameter_is_exact(
+                                self,
+                                group.owner_symbol,
+                                signature.declaration,
+                                parameter.declaration,
+                                parameter.annotation,
+                                parameter.base_type,
+                                group.array_targets,
+                            )
                     {
                         return None;
                     }

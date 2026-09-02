@@ -3467,6 +3467,9 @@ fn plan_source_callable_with_owner_shape(
             if global_namespace_functions.as_deref() == Some(declarations)
                 && declarations.contains(&declaration)
     );
+    let default_library_overload = global_namespace_overload
+        && store.source_is_default_library_declaration(declaration)
+        && type_parameters.is_empty();
     let global_augmentation_local = global_namespace_overload
         .then(|| store.source_global_callable_augmentation_local(owner_symbol, declaration))
         .flatten();
@@ -3943,7 +3946,9 @@ fn plan_source_callable_with_owner_shape(
                     parameter,
                 )));
             }
-            if matches!(owner_shape, SourceCallableOwnerShape::AmbientOverload(_)) {
+            if matches!(owner_shape, SourceCallableOwnerShape::AmbientOverload(_))
+                && !(default_library_overload && data.type_.is_some())
+            {
                 return Err(SourceCallableError::Unsupported(
                     SourceCallableUnsupported::AmbientRestParameter(parameter),
                 ));
@@ -4618,10 +4623,11 @@ fn plan_source_callable_with_owner_shape(
                 || plan.return_type.is_inferred()
                 || plan.export_local != global_augmentation_local
                 || plan.owner_parent.is_some()
-                || plan
-                    .parameters
-                    .iter()
-                    .any(|parameter| parameter.rest || parameter.initializer.is_some())
+                || plan.parameters.iter().any(|parameter| {
+                    parameter.rest
+                        && !(default_library_overload && parameter.explicit_type_node().is_some())
+                        || parameter.initializer.is_some()
+                })
             {
                 return Err(SourceCallableError::Unsupported(
                     SourceCallableUnsupported::OverloadDeclaration(declaration),
