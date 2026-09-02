@@ -21216,6 +21216,13 @@ fn prepare_constructor_parameter_type(
     };
     if !signature.parameters.contains(parameter)
         || !signature.type_parameters.is_empty()
+            && (!matches!(mode, ConstructorAnnotationMode::SourceResolvedFull)
+                || resolved_declared_signature_type_parameters(
+                    store,
+                    signature.declaration,
+                    &signature.type_parameters,
+                )
+                .is_none())
         || !signature_uses_constructor_interface_optional_types(store, signature.declaration)
         || cached_annotation_identity(
             store,
