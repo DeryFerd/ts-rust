@@ -13715,6 +13715,20 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                         target,
                     )
             });
+        let binding_default_target_is_exact =
+            provenance.family == SourceCallableFamily::ArrowFunction
+                && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+                && provenance.contextual_variable.is_none()
+                && provenance.captured_assignment.is_none()
+                && provenance.contextual_target.is_some_and(|target| {
+                    target != type_
+                        && super::source_callables::stored_object_parameter_default_arrow_is_exact(
+                            self,
+                            provenance.declaration,
+                            provenance.owner_symbol,
+                            target,
+                        )
+                });
         let sort_target_is_exact = (|| {
             let target = provenance.contextual_target?;
             let SourceNodeParent::Parent(call) = self.source_node_parent(provenance.declaration)?
@@ -13820,7 +13834,11 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             Some(())
         })()
         .is_some();
-        if promise_target_is_exact || expression_target_is_exact || sort_target_is_exact {
+        if promise_target_is_exact
+            || expression_target_is_exact
+            || binding_default_target_is_exact
+            || sort_target_is_exact
+        {
             self.set_source_callable_provenance_with_context(type_, provenance, true)
         } else {
             self.set_source_callable_provenance(type_, provenance)

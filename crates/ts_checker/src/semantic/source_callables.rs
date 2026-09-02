@@ -8162,7 +8162,7 @@ pub(super) fn source_direct_call_statement_container<TypePayload, MapperPayload>
 }
 
 #[allow(clippy::too_many_lines)] // Prove the source owner and its cached property context together.
-fn stored_object_parameter_default_arrow_is_exact(
+pub(super) fn stored_object_parameter_default_arrow_is_exact(
     store: &CanonicalTypeMapperStore,
     declaration: NodeRef,
     owner_symbol: SemanticSymbolId,
