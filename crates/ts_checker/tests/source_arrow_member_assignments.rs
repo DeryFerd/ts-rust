@@ -145,7 +145,7 @@ fn property_declaration(parsed: &ParseResult, owner: NodeRef, name: &str) -> Nod
         .nodes
         .iter()
         .find_map(|&id| {
-            let NodeData::PropertySignature(property) = &parsed.arena.get(id)?.data else {
+            let NodeData::PropertySignatureDeclaration(property) = &parsed.arena.get(id)?.data else {
                 return None;
             };
             let NodeData::Identifier(actual) = &parsed.arena.get(property.name)?.data else {
@@ -222,7 +222,7 @@ fn assert_contextual_rhs(
     let signature = callable_signature(checker, type_);
     let target_signature = callable_signature(checker, target);
     assert_ne!(signature, target_signature);
-    let NodeData::PropertySignature(property) =
+    let NodeData::PropertySignatureDeclaration(property) =
         &parsed.arena.get(target_declaration.node).unwrap().data
     else {
         unreachable!();
