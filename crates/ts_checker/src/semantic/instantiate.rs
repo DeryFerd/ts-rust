@@ -3391,6 +3391,9 @@ fn supported_instantiable_union_constituent(
                         .is_some(),
             )
         }
+        Some(TypeData::Intersection(_)) => {
+            instantiable_intersection_projection(store, type_, array_targets).map(|_| true)
+        }
         Some(TypeData::Union(_)) => Ok(match array_targets {
             Some(targets) => store
                 .validate_cached_union_result_with_array_targets(targets, type_, None)
