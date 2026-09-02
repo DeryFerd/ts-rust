@@ -135,6 +135,32 @@ fn validate_instantiated_alias_base_property_object(
     })
 }
 
+/// Reads an alias base from its retained source-header request.
+fn validate_source_instantiated_alias_base_property_object(
+    store: &CanonicalTypeMapperStore,
+    request: &super::interface_heritage::SourceInterfaceAliasBaseRequest,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Option<ValidatedInterfaceSurface> {
+    if !matches!(source_interface_alias_base_state(store, request, array_targets, query).ok()?,
+        SourceInterfaceAliasBaseState::Ready { type_: result, .. } if result == type_)
+    {
+        return None;
+    }
+    let members =
+        super::interface_heritage::interface_alias_base_members(store, type_, array_targets)
+            .ok()??;
+    Some(ValidatedInterfaceSurface {
+        owner: request.symbol(),
+        declared_properties: Vec::new(),
+        properties: members.properties,
+        index_infos: members.indexes,
+        declared_call_signatures: Vec::new(),
+        call_signatures: Vec::new(),
+    })
+}
+
 fn source_alias_override_types_are_exact(
     store: &CanonicalTypeMapperStore,
     own_type: TypeId,
@@ -1816,7 +1842,7 @@ fn validate_property_interface_worker(
             .is_some();
         let base =
             if let Some(request) = alias_request.filter(|request| request.reference().is_some()) {
-                validate_instantiated_alias_base_property_object(
+                validate_source_instantiated_alias_base_property_object(
                     store,
                     request,
                     base_type,
