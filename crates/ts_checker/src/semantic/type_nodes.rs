@@ -51539,9 +51539,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 }
                 _ => argument,
             };
-            let assignable = self
-                .compare_constraint_types(comparison_argument, constraint)
-                .map_err(|_| unsupported())?;
+            let mut demanded = HashSet::new();
+            let assignable = loop {
+                match self.compare_constraint_types(comparison_argument, constraint) {
+                    Ok(assignable) => break assignable,
+                    Err(super::RelationUnavailable::UnresolvedStructuredMembers(type_))
+                        if demanded.insert(type_)
+                            && self.prepare_constraint_interface_members(type_)? => {}
+                    Err(_) => return Err(unsupported()),
+                }
+            };
             if limit_mark.is_some_and(|mark| {
                 self.instantiation_session
                     .as_deref()
@@ -51608,6 +51615,52 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
         }
         Ok(())
+    }
+
+    /// Prepares a cold nongeneric interface requested by constraint comparison.
+    fn prepare_constraint_interface_members(
+        &mut self,
+        type_: TypeId,
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some(record) = self.store.type_payload(type_) else {
+            return Ok(false);
+        };
+        let TypeData::Interface(interface) = record.data() else {
+            return Ok(false);
+        };
+        if record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK != ObjectFlags::INTERFACE
+            || record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
+            || interface.declared_members_resolved
+            || interface
+                .all_type_parameters
+                .as_ref()
+                .is_some_and(|parameters| !parameters.is_empty())
+        {
+            return Ok(false);
+        }
+        let Some(owner) = record.symbol() else {
+            return Ok(false);
+        };
+        let flags = self.symbol_flags(owner)?;
+        if !flags.contains(SymbolFlags::INTERFACE)
+            || flags.contains(SymbolFlags::CLASS)
+            || preflight_class_or_interface_reference(self.store, self.host, owner, flags)? != 0
+        {
+            return Ok(false);
+        }
+        let invalid = || {
+            DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                symbol: owner,
+                declared_type: type_,
+            })
+        };
+        if self.canonical_symbol(owner)? != owner
+            || self.get_declared_type_of_symbol(owner)? != type_
+            || self.get_declared_interface_for_source_check(owner)? != type_
+        {
+            return Err(invalid());
+        }
+        Ok(true)
     }
 
     /// Proves both React factory bounds without forcing cold DOM or attribute members.
