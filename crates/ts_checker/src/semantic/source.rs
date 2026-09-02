@@ -10266,6 +10266,66 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }))
     }
 
+    fn is_type_import_namespace_value_use(
+        &self,
+        expression: NodeRef,
+        alias: SemanticSymbolId,
+    ) -> Result<bool, SourceCheckError> {
+        let Some(binding) = self.type_import_bindings.get(&alias) else {
+            return Ok(false);
+        };
+        if self.node(binding.declaration)?.kind != SyntaxKind::NamespaceImport {
+            return Ok(false);
+        }
+        let Some((store, host)) = self.semantic else {
+            return Ok(false);
+        };
+        let NodeData::Identifier(identifier) = &self.node(expression)?.data else {
+            return Ok(false);
+        };
+        let mut callback = host.name_resolver_host(store)?;
+        let resolved =
+            CanonicalNameResolver::new(self.arena, self.bound, store.symbol_store(), &mut callback)
+                .map_err(DeclaredTypeError::from)?
+                .resolve(
+                    Some(CanonicalResolutionLocation::Bound(expression)),
+                    &identifier.text,
+                    SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE | SymbolFlags::ALIAS,
+                    None,
+                    false,
+                    false,
+                );
+        let actual = match resolved {
+            Ok(Some(symbol))
+            | Err(ts_binder::CanonicalNameResolutionError::AliasResolutionUnavailable(symbol)) => {
+                store.get_merged_symbol(symbol)
+            }
+            Ok(None) => None,
+            Err(error) => return Err(DeclaredTypeError::from(error).into()),
+        };
+        if actual != Some(alias) {
+            return Ok(false);
+        }
+        if self.is_direct_top_level_variable_initializer(expression)? {
+            return Ok(true);
+        }
+        let Some(parent) = self
+            .node(expression)?
+            .parent
+            .map(|node| self.reference(node))
+        else {
+            return Ok(false);
+        };
+        let record = self.node(parent)?;
+        let NodeData::PropertyAccessExpression(access) = &record.data else {
+            return Ok(false);
+        };
+        Ok(record.kind == SyntaxKind::PropertyAccessExpression
+            && access.expression == expression.node
+            && access.question_dot_token.is_none()
+            && self.is_direct_top_level_variable_initializer(parent)?)
+    }
+
     fn is_direct_top_level_variable_initializer(
         &self,
         expression: NodeRef,
@@ -23667,6 +23727,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             {
                 continue;
             }
+            // Written arrow types use the ordinary initializer and assignment checks.
+            if binding == VariableBindingKind::Const
+                && variable.type_.is_some()
+                && let NodeData::ArrowFunction(arrow) = &self.node(initializer)?.data
+                && arrow.type_.is_some()
+                && arrow.modifiers.is_none()
+                && arrow.asterisk_token.is_none()
+                && arrow.type_parameters.is_none()
+                && arrow.parameters.nodes.iter().all(|parameter| {
+                    self.node(self.reference(*parameter)).is_ok_and(|record| {
+                        matches!(
+                            &record.data,
+                            NodeData::ParameterDeclaration(parameter)
+                                if parameter.type_.is_some()
+                        )
+                    })
+                })
+            {
+                continue;
+            }
             let Some((store, host)) = self.semantic else {
                 return Err(self.unsupported(
                     initializer,
@@ -25382,14 +25462,100 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 UnsupportedSourceSyntax::Arrow(declaration),
                             ));
                         };
-                        plan_redeclared_top_level_variable(
-                            self.bound,
-                            store,
-                            parent,
-                            name,
-                            &identifier.text,
-                        )
-                        .map_err(Self::variable_plan_error)?;
+                        let annotated_const = argument == declaration
+                            && variable.type_.is_some()
+                            && arrow.type_.is_some()
+                            && arrow.modifiers.is_none()
+                            && arrow.asterisk_token.is_none()
+                            && arrow.type_parameters.is_none()
+                            && arrow.parameters.nodes.iter().all(|parameter| {
+                                self.node(self.reference(*parameter)).is_ok_and(|record| {
+                                    matches!(
+                                        &record.data,
+                                        NodeData::ParameterDeclaration(parameter)
+                                            if parameter.type_.is_some()
+                                    )
+                                })
+                            })
+                            && record.parent.is_some_and(|list| {
+                                self.node(self.reference(list)).is_ok_and(|record| {
+                                    matches!(
+                                        &record.data,
+                                        NodeData::VariableDeclarationList(list)
+                                            if record.kind == SyntaxKind::VariableDeclarationList
+                                                && record.flags.0 == NODE_FLAG_CONST
+                                                && list.declarations.nodes.as_slice() == [parent.node]
+                                    )
+                                })
+                            });
+                        if annotated_const {
+                            let list = self.reference(record.parent.ok_or(
+                                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(
+                                    declaration,
+                                )),
+                            )?);
+                            let list_record = self.node(list)?;
+                            let statement = self.reference(list_record.parent.ok_or(
+                                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(
+                                    declaration,
+                                )),
+                            )?);
+                            let statement_record = self.node(statement)?;
+                            let NodeData::VariableStatement(statement_data) =
+                                &statement_record.data
+                            else {
+                                return Err(SourceCheckError::Unsupported(
+                                    UnsupportedSourceSyntax::Arrow(declaration),
+                                ));
+                            };
+                            if statement_record.kind != SyntaxKind::VariableStatement
+                                || statement_record.parent != Some(container.node)
+                                || statement_data.declaration_list != list.node
+                                || self.bound.block_scope_container(parent) != Some(container)
+                                || self.node(name)?.parent != Some(parent.node)
+                                || !variable.type_.is_some_and(|annotation| {
+                                    self.node(self.reference(annotation))
+                                        .is_ok_and(|record| record.parent == Some(parent.node))
+                                })
+                                || !matches!(
+                                    &self.node(container)?.data,
+                                    NodeData::SourceFile(source)
+                                        if source.statements.nodes.iter()
+                                            .filter(|node| **node == statement.node).count() == 1
+                                )
+                            {
+                                return Err(SourceCheckError::Unsupported(
+                                    UnsupportedSourceSyntax::Arrow(declaration),
+                                ));
+                            }
+                            let exported = self
+                                .validate_variable_modifiers(
+                                    statement,
+                                    statement_record.range,
+                                    list.node,
+                                    statement_data.modifiers.as_ref(),
+                                )?
+                                .is_some();
+                            plan_top_level_variable(
+                                self.bound,
+                                store,
+                                parent,
+                                name,
+                                &identifier.text,
+                                VariableBindingKind::Const,
+                                exported,
+                            )
+                            .map_err(Self::variable_plan_error)?;
+                        } else {
+                            plan_redeclared_top_level_variable(
+                                self.bound,
+                                store,
+                                parent,
+                                name,
+                                &identifier.text,
+                            )
+                            .map_err(Self::variable_plan_error)?;
+                        }
                     } else if !class_local
                         && !enclosing_arrow
                         && !enclosing_function
@@ -26698,6 +26864,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                     }))
                             .then_some(alias)
                         });
+                if let Some(alias) = type_import_alias
+                    && self.is_type_import_namespace_value_use(expression, alias)?
+                {
+                    let read = PlannedSourceTypeImportValueUse {
+                        node: expression,
+                        alias_symbol: alias,
+                        name,
+                    };
+                    self.identifier_reads.push((expression, alias));
+                    self.type_import_value_uses.push(read.clone());
+                    return Ok(PlannedExpression::new(
+                        expression,
+                        PlannedExpressionKind::TypeImportValueUse(read),
+                    ));
+                }
                 let kind = match variable_read {
                     Ok(read) => {
                         PlannedExpressionKind::Identifier(PlannedIdentifierRead::variable(read))
@@ -35713,6 +35894,7 @@ fn preflight_type_import_value_use(
     store: &CanonicalTypeMapperStore,
     resolved_type_imports: &HashMap<SemanticSymbolId, ResolvedSourceTypeImportBinding>,
     read: &PlannedSourceTypeImportValueUse,
+    namespace_type: Option<TypeId>,
 ) -> Result<PreparedSourceTypeImportValueUse, SourceCheckError> {
     let resolved = resolved_type_imports
         .get(&read.alias_symbol)
@@ -35732,9 +35914,12 @@ fn preflight_type_import_value_use(
         Err(error) => return Err(SourcePlanner::import_plan_error(read.node, &error)),
         Ok(()) => return Err(SourceCheckError::Import(read.node)),
     }
-    let error_type = store
-        .intrinsic_bootstrap()
-        .map(|bootstrap| bootstrap.error_type)
+    let error_type = namespace_type
+        .or_else(|| {
+            store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.error_type)
+        })
         .ok_or(SourceCheckError::LiteralCache(
             SourceLiteralCacheError::BootstrapUninitialized,
         ))?;
@@ -35771,7 +35956,17 @@ fn preflight_type_import_value_use(
                 message_by_code(1361).ok_or(SourceCheckError::MissingDiagnostic(1361))?,
                 [read.name.clone()],
             ),
-            related_information: Vec::new(),
+            related_information: if namespace_type.is_some() {
+                vec![CanonicalCheckerRelatedInformation {
+                    node: Some(resolved.binding.declaration),
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(1376).ok_or(SourceCheckError::MissingDiagnostic(1376))?,
+                        [read.name.clone()],
+                    ),
+                }]
+            } else {
+                Vec::new()
+            },
         },
         error_type,
         prior_links,
@@ -38479,6 +38674,9 @@ fn check_expression_type_with_capture_context(
                     SourcePropertyQueryError::Source(error) => error,
                 })?
             };
+            let recovery = checked
+                .has_missing_read_error(store, property)
+                .then_some(PrimitiveBinaryRecovery::Error);
             for diagnostic in checked.diagnostics {
                 publish_or_defer_class_property_diagnostic(
                     store,
@@ -38492,7 +38690,10 @@ fn check_expression_type_with_capture_context(
                 )?;
             }
             publish_expression_type(store, expression.node, checked.type_)?;
-            Ok(CheckedExpressionTypes::leaf(checked.type_, checked.type_))
+            Ok(CheckedExpressionTypes::primitive_binary(
+                checked.type_,
+                recovery,
+            ))
         }
         PlannedExpressionKind::Element(element) => {
             let receiver = check_expression_type_with_capture_context(
@@ -74513,8 +74714,28 @@ pub(super) fn check_source_file(
         if type_import_execution.value_uses.contains_key(&read.node) {
             return Err(SourceCheckError::Import(read.node));
         }
-        let prepared =
-            preflight_type_import_value_use(arena, bound, store, &resolved_type_imports, read)?;
+        let resolved = resolved_type_imports
+            .get(&read.alias_symbol)
+            .ok_or(SourceCheckError::Import(read.node))?;
+        let namespace_type = super::source_imports::prepare_source_type_import_namespace_use(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            resolved,
+            read.node,
+        )
+        .map_err(|error| SourcePlanner::import_plan_error(read.node, &error))?;
+        let prepared = preflight_type_import_value_use(
+            arena,
+            bound,
+            store,
+            &resolved_type_imports,
+            read,
+            namespace_type,
+        )?;
         if type_import_execution
             .value_uses
             .insert(read.node, prepared)

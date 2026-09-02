@@ -38,10 +38,10 @@ pub(super) enum PrimitiveBigIntExponentiationTarget {
     Unknown,
 }
 
-/// Tracks canonical any and error results between primitive binary operations.
+/// Tracks canonical any and error results used by primitive binary operations.
 ///
-/// The source executor retains this tag only on a completed primitive binary
-/// result and validates it against the exact bootstrap identity on reuse.
+/// The source executor retains this tag on completed primitive binary results
+/// and checked missing-property errors. Each use checks the exact bootstrap type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PrimitiveBinaryRecovery {
     Any,

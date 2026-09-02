@@ -649,6 +649,46 @@ pub(super) fn resolve_global_constructor_candidates(
     Ok(Some(ready))
 }
 
+/// Records only a propagated provider error, using the held source node facts.
+fn trace_global_constructor_provider_failure(
+    host: &DeclaredTypeHost<'_>,
+    plan: &GlobalConstructorValuePlan,
+    stage: &'static str,
+    node_role: &'static str,
+    node: NodeRef,
+    error: &DeclaredConstructorValueError,
+) {
+    use std::io::Write;
+
+    let variant = match error {
+        DeclaredConstructorValueError::Unsupported { .. } => "unsupported",
+        DeclaredConstructorValueError::InvalidValue(_) => "invalid_value",
+        DeclaredConstructorValueError::InvalidSignature(_) => "invalid_signature",
+        DeclaredConstructorValueError::Capacity(_) => "capacity",
+        DeclaredConstructorValueError::DeclaredType(_) => "declared_type",
+        DeclaredConstructorValueError::Members(_) => "members",
+    };
+    let record = host.node(node);
+    let kind = record.map(|record| record.kind);
+    let range = record.map(|record| (record.range.start, record.range.end));
+    let parent = record
+        .and_then(|record| record.parent)
+        .map(|parent| NodeRef::new(node.arena, node.file, parent));
+    let mut bytes = [0u8; 1024];
+    let length = {
+        let mut output = &mut bytes[..1023];
+        let _ = write!(
+            output,
+            "ts-rust-constructor-provider stage={stage} variant={variant} value={:?} owner={:?} node_role={node_role} node={node:?} kind={kind:?} range={range:?} parent={parent:?}",
+            plan.value_symbol(),
+            plan.owner_symbol(),
+        );
+        1023 - output.len()
+    };
+    bytes[length] = b'\n';
+    let _ = std::io::stderr().lock().write_all(&bytes[..=length]);
+}
+
 /// Uses the full declared query and the caller's existing instantiation session.
 #[allow(clippy::too_many_arguments)] // The provider must retain the complete caller context.
 pub(super) fn prepare_global_constructor_candidates(
@@ -660,40 +700,72 @@ pub(super) fn prepare_global_constructor_candidates(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     plan: &GlobalConstructorValuePlan,
 ) -> Result<GlobalConstructorCandidates, DeclaredConstructorValueError> {
-    if let Some(ready) = resolve_global_constructor_candidates(store, host, globals, options, plan)?
-    {
-        return Ok(ready);
-    }
-    if read_global_constructor_literal(store, plan)?.is_none() {
-        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
-            store,
-            host,
-            globals,
-            options,
-            session,
-            diagnostics,
-        )?;
-        if plan.kind != GlobalConstructorValueKind::TypeLiteral {
-            query.get_declared_interface_for_source_check(plan.owner_symbol())?;
+    let annotation = plan.value_annotation();
+    let mut observation = ("resolve_initial", "value_annotation", annotation);
+    let result = (|| {
+        if let Some(ready) =
+            resolve_global_constructor_candidates(store, host, globals, options, plan)?
+        {
+            return Ok(ready);
         }
-        query.get_type_from_type_node(plan.value_annotation())?;
-    }
-    validate_global_plan(store, host, globals, options, plan)?;
-    let invalid = || DeclaredConstructorValueError::InvalidValue(plan.value_symbol);
-    let ready = read_global_constructor_literal(store, plan)?.ok_or_else(invalid)?;
-    let value = if plan.kind != GlobalConstructorValueKind::TypeLiteral {
-        plan_global_named_constructor_value(store, host, plan.value_symbol)?
-    } else {
-        plan_global_type_literal_value(store, host, plan.value_symbol)?
-    }
-    .ok_or_else(invalid)?;
-    if !store.try_reserve_value_symbol_links(1) || !store.try_reserve_declared_value_provenance(1) {
-        return Err(DeclaredConstructorValueError::Capacity(
+        observation = ("read_initial", "value_annotation", annotation);
+        if read_global_constructor_literal(store, plan)?.is_none() {
+            observation = ("query_create", "value_annotation", annotation);
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                globals,
+                options,
+                session,
+                diagnostics,
+            )?;
+            if plan.kind != GlobalConstructorValueKind::TypeLiteral {
+                observation = ("query_owner", "owner_declaration", plan.owner.node);
+                query.get_declared_interface_for_source_check(plan.owner_symbol())?;
+            }
+            observation = ("query_annotation", "value_annotation", annotation);
+            query.get_type_from_type_node(plan.value_annotation())?;
+        }
+        observation = ("validate_final", "value_annotation", annotation);
+        validate_global_plan(store, host, globals, options, plan)?;
+        let invalid = || DeclaredConstructorValueError::InvalidValue(plan.value_symbol);
+        observation = ("read_final", "value_annotation", annotation);
+        let ready = read_global_constructor_literal(store, plan)?.ok_or_else(invalid)?;
+        let value = if plan.kind != GlobalConstructorValueKind::TypeLiteral {
+            observation = ("value_plan_named", "value_annotation", annotation);
+            plan_global_named_constructor_value(store, host, plan.value_symbol)?
+        } else {
+            observation = ("value_plan_literal", "value_annotation", annotation);
+            plan_global_type_literal_value(store, host, plan.value_symbol)?
+        }
+        .ok_or_else(invalid)?;
+        observation = (
+            "reserve_value_links",
+            "value_declaration",
             plan.value_declaration(),
-        ));
+        );
+        if !store.try_reserve_value_symbol_links(1) || !store.try_reserve_declared_value_provenance(1) {
+            return Err(DeclaredConstructorValueError::Capacity(
+                plan.value_declaration(),
+            ));
+        }
+        observation = ("publish_value", "value_declaration", plan.value_declaration());
+        publish_declared_value(store, value, ready.value.constructor_type)?;
+        observation = ("resolve_final", "value_annotation", annotation);
+        resolve_global_constructor_candidates(store, host, globals, options, plan)?
+            .ok_or_else(invalid)
+    })();
+    if let Err(error) = &result {
+        trace_global_constructor_provider_failure(
+            host,
+            plan,
+            observation.0,
+            observation.1,
+            observation.2,
+            error,
+        );
     }
-    publish_declared_value(store, value, ready.value.constructor_type)?;
-    resolve_global_constructor_candidates(store, host, globals, options, plan)?.ok_or_else(invalid)
+    result
 }
 
 /// Plans the declaration, not an expression that happens to use its value.

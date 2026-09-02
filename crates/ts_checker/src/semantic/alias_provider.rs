@@ -1632,12 +1632,18 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         }
         let SupportedAliasDeclaration::NamespaceImport {
             specifier,
-            type_only: false,
+            type_only,
         } = self.supported_declaration(store, declaration)?
         else {
             return Err(CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(declaration));
         };
         let resolved = self.resolved_module(declaration, specifier, store)?;
+        if type_only
+            && (resolved.usage_mode() != CanonicalModuleResolutionMode::Esm
+                || resolved.target_mode() != CanonicalModuleResolutionMode::Esm)
+        {
+            return Err(CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(declaration));
+        }
         let module = self.direct_source_module(store, declaration, resolved, true)?;
         if self
             .sources
@@ -1690,7 +1696,13 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                     AliasTargetState::Resolved(target) => target != module,
                     AliasTargetState::Unknown => true,
                 }
-                || links.type_only_declaration.is_some()
+                || links
+                    .type_only_declaration
+                    .is_some_and(|marker| !type_only || marker != declaration)
+                || type_only
+                    && (links.immediate_target.is_some()
+                        || links.alias_target != AliasTargetState::Unresolved)
+                    && links.type_only_declaration != Some(declaration)
         }) {
             return Err(CanonicalAliasTargetUnavailable::InvalidAliasLinks(alias));
         }

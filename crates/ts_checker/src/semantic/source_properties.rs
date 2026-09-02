@@ -2442,6 +2442,24 @@ pub(super) struct CheckedSourceProperty {
     pub(super) diagnostics: Vec<SourcePropertyDiagnostic>,
 }
 
+impl CheckedSourceProperty {
+    pub(super) fn has_missing_read_error(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        plan: &SourcePropertyPlan,
+    ) -> bool {
+        plan.is_read()
+            && store
+                .intrinsic_bootstrap()
+                .is_some_and(|bootstrap| self.type_ == bootstrap.error_type)
+            && self.diagnostics.iter().any(|diagnostic| {
+                diagnostic.name_node == plan.name_node
+                    && diagnostic.private_owner.is_none()
+                    && diagnostic.accessibility.is_none()
+            })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CopiedSourcePropertySuggestion {
     Unavailable,

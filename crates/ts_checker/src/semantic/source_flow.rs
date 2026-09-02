@@ -1446,6 +1446,107 @@ fn validate_source_arrow_owner(
     Ok(body)
 }
 
+/// Proves the source owner without requiring a caller's statement-list plan.
+fn validate_source_function_expression_owner(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    container: NodeRef,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(container);
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || !container.is_for(arena.id(), bound.file_id())
+        || !bound.contains(container)
+        || bound
+            .source_facts()
+            .is_none_or(|facts| facts.is_javascript_file() || facts.is_declaration_file())
+    {
+        return Err(invalid().into());
+    }
+    let record = arena.get(container.node).ok_or_else(invalid)?;
+    let NodeData::FunctionExpression(function) = &record.data else {
+        return Err(invalid().into());
+    };
+    let body = NodeRef::new(container.arena, container.file, function.body);
+    let body_record = arena.get(body.node).ok_or_else(invalid)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Err(invalid().into());
+    };
+    let owner_symbol = bound.symbol(container).ok_or_else(invalid)?;
+    let owner = store.symbol(owner_symbol).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::FunctionExpression
+        || store.source_node_kind(container) != Some(SyntaxKind::FunctionExpression)
+        || record.flags.0 != 0
+        || function.asterisk_token.is_some()
+        || function.modifiers.is_some()
+        || function.full_signature.is_some()
+        || function.next_container.is_some()
+        || function.symbol.is_some()
+        || function.flow_node.is_some()
+        || function.end_flow_node.is_some()
+        || function.return_flow_node.is_some()
+        || function.facts != 0
+        || body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(container.node)
+        || body_record.range.start < record.range.start
+        || body_record.range.end > record.range.end
+        || !bound.contains(body)
+        || store.source_node_parent(body) != Some(container)
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || block.facts != 0
+        || owner.flags() != SymbolFlags::FUNCTION
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.declarations() != Some(&[container])
+        || owner.value_declaration() != Some(container)
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || bound.local_symbol(container).is_some()
+        || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+    {
+        return Err(invalid().into());
+    }
+    if let Some(name) = function.name {
+        let name = NodeRef::new(container.arena, container.file, name);
+        let name_record = arena.get(name.node).ok_or_else(invalid)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(invalid().into());
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(container.node)
+            || name_record.range.start < record.range.start
+            || name_record.range.end > record.range.end
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || !bound.contains(name)
+            || store.source_child_with_kind(container, SyntaxKind::Identifier) != Some(name)
+            || store.source_identifier_text(name) != Some(identifier.text.as_str())
+            || owner.name().as_bytes() != identifier.text.as_bytes()
+        {
+            return Err(invalid().into());
+        }
+    } else if owner.name() != InternalSymbolName::Function.as_ref()
+        || store
+            .source_child_with_kind(container, SyntaxKind::Identifier)
+            .is_some()
+    {
+        return Err(invalid().into());
+    }
+    let start = bound
+        .flow_graph()
+        .container_start(container)
+        .ok_or_else(invalid)?;
+    if preflight_start_payload(bound.flow_graph(), container, start)? != Some(container) {
+        return Err(invalid().into());
+    }
+    Ok(body)
+}
+
 /// Reuses the object's member proof and retains the method's actual body and flow start.
 fn validate_source_object_method_owner(
     arena: &NodeArena,
@@ -8907,6 +9008,10 @@ fn annotated_uninitialized_local(
             if callable.kind == SyntaxKind::FunctionDeclaration =>
         {
             function.body.map(reference).ok_or_else(invalid)?
+        }
+        NodeData::FunctionExpression(_) if callable.kind == SyntaxKind::FunctionExpression => {
+            validate_source_function_expression_owner(arena, bound, store, container)
+                .map_err(|_| invalid())?
         }
         NodeData::ArrowFunction(_) if callable.kind == SyntaxKind::ArrowFunction => {
             validate_source_arrow_owner(arena, bound, store, container)?

@@ -2085,18 +2085,35 @@ fn plan_source_scoped_iteration_statement_syntax(
                 });
             }
             NodeData::VariableStatement(_) if record.kind == SyntaxKind::VariableStatement => {
-                let Some(callable) = callable.filter(|callable| callable.declaration == container)
-                else {
+                let declarations = if let Some(callable) =
+                    callable.filter(|callable| callable.declaration == container)
+                {
+                    SyntaxPlanner {
+                        arena,
+                        bound,
+                        store,
+                        callable,
+                        statement_scope: None,
+                    }
+                    .plan_local_statement(
+                        body_statement,
+                        control.body,
+                        container,
+                    )?
+                } else if callable.is_none()
+                    && container == bound.source_file()
+                    && expected_kind == SourceControlLoopKind::ForOf
+                {
+                    plan_captured_iteration_local_statement(
+                        arena,
+                        bound,
+                        store,
+                        control.body,
+                        body_statement,
+                    )?
+                } else {
                     return Err(unsupported_control_statement(body_statement, record.kind));
                 };
-                let declarations = SyntaxPlanner {
-                    arena,
-                    bound,
-                    store,
-                    callable,
-                    statement_scope: None,
-                }
-                .plan_local_statement(body_statement, control.body, container)?;
                 statements.extend(
                     declarations
                         .iter()

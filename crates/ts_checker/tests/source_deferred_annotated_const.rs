@@ -164,7 +164,7 @@ fn assert_exported_variable(
             .resolved_type,
         Some(type_)
     );
-    exported
+    local
 }
 
 fn assert_signature(
