@@ -104,7 +104,8 @@ use super::{
     signatures::{ElementFlags, IndexFlags, SignatureFlags, TupleElementInfo},
     source_callables::{
         StoredSourceCallableValidation, constrained_string_rest_tuple_parameter,
-        valid_fixed_generic_source_parameter_type, validate_stored_source_callable,
+        valid_fixed_generic_source_parameter_type, valid_optional_type,
+        validate_stored_source_callable,
     },
     source_overloads::source_overload_signature_type_query,
     store::{
@@ -3985,6 +3986,16 @@ fn validate_generic_call_signature_shape_worker(
         .zip(parameter_templates.iter().copied())
         .enumerate()
     {
+        let default_base = query_evidence.and_then(|evidence| {
+            source_default_parameter_base(
+                store,
+                evidence,
+                callable.signature,
+                index,
+                projected,
+                array_targets,
+            )
+        });
         let mut valid_template = validate_generic_parameter_template(
             store,
             projected,
@@ -4019,6 +4030,7 @@ fn validate_generic_call_signature_shape_worker(
             )?;
         }
         if !valid_template
+            && default_base.is_none()
             && (index >= fixed_parameter_count
                 || !valid_fixed_generic_source_parameter_type(store, projected))
             && (index < minimum_argument_count
@@ -4053,7 +4065,7 @@ fn validate_generic_call_signature_shape_worker(
                     && record.check_flags() == CheckFlags::NONE
             }) && store.value_symbol_links(symbol)
                 == Some(&ValueSymbolLinks {
-                    resolved_type: Some(projected),
+                    resolved_type: Some(default_base.unwrap_or(projected)),
                     ..ValueSymbolLinks::default()
                 })
         };
@@ -4628,6 +4640,33 @@ fn validate_generic_interface_reference(
     }
 
     Ok(Some(reference))
+}
+
+/// Reads a fixed default's body type from the validated source signature.
+fn source_default_parameter_base(
+    store: &CanonicalTypeMapperStore,
+    evidence: &SourceCallableTypeQueryEvidence,
+    signature: SignatureId,
+    index: usize,
+    call_type: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<TypeId> {
+    let signature = store.signature(signature)?;
+    let parameter = evidence.callable().parameters.get(index)?;
+    if signature.declaration() != Some(evidence.callable().declaration)
+        || signature.parameters().get(index) != Some(&parameter.symbol)
+        || !parameter.has_string_default_type()
+    {
+        return None;
+    }
+    let base = evidence.parameter_type(store, parameter)?;
+    let strict = store.intrinsic_bootstrap()?.options.strict_null_checks;
+    (if strict {
+        valid_optional_type(store, array_targets, base, call_type)
+    } else {
+        base == call_type
+    })
+    .then_some(base)
 }
 
 fn optional_generic_parameter_template(
@@ -5956,6 +5995,22 @@ fn collect_generic_call_argument_inferences_with_receiver(
         else {
             break;
         };
+        if store
+            .source_callable_type_query(shape.signature)
+            .and_then(|evidence| {
+                source_default_parameter_base(
+                    store,
+                    evidence,
+                    shape.signature,
+                    index,
+                    parameter,
+                    shape.array_targets,
+                )
+            })
+            .is_some()
+        {
+            continue;
+        }
         let parameter = if index >= shape.minimum_argument_count {
             optional_generic_parameter_template(
                 store,
