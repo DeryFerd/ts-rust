@@ -673,11 +673,33 @@ pub(super) struct SourceTruthinessCondition {
     pub(super) negated: bool,
 }
 
-/// The left operand of an authenticated `??=` uses presence, not truthiness.
+/// The left operand of an authenticated `??` or `??=` uses presence, not truthiness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceNullishCondition {
     pub(super) expression: NodeRef,
     pub(super) symbol: Option<SemanticSymbolId>,
+}
+
+/// A planned expression condition still needs its source and retained-edge proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassExpressionCondition {
+    pub(super) owner: NodeRef,
+    pub(super) expression: NodeRef,
+    pub(super) kind: SourceClassExpressionConditionKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceClassExpressionConditionKind {
+    Nullish(SemanticSymbolId),
+    Truthiness(SemanticSymbolId, bool),
+    Call,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SourceClassExpressionConditionProof {
+    source: SourceClassExpressionCondition,
+    /// Only edges reachable from this body's read points and effective exit.
+    edges: u8,
 }
 
 /// A checked nullish write keeps its real target and declaration separate.
@@ -787,9 +809,10 @@ pub(super) struct SourceInCondition {
     pub(super) symbol: SemanticSymbolId,
 }
 
-/// One cold-proven condition executable by the invocation-local flow frame.
+/// A source condition. Expression candidates need preflight before execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceFlowCondition {
+    ClassExpression(SourceClassExpressionCondition),
     Unchanged(NodeRef),
     Nullish(SourceNullishCondition),
     Truthiness(SourceTruthinessCondition),
@@ -805,6 +828,7 @@ pub(super) enum SourceFlowCondition {
 impl SourceFlowCondition {
     pub(super) const fn expression(self) -> NodeRef {
         match self {
+            Self::ClassExpression(condition) => condition.expression,
             Self::Unchanged(expression) => expression,
             Self::Nullish(condition) => condition.expression,
             Self::Truthiness(condition) => condition.expression,
@@ -819,6 +843,7 @@ impl SourceFlowCondition {
 
     const fn symbol(self) -> Option<SemanticSymbolId> {
         Some(match self {
+            Self::ClassExpression(_) => unreachable!("class expression conditions need preflight"),
             Self::Unchanged(_)
             | Self::ClassPropertyTruthiness(_)
             | Self::ClassPropertyEquality(_)
@@ -1932,6 +1957,7 @@ pub(super) struct SourceFlowPlan {
     points: HashMap<NodeRef, FlowRef>,
     point_order: Vec<NodeRef>,
     conditions: HashMap<NodeRef, SourceFlowCondition>,
+    class_expression_conditions: HashMap<NodeRef, SourceClassExpressionConditionProof>,
     assignments: HashMap<NodeRef, SourceFlowAssignment>,
     assignment_order: Vec<NodeRef>,
     assignment_declarations: HashMap<NodeRef, NodeRef>,
@@ -2336,6 +2362,7 @@ impl SourceFlowActivePath {
 
 #[derive(Default)]
 struct SourceFlowEffects {
+    class_expression_conditions: HashMap<NodeRef, SourceClassExpressionConditionProof>,
     assignment_declarations: HashMap<NodeRef, NodeRef>,
     captured_origins: HashMap<NodeRef, SourceCapturedFlowOrigin>,
     statement_list: Option<SourceCallableStatementListSyntax>,
@@ -3193,6 +3220,9 @@ impl SourceFlowPlan {
             })
             .unwrap_or(body.declaration);
         let conditions = conditions.into_iter().collect::<Vec<_>>();
+        let (conditions, expression_conditions) = prepare_class_expression_conditions(
+            arena, bound, store, host, body, container, &points, conditions,
+        )?;
         for condition in &conditions {
             if let Some(access) = condition.class_property_access() {
                 validate_class_property_flow_condition(store, host, bound, body, *condition)?;
@@ -3202,6 +3232,7 @@ impl SourceFlowPlan {
             }
         }
         let mut effects = SourceFlowEffects {
+            class_expression_conditions: expression_conditions,
             class_body: Some(body.clone()),
             start_container: matches!(body.kind, ClassBodyKind::StaticBlock)
                 .then(|| class_control_flow_container(host, body.declaration))
@@ -3818,11 +3849,21 @@ impl SourceFlowPlan {
         for condition in conditions {
             let expression = condition.expression();
             validate_bound_node(bound, graph, expression)?;
+            if matches!(condition, SourceFlowCondition::ClassExpression(_)) {
+                return Err(SourceFlowInvariant::UnknownCondition(expression).into());
+            }
             if condition.class_property_access().is_some() && effects.class_body.is_none()
             {
                 return Err(SourceFlowInvariant::InvalidClassProperty(expression).into());
             }
             if let SourceFlowCondition::Nullish(condition) = condition
+                && !effects
+                    .class_expression_conditions
+                    .get(&expression)
+                    .is_some_and(|proof| {
+                        matches!(proof.source.kind, SourceClassExpressionConditionKind::Nullish(symbol)
+                            if condition.symbol == Some(symbol))
+                    })
                 && effects
                     .nullish_assignments
                     .get(&expression)
@@ -3952,6 +3993,7 @@ impl SourceFlowPlan {
             points: planned_points,
             point_order,
             conditions: planned_conditions,
+            class_expression_conditions: effects.class_expression_conditions,
             assignments: planned_assignments,
             assignment_order,
             assignment_declarations: effects.assignment_declarations,
@@ -4299,6 +4341,7 @@ impl SourceFlowPlan {
                 })
                 .collect(),
             completed_callable_updates: HashSet::new(),
+            completed_expression_calls: HashSet::new(),
             call_effects: HashMap::new(),
             condition_values: HashMap::new(),
             in_conditions: HashMap::new(),
@@ -4392,12 +4435,18 @@ impl SourceFlowPlan {
         }
         for (condition, planned) in &self.conditions {
             let Some(edges) = coverage.condition_edges.get(condition).copied() else {
-                if matches!(planned, SourceFlowCondition::Unchanged(_)) {
+                if matches!(planned, SourceFlowCondition::Unchanged(_))
+                    && !self.class_expression_conditions.contains_key(condition)
+                {
                     continue;
                 }
                 return Err(SourceFlowInvariant::UnreachedCondition(*condition).into());
             };
-            if edges != BOTH_CONDITION_EDGES {
+            let expected = self
+                .class_expression_conditions
+                .get(condition)
+                .map_or(BOTH_CONDITION_EDGES, |proof| proof.edges);
+            if edges != expected {
                 return Err(SourceFlowInvariant::MissingConditionEdge {
                     condition: *condition,
                     true_edge: edges & TRUE_CONDITION_EDGE != 0,
@@ -4550,6 +4599,7 @@ pub(super) struct SourceFlowFrame<'plan, 'graph> {
     declared_types: SourceFlowTypes,
     assignment_states: HashMap<NodeRef, SourceFlowAssignmentState>,
     completed_callable_updates: HashSet<NodeRef>,
+    completed_expression_calls: HashSet<NodeRef>,
     call_effects: HashMap<NodeRef, SourceFlowCallEffect>,
     condition_values: HashMap<NodeRef, TypeId>,
     in_conditions: HashMap<NodeRef, CompletedInCondition>,
@@ -4688,6 +4738,18 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
             .conditions
             .values()
             .any(|condition| condition.class_property_access().is_some())
+    }
+
+    pub(super) fn is_expression_condition_call(&self, call: NodeRef) -> bool {
+        self.flow
+            .plan
+            .class_expression_conditions
+            .get(&call)
+            .is_some_and(|proof| {
+                proof.source.kind == SourceClassExpressionConditionKind::Call
+                    && self.flow.plan.conditions.get(&call)
+                        == Some(&SourceFlowCondition::Unchanged(call))
+            })
     }
 
     pub(super) fn has_property_equality_condition(&self, expression: NodeRef) -> bool {
@@ -5116,7 +5178,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         callee: TypeId,
         checked: &CheckedSourceCall,
     ) -> Result<(), SourceFlowError> {
-        if !self.has_property_conditions() {
+        if !self.has_property_conditions() && !self.is_expression_condition_call(plan.node) {
             return Ok(());
         }
         let invalid = || SourceFlowInvariant::InvalidCallEffect(plan.node);
@@ -5141,6 +5203,10 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         }
         self.validate_non_effecting_call(store, host, &completed)?;
         self.ordinary_calls.insert(plan.node, completed);
+        if self.is_expression_condition_call(plan.node) {
+            self.flow.completed_expression_calls.insert(plan.node);
+            self.flow.memo.clear();
+        }
         Ok(())
     }
 
@@ -5155,8 +5221,23 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         let unsupported = || SourceFlowError::Unsupported(SourceFlowUnsupported::Call(call));
         let (arena, bound) = host.source(call).ok_or_else(invalid)?;
         class_body_identities(store, host, &self.access).map_err(|_| invalid())?;
-        let statement =
-            validate_class_body_call(arena, bound, self.body, self.flow.plan.container, call)?;
+        let expression_condition = self.is_expression_condition_call(call);
+        let statement = if expression_condition {
+            let proof = self
+                .flow
+                .plan
+                .class_expression_conditions
+                .get(&call)
+                .ok_or_else(invalid)?;
+            if validate_class_expression_condition(arena, bound, store, host, self.body, proof.source)?
+                != SourceFlowCondition::Unchanged(call)
+            {
+                return Err(invalid().into());
+            }
+            proof.source.owner
+        } else {
+            validate_class_body_call(arena, bound, self.body, self.flow.plan.container, call)?
+        };
         let syntax = plan_direct_source_call_syntax(arena, store, call).map_err(|_| invalid())?;
         let source = class_flow_source_node(store, host, call).map_err(|_| invalid())?;
         let NodeData::CallExpression(data) = &source.data else {
@@ -5167,7 +5248,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         }
         let signature_links = store.signature_links(call).ok_or_else(invalid)?;
         if completed.access != self.access
-            || self.flow.plan.calls.get(&call) != Some(&statement)
+            || !expression_condition && self.flow.plan.calls.get(&call) != Some(&statement)
             || syntax.callee() != completed.plan.callee.node
             || !syntax.arguments().iter().copied().eq(completed
                 .plan
@@ -5877,12 +5958,29 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                         | SourceFlowCondition::ClassPropertyTruthiness(_)
                         | SourceFlowCondition::ClassPropertyEquality(_)
                         | SourceFlowCondition::ClassPropertyPredicate(_)
-                ) {
+                ) && !self
+                    .flow
+                    .plan
+                    .class_expression_conditions
+                    .get(&expression)
+                    .is_some_and(|proof| {
+                        matches!(proof.source.kind, SourceClassExpressionConditionKind::Nullish(_))
+                            || proof.source.kind == SourceClassExpressionConditionKind::Call
+                                && self.flow.completed_expression_calls.contains(&expression)
+                    })
+                {
                     return Err(SourceFlowUnsupported::FlowKind {
                         flow,
                         flags: node.flags,
                     }
                     .into());
+                }
+                if self.is_expression_condition_call(expression) {
+                    let completed = self
+                        .ordinary_calls
+                        .get(&expression)
+                        .ok_or(SourceFlowInvariant::UnreachedCondition(expression))?;
+                    self.validate_non_effecting_call(types.store(), host, completed)?;
                 }
                 let mut state = self.property_state_at(
                     types,
@@ -6930,6 +7028,17 @@ impl SourceFlowFrame<'_, '_> {
                     .conditions
                     .get(&condition_node)
                     .ok_or(SourceFlowInvariant::UnknownCondition(condition_node))?;
+                if self
+                    .plan
+                    .class_expression_conditions
+                    .get(&condition_node)
+                    .is_some_and(|proof| {
+                        proof.source.kind == SourceClassExpressionConditionKind::Call
+                    })
+                    && !self.completed_expression_calls.contains(&condition_node)
+                {
+                    return Err(SourceFlowInvariant::UnreachedCondition(condition_node).into());
+                }
                 let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
                 let Some(symbol) = condition.symbol() else {
                     return Ok(prior);
@@ -6955,7 +7064,8 @@ impl SourceFlowFrame<'_, '_> {
                     | SourceFlowKind::LoopLabel => unreachable!(),
                 };
                 let narrowed = match condition {
-                    SourceFlowCondition::Unchanged(_)
+                    SourceFlowCondition::ClassExpression(_)
+                    | SourceFlowCondition::Unchanged(_)
                     | SourceFlowCondition::ClassPropertyTruthiness(_)
                     | SourceFlowCondition::ClassPropertyEquality(_)
                     | SourceFlowCondition::ClassPropertyPredicate(_) => unreachable!(),
@@ -11943,6 +12053,226 @@ fn logical_statement_rows(
     })
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn prepare_class_expression_conditions(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    body: &ClassBodyPlan,
+    container: NodeRef,
+    points: &[NodeRef],
+    conditions: Vec<SourceFlowCondition>,
+) -> Result<
+    (
+        Vec<SourceFlowCondition>,
+        HashMap<NodeRef, SourceClassExpressionConditionProof>,
+    ),
+    SourceFlowError,
+> {
+    let mut proofs = HashMap::new();
+    if !conditions
+        .iter()
+        .any(|condition| matches!(condition, SourceFlowCondition::ClassExpression(_)))
+    {
+        return Ok((conditions, proofs));
+    }
+    let end = if matches!(
+        body.kind,
+        ClassBodyKind::Constructor | ClassBodyKind::StaticBlock
+    ) {
+        Some(
+            bound
+                .flow_graph()
+                .container_return(body.declaration)
+                .ok_or(SourceFlowInvariant::InvalidClassBody(body.declaration))?,
+        )
+    } else {
+        bound.flow_graph().container_end(container)
+    };
+    let retained = retained_condition_edges(bound, container, points, end)?;
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    for condition in conditions {
+        if !seen.insert(condition.expression()) {
+            return Err(SourceFlowInvariant::DuplicateCondition(condition.expression()).into());
+        }
+        let SourceFlowCondition::ClassExpression(source) = condition else {
+            result.push(condition);
+            continue;
+        };
+        let Some(&edges) = retained.get(&source.expression) else {
+            continue;
+        };
+        let checked = validate_class_expression_condition(arena, bound, store, host, body, source)?;
+        proofs.insert(
+            source.expression,
+            SourceClassExpressionConditionProof { source, edges },
+        );
+        result.push(checked);
+    }
+    Ok((result, proofs))
+}
+
+#[allow(clippy::too_many_lines)] // Keep source ownership and binding checks together.
+fn validate_class_expression_condition(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    body: &ClassBodyPlan,
+    source: SourceClassExpressionCondition,
+) -> Result<SourceFlowCondition, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::UnknownCondition(source.expression);
+    let owner = class_flow_source_node(store, host, source.owner).map_err(|_| invalid())?;
+    let expression =
+        class_flow_source_node(store, host, source.expression).map_err(|_| invalid())?;
+    if !source.owner.is_for(arena.id(), bound.file_id())
+        || expression.parent != Some(source.owner.node)
+        || owner.flags.0 != 0
+        || !source_node_is_descendant_of(arena, source.owner, body.body.node)
+        || bound.flow_container(source.expression) != Some(body.declaration)
+    {
+        return Err(invalid().into());
+    }
+    let nullish = match &owner.data {
+        NodeData::BinaryExpression(binary) if owner.kind == SyntaxKind::BinaryExpression => {
+            let token = arena.get(binary.operator_token).ok_or_else(invalid)?;
+            if token.parent != Some(source.owner.node)
+                || token.flags.0 != 0
+                || !matches!(token.data, NodeData::Token(_))
+                || !matches!(
+                    token.kind,
+                    SyntaxKind::AmpersandAmpersandToken
+                        | SyntaxKind::BarBarToken
+                        | SyntaxKind::QuestionQuestionToken
+                )
+                || source.expression.node != binary.left && source.expression.node != binary.right
+            {
+                return Err(invalid().into());
+            }
+            token.kind == SyntaxKind::QuestionQuestionToken && source.expression.node == binary.left
+        }
+        NodeData::ConditionalExpression(conditional)
+            if owner.kind == SyntaxKind::ConditionalExpression
+                && conditional.condition == source.expression.node
+                && super::source_calls::conditional_call_argument_syntax(arena, source.owner)
+                    .is_some() =>
+        {
+            false
+        }
+        _ => return Err(invalid().into()),
+    };
+    if nullish != matches!(source.kind, SourceClassExpressionConditionKind::Nullish(_)) {
+        return Err(invalid().into());
+    }
+    let mut reference = source.expression;
+    let mut negated = false;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(reference) || visited.len() > FLOW_DEPTH_LIMIT {
+            return Err(invalid().into());
+        }
+        let record = class_flow_source_node(store, host, reference).map_err(|_| invalid())?;
+        let child = match &record.data {
+            NodeData::ParenthesizedExpression(wrapper)
+                if record.kind == SyntaxKind::ParenthesizedExpression =>
+            {
+                wrapper.expression
+            }
+            NodeData::PrefixUnaryExpression(prefix)
+                if !nullish
+                    && record.kind == SyntaxKind::PrefixUnaryExpression
+                    && prefix.operator == SyntaxKind::ExclamationToken =>
+            {
+                negated = !negated;
+                prefix.operand
+            }
+            _ => break,
+        };
+        let child = NodeRef::new(reference.arena, reference.file, child);
+        let child_record = class_flow_source_node(store, host, child).map_err(|_| invalid())?;
+        if record.flags.0 != 0
+            || child_record.parent != Some(reference.node)
+            || child_record.range.start < record.range.start
+            || child_record.range.end > record.range.end
+        {
+            return Err(invalid().into());
+        }
+        reference = child;
+    }
+    match source.kind {
+        SourceClassExpressionConditionKind::Nullish(symbol)
+        | SourceClassExpressionConditionKind::Truthiness(symbol, _) => {
+            let parameter = body
+                .parameters
+                .iter()
+                .find(|parameter| parameter.symbol == symbol)
+                .ok_or_else(invalid)?;
+            let record = class_flow_source_node(store, host, parameter.declaration)
+                .map_err(|_| invalid())?;
+            let NodeData::ParameterDeclaration(parameter_data) = &record.data else {
+                return Err(invalid().into());
+            };
+            if record.kind != SyntaxKind::Parameter
+                || record.parent != Some(body.declaration.node)
+                || parameter_data.name != parameter.name_node.node
+                || parameter_data
+                    .type_
+                    .map(|node| NodeRef::new(reference.arena, reference.file, node))
+                    != parameter.annotation
+                || bound.container(parameter.declaration) != Some(body.declaration)
+                || bound
+                    .symbol(parameter.declaration)
+                    .and_then(|raw| store.get_merged_symbol(raw))
+                    != Some(symbol)
+                || own_class_flow_reference_symbol(store, host, bound, reference)? != Some(symbol)
+                || !matches!(
+                    arena
+                        .get(reference.node)
+                        .map(|node| (&node.kind, &node.data)),
+                    Some((SyntaxKind::Identifier, NodeData::Identifier(_)))
+                )
+                || matches!(source.kind, SourceClassExpressionConditionKind::Truthiness(_, expected) if expected != negated)
+            {
+                return Err(invalid().into());
+            }
+            Ok(if nullish {
+                SourceFlowCondition::Nullish(SourceNullishCondition {
+                    expression: source.expression,
+                    symbol: Some(symbol),
+                })
+            } else {
+                SourceFlowCondition::Truthiness(SourceTruthinessCondition {
+                    expression: source.expression,
+                    symbol,
+                    negated,
+                })
+            })
+        }
+        SourceClassExpressionConditionKind::Call => {
+            let NodeData::CallExpression(call) = &expression.data else {
+                return Err(invalid().into());
+            };
+            let syntax = plan_direct_source_call_syntax(arena, store, source.expression)
+                .map_err(|_| invalid())?;
+            if expression.kind != SyntaxKind::CallExpression
+                || expression.flags.0 != 0
+                || reference != source.expression
+                || negated
+                || call.question_dot_token.is_some()
+                || call.type_arguments.is_some()
+                || call.symbol.is_some()
+                || call.facts != 0
+                || !syntax.arguments().is_empty()
+            {
+                return Err(invalid().into());
+            }
+            Ok(SourceFlowCondition::Unchanged(source.expression))
+        }
+    }
+}
+
 /// The binder drops logical joins without flow effects. Candidate syntax does not
 /// make those discarded edges part of a callable's retained flow plan.
 fn retained_linear_truthiness_conditions(
@@ -12004,6 +12334,22 @@ fn retained_linear_truthiness_conditions(
         validate_node_container(bound, graph, container, reference)?;
     }
 
+    let retained = retained_condition_edges(bound, container, points, graph.container_end(container))?;
+    Ok(conditions
+        .into_iter()
+        .filter(|condition| retained.contains_key(&condition.expression))
+        .map(SourceFlowCondition::Truthiness)
+        .collect())
+}
+
+fn retained_condition_edges(
+    bound: &BoundFile,
+    container: NodeRef,
+    points: &[NodeRef],
+    end: Option<FlowRef>,
+) -> Result<HashMap<NodeRef, u8>, SourceFlowError> {
+    let graph = bound.flow_graph();
+    validate_container(graph, container)?;
     let mut point_flows = HashMap::new();
     let mut point_order = Vec::new();
     for &point in points {
@@ -12020,10 +12366,10 @@ fn retained_linear_truthiness_conditions(
     let mut pending = point_order
         .iter()
         .map(|point| point_flows[point])
-        .chain(graph.container_end(container))
+        .chain(end)
         .collect::<Vec<_>>();
     let mut visited = HashSet::new();
-    let mut retained = HashSet::new();
+    let mut retained = HashMap::new();
     while let Some(flow) = pending.pop() {
         if !visited.insert(flow) {
             continue;
@@ -12032,8 +12378,13 @@ fn retained_linear_truthiness_conditions(
         match source_flow_kind(flow, node.flags)? {
             SourceFlowKind::Unreachable => validate_unreachable_node(graph, flow, &node)?,
             SourceFlowKind::Start => {}
-            SourceFlowKind::TrueCondition | SourceFlowKind::FalseCondition => {
-                retained.insert(ast_payload(flow, &node)?);
+            kind @ (SourceFlowKind::TrueCondition | SourceFlowKind::FalseCondition) => {
+                *retained.entry(ast_payload(flow, &node)?).or_default() |=
+                    if kind == SourceFlowKind::TrueCondition {
+                        TRUE_CONDITION_EDGE
+                    } else {
+                        FALSE_CONDITION_EDGE
+                    };
                 pending.push(linear_antecedent(flow, &node)?);
             }
             SourceFlowKind::Assignment | SourceFlowKind::ArrayMutation | SourceFlowKind::Call => {
@@ -12044,11 +12395,7 @@ fn retained_linear_truthiness_conditions(
             }
         }
     }
-    Ok(conditions
-        .into_iter()
-        .filter(|condition| retained.contains(&condition.expression))
-        .map(SourceFlowCondition::Truthiness)
-        .collect())
+    Ok(retained)
 }
 
 fn validate_node_container(

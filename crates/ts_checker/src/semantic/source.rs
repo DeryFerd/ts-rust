@@ -33826,6 +33826,7 @@ pub(super) fn source_new_error(expression: NodeRef, error: SourceNewError) -> So
     SourcePlanner::new_plan_error(expression, error)
 }
 
+#[allow(clippy::too_many_lines)] // Keep class ownership and flow visits in the same order.
 fn class_expression_nodes(
     expression: &PlannedExpression,
 ) -> Result<Vec<&PlannedExpression>, SourceCheckError> {
@@ -33865,6 +33866,17 @@ fn class_expression_nodes(
                 pending.extend(binary.prefix.iter().rev().map(|step| &step.right));
                 pending.push(&binary.right);
                 pending.push(&binary.left);
+            }
+            PlannedExpressionKind::Logical(binary) if binary.nullish_assignment.is_none() => {
+                pending.push(&binary.right);
+                pending.push(&binary.left);
+            }
+            PlannedExpressionKind::Conditional(conditional)
+                if matches!(conditional.role, ConditionalExpressionRole::CallArgument(_)) =>
+            {
+                pending.push(&conditional.when_false);
+                pending.push(&conditional.when_true);
+                pending.push(&conditional.condition);
             }
             PlannedExpressionKind::Call(call) => {
                 pending.extend(call.arguments.iter().rev());
@@ -34190,6 +34202,31 @@ fn collect_class_expression_flow(
     conditions: &mut Vec<SourceFlowCondition>,
 ) -> Result<(), SourceCheckError> {
     for expression in class_expression_nodes(expression)? {
+        match &expression.kind {
+            PlannedExpressionKind::Logical(binary) if binary.nullish_assignment.is_none() => {
+                collect_class_operand_condition(
+                    expression.node,
+                    &binary.left,
+                    binary.operator == SyntaxKind::QuestionQuestionToken,
+                    conditions,
+                );
+                collect_class_operand_condition(
+                    expression.node,
+                    &binary.right,
+                    false,
+                    conditions,
+                );
+            }
+            PlannedExpressionKind::Conditional(conditional) => {
+                collect_class_operand_condition(
+                    expression.node,
+                    &conditional.condition,
+                    false,
+                    conditions,
+                );
+            }
+            _ => {}
+        }
         if matches!(
             expression.kind,
             PlannedExpressionKind::Identifier(_)
@@ -34215,6 +34252,60 @@ fn collect_class_expression_flow(
         }
     }
     Ok(())
+}
+
+fn collect_class_operand_condition(
+    owner: NodeRef,
+    operand: &PlannedExpression,
+    nullish: bool,
+    conditions: &mut Vec<SourceFlowCondition>,
+) {
+    use super::source_flow::{SourceClassExpressionCondition, SourceClassExpressionConditionKind};
+    let mut reference = operand;
+    let mut negated = false;
+    loop {
+        reference = reference.unparenthesized();
+        if reference.non_null_assertion
+            || reference.awaited
+            || reference.promise_call.is_some()
+            || reference.jsdoc_type.is_some()
+        {
+            return;
+        }
+        if let PlannedExpressionKind::LogicalNot(inner) = &reference.kind {
+            reference = inner;
+            negated = !negated;
+        } else {
+            break;
+        }
+    }
+    let kind = match &reference.kind {
+        PlannedExpressionKind::Identifier(read)
+            if read.kind == PlannedIdentifierReadKind::Variable =>
+        {
+            if nullish {
+                if negated {
+                    return;
+                }
+                SourceClassExpressionConditionKind::Nullish(read.value_symbol)
+            } else {
+                SourceClassExpressionConditionKind::Truthiness(read.value_symbol, negated)
+            }
+        }
+        PlannedExpressionKind::Call(call)
+            if !nullish && !negated && operand.node == call.node && call.arguments.is_empty() =>
+        {
+            SourceClassExpressionConditionKind::Call
+        }
+        _ => return,
+    };
+    conditions.push(SourceFlowCondition::ClassExpression(
+        SourceClassExpressionCondition {
+            owner,
+            expression: operand.node,
+            kind,
+        },
+    ));
 }
 
 fn class_body_flow_error(node: NodeRef, error: SourceFlowError) -> SourceCheckError {
@@ -42273,7 +42364,8 @@ fn check_expression_type_with_capture_context(
                 })?
             };
             if let Some(context) = class_flow.as_deref_mut()
-                && context.flow.has_property_conditions()
+                && (context.flow.has_property_conditions()
+                    || context.flow.is_expression_condition_call(call.node))
                 && !context.flow.is_predicate_condition_call(call.node)
             {
                 let call_owner = host
