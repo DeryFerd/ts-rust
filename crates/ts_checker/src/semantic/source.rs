@@ -1813,28 +1813,46 @@ impl PlannedExpression {
                 );
             }
             PlannedExpressionKind::SuperCall(call) => pending.extend(call.arguments()),
-            _ => self.eager_children(pending),
+            _ => self.eager_children(pending, false),
         }
     }
 
-    fn eager_children<'expression>(&'expression self, pending: &mut Vec<&'expression Self>) {
+    fn eager_children<'expression>(
+        &'expression self,
+        pending: &mut Vec<&'expression Self>,
+        source_order: bool,
+    ) {
+        fn extend<'expression>(
+            pending: &mut Vec<&'expression PlannedExpression>,
+            children: impl IntoIterator<Item = &'expression PlannedExpression>,
+            source_order: bool,
+        ) {
+            let start = pending.len();
+            pending.extend(children);
+            if source_order {
+                pending[start..].reverse();
+            }
+        }
+
         match &self.kind {
             PlannedExpressionKind::Parenthesized(inner)
             | PlannedExpressionKind::LogicalNot(inner)
             | PlannedExpressionKind::TypeOf(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => pending.push(inner),
-            PlannedExpressionKind::Array(elements) => pending.extend(elements),
+            PlannedExpressionKind::Array(elements) => extend(pending, elements, source_order),
             PlannedExpressionKind::Object { properties, .. } => {
-                pending.extend(
+                extend(
+                    pending,
                     properties
                         .iter()
                         .filter_map(PlannedObjectMember::eager_expression),
+                    source_order,
                 );
-                pending.extend(&self.object_spreads);
-                pending.extend(&self.object_computed_keys);
+                extend(pending, &self.object_spreads, source_order);
+                extend(pending, &self.object_computed_keys, source_order);
             }
             PlannedExpressionKind::Call(call) => {
-                pending.extend(&call.arguments);
+                extend(pending, &call.arguments, source_order);
                 pending.push(&call.callee);
             }
             PlannedExpressionKind::Property(property) => pending.push(&property.receiver),
@@ -1843,7 +1861,11 @@ impl PlannedExpression {
                 pending.push(&element.receiver);
             }
             PlannedExpressionKind::Binary(binary) => {
-                pending.extend(binary.prefix.iter().map(|step| &step.right));
+                extend(
+                    pending,
+                    binary.prefix.iter().map(|step| &step.right),
+                    source_order,
+                );
                 pending.push(&binary.right);
                 pending.push(&binary.left);
             }
@@ -1856,7 +1878,9 @@ impl PlannedExpression {
                 pending.push(&conditional.when_true);
                 pending.push(&conditional.condition);
             }
-            PlannedExpressionKind::Template(template) => pending.extend(&template.substitutions),
+            PlannedExpressionKind::Template(template) => {
+                extend(pending, &template.substitutions, source_order);
+            }
             PlannedExpressionKind::ImportCall(call) => pending.extend(call.specifier.as_ref()),
             PlannedExpressionKind::Null
             | PlannedExpressionKind::String(_)
@@ -31075,7 +31099,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 _ => UnsupportedSourceSyntax::Element(value.node),
                             }));
                         }
-                        value.eager_children(&mut pending);
+                        value.eager_children(&mut pending, false);
                     }
                     if let Some(symbol) = nullish_member_root(&left_plan) {
                         self.nullish_member_writes.insert((container, symbol));
@@ -33967,7 +33991,6 @@ pub(super) fn source_new_error(expression: NodeRef, error: SourceNewError) -> So
     SourcePlanner::new_plan_error(expression, error)
 }
 
-#[allow(clippy::too_many_lines)] // Keep class ownership and flow visits in the same order.
 fn class_expression_nodes(
     expression: &PlannedExpression,
 ) -> Result<Vec<&PlannedExpression>, SourceCheckError> {
@@ -33986,42 +34009,30 @@ fn class_expression_nodes(
         }
         nodes.push(expression);
         match &expression.kind {
-            PlannedExpressionKind::Parenthesized(inner)
-            | PlannedExpressionKind::LogicalNot(inner)
-            | PlannedExpressionKind::TypeOf(inner)
-            | PlannedExpressionKind::Assertion { operand: inner, .. } => pending.push(inner),
-            PlannedExpressionKind::Property(property) => pending.push(&property.receiver),
-            PlannedExpressionKind::Element(element) => {
+            PlannedExpressionKind::Element(element)
                 if matches!(
                     element.receiver.unparenthesized().kind,
                     PlannedExpressionKind::ClassReceiver(_)
-                ) {
-                    return Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Class(expression.node),
-                    ));
-                }
-                pending.push(&element.index);
-                pending.push(&element.receiver);
-            }
-            PlannedExpressionKind::Binary(binary) if binary.shorthand_assignment.is_none() => {
-                pending.extend(binary.prefix.iter().rev().map(|step| &step.right));
-                pending.push(&binary.right);
-                pending.push(&binary.left);
-            }
-            PlannedExpressionKind::Logical(binary) if binary.nullish_assignment.is_none() => {
-                pending.push(&binary.right);
-                pending.push(&binary.left);
-            }
-            PlannedExpressionKind::Conditional(conditional)
-                if matches!(conditional.role, ConditionalExpressionRole::CallArgument(_)) =>
+                ) =>
             {
-                pending.push(&conditional.when_false);
-                pending.push(&conditional.when_true);
-                pending.push(&conditional.condition);
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Class(expression.node),
+                ));
             }
-            PlannedExpressionKind::Call(call) => {
-                pending.extend(call.arguments.iter().rev());
-                pending.push(&call.callee);
+            PlannedExpressionKind::Binary(binary) if binary.shorthand_assignment.is_some() => {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Class(expression.node),
+                ));
+            }
+            PlannedExpressionKind::Logical(binary) if binary.nullish_assignment.is_some() => {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Class(expression.node),
+                ));
+            }
+            PlannedExpressionKind::ImportCall(_) | PlannedExpressionKind::TypeImportValueUse(_) => {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Class(expression.node),
+                ));
             }
             PlannedExpressionKind::SuperCall(call) => pending.extend(call.arguments().iter().rev()),
             PlannedExpressionKind::New(construction) if construction.is_library_constructor() => {
@@ -34050,37 +34061,8 @@ fn class_expression_nodes(
                     pending.push(executor);
                 }
             }
-            PlannedExpressionKind::Array(elements) => pending.extend(elements.iter().rev()),
-            PlannedExpressionKind::Object { properties, .. } => {
-                pending.extend(
-                    properties
-                        .iter()
-                        .rev()
-                        .filter_map(PlannedObjectMember::eager_expression),
-                );
-                pending.extend(expression.object_spreads.iter().rev());
-                pending.extend(expression.object_computed_keys.iter().rev());
-            }
-            PlannedExpressionKind::Template(template) => {
-                pending.extend(template.substitutions.iter().rev());
-            }
-            // An arrow has its own flow. Its lexical this still uses the class token.
-            PlannedExpressionKind::Arrow(_)
-            | PlannedExpressionKind::Null
-            | PlannedExpressionKind::String(_)
-            | PlannedExpressionKind::RegularExpression(_)
-            | PlannedExpressionKind::ImportMeta(_)
-            | PlannedExpressionKind::Number { .. }
-            | PlannedExpressionKind::BigInt { .. }
-            | PlannedExpressionKind::Boolean(_)
-            | PlannedExpressionKind::GlobalUndefined
-            | PlannedExpressionKind::Identifier(_)
-            | PlannedExpressionKind::ClassReceiver(_) => {}
-            _ => {
-                return Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Class(expression.node),
-                ));
-            }
+            // Deferred arrow bodies keep their own flow and lexical class token.
+            _ => expression.eager_children(&mut pending, true),
         }
     }
     Ok(nodes)
@@ -34599,7 +34581,7 @@ fn nullish_expression_assignments(
         } else {
             pending.push((expression, true));
             let mut children = Vec::new();
-            expression.eager_children(&mut children);
+            expression.eager_children(&mut children, false);
             pending.extend(children.into_iter().map(|child| (child, false)));
         }
     }
@@ -34640,7 +34622,7 @@ fn nullish_expression_calls<'a>(
         {
             calls.push(call.as_ref());
         }
-        expression.eager_children(&mut pending);
+        expression.eager_children(&mut pending, false);
     }
     calls
 }
@@ -48083,7 +48065,7 @@ fn complete_nullish_assignment_effects(
                 .complete_call_effect(store, host, call.node, SourceFlowCallEffect::Unchanged)
                 .map_err(|error| class_body_flow_error(expression.node, error))?;
         }
-        value.eager_children(&mut pending);
+        value.eager_children(&mut pending, false);
     }
     for (assignment, right) in assignments {
         let Some(symbol) = assignment.symbol.filter(|_| !assignment.readonly) else {
@@ -54301,7 +54283,7 @@ fn plan_ordinary_for_flow(
                 reads.push((expression.node, read.value_symbol));
                 points.push(expression.node);
             }
-            expression.eager_children(&mut pending);
+            expression.eager_children(&mut pending, false);
         }
     }
     points.sort_unstable();
@@ -55133,7 +55115,7 @@ fn validate_ordinary_for_expression_shape(
                     },
                 ));
             }
-            _ => expression.eager_children(&mut pending),
+            _ => expression.eager_children(&mut pending, false),
         }
     }
     Ok(())
@@ -66090,7 +66072,7 @@ fn check_callable_statement_expression_effects(
                 return Err(SourcePlanner::unsupported_function_body(callable));
             }
         }
-        expression.eager_children(&mut pending);
+        expression.eager_children(&mut pending, false);
     }
     Ok(())
 }

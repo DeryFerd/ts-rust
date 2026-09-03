@@ -3577,7 +3577,8 @@ pub(super) fn finish_source_super_call_plan(
         &syntax.argument_arrow_nodes,
         &syntax.array_argument_arrow_nodes,
         &arguments,
-    ) {
+    ) || !arguments.iter().all(is_supported_call_argument_plan)
+    {
         return Err(SourceCheckError::Unsupported(
             UnsupportedSourceSyntax::Call(syntax.node),
         ));
@@ -3857,9 +3858,7 @@ pub(super) fn plan_direct_source_call_syntax(
         let Some(argument_record) = arena.get(*argument_id) else {
             return Err(SourceCheckError::Call(node));
         };
-        if argument_record.parent != Some(node.node)
-            || !is_supported_call_argument_syntax(arena, argument)
-        {
+        if argument_record.parent != Some(node.node) {
             return Err(unsupported_direct_call_syntax(
                 arena,
                 node,
@@ -4370,7 +4369,6 @@ fn call_argument_plans_match(
                 argument.node == *syntax_node
                     && exact_arrow
                     && &planned_array_arrows == array_arrows
-                    && is_supported_call_argument_plan(argument)
             })
 }
 
@@ -4425,6 +4423,8 @@ pub(super) fn finish_direct_source_call_plan(
     };
     if callee.node != syntax.callee
         || !exact_callee
+        || syntax.form != DirectCallForm::Call
+            && !arguments.iter().all(is_supported_call_argument_plan)
         || !call_argument_plans_match(
             &syntax.arguments,
             &syntax.argument_arrow_nodes,
@@ -4457,11 +4457,7 @@ fn unparenthesized_arrow_argument_node(arena: &NodeArena, mut node: NodeRef) -> 
                 node = NodeRef::new(node.arena, node.file, parenthesized.expression);
             }
             (NodeData::ArrowFunction(_), SyntaxKind::ArrowFunction) => return Some(node),
-            (NodeData::FunctionExpression(_), SyntaxKind::FunctionExpression)
-                if is_supported_function_expression_argument_syntax(arena, node) =>
-            {
-                return Some(node);
-            }
+            (NodeData::FunctionExpression(_), SyntaxKind::FunctionExpression) => return Some(node),
             _ => return None,
         }
     }
@@ -4500,17 +4496,8 @@ fn collect_array_argument_arrow_syntax(
             }
             true
         }
-        (NodeData::ArrowFunction(_), SyntaxKind::ArrowFunction) => {
-            if !is_supported_arrow_argument_syntax(arena, node) {
-                return false;
-            }
-            arrows.push(node);
-            true
-        }
-        (NodeData::FunctionExpression(_), SyntaxKind::FunctionExpression) => {
-            if !is_supported_function_expression_argument_syntax(arena, node) {
-                return false;
-            }
+        (NodeData::ArrowFunction(_), SyntaxKind::ArrowFunction)
+        | (NodeData::FunctionExpression(_), SyntaxKind::FunctionExpression) => {
             arrows.push(node);
             true
         }
@@ -8259,6 +8246,7 @@ fn source_super_call_target(
     let (arena, _) = host.source(node).ok_or(SourceCheckError::Call(node))?;
     let syntax = plan_source_super_call_syntax(arena, store, host, node)?;
     if syntax != plan.syntax
+        || !plan.arguments.iter().all(is_supported_call_argument_plan)
         || !call_argument_plans_match(
             &syntax.arguments,
             &syntax.argument_arrow_nodes,
