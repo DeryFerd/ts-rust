@@ -42972,7 +42972,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
         );
-        let symbol = if let Some(capability) = self.type_reference_alias_targets.get(&node) {
+        let capability = match self.type_reference_alias_targets.get(&node) {
+            Some(capability) => Some(*capability),
+            None => planner.cached_source_annotation_type_import(node)?,
+        };
+        let symbol = if let Some(capability) = capability {
             let name = NodeRef::new(node.arena, node.file, reference.type_name);
             let name_record = preflight_node(self.store, self.host, name)?;
             let NodeData::Identifier(identifier) = &name_record.data else {
@@ -42990,7 +42994,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 node,
                 name,
                 &identifier.text,
-                *capability,
+                capability,
                 self.store
                     .symbol_node_links(node)
                     .and_then(|links| links.resolved_symbol),
