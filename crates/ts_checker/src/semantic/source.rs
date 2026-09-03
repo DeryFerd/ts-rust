@@ -1933,7 +1933,7 @@ pub(super) struct LogicalBinaryPlan {
     nullish_assignment: Option<SourceFlowNullishAssignment>,
 }
 
-/// Fully preflighted conditional initializer, object spread, or function return.
+/// Fully preflighted conditional with its actual source role.
 #[derive(Clone, Debug)]
 pub(super) struct ConditionalExpressionPlan {
     node: NodeRef,
@@ -1947,7 +1947,30 @@ pub(super) struct ConditionalExpressionPlan {
     // Cached expressions retain the raw type before contextual conversion.
     expected_cache: TypeId,
     dynamic_result: bool,
-    direct_return: bool,
+    role: ConditionalExpressionRole,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConditionalExpressionRole {
+    Ordinary,
+    DirectReturn,
+    CallArgument(super::source_calls::ConditionalCallArgumentSyntax),
+}
+
+impl ConditionalExpressionPlan {
+    pub(super) fn call_argument_parts(
+        &self,
+    ) -> Option<(
+        super::source_calls::ConditionalCallArgumentSyntax,
+        &PlannedExpression,
+        &PlannedExpression,
+        &PlannedExpression,
+    )> {
+        let ConditionalExpressionRole::CallArgument(syntax) = self.role else {
+            return None;
+        };
+        Some((syntax, &self.condition, &self.when_true, &self.when_false))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29506,6 +29529,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &mut self,
         expression: NodeRef,
     ) -> Result<PlannedExpression, SourceCheckError> {
+        if let Some(syntax) =
+            super::source_calls::conditional_call_argument_syntax(self.arena, expression)
+        {
+            return self.plan_conditional_call_argument(syntax);
+        }
         let mut root = expression;
         let mut asserted = false;
         while let Some(parent) = self.node(root)?.parent.map(|node| self.reference(node)) {
@@ -29962,7 +29990,86 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 expected_result,
                 expected_cache,
                 dynamic_result,
-                direct_return,
+                role: if direct_return {
+                    ConditionalExpressionRole::DirectReturn
+                } else {
+                    ConditionalExpressionRole::Ordinary
+                },
+            })),
+        ))
+    }
+
+    fn plan_conditional_call_argument(
+        &mut self,
+        syntax: super::source_calls::ConditionalCallArgumentSyntax,
+    ) -> Result<PlannedExpression, SourceCheckError> {
+        let expression = syntax.node;
+        if [syntax.node, syntax.call, syntax.argument]
+            .into_iter()
+            .any(|node| {
+                !node.is_for(self.arena.id(), self.bound.file_id()) || !self.bound.contains(node)
+            })
+            || super::source_calls::conditional_call_argument_syntax(self.arena, expression)
+                != Some(syntax)
+        {
+            return Err(SourceCheckError::Conditional(expression));
+        }
+        let NodeData::ConditionalExpression(conditional) = &self.node(expression)?.data else {
+            return Err(SourceCheckError::Conditional(expression));
+        };
+        let (condition, when_true, when_false, question, colon) = (
+            self.reference(conditional.condition),
+            self.reference(conditional.when_true),
+            self.reference(conditional.when_false),
+            self.reference(conditional.question_token),
+            self.reference(conditional.colon_token),
+        );
+        if !self.source_spelling_matches(question, "?")
+            || !self.source_spelling_matches(colon, ":")
+        {
+            return Err(SourceCheckError::Conditional(expression));
+        }
+        let condition = self.plan_expression(condition)?;
+        let when_true = self.plan_expression(when_true)?;
+        let when_false = self.plan_expression(when_false)?;
+        for operand in [&condition, &when_true, &when_false] {
+            if !super::source_calls::is_context_insensitive_conditional_operand_plan(operand) {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Call(syntax.call),
+                ));
+            }
+        }
+        let (store, _) = self
+            .semantic
+            .ok_or(SourceCheckError::Conditional(expression))?;
+        let expected_cache = store
+            .type_node_links(expression)
+            .and_then(|links| links.resolved_type)
+            .or_else(|| {
+                store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.error_type)
+            })
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        preflight_source_expression_cache(store, expression, expected_cache)?;
+        // The dynamic plan stores no inferred result. Execution checks both
+        // branches and validates their actual union before publishing it.
+        Ok(PlannedExpression::new(
+            expression,
+            PlannedExpressionKind::Conditional(Box::new(ConditionalExpressionPlan {
+                node: expression,
+                condition,
+                condition_expectation: ConditionalScalarExpectation::Dynamic,
+                when_true,
+                when_true_expectation: ConditionalScalarExpectation::Dynamic,
+                when_false,
+                when_false_expectation: ConditionalScalarExpectation::Dynamic,
+                expected_result: expected_cache,
+                expected_cache,
+                dynamic_result: true,
+                role: ConditionalExpressionRole::CallArgument(syntax),
             })),
         ))
     }
@@ -34224,7 +34331,7 @@ fn conditional_return_operand_plan_is_supported(expression: &PlannedExpression) 
         | PlannedExpressionKind::Call(_) => true,
         PlannedExpressionKind::Identifier(read) => read.kind == PlannedIdentifierReadKind::Variable,
         PlannedExpressionKind::Conditional(conditional) => {
-            conditional.direct_return
+            conditional.role == ConditionalExpressionRole::DirectReturn
                 && conditional_return_operand_plan_is_supported(&conditional.when_true)
                 && conditional_return_operand_plan_is_supported(&conditional.when_false)
         }
@@ -39629,7 +39736,56 @@ fn check_expression_type_with_capture_context(
             ))
         }
         PlannedExpressionKind::Conditional(conditional) => {
-            let condition = if uninitialized_local_read_annotation(
+            let call_argument = if let ConditionalExpressionRole::CallArgument(syntax) =
+                conditional.role
+            {
+                let (arena, _) = host
+                    .source(conditional.node)
+                    .ok_or(SourceCheckError::Conditional(conditional.node))?;
+                let record = host
+                    .node(conditional.node)
+                    .ok_or(SourceCheckError::Conditional(conditional.node))?;
+                let NodeData::ConditionalExpression(actual) = &record.data else {
+                    return Err(SourceCheckError::Conditional(conditional.node));
+                };
+                if syntax.node != conditional.node
+                    || super::source_calls::conditional_call_argument_syntax(arena, conditional.node)
+                        != Some(syntax)
+                    || conditional.condition.node
+                        != NodeRef::new(
+                            conditional.node.arena,
+                            conditional.node.file,
+                            actual.condition,
+                        )
+                    || conditional.when_true.node
+                        != NodeRef::new(
+                            conditional.node.arena,
+                            conditional.node.file,
+                            actual.when_true,
+                        )
+                    || conditional.when_false.node
+                        != NodeRef::new(
+                            conditional.node.arena,
+                            conditional.node.file,
+                            actual.when_false,
+                        )
+                    || [
+                        &conditional.condition,
+                        &conditional.when_true,
+                        &conditional.when_false,
+                    ]
+                    .into_iter()
+                    .any(|operand| {
+                        !super::source_calls::is_context_insensitive_conditional_operand_plan(operand)
+                    })
+                {
+                    return Err(SourceCheckError::Conditional(conditional.node));
+                }
+                true
+            } else {
+                false
+            };
+            let condition = if call_argument || uninitialized_local_read_annotation(
                 store,
                 host,
                 conditional.condition.unparenthesized(),
@@ -39768,7 +39924,7 @@ fn check_expression_type_with_capture_context(
             let when_true_flow = branch_flow_types
                 .as_ref()
                 .map_or(current_flow_types, |(truthy, _)| truthy);
-            let when_true = if uninitialized_local_read_annotation(
+            let when_true = if call_argument || uninitialized_local_read_annotation(
                 store,
                 host,
                 conditional.when_true.unparenthesized(),
@@ -39819,7 +39975,7 @@ fn check_expression_type_with_capture_context(
             let when_false_flow = branch_flow_types
                 .as_ref()
                 .map_or(current_flow_types, |(_, falsy)| falsy);
-            let when_false = if uninitialized_local_read_annotation(
+            let when_false = if call_argument || uninitialized_local_read_annotation(
                 store,
                 host,
                 conditional.when_false.unparenthesized(),
@@ -39872,7 +40028,8 @@ fn check_expression_type_with_capture_context(
                 &[when_true.raw, when_false.raw],
                 UnionReduction::Subtype,
             )?;
-            let apply_context = contextual_type.is_some() && !conditional.direct_return;
+            let apply_context = contextual_type.is_some()
+                && conditional.role != ConditionalExpressionRole::DirectReturn;
             if !conditional.dynamic_result {
                 let expected_result = if apply_context {
                     let widened_types = [
@@ -39902,6 +40059,9 @@ fn check_expression_type_with_capture_context(
             } else {
                 raw_type
             };
+            if call_argument {
+                preflight_source_expression_cache(store, conditional.node, raw_type)?;
+            }
             publish_expression_type(store, conditional.node, raw_type)?;
             Ok(CheckedExpressionTypes::leaf(raw_type, result_type))
         }
@@ -49261,7 +49421,7 @@ fn check_assignment_with_expression_type(
     }
     let source_type = source_types.result;
     if let PlannedExpressionKind::Conditional(conditional) = &expression.unparenthesized().kind
-        && conditional.direct_return
+        && conditional.role == ConditionalExpressionRole::DirectReturn
     {
         check_conditional_return_branches(
             store,

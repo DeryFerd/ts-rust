@@ -109,6 +109,14 @@ pub(super) struct SourceCallPlan {
     pub(super) arguments: Vec<PlannedExpression>,
 }
 
+/// A conditional connected to one real call argument through result operands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ConditionalCallArgumentSyntax {
+    pub(super) node: NodeRef,
+    pub(super) call: NodeRef,
+    pub(super) argument: NodeRef,
+}
+
 /// The exact callee family proven by call syntax.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceCallCalleeForm {
@@ -4706,7 +4714,167 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
                 || is_context_insensitive_logical_binary_syntax(arena, node)
                 || is_supported_shorthand_assignment_argument_syntax(arena, node)
         }
+        SyntaxKind::ConditionalExpression => {
+            is_supported_conditional_call_argument_syntax(arena, node)
+        }
         _ => false,
+    }
+}
+
+fn is_supported_conditional_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
+    let Some(record) = arena.get(node.node) else {
+        return false;
+    };
+    let NodeData::ConditionalExpression(conditional) = &record.data else {
+        return false;
+    };
+    if node.arena != arena.id()
+        || record.kind != SyntaxKind::ConditionalExpression
+        || record.flags.0 != 0
+        || conditional.facts != 0
+    {
+        return false;
+    }
+    let children = [
+        conditional.condition,
+        conditional.question_token,
+        conditional.when_true,
+        conditional.colon_token,
+        conditional.when_false,
+    ];
+    let mut previous_end = record.range.start;
+    for child in children {
+        let Some(child_record) = arena.get(child) else {
+            return false;
+        };
+        if child_record.parent != Some(node.node)
+            || child_record.range.start < previous_end
+            || child_record.range.end > record.range.end
+        {
+            return false;
+        }
+        previous_end = child_record.range.end;
+    }
+    for (token, kind) in [
+        (conditional.question_token, SyntaxKind::QuestionToken),
+        (conditional.colon_token, SyntaxKind::ColonToken),
+    ] {
+        if arena.get(token).is_none_or(|token| {
+            token.kind != kind || token.flags.0 != 0 || !matches!(token.data, NodeData::Token(_))
+        }) {
+            return false;
+        }
+    }
+    is_supported_call_argument_syntax(
+        arena,
+        NodeRef::new(node.arena, node.file, conditional.condition),
+    ) && [conditional.when_true, conditional.when_false]
+        .into_iter()
+        .all(|branch| {
+            is_context_insensitive_conditional_operand_syntax(
+                arena,
+                NodeRef::new(node.arena, node.file, branch),
+            )
+        })
+}
+
+fn is_context_insensitive_conditional_operand_syntax(arena: &NodeArena, node: NodeRef) -> bool {
+    let Some(record) = arena.get(node.node) else {
+        return false;
+    };
+    if !is_supported_call_argument_syntax(arena, node) {
+        return false;
+    }
+    match &record.data {
+        NodeData::ArrowFunction(_)
+        | NodeData::FunctionExpression(_)
+        | NodeData::ObjectLiteralExpression(_)
+        | NodeData::ArrayLiteralExpression(_)
+        | NodeData::TypeAssertion(_)
+        | NodeData::AsExpression(_) => false,
+        NodeData::ParenthesizedExpression(parenthesized) => {
+            is_context_insensitive_conditional_operand_syntax(
+                arena,
+                NodeRef::new(node.arena, node.file, parenthesized.expression),
+            )
+        }
+        NodeData::BinaryExpression(binary)
+            if arena.get(binary.operator_token).is_some_and(|operator| {
+                logical_binary_operator_text(operator.kind).is_some()
+            }) =>
+        {
+            [binary.left, binary.right].into_iter().all(|operand| {
+                is_context_insensitive_conditional_operand_syntax(
+                    arena,
+                    NodeRef::new(node.arena, node.file, operand),
+                )
+            })
+        }
+        NodeData::BinaryExpression(_) => {
+            is_context_insensitive_primitive_binary_syntax(arena, node)
+        }
+        _ => true,
+    }
+}
+
+/// Keep the argument owner separate from initializer and return admission.
+pub(super) fn conditional_call_argument_syntax(
+    arena: &NodeArena,
+    node: NodeRef,
+) -> Option<ConditionalCallArgumentSyntax> {
+    if !is_supported_conditional_call_argument_syntax(arena, node) {
+        return None;
+    }
+    let mut current = node;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current.node) {
+            return None;
+        }
+        let child = arena.get(current.node)?;
+        let parent = NodeRef::new(node.arena, node.file, child.parent?);
+        let record = arena.get(parent.node)?;
+        if record.flags.0 != 0
+            || child.range.start < record.range.start
+            || child.range.end > record.range.end
+        {
+            return None;
+        }
+        match &record.data {
+            NodeData::ParenthesizedExpression(wrapper)
+                if record.kind == SyntaxKind::ParenthesizedExpression
+                    && wrapper.expression == current.node => {}
+            NodeData::BinaryExpression(binary)
+                if record.kind == SyntaxKind::BinaryExpression
+                    && (binary.left == current.node || binary.right == current.node)
+                    && is_context_insensitive_logical_binary_syntax(arena, parent) => {}
+            NodeData::ConditionalExpression(conditional)
+                if (conditional.when_true == current.node
+                    || conditional.when_false == current.node)
+                    && is_supported_conditional_call_argument_syntax(arena, parent) => {}
+            NodeData::CallExpression(call)
+                if record.kind == SyntaxKind::CallExpression
+                    && call.question_dot_token.is_none()
+                    && call.symbol.is_none()
+                    && call.facts == 0
+                    && call
+                        .arguments
+                        .nodes
+                        .iter()
+                        .filter(|id| **id == current.node)
+                        .count()
+                        == 1
+                    && is_context_insensitive_conditional_operand_syntax(arena, current) =>
+            {
+                return Some(ConditionalCallArgumentSyntax {
+                    node,
+                    call: parent,
+                    argument: current,
+                });
+            }
+            _ => return None,
+        }
+        current = parent;
     }
 }
 
@@ -5352,10 +5520,44 @@ fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
                 && is_supported_call_argument_plan(left)
                 && is_supported_call_argument_plan(right)
         }
+        PlannedExpressionKind::Conditional(conditional) => conditional
+            .call_argument_parts()
+            .is_some_and(|(syntax, condition, when_true, when_false)| {
+                syntax.node == expression.node
+                    && is_supported_call_argument_plan(condition)
+                    && is_context_insensitive_conditional_operand_plan(when_true)
+                    && is_context_insensitive_conditional_operand_plan(when_false)
+            }),
         PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::SuperCall(_)
-        | PlannedExpressionKind::New(_)
-        | PlannedExpressionKind::Conditional(_) => false,
+        | PlannedExpressionKind::New(_) => false,
+    }
+}
+
+pub(super) fn is_context_insensitive_conditional_operand_plan(
+    expression: &PlannedExpression,
+) -> bool {
+    if !is_supported_call_argument_plan(expression) {
+        return false;
+    }
+    match &expression.kind {
+        PlannedExpressionKind::Arrow(_)
+        | PlannedExpressionKind::Object { .. }
+        | PlannedExpressionKind::Array(_)
+        | PlannedExpressionKind::Assertion { .. } => false,
+        PlannedExpressionKind::Parenthesized(inner) => {
+            is_context_insensitive_conditional_operand_plan(inner)
+        }
+        PlannedExpressionKind::Logical(binary) => {
+            let (left, right) = binary.operands();
+            is_context_insensitive_conditional_operand_plan(left)
+                && is_context_insensitive_conditional_operand_plan(right)
+        }
+        PlannedExpressionKind::Binary(binary) => {
+            primitive_binary_operator_text(binary.operator()).is_some()
+                && binary.shorthand_assignment_initializer().is_none()
+        }
+        _ => true,
     }
 }
 
