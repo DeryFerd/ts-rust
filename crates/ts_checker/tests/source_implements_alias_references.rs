@@ -467,12 +467,12 @@ fn implements_aliases_keep_defaults_substitutions_callables_and_replay() {
         );
     }
     let read = member(&parsed, reader, "read");
-    let NodeData::PropertySignatureDeclaration(read_data) =
+    let NodeData::PropertyDeclaration(read_data) =
         &parsed.arena.get(read.node).unwrap().data
     else {
         unreachable!()
     };
-    let function = node(&parsed, read_data.type_);
+    let function = node(&parsed, read_data.type_.unwrap());
     assert_eq!(
         parsed.arena.get(function.node).unwrap().kind,
         SyntaxKind::FunctionType
