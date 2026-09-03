@@ -16609,6 +16609,7 @@ mod tests {
                     argument_types: &arguments,
                     explicit_type_arguments: None,
                     receiver: None,
+                    contextual_return_type: None,
                 },
             );
             assert_eq!(&diagnostics, context.diagnostics());

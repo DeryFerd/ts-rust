@@ -3176,7 +3176,7 @@ mod tests {
             );
             assert!(matches!(is_literal_of_contextual_type(
                 store, None, LiteralKind::String, Some(target), &mut visited,
-            ), Err(SourceCheckError::RelationUnavailable(RelationUnavailable::MalformedIntersection(type_))) if type_ == target));
+            ), Err(RelationUnavailable::MalformedIntersection(type_)) if type_ == target));
             assert!(visited.is_empty());
             assert_eq!(
                 (
@@ -3257,9 +3257,7 @@ mod tests {
                 Some(deferred),
                 &mut HashSet::new(),
             ),
-            Err(SourceCheckError::RelationUnavailable(
-                RelationUnavailable::UnresolvedStructuredMembers(deferred),
-            )),
+            Err(RelationUnavailable::UnresolvedStructuredMembers(deferred)),
         );
         assert_eq!(
             (
@@ -3390,9 +3388,7 @@ mod tests {
                     Some(target),
                     &mut HashSet::new(),
                 ),
-                Err(SourceCheckError::RelationUnavailable(
-                    RelationUnavailable::MalformedIntersection(target),
-                )),
+                Err(RelationUnavailable::MalformedIntersection(target)),
             );
             assert_eq!(
                 (
@@ -4773,15 +4769,11 @@ mod tests {
 
         assert_eq!(
             validate_contextual_union(&store, None, containing_object),
-            Err(SourceCheckError::RelationUnavailable(
-                RelationUnavailable::UnsupportedUnionConstituent(object)
-            ))
+            Err(RelationUnavailable::UnsupportedUnionConstituent(object))
         );
         assert_eq!(
             validate_contextual_union(&store, None, claiming_object),
-            Err(SourceCheckError::RelationUnavailable(
-                RelationUnavailable::MalformedUnion(claiming_object)
-            ))
+            Err(RelationUnavailable::MalformedUnion(claiming_object))
         );
         assert_eq!(
             (
