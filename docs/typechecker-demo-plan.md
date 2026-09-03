@@ -21,8 +21,9 @@ Use the existing `query-core-integration` branch in
 `target/worktrees/query-hono-project-integration-2`. Reuse the current build
 target, `target/worktrees/next-core-build-1`. Root owns both. The candidate is not
 accepted, and no pending feature branch joins automatically.
-The last committed integration checkpoint is `de557d99c`, the reviewed merged
-global variable-and-namespace repair. A separate reference-flow draft still
+The last committed integration checkpoint is `031420b74`, the reviewed generic
+base-resolution crash repair. The full diagnostic selection now completes,
+but the full schema tests remain red. A separate reference-flow draft still
 changes six files in that worktree. It is not committed or promoted. Query still
 does not complete. Its latest result and regression losses are in the status
 document. The accepted compiler remains unchanged.
@@ -87,15 +88,24 @@ has 423 exact diagnostic records in 511 executed variants. Its separate
 payload, not just the total count. Run these same selections before promoting
 a batch. Missing outputs, crashes and new mismatches block promotion.
 
-The [fresh corpus checks](../target/query-core-integration-baseline-2-corpus-result.md)
-are not a pass. The diagnostic selection aborted with a stack overflow and no
-report. The type/symbol selection completed but lost three old exact diagnostic
-records, three exact type results and four exact symbol results. First identify
-the active variant at the crash and trace its recursion under the unchanged
-limits. Do not infer the crashing case from the preceding log line. Do not
-increase the stack limit or replace this failed baseline with a smaller pass.
-Repair this execution failure before adding more feature work. Then return to
-the shared Query operation below, with every remaining regression still open.
+The [base-resolution repair](../target/query-core-base-resolution-repair-1-result.md)
+retains every one of baseline 2's 6,325 passing tests. Accepted-name counts stay
+at 5,789 pass, 253 fail and 13 absent. No expectation changed. The complete
+positive and negative schema tests still fail, so this is only a crash repair.
+
+The [new complete corpus checks](../target/query-core-base-resolution-repair-1-corpus-result.md)
+ran all 511 diagnostic variants and all 95 type/symbol variants without a
+process crash. The diagnostic comparison retains 400 of 423 old exact records,
+has 23 changed exact records and 12 fatal records. Every type/symbol variant
+row matches baseline 2, including its old losses. None of these results permits
+promotion. The previous diagnostic run aborted, so the new complete loss list
+does not establish which batch caused each loss.
+
+Return to the shared Query operation below, with every regression still open.
+The next implementation must carry the merged generic class/interface base,
+real source context, substitutions and member state. Do not add the separate
+conditional alias admission patch. Full conditional method-return support
+also needs source-aware evaluation and replay, not only a wider validator.
 
 ### Work loop
 

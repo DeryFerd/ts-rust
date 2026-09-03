@@ -10,37 +10,44 @@ check. All earlier worker runs have closed. Root owns the integration branch
 
 ## Latest checkpoint
 
-The [fresh accepted-test comparison](../target/query-core-integration-baseline-2-result.md)
-retains 5,789 of 6,055 accepted passes. It has 253 failures and 13 absent exact
-names. All 120 accepted test groups ran. Every loss is listed and blocks
-promotion. Their causes are not all resolved. The unfinished reference-flow
-draft adds three lost accepted passes to the previous full comparison.
+The [base-resolution repair](../target/query-core-base-resolution-repair-1-result.md)
+is committed on the integration branch as `031420b74`. The complete diagnostic
+selection now finishes without a process crash. A bounded native backtrace
+identified repeated generic target and base resolution in
+`conditionalTypeSimplification.ts`. The repair follows Go's separation of
+target identity, base publication and later heritage constraint checks.
+The full schema tests still fail. This is not conditional-type acceptance.
 
-The [upstream checks](../target/query-core-integration-baseline-2-corpus-result.md)
-found a more serious problem. The fixed diagnostic selection aborted with a
-stack overflow and wrote no report. The crashing case is not yet identified.
-The separate 95-variant type/symbol selection completed. It retained 57 of 60
-old exact diagnostic records, 52 of 55 exact type results and 58 of 62 exact
-symbol results. New exact results do not offset these losses. One formerly
-exact variant now has a fatal invariant.
+All 6,325 passes from the previous integration test run remain. Against the
+accepted compiler, counts are unchanged: 5,789 of 6,055 passes retained,
+253 failures and 13 absent exact names. Every loss remains a promotion blocker.
+One debug-order assertion now passes, which is not a proved semantic gain.
 
-Query is still at 2 of 23 isolated roots complete. Ordinary checking does not
-complete. The [bounded observation](../target/query-core-inherited-interface-observation-1-result.md)
-confirms that full global-annotation preflight rejects the method signature
-before selected-property lookup. All 244 non-runtime records are unchanged.
-The observation was removed. The base type also needs merged generic
-class/interface handling, not only an interface-heritage guard change.
+The [complete corpus comparison](../target/query-core-base-resolution-repair-1-corpus-result.md)
+retains 400 of 423 previously exact diagnostic records. There are 23 changed
+exact records and 12 fatal records. One changed record keeps an exact status
+but has a different diagnostic path. These results remain blocked. The previous
+integration run aborted, so this comparison cannot attribute all losses to the
+new repair. All 95 type/symbol variant rows match baseline 2. Accepted retention
+stays at 57 of 60 diagnostic records, 52 of 55 type metadata rows and 58 of 62
+symbol metadata rows. Metadata equality does not independently prove rendered
+payload parity.
 
-All runtime checks are closed. The integration source remains at `de557d99c`
-with the preserved six-file reference-flow draft. No production change or test
-expectation changed in this work block. Nothing was promoted. One implementer
-and one reviewer remain the work model.
+[Unchanged Query](../target/query-core-base-resolution-query-1-result.md)
+still completes 2 of 23 isolated roots. Ordinary checking does not complete.
+All 244 checking records, outcomes, diagnostics and graph data are unchanged.
+The earlier caller observation still identifies full global-annotation
+preflight as the rejecting path. The base needs merged generic class/interface
+handling, not only an interface-heritage guard change.
 
-Next, identify and repair the corpus stack overflow under the same limits.
-Then continue Query's shared declared-value and inherited-member operation.
-Keep the regression list open until each loss is repaired or has concrete
-pinned-Go evidence for a changed contract. This checkpoint improves the
-baseline and diagnosis, not Query's completed-project result.
+All runtime checks are closed. The preserved six-file reference-flow draft
+remains uncommitted. No expectation changed, and nothing was promoted to the
+accepted compiler. One implementer and one reviewer remain the work model.
+
+Next, return to Query's shared declared-value and inherited-member operation
+with its real source context, base substitutions and state. Do not add the
+isolated conditional admission follow-up. Keep every regression open until it
+is repaired or has concrete pinned-Go evidence for a changed contract.
 
 ## Previous implementation checkpoint
 
@@ -163,6 +170,9 @@ project has gained a complete isolated root in the latest comparisons.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
+| Query, base-resolution repair | 2 of 23 isolated roots complete | All 244 checking records unchanged. Ordinary checking remains unsupported |
+| Full diagnostic corpus | 511 variants completed. 400 of 423 old exact records retained | Process crash fixed. 23 old exact records changed and 12 fatal records block promotion |
+| Current accepted test selection | 5,789 old passes retained, 253 fail, 13 absent | All 6,325 previous integration passes retained. No accepted loss cleared |
 | Query, merged variable-and-namespace repair | 2 of 23 isolated roots complete | Ownership error cleared. Ordinary checking stops at a method signature in process.d.ts. All diagnostics unchanged |
 | Variable-and-namespace tests | Library 5,065 pass, 372 fail. Public 40 pass, 6 fail | All three new cases pass. All 5,087 first-run passes retained. Existing failures still block promotion |
 | Query, reference-flow draft | 2 of 23 isolated roots complete | Ordinary checking fails with SymbolNotOwned. All diagnostic records remain unchanged |
