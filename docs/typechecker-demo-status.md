@@ -18,8 +18,23 @@ candidates below do not replace this accepted baseline.
 Two failures are now explained by a concrete Go comparison and corrected in
 `2bf54614a`. Those tests demanded complete member caches from an identity-only
 query. The corrected tests pass with all earlier behavior checks intact.
-That leaves 250 baseline failures without an accepted disposition. No production
-repair or new Query completion is claimed for this test correction.
+The first production batch, committed as `6652447c7`, restores two more old
+behavior tests. [Regression check 2](../target/query-core-interface-regression-2-result.md)
+retains every pass from the frozen checker baseline. Current accepted-name
+checker totals are 5,256 passes, 248 failures and 12 absent names.
+
+The [complete accepted test comparison](../target/query-core-accepted-complete-baseline-1-result.md)
+now covers every accepted harness. Of 6,055 old passes, 5,792 remain passing,
+250 fail and 13 exact names are absent. All 285 old compiler tests pass.
+Fixture checks add two old failures and one absent name. Causes and rename
+equivalence remain unproved where the records say so. Nothing is promoted.
+
+[Unchanged Query after this repair](../target/query-core-interface-demand-query-1-result.md)
+has no gain or loss. All 244 non-runtime records match Query 44, including
+the full input graph, every outcome and every diagnostic. Ordinary checking
+still stops at the class in `timeoutManager.ts`. This is one production batch
+without a Query improvement after the reset. The next work traces the shared
+class method annotation query, including its context and state.
 
 ## Current result
 
@@ -28,10 +43,12 @@ project has gained a complete isolated root in the latest comparisons.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
-| Query, combined census 44 | 2 of 23 isolated roots complete | No gain or loss against census 41. No internal errors |
+| Query, interface repair | 2 of 23 isolated roots complete | Every outcome and diagnostic matches census 44. Ordinary checking still stops |
 | Query, separate method candidate 43 | 2 of 23 isolated roots complete | Five roots now fail internal type-literal checks. Candidate remains excluded |
 | Hono, census 26 | 33 of 188 isolated roots complete | Every outcome and diagnostic matches census 25 |
 | Accepted checker baseline 1 | Library 5,067 pass, 370 fail. Public 669 pass, 27 fail | All 111 harnesses completed. 252 accepted passes lost, 12 names absent |
+| Interface regression check 2 | Library 5,068 pass, 369 fail. Public 673 pass, 24 fail | No baseline pass lost. Two behavior repairs, two test-contract corrections and one new passing case |
+| Complete accepted selection | 5,792 old passes retained, 250 fail, 13 absent | All 120 accepted harnesses checked. Original corpus selections remain unrun |
 | Return-context repair, six public targets | 19 pass, 0 fail | All three lost public passes restored |
 | Checker library, return-context repair | 5,064 pass, 373 fail | Both lost library passes restored. Every outcome matches run 54 |
 | Shared candidate, integration 2 | Library 5,067 pass, 370 fail. Public 239 pass, 35 fail | Three library recoveries. No old pass lost against runs 54 or 56 |

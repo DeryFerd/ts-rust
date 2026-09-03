@@ -59,6 +59,15 @@ checking complete caches. All earlier behavior checks remain, and both complete
 tests pass. This test-only change is committed as `2bf54614a`. It is not a
 production repair or a Query improvement. The original baseline is unchanged.
 
+The first production repair is committed on the integration branch as
+`6652447c7`. It retains every frozen baseline pass and restores two old behavior
+tests. Together with the two test corrections, accepted-name totals are now
+5,256 checker passes, 248 failures and 12 absent names. The remaining compiler
+and fixture tests have now run. The [complete comparison](../target/query-core-accepted-complete-baseline-1-result.md)
+has 5,792 accepted passes retained, 250 failures and 13 absent names across all
+120 accepted harnesses. [Query is unchanged](../target/query-core-interface-demand-query-1-result.md).
+The next batch must address the shared class method annotation operation.
+
 The [accepted original corpus](../target/wave202-core-class-call-corpus-2-receipt.md)
 has 423 exact diagnostic records in 511 executed variants and 60 exact semantic
 records in 95 variants. Preserve each accepted diagnostic, type and symbol
@@ -89,6 +98,37 @@ After two batches without a meaningful Query result, stop adding patches and
 reassess the dependency path. More workers are not the fallback. Run Hono after
 a meaningful Query milestone or a shared-path change that needs a cross-project
 check, rather than after every local edit.
+
+### Next operation: class method annotations
+
+The recorded Query method failure reaches a union-parameter helper that only
+accepts keyword constituents. Go queries each constituent through the normal
+type-node query. The earlier union patch reached a nested type-literal cache
+failure instead of completing the operation.
+
+The shared Rust path has a concrete order problem. Annotation preflight calls
+the completed-result cache reader before semantic demand. Both relevant cache
+readers reject a type-literal shell, although the normal executor accepts that
+pending identity and resolves its members. Preflight also creates a fresh
+planner without the live alias targets and source query context.
+
+The exact predicate that failed in Query is not yet proved. The next batch is:
+
+1. Add one bounded failure trace to distinguish a valid pending shell from a
+   changed owner, alias binding, outer parameter or missing child result.
+   Use unchanged Query and existing logs. Do not read held test bodies.
+2. Keep annotation ownership and pending identity separate from a completed
+   result. Carry the caller's globals, alias bindings, source context, session
+   and class scope through the existing canonical type query.
+3. Resolve the actual annotation and its members, then validate the completed
+   result. Keep changed-cache and wrong-owner rejections. Do not remove a cache
+   check or add a special rule for the observed source shape.
+4. Check cold and warm queries, prewarmed member order, imported and recursive
+   annotation dependencies, and a wrong argument with its exact Go diagnostic.
+   Then run unchanged Query and the accepted regression selections.
+
+This is one complete operation on the existing integration branch. It is not
+permission to join all preserved class patches or launch more feature work.
 
 ### Immediate milestone
 
