@@ -153,12 +153,24 @@ Hono 22's recorded `ContextVariableMap` failure. The old failure came from its
 JWT augmentation, and both unchanged JWT controls now pass. No duplicate fix
 or test was added. The new full Hono census must measure its current root result.
 
-The next runs use the reviewed Tests 51 branch at `c07bc5e1`, including the
-compile fix and all four additional Query repairs. Its roster is 77 targets and 208
-cases. Tests 49 remains the measured baseline, with 185 cases. The 23 added
-cases must be reported separately. Query 31 compares with completed Query 29.
-The full Hono census starts alongside them. The broad library run then uses
-Query 31's slot. These repairs are committed but unmeasured.
+Tests 51 and Query 31 also failed Rust compilation. Four API errors prevented
+all 208 tests and all 23 Query roots from running. Hono 24 and library run 6
+did not launch on that broken source.
+
+Root fixed the two affected source files and ran a fast normal-library compiler
+check before another project build. That [check passed in 32.13 seconds](../target/wave202-query-hono-compile-check-52-result.md).
+The checked source is committed as `722260115`. Tests, inputs and options are
+unchanged. This is a Rust compilation result, not a TypeScript recovery.
+
+Tests 52 now checks the same 77 targets and 208 cases. Tests 49 remains the
+measured baseline, with 185 cases. Keep the 23 added cases separate. Query 32
+and Hono 24 wait for the focused build to compile and close. The library run
+remains held. New feature changes stay outside this frozen batch.
+
+The workflow now requires a fast compiler check before a donor enters a
+project batch. Repeated commands no longer need another preparation reviewer
+or a chain of approval reports. Each runtime owner checks the source and
+command changes once, then runs the released check and retains its results.
 
 The Buffer change follows the pinned Go rule that a global augmentation can
 retain its module parent. A separate public test checks the real global table
