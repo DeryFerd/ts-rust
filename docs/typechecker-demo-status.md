@@ -9,14 +9,20 @@ project has gained a complete isolated root in the latest comparisons.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
-| Query, combined census 41 | 2 of 23 isolated roots complete | Restored the lost root and cleared six call invariants. No gain against census 36 |
+| Query, combined census 44 | 2 of 23 isolated roots complete | No gain or loss against census 41. No internal errors |
 | Query, separate method candidate 43 | 2 of 23 isolated roots complete | Five roots now fail internal type-literal checks. Candidate remains excluded |
 | Hono, census 25 | 33 of 188 isolated roots complete | No complete-root gains. One new internal call error |
 | Return-context repair, six public targets | 19 pass, 0 fail | All three lost public passes restored |
 | Checker library, return-context repair | 5,064 pass, 373 fail | Both lost library passes restored. Every outcome matches run 54 |
+| Shared candidate, integration 2 | Library 5,067 pass, 370 fail. Public 239 pass, 35 fail | Three library recoveries. No old pass lost against runs 54 or 56 |
 
 An isolated root is one original entry file checked on its own. These counts
 are not full-project passes or percentages of TypeScript support.
+
+The shared candidate's Query 44 run has finished. It still has two complete
+roots and 21 unsupported roots. All 23 diagnostic records, the ordinary result
+and the full graph match Query 41. One root reaches a different unsupported
+operation. The other 22 complete outcomes match. No complete root was gained.
 
 [Query 41](../target/wave202-query-combined-census-41-result.md) restores
 `subscribable.ts`, lost in Query 38. The six `.bind(this)` call invariants are
@@ -57,9 +63,11 @@ cases and gains three others. It also has two supported mismatches.
 
 1. Run both projects on one combined candidate. Commit `eb996907` contains the
    Query 41 repair, indexed writes, merged-interface cache validation and TS6504
-   path handling. The complete change passed source review and compiled. Its
-   full library and 94 public test targets are running. Query 44 and Hono 26
-   follow on the same frozen source and build target. No candidate is accepted.
+   path handling. Its [complete test gate](../target/wave202-project-integration-2-tests-1-result.md)
+   ran all 5,437 library cases and 274 public cases in 94 targets. Three library
+   cases recovered, with no old pass lost against runs 54 or 56. Query 44 has
+   finished without a complete-root gain. Hono 26 follows on the same frozen
+   source and build target. No candidate is accepted.
 2. Repair Query's class and method path. [Query 43](../target/wave202-query-combined-census-43-result.md)
    has no complete-root gain. Its separate method candidate has five internal
    type-literal errors and a later unsupported variable operation. Its test gate
