@@ -8164,6 +8164,10 @@ impl<'store> RelaterSession<'store> {
             return Ok(false);
         }
 
+        if self.cold_generic_interface_method_is_missing(owner, target)? {
+            return Ok(true);
+        }
+
         if !self
             .project_structural_callable_signatures(target)?
             .is_empty()
@@ -8205,6 +8209,164 @@ impl<'store> RelaterSession<'store> {
                 {
                     return Ok(true);
                 }
+            }
+        }
+        Ok(false)
+    }
+
+    // A required name can reject a relation before its method types are read.
+    fn cold_generic_interface_method_is_missing(
+        &mut self,
+        source: SemanticSymbolId,
+        target: TypeId,
+    ) -> Result<bool, RelationUnavailable> {
+        let invalid = || RelationUnavailable::InvalidStructuredMembers(target);
+        let record = self.store.type_payload(target).ok_or_else(invalid)?;
+        let TypeData::TypeReference(reference) = record.data() else {
+            return Ok(false);
+        };
+        let declared = reference.object.target.ok_or_else(invalid)?;
+        let declared_record = self.store.type_payload(declared).ok_or_else(invalid)?;
+        let TypeData::Interface(interface) = declared_record.data() else {
+            return Ok(false);
+        };
+        if declared_record.object_flags() & ObjectFlags::CLASS_OR_INTERFACE
+            != ObjectFlags::INTERFACE
+            || record
+                .object_flags()
+                .intersects(ObjectFlags::MEMBERS_RESOLVED | ObjectFlags::UNRESOLVED_MEMBERS)
+            || declared_record
+                .object_flags()
+                .intersects(ObjectFlags::MEMBERS_RESOLVED | ObjectFlags::UNRESOLVED_MEMBERS)
+            || reference.object.structured != StructuredTypeData::default()
+            || reference.object.source_computed_literal.is_some()
+            || interface.reference.object.structured != StructuredTypeData::default()
+            || interface.reference.object.source_computed_literal.is_some()
+            || interface.base_types_resolved
+            || interface.declared_members_resolved
+            || interface.resolved_base_constructor_type.is_some()
+            || interface.resolved_base_types.is_some()
+            || interface.declared_members.is_some()
+            || interface.declared_call_signatures.is_some()
+            || interface.declared_construct_signatures.is_some()
+            || interface.declared_index_infos.is_some()
+            || interface.outer_type_parameter_count != 0
+            || interface
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .is_none_or(|parameters| parameters.is_empty())
+        {
+            return Ok(false);
+        }
+        let owner = declared_record.symbol().ok_or_else(invalid)?;
+        if validate_direct_generic_reference(self.store, target)
+            .map_err(|error| match error {
+                super::reference_types::DirectGenericReferenceError::Capacity(_) => {
+                    RelationUnavailable::UnionValidationCapacity(target)
+                }
+                _ => invalid(),
+            })?
+            .target
+            != declared
+        {
+            return Err(invalid());
+        }
+        if self.observe_merged_symbol_lookup(owner) != Some(owner) {
+            return Err(invalid());
+        }
+        let owner_record = self.store.symbol(owner).ok_or_else(invalid)?;
+        let Some(&[declaration]) = owner_record.declarations() else {
+            return Ok(false);
+        };
+        if owner_record.flags() != SymbolFlags::INTERFACE
+            || owner_record.check_flags() != CheckFlags::NONE
+            || owner_record.value_declaration().is_some()
+            || owner_record.exports().is_some()
+            || owner_record.export_symbol().is_some()
+            || self.store.declared_type_initialization_in_progress(owner)
+            || !self.store.source_symbol_declarations_match(owner)
+            || self.store.source_symbol_flags(owner) != Some(SymbolFlags::INTERFACE)
+            || self.store.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration)
+            || self.store.source_declaration_symbol(declaration) != Some(owner)
+            || self
+                .store
+                .source_child_with_kind(declaration, SyntaxKind::Identifier)
+                .and_then(|name| self.store.source_identifier_text(name))
+                .is_none_or(|name| owner_record.name() != EscapedNameRef::source(name))
+        {
+            return Ok(false);
+        }
+        if !self.interface_declarations_prove_no_heritage(owner, declared)? {
+            return Ok(false);
+        }
+        let Some(members) = self.store.symbol(owner).and_then(|owner| owner.members()) else {
+            return Ok(false);
+        };
+        self.observe_symbol_table(members);
+        let entries = self
+            .store
+            .symbol_table(members)
+            .ok_or(RelationUnavailable::InvalidSymbolMembers(owner))?
+            .iter()
+            .map(|(name, member)| (name.to_owned(), member))
+            .collect::<Vec<_>>();
+        let mut seen = HashSet::with_capacity(entries.len());
+        let mut required = Vec::new();
+        for (name, member) in entries {
+            if !seen.insert(member) {
+                return Err(invalid());
+            }
+            let canonical = self.observe_merged_symbol_lookup(member);
+            let record = self.store.symbol(member).ok_or_else(invalid)?;
+            if record.name() != name.as_ref() {
+                return Err(invalid());
+            }
+            // Optional and merged methods keep the full member-resolution path.
+            if record.flags() != SymbolFlags::METHOD || canonical != Some(member) {
+                continue;
+            }
+            let Some(&[method]) = record.declarations() else {
+                continue;
+            };
+            if record.check_flags() != CheckFlags::NONE
+                || record.parent() != Some(owner)
+                || record.value_declaration() != Some(method)
+                || record.members().is_some()
+                || record.exports().is_some()
+                || record.export_symbol().is_some()
+                || !self.store.source_symbol_declarations_match(member)
+                || self.store.source_symbol_flags(member) != Some(SymbolFlags::METHOD)
+                || self.store.source_declaration_symbol(method) != Some(member)
+                || self.store.source_node_kind(method) != Some(SyntaxKind::MethodSignature)
+                || self.store.source_node_parent(method)
+                    != Some(SourceNodeParent::Parent(declaration))
+                || self
+                    .store
+                    .source_child_with_kind(method, SyntaxKind::Identifier)
+                    .and_then(|name| self.store.source_identifier_text(name))
+                    .is_none_or(|text| name.as_ref() != EscapedNameRef::source(text))
+                || self
+                    .store
+                    .source_direct_children(method)
+                    .is_none_or(|children| {
+                        children.iter().any(|child| {
+                            matches!(
+                                self.store.source_node_kind(*child),
+                                Some(SyntaxKind::QuestionToken | SyntaxKind::ComputedPropertyName)
+                            )
+                        })
+                    })
+            {
+                continue;
+            }
+            required.push(name);
+        }
+        for name in required {
+            if self.raw_symbol_members_prove_absent(source, name.as_ref())?
+                && self.global_object_property(name.as_ref())?.is_none()
+            {
+                return Ok(true);
             }
         }
         Ok(false)
