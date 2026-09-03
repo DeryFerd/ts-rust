@@ -73,11 +73,29 @@ has 5,792 accepted passes retained, 250 failures and 13 absent names across all
 120 accepted harnesses. [Query is unchanged](../target/query-core-interface-demand-query-1-result.md).
 The next batch follows the measured merged global-variable failure below.
 
+The [new complete test comparison](../target/query-core-integration-baseline-2-result.md)
+on `de557d99c` plus the preserved reference-flow draft retains 5,789 accepted
+passes, loses 253 and has 13 absent names. All 120 accepted groups ran. Only
+the three previously recorded reference-flow losses change outcomes against
+the last full checker and compiler/fixture selections. The exact loss list is
+complete, but cause analysis and repair are not.
+
 The [accepted original corpus](../target/wave202-core-class-call-corpus-2-receipt.md)
-has 423 exact diagnostic records in 511 executed variants and 60 exact semantic
-records in 95 variants. Preserve each accepted diagnostic, type and symbol
+has 423 exact diagnostic records in 511 executed variants. Its separate
+95-variant type/symbol selection has 60 exact top-level diagnostic records,
+55 exact type comparisons and 62 exact symbol comparisons. Preserve each accepted diagnostic, type and symbol
 payload, not just the total count. Run these same selections before promoting
 a batch. Missing outputs, crashes and new mismatches block promotion.
+
+The [fresh corpus checks](../target/query-core-integration-baseline-2-corpus-result.md)
+are not a pass. The diagnostic selection aborted with a stack overflow and no
+report. The type/symbol selection completed but lost three old exact diagnostic
+records, three exact type results and four exact symbol results. First identify
+the active variant at the crash and trace its recursion under the unchanged
+limits. Do not infer the crashing case from the preceding log line. Do not
+increase the stack limit or replace this failed baseline with a smaller pass.
+Repair this execution failure before adding more feature work. Then return to
+the shared Query operation below, with every remaining regression still open.
 
 ### Work loop
 
@@ -214,11 +232,17 @@ final bytes. The new focused passes do not offset old failures or absent tests.
 
 ### Next shared operation: inherited interface member lookup
 
-First confirm the actual caller for the new failure. The source already shows
-one likely cause. `cross_file_global_interface_supports_lazy_members` rejects
-interfaces with heritage. `check_source_plan` then uses full type-node checking
-in both preflight and execution. The library declares `process: NodeJS.Process`,
-and `Process` extends `EventEmitter`.
+The [bounded observation](../target/query-core-inherited-interface-observation-1-result.md)
+confirms the actual caller. Both affected attempts fail in
+`preflight_type_from_type_node`, before selected-property lookup. All 244
+non-runtime Query records remain unchanged. The observation was removed and
+the original integration fingerprint was restored.
+
+There are two heritage guards, in the interface-identity preflight and the
+source lazy-member selector. The selected annotation is `NodeJS.Process`, which
+extends `EventEmitter`. The latter is a merged generic interface and class with
+a default parameter. The existing direct-interface planner and the separate
+nongeneric ambient-class import proof do not complete that base operation.
 
 Pinned Go keeps separate work for declaration identity, member tables and base
 types, and the selected member's type. Its member-table resolver does not obtain
@@ -227,8 +251,17 @@ with their real query context and retained state. Keep base substitutions,
 canonical member owners, call/construct/index signatures and warm-cache checks.
 Complete declaration checking must still run when that phase is requested.
 
+Use one shared operation for these distinct states: declared identity, known
+own members, resolved bases and inherited members, and selected member type.
+An own-member query may leave bases pending. It must not report an inherited
+member as absent, complete a structural relation or set completion flags while
+bases are pending. The merged class base must use its actual import route,
+parameter identities, defaults and substitutions. Do not substitute a plain
+class identity for the defaulted base type.
+
 Do not only remove the heritage guard or add a special case for `send`. Test
-inherited property reads without resolving unrelated named method types. Then
+own and inherited property reads through a merged generic class base, including
+its default argument, without resolving unrelated named method types. Then
 query a method explicitly and require its correct type. Include deliberate
 errors, source-first and query-first checks, and replay. Compile all test code,
 run the focused cases, rerun unchanged Query, then run the accepted selections

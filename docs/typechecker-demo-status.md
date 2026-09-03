@@ -10,6 +10,40 @@ check. All earlier worker runs have closed. Root owns the integration branch
 
 ## Latest checkpoint
 
+The [fresh accepted-test comparison](../target/query-core-integration-baseline-2-result.md)
+retains 5,789 of 6,055 accepted passes. It has 253 failures and 13 absent exact
+names. All 120 accepted test groups ran. Every loss is listed and blocks
+promotion. Their causes are not all resolved. The unfinished reference-flow
+draft adds three lost accepted passes to the previous full comparison.
+
+The [upstream checks](../target/query-core-integration-baseline-2-corpus-result.md)
+found a more serious problem. The fixed diagnostic selection aborted with a
+stack overflow and wrote no report. The crashing case is not yet identified.
+The separate 95-variant type/symbol selection completed. It retained 57 of 60
+old exact diagnostic records, 52 of 55 exact type results and 58 of 62 exact
+symbol results. New exact results do not offset these losses. One formerly
+exact variant now has a fatal invariant.
+
+Query is still at 2 of 23 isolated roots complete. Ordinary checking does not
+complete. The [bounded observation](../target/query-core-inherited-interface-observation-1-result.md)
+confirms that full global-annotation preflight rejects the method signature
+before selected-property lookup. All 244 non-runtime records are unchanged.
+The observation was removed. The base type also needs merged generic
+class/interface handling, not only an interface-heritage guard change.
+
+All runtime checks are closed. The integration source remains at `de557d99c`
+with the preserved six-file reference-flow draft. No production change or test
+expectation changed in this work block. Nothing was promoted. One implementer
+and one reviewer remain the work model.
+
+Next, identify and repair the corpus stack overflow under the same limits.
+Then continue Query's shared declared-value and inherited-member operation.
+Keep the regression list open until each loss is repaired or has concrete
+pinned-Go evidence for a changed contract. This checkpoint improves the
+baseline and diagnosis, not Query's completed-project result.
+
+## Previous implementation checkpoint
+
 The integration branch is at `de557d99c`. The merged global variable-and-namespace
 repair is committed, following a test-helper rename in `6f7319419`. The separate
 six-file reference-flow draft remains uncommitted. Nothing is promoted to the
