@@ -138,9 +138,11 @@ existing diagnostic builder. The conditional-call test remains unchanged.
 The branch for Tests 50 and Query 30 passed integration review at `5bb26fd0`.
 It has these Query fixes and the Hono identity repair. All 185 old focused cases
 are unchanged. Four new test files add 13 cases, for 198 cases in 74 targets.
-The runtime checks are not yet complete. Added tests are not recovered tests.
+Both attempts then failed Rust compilation with E0015 in `source_flow.rs`.
+All 198 tests and all 23 Query roots were unrun. Root committed the one-line
+const-compatible panic fix as `6ddc80a7`. Added tests are not recovered tests.
 
-Four more pairs address independent Query failures: forward closure references
+Four more pairs completed repairs for independent Query failures: forward closure references
 in `retryer.ts`, a generic DOM reference, callback parameters in local
 initializers and returns, and generic interface references in `types.ts`.
 Each pair has its own worktree and separate source and test owners. They check
@@ -151,11 +153,12 @@ Hono 22's recorded `ContextVariableMap` failure. The old failure came from its
 JWT augmentation, and both unchanged JWT controls now pass. No duplicate fix
 or test was added. The new full Hono census must measure its current root result.
 
-Tests 50 and Query 30 are scheduled with the new full Hono census. The broad
-checker library run uses Query 30's slot after it closes. The next integration
-branch already has three reviewed pairs ready: forward closure references,
-merged DOM and Node generic references, and callback parameter source positions.
-Those fixes are committed but unmeasured.
+The next runs use the reviewed Tests 51 branch at `c07bc5e1`, including the
+compile fix and all four additional Query repairs. Its roster is 77 targets and 208
+cases. Tests 49 remains the measured baseline, with 185 cases. The 23 added
+cases must be reported separately. Query 31 compares with completed Query 29.
+The full Hono census starts alongside them. The broad library run then uses
+Query 31's slot. These repairs are committed but unmeasured.
 
 The Buffer change follows the pinned Go rule that a global augmentation can
 retain its module parent. A separate public test checks the real global table
