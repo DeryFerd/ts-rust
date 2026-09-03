@@ -5,23 +5,27 @@ Updated 2026-09-02. Neither Query nor Hono has passed a full Rust type check.
 ## Current result
 
 Project completion has not advanced in the latest measured comparisons.
-The latest focused batch recovered four unchanged tests with no lost pass.
+Focused tests have improved, but the latest batch lost two symbol-query passes
+and is held from acceptance.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
-| Query core, census 24 | 2 of 23 isolated roots complete | All 23 outcomes unchanged from census 23 |
+| Query core, census 25 | 2 of 23 isolated roots complete | Three failures moved, no complete gain or loss |
 | Hono, last complete census 22 | 33 of 188 isolated roots complete | Latest ordinary check failed after 23m48s |
-| Focused tests, run 44 | 157 pass, 24 fail | Four unchanged recoveries, one corrected test passes, no lost pass |
+| Focused tests, run 45 | 158 pass, 23 fail | Two initializer recoveries, two lost symbol-query passes, one corrected test passes |
 | Checker library, run 5 | 5,072 pass, 365 fail | Three recoveries since run 3, no pass lost |
 
 An isolated root is one original entry file checked on its own. These counts
 are not full-project passes or percentages of TypeScript support.
 
-[Query 24](../target/wave202-query-combined-census-24-result.md) checked all
-23 roots in 92.867 seconds. Only `index.ts` and `subscribable.ts` complete.
+[Query 25](../target/wave202-query-combined-census-25-result.md) checked all
+23 roots in 15.910 seconds. Only `index.ts` and `subscribable.ts` complete.
 The ordinary project check still rejects the class in `timeoutManager.ts`.
-The two cache files get further, but now reject imported `Mutation` and `Query`
-class type references. Neither cache file completes.
+The two cache files get past their own imported class annotations, then reject
+type references inside `mutation.ts` and `query.ts`. `queryClient.ts` reaches a
+later generic reference failure. No complete file was gained or lost.
+Compilation took a separate 5m47s. Both code and optimization changed since
+Query 24, so the faster census is not an isolated optimization result.
 
 [Tests 42](../target/wave202-query-hono-combined-tests-42-result.md) compiled
 all 66 targets and ran all 181 tests. No old pass was lost. Neither new test
@@ -42,11 +46,19 @@ test was lost. The corrected zero-argument test also passed, counted separately.
 The corrected cache-import test still fails. Other remaining failures include
 generic inheritance, JWT union caches, and nullish callback calls.
 
-There is narrower progress inside two failing groups. The observer tests now
-get past imported-class completion and stop at a type-reference query. The
-initializer tests now finish source checking, native diagnostics, return types
-and location queries, then fail a symbol-identity assertion. Neither group is
-a complete test pass yet.
+[Run 45](../target/wave202-query-hono-combined-tests-45-result.md) completed
+all 181 cases. Both initializer cases now pass. Two previously passing
+merged type/value symbol cases fail a public symbol-query assertion. A pair
+reviewed those failures against the pinned Go behavior. Both reviewers found
+that the old public expectation returns a lexical marker where Go returns the
+real export owner. Their proposed test correction is not yet approved or run.
+The tests remain failed and the batch is not accepted. A later `typeof` query
+has a separate discrepancy. The corrected imported-class heritage case passed
+separately.
+
+In run 43, the observer tests got past imported-class completion and stopped
+at a type-reference query. The initializer tests reached a symbol-identity
+assertion. Run 45 now passes both initializer cases. The observer cases still fail.
 
 The three default-parameter tests passed but took 301.03 seconds. That is a
 separate performance problem. Their repeated trace records are recoverable
@@ -61,8 +73,10 @@ are repaired, and all three affected tests pass in run 5.
 
 Query 24 and Tests 42 use `d22177564dc5846eb2e493d60bdda860e38e0c54`.
 Tests 43 uses `c8cbfdf383fe368daff5a388f71093e043129939`.
+Tests 44 and Query 25 use `7e3d586a3fc6ef8df0ffc3869105ae17292df240`.
+Tests 45 uses `031565fd3500fc6411eae5427b0c589064d22705`.
 Library 5 uses `9ed1608143cc76e2f4df831dcf1fd580490a69d7`, which has the
-earlier production bytes plus the test API repairs. All four runs are closed.
+earlier production bytes plus the test API repairs. These runs are closed.
 
 ### Why the demo has not advanced
 
@@ -94,8 +108,8 @@ result is a complete original project check with correct diagnostics.
 Query remains the first demo target. The 181-test run with the observer-class
 and initializer return-query repairs is complete. Run 44 also completed with
 optimization level 1 and the same safety checks. It kept 179 cases unchanged
-and tracked two corrected tests separately. The unchanged Query census is now
-running on that same source. Run 44's compilation took 6m02s. Its three default
+and tracked two corrected tests separately. Query 25 completed on that source
+without a complete-file gain. Run 44's compilation took 6m02s. Its three default
 tests passed in 29.35 seconds, but both code and optimization changed since run 43.
 
 Root committed a seven-line generic-alias repair after an observation identified
@@ -108,18 +122,31 @@ A separate seven-test diagnostic run located failing operations in DOM indexed
 access, local Set library types and returned async imports. It recovered no
 test. Those repairs are now signed and reviewed. Run 45's separate integration
 also adds observer callback replay, an early exit for irrelevant object-binding
-probes, and public export-symbol lookup. The tests have not run on this batch.
+probes, and public export-symbol lookup. That batch is now measured, with the
+two symbol-query failures above. Query 26 is now running to measure its project
+behavior, but that measurement cannot approve the source batch.
+
+Two repair pairs now work on proved failures. One retains optional parameters
+in authenticated generic-method calls. The other requests checking of an imported
+class before a consumer uses its members. Both preserve existing validators,
+tests and project inputs. Neither repair has run yet.
 
 Root committed a further 17-line intersection repair and joined the separate
 Omit repair. The property-type validator now uses the existing intersection
 mapper checks. The Omit repair keeps source context alive through inherited
-property checks. Their three unchanged tests will run together. A changed
-failure location is still not a complete case pass.
+property checks. Review of the pinned Go source guided the intersection repair.
+The first combined build failed because the bridge passed the
+wrong Rust options type. That is fixed. The next run compiled but still has one
+pass and two failures. Neither complete case recovered. Further diagnosis must
+identify the actual remaining failed checks, not infer them from type IDs.
 
 Hono's next measurement needs complete ownership-error coverage and aggregate
 stage timings. The previous trace missed ten error constructors. No optimized
-Hono run has happened. A separate cost audit checks what the saved build records
-can prove about compiler and test-harness rebuild time.
+Hono run has happened. The complete error-tracing change passed source review
+but has not run.
+A separate controlled experiment has started its one-job baseline. It will
+compare one and two Cargo jobs with fixed source, tests, safety checks and
+memory limits. It has no result yet.
 
 Integration and routine test-run review now have direct worker handoffs. Root
 does not need to repeat an unchanged run review. Source fixes, test corrections
