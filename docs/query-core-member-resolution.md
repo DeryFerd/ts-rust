@@ -105,10 +105,11 @@ Sixteen disjoint [accepted-loss audits](../target/query-core-accepted-failure-au
 account for all 286 full-1 losses against the accepted roster. Ten now pass.
 The remaining 263 failures and 13 absent names stay open. Source comparisons
 do not waive an entire test when a private branch remains unobserved.
-Seven more workers checked the next typeof operation, public controls, counts
-and the trace patch. Keep one production writer and one code reviewer. Give
-extra workers bounded source and evidence checks. Do not promote the checkpoint
-while any regression is unresolved.
+Nine more workers checked the next typeof operation, public controls, counts,
+session handling and the trace patch. The [type-query plan](query-core-type-query.md)
+records the next shared operation. Keep one production writer and one code
+reviewer. Give extra workers bounded source and evidence checks. Do not promote
+the checkpoint while any regression is unresolved.
 
 ## What the source comparison established
 
