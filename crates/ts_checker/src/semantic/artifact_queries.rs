@@ -541,6 +541,9 @@ impl CanonicalCheckerContext<'_> {
             )
             && let Some(symbol) = self.cached_artifact_symbol(node)?
         {
+            if matches!(parent, None | Some(LocationParent::ElementAccess(_))) {
+                return self.expression_export_artifact_symbol(node, symbol).map(Some);
+            }
             return Ok(Some(symbol));
         }
 
@@ -2278,6 +2281,86 @@ impl CanonicalCheckerContext<'_> {
         self.store()
             .get_merged_symbol(symbol)
             .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })
+    }
+
+    fn expression_export_artifact_symbol(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<SemanticSymbolId, CanonicalArtifactQueryError> {
+        let (_, _, record) = self.validated_artifact_node(node)?;
+        let NodeData::Identifier(identifier) = &record.data else {
+            return Ok(symbol);
+        };
+        let Some(parent) = record.parent else {
+            return Ok(symbol);
+        };
+        let (_, _, parent) =
+            self.validated_artifact_node(NodeRef::new(node.arena, node.file, parent))?;
+        if is_type_syntax(&parent.data)
+            || matches!(
+                parent.data,
+                NodeData::QualifiedName(_)
+                    | NodeData::ImportEqualsDeclaration(_)
+                    | NodeData::ExportAssignment(_)
+                    | NodeData::ExpressionWithTypeArguments(_)
+            )
+        {
+            return Ok(symbol);
+        }
+        let invalid = || CanonicalArtifactQueryError::InvalidSymbol { node, symbol };
+        let local = self.store().symbol(symbol).ok_or_else(invalid)?;
+        if local.flags() != SymbolFlags::EXPORT_VALUE {
+            return Ok(symbol);
+        }
+        let raw_export = local.export_symbol().ok_or_else(invalid)?;
+        let export = self.merged_artifact_symbol(node, raw_export)?;
+        let raw_record = self.store().symbol(raw_export).ok_or_else(invalid)?;
+        let export_record = self.store().symbol(export).ok_or_else(invalid)?;
+        let declarations = local.declarations().ok_or_else(invalid)?;
+        if declarations.is_empty()
+            || local.check_flags() != ts_binder::CheckFlags::NONE
+            || local.name() != EscapedNameRef::source(&identifier.text)
+            || local.value_declaration().is_some()
+            || local.parent().is_some()
+            || local.members().is_some()
+            || local.exports().is_some()
+            || self.store().get_merged_symbol(symbol) != Some(symbol)
+            || !raw_record.flags().intersects(SymbolFlags::VALUE)
+            || !export_record.flags().intersects(SymbolFlags::VALUE)
+            || raw_record
+                .flags()
+                .intersects(SymbolFlags::ALIAS | SymbolFlags::EXPORT_VALUE)
+            || export_record
+                .flags()
+                .intersects(SymbolFlags::ALIAS | SymbolFlags::EXPORT_VALUE)
+        {
+            return Err(invalid());
+        }
+        for (index, &declaration) in declarations.iter().enumerate() {
+            let (_, bound, _) = self.validated_artifact_node(declaration)?;
+            if declarations[..index].contains(&declaration)
+                || bound.local_symbol(declaration) != Some(symbol)
+                || bound.symbol(declaration) != Some(raw_export)
+                || raw_record
+                    .declarations()
+                    .is_none_or(|rows| !rows.contains(&declaration))
+                || export_record
+                    .declarations()
+                    .is_none_or(|rows| !rows.contains(&declaration))
+            {
+                return Err(invalid());
+            }
+        }
+        // Source checks retain the local export marker. Public value lookup
+        // skips that marker and returns the real exported declaration symbol.
+        if self.lexical_artifact_symbol(node, SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE)?
+            != Some(symbol)
+            || self.lexical_artifact_symbol(node, SymbolFlags::VALUE)? != Some(export)
+        {
+            return Err(invalid());
+        }
+        Ok(export)
     }
 
     fn module_declaration_artifact_type(
