@@ -3434,6 +3434,13 @@ impl PlannedCallableStatementList {
                 PlannedCallableStatement::Leaf(
                     PlannedLinearFunctionStatement::CompoundParameterAssignment(assignment),
                 ) => expressions.push(&assignment.right),
+                PlannedCallableStatement::Leaf(
+                    PlannedLinearFunctionStatement::ElementAssignment { assignment, .. },
+                ) => expressions.extend([
+                    &assignment.element.receiver,
+                    &assignment.element.index,
+                    &assignment.right,
+                ]),
                 PlannedCallableStatement::Return {
                     expression: Some(expression),
                     ..
@@ -17888,6 +17895,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 &mut logical_conditions,
                             );
                         }
+                        PlannedLinearFunctionStatement::ElementAssignment { assignment, .. } => {
+                            for expression in [
+                                &assignment.element.receiver,
+                                &assignment.element.index,
+                                &assignment.right,
+                            ] {
+                                collect_eager_logical_truthiness_conditions(
+                                    expression,
+                                    &mut logical_conditions,
+                                );
+                            }
+                        }
                         PlannedLinearFunctionStatement::Expression { expression, .. } => {
                             collect_eager_logical_truthiness_conditions(
                                 expression,
@@ -17984,6 +18003,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
         }
         for node in callable_statement_nodes(&statements) {
+            if let PlannedCallableStatement::Leaf(
+                PlannedLinearFunctionStatement::ElementAssignment { assignment, .. },
+            ) = node {
+                for expression in [
+                    &assignment.element.receiver,
+                    &assignment.element.index,
+                    &assignment.right,
+                ] {
+                    nullish.extend(
+                        nullish_expression_assignments(expression)
+                            .into_iter()
+                            .map(|(assignment, _)| assignment),
+                    );
+                    calls.extend(
+                        nullish_expression_calls(self.bound, expression)
+                            .into_iter()
+                            .map(|call| call.node),
+                    );
+                }
+            }
             let expression = match node {
                 PlannedCallableStatement::ObjectBinding(binding) => Some(&binding.initializer),
                 PlannedCallableStatement::ArrayBinding(binding) => Some(&binding.initializer),
@@ -18125,6 +18164,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         expression,
                     },
                 ) => {
+                    if let Some(assignment) =
+                        self.plan_linear_element_assignment(callable, *statement, *expression)?
+                    {
+                        statements.push(PlannedCallableStatement::Leaf(assignment));
+                        continue;
+                    }
                     if callable.family == SourceCallableFamily::ArrowFunction
                         && let Some((store, host)) = self.semantic
                         && super::source_flow::source_member_assignment_proof(
@@ -49398,6 +49443,87 @@ struct CheckedAssignment {
 }
 
 #[allow(clippy::too_many_arguments)] // Retains the source checker session and exact child plans.
+fn check_planned_callable_element_assignment(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    frame: &mut SourceFlowFrame<'_, '_>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    assignment: &PlannedElementAssignment,
+    flow: super::source_flow::SourceElementAssignmentProof,
+    class_flow: Option<&mut ClassBodyExecutionContext<'_, '_, '_>>,
+    arrow_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<(), SourceCheckError> {
+    let snapshot = frame
+        .snapshot_at(store, global_types, flow.statement)
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    let receiver = snapshot
+        .types()
+        .get(&flow.symbol)
+        .copied()
+        .ok_or_else(|| SourcePlanner::unsupported_function_body(callable))?;
+    // Typed arrays retain their receiver type. Evolving arrays need element inference.
+    if store
+        .canonical_array_reference(global_types, receiver)?
+        .is_none()
+    {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    }
+    check_planned_element_assignment_with_capture_context(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        snapshot.types(),
+        type_import_execution,
+        deferred,
+        assignment,
+        class_flow,
+        arrow_capture,
+    )?;
+    if store
+        .type_node_links(flow.receiver)
+        .and_then(|links| links.resolved_type)
+        != Some(receiver)
+    {
+        return Err(SourceCheckError::Element(flow.target));
+    }
+    for expression in [
+        &assignment.element.receiver,
+        &assignment.element.index,
+        &assignment.right,
+    ] {
+        complete_nullish_assignment_effects(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            frame,
+            type_import_execution,
+            expression,
+            snapshot.types(),
+        )?;
+    }
+    for target in flow.targets() {
+        frame
+            .complete_assignment(target, flow.symbol, receiver)
+            .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn check_planned_element_assignment(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -57447,22 +57573,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
                 return Err(SourcePlanner::unsupported_function_body(callable));
             }
             PlannedLinearFunctionStatement::ElementAssignment { assignment, flow } => {
-                let snapshot = frame
-                    .snapshot_at(store, global_types, flow.statement)
-                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-                let receiver = snapshot
-                    .types()
-                    .get(&flow.symbol)
-                    .copied()
-                    .ok_or_else(|| SourcePlanner::unsupported_function_body(callable))?;
-                // Typed arrays retain their receiver type. Evolving arrays need element inference.
-                if store
-                    .canonical_array_reference(global_types, receiver)?
-                    .is_none()
-                {
-                    return Err(SourcePlanner::unsupported_function_body(callable));
-                }
-                check_planned_element_assignment_with_capture_context(
+                check_planned_callable_element_assignment(
                     store,
                     host,
                     global_types,
@@ -57470,43 +57581,15 @@ fn check_planned_linear_function_statements_with_capture_entries(
                     options,
                     session,
                     diagnostics,
-                    snapshot.types(),
+                    &mut frame,
                     type_import_execution,
                     deferred,
+                    callable,
                     assignment,
+                    *flow,
                     class_flow.as_deref_mut(),
                     arrow_capture,
                 )?;
-                if store
-                    .type_node_links(flow.receiver)
-                    .and_then(|links| links.resolved_type)
-                    != Some(receiver)
-                {
-                    return Err(SourceCheckError::Element(flow.target));
-                }
-                for expression in [
-                    &assignment.element.receiver,
-                    &assignment.element.index,
-                    &assignment.right,
-                ] {
-                    complete_nullish_assignment_effects(
-                        store,
-                        host,
-                        global_types,
-                        options,
-                        session,
-                        diagnostics,
-                        &mut frame,
-                        type_import_execution,
-                        expression,
-                        snapshot.types(),
-                    )?;
-                }
-                for target in flow.targets() {
-                    frame
-                        .complete_assignment(target, flow.symbol, receiver)
-                        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-                }
             }
             PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
                 let current_type = check_planned_parameter_assignment(
@@ -59741,6 +59824,9 @@ fn check_callable_statement_nodes(
                         PlannedLinearFunctionStatement::CompoundParameterAssignment(assignment) => {
                             assignment.right.node
                         }
+                        PlannedLinearFunctionStatement::ElementAssignment { assignment, .. } => {
+                            assignment.expression
+                        }
                         _ => callable.body,
                     };
                     trace_callable_body_error("body.statement-check", node, host.node(node));
@@ -59805,6 +59891,17 @@ fn check_callable_statement_nodes(
                             callable,
                             &assignment.right,
                         )?
+                    }
+                    PlannedLinearFunctionStatement::ElementAssignment { assignment, .. } => {
+                        for expression in [
+                            &assignment.element.receiver,
+                            &assignment.element.index,
+                            &assignment.right,
+                        ] {
+                            check_callable_statement_expression_effects(
+                                store, host, callable, expression,
+                            )?;
+                        }
                     }
                     _ => return Err(SourcePlanner::unsupported_function_body(callable)),
                 }
@@ -60623,6 +60720,25 @@ fn check_planned_function_statement_prefix_with_capture_context(
                     deferred,
                     callable,
                     assignment,
+                    arrow_capture,
+                )?;
+            }
+            PlannedLinearFunctionStatement::ElementAssignment { assignment, flow } => {
+                check_planned_callable_element_assignment(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    frame,
+                    type_import_execution,
+                    deferred,
+                    callable,
+                    assignment,
+                    *flow,
+                    None,
                     arrow_capture,
                 )?;
             }

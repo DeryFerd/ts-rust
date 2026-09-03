@@ -2425,6 +2425,39 @@ struct SourceFlowEffects {
     region_points: HashMap<NodeRef, FlowRef>,
 }
 
+fn prepare_element_assignment(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    proof: SourceElementAssignmentProof,
+    effects: &mut SourceFlowEffects,
+    assignments: &mut Vec<SourceFlowAssignment>,
+) -> Result<(), SourceFlowError> {
+    if proof.container != container
+        || source_element_assignment_proof(store, host, proof.expression)? != Some(proof)
+        || effects
+            .element_assignments
+            .insert(proof.expression, proof)
+            .is_some()
+    {
+        return Err(SourceFlowInvariant::InvalidArrayMutation(proof.expression).into());
+    }
+    for target in proof.targets() {
+        if effects
+            .assignment_declarations
+            .insert(target, proof.declaration)
+            .is_some()
+        {
+            return Err(SourceFlowInvariant::DuplicateAssignment(target).into());
+        }
+        assignments.push(SourceFlowAssignment {
+            declaration: target,
+            symbol: proof.symbol,
+        });
+    }
+    Ok(())
+}
+
 const TRUE_CONDITION_EDGE: u8 = 1 << 0;
 const FALSE_CONDITION_EDGE: u8 = 1 << 1;
 const BOTH_CONDITION_EDGES: u8 = TRUE_CONDITION_EDGE | FALSE_CONDITION_EDGE;
@@ -2864,6 +2897,14 @@ impl SourceFlowPlan {
             ..SourceFlowEffects::default()
         };
         for expression in syntax.expression_statements() {
+            if let Some(proof) = source_element_assignment_proof(store, host, expression)? {
+                if syntax.expression_scope(expression) != bound.block_scope_container(expression) {
+                    return Err(SourceFlowInvariant::InvalidArrayMutation(expression).into());
+                }
+                prepare_element_assignment(
+                    store, host, container, proof, &mut effects, &mut assignments,
+                )?;
+            }
             if let Some(proof) = source_member_assignment_proof(store, host, expression)? {
                 if proof.container != container
                     || syntax.expression_scope(expression)
@@ -3751,28 +3792,9 @@ impl SourceFlowPlan {
         let mut effects = SourceFlowEffects::default();
         for proof in element_assignments {
             let host = host.ok_or(SourceFlowInvariant::InvalidArrayMutation(proof.expression))?;
-            if proof.container != container
-                || source_element_assignment_proof(store, host, proof.expression)? != Some(proof)
-                || effects
-                    .element_assignments
-                    .insert(proof.expression, proof)
-                    .is_some()
-            {
-                return Err(SourceFlowInvariant::InvalidArrayMutation(proof.expression).into());
-            }
-            for target in proof.targets() {
-                if effects
-                    .assignment_declarations
-                    .insert(target, proof.declaration)
-                    .is_some()
-                {
-                    return Err(SourceFlowInvariant::DuplicateAssignment(target).into());
-                }
-                planned_assignments.push(SourceFlowAssignment {
-                    declaration: target,
-                    symbol: proof.symbol,
-                });
-            }
+            prepare_element_assignment(
+                store, host, container, proof, &mut effects, &mut planned_assignments,
+            )?;
         }
         for assignment in parameter_assignments {
             validate_parameter_assignment(arena, bound, store, host, container, assignment)?;
