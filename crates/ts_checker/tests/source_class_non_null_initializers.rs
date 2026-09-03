@@ -354,3 +354,148 @@ fn generic_non_null_operands_keep_the_unsupported_type_without_publication() {
         assert_replay(&mut checker, &parsed, &fields, Some(&error));
     }
 }
+
+#[test]
+fn non_null_initializers_preserve_template_string_mapping_and_keyof_types() {
+    use ts_checker::semantic::types::TypeFlags;
+
+    const LIBRARY: FileId = FileId::new(203_212);
+    let library = parse_source_file(include_str!("../../ts_bundled/libs/lib.es5.d.ts"));
+    let parsed = parse_source_file(concat!(
+        "declare const pattern: `item:${string}` | undefined;\n",
+        "declare const mapped: Uppercase<string>;\n",
+        "class Preserved<T> {\n",
+        "  pattern: `item:${string}` = pattern!;\n",
+        "  mapped: Uppercase<string> = mapped!;\n",
+        "  key: keyof T = undefined!;\n",
+        "  keptKey: keyof T = this.key!;\n",
+        "}\n",
+    ));
+    let files = [
+        (LIBRARY, &library, "\"/lib/lib.es5.d.ts\""),
+        (FILE, &parsed, "\"/project/non-null-string-and-key.ts\""),
+    ];
+    let mut binder = CanonicalBinder::new();
+    for (file, parsed, path) in files {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source(path),
+                    CanonicalSourceLanguage::TypeScript,
+                    file == LIBRARY,
+                    file == LIBRARY,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+    }
+    for (file, parsed, _) in files {
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+    }
+    let mut checker = CanonicalCheckerContext::new(
+        binder.finish(),
+        files
+            .into_iter()
+            .map(|(file, parsed, _)| (file, &parsed.arena))
+            .collect(),
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            strict_property_initialization: true,
+            no_implicit_any: true,
+            name_resolution: CanonicalNameResolverOptions {
+                emit_target: ScriptTarget::Es2015,
+                ..CanonicalNameResolverOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        },
+    )
+    .unwrap();
+    checker.check_source_file(FILE).unwrap();
+    assert!(
+        checker.diagnostics().is_empty(),
+        "{:?}",
+        checker.diagnostics(),
+    );
+
+    let pattern = field(&parsed, "pattern");
+    let mapped = field(&parsed, "mapped");
+    let key = field(&parsed, "key");
+    let kept_key = field(&parsed, "keptKey");
+    for field in [&pattern, &mapped, &kept_key] {
+        let expected = cached_type(&checker, field.annotation);
+        assert_eq!(cached_type(&checker, field.initializer), expected);
+        assert_eq!(checker.get_type_at_location(field.name).unwrap(), expected);
+    }
+    let bootstrap = checker.store().intrinsic_bootstrap().unwrap();
+    let (string, undefined, never) = (
+        bootstrap.string_type,
+        bootstrap.undefined_type,
+        bootstrap.never_type,
+    );
+    let pattern_type = cached_type(&checker, pattern.initializer);
+    let record = checker.store().type_payload(pattern_type).unwrap();
+    assert_eq!(record.flags(), TypeFlags::TEMPLATE_LITERAL);
+    let TypeData::TemplateLiteral(template) = record.data() else {
+        panic!("the pattern must keep its template type");
+    };
+    assert_eq!(template.texts, ["item:", ""]);
+    assert_eq!(template.types, [string]);
+    let operand = cached_type(&checker, pattern.operand);
+    let TypeData::Union(union) = checker.store().type_payload(operand).unwrap().data() else {
+        panic!("the pattern operand must retain undefined");
+    };
+    assert_eq!(union.union.types.len(), 2);
+    assert!(union.union.types.contains(&pattern_type));
+    assert!(union.union.types.contains(&undefined));
+
+    let mapped_type = cached_type(&checker, mapped.initializer);
+    assert_eq!(cached_type(&checker, mapped.operand), mapped_type);
+    let record = checker.store().type_payload(mapped_type).unwrap();
+    assert_eq!(record.flags(), TypeFlags::STRING_MAPPING);
+    let TypeData::StringMapping(mapping) = record.data() else {
+        panic!("the mapped string must keep its mapping type");
+    };
+    assert_eq!(mapping.target, string);
+    let owner = checker.store().symbol(record.symbol().unwrap()).unwrap();
+    assert_eq!(owner.name().as_utf8(), Some("Uppercase"));
+    let [declaration] = owner.declarations().unwrap() else {
+        panic!("Uppercase must keep its actual library declaration");
+    };
+    assert!(declaration.is_for(library.arena.id(), LIBRARY));
+    let NodeData::TypeAliasDeclaration(alias) =
+        &library.arena.get(declaration.node).unwrap().data
+    else {
+        panic!("Uppercase must be the bundled type alias");
+    };
+    let NodeData::Identifier(name) = &library.arena.get(alias.name).unwrap().data else {
+        panic!("the bundled alias must have a name");
+    };
+    assert_eq!(name.text, "Uppercase");
+
+    let key_type = cached_type(&checker, kept_key.initializer);
+    assert_eq!(cached_type(&checker, key.annotation), key_type);
+    assert_eq!(cached_type(&checker, kept_key.operand), key_type);
+    assert_eq!(cached_type(&checker, key.initializer), never);
+    let record = checker.store().type_payload(key_type).unwrap();
+    assert_eq!(record.flags(), TypeFlags::INDEX);
+    let TypeData::Index(index) = record.data() else {
+        panic!("keyof T must retain its index type");
+    };
+    let formal = symbol(&checker, only(&parsed, SyntaxKind::TypeParameter));
+    assert_eq!(
+        checker.store().type_payload(index.target).unwrap().symbol(),
+        Some(formal),
+    );
+    let fields = [&pattern, &mapped, &key, &kept_key]
+        .map(|field| symbol(&checker, field.declaration));
+    assert_replay(&mut checker, &parsed, &fields, None);
+}
