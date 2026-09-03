@@ -9,13 +9,28 @@ project has gained a complete isolated root in the latest comparisons.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
-| Query core, census 33 | 2 of 23 isolated roots complete | Nine completed censuses without a new complete root. Six invariant failures |
+| Query core, replacement census 34 | 2 of 23 isolated roots complete | All six prior invariant failures clear. No complete-root gain |
 | Hono, census 24 | 33 of 188 isolated roots complete | No complete-root gains. Internal errors fell from 6 to 2, becoming unsupported stops |
 | Focused tests, run 53 | 177 pass, 31 fail | One unchanged case recovered, no old pass lost. New cases: 11 pass, 12 fail |
-| Checker library, run 7 | 5,068 pass, 369 fail | Seven lost passes, three recoveries. Source acceptance remains blocked |
+| Checker library, sort run 1 | 5,071 pass, 366 fail | Three recoveries and no lost passes against library run 7. Source acceptance remains blocked |
 
 An isolated root is one original entry file checked on its own. These counts
 are not full-project passes or percentages of TypeScript support.
+
+[Replacement Query 34](../target/wave202-query-combined-census-34-result.md)
+ran after Query 35. It tests the class repair and has 21 unsupported roots
+with no invariant failures. Five roots now get past their prior `removable.ts`
+failure and stop at a heritage clause in `timeoutManager.ts`. The constructor
+failure in `mutationObserver.ts` also clears, exposing an import-alias limit.
+All 244 records and project inputs match Query 33. The census took 18.684
+seconds after a 1m53s build. No additional root completes.
+
+[Query 35](../target/wave202-query-combined-census-35-result.md) checks the
+callback repair against Query 32. It still has 20 unsupported roots and one
+invariant failure. Only `hydration.ts` changes, from an unsupported function
+body to the optional call `thenResult?.catch?.(noop)`. The other 22 outcomes
+and all recorded project inputs match. The census took 18.370 seconds after
+a 1m54s build. This source does not include the separate class-condition fix.
 
 [Query 32](../target/wave202-query-combined-census-32-result.md) completed all
 23 roots and 244 records with unchanged project inputs. It has 20 unsupported
@@ -37,8 +52,8 @@ project run stays held until that control passes.
 188 roots with unchanged recorded inputs. It has 152 unsupported roots,
 two internal errors and one original skip. The same 33 roots complete.
 The ordinary check still fails in `http-exception.ts`. A separate observation
-identifies the reported symbol as the merged global `Response`. Its precise
-rejecting guard is still under investigation. The complete census took
+identifies the reported symbol as the merged global `Response`. Ordinary5
+below measures the later ownership repair. The complete census took
 716.068 seconds after a 1m58s build.
 
 [Hono ordinary 5](../target/wave202-hono-ordinary-5-result.md) clears the
@@ -51,8 +66,11 @@ or replay, and does not establish a completed file or project.
 [Tests 53](../target/wave202-query-hono-combined-tests-53-result.md) ran all
 208 cases in 77 targets. The 185 old cases have 166 passes and 19 failures.
 The unchanged conditional-call diagnostic case recovered. The 23 new cases
-have 11 passes and 12 failures. Two new callback cases hit a provenance
-publication debug assertion. These failures still need repair.
+have 11 passes and 12 failures. Two callback cases hit a provenance publication
+debug assertion. Both later recover in the unchanged
+[callback-owner1 tests](../target/wave202-callback-owner-1-result.md).
+That run passes five unchanged cases and three new captured-write cases.
+One helper-corrected case still fails during arrow parameter checking.
 
 [Library 6](../target/wave202-query-hono-checker-lib-6-result.md) failed to
 compile its test harness. A test-only `SourceFlowPlan` initializer lacks the
@@ -64,8 +82,16 @@ Normal-library compilation did not catch this test-only error.
 and three recoveries against run 5. One loss is a real sort-callback routing
 regression. Another is only map ordering in a debug snapshot. The remaining
 five involve changed support, member state, or an unsupported-error category
-and need further checks. All seven remain measured failures. No test
-expectation has changed, and the source batch is not accepted.
+and need further checks. All seven were failures at that checkpoint. No test
+expectation changed, and the source batch was not accepted.
+
+[Sort run 1](../target/wave202-sort-call-route-1-result.md) runs all 5,437
+library cases on the sort repair. It recovers the unchanged sort-callback case
+and a class-method array-target query. The debug-order case also passes, but
+the sort repair does not fix its unstable output order. No old pass is lost.
+One new callback diagnostic control passes. The new positive/custom-method
+control fails on a method signature before its later assertions. It remains
+unchanged and is not counted as a pass.
 
 The [constructor repair](../target/wave202-constructor-trailing-comma-1-result.md)
 passes both new tests. [Generic defaults, run 3](../target/wave202-function-parameter-default-3-result.md)
@@ -74,15 +100,59 @@ numeric controls retain their passes. The remaining new case fails a
 contextual literal identity check. Its expected result matches the pinned Go
 checker. These focused gains are not complete-project gains.
 
+## Active repairs
+
+[Class-condition3](../target/wave202-class-condition-3-result.md) passes all
+five unchanged tests. One case recovers and no pass is lost. The last repair
+uses the existing optional-read helper for `label?: string`, while leaving
+field storage and assignment rules unchanged. The complete test now passes
+its original branch-type, TS2345, ownership and replay assertions.
+
+[Both merged-global property controls](../target/wave202-merged-global-property-2-result.md)
+now pass on commit `c8597243`. The eight-line repair reuses the existing
+global-owner check instead of rejecting
+a second global value declaration early. The fixed tests check both interface
+members, the value's prototype, the incompatible-assignment diagnostic and
+repeat queries. Hono still fails in a separate property-read query without
+the source context needed to request interface heritage information. These
+controls do not prove a Hono project pass.
+
+The [shared-expression change](../target/wave202-shared-value-expression-1-result.md)
+is committed and passes compilation for the library and all three selected
+public test targets. Those tests have not run on this change.
+It removes duplicate call-argument syntax checks, shares class child traversal,
+and uses binder ownership for direct callbacks. The existing expression
+planner and evaluator remain in use. Context, flow and Array.sort routing
+must remain correct in the combined tests.
+
+The class, callback, global and debug-output fixes are combined on the measured
+sort branch at `f253d469`. Review confirms that all donor changes and public
+tests are preserved. This combined candidate has not run its tests. The
+shared-expression change is now being added after its compiler check passed.
+Diagnostic code and unfinished optional-call or generic-return work stay
+outside this candidate.
+
+The [debug-output repair](../target/wave202-symbol-table-debug-1-result.md)
+passes its new public test and the unchanged alias snapshot test. It sorts
+symbol names only when printing debug output. It does not change type checking
+or count as a project gain.
+
+The [Hono observation](../target/wave202-hono-member-readiness-observation-1-result.md)
+identifies the next failure as missing interface heritage information during
+a property read without source-query context. The existing source-aware query
+can request that information. The missing caller is not yet identified, so
+there is no reviewed production fix or new Hono pass for this failure.
+
 ## Next project milestones
 
-1. Finish the shared `removable.ts` path used by five Query roots. Check each
-   small repair on the real project immediately. A changed first error is not
+1. Resolve the `timeoutManager.ts` heritage failure now shared by five Query
+   roots. Check the repair on the real project. A changed first error is not
    completion. The next useful result is a complete root with correct checking.
 2. Resolve the members needed by Hono's next type comparison. Keep the exact
    declaration ownership and use the existing member-resolution path.
-3. Keep the compiler and test harness buildable. Integrate small tested changes
-   instead of collecting another large batch of uncompiled worker changes.
+3. Run the combined candidate's focused tests and regression checks, then check
+   the unchanged projects. Do not wait for the separate optional-call and
+   generic-return repairs to finish before measuring the combined changes.
 
 More workers have not increased the measured project completion rate in the
 latest comparisons. Each project needs a short edit, test and project-check
@@ -164,7 +234,8 @@ preserve every old test and original project input. Broader tests and source
 acceptance remain required.
 
 Slow feedback added to this delay. Earlier Hono ordinary checks took about
-24 minutes. The latest checks take about 2.5 minutes. Source, diagnostics,
+24 minutes. Ordinary check 3 took about 2.5 minutes, and the latest check took
+about 5.2 minutes. Source, diagnostics,
 optimization, job count and target changed, so this difference does not isolate
 a cause. Hono 24 now provides the newer full census shown above.
 
@@ -191,7 +262,7 @@ but its exact rejecting check is not yet proved. The ordinary check took
 seconds in check 3. It still returns no graph, complete diagnostics or replay.
 No file or project pass follows from the changed error.
 
-## Current work and next checks
+## Earlier work and checks
 
 The current Query repairs address three measured stops:
 
