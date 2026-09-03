@@ -21,12 +21,19 @@ Use the existing `query-core-integration` branch in
 `target/worktrees/query-hono-project-integration-2`. Reuse the current build
 target, `target/worktrees/next-core-build-1`. Root owns both. The candidate is not
 accepted, and no pending feature branch joins automatically.
-The last committed integration checkpoint is `031420b74`, the reviewed generic
+The last committed integration checkpoint is `37179715d`, the Go-checked
+merged-member behavior tests. Both complete tests still fail at the merged
+generic base. The last production change is `031420b74`, the reviewed generic
 base-resolution crash repair. The full diagnostic selection now completes,
 but the full schema tests remain red. A separate reference-flow draft still
 changes six files in that worktree. It is not committed or promoted. Query still
 does not complete. Its latest result and regression losses are in the status
 document. The accepted compiler remains unchanged.
+
+The [next shared member-resolution task](query-core-member-resolution.md)
+records the exact Go order, reusable Rust identity code, default/base/member
+gaps and caller changes. Start implementation there. Do not repeat a broad
+source audit or add another isolated admission rule.
 
 ### Regression baseline
 

@@ -10,6 +10,16 @@ check. All earlier worker runs have closed. Root owns the integration branch
 
 ## Latest checkpoint
 
+The [shared member-resolution task](query-core-member-resolution.md) now has
+a [small Go-checked baseline](../target/query-core-merged-members-baseline-5-result.md).
+It is committed on the integration branch as `37179715d`. The two complete
+Rust tests compile, then reject the merged generic `Emitter` base. Go accepts
+the positive input and reports exactly TS2322 for the separate negative input.
+No production code changed in this block. Query and regression results below
+are still the last complete measurements. The reviewer and root identified
+the required common operation across defaults, bases and selected members.
+The next block implements that operation, not another admission guard.
+
 The [base-resolution repair](../target/query-core-base-resolution-repair-1-result.md)
 is committed on the integration branch as `031420b74`. The complete diagnostic
 selection now finishes without a process crash. A bounded native backtrace
@@ -44,7 +54,7 @@ All runtime checks are closed. The preserved six-file reference-flow draft
 remains uncommitted. No expectation changed, and nothing was promoted to the
 accepted compiler. One implementer and one reviewer remain the work model.
 
-Next, return to Query's shared declared-value and inherited-member operation
+Next, implement the [shared declared-value and inherited-member operation](query-core-member-resolution.md)
 with its real source context, base substitutions and state. Do not add the
 isolated conditional admission follow-up. Keep every regression open until it
 is repaired or has concrete pinned-Go evidence for a changed contract.
