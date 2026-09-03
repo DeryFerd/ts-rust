@@ -44,7 +44,7 @@ and 10 exact names are absent. Name continuity does not prove unchanged test bod
 No new source candidate is accepted.
 
 The [original corpus checks](../target/wave202-measured-core-corpus-1-result.md)
-also reject this candidate. The diagnostic selection aborts with a stack
+also reject the earlier combined candidate `b4fe2618`. Its diagnostic selection aborts with a stack
 overflow and produces no final scorecard. The semantic selection stays at
 60 exact matches out of 95 executed variants, but loses three previously exact
 cases and gains three others. It also has two supported mismatches.
@@ -52,10 +52,13 @@ cases and gains three others. It also has two supported mismatches.
 ## Current work
 
 - Restore Query's five lost tests and the real bind call. Preserve working
-  return-context inference. Run the unchanged Query census on the repair.
+  return-context inference. The reviewed source and new control are committed.
+  Their combined test gate is running, followed by the unchanged Query census.
 - Diagnose the later method error from Query 37. The remaining new-test failure
   comes from replay omitting three explicit relation queries. The correction
   repeats those same queries and keeps the complete snapshot assertion.
+  Query 42's observation locates the method failure in keyword-only union
+  parameter checking. General canonical union annotation support is in progress.
 - Hono's property-context repair passes all three public tests. Its full library
   run has 5,065 passes and 372 failures. [Hono ordinary 6](../target/wave202-hono-ordinary-6-result.md)
   gets past the missing-member error, then fails cached-type validation in
@@ -65,8 +68,11 @@ cases and gains three others. It also has two supported mismatches.
   inline call's exact tuple result. An array-only result is not a substitute.
 - Keep optional-call testing separate until its full cases pass. The generic
   indexed-write repair passes both complete tests and moves one real project stop.
-- The corpus crash is isolated to `conditionalTypeSimplification.ts`. A reviewed
-  lazy generic-reference repair and two full-feature tests are committed but unrun.
+- The corpus crash is isolated to `conditionalTypeSimplification.ts`. The first
+  lazy-reference repair compiles. The original fixture now returns an unsupported
+  generic reference instead of aborting, and both full-feature tests still fail.
+  Its library comparison also loses six passes and gains one. The repair remains
+  incomplete, with every original expectation retained.
 - The TS6504 root-path repair passes all 312 selected compiler tests. Its
   [unchanged semantic selection](../target/wave202-root-javascript-semantic-1-result.md)
   has 61 exact matches instead of 60. All other full records are unchanged.
