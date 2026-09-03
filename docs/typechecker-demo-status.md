@@ -9,13 +9,54 @@ project has gained a complete isolated root in the latest comparisons.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
-| Query core, replacement census 34 | 2 of 23 isolated roots complete | All six prior invariant failures clear. No complete-root gain |
+| Query core, census 36 | 2 of 23 isolated roots complete | Class and callback improvements survive integration. No complete-root gain |
 | Hono, census 24 | 33 of 188 isolated roots complete | No complete-root gains. Internal errors fell from 6 to 2, becoming unsupported stops |
-| Focused tests, run 53 | 177 pass, 31 fail | One unchanged case recovered, no old pass lost. New cases: 11 pass, 12 fail |
-| Checker library, sort run 1 | 5,071 pass, 366 fail | Three recoveries and no lost passes against library run 7. Source acceptance remains blocked |
+| Focused tests, run 54 | 190 pass, 29 fail | Three unchanged cases recovered, no old public pass lost. New cases: 10 pass, 1 fail |
+| Checker library, run 54 | 5,064 pass, 373 fail | Seven lost passes against sort run 1. Source acceptance remains blocked |
 
 An isolated root is one original entry file checked on its own. These counts
 are not full-project passes or percentages of TypeScript support.
+
+[Query 36](../target/wave202-query-combined-census-36-result.md) uses the combined
+candidate `b4fe2618`. Ordinary checking still stops in `timeoutManager.ts`.
+Five isolated roots stop at its heritage reference. Hydration gets past its
+previous function-body failure and stops at `thenResult?.catch?.(noop)`.
+No additional root completes. Hono 25 is running on the same candidate.
+
+[Tests 54](../target/wave202-query-hono-combined-tests-54-result.md) runs all
+5,437 library cases and 219 public cases. The seven library losses include six
+callback-validation controls and one unstable debug-map ordering case.
+The six controls mix structural validation with prior unsupported-form limits.
+Their failures remain recorded. Their correct resolution is not yet proved.
+Against the older accepted set of 4,839 library names, 4,598 now pass, 231 fail,
+and 10 exact names are absent. Name continuity alone does not prove unchanged
+test bodies. None of the 225 previously identified old-name failures recovered.
+
+The [original corpus checks](../target/wave202-measured-core-corpus-1-result.md)
+also reject this candidate. The diagnostic selection aborts with a stack
+overflow and produces no final scorecard. The semantic selection stays at
+60 exact matches out of 95 executed variants, but loses three previously exact
+cases and gains three others. It also has two supported mismatches.
+
+## Current work
+
+- Query's cold constructor and heritage fix is committed. Its first gate failed
+  to compile a new test. A reviewed test-only borrow correction is committed,
+  and the next complete gate is released. Query 37 remains conditional on that gate.
+- Hono's trace identifies the exact class-body property query that loses source
+  context. Its two-file production repair and new test are under review.
+- Generic return-context inference passes all six focused tests. It is in the
+  next combined candidate, which has not run its tests.
+- Optional calls and generic indexed writes are committed and under test.
+  Neither has a measured project gain yet.
+
+The next useful results are successful ordinary project checks, additional
+complete roots, and preserved native diagnostics. More commits or focused test
+passes do not replace those results. Parallel patches and review have outpaced
+integration. The project-check cycle needs to stay short, while a separate
+regression track protects previously working behavior.
+
+## Earlier checkpoints
 
 [Replacement Query 34](../target/wave202-query-combined-census-34-result.md)
 ran after Query 35. It tests the class repair and has 21 unsupported roots
@@ -100,7 +141,7 @@ numeric controls retain their passes. The remaining new case fails a
 contextual literal identity check. Its expected result matches the pinned Go
 checker. These focused gains are not complete-project gains.
 
-## Active repairs
+## Earlier repair checkpoints
 
 [Class-condition3](../target/wave202-class-condition-3-result.md) passes all
 five unchanged tests. One case recovers and no pass is lost. The last repair
