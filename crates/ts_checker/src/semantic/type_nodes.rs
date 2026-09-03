@@ -44777,6 +44777,25 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             && flags.contains(SymbolFlags::INTERFACE)
             && !flags.contains(SymbolFlags::CLASS)
         {
+            // Check retained merged-owner caches without resolving member annotations.
+            let context = self
+                .global_types
+                .as_ref()
+                .map(|_| self.source_query_context())
+                .transpose()?;
+            object_members::plan_merged_global_interface_with_query_context(
+                self.store,
+                self.host,
+                symbol,
+                self.global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types),
+                context
+                    .as_ref()
+                    .map(SourceTypeQueryContext::heritage)
+                    .as_ref(),
+            )
+            .map_err(property_object_error)?;
             return get_declared_class_interface_or_type_parameter(
                 self.store, self.host, symbol, flags,
             )?
