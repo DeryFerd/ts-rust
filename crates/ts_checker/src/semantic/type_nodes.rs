@@ -19053,6 +19053,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // Keep each property form under the same source cycle guard.
     fn intersection_property_type_syntax(
         &self,
         node: NodeRef,
@@ -19091,6 +19092,109 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         return Ok(false);
                     }
                     self.intersection_property_type_syntax(inner, validating)
+                }
+                NodeData::UnionTypeNode(union) if record.kind == SyntaxKind::UnionType => {
+                    if union.types.nodes.len() < 2
+                        || union.types.has_trailing_comma
+                        || union.types.range != record.range
+                    {
+                        return Ok(false);
+                    }
+                    let alias = self.direct_union_alias(node)?;
+                    let planned = self.plan.unions.get(&node);
+                    if planned.is_some_and(|plan| {
+                        plan.alias_symbol != alias
+                            || !plan.types.iter().copied().eq(union
+                                .types
+                                .nodes
+                                .iter()
+                                .map(|child| NodeRef::new(node.arena, node.file, *child)))
+                    }) {
+                        return Ok(false);
+                    }
+                    let mut previous_end = record.range.start;
+                    for (index, child) in union.types.nodes.iter().enumerate() {
+                        let child_node = NodeRef::new(node.arena, node.file, *child);
+                        let child_record = preflight_node(self.store, self.host, child_node)?;
+                        if child_record.parent != Some(node.node)
+                            || child_record.range.start < previous_end
+                            || child_record.range.end > record.range.end
+                            || union.types.nodes[..index].contains(child)
+                        {
+                            return Ok(false);
+                        }
+                        previous_end = child_record.range.end;
+                        if planned.is_some()
+                            && !self.intersection_property_type_syntax(child_node, validating)?
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    if planned.is_some() {
+                        return Ok(true);
+                    }
+                    // A validated cached union can skip planning its children.
+                    let Some(cached) = self
+                        .store
+                        .type_node_links(node)
+                        .and_then(|links| links.resolved_type)
+                    else {
+                        return Ok(false);
+                    };
+                    self.validate_cached_qualified_type_sources(node, &mut HashSet::new())?;
+                    self.validate_cached_union_result(cached, alias)
+                        .map_err(type_construction_error)?;
+                    Ok(true)
+                }
+                NodeData::TypeOperatorNode(operator)
+                    if record.kind == SyntaxKind::TypeOperator
+                        && operator.operator == SyntaxKind::KeyOfKeyword =>
+                {
+                    let operand = NodeRef::new(node.arena, node.file, operator.type_);
+                    Ok(self.plan.keyofs.get(&node) == Some(&operand)
+                        && preflight_node(self.store, self.host, operand)?.parent
+                            == Some(node.node))
+                }
+                NodeData::ConditionalTypeNode(conditional)
+                    if record.kind == SyntaxKind::ConditionalType =>
+                {
+                    let Some(plan) = self.plan.conditionals.get(&node) else {
+                        return Ok(false);
+                    };
+                    if !self.plan.source_conditionals.contains(&node)
+                        || !plan.infer_parameters.is_empty()
+                        || plan
+                            .outer_parameters
+                            .as_ref()
+                            .is_some_and(|parameters| !parameters.is_empty())
+                        || plan.alias_symbol != self.direct_type_alias_owner(node)?
+                    {
+                        return Ok(false);
+                    }
+                    if let Some(alias) = plan.alias_symbol
+                        && self
+                            .plan
+                            .aliases
+                            .get(&alias)
+                            .is_none_or(|alias| !alias.type_parameters.is_empty())
+                    {
+                        return Ok(false);
+                    }
+                    for (planned, child) in [
+                        (plan.check_type, conditional.check_type),
+                        (plan.extends_type, conditional.extends_type),
+                        (plan.true_type, conditional.true_type),
+                        (plan.false_type, conditional.false_type),
+                    ] {
+                        if planned != NodeRef::new(node.arena, node.file, child)
+                            || preflight_node(self.store, self.host, planned)?.parent
+                                != Some(node.node)
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    // The existing source evaluator selects the required branch.
+                    Ok(true)
                 }
                 NodeData::TypeLiteralNode(_) if record.kind == SyntaxKind::TypeLiteral => {
                     let Some(plan) = self.plan.type_literals.get(&node) else {
