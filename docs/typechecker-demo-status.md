@@ -10,7 +10,7 @@ project has gained a complete isolated root in the latest comparisons.
 | Check | Latest result | Change |
 | --- | --- | --- |
 | Query core, census 29 | 2 of 23 isolated roots complete | Seven completed censuses without a new complete root |
-| Hono, last complete census 22 | 33 of 188 isolated roots complete | Current failed relation reaches a cached `globalThis` dependency |
+| Hono, last complete census 22 | 33 of 188 isolated roots complete | Ordinary check 4 clears the earlier relation error, then fails symbol ownership |
 | Focused tests, run 49 | 165 pass, 20 fail | All 184 old outcomes unchanged. New conditional test fails on missing diagnostic detail |
 | Checker library, run 5 | 5,072 pass, 365 fail | Three recoveries since run 3, no pass lost |
 
@@ -106,8 +106,15 @@ names the failed cached object's owner as `globalThis`. The outer relation has
 identical endpoints, but Rust walks their cached child types before returning.
 Pinned Go returns for identical types before structural traversal. The new
 eight-line repair stops that child walk for identical endpoints and retains
-direct root validation. It is committed as `5c229304`, but not yet measured.
-Its frozen project-check copy lets test writing continue in parallel.
+direct root validation. Ordinary check 4 measured it at `5c229304` in a frozen
+copy while test writing continued separately.
+
+[Hono ordinary check 4](../target/wave202-hono-ordinary-4-result.md) clears the prior
+`R01.RELATION` stop. It next returns `INV.SOURCE.RELATION` in `http-exception.ts`
+because a symbol is not store-owned. The symbol's name and rejecting check are
+not yet proved. The ordinary check took 311.957 seconds, compared with 154.069
+seconds in check 3. It still returns no graph, complete diagnostics or replay.
+No file or project pass follows from the changed error.
 
 ## Current work and next checks
 
@@ -128,14 +135,27 @@ The current Query repairs address three measured stops:
 
 The union-member diagnostic fix is committed as `0c836cca`. It reuses the
 existing diagnostic builder. The conditional-call test remains unchanged.
-The branch for Tests 50 and Query 30 is being assembled from these Query fixes
-and the Hono identity repair. Its checks are not yet complete.
+The branch for Tests 50 and Query 30 passed integration review at `5bb26fd0`.
+It has these Query fixes and the Hono identity repair. All 185 old focused cases
+are unchanged. Four new test files add 13 cases, for 198 cases in 74 targets.
+The runtime checks are not yet complete. Added tests are not recovered tests.
 
 Four more pairs address independent Query failures: forward closure references
 in `retryer.ts`, a generic DOM reference, callback parameters in local
 initializers and returns, and generic interface references in `types.ts`.
 Each pair has its own worktree and separate source and test owners. They check
 existing changes before adding code. These are not measured recoveries.
+
+The empty-interface investigation found that current source already repairs
+Hono 22's recorded `ContextVariableMap` failure. The old failure came from its
+JWT augmentation, and both unchanged JWT controls now pass. No duplicate fix
+or test was added. The new full Hono census must measure its current root result.
+
+Tests 50 and Query 30 are scheduled with the new full Hono census. The broad
+checker library run uses Query 30's slot after it closes. The next integration
+branch already has three reviewed pairs ready: forward closure references,
+merged DOM and Node generic references, and callback parameter source positions.
+Those fixes are committed but unmeasured.
 
 The Buffer change follows the pinned Go rule that a global augmentation can
 retain its module parent. A separate public test checks the real global table
