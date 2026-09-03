@@ -26515,7 +26515,7 @@ fn effective_generic_interface_bases<'a>(
     .then_some(bases)
 }
 
-fn valid_generic_publication_target(
+pub(super) fn valid_generic_publication_target(
     store: &CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,
     target: TypeId,

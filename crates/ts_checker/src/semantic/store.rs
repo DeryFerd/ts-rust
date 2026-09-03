@@ -16835,6 +16835,13 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         )
     }
 
+    pub(super) fn is_interface_base_resolution_active(&self, type_: TypeId) -> bool {
+        self.type_resolutions.contains(
+            TypeResolutionTarget::Type(type_),
+            TypeSystemPropertyName::ResolvedBaseTypes,
+        )
+    }
+
     fn validate_canonical_resolution_target(
         &self,
         target: TypeResolutionTarget,

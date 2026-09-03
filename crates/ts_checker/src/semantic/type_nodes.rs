@@ -5821,6 +5821,13 @@ struct PlannedTypeReference {
     direct_generic_defaults: Vec<PlannedDirectGenericDefault>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TypeReferenceConstraintCheck {
+    Once,
+    DeferredHeritage,
+    PublishedHeritage,
+}
+
 /// Keeps the actual query-plan binding before final reference links are published.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceMappedLookupReferenceProof {
@@ -44681,8 +44688,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         result
     }
 
-    /// Selects only a cold, noncallable interface with no heritage.
-    /// Other states remain subject to the existing member validator.
+    /// Selects cold declared members with either no bases or authenticated,
+    /// complete bases. Other states keep the existing member validation.
     fn cold_generic_interface_declared_member_target(
         &self,
         reference: TypeId,
@@ -44718,10 +44725,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             || !(target_record.object_flags() & !target_flags).is_empty()
             || interface.reference.object.structured != StructuredTypeData::default()
             || interface.reference.object.source_computed_literal.is_some()
-            || interface.base_types_resolved
             || interface.declared_members_resolved
             || interface.resolved_base_constructor_type.is_some()
-            || interface.resolved_base_types.is_some()
             || interface.declared_members.is_some()
             || interface.declared_call_signatures.is_some()
             || interface.declared_construct_signatures.is_some()
@@ -44742,7 +44747,6 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let parameters = interface.reference.resolved_type_arguments.as_deref()?;
         if direct.target != target
             || identity.symbol != owner
-            || identity.heritage.is_some()
             || parameters.len() != identity.parameters.len()
             || parameters
                 .iter()
@@ -44752,6 +44756,26 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 })
         {
             return None;
+        }
+        match identity.heritage {
+            None if !interface.base_types_resolved && interface.resolved_base_types.is_none() => {}
+            Some(_) if interface.base_types_resolved => {
+                let members =
+                    object_members::plan_generic_interface(self.store, self.host, owner).ok()?;
+                if !object_members::valid_generic_publication_target(
+                    self.store,
+                    &members,
+                    target,
+                    target_record,
+                    interface,
+                    self.global_types
+                        .as_ref()
+                        .map(CanonicalArrayTargets::from_global_types),
+                ) {
+                    return None;
+                }
+            }
+            _ => return None,
         }
         Some((owner, target))
     }
@@ -44802,7 +44826,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
             let result = (|| {
                 stage = "interface_members_execute_identity";
-                if self.execute_declared_type(symbol, &plan, &mut prepared)? != target {
+                // An enclosing base query owns its post-publication constraint
+                // check. The selector proved its complete bases, so member
+                // preparation must not start that same base query again.
+                let resolve_heritage = !self.store.is_interface_base_resolution_active(target);
+                if self.execute_declared_type_worker(
+                    symbol,
+                    &plan,
+                    &mut prepared,
+                    resolve_heritage,
+                )? != target {
                     return Err(DeclaredTypeError::Unavailable(
                         DeclaredTypeUnavailable::InvalidCachedDeclaredType {
                             symbol,
@@ -46165,6 +46198,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         plan: &TypeQueryPlan,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, DeclaredTypeError> {
+        self.execute_declared_type_worker(symbol, plan, prepared, true)
+    }
+
+    fn execute_declared_type_worker(
+        &mut self,
+        symbol: SemanticSymbolId,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+        resolve_generic_heritage: bool,
+    ) -> Result<TypeId, DeclaredTypeError> {
         let flags = self.symbol_flags(symbol)?;
         let error_type = self
             .store
@@ -46243,6 +46286,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             TypeNodeUnavailable::InvalidTypeReference(interface.node),
                         ));
                     }
+                    if !resolve_generic_heritage {
+                        return Ok(declared_type);
+                    }
                     return self.execute_generic_interface_heritage(
                         symbol,
                         declared_type,
@@ -46252,6 +46298,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     );
                 }
                 if let Some(interface) = plan.generic_interfaces.get(&symbol).cloned() {
+                    if !resolve_generic_heritage {
+                        return Ok(declared_type);
+                    }
                     return self.execute_generic_interface_heritage(
                         symbol,
                         declared_type,
@@ -46285,6 +46334,48 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     }
 
     fn execute_generic_interface_heritage(
+        &mut self,
+        symbol: SemanticSymbolId,
+        target: TypeId,
+        (interface_symbol, heritage): (SemanticSymbolId, Option<&DirectInterfaceHeritagePlan>),
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let invalid = || {
+            DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                symbol,
+                declared_type: target,
+            })
+        };
+        if interface_symbol != symbol
+            || heritage.is_none_or(|heritage| heritage.bases.is_empty())
+            || self.store.is_interface_base_resolution_active(target)
+        {
+            return Err(invalid());
+        }
+        if !self.store.push_type_resolution(
+            TypeResolutionTarget::Type(target),
+            TypeSystemPropertyName::ResolvedBaseTypes,
+        )? {
+            return Err(invalid());
+        }
+        let result = self.execute_generic_interface_heritage_worker(
+            symbol,
+            target,
+            (interface_symbol, heritage),
+            plan,
+            prepared,
+        );
+        let Some(cycle_free) = self.store.pop_type_resolution() else {
+            return Err(invalid());
+        };
+        if result.is_ok() && !cycle_free {
+            return Err(invalid());
+        }
+        result
+    }
+
+    fn execute_generic_interface_heritage_worker(
         &mut self,
         symbol: SemanticSymbolId,
         target: TypeId,
@@ -46360,13 +46451,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
         let expected_bases = (!bases.is_empty()).then_some(bases.as_slice());
         if data.base_types_resolved {
-            return if data.resolved_base_types.as_deref() == expected_bases {
-                Ok(target)
-            } else {
-                Err(invalid())
-            };
-        }
-        if data.resolved_base_types.is_some()
+            if data.resolved_base_types.as_deref() != expected_bases {
+                return Err(invalid());
+            }
+        } else if data.resolved_base_types.is_some()
             || !self.store.set_interface_base_resolution(
                 target,
                 true,
@@ -46375,6 +46463,33 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             )
         {
             return Err(invalid());
+        }
+        // Native source checking checks heritage arguments after resolving bases.
+        // Repeat this step on warm queries so an earlier failed check cannot hide
+        // behind the reference that base construction already published.
+        for base in &heritage.bases {
+            if base.kind != DirectInterfaceBaseKind::Interface
+                || !plan.references.contains_key(&base.node)
+            {
+                continue;
+            }
+            let cached = self
+                .store
+                .type_node_links(base.node)
+                .and_then(|links| links.resolved_type)
+                .ok_or_else(invalid)?;
+            let previous = std::mem::take(self.diagnostics);
+            let checked = self.execute_type_reference_worker(
+                base.node,
+                plan,
+                prepared,
+                TypeReferenceConstraintCheck::PublishedHeritage,
+            );
+            let emitted = std::mem::replace(self.diagnostics, previous);
+            super::source::merge_retry_diagnostics(self.diagnostics, emitted);
+            if checked? != cached {
+                return Err(invalid());
+            }
         }
         Ok(target)
     }
@@ -46584,14 +46699,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             {
                 return Err(invalid());
             }
-            let type_ = self.execute_type_node(base.node, plan, prepared)?;
+            let target = self.execute_declared_type(base.symbol, plan, prepared)?;
+            let type_ = self.execute_type_reference_worker(
+                base.node,
+                plan,
+                prepared,
+                TypeReferenceConstraintCheck::DeferredHeritage,
+            )?;
             let resolved =
                 validate_direct_generic_reference(self.store, type_).map_err(|_| invalid())?;
-            if self
-                .store
-                .declared_type_links(base.symbol)
-                .and_then(|links| links.declared_type)
-                != Some(resolved.target)
+            if resolved.target != target
+                || self
+                    .store
+                    .declared_type_links(base.symbol)
+                    .and_then(|links| links.declared_type)
+                    != Some(target)
             {
                 return Err(invalid());
             }
@@ -52168,6 +52290,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         plan: &TypeQueryPlan,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, DeclaredTypeError> {
+        self.execute_type_reference_worker(
+            node,
+            plan,
+            prepared,
+            TypeReferenceConstraintCheck::Once,
+        )
+    }
+
+    fn execute_type_reference_worker(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+        constraint_check: TypeReferenceConstraintCheck,
+    ) -> Result<TypeId, DeclaredTypeError> {
         let semantic_mark = self.source_branch_recoveries.len();
         let source_limit_mark = plan
             .references
@@ -52353,7 +52490,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     self.execute_type_node(*argument, plan, prepared)?;
                 }
             }
-            let declared_type = self.execute_declared_type(symbol, plan, prepared)?;
+            // A generic reference needs its target identity, not the target's bases.
+            // Actual base queries use execute_declared_type before reading arguments.
+            let declared_type = self.execute_declared_type_worker(
+                symbol,
+                plan,
+                prepared,
+                !reference.direct_generic,
+            )?;
             if let Some(recovered) = self.source_query_recovery_since(source_limit_mark)? {
                 return Ok(recovered);
             }
@@ -52424,20 +52568,53 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         .map_err(|_| {
                             type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
                         })?;
-                        if cached_resolved_type.is_none()
-                            || self
-                                .store
-                                .symbol(symbol)
-                                .and_then(|owner| owner.name().as_utf8())
-                                == Some("DetailedHTMLFactory")
+                        // Intern the reference before this dependency-closed query
+                        // demands bases. A nested reference can use the exact target
+                        // whose enclosing base query is still active.
+                        if constraint_check == TypeReferenceConstraintCheck::Once
+                            && !self.store.is_interface_base_resolution_active(declared_type)
                         {
-                            self.check_direct_generic_reference_constraints(
+                            let demanded = self.execute_declared_type(symbol, plan, prepared)?;
+                            if let Some(recovered) =
+                                self.source_query_recovery_since(source_limit_mark)?
+                            {
+                                return Ok(recovered);
+                            }
+                            if demanded != declared_type {
+                                return Err(type_node_unavailable(
+                                    TypeNodeUnavailable::InvalidTypeReference(node),
+                                ));
+                            }
+                        }
+                        let recheck_heritage =
+                            constraint_check == TypeReferenceConstraintCheck::PublishedHeritage
+                                || self.store.source_node_kind(node)
+                                    == Some(SyntaxKind::ExpressionWithTypeArguments);
+                        if constraint_check != TypeReferenceConstraintCheck::DeferredHeritage
+                            && (recheck_heritage
+                                || cached_resolved_type.is_none()
+                                || self
+                                    .store
+                                    .symbol(symbol)
+                                    .and_then(|owner| owner.name().as_utf8())
+                                    == Some("DetailedHTMLFactory"))
+                        {
+                            let previous = recheck_heritage
+                                .then(|| std::mem::take(self.diagnostics));
+                            let checked = self.check_direct_generic_reference_constraints(
                                 node,
                                 &reference,
                                 &type_arguments,
                                 &constraints,
-                            )?;
-                        } else if !constraints.is_empty()
+                            );
+                            if let Some(previous) = previous {
+                                let emitted = std::mem::replace(self.diagnostics, previous);
+                                super::source::merge_retry_diagnostics(self.diagnostics, emitted);
+                            }
+                            checked?;
+                        } else if constraint_check
+                            != TypeReferenceConstraintCheck::DeferredHeritage
+                            && !constraints.is_empty()
                             && self
                                 .store
                                 .symbol(symbol)
@@ -52941,6 +53118,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 }
                 _ => argument,
             };
+            if self.global_types.is_some()
+                && self.instantiation_session.is_some()
+                && self.type_reference_alias_targets.is_empty()
+                && self.jsdoc_import_type_target.is_none()
+                && self.pending_function_parameters.is_empty()
+            {
+                self.prepare_generic_interface_declared_members(constraint)?;
+                self.prepare_generic_interface_declared_members(comparison_argument)?;
+            }
             let mut demanded = HashSet::new();
             let assignable = loop {
                 match self.compare_constraint_types(comparison_argument, constraint) {
