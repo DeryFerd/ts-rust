@@ -3934,7 +3934,6 @@ fn plan_concrete_interface_type_arguments(
                 NodeRef::new(base_declaration.arena, base_declaration.file, *parameter),
                 *symbol,
                 node,
-                HeritageTypeParameterAnnotations::Defer,
             )?;
         }
         if shared_base_parameters.is_none() {
