@@ -78871,7 +78871,9 @@ fn check_source_plan(
                 VariableInvariant::InvalidSymbolShape(read.read.value_symbol),
             ));
         }
-        if cross_file_global_uses_only_object_factory_calls(host, &identifier_reads, read) {
+        if declared_value.is_some()
+            || cross_file_global_uses_only_object_factory_calls(host, &identifier_reads, read)
+        {
             lazy_cross_file_globals.insert(read.read.value_symbol);
         }
         session.reset_query();

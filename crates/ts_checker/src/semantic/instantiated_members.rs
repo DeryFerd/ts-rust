@@ -70,7 +70,7 @@ use super::{
         cached_planned_type_identity, resolved_declared_property_types,
         validate_resolved_declared_property_object,
     },
-    reference_types::{DirectGenericReferenceError, validate_direct_generic_reference},
+    reference_types::{DirectGenericReference, DirectGenericReferenceError, validate_direct_generic_reference},
     signatures::{
         ElementFlags, IndexInfo, SignatureFlags, SignatureInstantiationError, TupleElementInfo,
     },
@@ -814,13 +814,7 @@ impl InstantiatedIndexRecovery {
                 .ok()
                 .as_deref()
                 == Some(self.mapper_sources.as_slice())
-            && self.mapper_targets
-                == shape
-                    .target_arguments
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(shape.reference))
-                    .collect::<Vec<_>>()
+            && self.mapper_targets == member_mapper_arguments(store, shape)
     }
 
     fn matches_cached_identity(
@@ -9308,7 +9302,7 @@ fn cached_inherited_properties(
         let Some(base) = mapped_inherited_type(store, shape, *base, array_targets)? else {
             return Ok(None);
         };
-        let (properties, indexes) = if validate_direct_generic_reference(store, base).is_ok() {
+        let (properties, indexes) = if source_member_reference(store, base).is_ok() {
             let Some(members) = validate_generic_interface_members(store, base, array_targets)?
             else {
                 return Ok(None);
@@ -9370,12 +9364,7 @@ fn mapped_inherited_type(
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<TypeId>, GenericInterfaceMemberError> {
     let sources = mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
-    let targets = shape
-        .target_arguments
-        .iter()
-        .copied()
-        .chain(std::iter::once(shape.reference))
-        .collect::<Vec<_>>();
+    let targets = member_mapper_arguments(store, shape);
     cached_instantiation_with_vector(store, type_, &sources, &targets, array_targets, None)
         .map_err(|error| property_instantiation_error(type_, &error))
 }
@@ -9387,12 +9376,7 @@ fn materialize_inherited_members(
     session: &mut InstantiationSession,
 ) -> Result<(), GenericInterfaceMemberError> {
     let sources = mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
-    let targets = shape
-        .target_arguments
-        .iter()
-        .copied()
-        .chain(std::iter::once(shape.reference))
-        .collect::<Vec<_>>();
+    let targets = member_mapper_arguments(store, shape);
     for base in &shape.base_types {
         let limit_mark = session.limit_event_mark();
         let resolved = instantiate_type_with_vector_and_session(
@@ -9410,7 +9394,7 @@ fn materialize_inherited_members(
                 shape.reference,
             ));
         }
-        if validate_direct_generic_reference(store, resolved).is_ok() {
+        if source_member_reference(store, resolved).is_ok() {
             resolve_members_with_array_targets_and_session(
                 store,
                 resolved,
@@ -9433,6 +9417,34 @@ fn materialize_inherited_members(
     Ok(())
 }
 
+pub(super) fn source_member_reference(
+    store: &CanonicalTypeMapperStore,
+    reference: TypeId,
+) -> Result<DirectGenericReference, GenericInterfaceMemberError> {
+    let direct_error = match validate_direct_generic_reference(store, reference) {
+        Ok(direct) => return Ok(direct),
+        Err(error) => error,
+    };
+    let invalid = || GenericInterfaceMemberError::InvalidTarget(reference);
+    let Some(names) = store.source_declared_member_names(reference) else {
+        return Err(direct_error.into());
+    };
+    let record = store.type_payload(reference).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = record.data() else {
+        return Err(invalid());
+    };
+    if interface.reference.resolved_type_arguments.as_deref().is_some_and(|args| !args.is_empty()) {
+        return Err(direct_error.into());
+    }
+    if !names.validates_target(store, reference)
+        || record.object_flags().contains(ObjectFlags::CLASS)
+        || super::declared::cached_interface_type(store, names.owner()).map_err(|_| invalid())? != Some(reference)
+    {
+        return Err(invalid());
+    }
+    Ok(DirectGenericReference { target: reference, type_arguments: Vec::new() })
+}
+
 fn validate_shape(
     store: &CanonicalTypeMapperStore,
     reference: TypeId,
@@ -9453,7 +9465,7 @@ fn validate_shape(
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(reference));
         }
     }
-    let direct = validate_direct_generic_reference(store, reference)?;
+    let direct = source_member_reference(store, reference)?;
     let class_target = store
         .type_payload(direct.target)
         .is_some_and(|record| record.object_flags().contains(ObjectFlags::CLASS));
@@ -9503,8 +9515,10 @@ fn validate_shape(
         inherited_index_infos: Vec::new(),
         inherited_members_ready: false,
     };
-    if class_target && reference == shape.target {
-        // The class producer already published the original field symbols.
+    if reference == shape.target
+        && (class_target || store.source_declared_member_names(shape.target).is_some())
+    {
+        // A target keeps its own symbols. Only an applied reference needs copies.
         for property in &mut shape.properties {
             property.requires_proxy = false;
         }
@@ -9529,6 +9543,11 @@ fn validate_shape(
             inherited_index_infos: Vec::new(),
             inherited_members_ready: false,
         };
+        if store.source_declared_member_names(shape.target).is_some() {
+            for property in &mut target_shape.properties {
+                property.requires_proxy = false;
+            }
+        }
         if let Some((properties, indexes)) =
             cached_inherited_properties(store, &target_shape, array_targets)?
         {
@@ -9647,7 +9666,7 @@ fn validate_declared_target(
         base_types.clear();
     }
     for base in base_types {
-        if let Ok(reference) = validate_direct_generic_reference(store, base) {
+        if let Ok(reference) = source_member_reference(store, base) {
             if active[heritage_start..].contains(&reference.target) {
                 return Err(GenericInterfaceMemberError::InvalidTarget(target));
             }
@@ -10008,18 +10027,27 @@ fn mapper_parameters_for_target(
     target: TypeId,
     source_parameters: &[TypeId],
 ) -> Result<Vec<TypeId>, GenericInterfaceMemberError> {
-    let this_type = store
+    let interface = store
         .type_payload(target)
         .and_then(|record| match record.data() {
-            TypeData::Interface(interface) => interface.this_type,
+            TypeData::Interface(interface) => Some(interface),
             _ => None,
         })
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
     Ok(source_parameters
         .iter()
         .copied()
-        .chain(std::iter::once(this_type))
+        .chain(interface.this_type)
         .collect())
+}
+
+fn member_mapper_arguments(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+) -> Vec<TypeId> {
+    let has_this = matches!(store.type_payload(shape.target).map(|record| record.data()),
+        Some(TypeData::Interface(interface)) if interface.this_type.is_some());
+    shape.target_arguments.iter().copied().chain(has_this.then_some(shape.reference)).collect()
 }
 
 #[allow(clippy::too_many_lines)] // One fail-closed proof covers the complete admitted source surface.
@@ -10485,7 +10513,7 @@ fn source_declared_target_header(
     if !names.validates_target(store, target) {
         return Err(invalid());
     }
-    let direct = validate_direct_generic_reference(store, target).map_err(|_| invalid())?;
+    let direct = source_member_reference(store, target).map_err(|_| invalid())?;
     if direct.target != target {
         return Err(invalid());
     }
@@ -11376,12 +11404,7 @@ fn generic_interface_call_projections(
         return Err(invalid());
     }
     let sources = mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
-    let targets = shape
-        .target_arguments
-        .iter()
-        .copied()
-        .chain(std::iter::once(shape.reference))
-        .collect::<Vec<_>>();
+    let targets = member_mapper_arguments(store, shape);
     let mut result = Vec::with_capacity(signatures.len());
     for (&signature, &original) in signatures.iter().zip(&shape.call_signatures) {
         let source = store.signature(original).ok_or_else(invalid)?;
@@ -11596,26 +11619,8 @@ fn validate_warm_members(
         array_targets,
     )?;
     let (own_properties, inherited_properties) = properties.split_at(shape.properties.len());
-    let mapper_targets = shape
-        .target_arguments
-        .iter()
-        .copied()
-        .chain(std::iter::once(shape.reference))
-        .collect::<Vec<_>>();
-    let all_parameters = shape
-        .source_parameters
-        .iter()
-        .copied()
-        .chain(std::iter::once(
-            store
-                .type_payload(shape.target)
-                .and_then(|record| match record.data() {
-                    TypeData::Interface(interface) => interface.this_type,
-                    _ => None,
-                })
-                .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?,
-        ))
-        .collect::<Vec<_>>();
+    let mapper_targets = member_mapper_arguments(store, shape);
+    let all_parameters = mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
     let mapper = own_properties
         .iter()
         .zip(&shape.properties)
@@ -11828,12 +11833,7 @@ fn valid_instantiated_index_info(
         else {
             return false;
         };
-        let targets = shape
-            .target_arguments
-            .iter()
-            .copied()
-            .chain(std::iter::once(shape.reference))
-            .collect::<Vec<_>>();
+        let targets = member_mapper_arguments(store, shape);
         cached_instantiation_with_vector(
             store,
             source_info.value_type(),
@@ -11998,12 +11998,7 @@ fn prepare_cold_member_values(
 ) -> Result<ColdMemberValues, GenericInterfaceMemberError> {
     let mapper_sources =
         mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
-    let mapper_targets = shape
-        .target_arguments
-        .iter()
-        .copied()
-        .chain(std::iter::once(shape.reference))
-        .collect::<Vec<_>>();
+    let mapper_targets = member_mapper_arguments(store, shape);
     let requires_mapper = !shape.call_signatures.is_empty() && shape.reference != shape.target
         || !shape.index_infos.is_empty()
             && shape
@@ -14760,7 +14755,7 @@ mod tests {
             assert!(cold.contains(&argument));
             assert!(cold.contains(&shape.source_parameters[0]));
             for property in &shape.properties {
-                assert!(cold.contains(&property.type_));
+                assert!(cold.contains(&property.value.resolved().expect("declared member value is resolved")));
             }
             for base in &shape.base_types {
                 assert!(cold.contains(base));

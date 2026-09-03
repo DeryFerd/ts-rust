@@ -584,6 +584,7 @@ impl SourceDeclaredMemberNames {
                 .reference
                 .resolved_type_arguments
                 .as_deref()
+                .or_else(|| self.parameters.is_empty().then_some(&[]))
                 .is_some_and(|arguments| {
                     arguments.len() == self.parameters.len()
                         && arguments
@@ -720,13 +721,29 @@ pub(super) fn plan_source_declared_members(
     };
     for &declaration in &owner_identity.declarations {
         let record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
-        let source_members = match &record.data {
-            NodeData::InterfaceDeclaration(interface) => &interface.members,
-            NodeData::ClassDeclaration(class) => &class.members,
-            NodeData::ClassExpression(class) => &class.members,
+        let (source_members, clauses) = match &record.data {
+            NodeData::InterfaceDeclaration(interface) => {
+                (&interface.members, interface.heritage_clauses.as_ref())
+            }
+            NodeData::ClassDeclaration(class) => {
+                (&class.members, class.heritage_clauses.as_ref())
+            }
+            NodeData::ClassExpression(class) => {
+                (&class.members, class.heritage_clauses.as_ref())
+            }
             NodeData::ModuleDeclaration(_) | NodeData::VariableDeclaration(_) => continue,
             _ => return Err(invalid()),
         };
+        if let Some(clauses) = clauses {
+            let heritage = plan_direct_interface_heritage(store, host, declaration, owner, clauses)
+                .map_err(|error| match error {
+                    DirectInterfaceHeritageError::Invalid => invalid(),
+                    DirectInterfaceHeritageError::Unsupported { node, kind } => {
+                        PropertyObjectError::UnsupportedMember { node, kind }
+                    }
+                })?;
+            merge_interface_heritage(store, host, &mut plan.heritage, heritage, None, true)?;
+        }
         for member in &source_members.nodes {
             let member = NodeRef::new(declaration.arena, declaration.file, *member);
             match store.source_node_kind(member) {
@@ -797,7 +814,7 @@ pub(super) fn resolve_object_property_by_key_with_source(
         )?
         .get_property_of_source_interface(receiver, name);
     }
-    if validate_direct_generic_reference(store, receiver)
+    if super::instantiated_members::source_member_reference(store, receiver)
         .ok()
         .is_some_and(|reference| {
             store
@@ -1410,7 +1427,7 @@ fn resolve_instantiated_object_property_by_key_with_source(
         return resolve_object_property_by_key(store, Some(global_types), receiver, name, session)
             .map_err(Into::into);
     }
-    let source_names = validate_direct_generic_reference(store, receiver)
+    let source_names = super::instantiated_members::source_member_reference(store, receiver)
         .ok()
         .is_some_and(|reference| {
             store
@@ -13233,26 +13250,19 @@ pub(super) fn declared_type_declaration_parent(
     let source_symbol_record = store.symbol(source_symbol).ok_or_else(invalid)?;
     let exported_symbol_record = store.symbol(symbol).ok_or_else(invalid)?;
     let local = bound.local_symbol(declaration).ok_or_else(invalid)?;
-    let local_record = store.symbol(local).ok_or_else(invalid)?;
+    validate_declared_type_export_local(
+        store,
+        host,
+        declaration,
+        symbol,
+        identifier.text.as_str(),
+        local,
+    )?;
     if super::source_imports::source_file_namespace_declaration(store, host, source_symbol)
         .map_err(|_| ())?
         != source
         || source_symbol_record.exports().is_none()
         || exported_symbol_record.name().as_utf8() != Some(identifier.text.as_str())
-        || local == symbol
-        || store.get_merged_symbol(local) != Some(local)
-        || local_record.flags() != SymbolFlags::NONE
-        || local_record.check_flags() != CheckFlags::NONE
-        || local_record.name().as_utf8() != Some(identifier.text.as_str())
-        || local_record.declarations() != Some(&[declaration])
-        || local_record.value_declaration().is_some()
-        || local_record.members().is_some()
-        || local_record.exports().is_some()
-        || local_record.parent().is_some()
-        || local_record
-            .export_symbol()
-            .and_then(|export| store.get_merged_symbol(export))
-            != Some(symbol)
         || source_symbol_record
             .exports()
             .and_then(|exports| store.symbol_table(exports))
@@ -13390,56 +13400,84 @@ fn declared_namespace_type_parent(
         }
     }
     if let Some(local) = bound.local_symbol(declaration) {
-        let record = store.symbol(local).ok_or_else(invalid)?;
-        let declarations = owner
-            .declarations()
-            .ok_or_else(invalid)?
-            .iter()
-            .copied()
-            .filter(|candidate| {
-                candidate.is_for(declaration.arena, declaration.file)
-                    && bound.local_symbol(*candidate) == Some(local)
-            })
-            .collect::<Vec<_>>();
-        // An interface and a variable share the binder's value-export placeholder.
-        let has_local_value = owner.flags().without(SymbolFlags::TRANSIENT)
-            == SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
-            && declarations.iter().any(|candidate| {
-                host.node(*candidate).is_some_and(|record| {
-                    matches!(
-                        (record.kind, &record.data),
-                        (
-                            SyntaxKind::VariableDeclaration,
-                            NodeData::VariableDeclaration(_)
-                        )
-                    )
-                })
-            });
-        let expected_local_flags = if has_local_value {
-            SymbolFlags::EXPORT_VALUE
-        } else {
-            SymbolFlags::NONE
-        };
-        if local == symbol
-            || store.get_merged_symbol(local) != Some(local)
-            || record.flags() != expected_local_flags
-            || record.check_flags() != CheckFlags::NONE
-            || record.name().as_utf8() != Some(name)
-            || declarations.is_empty()
-            || record.declarations() != Some(declarations.as_slice())
-            || record.value_declaration().is_some()
-            || record.members().is_some()
-            || record.exports().is_some()
-            || record.parent().is_some()
-            || record
-                .export_symbol()
-                .and_then(|export| store.get_merged_symbol(export))
-                != Some(symbol)
+        validate_declared_type_export_local(store, host, declaration, symbol, name, local)?;
+    }
+    Ok(symbol_parent)
+}
+
+fn validate_declared_type_export_local(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    name: &str,
+    local: SemanticSymbolId,
+) -> Result<(), ()> {
+    let (arena, bound) = host.source(declaration).ok_or(())?;
+    let owner = store.symbol(symbol).ok_or(())?;
+    let record = store.symbol(local).ok_or(())?;
+    let declarations = owner
+        .declarations()
+        .ok_or(())?
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate.is_for(declaration.arena, declaration.file)
+                && bound.local_symbol(*candidate) == Some(local)
+        })
+        .collect::<Vec<_>>();
+    // The binder combines value meaning within this local declaration group.
+    // Another namespace block can share the export without sharing this local.
+    let mut has_value = false;
+    for &candidate in &declarations {
+        let node = preflight_node(store, host, candidate).map_err(|_| ())?;
+        if bound
+            .symbol(candidate)
+            .and_then(|raw| store.get_merged_symbol(raw))
+            != Some(symbol)
         {
             return Err(());
         }
+        has_value |= match (node.kind, &node.data) {
+            (SyntaxKind::ClassDeclaration, NodeData::ClassDeclaration(_))
+            | (SyntaxKind::FunctionDeclaration, NodeData::FunctionDeclaration(_))
+            | (SyntaxKind::EnumDeclaration, NodeData::EnumDeclaration(_))
+            | (SyntaxKind::VariableDeclaration, NodeData::VariableDeclaration(_))
+            | (SyntaxKind::BindingElement, NodeData::BindingElement(_)) => true,
+            (SyntaxKind::ModuleDeclaration, NodeData::ModuleDeclaration(_)) => {
+                ts_binder::module_declaration_local_export_flags(arena, candidate.node)
+                    .ok_or(())?
+                    .contains(SymbolFlags::EXPORT_VALUE)
+            }
+            (SyntaxKind::InterfaceDeclaration, NodeData::InterfaceDeclaration(_))
+            | (SyntaxKind::TypeAliasDeclaration, NodeData::TypeAliasDeclaration(_)) => false,
+            _ => return Err(()),
+        };
     }
-    Ok(symbol_parent)
+    let expected_flags = if has_value {
+        SymbolFlags::EXPORT_VALUE
+    } else {
+        SymbolFlags::NONE
+    };
+    if local == symbol
+        || store.get_merged_symbol(local) != Some(local)
+        || record.flags() != expected_flags
+        || record.check_flags() != CheckFlags::NONE
+        || record.name().as_utf8() != Some(name)
+        || !declarations.contains(&declaration)
+        || record.declarations() != Some(declarations.as_slice())
+        || record.value_declaration().is_some()
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent().is_some()
+        || record
+            .export_symbol()
+            .and_then(|export| store.get_merged_symbol(export))
+            != Some(symbol)
+    {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn is_exact_export_modifier(

@@ -2733,8 +2733,7 @@ pub(super) fn plan_interface_type_base_reference(
         .find(|base| {
             base.node == node
                 && (base.kind.is_instantiated_alias()
-                    || base.kind == DirectInterfaceBaseKind::Interface
-                        && !base.type_arguments.is_empty())
+                    || base.kind == DirectInterfaceBaseKind::Interface)
         }))
 }
 

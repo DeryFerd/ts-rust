@@ -3328,6 +3328,7 @@ fn check_direct_source_property_with_source_mode(
                 && !source_class_reference
                 && !completed_applied_class_origin
                 && !conditional_mapped
+                && !target.is_some_and(|target| store.source_declared_member_names(target).is_some())
                 && store.source_interface_heritage_header(receiver).is_none()
                 && !is_cold_direct_nongeneric_interface(store, receiver)
             {
@@ -3340,11 +3341,11 @@ fn check_direct_source_property_with_source_mode(
                 )
                 .map_err(SourcePropertyQueryError::Property);
             }
-            if let Some(owner) = cold_inherited_interface_owner(store, host, receiver, name)
+            if cold_inherited_interface_owner(store, host, receiver, name)
                 .map_err(SourcePropertyQueryError::Source)?
+                .is_some()
             {
-                let resolved =
-                    super::type_nodes::CanonicalTypeQuery::new_with_global_types_and_session(
+                super::type_nodes::CanonicalTypeQuery::new_with_global_types_and_session(
                         store,
                         host,
                         global_types,
@@ -3352,11 +3353,8 @@ fn check_direct_source_property_with_source_mode(
                         session,
                         diagnostics,
                     )
-                    .and_then(|mut query| query.get_declared_interface_for_source_check(owner))
+                    .and_then(|mut query| query.prepare_source_class_interface_members(receiver))
                     .map_err(|error| SourcePropertyQueryError::Source(error.into()))?;
-                if resolved != receiver {
-                    return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
-                }
                 return super::object_members::resolve_object_property_by_key_with_source(
                     store,
                     host,
@@ -3590,7 +3588,7 @@ fn cold_inherited_interface_owner(
     if members.is_some_and(|members| members.get_source(name).is_some()) {
         return Ok(None);
     }
-    let planned = super::object_members::plan_interface(store, host, owner).map_err(|error| {
+    let (names, planned) = super::object_members::plan_source_declared_members(store, host, owner).map_err(|error| {
         use super::object_members::PropertyObjectError;
         match error {
             PropertyObjectError::UnsupportedMember { node, kind } => {
@@ -3609,9 +3607,9 @@ fn cold_inherited_interface_owner(
     if planned.heritage.is_none() {
         return Err(invalid().into());
     }
-    for property in &planned.properties {
-        let key = super::object_members::planned_declared_property_key(store, property)
-            .ok_or(RelationUnavailable::UnsupportedStructuredType(receiver))?;
+    for property in names.properties() {
+        let key = store.symbol(property)
+            .ok_or(RelationUnavailable::UnsupportedStructuredType(receiver))?.name();
         if key == EscapedNameRef::source(name) {
             return Ok(None);
         }
