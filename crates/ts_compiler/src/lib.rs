@@ -2210,7 +2210,7 @@ impl Program {
                     || (program.options.check_js && !program.options.allow_js_specified))
                 && is_javascript_file_name(&file_name)
             {
-                let display_name = relative_path(&program.current_directory, &file_name);
+                let display_name = ts_path::normalize_slashes(root_name);
                 program
                     .diagnostics
                     .push(javascript_file_not_allowed_diagnostic(&display_name));
