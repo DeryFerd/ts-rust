@@ -42518,24 +42518,17 @@ fn check_expression_type_with_capture_context(
                     || context.flow.is_expression_condition_call(call.node))
                 && !context.flow.is_predicate_condition_call(call.node)
             {
-                let call_owner = host
-                    .bound_file(call.node)
-                    .and_then(|bound| bound.flow_container(call.node))
-                    .ok_or(SourceCheckError::Class(call.node))?;
-                // Deferred arrows use the class token, but keep their own call effects.
-                if call_owner == context.flow.body_declaration() {
-                    context
-                        .flow
-                        .complete_non_effecting_call(
-                            store,
-                            host,
-                            global_types,
-                            call,
-                            callee.result,
-                            &checked,
-                        )
-                        .map_err(|error| class_body_flow_error(call.node, error))?;
-                }
+                context
+                    .flow
+                    .complete_non_effecting_call(
+                        store,
+                        host,
+                        global_types,
+                        call,
+                        callee.result,
+                        &checked,
+                    )
+                    .map_err(|error| class_body_flow_error(call.node, error))?;
             }
             Ok(CheckedExpressionTypes::leaf(
                 checked.return_type,
