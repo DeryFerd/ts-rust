@@ -19,6 +19,12 @@ have not executed. The fixture does not yet cover Query's import/alias route.
 Query's last unchanged run still completes only 2 of 23 isolated roots.
 Ordinary project checking does not complete. There is no new Query gain.
 
+The first [implementation checkpoint](../target/query-core-merged-members-implementation-3-result.md),
+`af2597745`, compiles but is not accepted. Both complete tests still fail.
+The [new Query run](../target/query-core-merged-members-query-1-result.md) has
+the same 244 checking records as the previous run. Do not add more base
+admission rules before changing the shared member-value state below.
+
 ## What the source comparison established
 
 The Go checkout is pinned to `dc37b5249ab60e2bbce936f71b883e6c8136167e`.
@@ -69,6 +75,15 @@ does not mean every named member type is known. Change callers and validators
 that currently make that assumption together. Do not add another package-specific
 header or a second definition of completed members.
 
+Use explicit pending and resolved values in `instantiated_members::DeclaredProperty`.
+Pending requires a proved completed name table and clean unresolved value links.
+Keep identity, declaration, parent and table checks for both states. Keep all
+existing value checks for resolved members. Compute proxy policy from the
+owner/reference mapping, not from cache warmth. A resolved source must not make
+an existing proxy suddenly invalid. Reject a resolved proxy or recovery record
+while its source is pending. At demand, resolve and validate that one source
+member through the live query, then use the existing proxy mapper.
+
 ### 2. Resolve defaults and bases from that owner
 
 Generalize `preflight_merged_interface_defaults` and the direct reference
@@ -85,6 +100,13 @@ base to be a nongeneric global interface/value pair.
 Reuse the active `ResolvedBaseTypes` resolution frame, ordered base publication
 and later heritage constraint checks from the recent crash repair. A pending
 base is not an empty base. A failed request must unwind its active frame.
+
+The checkpoint still needs four class-base corrections. Separate `extends`
+from `implements`. Authenticate actual class base references. Retain the
+existing class base-constructor state separately from interface contributions.
+Use the local formal count for written argument arity, while retaining the full
+outer/local vector for identity checks. These are not completed by widening
+the interface executor's class flag check.
 
 ### 3. Build the member table and demand one member
 

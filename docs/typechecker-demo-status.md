@@ -10,15 +10,17 @@ check. All earlier worker runs have closed. Root owns the integration branch
 
 ## Latest checkpoint
 
-The [shared member-resolution task](query-core-member-resolution.md) now has
-a [small Go-checked baseline](../target/query-core-merged-members-baseline-5-result.md).
-It is committed on the integration branch as `37179715d`. The two complete
-Rust tests compile, then reject the merged generic `Emitter` base. Go accepts
-the positive input and reports exactly TS2322 for the separate negative input.
-No production code changed in this block. Query and regression results below
-are still the last complete measurements. The reviewer and root identified
-the required common operation across defaults, bases and selected members.
-The next block implements that operation, not another admission guard.
+The [shared member draft](../target/query-core-merged-members-implementation-3-result.md)
+is saved as unaccepted integration checkpoint `af2597745`. Implementation and
+test code compile. Both complete tests still fail, now at the actual merged
+`Emitter` interface declaration. No final type, diagnostic or replay assertion
+has passed. The Go-checked TypeScript inputs are unchanged.
+
+The draft preserves merge order and canonical formals, shares default planning,
+and keeps the selected method caller's source context. The pending member-value
+operation is not implemented. The reviewer also found four unfinished class-base
+paths. The next change must update shared state and its callers together, not
+add another exception for the current rejected declaration.
 
 The [base-resolution repair](../target/query-core-base-resolution-repair-1-result.md)
 is committed on the integration branch as `031420b74`. The complete diagnostic
@@ -28,7 +30,8 @@ identified repeated generic target and base resolution in
 target identity, base publication and later heritage constraint checks.
 The full schema tests still fail. This is not conditional-type acceptance.
 
-All 6,325 passes from the previous integration test run remain. Against the
+In that earlier full regression run, all 6,325 previous integration passes
+remained. No full regression selection ran on `af2597745`. Against the
 accepted compiler, counts are unchanged: 5,789 of 6,055 passes retained,
 253 failures and 13 absent exact names. Every loss remains a promotion blocker.
 One debug-order assertion now passes, which is not a proved semantic gain.
@@ -43,9 +46,11 @@ stays at 57 of 60 diagnostic records, 52 of 55 type metadata rows and 58 of 62
 symbol metadata rows. Metadata equality does not independently prove rendered
 payload parity.
 
-[Unchanged Query](../target/query-core-base-resolution-query-1-result.md)
+[Unchanged Query](../target/query-core-merged-members-query-1-result.md)
 still completes 2 of 23 isolated roots. Ordinary checking does not complete.
-All 244 checking records, outcomes, diagnostics and graph data are unchanged.
+All 244 checking records, outcomes, diagnostics and graph data match the
+previous base-resolution run. The new build took 114 seconds and the census
+took 18.604 seconds.
 The earlier caller observation still identifies full global-annotation
 preflight as the rejecting path. The base needs merged generic class/interface
 handling, not only an interface-heritage guard change.
