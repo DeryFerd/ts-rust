@@ -1,7 +1,7 @@
 # Query core member resolution
 
-Updated 2026-09-03. The focused behavior passes. Integration remains rejected.
-Root is the only implementer. One reviewer checks the change. Use the existing
+Updated 2026-09-03. Four lost tests recovered. Integration remains rejected.
+Root is the only implementer. One reviewer checks code changes. Use the existing
 `query-core-integration` branch. Do not start another feature branch.
 
 ## Result required
@@ -18,13 +18,15 @@ negative case reports the exact TS2322 diagnostic. The unused generic method
 remains unresolved. Pinned Go agrees on both unchanged TypeScript inputs.
 The fixture does not cover all of Query's import and alias paths.
 
-The [full regression selection](../target/query-core-source-member-operation-regression-2-result.md)
-loses 54 previous checker passes. It retains 6,272 of 6,326 previous integration
-passes and adds the two passing member tests. Against the accepted compiler,
-5,765 of 6,055 passes remain, 277 fail and 13 exact names are absent. The batch
-is rejected. No expectation change is approved.
+The [latest full regression selection](../target/query-core-member-regression-full-1-result.md)
+has 6,278 passes and 457 failures across 6,735 tests. It retains all 6,274
+previous passes and recovers four losses. Fifty of the 54 recent lost passes
+remain. Against the accepted compiler, 5,769 of 6,055 pass, 273 fail and 13
+exact names are absent. The batch is rejected. No expectation change is approved.
+The three-file repair is saved as signed checkpoint `ae2f42ac2`. The separate
+reference-flow draft remains unchanged and unstaged.
 
-[Unchanged Query](../target/query-core-source-member-operation-query-2-result.md)
+[Unchanged Query](../target/query-core-member-regression-query-2-result.md)
 still completes only 2 of 23 isolated roots. Ordinary checking no longer stops
 at the unread Node `send` method. It fails at a void annotation instead. No
 additional root completes and diagnostics remain unchanged. This is not a demo.
@@ -42,27 +44,34 @@ inherited lookup and applied generic bases. It retains names before demanding
 one member value. That exposed failures in existing consumers and validators.
 Repair these failures before advancing Query's next stopping point.
 
-1. Restore base-state validation. The new `generic_member_names` return in
-   `execute_declared_type_worker` skips the old lazy DOM route's checks for
-   stored heritage provenance and partial base/member state. Authenticate that
-   state before returning or publishing identity. Keep legitimate warm state.
-   Do not clear caches or copy a cold-only rejection into every request.
-2. Trace the inherited callable and property failures through the shared name,
-   value and proxy states. Start with the existing public cases in
-   `source_interface_heritage`, `native_merged_interface_bases` and
-   `merged_global_interfaces`. Preserve their full cold, warm and caller-context
-   checks. A names-complete table must not imply values-complete state.
-3. Recheck all 54 newly lost names and both new complete member tests. Then run
+1. Separate full and name-only member plans. A full request must upgrade an
+   earlier name-only plan. A later lazy request must not downgrade a full plan.
+   Preserve caller mode when planning concrete generic bases. Select strict
+   completed generic reuse during planning, before optional-union and receiver
+   preparation. Compute expected member types from source, not stored values.
+2. Complete the remaining shared source demand. Direct completed heritage must
+   use the source-aware property provider. Empty intermediate interfaces need
+   an empty member plan. Proved nongeneric source bases must retain identity
+   through the instantiation classifier. Carry written-base owner proofs into
+   reference planning and preserve legal repeated bases. The
+   [parallel audit](../target/query-core-member-regression-parallel-audit.md)
+   records the concrete paths and limits on each finding.
+3. Recheck all 50 remaining recent losses and both complete member tests. Then run
    the full accepted selections. Every earlier accepted loss also stays open.
 4. Rerun unchanged Query. Its current void failure needs bounded metadata for
    the rejecting reader, ownership role, plan membership and cache fields. The
    keyword planner, executor and cache readers already support void. Do not
    add another syntax admission rule.
 
+The latest patch restores source heritage validation before identity reuse,
+fills ordinary Pending values without replacing names or proxies, and connects
+inherited source-aware property demand. It also extends the checked Array edge
+walk. Cached annotation edges on Pending members still need to stay in that
+walk. Shape validation alone does not prove caller Array authority.
+
 The negative DOM test's exact private corruption is not visible in the log.
-The missing production validation is proved, but attribution to that mutation
-is not. Do not change its expectation. No private test body or held Query source
-body was read.
+It still fails. Do not change its expectation. No private test body or held
+Query source body was read.
 
 The rest of the same operation remains open:
 
@@ -75,8 +84,9 @@ The rest of the same operation remains open:
   current routes remain separate, but changed cache expectations need concrete
   pinned-Go evidence before any test change.
 
-No further worker is needed for this dependency path. Keep one implementer and
-one reviewer. Do not promote the checkpoint while any regression is unresolved.
+Eighteen read-only investigations ran in parallel. Keep one production writer
+and one code reviewer. Give extra workers bounded source and evidence checks.
+Do not promote the checkpoint while any regression is unresolved.
 
 ## What the source comparison established
 
@@ -100,6 +110,12 @@ The checkpoint adds merged-owner defaults and the measured class/interface
 instance-base path. General runtime class bases and selected class methods
 remain unfinished. The shared member operation also has the regression gaps
 listed above. Changing only the global-read guard does not finish these callers.
+
+Full Go source checking resolves ordinary property values. Plain bodyless method
+checking does not always resolve the named method's callable cache. Rust still
+uses its older eager method-value policy in full publication. Separate method
+annotation checking from selected method value demand before claiming cache
+parity. Pinned Go also retains repeated noncircular bases in written order.
 
 ## Implementation
 
@@ -207,7 +223,7 @@ diagnostic changes and whether ordinary checking completes. The small fixture
 does not replace this check, especially for imports and aliases.
 
 Before promotion, run the accepted regression selections and compare every
-old passing name and diagnostic record. The current 277 failures, 13 absent
+old passing name and diagnostic record. The current 273 failures, 13 absent
 names and changed corpus records remain open blockers. New passes do not offset
 them. Do not change an accepted expectation without concrete pinned-Go evidence.
 
