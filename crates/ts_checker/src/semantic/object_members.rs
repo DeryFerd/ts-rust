@@ -803,7 +803,9 @@ pub(super) fn resolve_object_property_by_key_with_source(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
-    if store.source_interface_heritage_header(receiver).is_some() {
+    if store.source_interface_heritage_header(receiver).is_some()
+        || store.direct_interface_heritage_provenance(receiver).is_some()
+    {
         return CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,
@@ -1424,8 +1426,15 @@ fn resolve_instantiated_object_property_by_key_with_source(
         .direct_interface_heritage_provenance(receiver)
         .is_some()
     {
-        return resolve_object_property_by_key(store, Some(global_types), receiver, name, session)
-            .map_err(Into::into);
+        return CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_property_of_source_interface(receiver, name);
     }
     let source_names = super::instantiated_members::source_member_reference(store, receiver)
         .ok()
@@ -26956,6 +26965,79 @@ fn publish_generic_interface_declared_members_worker(
         || !valid_generic_property_types(store, plan, property_types)
     {
         return Err(invalid());
+    }
+
+    if let Some(names) = store.source_declared_member_names(target) {
+        if !names.validates_target(store, target)
+            || !names.properties().eq(plan.properties.iter().map(|property| property.symbol))
+            || super::instantiated_members::validated_generic_interface_type_edges(
+                store, target, array_targets,
+            )
+            .is_err()
+            || interface
+                .declared_index_infos
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .zip(&index_types)
+                .any(|(index, (key, value))| {
+                    store.index_info(*index).is_none_or(|info| {
+                        info.key_type() != *key || info.value_type() != *value
+                    })
+                })
+        {
+            return Err(invalid());
+        }
+        let mut pending = Vec::new();
+        for (property, type_) in plan.properties.iter().zip(property_types) {
+            if store.symbol(property.symbol).is_some_and(|record| {
+                record.flags().contains(SymbolFlags::METHOD)
+            }) {
+                continue;
+            }
+            let expected = expected_declared_property_links(store, plan, property, *type_)
+                .ok_or_else(invalid)?;
+            if !valid_declared_property_check_flags(store, property) {
+                return Err(invalid());
+            }
+            match store.value_symbol_links(property.symbol) {
+                Some(links) if links.resolved_type.is_some() => {
+                    if links != &expected {
+                        return Err(invalid());
+                    }
+                }
+                links if links.is_none_or(|links| links == &ValueSymbolLinks::default()) => {
+                    pending.push((property, expected));
+                }
+                _ => return Err(invalid()),
+            }
+        }
+        let missing = pending.iter().filter(|(property, _)| {
+            store.value_symbol_links(property.symbol).is_none()
+        }).count();
+        if !store.try_reserve_value_symbol_links(missing) {
+            return Err(PropertyObjectError::Capacity(plan.node));
+        }
+        // Full declaration checking fills the existing originals. It does not
+        // replace the name table or any proxy made by an earlier lazy read.
+        match preparation {
+            Some((prepared, globals)) => {
+                publish_interface_method_values_prepared(
+                    store, plan, &method_types, prepared, globals,
+                )?;
+            }
+            None => {
+                publish_interface_method_values(store, plan, &method_types)?;
+            }
+        }
+        for (property, links) in pending {
+            assert!(store.set_value_symbol_links(property.symbol, links));
+        }
+        super::instantiated_members::validated_generic_interface_type_edges(
+            store, target, array_targets,
+        )
+        .map_err(|_| invalid())?;
+        return Ok(target);
     }
 
     if interface.declared_members_resolved {

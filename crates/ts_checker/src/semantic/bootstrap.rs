@@ -3159,6 +3159,32 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     return Ok(());
                 }
+                if matches!(record.data(), TypeData::Interface(_))
+                    && !record.object_flags().contains(ObjectFlags::CLASS)
+                    && self.source_declared_member_names(type_).is_some()
+                    && !array_validation.targets().is_some_and(|targets| {
+                        type_ == targets.array_type() || type_ == targets.readonly_array_type()
+                    })
+                    && record.symbol().is_none_or(|symbol| {
+                        !self.symbol_is_registered_global_array(symbol)
+                    })
+                {
+                    let edges = super::instantiated_members::validated_generic_interface_type_edges(
+                        self,
+                        type_,
+                        array_validation.targets(),
+                    )
+                    .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?;
+                    for edge in edges {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            visited,
+                            allowed_pending,
+                        )?;
+                    }
+                    return Ok(());
+                }
                 match object_members::validate_resolved_declared_property_type_graph(self, type_) {
                     object_members::DeclaredPropertyTypeGraphValidation::Traversable(
                         property_types,
@@ -3213,31 +3239,67 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let structured = &interface.reference.object.structured;
         let mut edges = Vec::new();
         for property in structured.properties.as_deref().unwrap_or_default() {
+            if self.value_symbol_links(*property).is_none_or(|links| {
+                links.target.is_none() && links.resolved_type.is_none()
+            }) {
+                let owner = self
+                    .get_parent_of_symbol(*property)
+                    .and_then(|owner| self.declared_type_links(owner))
+                    .and_then(|links| links.declared_type)
+                    .ok_or_else(invalid)?;
+                let names = self.source_declared_member_names(owner).ok_or_else(invalid)?;
+                if !names.validates_target(self, owner)
+                    || !names.properties().any(|symbol| symbol == *property)
+                {
+                    return Err(invalid());
+                }
+                edges.extend(
+                    super::instantiated_members::validated_generic_interface_type_edges(
+                        self,
+                        owner,
+                        array_targets,
+                    )
+                    .map_err(|_| invalid())?,
+                );
+                edges.push(owner);
+                continue;
+            }
             let links = self.value_symbol_links(*property).ok_or_else(invalid)?;
             if let Some(target) = links.target {
-                let reference = super::structured_members::inherited_generic_property_reference_with_query_context(
+                if let Some(reference) = super::structured_members::inherited_generic_property_reference_with_query_context(
                     self,
                     type_,
                     *property,
                     array_targets,
                     query,
                 )
-                .or_else(|| {
-                    super::structured_members::inherited_alias_property_reference_with_query_context(
+                {
+                    // The shared member proof checks both unresolved source values
+                    // and every published value without forcing an unread member.
+                    edges.extend(
+                        super::instantiated_members::validated_generic_interface_type_edges(
+                            self,
+                            reference,
+                            array_targets,
+                        )
+                        .map_err(|_| invalid())?,
+                    );
+                    edges.push(reference);
+                } else {
+                    let reference = super::structured_members::inherited_alias_property_reference_with_query_context(
                         self,
                         type_,
                         *property,
                         array_targets,
                         query,
                     )
-                })
-                .ok_or_else(invalid)?;
-                let template = self
-                    .value_symbol_links(target)
-                    .and_then(|links| links.resolved_type)
                     .ok_or_else(invalid)?;
-                // A lazy proxy still needs its template and substitutions checked.
-                edges.extend([template, reference]);
+                    let template = self
+                        .value_symbol_links(target)
+                        .and_then(|links| links.resolved_type)
+                        .ok_or_else(invalid)?;
+                    edges.extend([template, reference]);
+                }
             } else if links.resolved_type.is_none() {
                 return Err(invalid());
             }

@@ -39029,25 +39029,33 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ) -> Result<Option<super::relater::ResolvedOwnProperty>, super::source::SourceCheckError> {
         self.begin_source_query();
         let result = (|| {
-            self.prepare_source_interface_heritage(SourceInterfaceHeritageRequest::Header {
-                receiver,
-            })?;
-            let header = self
+            if let Some(header) = self
                 .store
                 .source_interface_heritage_header(receiver)
                 .cloned()
-                .ok_or(super::RelationUnavailable::InvalidStructuredMembers(
+            {
+                self.prepare_source_interface_heritage(SourceInterfaceHeritageRequest::Header {
                     receiver,
-                ))?;
-            for alias in header.bases().iter().filter_map(|base| base.alias()) {
-                self.prepare_source_interface_heritage(SourceInterfaceHeritageRequest::Alias {
-                    receiver,
-                    alias: alias.symbol(),
-                    root: alias.root(),
                 })?;
+                for alias in header.bases().iter().filter_map(|base| base.alias()) {
+                    self.prepare_source_interface_heritage(SourceInterfaceHeritageRequest::Alias {
+                        receiver,
+                        alias: alias.symbol(),
+                        root: alias.root(),
+                    })?;
+                }
             }
             let context = self.source_query_context()?;
             let arrays = Some(CanonicalArrayTargets::from_global_types(&context.globals));
+            if structured_members::validate_interface_heritage_members_with_query_context(
+                self.store,
+                receiver,
+                arrays,
+                Some(&context.heritage()),
+            ) != structured_members::InterfaceHeritageMembersValidation::Valid
+            {
+                return Err(super::RelationUnavailable::InvalidStructuredMembers(receiver).into());
+            }
             let inherited = self
                 .store
                 .type_payload(receiver)
@@ -39065,14 +39073,22 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         Some(&context.heritage()),
                     )
             {
-                let session = self.instantiation_session.as_deref_mut().ok_or_else(|| {
-                    type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery)
-                })?;
-                super::instantiated_members::demand_instantiated_property_type(
-                    self.store, reference, property, arrays, session,
-                )
-                .map_err(|error| object_members::source_generic_member_error(receiver, &error))?;
+                self.get_type_of_instantiated_interface_property(reference, property)?;
+            } else if let Some(property) = inherited
+                && self
+                    .store
+                    .value_symbol_links(property)
+                    .is_none_or(|links| links.target.is_none())
+                && self
+                    .store
+                    .get_parent_of_symbol(property)
+                    .and_then(|owner| self.store.declared_type_links(owner))
+                    .and_then(|links| links.declared_type)
+                    .is_some_and(|owner| self.store.source_declared_member_names(owner).is_some())
+            {
+                self.get_type_of_instantiated_interface_property(receiver, property)?;
             }
+            let context = self.source_query_context()?;
             structured_members::validated_interface_property_by_key_with_query_context(
                 self.store,
                 receiver,
@@ -46541,6 +46557,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         {
             if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
                 if plan.generic_member_names.contains_key(&symbol) {
+                    self.validate_source_member_heritage_state(symbol, declared_type)?;
                     return Ok(declared_type);
                 }
                 if let Some(header) = plan.interface_headers.get(&symbol) {
@@ -47174,6 +47191,57 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(reference)
     }
 
+    /// Checks retained heritage against the current source before member publication.
+    fn validate_source_member_heritage_state(
+        &self,
+        symbol: SemanticSymbolId,
+        target: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        let complete = self.store.direct_interface_heritage_provenance(target).is_some();
+        let header = self.store.source_interface_heritage_header(target);
+        if !complete && header.is_none() {
+            return Ok(());
+        }
+        let invalid = || {
+            DeclaredTypeError::from(DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                symbol,
+                declared_type: target,
+            })
+        };
+        let context = if self.global_types.is_some() {
+            Some(self.source_query_context()?)
+        } else {
+            None
+        };
+        let arrays = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types);
+        let heritage = context.as_ref().map(SourceTypeQueryContext::heritage);
+        if complete {
+            let plan = object_members::plan_interface(self.store, self.host, symbol)
+                .map_err(|_| invalid())?;
+            if !structured_members::validate_planned_interface_heritage_members_with_query_context(
+                self.store,
+                &plan,
+                target,
+                arrays,
+                heritage.as_ref(),
+            ) {
+                return Err(invalid());
+            }
+        } else if let Some(header) = header {
+            super::interface_heritage::validate_source_interface_heritage_cache_edges(
+                self.store,
+                target,
+                header,
+                arrays,
+                heritage.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
     fn execute_generic_interface_declared_members(
         &mut self,
         symbol: SemanticSymbolId,
@@ -47193,6 +47261,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .cloned()
             .ok_or_else(invalid)?;
         if let Some(names) = plan.generic_member_names.get(&symbol) {
+            self.validate_source_member_heritage_state(symbol, target)?;
             if let Some(published) = self.store.source_declared_member_names(target) {
                 if !published.validates_target(self.store, target) || !names.is_current(self.store)
                 {
@@ -47218,6 +47287,34 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             base.symbol, base_target, plan, prepared,
                         )?;
                     }
+                }
+            }
+            if self.store.source_declared_member_names(target).is_none()
+                && matches!(self.store.type_payload(target).map(TypeRecord::data),
+                    Some(TypeData::Interface(interface)) if interface.declared_members_resolved)
+            {
+                if self.store.direct_interface_heritage_provenance(target).is_some() {
+                    // The entry check proved the completed table. The base loop
+                    // above still performs the written-reference diagnostics.
+                    return Ok(());
+                }
+                let nongeneric = self.store.type_payload(target).is_some_and(|record| {
+                    !record.object_flags().contains(ObjectFlags::CLASS)
+                        && (!record.object_flags().contains(ObjectFlags::REFERENCE)
+                            || super::reference_types::validate_nongeneric_interface_argument_origin(
+                                self.store, target,
+                            ).is_ok())
+                });
+                if nongeneric {
+                    let complete = object_members::plan_interface(self.store, self.host, symbol)
+                        .map_err(property_object_error)?;
+                    if complete.heritage.is_some()
+                        || !matches!(object_members::interface_state(self.store, &complete, target),
+                            Ok(object_members::PropertyObjectState::Resolved(actual)) if actual == target)
+                    {
+                        return Err(invalid());
+                    }
+                    return Ok(());
                 }
             }
             self.execute_interface_method_type_parameters(
