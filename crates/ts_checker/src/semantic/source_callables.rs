@@ -6325,7 +6325,7 @@ fn source_direct_call_reference(
         .resolve(
             Some(CanonicalResolutionLocation::Bound(receiver)),
             &identifier.text,
-            SymbolFlags::VALUE,
+            SymbolFlags::VALUE | SymbolFlags::ALIAS,
             None,
             false,
             false,
@@ -6336,6 +6336,9 @@ fn source_direct_call_reference(
     };
     let symbol = store.get_merged_symbol(symbol).ok_or_else(invalid)?;
     let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    if owner.flags().contains(SymbolFlags::ALIAS) {
+        return Ok(None);
+    }
     let Some(declaration) = owner.value_declaration() else {
         return Ok(None);
     };
@@ -6697,7 +6700,7 @@ fn source_fixed_method_callback_receiver(
         .resolve(
             Some(CanonicalResolutionLocation::Bound(receiver)),
             &identifier.text,
-            SymbolFlags::VALUE,
+            SymbolFlags::VALUE | SymbolFlags::ALIAS,
             None,
             false,
             false,
@@ -6707,6 +6710,9 @@ fn source_fixed_method_callback_receiver(
         return Ok(None);
     };
     let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    if owner.flags().contains(SymbolFlags::ALIAS) {
+        return Ok(None);
+    }
     let Some(declaration) = owner.value_declaration() else {
         return Ok(None);
     };
