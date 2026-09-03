@@ -4209,7 +4209,8 @@ fn plan_source_callable_with_owner_shape(
                                 &owner_shape,
                                 SourceCallableOwnerShape::ExportedImplementationOverload(_)
                             ))
-                    && type_parameters.is_empty()
+                    && (type_parameters.is_empty()
+                        || matches!(&owner_shape, SourceCallableOwnerShape::Unique))
                     && !is_async
                     && name_record.kind == SyntaxKind::Identifier
                     && data.type_.is_none()
@@ -4288,7 +4289,7 @@ fn plan_source_callable_with_owner_shape(
                     || object_parameter_default_arrow
                     || direct_implicit_any_rest_arrow)
                     || body_mode.is_ambient() && !rest
-                    || !type_parameters.is_empty()
+                    || !type_parameters.is_empty() && string_default.is_none()
                     || initializer.is_some()
                         && !initialized_array_binding
                         && string_default.is_none()
@@ -10580,7 +10581,10 @@ fn validate_exact_generic_annotation_shape(
                     )?,
                     None => false,
                 };
-            if parameter.is_implicit_any() || parameter.initializer.is_some() || !rest_is_exact {
+            if parameter.is_implicit_any()
+                || parameter.initializer.is_some() && !parameter.has_string_default_type()
+                || !rest_is_exact
+            {
                 return Err(SourceCallableError::Unsupported(
                     SourceCallableUnsupported::GenericSignature(plan.declaration),
                 ));
@@ -12886,7 +12890,6 @@ fn valid_source_callable_plan_owner(
                 origin.function != plan.declaration
                     || plan.family != SourceCallableFamily::FunctionDeclaration
                     || plan.body_mode != SourceCallableBodyMode::Present
-                    || !plan.type_parameters.is_empty()
                     || plan.is_async
                     || !origin.matches_parameter(store, *parameter)
             })
@@ -15458,7 +15461,7 @@ pub(super) fn publish_source_callable_parameter_types(
                 )));
             }
             let cached = match query_evidence {
-                Some(evidence) => evidence.annotation_type(parameter.type_node),
+                Some(evidence) => evidence.parameter_type(store, parameter),
                 None => parameter.base_type(store),
             }
             .ok_or_else(|| {
@@ -17582,10 +17585,12 @@ fn valid_stored_generic_source_signature(
                     .iter()
                     .zip(&evidence.callable().parameters)
                     .all(|(type_, parameter)| {
-                        let Some(base) = evidence.annotation_type(parameter.type_node) else {
+                        let Some(base) = evidence.parameter_type(store, parameter) else {
                             return false;
                         };
-                        if bootstrap.options.strict_null_checks && parameter.optional {
+                        if bootstrap.options.strict_null_checks
+                            && (parameter.optional || parameter.initializer.is_some())
+                        {
                             valid_optional_type(store, array_targets, base, *type_)
                         } else {
                             base == *type_
@@ -19169,7 +19174,7 @@ fn validate_parameter_links(
     let base = if plan.requires_type_query_evidence() {
         store
             .source_callable_type_query(signature)
-            .and_then(|evidence| evidence.annotation_type(parameter.type_node))
+            .and_then(|evidence| evidence.parameter_type(store, parameter))
     } else {
         parameter.base_type(store)
     }
