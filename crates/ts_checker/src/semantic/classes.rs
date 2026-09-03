@@ -9025,9 +9025,21 @@ pub(super) fn source_class_generic_method_callee(
     if store.source_node_kind(class) != Some(SyntaxKind::ClassDeclaration) {
         return Ok(None);
     }
-    let Some(owner) = store.source_declaration_symbol(class) else {
-        return Ok(None);
-    };
+    let symbol = store
+        .source_declaration_symbol(declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(declaration)))?;
+    let invalid = || invariant(ClassInvariant::InvalidPropertyValueCache(symbol));
+    let owner = store
+        .symbol(symbol)
+        .and_then(Symbol::parent)
+        .ok_or_else(invalid)?;
+    if !store.source_declaration_belongs_to_symbol(class, owner)
+        || store
+            .symbol(owner)
+            .is_none_or(|owner| !owner.flags().contains(SymbolFlags::CLASS))
+    {
+        return Err(invalid());
+    }
     let Some(provenance) = store.source_class_provenance_for_symbol(owner) else {
         return Ok(None);
     };
@@ -9043,14 +9055,10 @@ pub(super) fn source_class_generic_method_callee(
     if method.method.type_parameters.is_empty() {
         return Ok(None);
     }
-    let invalid = || {
-        invariant(ClassInvariant::InvalidPropertyValueCache(
-            method.method.symbol,
-        ))
-    };
     validate_source_class_stored_header(store, provenance)?;
     let (callee, expected_signature) = provenance.prepared.methods[index];
-    if expected_signature != signature
+    if method.method.symbol != symbol
+        || expected_signature != signature
         || method.method.side != ClassPropertySide::Instance
         || method.method.overload
         || record.type_parameters()

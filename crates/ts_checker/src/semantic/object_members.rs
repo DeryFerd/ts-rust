@@ -24932,11 +24932,12 @@ pub(super) fn declared_class_method_type_parameter_view(
     {
         return None;
     }
-    let owner = store.source_declaration_symbol(class_declaration)?;
-    let class = store.symbol(owner)?;
     let symbol = store.source_declaration_symbol(declaration)?;
     let method = store.symbol(symbol)?;
-    if !class.flags().contains(SymbolFlags::CLASS)
+    let owner = method.parent()?;
+    let class = store.symbol(owner)?;
+    if !store.source_declaration_belongs_to_symbol(class_declaration, owner)
+        || !class.flags().contains(SymbolFlags::CLASS)
         || class.check_flags() != CheckFlags::NONE
         || class.declarations() != Some(&[class_declaration])
         || class.value_declaration() != Some(class_declaration)

@@ -862,7 +862,13 @@ fn source_class_method_annotation_owner(
         return Ok(None);
     };
     let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(annotation));
-    let owner = store.source_declaration_symbol(class).ok_or_else(invalid)?;
+    let owner = host.bound_file(class)
+        .and_then(|bound| bound.symbol(class))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    if !store.source_declaration_belongs_to_symbol(class, owner) {
+        return Err(invalid());
+    }
     super::classes::source_class_method_type_parameter_plan(store, host, owner, annotation)
         .map_err(|_| invalid())?
         .ok_or_else(invalid)?;
@@ -17133,14 +17139,30 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if self.lazy_interface_values {
             return self.plan_source_class_interface_members(symbol);
         }
-        let replay_imported = self.checking_imported_arguments
-            && self.imported_argument_generic_members.insert(symbol);
-        if !self.plan.generic_member_plans.contains_key(&symbol) || replay_imported {
+        self.plan_full_generic_interface_declared_members(symbol)
+    }
+
+    fn plan_full_generic_interface_declared_members(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        let previous = std::mem::replace(&mut self.lazy_interface_values, false);
+        let result = (|| {
+            let replay_imported = self.checking_imported_arguments
+                && self.imported_argument_generic_members.insert(symbol);
+            let already_full = self.plan.generic_member_plans.contains_key(&symbol)
+                && !self.plan.generic_member_names.contains_key(&symbol);
+            if already_full && !replay_imported {
+                return Ok(());
+            }
             let members = object_members::plan_generic_interface(self.store, self.host, symbol)
                 .map_err(property_object_error)?;
             self.plan
                 .generic_member_plans
                 .insert(symbol, members.clone());
+            // Register Full before dependencies. Recursive Names requests must
+            // retain this plan and its annotation work.
+            self.plan.generic_member_names.remove(&symbol);
             if self.has_generic_interface_heritage(symbol)? {
                 self.plan_generic_interface_heritage(symbol)?;
             }
@@ -17172,21 +17194,57 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             {
                 self.plan_type_node_in_context(property.key.type_node, None, false)?;
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        self.lazy_interface_values = previous;
+        result
     }
 
     fn plan_source_class_interface_members(
         &mut self,
         symbol: SemanticSymbolId,
     ) -> Result<(), DeclaredTypeError> {
-        if self.plan.generic_member_names.contains_key(&symbol) {
+        if self.plan.generic_member_plans.contains_key(&symbol) {
             return Ok(());
+        }
+        let source = super::declared::plan_class_interface_source(self.store, self.host, symbol)?;
+        if source.class_declaration.is_none()
+            && !source.local_type_parameters.is_empty()
+            && let Some(target) = self.store.declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+            && self.store.source_declared_member_names(target).is_none()
+            && let Some(record) = self.store.type_payload(target)
+            && let TypeData::Interface(interface) = record.data()
+            && interface.declared_members_resolved
+        {
+            let invalid = || DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                    symbol,
+                    declared_type: target,
+                },
+            );
+            let reference = validate_direct_generic_reference(self.store, target)
+                .map_err(|_| invalid())?;
+            let parameters = source.outer_type_parameters.iter().copied()
+                .chain(source.local_type_parameters.iter().map(|parameter| parameter.symbol))
+                .collect::<Vec<_>>();
+            if record.symbol() != Some(symbol)
+                || record.object_flags().contains(ObjectFlags::CLASS)
+                || !interface.base_types_resolved
+                || reference.target != target
+                || reference.type_arguments.iter()
+                    .map(|parameter| cached_ordinary_type_parameter_owner(self.store, *parameter))
+                    .collect::<Option<Vec<_>>>().as_deref() != Some(parameters.as_slice())
+            {
+                return Err(invalid());
+            }
+            // Existing full tables need fresh annotation checks and the strict
+            // warm publisher, not another cold name-table publication.
+            return self.plan_full_generic_interface_declared_members(symbol);
         }
         let (names, members) =
             object_members::plan_source_declared_members(self.store, self.host, symbol)
                 .map_err(property_object_error)?;
-        let source = super::declared::plan_class_interface_source(self.store, self.host, symbol)?;
         self.plan.generic_member_names.insert(symbol, names);
         self.plan.generic_member_plans.insert(symbol, members.clone());
         if let Some(heritage) = &members.heritage {
@@ -17237,11 +17295,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         &mut self,
         base: &DirectInterfaceBasePlan,
     ) -> Result<(), DeclaredTypeError> {
-        let previous = self.lazy_interface_values;
-        self.lazy_interface_values = true;
-        let members = self.plan_generic_interface_declared_members(base.symbol);
-        self.lazy_interface_values = previous;
-        members?;
+        self.plan_generic_interface_declared_members(base.symbol)?;
         for argument in &base.type_arguments {
             self.plan_type_node_in_context(*argument, None, false)?;
         }
@@ -47260,8 +47314,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .get(&symbol)
             .cloned()
             .ok_or_else(invalid)?;
+        let legacy_complete = self.store.source_declared_member_names(target).is_none()
+            && matches!(self.store.type_payload(target).map(TypeRecord::data),
+                Some(TypeData::Interface(interface)) if interface.declared_members_resolved);
+        if legacy_complete
+            && !matches!(self.store.type_payload(target).map(TypeRecord::data),
+                Some(TypeData::Interface(interface)) if interface.base_types_resolved)
+        {
+            return Err(invalid());
+        }
+        self.validate_source_member_heritage_state(symbol, target)?;
         if let Some(names) = plan.generic_member_names.get(&symbol) {
-            self.validate_source_member_heritage_state(symbol, target)?;
             if let Some(published) = self.store.source_declared_member_names(target) {
                 if !published.validates_target(self.store, target) || !names.is_current(self.store)
                 {
@@ -47385,6 +47448,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return Ok(());
         }
         if let Some(heritage) = &members.heritage {
+            self.execute_generic_interface_heritage(
+                symbol,
+                target,
+                (symbol, Some(heritage)),
+                plan,
+                prepared,
+            )?;
             for base in &heritage.bases {
                 if base.kind.is_instantiated_alias() {
                     self.execute_interface_alias_base(base, plan, prepared)?;
@@ -47480,6 +47550,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.global_types.as_ref(),
         )
         .map_err(property_object_error)?;
+        if legacy_complete
+            && (self.store.source_declared_member_names(target).is_some()
+                || !matches!(self.store.type_payload(target).map(TypeRecord::data),
+                    Some(TypeData::Interface(interface))
+                        if interface.declared_members_resolved && interface.base_types_resolved))
+        {
+            return Err(invalid());
+        }
         object_members::publish_generic_interface_declared_members_prepared(
             self.store,
             &members,
