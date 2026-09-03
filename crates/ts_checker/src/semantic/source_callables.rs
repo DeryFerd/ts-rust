@@ -6458,34 +6458,54 @@ fn source_direct_call_reference(
         }
         _ => return Ok(None),
     };
-    let statement = if let Some((statement, scope)) = source_direct_call_value_container(store, call) {
-        if bound.container(call) != Some(scope) || bound.container(statement) != Some(scope) {
-            return Ok(None);
-        }
-        statement
-    } else {
-        let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(call) else {
-            return Ok(None);
-        };
-        let statement_record = preflight_node(store, host, statement)?;
-        if !matches!(&statement_record.data, NodeData::ExpressionStatement(statement)
-            if statement.expression == call.node && statement.flow_node.is_none())
-            || statement_record.kind != SyntaxKind::ExpressionStatement
-            || statement_record.flags.0 != 0
-        {
-            return Ok(None);
-        }
-        statement
-    };
     let Some(container) = bound.container(call) else {
         return Ok(None);
     };
     if !matches!(
         store.source_node_kind(container),
         Some(SyntaxKind::SourceFile | SyntaxKind::ArrowFunction | SyntaxKind::FunctionDeclaration)
-    ) || bound.container(statement) != Some(container)
-    {
+    ) {
         return Ok(None);
+    }
+    if container != bound.source_file() {
+        let symbol = bound
+            .symbol(container)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(invalid)?;
+        if !host.symbol_matches(store, container, symbol)
+            || !store.source_symbol_declarations_match(symbol)
+            || store.symbol(symbol).is_none_or(|owner| {
+                !owner.flags().contains(SymbolFlags::FUNCTION)
+                    || owner.check_flags() != CheckFlags::NONE
+                    || owner.value_declaration() != Some(container)
+            })
+        {
+            return Err(invalid());
+        }
+    }
+    // The shared expression planner owns the enclosing value shape. Keep the
+    // actual binder container and every parent edge, independent of statement kind.
+    let mut current = call;
+    let mut visited = HashSet::new();
+    while current != container {
+        if !visited.insert(current)
+            || !current.is_for(callback.arena, callback.file)
+            || bound.container(current) != Some(container)
+        {
+            return Err(invalid());
+        }
+        let parent = preflight_node(store, host, current)?
+            .parent
+            .map(|node| NodeRef::new(callback.arena, callback.file, node))
+            .ok_or_else(invalid)?;
+        if store.source_node_parent(current) != Some(SourceNodeParent::Parent(parent))
+            || store.source_direct_children(parent).is_none_or(|children| {
+                children.iter().filter(|child| **child == current).count() != 1
+            })
+        {
+            return Err(invalid());
+        }
+        current = parent;
     }
     let callback_owner = bound.symbol(callback).ok_or_else(invalid)?;
     if !host.symbol_matches(store, callback, callback_owner)
