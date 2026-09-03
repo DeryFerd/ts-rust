@@ -6128,6 +6128,44 @@ impl SourceDirectCallResolution {
     }
 }
 
+/// Array sort keeps its existing contextual callback and cache checks.
+pub(super) fn source_array_sort_callback_is_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    callback: NodeRef,
+    current_flow_types: &std::collections::HashMap<SemanticSymbolId, TypeId>,
+) -> Result<bool, SourceCallableError> {
+    if host.source(callback).is_none_or(|(arena, _)| {
+        !super::source_calls::is_authenticated_sort_callback_syntax(arena, callback)
+    }) {
+        return Ok(false);
+    }
+    if !callback.is_for(source.node_ref().arena, source.node_ref().file) {
+        return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
+            callback,
+        )));
+    }
+    let Some(reference) = source_direct_call_reference(store, host, callback)? else {
+        return Ok(false);
+    };
+    let invalid = || invariant(SourceCallableInvariant::InvalidTypeCache(callback));
+    let receiver_type = current_flow_types
+        .get(&reference.symbol)
+        .copied()
+        .or_else(|| {
+            store
+                .value_symbol_links(reference.symbol)
+                .and_then(|links| links.resolved_type)
+        })
+        .ok_or_else(invalid)?;
+    Ok(store
+        .canonical_array_reference(global_types, receiver_type)
+        .map_err(|_| invalid())?
+        .is_some())
+}
+
 /// The actual callee was already checked by the ordinary call evaluator.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn prepare_source_direct_call_resolution(

@@ -46603,7 +46603,16 @@ fn check_contextual_direct_call_arrow(
     } else {
         false
     };
-    let proof = if promise || super::source_callables::source_object_parameter_default_arrow_is_exact(
+    let proof = if promise || super::source_callables::source_array_sort_callback_is_exact(
+        store,
+        host,
+        global_types,
+        source,
+        arrow.callable.declaration,
+        current_flow_types,
+    )
+    .map_err(SourcePlanner::callable_plan_error)?
+    || super::source_callables::source_object_parameter_default_arrow_is_exact(
         store,
         host,
         arrow.callable.declaration,
