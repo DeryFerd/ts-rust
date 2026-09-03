@@ -13268,6 +13268,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             if self.bound.container(declaration) == Some(body.declaration) {
                 continue;
             }
+            // Ambient globals use their checked declaration type, not an outer local's flow.
+            if self.cross_file_global_reads.iter().any(|global| {
+                global.read.resolved_symbol == read.resolved_symbol
+                    && global.read.value_symbol == read.value_symbol
+                    && store.source_node_parent(global.type_node)
+                        == Some(SourceNodeParent::Parent(declaration))
+            }) {
+                continue;
+            }
             let Some(record) = host.node(declaration) else {
                 return Err(SourceCheckError::Class(expression.node));
             };
