@@ -11,7 +11,7 @@ its latest measured comparison. The latest focused batch also has no recovery.
 | --- | --- | --- |
 | Query core, census 24 | 2 of 23 isolated roots complete | All 23 outcomes unchanged from census 23 |
 | Hono, last complete census 22 | 33 of 188 isolated roots complete | Latest ordinary check failed after 23m48s |
-| Focused tests, run 42 | 153 pass, 28 fail | All 179 old outcomes unchanged, both new tests fail |
+| Focused tests, run 43 | 152 pass, 29 fail | One changed result is an old "unsupported" expectation |
 | Checker library, run 5 | 5,072 pass, 365 fail | Three recoveries since run 3, no pass lost |
 
 An isolated root is one original entry file checked on its own. These counts
@@ -29,6 +29,18 @@ passed. Later review found an incorrect error location in the zero-argument
 test and an incorrect AST field selector in the cache-import test. Correct
 those separately and do not count a corrected expectation as a checker gain.
 
+[Run 43](../target/wave202-query-hono-combined-tests-43-result.md) also completed
+all 181 cases. Its one changed outcome gets `Ok(())`
+where an older imported-class test expected `Unsupported(Class)`. Native source
+review supports that class form, but the later type assertions have not run.
+The other 180 outcomes match run 42.
+
+There is narrower progress inside two failing groups. The observer tests now
+get past imported-class completion and stop at a type-reference query. The
+initializer tests now finish source checking, native diagnostics, return types
+and location queries, then fail a symbol-identity assertion. Neither group is
+a complete test pass yet.
+
 The three default-parameter tests passed but took 301.03 seconds. That is a
 separate performance problem. Their repeated trace records are recoverable
 probes, not proof that those probes consumed all five minutes.
@@ -41,8 +53,9 @@ six test expressions used an outdated optional-symbol API. Those expressions
 are repaired, and all three affected tests pass in run 5.
 
 Query 24 and Tests 42 use `d22177564dc5846eb2e493d60bdda860e38e0c54`.
+Tests 43 uses `c8cbfdf383fe368daff5a388f71093e043129939`.
 Library 5 uses `9ed1608143cc76e2f4df831dcf1fd580490a69d7`, which has the
-earlier production bytes plus the test API repairs. All three runs are closed.
+earlier production bytes plus the test API repairs. All four runs are closed.
 
 ### Why the demo has not advanced
 
@@ -57,9 +70,13 @@ checking or replay. No root census ran. Its error trace missed ten constructor
 sites, so that run did not locate the origin. Full input equality is unavailable
 for that failed construction. The saved report records the metadata difference.
 
-The Hono build used Rust optimization level 0. An optimized feedback experiment
-is being prepared with debug assertions and overflow checks kept on. No speed
-gain has been measured, and the acceptance settings have not changed.
+The Hono build used Rust optimization level 0. A separate
+[optimized feedback experiment](../target/wave202-defaults-opt1-1-result.md)
+reduced the same three-test group's execution time from 301.03 to 31.14 seconds.
+All three passed with debug assertions and overflow checks kept on. That is
+9.67 times faster test execution in one measurement. The first optimized build
+took a separate 4m56s. It is not a 9.67-times improvement in total feedback time.
+No acceptance settings changed, and no optimized Hono run has happened yet.
 
 Parallel source work has outpaced integration and full-project validation.
 Worker count and commit count are not the success measures. The next useful
@@ -67,20 +84,23 @@ result is a complete original project check with correct diagnostics.
 
 ### Current work and demo order
 
-Query remains the first demo target. The next 181-test run is running with the
-observer-class and initializer return-query repairs. A separate integration
+Query remains the first demo target. The 181-test run with the observer-class
+and initializer return-query repairs is complete. A separate integration
 pair has combined five reviewed fixes for Node member tables, callback return
 types, JWT member names, merged global aliases and Promise argument checks.
 Those five fixes have not run yet.
 
 Root committed a seven-line generic-alias repair after an observation identified
 the missing `keyof` operand reference plan. It retains all existing owner, cache
-and constraint checks. Its three unchanged tests are being prepared for a run.
+and constraint checks. Its three unchanged tests ran: one passed and two failed.
+Both former generic-alias cache failures now reach later structured-type
+relation failures. The first error is fixed, but neither whole case passes.
 
-A separate seven-test diagnostic run covers DOM overloads, `typeof`, local Set
-construction and returned async functions. Another pair owns the remaining
-cache-import parser-kind gap. Hono ownership coverage and the five-minute
-default-parameter test cost have separate investigations.
+A separate seven-test diagnostic run located failing operations in DOM indexed
+access, local Set library types and returned async imports. It recovered no
+test. Three pairs now own those repairs. The cache-import parser-kind repair
+and two mechanical test corrections are being added to the next integration.
+Hono ownership coverage and the default-parameter cost remain separate work.
 
 Integration and routine test-run review now have direct worker handoffs. Root
 does not need to repeat an unchanged run review. Source fixes, test corrections
