@@ -10543,6 +10543,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             SyntaxKind::TypeOperator if union_constituent => match &record.data {
                 NodeData::TypeOperatorNode(operator)
+                    if operator.operator == SyntaxKind::KeyOfKeyword =>
+                {
+                    self.plan_keyof_type(node, alias_owner)
+                }
+                NodeData::TypeOperatorNode(operator)
                     if operator.operator == SyntaxKind::ReadonlyKeyword
                         && self.array_targets.is_some()
                         && self.is_readonly_array_type(node, operator.type_)? =>
