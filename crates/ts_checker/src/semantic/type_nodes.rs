@@ -6045,6 +6045,7 @@ struct TypeQueryPlan {
         BTreeMap<SemanticSymbolId, super::interface_heritage::SourceInterfaceHeritageHeader>,
     generic_interfaces: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
     generic_member_plans: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
+    generic_member_names: BTreeMap<SemanticSymbolId, object_members::SourceDeclaredMemberNames>,
     generic_interface_identities:
         BTreeMap<SemanticSymbolId, object_members::GenericInterfaceIdentityPlan>,
     generic_interface_constraints:
@@ -17132,8 +17133,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let replay_imported = self.checking_imported_arguments
             && self.imported_argument_generic_members.insert(symbol);
         if !self.plan.generic_member_plans.contains_key(&symbol) || replay_imported {
-            let members = object_members::plan_generic_interface(self.store, self.host, symbol)
-                .map_err(property_object_error)?;
+            let members = if self.lazy_interface_values {
+                let (names, mut members) =
+                    object_members::plan_source_declared_members(self.store, self.host, symbol)
+                        .map_err(property_object_error)?;
+                members.heritage =
+                    object_members::plan_generic_interface_identity(self.store, self.host, symbol)
+                        .map_err(property_object_error)?
+                        .heritage;
+                self.plan.generic_member_names.insert(symbol, names);
+                members
+            } else {
+                object_members::plan_generic_interface(self.store, self.host, symbol)
+                    .map_err(property_object_error)?
+            };
             self.plan
                 .generic_member_plans
                 .insert(symbol, members.clone());
@@ -17176,15 +17189,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         &mut self,
         base: &DirectInterfaceBasePlan,
     ) -> Result<(), DeclaredTypeError> {
-        if self
-            .store
-            .symbol(base.symbol)
-            .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
-        {
-            self.plan_generic_interface_heritage(base.symbol)?;
-        } else {
-            self.plan_generic_interface_declared_members(base.symbol)?;
-        }
+        let previous = self.lazy_interface_values;
+        self.lazy_interface_values = true;
+        let members = self.plan_generic_interface_declared_members(base.symbol);
+        self.lazy_interface_values = previous;
+        members?;
         for argument in &base.type_arguments {
             self.plan_type_node_in_context(*argument, None, false)?;
         }
@@ -41071,6 +41080,28 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .value_symbol_links(property)
             .and_then(|links| links.target)
             .unwrap_or(property);
+        if let Some(target) = self
+            .store
+            .get_parent_of_symbol(method)
+            .and_then(|owner| self.store.declared_type_links(owner))
+            .and_then(|links| links.declared_type)
+            && let Some(names) = self.store.source_declared_member_names(target)
+        {
+            if !names.validates_target(self.store, target)
+                || !names.properties().any(|symbol| symbol == method)
+            {
+                return Err(invalid().into());
+            }
+            if self
+                .store
+                .symbol(method)
+                .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::METHOD))
+            {
+                self.get_type_of_interface_method(method)?;
+            } else {
+                self.get_type_of_declared_value_worker(method)?;
+            }
+        }
         self.prepare_generic_interface_method_callback_returns(receiver, method)?;
         let session = self
             .instantiation_session
@@ -44979,6 +45010,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .with_source_globals(self.global_types.as_ref());
             planner.source_context = Some(self.source_query_context()?);
             stage = "interface_members_plan";
+            planner.lazy_interface_values = true;
             planner.plan_generic_interface_declared_members(symbol)?;
             let plan = planner.finish();
             stage = "interface_members_prepare";
@@ -47014,6 +47046,90 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .get(&symbol)
             .cloned()
             .ok_or_else(invalid)?;
+        if let Some(names) = plan.generic_member_names.get(&symbol) {
+            if let Some(published) = self.store.source_declared_member_names(target) {
+                if !published.validates_target(self.store, target) || !names.is_current(self.store)
+                {
+                    return Err(invalid());
+                }
+            }
+            if let Some(heritage) = &members.heritage {
+                for base in &heritage.bases {
+                    if base.kind.is_instantiated_alias() {
+                        self.execute_interface_alias_base(base, plan, prepared)?;
+                    } else if base.type_arguments.is_empty() {
+                        self.execute_declared_type(base.symbol, plan, prepared)?;
+                    } else {
+                        self.execute_concrete_generic_interface_base(base, plan, prepared)?;
+                    }
+                }
+            }
+            self.execute_interface_method_type_parameters(
+                &[],
+                &members.call_signatures,
+                plan,
+                prepared,
+            )?;
+            for annotation in members.call_type_nodes() {
+                self.execute_type_node(annotation, plan, prepared)?;
+            }
+            let mut indexes = Vec::new();
+            for (key, value) in members.index_type_nodes() {
+                indexes.push((
+                    self.execute_type_node(key, plan, prepared)?,
+                    self.execute_type_node(value, plan, prepared)?,
+                ));
+            }
+            let mut calls = Vec::new();
+            for signature in &members.call_signatures {
+                let mut parameter_types = Vec::new();
+                for parameter in &signature.parameters {
+                    parameter_types.push(self.execute_type_node(
+                        parameter.type_node,
+                        plan,
+                        prepared,
+                    )?);
+                }
+                let return_type = if signature.implicit_any_return {
+                    self.store
+                        .intrinsic_bootstrap()
+                        .ok_or_else(invalid)?
+                        .any_type
+                } else {
+                    self.execute_type_node(signature.return_type, plan, prepared)?
+                };
+                calls.push(object_members::ResolvedCallSignatureTypes {
+                    parameter_types,
+                    return_type,
+                });
+            }
+            object_members::prepare_source_declared_call_optional_parameters(
+                self.store,
+                &members,
+                prepared,
+                self.global_types.as_ref(),
+                names,
+            )
+            .map_err(property_object_error)?;
+            if matches!(self.store.type_payload(target).map(TypeRecord::data), Some(TypeData::Interface(interface)) if !interface.base_types_resolved)
+            {
+                if members.heritage.is_some()
+                    || !self.store.publish_interface_no_base_resolution(target)
+                {
+                    return Err(invalid());
+                }
+            }
+            object_members::publish_source_declared_members(
+                self.store,
+                &members,
+                target,
+                names.clone(),
+                &indexes,
+                &calls,
+            )
+            .map_err(property_object_error)?;
+            return Ok(());
+        }
         if let Some(heritage) = &members.heritage {
             for base in &heritage.bases {
                 if base.kind.is_instantiated_alias() {

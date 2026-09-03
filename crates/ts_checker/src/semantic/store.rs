@@ -65,7 +65,8 @@ use super::{
         MappedIndexRecovery, MappedPropertyRecovery, MappedTypeModifiers, SourceMappedLookupRequest,
     },
     object_members::{
-        ObjectLiteralGetterOrigin, ObjectLiteralGetterReturnProof, ObjectLiteralPropertyCloneOrigin,
+        ObjectLiteralGetterOrigin, ObjectLiteralGetterReturnProof,
+        ObjectLiteralPropertyCloneOrigin, SourceDeclaredMemberNames,
     },
     relation::{RelationCaches, RelationComparisonResult, RelationKind, RelationStateSnapshot},
     signatures::{
@@ -860,6 +861,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_node_children: BTreeMap<NodeArenaId, Vec<Box<[NodeId]>>>,
     source_symbol_declarations: HashMap<SemanticSymbolId, SourceSymbolDeclarations>,
     source_merged_declaration_order: HashMap<SemanticSymbolId, Box<[NodeRef]>>,
+    source_declared_member_names: HashMap<TypeId, SourceDeclaredMemberNames>,
     source_global_bindings: Option<SourceGlobalBindings>,
     computed_method_name_groups: HashMap<SemanticSymbolId, ComputedMethodNameGroup>,
     source_declaration_owners: HashMap<NodeRef, Vec<SemanticSymbolId>>,
@@ -1094,6 +1096,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_node_children: BTreeMap::new(),
             source_symbol_declarations,
             source_merged_declaration_order: HashMap::new(),
+            source_declared_member_names: HashMap::new(),
             source_global_bindings: None,
             computed_method_name_groups: HashMap::new(),
             source_declaration_owners,
@@ -2847,6 +2850,21 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     .get(&symbol)
                     .map(|source| source.declarations.as_ref())
             })
+    }
+
+    pub(super) fn source_declared_member_names(
+        &self,
+        target: TypeId,
+    ) -> Option<&SourceDeclaredMemberNames> {
+        self.source_declared_member_names.get(&target)
+    }
+
+    pub(super) fn retain_source_declared_member_names(
+        &mut self,
+        target: TypeId,
+        names: SourceDeclaredMemberNames,
+    ) {
+        self.source_declared_member_names.insert(target, names);
     }
 
     /// Records the order used by the merger, independently of later symbol writes.

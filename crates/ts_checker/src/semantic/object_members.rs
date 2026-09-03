@@ -406,6 +406,371 @@ pub(super) struct SourceMemberName {
     pub(super) computed: Option<PlannedComputedMemberKey>,
 }
 
+#[derive(Clone, Debug)]
+struct SourceMemberIdentity {
+    symbol: SemanticSymbolId,
+    name: EscapedName,
+    flags: SymbolFlags,
+    declarations: Vec<NodeRef>,
+    value_declaration: Option<NodeRef>,
+    parent: Option<SemanticSymbolId>,
+    members: Option<SymbolTableId>,
+    exports: Option<SymbolTableId>,
+    export_symbol: Option<SemanticSymbolId>,
+}
+
+impl SourceMemberIdentity {
+    fn capture(store: &CanonicalTypeMapperStore, symbol: SemanticSymbolId) -> Option<Self> {
+        let record = store.symbol(symbol)?;
+        Some(Self {
+            symbol,
+            name: record.name().to_owned(),
+            flags: record.flags(),
+            declarations: record.declarations()?.to_vec(),
+            value_declaration: record.value_declaration(),
+            parent: store.get_parent_of_symbol(symbol),
+            members: record.members(),
+            exports: record.exports(),
+            export_symbol: record.export_symbol(),
+        })
+    }
+
+    fn is_current(&self, store: &CanonicalTypeMapperStore) -> bool {
+        store.get_merged_symbol(self.symbol) == Some(self.symbol)
+            && store.source_merged_symbol_declarations_in_order(self.symbol)
+            && store.symbol(self.symbol).is_some_and(|record| {
+                record.name() == self.name.as_ref()
+                    && record.flags() == self.flags
+                    && record.declarations() == Some(self.declarations.as_slice())
+                    && record.value_declaration() == self.value_declaration
+                    && store.get_parent_of_symbol(self.symbol) == self.parent
+                    && record.members() == self.members
+                    && record.exports() == self.exports
+                    && record.export_symbol() == self.export_symbol
+            })
+    }
+}
+
+/// Completed source names do not imply completed property values.
+#[derive(Clone, Debug)]
+pub(super) struct SourceDeclaredMemberNames {
+    owner: SourceMemberIdentity,
+    raw_members: Vec<(EscapedName, SemanticSymbolId)>,
+    members: Vec<SourceMemberIdentity>,
+    parameters: Vec<SourceMemberIdentity>,
+    outer_parameter_count: usize,
+    signatures: Vec<PlannedCallSignature>,
+    published_calls: Option<Vec<SignatureId>>,
+    published_constructs: Option<Vec<SignatureId>>,
+    published_indexes: Option<Vec<super::IndexInfoId>>,
+    declared_table: Option<SymbolTableId>,
+    published: bool,
+}
+
+impl SourceDeclaredMemberNames {
+    pub(super) fn owner(&self) -> SemanticSymbolId {
+        self.owner.symbol
+    }
+
+    pub(super) fn properties(&self) -> impl Iterator<Item = SemanticSymbolId> + '_ {
+        self.members.iter().map(|member| member.symbol)
+    }
+
+    pub(super) fn is_current(&self, store: &CanonicalTypeMapperStore) -> bool {
+        if !self.owner.is_current(store)
+            || store
+                .symbol(self.owner())
+                .is_none_or(|owner| owner.check_flags() != CheckFlags::NONE)
+            || self
+                .owner
+                .members
+                .and_then(|table| store.symbol_table(table))
+                .is_none_or(|table| {
+                    table.len() != self.raw_members.len()
+                        || self
+                            .raw_members
+                            .iter()
+                            .any(|(name, symbol)| table.get(name.as_ref()) != Some(*symbol))
+                })
+            || self.members.iter().any(|member| {
+                !member.is_current(store)
+                    || validate_cold_source_member_symbol(store, self.owner(), member.symbol)
+                        .is_err()
+                    || !source_named_member_value_is_valid(store, member.symbol)
+                    || self.published
+                        && member.flags.contains(SymbolFlags::PROPERTY)
+                        && !member.flags.intersects(SymbolFlags::ACCESSOR)
+                        && store.symbol(member.symbol).is_none_or(|record| {
+                            let readonly = member.declarations.iter().any(|declaration| {
+                                store
+                                    .source_child_with_kind(
+                                        *declaration,
+                                        SyntaxKind::ReadonlyKeyword,
+                                    )
+                                    .is_some()
+                            });
+                            record.check_flags()
+                                != if readonly {
+                                    CheckFlags::READONLY
+                                } else {
+                                    CheckFlags::NONE
+                                }
+                        })
+                    || member.declarations.iter().any(|declaration| {
+                        collect_source_member_annotation_edges(
+                            store,
+                            None,
+                            self.owner(),
+                            *declaration,
+                            store
+                                .value_symbol_links(member.symbol)
+                                .is_some_and(|links| links.resolved_type.is_some()),
+                            &HashMap::new(),
+                            &mut Vec::new(),
+                        )
+                        .is_err()
+                    })
+            })
+            || self.parameters.iter().any(|parameter| {
+                !parameter.is_current(store)
+                    || store
+                        .symbol(parameter.symbol)
+                        .is_none_or(|record| record.check_flags() != CheckFlags::NONE)
+            })
+        {
+            return false;
+        }
+        if !self.published {
+            return true;
+        }
+        match self
+            .declared_table
+            .and_then(|table| store.symbol_table(table))
+        {
+            None => self.members.is_empty() && self.declared_table.is_none(),
+            Some(table) => {
+                table.len() == self.members.len()
+                    && self
+                        .members
+                        .iter()
+                        .all(|member| table.get(member.name.as_ref()) == Some(member.symbol))
+            }
+        }
+    }
+
+    pub(super) fn validates_target(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        target: TypeId,
+    ) -> bool {
+        if !self.is_current(store) {
+            return false;
+        }
+        let Some(record) = store.type_payload(target) else {
+            return false;
+        };
+        let TypeData::Interface(interface) = record.data() else {
+            return false;
+        };
+        record.symbol() == Some(self.owner())
+            && store
+                .declared_type_links(self.owner())
+                .and_then(|links| links.declared_type)
+                == Some(target)
+            && record.flags() == TypeFlags::OBJECT
+            && record.alias().is_none()
+            && interface.outer_type_parameter_count == self.outer_parameter_count
+            && interface
+                .reference
+                .resolved_type_arguments
+                .as_deref()
+                .is_some_and(|arguments| {
+                    arguments.len() == self.parameters.len()
+                        && arguments
+                            .iter()
+                            .zip(&self.parameters)
+                            .all(|(type_, parameter)| {
+                                cached_ordinary_type_parameter_owner(store, *type_)
+                                    == Some(parameter.symbol)
+                                    && store
+                                        .declared_type_links(parameter.symbol)
+                                        .and_then(|links| links.declared_type)
+                                        == Some(*type_)
+                            })
+                })
+            && (!self.published
+                || interface.declared_members_resolved
+                    && interface.declared_members == self.declared_table
+                    && interface.declared_call_signatures == self.published_calls
+                    && interface.declared_construct_signatures == self.published_constructs
+                    && interface.declared_index_infos == self.published_indexes
+                    && [false, true].into_iter().all(|construct| {
+                        let expected = if construct {
+                            &self.published_constructs
+                        } else {
+                            &self.published_calls
+                        };
+                        self.signatures
+                            .iter()
+                            .filter(|signature| signature.is_construct() == construct)
+                            .map(|signature| validate_resolved_call_signature(store, signature))
+                            .collect::<Option<Vec<_>>>()
+                            .as_deref()
+                            == Some(expected.as_deref().unwrap_or_default())
+                    })
+                    && self.published_indexes.as_ref().is_none_or(|indexes| {
+                        self.owner
+                            .members
+                            .and_then(|table| store.symbol_table(table))
+                            .and_then(|table| table.get(InternalSymbolName::Index.as_ref()))
+                            .is_some_and(|symbol| {
+                                super::structured_members::valid_index_symbol(
+                                    store,
+                                    self.owner(),
+                                    &self.owner.declarations,
+                                    symbol,
+                                    indexes,
+                                )
+                            })
+                    }))
+    }
+}
+
+fn source_named_member_value_is_valid(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> bool {
+    match store.value_symbol_links(symbol) {
+        Some(links) if links.resolved_type.is_some() => {
+            super::structured_members::valid_property_symbol(store, symbol)
+        }
+        links => {
+            links.is_none_or(|links| links == &ValueSymbolLinks::default())
+                && store.declared_value_provenance(symbol).is_none()
+                && store.instantiated_property_recovery(symbol).is_none()
+        }
+    }
+}
+
+/// Plans signature annotations while retaining named members without reading their types.
+pub(super) fn plan_source_declared_members(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+) -> Result<(SourceDeclaredMemberNames, PropertyObjectPlan), PropertyObjectError> {
+    let invalid = || PropertyObjectError::InvalidInterfaceSymbol(owner);
+    let (names, _) = plan_source_member_names(store, host, owner).map_err(|_| invalid())?;
+    validate_source_member_name_cache(store, host, owner, &names).map_err(|_| invalid())?;
+    let owner_identity = SourceMemberIdentity::capture(store, owner).ok_or_else(invalid)?;
+    let source =
+        super::declared::plan_class_interface_source(store, host, owner).map_err(|_| invalid())?;
+    let outer_parameter_count = source.outer_type_parameters.len();
+    let parameters = source
+        .outer_type_parameters
+        .into_iter()
+        .chain(
+            source
+                .local_type_parameters
+                .into_iter()
+                .map(|parameter| parameter.symbol),
+        )
+        .map(|symbol| SourceMemberIdentity::capture(store, symbol).ok_or_else(invalid))
+        .collect::<Result<Vec<_>, _>>()?;
+    let node = *owner_identity.declarations.first().ok_or_else(invalid)?;
+    let raw_members = owner_identity
+        .members
+        .and_then(|table| store.symbol_table(table))
+        .ok_or_else(invalid)?
+        .iter()
+        .map(|(name, symbol)| (name.to_owned(), symbol))
+        .collect();
+    let mut members = Vec::new();
+    let mut seen = HashSet::new();
+    for name in names {
+        if name.computed.is_some() {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: name.declaration,
+                kind: store
+                    .source_node_kind(name.declaration)
+                    .ok_or_else(invalid)?,
+            });
+        }
+        validate_cold_source_member_symbol(store, owner, name.symbol)?;
+        if seen.insert(name.symbol) {
+            members.push(SourceMemberIdentity::capture(store, name.symbol).ok_or_else(invalid)?);
+        }
+    }
+    let mut plan = PropertyObjectPlan {
+        kind: PropertyObjectKind::Interface,
+        node,
+        const_context: false,
+        declarations: owner_identity.declarations.clone(),
+        symbol: owner,
+        members: owner_identity.members,
+        properties: Vec::new(),
+        methods: Vec::new(),
+        accessors: Vec::new(),
+        object_literal_getters: Vec::new(),
+        class_assignment_properties: None,
+        spreads: Vec::new(),
+        indexes: Vec::new(),
+        call_signatures: Vec::new(),
+        alias_symbol: None,
+        heritage: None,
+    };
+    for &declaration in &owner_identity.declarations {
+        let record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
+        let source_members = match &record.data {
+            NodeData::InterfaceDeclaration(interface) => &interface.members,
+            NodeData::ClassDeclaration(class) => &class.members,
+            NodeData::ClassExpression(class) => &class.members,
+            NodeData::ModuleDeclaration(_) | NodeData::VariableDeclaration(_) => continue,
+            _ => return Err(invalid()),
+        };
+        for member in &source_members.nodes {
+            let member = NodeRef::new(declaration.arena, declaration.file, *member);
+            match store.source_node_kind(member) {
+                Some(SyntaxKind::CallSignature | SyntaxKind::ConstructSignature) => {
+                    plan.call_signatures.push(plan_call_signature(
+                        store,
+                        host,
+                        declaration,
+                        owner,
+                        member,
+                    )?);
+                }
+                Some(SyntaxKind::IndexSignature) => {
+                    plan.indexes.push(plan_index_signature(
+                        store,
+                        host,
+                        declaration,
+                        owner,
+                        member,
+                    )?);
+                }
+                _ => {}
+            }
+        }
+    }
+    let names = SourceDeclaredMemberNames {
+        owner: owner_identity,
+        raw_members,
+        members,
+        parameters,
+        outer_parameter_count,
+        signatures: plan.call_signatures.clone(),
+        published_calls: None,
+        published_constructs: None,
+        published_indexes: None,
+        declared_table: None,
+        published: false,
+    };
+    if !names.is_current(store) {
+        return Err(invalid());
+    }
+    Ok((names, plan))
+}
+
 /// Resolves one source member without preparing sibling type annotations.
 /// Alias instances return their source-owned proxy symbol.
 /// Use this result for type reads, not union-property or member-table publication.
@@ -431,6 +796,25 @@ pub(super) fn resolve_object_property_by_key_with_source(
             diagnostics,
         )?
         .get_property_of_source_interface(receiver, name);
+    }
+    if validate_direct_generic_reference(store, receiver)
+        .ok()
+        .is_some_and(|reference| {
+            store
+                .source_declared_member_names(reference.target)
+                .is_some()
+        })
+    {
+        return resolve_instantiated_object_property_by_key_with_source(
+            store,
+            host,
+            global_types,
+            options,
+            receiver,
+            name,
+            session,
+            diagnostics,
+        );
     }
     let conditional_mapped = store.type_payload(receiver).is_some_and(|record| {
         matches!(record.data(), TypeData::Mapped(mapped)
@@ -1026,13 +1410,21 @@ fn resolve_instantiated_object_property_by_key_with_source(
         return resolve_object_property_by_key(store, Some(global_types), receiver, name, session)
             .map_err(Into::into);
     }
-    if let Some(method) = super::instantiated_members::selected_generic_interface_method_source(
-        store,
-        receiver,
-        name,
-        Some(CanonicalArrayTargets::from_global_types(global_types)),
-    )
-    .map_err(|error| source_generic_member_error(receiver, &error))?
+    let source_names = validate_direct_generic_reference(store, receiver)
+        .ok()
+        .is_some_and(|reference| {
+            store
+                .source_declared_member_names(reference.target)
+                .is_some()
+        });
+    if !source_names
+        && let Some(method) = super::instantiated_members::selected_generic_interface_method_source(
+            store,
+            receiver,
+            name,
+            Some(CanonicalArrayTargets::from_global_types(global_types)),
+        )
+        .map_err(|error| source_generic_member_error(receiver, &error))?
     {
         CanonicalTypeQuery::new_with_global_types_and_session(
             store,
@@ -1071,7 +1463,7 @@ fn resolve_instantiated_object_property_by_key_with_source(
             store.source_class_provenance(target).is_some()
         }))
     });
-    let type_ = if record.flags().contains(SymbolFlags::METHOD) || source_class {
+    let type_ = if record.flags().contains(SymbolFlags::METHOD) || source_class || source_names {
         CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,
@@ -2148,6 +2540,26 @@ pub(super) fn collect_cold_source_member_annotation_edges(
     computed_expressions: &HashMap<NodeRef, TypeId>,
     edges: &mut Vec<TypeId>,
 ) -> Result<(), PropertyObjectError> {
+    collect_source_member_annotation_edges(
+        store,
+        Some(host),
+        owner,
+        declaration,
+        published,
+        computed_expressions,
+        edges,
+    )
+}
+
+fn collect_source_member_annotation_edges(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    published: bool,
+    computed_expressions: &HashMap<NodeRef, TypeId>,
+    edges: &mut Vec<TypeId>,
+) -> Result<(), PropertyObjectError> {
     let invalid = || PropertyObjectError::InvalidInterfaceSymbol(owner);
     let mut pending = vec![declaration];
     let mut visited = HashSet::new();
@@ -2155,7 +2567,14 @@ pub(super) fn collect_cold_source_member_annotation_edges(
         if !visited.insert(node) {
             return Err(invalid());
         }
-        let record = preflight_node(store, host, node).map_err(|_| invalid())?;
+        let kind = match host {
+            Some(host) => {
+                preflight_node(store, host, node)
+                    .map_err(|_| invalid())?
+                    .kind
+            }
+            None => store.source_node_kind(node).ok_or_else(invalid)?,
+        };
         if let Some(links) = store.type_node_links(node) {
             if let Some(type_) = links.resolved_type {
                 let computed = computed_expressions.get(&node) == Some(&type_)
@@ -2165,23 +2584,22 @@ pub(super) fn collect_cold_source_member_annotation_edges(
                             ..TypeNodeLinks::default()
                         };
                 if !computed
-                    && (!record.kind.is_keyword_type()
+                    && (!kind.is_keyword_type()
                         && !(SyntaxKind::FIRST_TYPE_NODE as u16
                             ..=SyntaxKind::LAST_TYPE_NODE as u16)
-                            .contains(&(record.kind as u16))
+                            .contains(&(kind as u16))
                         || super::callable_sets::validated_method_annotation_type(store, node)
                             != Some(type_))
                 {
                     return Err(invalid());
                 }
                 edges.push(type_);
-                if matches!(
-                    record.kind,
-                    SyntaxKind::FunctionType | SyntaxKind::ConstructorType
-                ) && matches!(
-                    super::callable_sets::validate_stored_callable_set(store, type_),
-                    super::callable_sets::StoredCallableSetValidation::Valid { .. }
-                ) {
+                if matches!(kind, SyntaxKind::FunctionType | SyntaxKind::ConstructorType)
+                    && matches!(
+                        super::callable_sets::validate_stored_callable_set(store, type_),
+                        super::callable_sets::StoredCallableSetValidation::Valid { .. }
+                    )
+                {
                     continue;
                 }
             } else if links != &TypeNodeLinks::default() {
@@ -2205,10 +2623,7 @@ pub(super) fn collect_cold_source_member_annotation_edges(
                     .value_symbol_links(symbol)
                     .is_some_and(|links| links != &ValueSymbolLinks::default())
                     && !(published
-                        && matches!(
-                            record.kind,
-                            SyntaxKind::Parameter | SyntaxKind::BindingElement
-                        )))
+                        && matches!(kind, SyntaxKind::Parameter | SyntaxKind::BindingElement)))
         {
             return Err(invalid());
         }
@@ -8752,18 +9167,16 @@ pub(super) fn plan_interface(
                 continue;
             }
             if !base.type_arguments.is_empty() {
-                let base_plan = plan_generic_interface(store, host, base.symbol)?;
+                let (_, base_plan) = plan_source_declared_members(store, host, base.symbol)?;
                 if authenticated_react_portal_interface(store, host, &plan)? {
                     return Ok(plan);
                 }
-                let constrained = base_plan.declarations.iter().any(|declaration| {
-                    let Some(record) = host.node(*declaration) else { return true; };
-                    let NodeData::InterfaceDeclaration(interface) = &record.data else { return true; };
-                    interface.type_parameters.as_ref().is_none_or(|parameters| parameters.nodes.iter().any(|parameter| {
-                        !matches!(host.node(NodeRef::new(declaration.arena, declaration.file, *parameter)).map(|record| &record.data),
-                            Some(NodeData::TypeParameterDeclaration(parameter)) if parameter.constraint.is_none())
-                    }))
-                });
+                let source = super::declared::plan_class_interface_source(store, host, base.symbol)
+                    .map_err(|_| PropertyObjectError::InvalidInterfaceSymbol(base.symbol))?;
+                let constrained = source
+                    .local_type_parameters
+                    .iter()
+                    .any(|parameter| parameter.constraint.is_some());
                 if heritage.bases.len() != 1
                     || constrained
                     || !plan.call_signatures.is_empty()
@@ -23544,6 +23957,14 @@ fn valid_planned_call_signature_set(
     store: &CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,
 ) -> bool {
+    valid_planned_call_signature_set_with_names(store, plan, None)
+}
+
+fn valid_planned_call_signature_set_with_names(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    names: Option<&SourceDeclaredMemberNames>,
+) -> bool {
     if plan.call_signatures.is_empty() {
         return plan.members.is_none_or(|members| {
             store.symbol_table(members).is_some_and(|members| {
@@ -23577,11 +23998,12 @@ fn valid_planned_call_signature_set(
     } else {
         0
     };
-    members.len()
-        == family_count
-            .saturating_add(enclosing_parameter_count)
-            .saturating_add(plan.properties.len())
-            .saturating_add(usize::from(!plan.indexes.is_empty()))
+    (names.is_some_and(|names| names.owner() == plan.symbol && names.is_current(store))
+        || members.len()
+            == family_count
+                .saturating_add(enclosing_parameter_count)
+                .saturating_add(plan.properties.len())
+                .saturating_add(usize::from(!plan.indexes.is_empty())))
         && (plan.kind == PropertyObjectKind::Interface
             || plan.properties.is_empty()
             || plan.kind == PropertyObjectKind::TypeLiteral
@@ -25548,11 +25970,37 @@ pub(super) fn prepare_interface_call_optional_parameters(
     preparation: &mut PreparedTypeQueryTypes,
     globals: Option<&CanonicalGlobalTypes>,
 ) -> Result<(), PropertyObjectError> {
+    prepare_interface_call_optional_parameters_worker(store, plan, preparation, globals, None)
+}
+
+pub(super) fn prepare_source_declared_call_optional_parameters(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    preparation: &mut PreparedTypeQueryTypes,
+    globals: Option<&CanonicalGlobalTypes>,
+    names: &SourceDeclaredMemberNames,
+) -> Result<(), PropertyObjectError> {
+    prepare_interface_call_optional_parameters_worker(
+        store,
+        plan,
+        preparation,
+        globals,
+        Some(names),
+    )
+}
+
+fn prepare_interface_call_optional_parameters_worker(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    preparation: &mut PreparedTypeQueryTypes,
+    globals: Option<&CanonicalGlobalTypes>,
+    names: Option<&SourceDeclaredMemberNames>,
+) -> Result<(), PropertyObjectError> {
     if optional_interface_call_union_operations(plan) == Some(0) {
         return Ok(());
     }
     let invalid = || invalid_plan(plan);
-    if !valid_planned_call_signature_set(store, plan) {
+    if !valid_planned_call_signature_set_with_names(store, plan, names) {
         return Err(invalid());
     }
     let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
@@ -25753,6 +26201,83 @@ pub(super) fn publish_declared_members(
     index_types: &[(TypeId, TypeId)],
     call_types: &[ResolvedCallSignatureTypes],
 ) -> Result<TypeId, PropertyObjectError> {
+    publish_declared_members_worker(
+        store,
+        plan,
+        state,
+        property_types,
+        index_types,
+        call_types,
+        None,
+    )
+}
+
+pub(super) fn publish_source_declared_members(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    target: TypeId,
+    names: SourceDeclaredMemberNames,
+    index_types: &[(TypeId, TypeId)],
+    call_types: &[ResolvedCallSignatureTypes],
+) -> Result<TypeId, PropertyObjectError> {
+    if let Some(published) = store.source_declared_member_names(target) {
+        let indexes = published.published_indexes.as_deref().unwrap_or_default();
+        if !names.is_current(store)
+            || !published.validates_target(store, target)
+            || !valid_planned_call_signature_set_with_names(store, plan, Some(published))
+            || indexes.len() != index_types.len()
+            || indexes.len() != plan.indexes.len()
+            || indexes
+                .iter()
+                .zip(index_types)
+                .any(|(index, (key, value))| {
+                    store.index_info(*index).is_none_or(|index| {
+                        index.key_type() != *key || index.value_type() != *value
+                    })
+                })
+            || call_types.len() != plan.call_signatures.len()
+            || plan
+                .call_signatures
+                .iter()
+                .zip(call_types)
+                .any(|(planned, resolved)| {
+                    validate_resolved_call_signature(store, planned).is_none_or(|signature| {
+                        !resolved_declared_parameter_types_match(
+                            store,
+                            planned,
+                            signature,
+                            &resolved.parameter_types,
+                        ) || store
+                            .signature(signature)
+                            .and_then(super::signatures::Signature::resolved_return_type)
+                            != Some(resolved.return_type)
+                    })
+                })
+        {
+            return Err(invalid_cache(plan, target));
+        }
+        return Ok(target);
+    }
+    publish_declared_members_worker(
+        store,
+        plan,
+        PropertyObjectState::Shell(target),
+        &[],
+        index_types,
+        call_types,
+        Some(names),
+    )
+}
+
+fn publish_declared_members_worker(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    state: PropertyObjectState,
+    property_types: &[TypeId],
+    index_types: &[(TypeId, TypeId)],
+    call_types: &[ResolvedCallSignatureTypes],
+    mut source_names: Option<SourceDeclaredMemberNames>,
+) -> Result<TypeId, PropertyObjectError> {
     if plan.kind == PropertyObjectKind::ObjectLiteral {
         return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
     }
@@ -25761,8 +26286,27 @@ pub(super) fn publish_declared_members(
     let generic_interface = store.type_payload(type_).is_some_and(|record| {
         matches!(record.data(), TypeData::Interface(_))
             && record.object_flags().contains(ObjectFlags::REFERENCE)
-    }) && validate_nongeneric_interface_argument_origin(store, type_).is_err();
-    if generic_interface
+    }) && validate_nongeneric_interface_argument_origin(store, type_)
+        .is_err();
+    if source_names.as_ref().is_some_and(|names| {
+        !names.validates_target(store, type_)
+            || names.owner() != plan.symbol
+            || !plan.properties.is_empty()
+            || !plan.methods.is_empty()
+            || !plan.accessors.is_empty()
+            || store.type_payload(type_).is_none_or(|record| {
+                !matches!(record.data(), TypeData::Interface(interface)
+                    if !interface.declared_members_resolved
+                        && interface.declared_members.is_none()
+                        && interface.declared_call_signatures.is_none()
+                        && interface.declared_construct_signatures.is_none()
+                        && interface.declared_index_infos.is_none())
+            })
+    }) {
+        return Err(invalid_cache(plan, type_));
+    }
+    if source_names.is_none()
+        && generic_interface
         && (!supported_generic_interface_calls(plan)
             || state.is_resolved()
             || store.type_payload(type_).is_none_or(|record| {
@@ -25774,7 +26318,7 @@ pub(super) fn publish_declared_members(
     {
         return Err(invalid_cache(plan, type_));
     }
-    if !valid_planned_call_signature_set(store, plan) {
+    if !valid_planned_call_signature_set_with_names(store, plan, source_names.as_ref()) {
         return Err(invalid_cache(plan, type_));
     }
     if state.is_resolved() {
@@ -25924,11 +26468,11 @@ pub(super) fn publish_declared_members(
         .filter_map(|signature| signature.type_predicate)
         .filter(|predicate| store.symbol_node_links(predicate.parameter_name).is_none())
         .count();
-    let generic_member_table = if generic_interface && !plan.properties.is_empty() {
-        Some(
-            PreparedSymbolTable::new(plan.properties.len())
-                .ok_or(PropertyObjectError::Capacity(plan.node))?,
-        )
+    let name_count = source_names
+        .as_ref()
+        .map_or(plan.properties.len(), |names| names.members.len());
+    let generic_member_table = if (generic_interface || source_names.is_some()) && name_count != 0 {
+        Some(PreparedSymbolTable::new(name_count).ok_or(PropertyObjectError::Capacity(plan.node))?)
     } else {
         None
     };
@@ -25970,9 +26514,17 @@ pub(super) fn publish_declared_members(
         }
     }
 
-    let declared_members = if generic_interface {
+    let declared_members = if generic_interface || source_names.is_some() {
         generic_member_table.map(|table| {
             let members = store.alloc_prepared_symbol_table(table);
+            if let Some(names) = &source_names {
+                for member in &names.members {
+                    assert_eq!(
+                        store.insert_symbol(members, member.name.clone(), member.symbol),
+                        Some(None)
+                    );
+                }
+            }
             for property in &plan.properties {
                 assert_eq!(
                     store.insert_symbol(members, property.name.clone(), property.symbol),
@@ -26130,7 +26682,7 @@ pub(super) fn publish_declared_members(
                 published_constructs.clone(),
                 published_index_infos.clone(),
             ));
-            if !generic_interface {
+            if !generic_interface && source_names.is_none() {
                 assert!(store.set_interface_base_resolution(type_, true, None, None));
                 assert!(store.set_structured_type_members(
                     type_,
@@ -26145,6 +26697,31 @@ pub(super) fn publish_declared_members(
         PropertyObjectKind::ObjectLiteral => {
             unreachable!("object-literal plans were rejected before publication")
         }
+    }
+    if let Some(mut names) = source_names.take() {
+        names.declared_table = declared_members;
+        names.published = true;
+        let TypeData::Interface(interface) =
+            store.type_payload(type_).expect("the target exists").data()
+        else {
+            unreachable!("source member names require an interface record");
+        };
+        names.published_calls = interface.declared_call_signatures.clone();
+        names.published_constructs = interface.declared_construct_signatures.clone();
+        names.published_indexes = interface.declared_index_infos.clone();
+        for member in &names.members {
+            if member.flags.contains(SymbolFlags::PROPERTY)
+                && !member.flags.intersects(SymbolFlags::ACCESSOR)
+            {
+                let readonly = member.declarations.iter().any(|declaration| {
+                    store
+                        .source_child_with_kind(*declaration, SyntaxKind::ReadonlyKeyword)
+                        .is_some()
+                });
+                assert!(store.set_source_property_readonly(member.symbol, readonly));
+            }
+        }
+        store.retain_source_declared_member_names(type_, names);
     }
     if !signatures.is_empty() {
         assert!(

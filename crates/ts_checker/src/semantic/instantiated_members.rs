@@ -360,10 +360,25 @@ impl From<DirectGenericReferenceError> for GenericInterfaceMemberError {
 struct DeclaredProperty {
     symbol: SemanticSymbolId,
     name: EscapedName,
-    type_: TypeId,
+    value: DeclaredPropertyValue,
     requires_proxy: bool,
     method: bool,
     source_mapper: Option<TypeMapperId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeclaredPropertyValue {
+    Pending,
+    Resolved(TypeId),
+}
+
+impl DeclaredPropertyValue {
+    fn resolved(self) -> Option<TypeId> {
+        match self {
+            Self::Pending => None,
+            Self::Resolved(type_) => Some(type_),
+        }
+    }
 }
 
 type DeclaredTargetHeader = (
@@ -3225,11 +3240,22 @@ fn append_validated_generic_interface_type_edges(
     let warm = validate_warm_members(store, shape, array_targets)?;
     edges.extend_from_slice(&shape.target_arguments);
     edges.extend_from_slice(&shape.base_types);
-    edges.extend(shape.properties.iter().map(|property| property.type_));
+    edges.extend(
+        shape
+            .properties
+            .iter()
+            .filter_map(|property| property.value.resolved()),
+    );
     for &symbol in shape.inherited_properties.iter().chain(
         warm.iter()
             .flat_map(InstantiatedInterfaceMembers::properties),
     ) {
+        if shape.properties.iter().any(|property| {
+            property.symbol == symbol && property.value == DeclaredPropertyValue::Pending
+        }) && store.value_symbol_links(symbol).is_none()
+        {
+            continue;
+        }
         let links = store
             .value_symbol_links(symbol)
             .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(symbol))?;
@@ -5569,15 +5595,13 @@ pub(super) fn instantiated_method_predicate_matches(
                 && original.parameter_index() == instantiated.parameter_index()
                 && match (original.type_id(), instantiated.type_id()) {
                     (None, None) => true,
-                    (Some(original), Some(instantiated)) => {
-                        instantiated_method_type_matches(
-                            store,
-                            original,
-                            instantiated,
-                            mapper,
-                            targets,
-                        )
-                    }
+                    (Some(original), Some(instantiated)) => instantiated_method_type_matches(
+                        store,
+                        original,
+                        instantiated,
+                        mapper,
+                        targets,
+                    ),
                     _ => false,
                 }
         }
@@ -9649,6 +9673,11 @@ fn validate_declared_target(
         }
     }
     for property in &mut properties {
+        let Some(type_) = property.value.resolved() else {
+            // The source-name proof fixes this policy before any value is read.
+            property.requires_proxy = true;
+            continue;
+        };
         let property_parameters = if property.source_mapper.is_some() {
             let declaring = store
                 .get_parent_of_symbol(property.symbol)
@@ -9671,7 +9700,7 @@ fn validate_declared_target(
             if let Some((_, _, edges)) =
                 super::callable_sets::completed_source_class_method_callable(
                     store,
-                    property.type_,
+                    type_,
                     array_targets,
                 )
             {
@@ -9686,7 +9715,7 @@ fn validate_declared_target(
                 }
             }
             let signatures = store
-                .type_payload(property.type_)
+                .type_payload(type_)
                 .and_then(|record| record.data().structured())
                 .and_then(|structured| structured.signatures.as_deref())
                 .ok_or(GenericInterfaceMemberError::InvalidMember(property.symbol))?
@@ -9699,7 +9728,7 @@ fn validate_declared_target(
                     .resolved_return_type()
                     .ok_or(GenericInterfaceMemberError::InvalidMember(property.symbol))?;
                 let parameter_types =
-                    copied_method_parameter_types(store, property.type_, signature, array_targets)
+                    copied_method_parameter_types(store, type_, signature, array_targets)
                         .filter(|types| types.len() == signature_record.parameters().len())
                         .ok_or(GenericInterfaceMemberError::InvalidMember(property.symbol))?;
                 let mut signature_parameters = property_parameters.clone();
@@ -9721,13 +9750,13 @@ fn validate_declared_target(
         } else {
             property.requires_proxy |= member_type_requires_instantiation(
                 store,
-                property.type_,
+                type_,
                 &property_parameters,
                 array_targets,
             )?;
             validate_nested_reference_targets(
                 store,
-                property.type_,
+                type_,
                 array_targets,
                 active,
                 validated,
@@ -9999,6 +10028,9 @@ fn declared_target_header(
     target: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
+    if let Some(names) = store.source_declared_member_names(target) {
+        return source_declared_target_header(store, target, names);
+    }
     let record = store
         .type_payload(target)
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
@@ -10375,7 +10407,7 @@ fn declared_target_header(
             DeclaredProperty {
                 symbol,
                 name: property.name().to_owned(),
-                type_,
+                value: DeclaredPropertyValue::Resolved(type_),
                 requires_proxy: false,
                 method,
                 source_mapper: None,
@@ -10439,6 +10471,95 @@ fn declared_target_header(
         owner,
         source_parameters,
         declared_members,
+        properties,
+        index_infos,
+    ))
+}
+
+fn source_declared_target_header(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    names: &super::object_members::SourceDeclaredMemberNames,
+) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
+    let invalid = || GenericInterfaceMemberError::InvalidTarget(target);
+    if !names.validates_target(store, target) {
+        return Err(invalid());
+    }
+    let direct = validate_direct_generic_reference(store, target).map_err(|_| invalid())?;
+    if direct.target != target {
+        return Err(invalid());
+    }
+    let TypeData::Interface(interface) = store.type_payload(target).ok_or_else(invalid)?.data()
+    else {
+        return Err(invalid());
+    };
+    if !interface.base_types_resolved || !interface.declared_members_resolved {
+        return Err(invalid());
+    }
+    let owner = names.owner();
+    let declarations = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::declarations)
+        .ok_or_else(invalid)?;
+    let index_infos = interface.declared_index_infos.clone().unwrap_or_default();
+    let raw = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|table| store.symbol_table(table))
+        .ok_or_else(invalid)?;
+    let index_symbol = raw.get(InternalSymbolName::Index.as_ref());
+    if index_symbol.is_some() != !index_infos.is_empty()
+        || index_symbol.is_some_and(|symbol| {
+            !valid_index_symbol(store, owner, declarations, symbol, &index_infos)
+        })
+        || super::object_members::generic_declared_call_signature_edges(store, target).is_none()
+    {
+        return Err(invalid());
+    }
+    let mut properties = Vec::new();
+    for symbol in names.properties() {
+        let member = store
+            .symbol(symbol)
+            .ok_or(GenericInterfaceMemberError::InvalidMember(symbol))?;
+        let value = match store.value_symbol_links(symbol) {
+            Some(links) if links.resolved_type.is_some() => {
+                let type_ = links
+                    .resolved_type
+                    .expect("the value branch checked the type");
+                if !super::structured_members::valid_property_symbol(store, symbol)
+                    || !optional_member_type_is_normalized(
+                        store,
+                        type_,
+                        member.flags().contains(SymbolFlags::OPTIONAL),
+                    )
+                {
+                    return Err(GenericInterfaceMemberError::InvalidMember(symbol));
+                }
+                DeclaredPropertyValue::Resolved(type_)
+            }
+            links
+                if links.is_none_or(|links| links == &ValueSymbolLinks::default())
+                    && store.declared_value_provenance(symbol).is_none()
+                    && store.instantiated_property_recovery(symbol).is_none() =>
+            {
+                DeclaredPropertyValue::Pending
+            }
+            _ => return Err(GenericInterfaceMemberError::InvalidMember(symbol)),
+        };
+        properties.push(DeclaredProperty {
+            symbol,
+            name: member.name().to_owned(),
+            value,
+            // The mapping policy cannot change when a source value is queried.
+            requires_proxy: true,
+            method: member.flags().contains(SymbolFlags::METHOD),
+            source_mapper: None,
+        });
+    }
+    Ok((
+        owner,
+        direct.type_arguments,
+        interface.declared_members,
         properties,
         index_infos,
     ))
@@ -10527,7 +10648,7 @@ fn declared_class_field_target_header(
             properties.push(DeclaredProperty {
                 symbol,
                 name: property.name().to_owned(),
-                type_,
+                value: DeclaredPropertyValue::Resolved(type_),
                 requires_proxy: false,
                 method,
                 source_mapper,
@@ -10643,7 +10764,7 @@ fn declared_class_field_target_header(
         properties.push(DeclaredProperty {
             symbol,
             name: property.name().to_owned(),
-            type_,
+            value: DeclaredPropertyValue::Resolved(type_),
             requires_proxy: false,
             method: false,
             source_mapper: None,
@@ -11373,8 +11494,15 @@ fn property_receiver_mapper(
     match property.source_mapper {
         None => Some(mapper),
         Some(source_mapper) => {
+            let identity = match property.value {
+                DeclaredPropertyValue::Resolved(type_) => type_,
+                DeclaredPropertyValue::Pending => {
+                    let owner = store.get_parent_of_symbol(property.symbol)?;
+                    store.declared_type_links(owner)?.declared_type?
+                }
+            };
             let TypeMapperApplication::Composite { first, second } =
-                store.mapper_application(mapper, property.type_)?
+                store.mapper_application(mapper, identity)?
             else {
                 return None;
             };
@@ -11621,14 +11749,22 @@ fn validate_warm_members(
             || links
                 .resolved_type
                 .is_some_and(|type_| store.type_payload(type_).is_none())
-            || !cached_instantiated_property_value_matches(
-                store,
-                *property,
-                source.type_,
-                property_mapper,
-                links.resolved_type,
-                array_targets,
-            )
+            || match source.value {
+                DeclaredPropertyValue::Pending => {
+                    links.resolved_type.is_some()
+                        || store.instantiated_property_recovery(*property).is_some()
+                }
+                DeclaredPropertyValue::Resolved(type_) => {
+                    !cached_instantiated_property_value_matches(
+                        store,
+                        *property,
+                        type_,
+                        property_mapper,
+                        links.resolved_type,
+                        array_targets,
+                    )
+                }
+            }
         {
             return Err(GenericInterfaceMemberError::InvalidCachedProperty(
                 *property,

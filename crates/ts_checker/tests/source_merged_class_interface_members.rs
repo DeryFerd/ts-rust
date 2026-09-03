@@ -161,6 +161,14 @@ fn check_once(source: &str, negative: bool, query_first: bool) {
             | SourceCheckError::DeclaredType(DeclaredTypeError::Unavailable(
                 DeclaredTypeUnavailable::InvalidInterfaceDeclaration(node),
             )) => Some(*node),
+            SourceCheckError::DeclaredType(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::MissingDeclarations(symbol),
+            )) => checker
+                .store()
+                .symbol(*symbol)
+                .and_then(|record| record.declarations())
+                .and_then(|nodes| nodes.first())
+                .copied(),
             _ => None,
         };
         if let Some(node) = source_node {

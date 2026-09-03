@@ -2004,7 +2004,11 @@ fn validate_property_interface_worker(
     let declared_names = declared
         .properties
         .iter()
-        .map(|property| store.symbol(*property).map(|record| record.name().to_owned()))
+        .map(|property| {
+            store
+                .symbol(*property)
+                .map(|record| record.name().to_owned())
+        })
         .collect::<Option<HashSet<_>>>()?;
     let source_bases = heritage_provenance
         .and_then(|provenance| provenance.source.as_ref())
@@ -3033,7 +3037,10 @@ pub(super) fn valid_late_bound_unique_symbol_member(
     })
 }
 
-fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSymbolId) -> bool {
+pub(super) fn valid_property_symbol(
+    store: &CanonicalTypeMapperStore,
+    property: SemanticSymbolId,
+) -> bool {
     let Some(record) = store.symbol(property) else {
         return false;
     };
@@ -3126,6 +3133,25 @@ fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSym
         return false;
     }
 
+    if store
+        .value_symbol_links(property)
+        .is_none_or(|links| links == &ValueSymbolLinks::default())
+    {
+        return store
+            .get_parent_of_symbol(property)
+            .and_then(|owner| store.declared_type_links(owner))
+            .and_then(|links| links.declared_type)
+            .is_some_and(|target| {
+                store
+                    .source_declared_member_names(target)
+                    .is_some_and(|names| {
+                        names.validates_target(store, target)
+                            && names.properties().any(|symbol| symbol == property)
+                            && store.declared_value_provenance(property).is_none()
+                            && store.instantiated_property_recovery(property).is_none()
+                    })
+            });
+    }
     store.value_symbol_links(property).is_some_and(|links| {
         let Some(read_type) = links.resolved_type else {
             return false;
