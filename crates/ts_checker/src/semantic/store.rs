@@ -4577,6 +4577,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let Some(SourceNodeParent::Parent(container)) = self.source_node_parent(call) else {
             return false;
         };
+        let value_container = captured_assignment
+            .is_none()
+            .then(|| super::source_callables::source_direct_call_value_container(self, call))
+            .flatten();
         let source = match self.source_node_kind(container) {
             Some(SyntaxKind::ExpressionStatement) if captured_assignment.is_none() => {
                 let Some(SourceNodeParent::Parent(source)) = self.source_node_parent(container)
@@ -4626,7 +4630,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 };
                 source.node_ref()
             }
-            _ => return false,
+            _ => {
+                let Some((_, scope)) = value_container else {
+                    return false;
+                };
+                scope
+            }
         };
         if self.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
             || !matches!(
@@ -4642,6 +4651,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             )
             || !lexical
                 && self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+                && value_container.is_none()
                 && !(self.source_node_kind(call) == Some(SyntaxKind::CallExpression)
                     && self.source_node_kind(container) == Some(SyntaxKind::ExpressionStatement)
                     && super::source_callables::source_direct_call_statement_container(

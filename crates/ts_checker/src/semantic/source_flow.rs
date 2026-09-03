@@ -1316,6 +1316,12 @@ fn source_captured_arrow_is_stored(
                 .map(|symbol| symbol.is_some())
                 .map_err(|_| invalid().into());
             }
+            NodeData::CallExpression(_) if current == arrow => {
+                return super::source_callables::source_direct_call_argument_arrow_is_exact(
+                    store, host, arrow,
+                )
+                .map_err(|_| invalid().into());
+            }
             NodeData::NewExpression(_) if current == arrow => {
                 return super::source_callables::source_promise_constructor_argument_arrow_is_exact(
                     store, host, arrow,
