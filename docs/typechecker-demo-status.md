@@ -2,7 +2,90 @@
 
 Updated 2026-09-02. Neither Query nor Hono has passed a full Rust type check.
 
-## Latest measured result
+## Current result
+
+Project progress has stalled. The focused tests have improved, but neither
+project has gained a complete root in its latest measured comparison.
+
+| Check | Latest result | Change |
+| --- | --- | --- |
+| Query core, census 23 | 2 of 23 isolated roots complete | No gain or loss since census 22 |
+| Hono, last complete census 22 | 33 of 188 isolated roots complete | Census 23 timed out after 30 minutes |
+| Focused tests, run 41 | 153 pass, 26 fail | Three unchanged tests recovered, no old pass lost |
+| Checker library, run 5 | 5,072 pass, 365 fail | Three recoveries since run 3, no pass lost |
+
+An isolated root is one original entry file checked on its own. These counts
+are not full-project passes or percentages of TypeScript support.
+
+[Query 23](../target/wave202-query-combined-census-23-result.md) checked all
+23 roots in 91.254 seconds. Only `index.ts` and `subscribable.ts` complete.
+The ordinary project check still rejects the class in `timeoutManager.ts`.
+The two cache files get further, but now reject imported `Mutation` and `Query`
+class type references. Neither cache file completes.
+
+[Tests 41](../target/wave202-query-hono-combined-tests-41-result.md) compiled
+all 64 targets and ran all 179 tests. Three unchanged default-parameter tests
+recovered. Four new cache and manager tests pass. The new initializer and
+observer tests still fail. Two returned-arrow cases also pass, but their file
+contains an approved assertion correction. Do not count those as unchanged
+test gains.
+
+[Library 5](../target/wave202-query-hono-checker-lib-5-result.md) ran all
+5,437 tests, with none ignored or filtered. Two generic-method tests recovered.
+A third recovery was a historical map-order snapshot failure. One historical
+pass from library run 2 still fails. Library run 4 did not run tests because
+six test expressions used an outdated optional-symbol API. Those expressions
+are repaired, and all three affected tests pass in run 5.
+
+Query 23 and Tests 41 use `6e7ceab343667c503a623638a82c17565b972e3f`.
+Library 5 uses `9ed1608143cc76e2f4df831dcf1fd580490a69d7`, which has the
+same production bytes plus the test API repairs. All three runs are closed.
+
+### Why the demo has not advanced
+
+Several fixes clear one unsupported operation and expose another in the same
+file. The cache files are a measured example. The focused tests prove parts of
+the implementation, but do not establish that a complete project works.
+
+Build failures have also delayed feedback. Hono has a separate measured
+slowdown. Its last attempt took about 24 minutes to return an ownership error,
+then reached the 30-minute limit with only four root outcomes. An earlier full
+census took about 10 minutes. The cause is not proved yet.
+
+Parallel source work has outpaced integration and full-project validation.
+Worker count and commit count are not the success measures. The next useful
+result is a complete original project check with correct diagnostics.
+
+### Current work and demo order
+
+Query remains the first demo target. One pair owns the imported generic-class
+annotation failures in its two cache files. A second pair owns the unchanged
+observer-class tests. A separate integration pair is combining the reviewed
+zero-argument class-condition fix with the test API repairs. Its next focused
+selection has 65 targets and 180 tests. That new test has not run yet.
+
+Hono's ordinary project check is running with bounded timing and ownership-error
+observations. It uses the original project configuration. It does not run the
+isolated-root census. The next Hono change must address the measured slowdown
+or the actual ownership failure. Repeating the timed-out census now would not
+provide useful feedback.
+
+A separate three-test observation confirms that the two generic-alias failures
+construct their errors in the same production helper. It does not yet identify
+the exact failed guard. Those tests remain one pass and two failures.
+
+For each repair, run its focused controls, combine it in a small batch, and run
+the unchanged Query project again. Preserve working cases and native error
+checks. Before acceptance, run the broader tests and unchanged original corpus,
+remove temporary observations, and verify the final source again.
+
+No current repair batch is accepted on the primary branch. Neither full-project
+demo is ready. A partial demo must say which real files complete and must also
+show intentional type errors being reported.
+
+## Earlier snapshot, runs 39 and 22
+
+This section is retained history. Current results and work above supersede it.
 
 Query has one new complete isolated root. The latest Hono census timed out.
 Neither project is ready for a full typechecking demo.
