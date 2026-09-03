@@ -4,14 +4,14 @@ Updated 2026-09-02. Neither Query nor Hono has passed a full Rust type check.
 
 ## Current result
 
-Project progress has stalled. Neither project has gained a complete root in
-its latest measured comparison. The latest focused batch also has no recovery.
+Project completion has not advanced in the latest measured comparisons.
+The latest focused batch recovered four unchanged tests with no lost pass.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
 | Query core, census 24 | 2 of 23 isolated roots complete | All 23 outcomes unchanged from census 23 |
 | Hono, last complete census 22 | 33 of 188 isolated roots complete | Latest ordinary check failed after 23m48s |
-| Focused tests, run 43 | 152 pass, 29 fail | One changed result is an old "unsupported" expectation |
+| Focused tests, run 44 | 157 pass, 24 fail | Four unchanged recoveries, one corrected test passes, no lost pass |
 | Checker library, run 5 | 5,072 pass, 365 fail | Three recoveries since run 3, no pass lost |
 
 An isolated root is one original entry file checked on its own. These counts
@@ -34,6 +34,13 @@ all 181 cases. Its one changed outcome gets `Ok(())`
 where an older imported-class test expected `Unsupported(Class)`. Native source
 review supports that class form, but the later type assertions have not run.
 The other 180 outcomes match run 42.
+
+[Run 44](../target/wave202-query-hono-combined-tests-44-result.md) completed
+all 181 cases. Four unchanged tests recovered: both Node overload cases,
+a dependent global alias case, and a Promise argument-error case. No passing
+test was lost. The corrected zero-argument test also passed, counted separately.
+The corrected cache-import test still fails. Other remaining failures include
+generic inheritance, JWT union caches, and nullish callback calls.
 
 There is narrower progress inside two failing groups. The observer tests now
 get past imported-class completion and stop at a type-reference query. The
@@ -85,10 +92,11 @@ result is a complete original project check with correct diagnostics.
 ### Current work and demo order
 
 Query remains the first demo target. The 181-test run with the observer-class
-and initializer return-query repairs is complete. A separate integration
-pair has combined five reviewed fixes for Node member tables, callback return
-types, JWT member names, merged global aliases and Promise argument checks.
-Those five fixes have not run yet.
+and initializer return-query repairs is complete. Run 44 also completed with
+optimization level 1 and the same safety checks. It kept 179 cases unchanged
+and tracked two corrected tests separately. The unchanged Query census is now
+running on that same source. Run 44's compilation took 6m02s. Its three default
+tests passed in 29.35 seconds, but both code and optimization changed since run 43.
 
 Root committed a seven-line generic-alias repair after an observation identified
 the missing `keyof` operand reference plan. It retains all existing owner, cache
@@ -98,9 +106,20 @@ relation failures. The first error is fixed, but neither whole case passes.
 
 A separate seven-test diagnostic run located failing operations in DOM indexed
 access, local Set library types and returned async imports. It recovered no
-test. Three pairs now own those repairs. The cache-import parser-kind repair
-and two mechanical test corrections are being added to the next integration.
-Hono ownership coverage and the default-parameter cost remain separate work.
+test. Those repairs are now signed and reviewed. Run 45's separate integration
+also adds observer callback replay, an early exit for irrelevant object-binding
+probes, and public export-symbol lookup. The tests have not run on this batch.
+
+Root committed a further 17-line intersection repair and joined the separate
+Omit repair. The property-type validator now uses the existing intersection
+mapper checks. The Omit repair keeps source context alive through inherited
+property checks. Their three unchanged tests will run together. A changed
+failure location is still not a complete case pass.
+
+Hono's next measurement needs complete ownership-error coverage and aggregate
+stage timings. The previous trace missed ten error constructors. No optimized
+Hono run has happened. A separate cost audit checks what the saved build records
+can prove about compiler and test-harness rebuild time.
 
 Integration and routine test-run review now have direct worker handoffs. Root
 does not need to repeat an unchanged run review. Source fixes, test corrections
