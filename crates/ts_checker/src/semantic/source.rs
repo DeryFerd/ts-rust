@@ -2712,6 +2712,29 @@ fn validate_deferred_local_arrow(
 ) -> Result<(), SourceCheckError> {
     let invalid = || SourceCheckError::Arrow(local.declaration);
     let arrow = deferred_local_arrow(local).ok_or_else(invalid)?;
+    let body =
+        validate_deferred_local_arrow_owner(store, host, callable, local, arrow, array_targets)?;
+    if !matches!(body, SourceArrowBodyPlan::LinearBlock { .. }) {
+        return Err(invalid());
+    }
+    let (arena, bound) = host.source(local.declaration).ok_or_else(invalid)?;
+    let body = plan_source_linear_function_statements_syntax(arena, bound, store, &arrow.callable)
+        .map_err(|error| SourcePlanner::function_statements_plan_error(&arrow.callable, error))?;
+    if body.return_statement.is_some() || body.return_expression.is_some() {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn validate_deferred_local_arrow_owner(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    callable: &SourceCallablePlan,
+    local: &PlannedVariable,
+    arrow: &PlannedArrowExpression,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceArrowBodyPlan, SourceCheckError> {
+    let invalid = || SourceCheckError::Arrow(local.declaration);
     let (arena, bound) = host.source(local.declaration).ok_or_else(invalid)?;
     let record = host.node(local.declaration).ok_or_else(invalid)?;
     let NodeData::VariableDeclaration(variable) = &record.data else {
@@ -2745,15 +2768,33 @@ fn validate_deferred_local_arrow(
     let (actual, body) =
         plan_source_arrow_value(store, host, arrow.callable.declaration, array_targets)
             .map_err(SourcePlanner::arrow_plan_error)?;
-    if actual != arrow.callable || !matches!(body, SourceArrowBodyPlan::LinearBlock { .. }) {
+    if actual != arrow.callable {
         return Err(invalid());
     }
-    let body = plan_source_linear_function_statements_syntax(arena, bound, store, &actual)
-        .map_err(|error| SourcePlanner::function_statements_plan_error(&actual, error))?;
-    if body.return_statement.is_some() || body.return_expression.is_some() {
-        return Err(invalid());
-    }
-    Ok(())
+    Ok(body)
+}
+
+fn deferred_annotated_local_arrow(local: &PlannedVariable) -> Option<&PlannedArrowExpression> {
+    let PlannedVariableInitializer::Expression(initializer) = &local.initializer else {
+        return None;
+    };
+    let PlannedExpressionKind::Arrow(arrow) = &initializer.kind else {
+        return None;
+    };
+    (local.binding == VariableBindingKind::Const
+        && local.type_node.is_none()
+        && local.jsdoc_type.is_none()
+        && !local.evolving_array
+        && !initializer.awaited
+        && arrow.callable.declaration == initializer.node
+        && arrow.callable.family == SourceCallableFamily::ArrowFunction
+        && arrow.callable.body_mode == SourceCallableBodyMode::Present
+        && arrow.callable.return_type.type_node().is_some()
+        && !arrow.callable.is_async
+        && arrow.callable.type_parameters.is_empty()
+        && arrow.parameter_initializers.is_empty()
+        && arrow.prototype_this.is_none())
+    .then_some(arrow)
 }
 
 #[derive(Clone, Debug)]
@@ -3252,6 +3293,7 @@ struct PlannedCallableStatementList {
     syntax: SourceCallableStatementListSyntax,
     locals: Vec<PlannedVariable>,
     statements: Vec<PlannedCallableStatement>,
+    deferred_local_arrows: HashSet<usize>,
     flow: SourceFlowPlan,
     capture_assignments: Vec<SourceFlowAssignment>,
 }
@@ -17438,7 +17480,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 self.arena, self.bound, store, callable,
             ) {
                 Ok(syntax) => {
-                    // The established deferred-local route alone can expose later locals.
+                    // Keep the existing no-return linear scheduler when it applies.
                     let mut deferred = callable.family == SourceCallableFamily::ArrowFunction
                         && callable.parameters.is_empty()
                         && callable.return_type.is_inferred()
@@ -17449,15 +17491,28 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                     | SourceCallableStatementSyntax::Empty(_)
                             )
                         });
+                    let mut annotated_deferred = false;
                     for statement in &syntax.statements {
                         if let SourceCallableStatementSyntax::Leaf(
                             SourceLinearFunctionStatementSyntax::Local(local),
                         ) = statement
                         {
                             deferred |= self.can_defer_local_arrow_body(callable, *local)?;
+                            annotated_deferred |=
+                                self.can_defer_annotated_local_arrow_body(callable, *local)?;
                         }
                     }
-                    if !deferred {
+                    // The old no-return scheduler cannot check an outer value return.
+                    let returns_value = syntax.statements.iter().any(|statement| {
+                        matches!(
+                            statement,
+                            SourceCallableStatementSyntax::Return {
+                                expression: Some(_),
+                                ..
+                            }
+                        )
+                    });
+                    if !deferred || annotated_deferred && returns_value {
                         return self
                             .finish_callable_statement_list(syntax)
                             .map(|body| PlannedFunctionBody::StatementList(Box::new(body)));
@@ -17612,6 +17667,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         syntax: SourceCallableStatementListSyntax,
     ) -> Result<PlannedCallableStatementList, SourceCheckError> {
         let callable = &syntax.callable;
+        let mut deferred_declarations = HashSet::new();
+        for statement in &syntax.statements {
+            if let SourceCallableStatementSyntax::Leaf(
+                SourceLinearFunctionStatementSyntax::Local(local),
+            ) = statement
+                && self.can_defer_annotated_local_arrow_body(callable, *local)?
+            {
+                deferred_declarations.insert(local.declaration);
+            }
+        }
         let mut locals = Vec::new();
         let statements = self
             .finish_callable_statements(
@@ -17903,10 +17968,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             );
             Self::source_flow_plan_error(callable, error)
         })?;
+        let deferred_local_arrows = locals
+            .iter()
+            .enumerate()
+            .filter_map(|(index, local)| {
+                deferred_declarations.contains(&local.declaration).then_some(index)
+            })
+            .collect();
         Ok(PlannedCallableStatementList {
             syntax,
             locals,
             statements,
+            deferred_local_arrows,
             flow,
             capture_assignments,
         })
@@ -17920,6 +17993,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         locals: &mut Vec<PlannedVariable>,
         local_writes: CallableLocalWrites,
     ) -> Result<Vec<PlannedCallableStatement>, SourceCheckError> {
+        let local_syntax = syntax
+            .iter()
+            .filter_map(|statement| match statement {
+                SourceCallableStatementSyntax::Leaf(
+                    SourceLinearFunctionStatementSyntax::Local(local),
+                ) => Some(*local),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let mut statements = Vec::new();
         for statement in syntax {
             let statement = match statement {
@@ -17938,7 +18020,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     SourceLinearFunctionStatementSyntax::Local(local),
                 ) => {
                     let index = locals.len();
-                    locals.push(self.finish_local_declaration_with_array_flow(*local, true)?);
+                    let planned = if self.can_defer_annotated_local_arrow_body(callable, *local)? {
+                        let planned = self.finish_deferred_local_arrow(*local, &local_syntax)?;
+                        if deferred_annotated_local_arrow(&planned).is_none() {
+                            return Err(SourceCheckError::Arrow(local.declaration));
+                        }
+                        planned
+                    } else {
+                        self.finish_local_declaration_with_array_flow(*local, true)?
+                    };
+                    locals.push(planned);
                     PlannedCallableStatement::Leaf(PlannedLinearFunctionStatement::Local(index))
                 }
                 SourceCallableStatementSyntax::Leaf(
@@ -18940,6 +19031,56 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             capture_assignments,
             captured_array_mutations,
         })
+    }
+
+    // A written return lets the initializer publish its signature before its body.
+    fn can_defer_annotated_local_arrow_body(
+        &self,
+        callable: &SourceCallablePlan,
+        local: SourceLocalDeclarationSyntax,
+    ) -> Result<bool, SourceCheckError> {
+        if local.binding != VariableBindingKind::Const
+            || local.type_node.is_some()
+            || callable.is_async
+            || !matches!(
+                callable.family,
+                SourceCallableFamily::FunctionDeclaration | SourceCallableFamily::ArrowFunction
+            )
+            || self.bound.container(local.declaration) != Some(callable.declaration)
+            || self.bound.block_scope_container(local.declaration) != Some(callable.declaration)
+            || self.node(local.statement)?.parent != Some(callable.body.node)
+        {
+            return Ok(false);
+        }
+        let Some(initializer) = local.initializer else {
+            return Ok(false);
+        };
+        let record = self.node(initializer)?;
+        let NodeData::ArrowFunction(arrow) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::ArrowFunction
+            || record.parent != Some(local.declaration.node)
+            || arrow.type_.is_none()
+            || arrow.type_parameters.is_some()
+            || arrow.modifiers.is_some()
+            || arrow.asterisk_token.is_some()
+        {
+            return Ok(false);
+        }
+        for parameter in &arrow.parameters.nodes {
+            let record = self.node(self.reference(*parameter))?;
+            let NodeData::ParameterDeclaration(parameter) = &record.data else {
+                return Ok(false);
+            };
+            if record.kind != SyntaxKind::Parameter
+                || parameter.type_.is_none()
+                || parameter.initializer.is_some()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn can_defer_local_arrow_body(
@@ -58457,6 +58598,7 @@ struct CallableStatementReturns {
     has_bare_return: bool,
     has_return: bool,
     contextual_return: Option<TypeId>,
+    deferred_local_arrows: Vec<(usize, HashMap<SemanticSymbolId, TypeId>)>,
 }
 
 fn restore_callable_statement_entries(
@@ -58690,6 +58832,114 @@ fn check_planned_callable_statement_list(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn check_deferred_statement_list_arrows(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    body: &PlannedCallableStatementList,
+    returned: &CallableStatementReturns,
+    staged_value_types: &HashMap<SemanticSymbolId, TypeId>,
+    outer_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<(), SourceCheckError> {
+    let callable = &body.syntax.callable;
+    let bound = host
+        .bound_file(callable.declaration)
+        .ok_or(SourceCheckError::Arrow(callable.declaration))?;
+    let mut checked_indices = HashSet::new();
+    for (index, creation_types) in &returned.deferred_local_arrows {
+        if !body.deferred_local_arrows.contains(index) || !checked_indices.insert(*index) {
+            return Err(SourceCheckError::Arrow(callable.declaration));
+        }
+        let local = body
+            .locals
+            .get(*index)
+            .ok_or(SourceCheckError::Arrow(callable.declaration))?;
+        let arrow = deferred_annotated_local_arrow(local)
+            .ok_or(SourceCheckError::Arrow(local.declaration))?;
+        validate_deferred_local_arrow_owner(
+            store,
+            host,
+            callable,
+            local,
+            arrow,
+            Some(global_types.array_targets),
+        )?;
+        let local_start = host
+            .node(local.declaration)
+            .ok_or(SourceCheckError::Arrow(local.declaration))?
+            .range
+            .start;
+        let mut flow_types = creation_types.clone();
+        // Keep the creation flow for prior locals. Later bindings are body-only entries.
+        for later in &body.locals {
+            if !flow_types.contains_key(&later.symbol)
+                && host
+                    .node(later.declaration)
+                    .is_some_and(|node| node.range.start > local_start)
+                && bound.block_scope_container(later.declaration) == Some(callable.declaration)
+                && matches!(
+                    later.initializer,
+                    PlannedVariableInitializer::Expression(_)
+                        | PlannedVariableInitializer::ContextualArrow(_)
+                        | PlannedVariableInitializer::Jsx { .. }
+                )
+            {
+                let type_ = staged_value_types.get(&later.symbol).copied().ok_or(
+                    SourceCheckError::Variable(VariableInvariant::MissingStagedValueType(
+                        later.symbol,
+                    )),
+                )?;
+                flow_types.insert(later.symbol, type_);
+            }
+        }
+        let PlannedVariableInitializer::Expression(initializer) = &local.initializer else {
+            return Err(SourceCheckError::Arrow(local.declaration));
+        };
+        let capture = Some(SourceArrowCaptureContext {
+            declared_types: &returned.declared_entries,
+            mutable_symbols: None,
+            outer: outer_capture.as_ref(),
+            flow: Some(&body.flow),
+            assignments: &body.capture_assignments,
+            value_exports: &[],
+        });
+        session.reset_query();
+        let checked = check_expression_type_with_capture_context(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            &flow_types,
+            type_import_execution,
+            initializer,
+            None,
+            deferred,
+            None,
+            capture,
+        )?;
+        if staged_value_types.get(&local.symbol) != Some(&checked.result) {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(local.symbol),
+            ));
+        }
+        check_callable_statement_expression_effects(store, host, callable, initializer)?;
+    }
+    if checked_indices != body.deferred_local_arrows {
+        return Err(SourceCheckError::Arrow(callable.declaration));
+    }
+    Ok(())
+}
+
 /// Contextual callbacks use the same statements before their signature is published.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn check_planned_callable_statement_list_worker(
@@ -58865,6 +59115,21 @@ fn check_planned_callable_statement_list_worker(
             &mut returned,
             staged_value_types,
             value_order,
+            outer_capture,
+        )?;
+        check_deferred_statement_list_arrows(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            type_import_execution,
+            deferred,
+            body,
+            &returned,
+            staged_value_types,
             outer_capture,
         )?;
         frame
@@ -59147,6 +59412,69 @@ fn check_callable_statement_nodes(
                 }
             }
             PlannedCallableStatement::Leaf(leaf) => {
+                if let PlannedLinearFunctionStatement::Local(index) = leaf
+                    && body.deferred_local_arrows.contains(index)
+                {
+                    let local = body
+                        .locals
+                        .get(*index)
+                        .ok_or_else(|| SourcePlanner::unsupported_function_body(callable))?;
+                    let arrow = deferred_annotated_local_arrow(local)
+                        .ok_or(SourceCheckError::Arrow(local.declaration))?;
+                    validate_deferred_local_arrow_owner(
+                        store,
+                        host,
+                        callable,
+                        local,
+                        arrow,
+                        Some(global_types.array_targets),
+                    )?;
+                    let snapshot = frame
+                        .snapshot_at(store, global_types, local.name)
+                        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                    session.reset_query();
+                    issue_arrow_line_terminator_diagnostic(
+                        host,
+                        diagnostics,
+                        arrow.callable.declaration,
+                    )?;
+                    let materialized = materialize_checked_source_callable(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        &arrow.callable,
+                        type_import_execution.annotation_capabilities,
+                    )?;
+                    preflight_source_expression_cache(
+                        store,
+                        arrow.callable.declaration,
+                        materialized.type_,
+                    )?;
+                    publish_expression_type(store, arrow.callable.declaration, materialized.type_)?;
+                    let declared = inferred_variable_type(
+                        store,
+                        global_types,
+                        local.binding,
+                        materialized.type_,
+                    )?;
+                    stage_value_type(
+                        store,
+                        staged_value_types,
+                        value_order,
+                        local.symbol,
+                        declared,
+                    )?;
+                    frame
+                        .complete_assignment(local.declaration, local.symbol, declared)
+                        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                    returned
+                        .deferred_local_arrows
+                        .push((*index, snapshot.types().clone()));
+                    continue;
+                }
                 check_planned_function_statement_prefix_with_capture_context(
                     store,
                     host,
