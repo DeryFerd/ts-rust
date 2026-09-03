@@ -5724,6 +5724,7 @@ struct SourceCallResolutionRequest<'a> {
     argument_types: &'a [TypeId],
     explicit_type_arguments: Option<&'a [TypeId]>,
     receiver: Option<TypeId>,
+    contextual_return_type: Option<TypeId>,
 }
 
 fn resolve_source_call_once(
@@ -5742,6 +5743,7 @@ fn resolve_source_call_once(
         argument_types,
         explicit_type_arguments,
         receiver,
+        contextual_return_type,
     } = request;
     if matches!(
         super::instantiated_members::validate_generic_interface_callable(
@@ -5764,7 +5766,7 @@ fn resolve_source_call_once(
         diagnostics,
     )
     .map_err(|_| SourceCallResolutionError::Invariant)?
-    .resolve_source_generic_method_call(
+    .resolve_source_generic_method_call_with_return_context(
         GenericCallVectorRequest {
             form,
             optional_chain: false,
@@ -5775,6 +5777,7 @@ fn resolve_source_call_once(
         },
         existing_call_signature,
         receiver,
+        contextual_return_type,
     )
     .inspect_err(|error| {
         observe_call_failure_detail(
@@ -5990,7 +5993,12 @@ fn resolve_source_call_once(
         diagnostics,
     )
     .map_err(|_| SourceCallResolutionError::Invariant)?
-    .resolve_source_generic_call_vector(vector_request, existing_call_signature, receiver)
+    .resolve_source_generic_call_vector_with_return_context(
+        vector_request,
+        existing_call_signature,
+        receiver,
+        contextual_return_type,
+    )
     .inspect_err(|error| {
         observe_call_failure_detail(
             "resolve_generic_vector",
@@ -6019,12 +6027,14 @@ fn resolve_source_call_once(
             return Err(SourceCallResolutionError::Relation(error));
         }
         Err(error)
-            if source_identity_fallback_is_exact(
-                store,
-                explicit_type_arguments,
-                argument_types,
-                &error,
-            ) => {}
+            if (contextual_return_type.is_none()
+                || explicit_type_arguments.is_some_and(|arguments| !arguments.is_empty()))
+                && source_identity_fallback_is_exact(
+                    store,
+                    explicit_type_arguments,
+                    argument_types,
+                    &error,
+                ) => {}
         Err(GenericCallVectorError::Invariant(_)) => {
             return Err(SourceCallResolutionError::Invariant);
         }
@@ -6156,6 +6166,7 @@ fn resolve_jsx_call_signature(
                 argument_types: arguments,
                 explicit_type_arguments: None,
                 receiver: None,
+                contextual_return_type: None,
             },
         ) {
             Ok(resolution) => break resolution,
@@ -9378,6 +9389,34 @@ pub(super) fn check_direct_source_call(
     callee_type: TypeId,
     argument_types: &[TypeId],
 ) -> Result<CheckedSourceCall, SourceCheckError> {
+    check_direct_source_call_with_return_context(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        plan,
+        callee_type,
+        argument_types,
+        None,
+    )
+}
+
+/// The source expression checker supplies the canonical context of this call.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_direct_source_call_with_return_context(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    plan: &SourceCallPlan,
+    callee_type: TypeId,
+    argument_types: &[TypeId],
+    contextual_return_type: Option<TypeId>,
+) -> Result<CheckedSourceCall, SourceCheckError> {
     if store
         .signature_links(plan.node)
         .is_some_and(|links| links.effects_signature != EffectsSignatureState::Unresolved)
@@ -9518,6 +9557,7 @@ pub(super) fn check_direct_source_call(
                 argument_types,
                 explicit_type_arguments: explicit_type_arguments.as_deref(),
                 receiver,
+                contextual_return_type,
             },
         ) {
             Ok(resolution) => break resolution,

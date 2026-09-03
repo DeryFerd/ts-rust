@@ -34,6 +34,7 @@ use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, MinArgumentCountFlags,
     RelationUnavailable, SemanticSymbolId, SignatureId, TypeId, TypeMapperId, ValueSymbolLinks,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
+    bootstrap::UnionReduction,
     callable_sets::{
         StoredCallableSetValidation, completed_source_class_constructor_candidates,
         validate_stored_callable_set_with_array_targets,
@@ -104,7 +105,8 @@ use super::{
     signatures::{ElementFlags, IndexFlags, SignatureFlags, TupleElementInfo},
     source_callables::{
         StoredSourceCallableValidation, constrained_string_rest_tuple_parameter,
-        valid_fixed_generic_source_parameter_type, validate_stored_source_callable,
+        valid_fixed_generic_source_parameter_type, valid_optional_type,
+        validate_stored_source_callable,
     },
     source_overloads::source_overload_signature_type_query,
     store::{
@@ -113,7 +115,7 @@ use super::{
     },
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_nodes::SourceCallableTypeQueryEvidence,
-    type_records::TypeData,
+    type_records::{TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags, VarianceFlags},
 };
 
@@ -464,6 +466,7 @@ struct GenericCallSignatureShape {
     rest_tuple_template: Option<TypeId>,
     strict_function_types: Option<bool>,
     this_argument: Option<TypeId>,
+    contextual_return_type: Option<TypeId>,
     minimum_argument_count: usize,
     return_type: TypeId,
     return_requires_exact_cache: bool,
@@ -637,6 +640,31 @@ pub(super) fn resolve_generic_call_vector_with_source(
     this_argument: Option<TypeId>,
     source: &mut dyn ConditionalBranchSource,
 ) -> Result<GenericCallVectorResolution, GenericCallVectorError> {
+    resolve_generic_call_vector_with_return_context(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        existing_call_signature,
+        session,
+        this_argument,
+        source,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_generic_call_vector_with_return_context(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: GenericCallVectorRequest<'_>,
+    existing_call_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
+    this_argument: Option<TypeId>,
+    source: &mut dyn ConditionalBranchSource,
+    contextual_return_type: Option<TypeId>,
+) -> Result<GenericCallVectorResolution, GenericCallVectorError> {
     validate_generic_call_vector_request(store, request)?;
     let callable = match validate_stored_single_callable(store, request.callee) {
         StoredSingleCallableValidation::Valid { callable, .. } => callable,
@@ -653,7 +681,7 @@ pub(super) fn resolve_generic_call_vector_with_source(
         }
     };
     let mut source = Some(source);
-    let candidate = check_generic_call_candidate_with_receiver_context(
+    let candidate = check_generic_call_candidate_with_return_context(
         store,
         global_types,
         strict_function_types,
@@ -664,6 +692,7 @@ pub(super) fn resolve_generic_call_vector_with_source(
         session,
         this_argument,
         &mut source,
+        contextual_return_type,
     )?;
     let resolution = finish_generic_call_candidate_with_source(
         store,
@@ -809,6 +838,35 @@ pub(super) fn check_generic_call_candidate_with_receiver_context(
     this_argument: Option<TypeId>,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<GenericCallVectorCandidate, GenericCallVectorError> {
+    check_generic_call_candidate_with_return_context(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        callable,
+        relation,
+        context,
+        session,
+        this_argument,
+        source,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_generic_call_candidate_with_return_context(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: GenericCallVectorRequest<'_>,
+    callable: &ValidatedSingleCallable,
+    relation: GenericCallArgumentRelation,
+    context: Option<&PreparedGenericConstructorContext>,
+    session: &mut InstantiationSession,
+    this_argument: Option<TypeId>,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+    contextual_return_type: Option<TypeId>,
+) -> Result<GenericCallVectorCandidate, GenericCallVectorError> {
     let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
     if generic_call_signature_candidate(store, request.callee, callable.signature, array_targets)?
         != *callable
@@ -829,6 +887,7 @@ pub(super) fn check_generic_call_candidate_with_receiver_context(
         this_argument,
         source,
         Some(strict_function_types),
+        contextual_return_type,
         |store, session, source, target| {
             store.is_type_assignable_to_with_session(
                 source,
@@ -2699,6 +2758,7 @@ fn check_validated_generic_call_candidate(
             } => Some(strict_function_types),
             GenericCallArgumentRelation::Assignable => None,
         },
+        None,
         &mut is_assignable,
         &mut is_strict_subtype,
         &mut is_subtype,
@@ -2718,6 +2778,7 @@ fn check_validated_generic_call_candidate_with_receiver(
     this_argument: Option<TypeId>,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
     strict_function_types: Option<bool>,
+    contextual_return_type: Option<TypeId>,
     mut is_assignable: impl FnMut(
         &mut CanonicalTypeMapperStore,
         &mut InstantiationSession,
@@ -2752,6 +2813,8 @@ fn check_validated_generic_call_candidate_with_receiver(
         validate_generic_call_signature_shape(store, request.callee, callable, array_targets)?;
     shape.strict_function_types = strict_function_types;
     shape.this_argument = this_argument;
+    shape.contextual_return_type =
+        contextual_return_type.filter(|_| request.explicit_type_arguments.is_none());
     if (shape.class_constructor.is_some() || shape.named_constructor)
         != (request.form == DirectCallForm::New)
     {
@@ -2846,6 +2909,8 @@ fn check_validated_generic_call_candidate_with_receiver(
                 &mut is_strict_subtype,
                 &mut is_subtype,
                 session,
+                source,
+                contextual_return_type,
             )?,
         }
     };
@@ -3152,6 +3217,7 @@ fn finish_generic_call_candidate_with_source_validation(
                     &mut is_strict_subtype,
                     &mut is_subtype,
                     session,
+                    source,
                 )?,
             },
         };
@@ -3985,6 +4051,16 @@ fn validate_generic_call_signature_shape_worker(
         .zip(parameter_templates.iter().copied())
         .enumerate()
     {
+        let default_base = query_evidence.and_then(|evidence| {
+            source_default_parameter_base(
+                store,
+                evidence,
+                callable.signature,
+                index,
+                projected,
+                array_targets,
+            )
+        });
         let mut valid_template = validate_generic_parameter_template(
             store,
             projected,
@@ -4019,6 +4095,7 @@ fn validate_generic_call_signature_shape_worker(
             )?;
         }
         if !valid_template
+            && default_base.is_none()
             && (index >= fixed_parameter_count
                 || !valid_fixed_generic_source_parameter_type(store, projected))
             && (index < minimum_argument_count
@@ -4053,7 +4130,7 @@ fn validate_generic_call_signature_shape_worker(
                     && record.check_flags() == CheckFlags::NONE
             }) && store.value_symbol_links(symbol)
                 == Some(&ValueSymbolLinks {
-                    resolved_type: Some(projected),
+                    resolved_type: Some(default_base.unwrap_or(projected)),
                     ..ValueSymbolLinks::default()
                 })
         };
@@ -4112,6 +4189,7 @@ fn validate_generic_call_signature_shape_worker(
         rest_tuple_template,
         strict_function_types: None,
         this_argument: None,
+        contextual_return_type: None,
         minimum_argument_count: generic_call_signature_minimum_argument_count(
             store,
             callable.signature,
@@ -4628,6 +4706,33 @@ fn validate_generic_interface_reference(
     }
 
     Ok(Some(reference))
+}
+
+/// Reads a fixed default's body type from the validated source signature.
+fn source_default_parameter_base(
+    store: &CanonicalTypeMapperStore,
+    evidence: &SourceCallableTypeQueryEvidence,
+    signature: SignatureId,
+    index: usize,
+    call_type: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<TypeId> {
+    let signature = store.signature(signature)?;
+    let parameter = evidence.callable().parameters.get(index)?;
+    if signature.declaration() != Some(evidence.callable().declaration)
+        || signature.parameters().get(index) != Some(&parameter.symbol)
+        || !parameter.has_string_default_type()
+    {
+        return None;
+    }
+    let base = evidence.parameter_type(store, parameter)?;
+    let strict = store.intrinsic_bootstrap()?.options.strict_null_checks;
+    (if strict {
+        valid_optional_type(store, array_targets, base, call_type)
+    } else {
+        base == call_type
+    })
+    .then_some(base)
 }
 
 fn optional_generic_parameter_template(
@@ -5755,18 +5860,23 @@ fn failure_type_arguments(
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
     session: &mut InstantiationSession,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<Vec<TypeId>, GenericCallVectorError> {
     match request.explicit_type_arguments {
         Some(explicit) => explicit_recovery_type_arguments(store, shape, explicit),
-        None => infer_generic_call_type_arguments(
+        None => infer_generic_call_type_arguments_with_receiver(
             store,
             shape,
             request.arguments,
+            shape.this_argument,
+            &[],
             global_types,
             is_assignable,
             is_strict_subtype,
             is_subtype,
             session,
+            source,
+            shape.contextual_return_type,
         ),
     }
 }
@@ -5808,6 +5918,8 @@ fn infer_generic_call_type_arguments(
         is_strict_subtype,
         is_subtype,
         session,
+        &mut None,
+        None,
     )
 }
 
@@ -5838,17 +5950,143 @@ fn infer_generic_call_type_arguments_with_receiver(
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
     session: &mut InstantiationSession,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+    contextual_return_type: Option<TypeId>,
 ) -> Result<Vec<TypeId>, GenericCallVectorError> {
+    let return_limit_mark = session.limit_event_mark();
+    let return_inference = collect_generic_call_return_inferences(
+        store,
+        shape,
+        contextual_return_type,
+        global_types,
+        session,
+    )?;
+    let mut contextual_arguments = arguments.to_vec();
+    if let Some(return_inference) = return_inference.as_ref() {
+        let selected = (0..return_inference.type_parameters.len())
+            .filter(|&index| {
+                !return_inference.buckets[index].is_empty()
+                    || !return_inference.contravariant_buckets[index].is_empty()
+            })
+            .collect::<Vec<_>>();
+        if !selected.is_empty() {
+            let mut context_shape = shape.clone();
+            context_shape.type_parameters = selected
+                .iter()
+                .map(|&index| shape.type_parameters[index].clone())
+                .collect();
+            let mut context_inference = GenericCallInferenceState {
+                type_parameters: selected
+                    .iter()
+                    .map(|&index| return_inference.type_parameters[index])
+                    .collect(),
+                buckets: selected
+                    .iter()
+                    .map(|&index| return_inference.buckets[index].clone())
+                    .collect(),
+                contravariant_buckets: selected
+                    .iter()
+                    .map(|&index| return_inference.contravariant_buckets[index].clone())
+                    .collect(),
+                arguments: Vec::new(),
+                from_candidates: vec![false; selected.len()],
+                constraint_recovered: vec![false; selected.len()],
+                fixed: vec![false; selected.len()],
+            };
+            solve_generic_call_argument_inferences(
+                store,
+                &context_shape,
+                &mut context_inference,
+                global_types,
+                is_assignable,
+                is_strict_subtype,
+                is_subtype,
+                session,
+            )?;
+            for (index, argument) in contextual_arguments.iter_mut().enumerate() {
+                let Some(parameter) = shape
+                    .parameter_templates
+                    .get(index)
+                    .copied()
+                    .filter(|_| index < shape.fixed_parameter_count())
+                    .or(shape.rest_element_template)
+                else {
+                    continue;
+                };
+                let context = generic_call_return_parameter_context(
+                    store,
+                    parameter,
+                    &return_inference.type_parameters,
+                    &context_inference.type_parameters,
+                    &context_inference.arguments,
+                    session,
+                    global_types,
+                    source,
+                )?;
+                if context != parameter
+                    && super::contextual::is_literal_type_of_contextual_type(
+                        store,
+                        global_types,
+                        *argument,
+                        context,
+                    )?
+                {
+                    *argument = inference_candidate_literal_treatment(
+                        store,
+                        *argument,
+                        InferenceLiteralTreatment::Regularize,
+                        global_types,
+                        &mut Some(&mut |store, types, reduction| {
+                            if let Some(globals) = global_types {
+                                store.expression_union_type_with_global_types_and_session(
+                                    globals, types, reduction, session,
+                                )
+                            } else {
+                                store.literal_union_type_with_alias_and_array_targets_and_session(
+                                    types,
+                                    None,
+                                    shape.array_targets,
+                                    session,
+                                )
+                            }
+                        }),
+                    )
+                    .map_err(NakedTypeCandidateError::from)?;
+                }
+            }
+        }
+    }
+    if return_inference.is_some() && session.limit_event_occurred_since(return_limit_mark) {
+        return Err(
+            GenericCallVectorUnsupported::InstantiationLimitRecovery(shape.signature).into(),
+        );
+    }
     let mut inference = collect_generic_call_argument_inferences_with_receiver(
         store,
         shape,
-        arguments,
+        &contextual_arguments,
         global_types,
         session,
         this_argument,
         noninferring_conditionals,
     )?;
-    solve_generic_call_argument_inferences(
+    let mut return_priority = vec![false; inference.type_parameters.len()];
+    if let Some(return_inference) = return_inference {
+        for index in 0..inference.type_parameters.len() {
+            // Written return context has lower priority than every argument candidate.
+            if inference.buckets[index].is_empty()
+                && inference.contravariant_buckets[index].is_empty()
+                && (!return_inference.buckets[index].is_empty()
+                    || !return_inference.contravariant_buckets[index].is_empty())
+            {
+                inference.buckets[index] = return_inference.buckets[index].clone();
+                inference.contravariant_buckets[index] =
+                    return_inference.contravariant_buckets[index].clone();
+                return_priority[index] = true;
+            }
+        }
+    }
+    solve_generic_call_argument_inferences_with_return_priority(
         store,
         shape,
         &mut inference,
@@ -5857,8 +6095,135 @@ fn infer_generic_call_type_arguments_with_receiver(
         is_strict_subtype,
         is_subtype,
         session,
+        Some(&return_priority),
     )?;
     Ok(inference.arguments)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generic_call_return_parameter_context(
+    store: &mut CanonicalTypeMapperStore,
+    parameter: TypeId,
+    type_parameters: &[TypeId],
+    sources: &[TypeId],
+    targets: &[TypeId],
+    session: &mut InstantiationSession,
+    global_types: Option<&CanonicalGlobalTypes>,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<TypeId, GenericCallVectorError> {
+    let flags = store
+        .type_payload(parameter)
+        .ok_or(RelationUnavailable::Type(parameter))?
+        .flags();
+    if !flags.intersects(TypeFlags::INSTANTIABLE | TypeFlags::UNION | TypeFlags::INTERSECTION) {
+        return Ok(parameter);
+    }
+    let globals = global_types.ok_or(GenericCallVectorInvariant::MissingBootstrap)?;
+    let context = super::instantiate::instantiate_instantiable_types_with_vector_and_session(
+        store,
+        parameter,
+        type_parameters,
+        sources,
+        targets,
+        globals,
+        session,
+        source,
+    )?;
+    if store
+        .type_payload(context)
+        .ok_or(RelationUnavailable::Type(context))?
+        .flags()
+        .intersects(TypeFlags::ANY | TypeFlags::UNKNOWN)
+    {
+        return Ok(parameter);
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(GenericCallVectorInvariant::MissingBootstrap)?;
+    let (true_type, false_type) = (bootstrap.regular_true_type, bootstrap.regular_false_type);
+    if let Some(TypeData::Union(union)) = store.type_payload(context).map(TypeRecord::data)
+        && union.union.types.contains(&true_type)
+        && union.union.types.contains(&false_type)
+    {
+        // A full boolean context must not make either boolean literal non-widening.
+        let remaining = union
+            .union
+            .types
+            .iter()
+            .copied()
+            .filter(|type_| *type_ != true_type && *type_ != false_type)
+            .collect::<Vec<_>>();
+        return store
+            .expression_union_type_with_global_types_and_session(
+                globals,
+                &remaining,
+                UnionReduction::None,
+                session,
+            )
+            .map_err(NakedTypeCandidateError::from)
+            .map_err(Into::into);
+    }
+    Ok(context)
+}
+
+fn collect_generic_call_return_inferences(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    contextual_return_type: Option<TypeId>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+) -> Result<Option<GenericCallInferenceState>, GenericCallVectorError> {
+    let Some(context) = contextual_return_type else {
+        return Ok(None);
+    };
+    let parameters = shape
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.type_)
+        .collect::<Vec<_>>();
+    if !super::instantiate::instantiable_member_type_contains_variables(
+        store,
+        shape.return_type,
+        &parameters,
+        shape.array_targets,
+    )? {
+        return Ok(None);
+    }
+    let count = parameters.len();
+    let mut inference = GenericCallInferenceState {
+        type_parameters: parameters,
+        buckets: vec![Vec::new(); count],
+        contravariant_buckets: vec![Vec::new(); count],
+        arguments: Vec::new(),
+        from_candidates: vec![false; count],
+        constraint_recovered: vec![false; count],
+        fixed: vec![false; count],
+    };
+    let mut state = GenericConstructorInferenceState {
+        structural: false,
+        active_pairs: Vec::new(),
+        completed_pairs: Vec::new(),
+        implied_arities: vec![None; count],
+        strict_function_types: shape.strict_function_types,
+        bivariant: false,
+    };
+    collect_generic_call_inferences_pair(
+        store,
+        shape.array_targets,
+        global_types,
+        context,
+        shape.return_type,
+        &inference.type_parameters,
+        &mut inference.buckets,
+        &mut inference.contravariant_buckets,
+        shape.signature,
+        false,
+        &mut Vec::new(),
+        false,
+        session,
+        &mut state,
+    )?;
+    Ok(Some(inference))
 }
 
 /// Keeps the real prefix candidates until a deferred argument has been checked.
@@ -5956,6 +6321,22 @@ fn collect_generic_call_argument_inferences_with_receiver(
         else {
             break;
         };
+        if store
+            .source_callable_type_query(shape.signature)
+            .and_then(|evidence| {
+                source_default_parameter_base(
+                    store,
+                    evidence,
+                    shape.signature,
+                    index,
+                    parameter,
+                    shape.array_targets,
+                )
+            })
+            .is_some()
+        {
+            continue;
+        }
         let parameter = if index >= shape.minimum_argument_count {
             optional_generic_parameter_template(
                 store,
@@ -6162,6 +6543,49 @@ fn solve_generic_call_argument_inferences(
     ) -> Result<bool, RelationUnavailable>,
     session: &mut InstantiationSession,
 ) -> Result<(), GenericCallVectorError> {
+    solve_generic_call_argument_inferences_with_return_priority(
+        store,
+        shape,
+        inference,
+        global_types,
+        is_assignable,
+        is_strict_subtype,
+        is_subtype,
+        session,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_generic_call_argument_inferences_with_return_priority(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    inference: &mut GenericCallInferenceState,
+    global_types: Option<&CanonicalGlobalTypes>,
+    is_assignable: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_strict_subtype: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_subtype: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    session: &mut InstantiationSession,
+    return_priority: Option<&[bool]>,
+) -> Result<(), GenericCallVectorError> {
+    if return_priority.is_some_and(|priority| priority.len() != shape.type_parameters.len()) {
+        return Err(GenericCallVectorInvariant::CallableSignatureMismatch(shape.signature).into());
+    }
     let type_parameters = &inference.type_parameters;
     let buckets = &inference.buckets;
     let contravariant_buckets = &inference.contravariant_buckets;
@@ -6337,8 +6761,42 @@ fn solve_generic_call_argument_inferences(
         if let Some(constraint) = instantiated_constraint
             && !is_assignable(store, session, argument, constraint)?
         {
-            inference.constraint_recovered[index] = true;
-            argument = constraint;
+            let mut filtered = None;
+            if return_priority.is_some_and(|priority| priority[index])
+                && let Some(TypeData::Union(union)) =
+                    store.type_payload(argument).map(TypeRecord::data)
+            {
+                let mut retained = Vec::new();
+                for constituent in union.union.types.clone() {
+                    if is_assignable(store, session, constituent, constraint)? {
+                        retained.push(constituent);
+                    }
+                }
+                if !retained.is_empty() {
+                    let type_ = store
+                        .expression_union_type_with_global_types_and_session(
+                            global_types.ok_or(GenericCallVectorInvariant::MissingBootstrap)?,
+                            &retained,
+                            UnionReduction::Literal,
+                            session,
+                        )
+                        .map_err(NakedTypeCandidateError::from)?;
+                    if !store
+                        .type_payload(type_)
+                        .ok_or(RelationUnavailable::Type(type_))?
+                        .flags()
+                        .intersects(TypeFlags::NEVER)
+                    {
+                        filtered = Some(type_);
+                    }
+                }
+            }
+            if let Some(filtered) = filtered {
+                argument = filtered;
+            } else {
+                inference.constraint_recovered[index] = true;
+                argument = constraint;
+            }
         }
         inferred.push(argument);
         session.clear_active_mapper_caches();
@@ -11778,6 +12236,7 @@ fn identity_generic_call_vector_shape(
         rest_tuple_template: None,
         strict_function_types: None,
         this_argument: None,
+        contextual_return_type: None,
         minimum_argument_count: 1,
         return_type: shape.type_parameter,
         return_requires_exact_cache: false,

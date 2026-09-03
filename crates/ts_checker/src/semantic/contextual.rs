@@ -465,12 +465,13 @@ fn preflight_contextual_type_graph(
         if flags == TypeFlags::TYPE_PARAMETER
             && cached_ordinary_type_parameter_owner(store, contextual_type).is_some()
         {
-            return validate_contextual_union(store, global_types, contextual_type);
+            return validate_contextual_union(store, global_types, contextual_type)
+                .map_err(Into::into);
         }
         if flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
             return Err(RelationUnavailable::UnsupportedStructuredType(contextual_type).into());
         }
-        validate_contextual_union(store, global_types, contextual_type)
+        validate_contextual_union(store, global_types, contextual_type).map_err(Into::into)
     })();
     assert!(visiting.remove(&contextual_type));
     if result.is_ok() {
@@ -1660,6 +1661,13 @@ pub(super) fn source_keyof_contextual_type_parameter(
     store: &CanonicalTypeMapperStore,
     type_parameter: TypeId,
 ) -> Result<Option<SourceGenericConstraint>, SourceCheckError> {
+    source_keyof_contextual_type_parameter_worker(store, type_parameter).map_err(Into::into)
+}
+
+fn source_keyof_contextual_type_parameter_worker(
+    store: &CanonicalTypeMapperStore,
+    type_parameter: TypeId,
+) -> Result<Option<SourceGenericConstraint>, RelationUnavailable> {
     let record = store
         .type_payload(type_parameter)
         .ok_or(RelationUnavailable::Type(type_parameter))?;
@@ -1669,10 +1677,10 @@ pub(super) fn source_keyof_contextual_type_parameter(
     let Some(proof) = source_generic_type_parameter_constraint(store, type_parameter).map_err(
         |error| match error {
             GenericCallVectorError::Unsupported(_) => {
-                RelationUnavailable::UnsupportedStructuredType(type_parameter).into()
+                RelationUnavailable::UnsupportedStructuredType(type_parameter)
             }
-            GenericCallVectorError::Relation(error) => SourceCheckError::from(error),
-            _ => RelationUnavailable::MalformedStructuredType(type_parameter).into(),
+            GenericCallVectorError::Relation(error) => error,
+            _ => RelationUnavailable::MalformedStructuredType(type_parameter),
         },
     )?
     else {
@@ -1701,7 +1709,7 @@ fn is_literal_of_contextual_type(
     kind: LiteralKind,
     contextual_type: Option<TypeId>,
     visited: &mut HashSet<TypeId>,
-) -> Result<bool, SourceCheckError> {
+) -> Result<bool, RelationUnavailable> {
     let Some(contextual_type) = contextual_type else {
         return Ok(false);
     };
@@ -1714,7 +1722,7 @@ fn is_literal_of_contextual_type(
             .ok_or(RelationUnavailable::Type(contextual_type))?;
         let flags = record.flags();
         if flags == TypeFlags::TYPE_PARAMETER
-            && source_keyof_contextual_type_parameter(store, contextual_type)?.is_some()
+            && source_keyof_contextual_type_parameter_worker(store, contextual_type)?.is_some()
         {
             return Ok(matches!(kind, LiteralKind::String | LiteralKind::Number));
         }
@@ -1775,7 +1783,11 @@ fn is_literal_of_contextual_type(
             return Err(RelationUnavailable::UnsupportedStructuredType(contextual_type).into());
         }
         if flags.intersects(TypeFlags::FRESHABLE) {
-            store.validate_union_constituent(contextual_type)?;
+            store
+                .validate_union_constituent(contextual_type)
+                .map_err(|error| {
+                    super::relater::union_validation_unavailable(contextual_type, error)
+                })?;
         }
         Ok(match kind {
             LiteralKind::String => flags.intersects(TypeFlags::STRING_LITERAL),
@@ -1791,7 +1803,7 @@ fn is_literal_of_contextual_type(
 fn validate_contextual_template(
     store: &CanonicalTypeMapperStore,
     contextual_type: TypeId,
-) -> Result<Vec<TypeId>, SourceCheckError> {
+) -> Result<Vec<TypeId>, RelationUnavailable> {
     let record = store
         .type_payload(contextual_type)
         .ok_or(RelationUnavailable::Type(contextual_type))?;
@@ -1815,16 +1827,71 @@ fn validate_contextual_union(
     store: &CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
     union: TypeId,
-) -> Result<(), SourceCheckError> {
+) -> Result<(), RelationUnavailable> {
     let result = match global_types {
         Some(global_types) => {
             store.validate_union_constituent_with_global_types(global_types, union)
         }
         None => store.validate_union_constituent(union),
     };
-    result
-        .map_err(|error| super::relater::union_validation_unavailable(union, error))
-        .map_err(Into::into)
+    result.map_err(|error| super::relater::union_validation_unavailable(union, error))
+}
+
+/// Checks the literal kind, not its value, against the mapped argument context.
+pub(super) fn is_literal_type_of_contextual_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    candidate: TypeId,
+    contextual_type: TypeId,
+) -> Result<bool, RelationUnavailable> {
+    if !store
+        .type_payload(candidate)
+        .ok_or(RelationUnavailable::Type(candidate))?
+        .flags()
+        .intersects(TypeFlags::LITERAL | TypeFlags::UNION)
+    {
+        return Ok(false);
+    }
+    match global_types {
+        Some(globals) => store.validate_union_constituent_with_global_types(globals, candidate),
+        None => store.validate_union_constituent(candidate),
+    }
+    .map_err(|error| super::relater::union_validation_unavailable(candidate, error))?;
+    let mut pending = vec![candidate];
+    let mut visited = HashSet::new();
+    while let Some(type_) = pending.pop() {
+        if !visited.insert(type_) {
+            continue;
+        }
+        let record = store
+            .type_payload(type_)
+            .ok_or(RelationUnavailable::Type(type_))?;
+        if let TypeData::Union(union) = record.data() {
+            pending.extend_from_slice(&union.union.types);
+            continue;
+        }
+        let kind = if record.flags().intersects(TypeFlags::STRING_LITERAL) {
+            LiteralKind::String
+        } else if record.flags().intersects(TypeFlags::NUMBER_LITERAL) {
+            LiteralKind::Number
+        } else if record.flags().intersects(TypeFlags::BIG_INT_LITERAL) {
+            LiteralKind::BigInt
+        } else if record.flags().intersects(TypeFlags::BOOLEAN_LITERAL) {
+            LiteralKind::Boolean
+        } else {
+            continue;
+        };
+        if is_literal_of_contextual_type(
+            store,
+            global_types,
+            kind,
+            Some(contextual_type),
+            &mut HashSet::new(),
+        )? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Initialized arrows receive their callable context without its optional undefined branch.

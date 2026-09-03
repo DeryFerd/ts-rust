@@ -7033,6 +7033,8 @@ pub(super) struct SourceCallableTypeQueryEvidence {
     type_parameters: Box<[ResolvedSourceCallableTypeParameter]>,
     base_constraints: Box<[TypeId]>,
     annotation_results: BTreeMap<NodeRef, TypeId>,
+    default_types:
+        BTreeMap<SemanticSymbolId, (TypeId, source_callables::SourceCallableDefaultType)>,
     plan: TypeQueryPlan,
 }
 
@@ -7057,6 +7059,27 @@ impl SourceCallableTypeQueryEvidence {
         self.annotation_results.get(&annotation).copied()
     }
 
+    /// Keeps inferred defaults separate from written type annotations.
+    pub(super) fn parameter_type(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        parameter: &source_callables::SourceCallableParameterPlan,
+    ) -> Option<TypeId> {
+        if !self
+            .callable
+            .all_parameters()
+            .any(|planned| planned == parameter)
+        {
+            return None;
+        }
+        if let Some(annotation) = parameter.explicit_type_node() {
+            return self.annotation_type(annotation);
+        }
+        let (base, proof) = self.default_types.get(&parameter.symbol)?;
+        (proof.parameter() == *parameter && proof.is_exact(store, self.callable.declaration, *base))
+            .then_some(*base)
+    }
+
     pub(super) fn is_exact(&self, store: &CanonicalTypeMapperStore) -> bool {
         let Some(bootstrap) = store.intrinsic_bootstrap() else {
             return false;
@@ -7065,6 +7088,16 @@ impl SourceCallableTypeQueryEvidence {
             || self.type_parameters.len() != self.base_constraints.len()
             || self.type_parameters.is_empty()
             || self.callable.type_parameter_syntax.declaration() != self.callable.declaration
+            || self.default_types.len()
+                != self
+                    .callable
+                    .all_parameters()
+                    .filter(|parameter| parameter.has_string_default_type())
+                    .count()
+            || self.callable.all_parameters().any(|parameter| {
+                parameter.explicit_type_node().is_none()
+                    && self.parameter_type(store, parameter).is_none()
+            })
             || self.plan.references.values().any(|reference| {
                 reference
                     .property_import
@@ -38468,6 +38501,28 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         )>,
         super::generic_method_calls::GenericMethodCallError,
     > {
+        self.resolve_source_generic_method_call_with_return_context(
+            request,
+            existing_call_signature,
+            this_argument,
+            None,
+        )
+    }
+
+    pub(super) fn resolve_source_generic_method_call_with_return_context(
+        &mut self,
+        request: super::generic_calls::GenericCallVectorRequest<'_>,
+        existing_call_signature: Option<SignatureId>,
+        this_argument: Option<TypeId>,
+        contextual_return_type: Option<TypeId>,
+    ) -> Result<
+        Option<(
+            super::generic_method_calls::GenericMethodCallResolution,
+            SignatureId,
+            TypeId,
+        )>,
+        super::generic_method_calls::GenericMethodCallError,
+    > {
         let source_error = |error| {
             super::generic_method_calls::GenericMethodCallError::Generic(
                 super::generic_calls::GenericCallVectorError::Instantiation(
@@ -38495,7 +38550,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             };
             let result = (|| {
                 let Some(resolution) =
-                    super::generic_method_calls::resolve_generic_method_call_with_source(
+                    super::generic_method_calls::resolve_generic_method_call_with_return_context(
                         self.store,
                         &globals,
                         strict,
@@ -38504,6 +38559,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         session,
                         this_argument,
                         &mut adapter,
+                        contextual_return_type,
                     )?
                 else {
                     return Ok(None);
@@ -38562,6 +38618,28 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         ),
         super::generic_calls::GenericCallVectorError,
     > {
+        self.resolve_source_generic_call_vector_with_return_context(
+            request,
+            existing_call_signature,
+            this_argument,
+            None,
+        )
+    }
+
+    pub(super) fn resolve_source_generic_call_vector_with_return_context(
+        &mut self,
+        request: super::generic_calls::GenericCallVectorRequest<'_>,
+        existing_call_signature: Option<SignatureId>,
+        this_argument: Option<TypeId>,
+        contextual_return_type: Option<TypeId>,
+    ) -> Result<
+        (
+            super::generic_calls::GenericCallVectorResolution,
+            SignatureId,
+            TypeId,
+        ),
+        super::generic_calls::GenericCallVectorError,
+    > {
         let source_error = |error| {
             super::generic_calls::GenericCallVectorError::Instantiation(
                 super::instantiate::InstantiationError::Declared(error),
@@ -38586,16 +38664,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 diagnostics: self.diagnostics,
             };
             let result = (|| {
-                let resolution = super::generic_calls::resolve_generic_call_vector_with_source(
-                    self.store,
-                    &globals,
-                    strict,
-                    request,
-                    existing_call_signature,
-                    session,
-                    this_argument,
-                    &mut adapter,
-                )?;
+                let resolution =
+                    super::generic_calls::resolve_generic_call_vector_with_return_context(
+                        self.store,
+                        &globals,
+                        strict,
+                        request,
+                        existing_call_signature,
+                        session,
+                        this_argument,
+                        &mut adapter,
+                        contextual_return_type,
+                    )?;
                 let materialized =
                     super::generic_calls::materialize_generic_call_vector_source_with_source(
                         self.store,
@@ -41331,6 +41411,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         optional_unions: usize,
     ) -> Result<(Arc<SourceCallableTypeQueryEvidence>, PreparedTypeQueryTypes), DeclaredTypeError>
     {
+        let default_types = self.source_callable_string_default_types(callable)?;
         let mut prepared =
             self.prepare_literal_types_with_additional(&plan, optional_unions, cold_types)?;
         let parameters = callable
@@ -41433,13 +41514,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 }
             }
             for parameter in callable.all_parameters() {
-                let node = parameter.explicit_type_node().ok_or_else(|| {
-                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(
-                        callable.declaration,
-                    ))
-                })?;
-                annotation_results
-                    .insert(node, self.execute_type_node(node, &plan, &mut prepared)?);
+                if let Some(node) = parameter.explicit_type_node() {
+                    annotation_results
+                        .insert(node, self.execute_type_node(node, &plan, &mut prepared)?);
+                } else if !default_types.contains_key(&parameter.symbol) {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionType(callable.declaration),
+                    ));
+                }
             }
             self.flush_pending_function_parameters(&plan, &mut prepared)?;
             self.capture_source_callable_query_results(
@@ -41458,6 +41540,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             type_parameters: type_parameters.into_boxed_slice(),
             base_constraints: base_constraints.into_boxed_slice(),
             annotation_results,
+            default_types,
             plan,
         });
         if !evidence.is_exact(self.store) {
@@ -41957,9 +42040,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let base_types = callable
             .all_parameters()
             .map(|parameter| {
-                parameter
-                    .explicit_type_node()
-                    .and_then(|node| evidence.annotation_type(node))
+                evidence
+                    .parameter_type(self.store, parameter)
                     .ok_or_else(|| {
                         type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(
                             callable.declaration,
@@ -43943,6 +44025,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 evidence.type_parameters.to_vec(),
                 evidence.base_constraints.to_vec(),
                 evidence.annotation_results.clone(),
+                evidence.default_types.clone(),
             ))
         } else {
             None
@@ -44030,7 +44113,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
         if cycle_free {
             let query_evidence =
-                if let Some((type_parameters, base_constraints, mut annotation_results)) = inputs {
+                if let Some((
+                    type_parameters,
+                    base_constraints,
+                    mut annotation_results,
+                    default_types,
+                )) = inputs
+                {
                     if annotation_results
                         .insert(return_type_node, resolved)
                         .is_some_and(|previous| previous != resolved)
@@ -44050,6 +44139,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         type_parameters: type_parameters.into_boxed_slice(),
                         base_constraints: base_constraints.into_boxed_slice(),
                         annotation_results,
+                        default_types,
                         plan,
                     });
                     if !evidence.is_exact(self.store) {
