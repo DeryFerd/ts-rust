@@ -772,12 +772,14 @@ pub(super) fn preflight_source_class_heritage_type(
             .values()
             .any(|reference| reference.arity != PlannedTypeReferenceArity::Valid)
         || plan.references.get(&heritage).is_none_or(|reference| {
-            store
-                .symbol(reference.symbol)
-                .is_none_or(|symbol| {
-                    symbol.flags() != SymbolFlags::CLASS
-                        && !(implementation && symbol.flags() == SymbolFlags::INTERFACE)
-                })
+            store.symbol(reference.symbol).is_none_or(|symbol| {
+                symbol.flags() != SymbolFlags::CLASS
+                    && !(implementation
+                        && matches!(
+                            symbol.flags(),
+                            SymbolFlags::INTERFACE | SymbolFlags::TYPE_ALIAS
+                        ))
+            })
         })
     {
         return Err(type_node_unavailable(
@@ -4985,6 +4987,15 @@ fn type_alias_declaration(
         return None;
     };
     Some(*declaration)
+}
+
+/// Checks the real alias header without evaluating its body in the class planner.
+pub(super) fn preflight_class_implementation_alias(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<(), DeclaredTypeError> {
+    plan_type_alias_header(store, host, symbol).map(|_| ())
 }
 
 fn plan_type_alias_header(
@@ -24562,7 +24573,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if record_heritage
             && if source_class_heritage {
                 flags != SymbolFlags::CLASS
-                    && !(source_class_implementation && flags == SymbolFlags::INTERFACE)
+                    && !(source_class_implementation
+                        && matches!(flags, SymbolFlags::INTERFACE | SymbolFlags::TYPE_ALIAS))
             } else if array_heritage {
                 global_array_target != self.array_targets.map(CanonicalArrayTargets::array_type)
                     || !self.global_symbol_has_name(symbol, "Array")
@@ -39666,6 +39678,32 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         heritage: NodeRef,
         derived_owner: SemanticSymbolId,
     ) -> Result<TypeId, DeclaredTypeError> {
+        self.get_source_class_heritage_type_with_binding(heritage, derived_owner, None)
+    }
+
+    /// Keeps the written alias binding separate from the resolved object's owner.
+    pub(super) fn get_source_class_implementation_type(
+        &mut self,
+        heritage: NodeRef,
+        derived_owner: SemanticSymbolId,
+        target: SemanticSymbolId,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        if source_class_implementation_owner(self.store, self.host, heritage)?
+            != Some(derived_owner)
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(heritage),
+            ));
+        }
+        self.get_source_class_heritage_type_with_binding(heritage, derived_owner, Some(target))
+    }
+
+    fn get_source_class_heritage_type_with_binding(
+        &mut self,
+        heritage: NodeRef,
+        derived_owner: SemanticSymbolId,
+        target: Option<SemanticSymbolId>,
+    ) -> Result<TypeId, DeclaredTypeError> {
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(heritage));
         let globals = self.global_types.as_ref().ok_or_else(&invalid)?;
         let proof = preflight_source_class_heritage_type(
@@ -39676,6 +39714,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             heritage,
             derived_owner,
         )?;
+        if target.is_some_and(|target| proof.bindings.get(&heritage) != Some(&target)) {
+            return Err(invalid());
+        }
         let previous_owner = self.source_class_annotation.replace(derived_owner);
         let previous_heritage = self.source_class_heritage.replace(heritage);
         let result = self.get_type_from_type_node_worker(heritage, false, true);

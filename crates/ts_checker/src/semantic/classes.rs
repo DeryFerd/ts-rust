@@ -8357,11 +8357,11 @@ pub(super) fn check_class_implementation_compatibility(
         flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
     }
     for implementation in header.implementations {
-        let class_target = store
+        let legacy_class_target = store
             .symbol(implementation.symbol)
             .is_some_and(|symbol| symbol.flags() == SymbolFlags::CLASS);
         // The legacy shell query proves that its class target has no instance members.
-        if class_target && !implementation.source_type {
+        if legacy_class_target && !implementation.source_type {
             continue;
         }
         let target_type = {
@@ -8374,18 +8374,50 @@ pub(super) fn check_class_implementation_compatibility(
                 diagnostics,
             )?;
             if implementation.source_type {
-                query.get_source_class_heritage_type(implementation.node, members.shells.symbol)?
+                query.get_source_class_implementation_type(
+                    implementation.node,
+                    members.shells.symbol,
+                    implementation.symbol,
+                )?
             } else {
                 query.get_declared_type_of_symbol(implementation.symbol)?
             }
         };
-        if store.type_payload(target_type).and_then(TypeRecord::symbol)
-            != Some(implementation.symbol)
-        {
+        let target_owner = store.type_payload(target_type).and_then(TypeRecord::symbol);
+        if !implementation.source_type && target_owner != Some(implementation.symbol) {
             return Err(SourceCheckError::Class(implementation.expression));
         }
+        if implementation.source_type
+            && !super::interface_heritage::interface_base_has_statically_known_members(
+                store,
+                target_type,
+            )?
+        {
+            diagnostics.lookup_or_issue(
+                Some(implementation.node),
+                Diagnostic::new(
+                    message_by_code(2422).ok_or(SourceCheckError::MissingDiagnostic(2422))?,
+                ),
+            );
+            continue;
+        }
+        let class_target = target_owner
+            .and_then(|symbol| store.symbol(symbol))
+            .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::CLASS));
+        let interface_target = target_owner
+            .and_then(|symbol| store.symbol(symbol))
+            .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::INTERFACE) && !class_target);
         let mut required_methods = implementation.method.into_iter().collect::<Vec<_>>();
-        if implementation.source_type && !class_target {
+        if implementation.source_type && (class_target || interface_target) {
+            preflight_implementation_member_annotations(
+                store,
+                host,
+                target_owner.ok_or(SourceCheckError::Class(implementation.expression))?,
+                implementation.expression,
+            )
+            .map_err(|_| SourceCheckError::Class(implementation.expression))?;
+        }
+        if implementation.source_type && interface_target {
             CanonicalTypeQuery::new_with_global_types_and_session(
                 store,
                 host,
@@ -8396,7 +8428,7 @@ pub(super) fn check_class_implementation_compatibility(
             )?
             .prepare_generic_interface_declared_members(target_type)?;
             if let Some(table) = store
-                .symbol(implementation.symbol)
+                .symbol(target_owner.ok_or(SourceCheckError::Class(implementation.expression))?)
                 .and_then(Symbol::members)
                 .and_then(|members| store.symbol_table(members))
             {
@@ -8416,8 +8448,76 @@ pub(super) fn check_class_implementation_compatibility(
                     }
                 }
             }
+        } else if implementation.source_type && !class_target {
+            let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
+            if store
+                .type_payload(target_type)
+                .is_some_and(|record| matches!(record.data(), TypeData::Intersection(_)))
+            {
+                let resolved = super::intersection_types::demand_source_intersection_members(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    target_type,
+                )?;
+                if resolved != target_type {
+                    return Err(SourceCheckError::Class(implementation.expression));
+                }
+                // Resolving members can reduce a cold intersection to never.
+                if !super::interface_heritage::interface_base_has_statically_known_members(
+                    store,
+                    target_type,
+                )? {
+                    diagnostics.lookup_or_issue(
+                        Some(implementation.node),
+                        Diagnostic::new(
+                            message_by_code(2422)
+                                .ok_or(SourceCheckError::MissingDiagnostic(2422))?,
+                        ),
+                    );
+                    continue;
+                }
+            } else {
+                super::object_aliases::source_property_object_projection(store, target_type)?
+                    .ok_or(SourceCheckError::Class(implementation.expression))?;
+                let target_members = super::instantiated_members::resolve_property_object_alias_members_with_array_targets(
+                    store, target_type, array_targets,
+                )?;
+                for property in target_members.properties {
+                    let value = super::instantiated_members::demand_property_object_alias_property(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        target_type,
+                        property,
+                    )?;
+                    super::instantiated_members::prepare_source_property_callable_return(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        value,
+                    )?;
+                }
+            }
+            super::interface_heritage::interface_alias_base_members(
+                store,
+                target_type,
+                array_targets,
+            )?
+            .ok_or(SourceCheckError::Class(implementation.expression))?;
         }
         for method in &required_methods {
+            let method_owner =
+                target_owner.ok_or(SourceCheckError::Class(implementation.expression))?;
             let method_type = CanonicalTypeQuery::new_with_global_types_and_session(
                 store,
                 host,
@@ -8431,13 +8531,13 @@ pub(super) fn check_class_implementation_compatibility(
                 .symbol(method.symbol)
                 .ok_or(SourceCheckError::Class(implementation.expression))?;
             let member = store
-                .symbol(implementation.symbol)
+                .symbol(method_owner)
                 .and_then(Symbol::members)
                 .and_then(|members| store.symbol_table(members))
                 .and_then(|members| members.get(symbol.name()));
             if member != Some(method.symbol)
                 || symbol.name().as_utf8() != Some(method.name.as_str())
-                || symbol.parent() != Some(implementation.symbol)
+                || symbol.parent() != Some(method_owner)
                 || store.type_payload(method_type).and_then(TypeRecord::symbol)
                     != Some(method.symbol)
             {
@@ -17647,11 +17747,18 @@ fn plan_class_implementations(
                 .symbol(symbol)
                 .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(expression)))?;
             if symbol == owner
-                || !matches!(target.flags(), SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+                || !matches!(
+                    target.flags(),
+                    SymbolFlags::CLASS | SymbolFlags::INTERFACE | SymbolFlags::TYPE_ALIAS
+                )
             {
                 return Err(unsupported(ClassUnsupported::Heritage(expression)));
             }
-            preflight_class_or_interface_reference(store, host, symbol, target.flags())?;
+            if target.flags() == SymbolFlags::TYPE_ALIAS {
+                super::type_nodes::preflight_class_implementation_alias(store, host, symbol)?;
+            } else {
+                preflight_class_or_interface_reference(store, host, symbol, target.flags())?;
+            }
             preflight_implementation_member_annotations(store, host, symbol, expression)?;
             implementations.push(DirectClassImplementationPlan {
                 clause,

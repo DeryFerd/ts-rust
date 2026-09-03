@@ -11213,6 +11213,79 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .type_payload(type_id)
             .map(TypeRecord::flags)
             .ok_or(RelationUnavailable::Type(type_id))?;
+        if flags.intersects(TypeFlags::INTERSECTION) {
+            let bootstrap = self.relation_bootstrap_facts()?;
+            let mut session = RelaterSession::new_with_global_types_options_and_session(
+                self,
+                RelationKind::Assignable,
+                bootstrap,
+                global_types,
+                strict_function_types,
+                instantiation_session,
+            )
+            .with_global_this_hint(global_this_hint);
+            let projection = session.intersection_projection(type_id)?;
+            let structured = session
+                .store
+                .type_payload(type_id)
+                .and_then(|record| record.data().structured())
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+            if projection.reduced_to_never
+                || structured.call_signature_count != 0
+                || structured
+                    .signatures
+                    .as_ref()
+                    .is_some_and(|signatures| !signatures.is_empty())
+                || structured
+                    .index_infos
+                    .as_ref()
+                    .is_some_and(|indexes| !indexes.is_empty())
+            {
+                return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
+            }
+            let resolved = session.resolved_object_members(type_id, false)?;
+            if !matches!(resolved.property_origin, ObjectPropertyOrigin::Intersection(receiver) if receiver == type_id)
+                || resolved.members != Some(projection.members)
+                || resolved.properties != projection.properties
+                || !resolved.index_infos.is_empty()
+                || !resolved.call_signatures.is_empty()
+                || resolved.exact_callable
+            {
+                return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+            }
+            let mut properties = Vec::with_capacity(resolved.properties.len());
+            let mut by_name = HashMap::with_capacity(resolved.properties.len());
+            for symbol in resolved.properties {
+                let record = session.property_symbol(symbol, resolved.property_origin)?;
+                let name = record.name().to_owned();
+                let optional = record.flags().contains(SymbolFlags::OPTIONAL);
+                let declaration = record
+                    .value_declaration()
+                    .or_else(|| {
+                        record
+                            .declarations()
+                            .and_then(|declarations| declarations.first().copied())
+                    })
+                    .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                if host.node(declaration).is_none()
+                    || by_name.insert(name.clone(), properties.len()).is_some()
+                {
+                    return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                }
+                let type_ = session.property_type(symbol, resolved.property_origin)?;
+                properties.push(ResolvedDeclaredProperty {
+                    symbol,
+                    name,
+                    type_,
+                    optional,
+                    declaration,
+                });
+            }
+            return Ok(Some(ResolvedDeclaredPropertyObject {
+                properties,
+                by_name,
+            }));
+        }
         if !flags.intersects(TypeFlags::OBJECT) {
             return Ok(None);
         }
