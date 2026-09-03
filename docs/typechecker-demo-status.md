@@ -9,13 +9,28 @@ project has gained a complete isolated root in the latest comparisons.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
-| Query core, census 28 | 2 of 23 isolated roots complete | No gain or loss. Five files reach one later call failure |
-| Hono, last complete census 22 | 33 of 188 isolated roots complete | Ordinary check 3 clears Buffer ownership, then fails an object-type comparison |
-| Focused tests, run 48 | 165 pass, 19 fail | Two unchanged JWT tests recovered, no pass lost. One new callback test passes |
+| Query core, census 29 | 2 of 23 isolated roots complete | Seven completed censuses without a new complete root |
+| Hono, last complete census 22 | 33 of 188 isolated roots complete | Current failed relation reaches a cached `globalThis` dependency |
+| Focused tests, run 49 | 165 pass, 20 fail | All 184 old outcomes unchanged. New conditional test fails on missing diagnostic detail |
 | Checker library, run 5 | 5,072 pass, 365 fail | Three recoveries since run 3, no pass lost |
 
 An isolated root is one original entry file checked on its own. These counts
 are not full-project passes or percentages of TypeScript support.
+
+[Query 29](../target/wave202-query-combined-census-29-result.md) checked all
+244 records and 23 original roots. The conditional-call repair changes the
+shared failure in five roots. The next stop is `this.gcTime || 0` inside the
+same call in `removable.ts`. The class-body walker does not visit logical
+expressions. The other 18 root outcomes and the ordinary `timeoutManager.ts`
+failure are unchanged. Original inputs, options and libraries match Query 28.
+Compilation took 2m00s and the census took 16.890 seconds.
+
+[Tests 49](../target/wave202-query-hono-combined-tests-49-result.md) ran all
+185 cases in 70 targets. All 184 old outcomes match run 48. The new conditional
+case reaches its diagnostic assertion, but Rust omits the failed union-member
+detail beneath TS2345. The test remains unchanged. The fix must preserve that
+native detail. Compilation took 2m08s. Both runs used the direct repair branch
+at `70316a69fdd3471a96b389df02cf0475c2ea1543`, without another integration step.
 
 [Query 28](../target/wave202-query-combined-census-28-result.md) completed all
 244 records and 23 root attempts. Only `index.ts` and `subscribable.ts` complete.
@@ -67,6 +82,12 @@ Focused tests prove individual cases, not full-project checking.
 Parallel source work has also outpaced integration and project validation.
 Worker count and commit count are not evidence that Query or Hono works.
 The current priority is the errors returned by the unchanged real projects.
+Root-only review and run approval also delayed useful checks. A small reviewed
+source fix can now get its own frozen project-check copy while its new tests
+are still being written. The integration and run pairs can now verify final
+pins and start an approved check without another root review. They still must
+preserve every old test and original project input. Broader tests and source
+acceptance remain required.
 
 Slow feedback added to this delay. Earlier Hono ordinary checks took about
 24 minutes. The latest checks take about 2.5 minutes. Source, diagnostics,
@@ -75,17 +96,46 @@ a cause. No new full Hono census ran.
 
 [Hono ordinary check 3](../target/wave202-hono-ordinary-3-result.md) clears
 the `Buffer` ownership failure. It now returns `R01.RELATION`, an unsupported
-object-type comparison, in `http-exception.ts`. The type's identity is not yet
-known. The build took 1m57s and the ordinary check took 154.069 seconds.
+object-type comparison, in `http-exception.ts`. The build took 1m57s and the
+ordinary check took 154.069 seconds.
 The failed check still returns no complete graph, input identity or replay.
 This is a cleared first failure, not a complete file or project pass.
 
+The [next Hono trace](../target/wave202-hono-structured-relation-observation-1-result.md)
+names the failed cached object's owner as `globalThis`. The outer relation has
+identical endpoints, but Rust walks their cached child types before returning.
+Pinned Go returns for identical types before structural traversal. The new
+eight-line repair stops that child walk for identical endpoints and retains
+direct root validation. It is committed as `5c229304`, but not yet measured.
+Its frozen project-check copy lets test writing continue in parallel.
+
 ## Current work and next checks
 
-Tests 47 includes the Buffer ownership fix, closed Promise-reference support,
-and intersection-property forms. Only the new ownership test passes. No existing
-Promise or Set case recovered. Hono ordinary check 3 used that same source and
-completed without a root census. Its next relation failure is under review.
+The current Query repairs address three measured stops:
+
+- The ordinary check rejects a type alias in an `implements` clause. The source
+  repair is committed as `20915d7f`, with three new controls in `9549fa9e`.
+  It keeps alias identity separate from resolved object ownership and preserves
+  the native invalid-base and missing-member diagnostics. These tests are unrun.
+- Five roots stop on the logical argument in `removable.ts`. The repair pair
+  is checking class-body traversal and retained flow for the complete call.
+- Two roots stop on `#currentQuery = undefined!` in `queryObserver.ts`.
+  The source repair and its follow-up are committed through `03003910`.
+  They use the existing non-null evaluator and class assignment checks.
+  Review caught an overly broad rejection of template literals and string
+  mappings. The follow-up preserves those known non-nullable types and proved
+  `keyof` types. General `NonNullable<T>` evaluation remains unfinished.
+
+The union-member diagnostic fix is committed as `0c836cca`. It reuses the
+existing diagnostic builder. The conditional-call test remains unchanged.
+The branch for Tests 50 and Query 30 is being assembled from these Query fixes
+and the Hono identity repair. Its checks are not yet complete.
+
+Four more pairs address independent Query failures: forward closure references
+in `retryer.ts`, a generic DOM reference, callback parameters in local
+initializers and returns, and generic interface references in `types.ts`.
+Each pair has its own worktree and separate source and test owners. They check
+existing changes before adding code. These are not measured recoveries.
 
 The Buffer change follows the pinned Go rule that a global augmentation can
 retain its module parent. A separate public test checks the real global table
@@ -103,19 +153,14 @@ Run 48 measured two more reviewed production fixes:
   repeated checking. This one-call-site fix preserves their original tests.
   Both tests now pass.
 
-Run 48 and Query census 28 used separate build targets in parallel. Both are
+Run 49 and Query census 29 used separate build targets in parallel. Both are
 closed. Source acceptance remains separate from these feedback checks.
 
-The next diagnosis pairs cover the shared Query call, Hono's object comparison,
-and the later errors in the existing async-function and Set tests. Each pair has
-one owner and one reviewer. These tasks address measured failures. The work
-must preserve the real project inputs and existing tests.
-
-The [Query class trace](../target/wave202-query-heritage-origin-1-result.md)
-located the final heritage rejection in the implementation-target check.
-The next small observation is committed. It will distinguish a self-target from
-rejected symbol flags. Its runtime is not released. The real project error
-remains unchanged. No held source body was read.
+The [Set trace](../target/wave202-set-array-target-observation-1-result.md)
+reports no supplied array targets at the failed cached `ReadonlyArray` check.
+All three selected tests still fail. The caller that loses those targets is
+under review. A separate generic-function alias repair also recovered no cases.
+Neither result is a passing feature or a project gain.
 
 The test and project feedback runs now use four Cargo build jobs with the
 same optimization level, assertions, overflow checks and memory limits.
