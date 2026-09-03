@@ -7,7 +7,7 @@ use ts_checker::semantic::{
     AliasTargetState, CanonicalCheckerContext, CanonicalCheckerOptions,
     CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
     CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, ClassMembers,
-    IntrinsicBootstrapOptions, SourceCheckError, TypeData, TypeId, UnsupportedSourceSyntax,
+    IntrinsicBootstrapOptions, TypeData, TypeId,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -371,37 +371,206 @@ fn imported_local_class_exports_keep_exact_provider_errors_on_replay() {
 }
 
 #[test]
-fn imported_local_generic_class_heritage_keeps_its_typed_boundary() {
-    let provider = parse_source_file(
-        "class Base<T> { value!: T; } export { Base as PublicBase };",
-    );
+#[allow(clippy::too_many_lines)] // Keep the imported generic base and its replay checks together.
+fn imported_local_generic_class_heritage_keeps_applied_base_identity() {
+    let provider = parse_source_file("class Base<T> { value!: T; } export { Base as PublicBase };");
     let consumer = parse_source_file(concat!(
         "import { PublicBase as ImportedBase } from './base';\n",
         "class Derived extends ImportedBase<string> {}\n",
     ));
     let heritage = heritage_expression(&consumer);
+    let wrapper = only_node(&consumer, CONSUMER, SyntaxKind::ExpressionWithTypeArguments);
     let mut context = context(&provider, &consumer);
-    let derived = symbol(
-        &context,
-        named(&consumer, CONSUMER, SyntaxKind::ClassDeclaration, "Derived"),
+    let base_declaration = named(&provider, PROVIDER, SyntaxKind::ClassDeclaration, "Base");
+    let base_owner = symbol(&context, base_declaration);
+    let derived_declaration = named(&consumer, CONSUMER, SyntaxKind::ClassDeclaration, "Derived");
+    let derived_owner = symbol(&context, derived_declaration);
+    let parameter = only_node(&provider, PROVIDER, SyntaxKind::TypeParameter);
+    let parameter_owner = symbol(&context, parameter);
+    let field_declaration = named(
+        &provider,
+        PROVIDER,
+        SyntaxKind::PropertyDeclaration,
+        "value",
     );
-    let expected = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(heritage));
-    assert_eq!(context.check_source_file(CONSUMER), Err(expected));
+    let field = symbol(&context, field_declaration);
+    let export_alias = symbol(
+        &context,
+        named(
+            &provider,
+            PROVIDER,
+            SyntaxKind::ExportSpecifier,
+            "PublicBase",
+        ),
+    );
+    let import_alias = symbol(
+        &context,
+        named(
+            &consumer,
+            CONSUMER,
+            SyntaxKind::ImportSpecifier,
+            "ImportedBase",
+        ),
+    );
+    let check = |context: &mut CanonicalCheckerContext<'_>| {
+        let base = context.get_nongeneric_class_members(base_owner).unwrap();
+        let derived = context.get_nongeneric_class_members(derived_owner).unwrap();
+        let formal = context
+            .get_declared_type_of_symbol(parameter_owner)
+            .unwrap();
+        assert_eq!(
+            context.get_declared_type_of_symbol(base_owner),
+            Ok(base.shells().instance_type())
+        );
+        assert_eq!(
+            context.get_declared_type_of_symbol(derived_owner),
+            Ok(derived.shells().instance_type())
+        );
+        assert_eq!(base.shells().declaration(), base_declaration);
+        assert_eq!(derived.shells().declaration(), derived_declaration);
+        assert_ne!(
+            base.shells().instance_type(),
+            derived.shells().instance_type()
+        );
+        assert_ne!(base.shells().value_type(), derived.shells().value_type());
+        let inherited = derived.base().unwrap();
+        assert_eq!(inherited.symbol(), base_owner);
+        assert_eq!(inherited.instance_type(), base.shells().instance_type());
+        assert_eq!(inherited.value_type(), base.shells().value_type());
+        let applied = inherited.applied_instance_type();
+        assert_ne!(applied, inherited.instance_type());
+
+        let store = context.store();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let TypeData::TypeReference(reference) = store.type_payload(applied).unwrap().data() else {
+            panic!("the base must keep its string argument")
+        };
+        assert_eq!(reference.object.target, Some(inherited.instance_type()));
+        assert_eq!(
+            reference.resolved_type_arguments.as_deref(),
+            Some(&[string][..])
+        );
+        let TypeData::Interface(instance) = store
+            .type_payload(derived.shells().instance_type())
+            .unwrap()
+            .data()
+        else {
+            panic!("the derived class must keep its own instance")
+        };
+        assert_eq!(
+            instance.resolved_base_types.as_deref(),
+            Some(&[applied][..])
+        );
+        assert_eq!(
+            instance.resolved_base_constructor_type,
+            Some(inherited.value_type())
+        );
+        let TypeData::Interface(base_instance) = store
+            .type_payload(base.shells().instance_type())
+            .unwrap()
+            .data()
+        else {
+            panic!("the base must keep its original formal")
+        };
+        assert_eq!(
+            base_instance.reference.resolved_type_arguments.as_deref(),
+            Some(&[formal][..])
+        );
+        assert_eq!(
+            provider.arena.get(parameter.node).unwrap().parent,
+            Some(base_declaration.node)
+        );
+        assert_eq!(
+            store.symbol(parameter_owner).unwrap().parent(),
+            Some(base_owner)
+        );
+        let formal_record = store.type_payload(formal).unwrap();
+        assert_eq!(formal_record.symbol(), Some(parameter_owner));
+        let TypeData::TypeParameter(parameter_type) = formal_record.data() else {
+            panic!("the original formal must remain a type parameter")
+        };
+        assert_eq!(parameter_type.target, None);
+        assert_eq!(parameter_type.mapper, None);
+        assert_eq!(
+            store.symbol(field).unwrap().declarations(),
+            Some(&[field_declaration][..])
+        );
+        assert_eq!(store.symbol(field).unwrap().parent(), Some(base_owner));
+        let field_links = store.value_symbol_links(field).unwrap();
+        assert_eq!(field_links.resolved_type, Some(formal));
+        assert_eq!(field_links.target, None);
+        assert_eq!(field_links.mapper, None);
+        assert_eq!(base.instance_properties(), &[field]);
+        assert_eq!(derived.instance_properties(), &[field]);
+        assert!(derived.declared_instance_properties().is_empty());
+        assert_eq!(
+            store
+                .signature(base.default_construct_signature())
+                .unwrap()
+                .resolved_return_type(),
+            Some(base.shells().instance_type())
+        );
+
+        assert_ne!(import_alias, export_alias);
+        assert_ne!(export_alias, base_owner);
+        assert_eq!(
+            store.symbol(base_owner).unwrap().flags(),
+            SymbolFlags::CLASS
+        );
+        for alias in [export_alias, import_alias] {
+            assert_eq!(store.symbol(alias).unwrap().flags(), SymbolFlags::ALIAS);
+            let links = store.alias_symbol_links(alias).unwrap();
+            assert_eq!(links.alias_target, AliasTargetState::Resolved(base_owner));
+            assert_eq!(links.type_only_declaration, None);
+        }
+        assert_eq!(
+            store
+                .alias_symbol_links(import_alias)
+                .unwrap()
+                .immediate_target,
+            Some(export_alias)
+        );
+        assert_eq!(value_type(context, import_alias), inherited.value_type());
+        assert_eq!(
+            store
+                .type_node_links(heritage)
+                .and_then(|links| links.resolved_type),
+            Some(inherited.value_type())
+        );
+        assert_eq!(
+            store
+                .symbol_node_links(heritage)
+                .and_then(|links| links.resolved_symbol),
+            Some(import_alias)
+        );
+        assert_eq!(
+            store
+                .type_node_links(wrapper)
+                .and_then(|links| links.resolved_type),
+            Some(applied)
+        );
+        for file in [PROVIDER, CONSUMER] {
+            assert!(
+                store
+                    .source_file_links(context.source_file(file).unwrap())
+                    .unwrap()
+                    .type_checked
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+        (base, derived, formal)
+    };
+    context.check_source_file(CONSUMER).unwrap();
+    let identities = check(&mut context);
     let warm_counts = counts(&context);
+    let relations = context.store().relation_state_snapshot();
     let diagnostics = context.diagnostics().clone();
     for _ in 0..2 {
-        assert_eq!(context.check_source_file(CONSUMER), Err(expected));
-        assert_eq!(context.recheck_source_file(CONSUMER), Err(expected));
+        context.check_source_file(CONSUMER).unwrap();
+        context.recheck_source_file(CONSUMER).unwrap();
+        assert_eq!(check(&mut context), identities);
         assert_eq!(counts(&context), warm_counts);
+        assert_eq!(context.store().relation_state_snapshot(), relations);
         assert_eq!(context.diagnostics(), &diagnostics);
-        assert!(context.diagnostics().is_empty());
-        assert!(context.store().declared_type_links(derived).is_none());
-        assert!(context.store().value_symbol_links(derived).is_none());
-        assert!(
-            context
-                .store()
-                .source_file_links(context.source_file(CONSUMER).unwrap())
-                .is_none_or(|links| !links.type_checked)
-        );
     }
 }
