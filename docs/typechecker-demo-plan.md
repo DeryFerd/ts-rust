@@ -21,6 +21,8 @@ Use one integration branch, `query-core-integration`, at the existing candidate
 `eb99690774e90e6333bc606e1402b6770259d371`. Reuse its current worktree and build
 target. Hono 26 has closed and root owns both. The candidate is not accepted,
 and no pending feature branch joins automatically.
+The latest tested integration checkpoint is `f38238f76`. It is committed with a
+clean worktree, but is not promoted. Query still does not complete.
 
 ### Regression baseline
 
@@ -66,7 +68,7 @@ tests. Together with the two test corrections, accepted-name totals are now
 and fixture tests have now run. The [complete comparison](../target/query-core-accepted-complete-baseline-1-result.md)
 has 5,792 accepted passes retained, 250 failures and 13 absent names across all
 120 accepted harnesses. [Query is unchanged](../target/query-core-interface-demand-query-1-result.md).
-The next batch must address the shared class method annotation operation.
+The next batch follows the measured merged global-variable failure below.
 
 The [accepted original corpus](../target/wave202-core-class-call-corpus-2-receipt.md)
 has 423 exact diagnostic records in 511 executed variants and 60 exact semantic
@@ -82,8 +84,9 @@ a batch. Missing outputs, crashes and new mismatches block promotion.
    examine the shared path before adding another exception.
 2. Implement the complete operation on the integration branch. Keep original
    project inputs, compiler options, libraries and expected diagnostics fixed.
-3. Compile implementation and test code. Run focused positive and negative
-   cases, then rerun unchanged Query on that build. Use the existing runner,
+3. Compile implementation, library test helpers and public test code. Run
+   focused positive and negative cases, then rerun unchanged Query on that build.
+   Use the existing runner,
    normal logs, actual tool permissions and resource limits.
 4. Have the single reviewer check the complete change and results. Do not add
    preparation reviewers, repeated approval messages or new feature owners.
@@ -99,36 +102,79 @@ reassess the dependency path. More workers are not the fallback. Run Hono after
 a meaningful Query milestone or a shared-path change that needs a cross-project
 check, rather than after every local edit.
 
-### Next operation: class method annotations
+### Next operation: merged ambient global values
 
-The recorded Query method failure reaches a union-parameter helper that only
-accepts keyword constituents. Go queries each constituent through the normal
-type-node query. The earlier union patch reached a nested type-literal cache
-failure instead of completing the operation.
+The [current class observation](../target/query-core-class-annotation-observation-1-result.md)
+did not reproduce the earlier type-literal cache failure on the integration
+branch. Its bounded cache trace emitted no failure records. Applying the
+preserved method-union change moved ordinary Query to an unsupported variable
+read. The project still did not complete, and all diagnostics stayed unchanged.
 
-The shared Rust path has a concrete order problem. Annotation preflight calls
-the completed-result cache reader before semantic demand. Both relevant cache
-readers reject a type-literal shell, although the normal executor accepts that
-pending identity and resolves its members. Preflight also creates a fresh
-planner without the live alias targets and source query context.
+The [variable observation](../target/query-core-variable-symbol-observation-1-result.md)
+identified the rejecting function and symbol metadata. It is a variable
+declaration in another file with a merged transient symbol. It has no
+instantiation flag, target or mapper. An instantiated-parameter repair would
+address the wrong operation. Both observations retained every prior outcome
+and diagnostic except the two recorded changes in stopping point.
 
-The exact predicate that failed in Query is not yet proved. The next batch is:
+The shared source planner reaches cross-file variable handling only after a
+CrossFileDeclaration result. This merged variable is rejected earlier as
+NonVariableSymbol. The existing declared-value reader already checks saved
+global declaration order, raw merge edges, global augmentation ownership,
+selected annotation and cache provenance. Extend that operation as follows:
 
-1. Add one bounded failure trace to distinguish a valid pending shell from a
-   changed owner, alias binding, outer parameter or missing child result.
-   Use unchanged Query and existing logs. Do not read held test bodies.
-2. Keep annotation ownership and pending identity separate from a completed
-   result. Carry the caller's globals, alias bindings, source context, session
-   and class scope through the existing canonical type query.
-3. Resolve the actual annotation and its members, then validate the completed
-   result. Keep changed-cache and wrong-owner rejections. Do not remove a cache
-   check or add a special rule for the observed source shape.
-4. Check cold and warm queries, prewarmed member order, imported and recursive
-   annotation dependencies, and a wrong argument with its exact Go diagnostic.
-   Then run unchanged Query and the accepted regression selections.
+1. Resolve the identifier in its real lexical scope. Require the result to
+   match the saved global binding. Local variables and imports must still hide
+   a global with the same name.
+2. Select the value declaration from saved declaration order, then check the
+   mutable symbol against it. Keep raw declaration, export, local placeholder
+   and global augmentation parent checks. Do not allow TRANSIENT by itself.
+3. Query the selected declared value through the canonical query, with the
+   host, globals, options, aliases and session. Keep normal type preparation,
+   source context, selected member demand and value provenance.
+4. Compile implementation and tests. Check duplicate declarations, global
+   augmentation, class reads, local shadows, exact positive and negative
+   results, query order and replay. Rerun unchanged Query and the accepted
+   regression selections before accepting this batch.
 
-This is one complete operation on the existing integration branch. It is not
-permission to join all preserved class patches or launch more feature work.
+The draft shares the existing script-origin global proof. It does not claim
+support for globals introduced first by an augmentation. The selected Query
+annotation form is not inferred from numeric IDs. Let the canonical query
+identify the actual dependency. The method-union change remains unaccepted
+until the combined batch passes its checks. No other class branches join.
+
+### Reassessment: class conditions and branch flow
+
+The first ambient global-value draft passed 39 focused tests, but gained no
+complete Query root. Together with the interface repair, this is two batches
+without a complete project gain. The corrected full regression selection closed
+with three new lost library passes. Regression check 3 repairs all three and
+retains every previous integration result. The fresh Query run still has two
+complete isolated roots and an unsupported ordinary check. All diagnostics match
+the integration baseline. This batch has closed. Do not add another syntax rule.
+Implement the condition and branch-flow operation together as described below.
+
+The latest ordinary failure is the enclosing binary expression. The static
+class statement path accepts only a property compared with undefined in this
+position. The class executor also needs a matching branch-flow snapshot. These
+are separate requirements. Accepting a new expression form alone will fail
+later or lose narrowing.
+
+The next complete operation must carry the condition through planning, binder
+branch edges, normal expression checking, branch-specific narrowing and call or
+assignment invalidation. Reuse existing general condition checking where its
+context is complete. Preserve class member and parameter identities. Test both
+branches, global and class properties, negation, logical composition, exact
+operand errors and replay. Do not label arbitrary conditions as Unchanged.
+Keep the class body's declared ambient-global types separate from outer mutable
+local narrowing. Retain its real binder container, read points, assignments,
+calls and branch edges through both planning and execution.
+
+The pinned Go checker checks the full condition normally in checkIfStatement.
+Its flow query separately narrows the referenced type for the true or false
+branch. This is the structure to port. The actual Query operand form remains
+unread under the source restrictions. Confirm the rejecting predicate with a
+bounded trace or a focused case before editing this path.
 
 ### Immediate milestone
 

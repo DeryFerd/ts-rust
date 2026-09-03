@@ -8,6 +8,22 @@ All other production drafts are frozen. Hono remains a periodic cross-project
 check. All earlier worker runs have closed. Root owns the integration branch
 `query-core-integration` and its build target.
 
+## Latest checkpoint
+
+Candidate `f38238f76` is committed on the integration branch. Its worktree is
+clean. It retains every previous integration test outcome and repairs the three
+failures introduced by its first draft. All 39 focused tests pass. The full
+checker selection has 5,068 library passes with 369 failures and 687 public
+passes with 24 failures. Against the accepted checker selection, 248 old passes
+still fail and 12 names are absent. Those remain blockers.
+
+[Fresh Query](../target/query-core-ambient-global-values-query-2-result.md) still
+does not complete. It has 2 of 23 complete isolated roots and no diagnostic gain.
+The next operation is class condition checking together with branch flow. All
+runtime checks are closed. The candidate is not promoted to the accepted compiler.
+
+## Earlier checks
+
 Against the last accepted compiler, the
 [complete checker baseline](../target/query-core-accepted-checker-baseline-1-result.md)
 retains 5,252 of 6,055 selected passes, loses 252, and leaves 551 missing or
@@ -33,10 +49,50 @@ equivalence remain unproved where the records say so. Nothing is promoted.
 has no gain or loss. All 244 non-runtime records match Query 44, including
 the full input graph, every outcome and every diagnostic. Ordinary checking
 still stops at the class in `timeoutManager.ts`. This is one production batch
-without a Query improvement after the reset. The next work traces the shared
-class method annotation query, including its context and state.
+without a Query improvement after the reset.
 
-## Current result
+Two bounded observations now identify the next operation. The
+[class observation](../target/query-core-class-annotation-observation-1-result.md)
+did not reproduce the earlier type-literal cache failure. Its preserved union
+change reached a later unsupported variable read. The
+[variable observation](../target/query-core-variable-symbol-observation-1-result.md)
+identified the ordinary variable reader and a merged global variable with no
+instantiation state. All 24 outcomes and diagnostics match the first observation.
+Neither observation gained a complete root. The ambient global-value draft then
+passed [all 39 focused tests](../target/query-core-ambient-global-values-1-result.md).
+Its [unchanged Query run](../target/query-core-ambient-global-values-query-1-result.md)
+clears the variable rejection but stops at the enclosing binary expression.
+All diagnostics remain unchanged. Root 0 reaches a different unsupported DOM
+type. No complete root or project check was gained.
+
+The first regression build found a missing field in a library test helper before
+tests ran. The extra field was removed. The [corrected full selection](../target/query-core-ambient-global-values-regression-2-result.md)
+compiled and ran all 6,148 cases. It lost exactly three library passes and retained
+every public result. That rejected draft had 5,065 library passes with 372 failures,
+and 687 public passes with 24 failures. Against the accepted checker selection,
+5,253 passes remain, 251 fail and 12 names are absent. Earlier compiler and fixture
+results are not fresh results for this draft.
+
+The new global route incorrectly forced lazy member checking for all ambient
+globals. It also changed the existing poisoned-variable error. Both are repaired.
+[Regression check 3](../target/query-core-ambient-global-values-regression-3-result.md)
+recovers all three lost passes. Every earlier integration result is retained.
+Current counts are 5,068 library passes with 369 failures and 687 public passes
+with 24 failures. Accepted checker counts return to 5,256 pass, 248 fail and 12
+absent names. All 39 focused tests pass. [Fresh unchanged Query](../target/query-core-ambient-global-values-query-2-result.md)
+still completes only 2 of 23 isolated roots. Ordinary checking stops at the same
+binary condition, with no diagnostic gain. Restoring full member demand returns
+root 0 to its earlier unsupported DOM reference. No complete root is lost.
+
+The [remaining failure groups](../target/query-core-ambient-global-values-regression-3-failure-groups.json)
+include 57 operation rejections, 15 incorrect or missing results, 26 cache or state
+assertions, 27 old unsupported-boundary expectations and 25 other error-contract
+mismatches. Another 98 remain unknown. These groups are observations, not cause
+explanations or approved expectation changes. Nothing is promoted. All runtime
+checks have closed. After two batches without a complete Query gain, the next
+work must connect condition checking and class branch flow as one operation.
+
+## Measured results
 
 Full-project progress is stalled. Focused tests still recover cases, but neither
 project has gained a complete isolated root in the latest comparisons.
@@ -44,6 +100,9 @@ project has gained a complete isolated root in the latest comparisons.
 | Check | Latest result | Change |
 | --- | --- | --- |
 | Query, interface repair | 2 of 23 isolated roots complete | Every outcome and diagnostic matches census 44. Ordinary checking still stops |
+| Query, current bounded observations | 2 of 23 isolated roots complete | Ordinary checking reaches a merged global-variable rejection. No diagnostic gain |
+| Query, repaired ambient global values | 2 of 23 isolated roots complete | Variable rejection cleared. Ordinary checking still stops at its enclosing binary expression. No diagnostic gain |
+| Ambient global-value regression check 3 | Library 5,068 pass, 369 fail. Public 687 pass, 24 fail | All three new losses repaired. Every previous integration outcome retained. All 39 focused tests pass |
 | Query, separate method candidate 43 | 2 of 23 isolated roots complete | Five roots now fail internal type-literal checks. Candidate remains excluded |
 | Hono, census 26 | 33 of 188 isolated roots complete | Every outcome and diagnostic matches census 25 |
 | Accepted checker baseline 1 | Library 5,067 pass, 370 fail. Public 669 pass, 27 fail | All 111 harnesses completed. 252 accepted passes lost, 12 names absent |
