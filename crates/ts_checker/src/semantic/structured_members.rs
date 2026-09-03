@@ -19,7 +19,10 @@ use super::{
     CanonicalTypeMapperStore, IndexInfoId, SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
     declared::cached_ordinary_type_parameter_owner,
-    instantiated_members::validate_generic_interface_members,
+    instantiated_members::{
+        validate_generic_interface_members,
+        validate_property_object_alias_members_with_array_targets,
+    },
     interface_heritage::{
         DirectInterfaceBaseKind, SourceInterfaceAliasBaseState,
         SourceInterfaceHeritageQueryContext, source_interface_alias_base_request,
@@ -28,6 +31,7 @@ use super::{
     links::{
         MembersOrExportsResolutionKind, ResolvedSignatureState, SignatureLinks, ValueSymbolLinks,
     },
+    object_aliases::property_object_alias_projection,
     object_members::{
         DeclaredPropertyTypeGraphValidation, DirectInterfaceDeclaredState,
         PlannedComputedMemberKey, PropertyObjectError, PropertyObjectKind, PropertyObjectPlan,
@@ -1664,6 +1668,61 @@ pub(super) fn inherited_generic_property_reference_with_query_context(
                 .is_some_and(|members| members.properties().contains(&property))
         {
             return Some(original);
+        }
+    }
+    None
+}
+
+/// Finds the retained alias instance that owns an inherited property proxy.
+pub(super) fn inherited_alias_property_reference_with_query_context(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+    property: SemanticSymbolId,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Option<TypeId> {
+    let heritage = store.direct_interface_heritage_provenance(receiver)?;
+    if validate_interface_heritage_members_with_query_context(store, receiver, array_targets, query)
+        != InterfaceHeritageMembersValidation::Valid
+        || store
+            .type_payload(receiver)?
+            .data()
+            .structured()?
+            .properties
+            .as_deref()
+            .is_none_or(|properties| !properties.contains(&property))
+    {
+        return None;
+    }
+    let links = store.value_symbol_links(property)?;
+    if links.target.is_none() || links.mapper.is_none() {
+        return None;
+    }
+    let mut pending = heritage
+        .bases
+        .iter()
+        .rev()
+        .map(|&(_, base)| base)
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        if let Some(heritage) = store.direct_interface_heritage_provenance(current) {
+            for &(_, base) in heritage.bases.iter().rev() {
+                pending.push(base);
+            }
+            continue;
+        }
+        if property_object_alias_projection(store, current).ok()?.is_none() {
+            continue;
+        }
+        let members =
+            validate_property_object_alias_members_with_array_targets(store, current, array_targets)
+                .ok()??;
+        if members.properties.contains(&property) {
+            return Some(current);
         }
     }
     None

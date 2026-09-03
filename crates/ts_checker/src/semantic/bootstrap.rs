@@ -3222,6 +3222,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     array_targets,
                     query,
                 )
+                .or_else(|| {
+                    super::structured_members::inherited_alias_property_reference_with_query_context(
+                        self,
+                        type_,
+                        *property,
+                        array_targets,
+                        query,
+                    )
+                })
                 .ok_or_else(invalid)?;
                 let template = self
                     .value_symbol_links(target)
