@@ -472,7 +472,7 @@ fn implements_aliases_keep_defaults_substitutions_callables_and_replay() {
     else {
         unreachable!()
     };
-    let function = node(&parsed, read_data.type_.unwrap());
+    let function = node(&parsed, read_data.type_);
     assert_eq!(
         parsed.arena.get(function.node).unwrap().kind,
         SyntaxKind::FunctionType
