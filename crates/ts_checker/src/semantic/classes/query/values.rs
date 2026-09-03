@@ -583,7 +583,8 @@ impl ClassValueQuery<'_, '_, '_> {
         &mut self,
         symbol: SemanticSymbolId,
     ) -> Result<TypeId, ClassError> {
-        self.member_type_inner(symbol, &mut HashSet::new())
+        let type_ = self.member_type_inner(symbol, &mut HashSet::new())?;
+        self.read_type(symbol, type_)
     }
 
     fn member_type_inner(
