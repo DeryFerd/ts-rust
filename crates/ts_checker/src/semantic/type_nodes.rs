@@ -23901,6 +23901,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
         if !self.replay_cached_annotations
             && !record_heritage
+            // A keyof constraint needs the operand's reference plan on replay.
+            && !record.parent.is_some_and(|parent| {
+                self.plan
+                    .keyofs
+                    .get(&NodeRef::new(node.arena, node.file, parent))
+                    == Some(&node)
+            })
             && !cached_intersection_source
             && !cached_mapped_lookup_source
             && exact_import.is_none()
