@@ -4,31 +4,34 @@ Updated 2026-09-02. Neither Query nor Hono has passed a full Rust type check.
 
 ## Current result
 
-Project progress has stalled. The focused tests have improved, but neither
-project has gained a complete root in its latest measured comparison.
+Project progress has stalled. Neither project has gained a complete root in
+its latest measured comparison. The latest focused batch also has no recovery.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
-| Query core, census 23 | 2 of 23 isolated roots complete | No gain or loss since census 22 |
-| Hono, last complete census 22 | 33 of 188 isolated roots complete | Census 23 timed out after 30 minutes |
-| Focused tests, run 41 | 153 pass, 26 fail | Three unchanged tests recovered, no old pass lost |
+| Query core, census 24 | 2 of 23 isolated roots complete | All 23 outcomes unchanged from census 23 |
+| Hono, last complete census 22 | 33 of 188 isolated roots complete | Latest ordinary check failed after 23m48s |
+| Focused tests, run 42 | 153 pass, 28 fail | All 179 old outcomes unchanged, both new tests fail |
 | Checker library, run 5 | 5,072 pass, 365 fail | Three recoveries since run 3, no pass lost |
 
 An isolated root is one original entry file checked on its own. These counts
 are not full-project passes or percentages of TypeScript support.
 
-[Query 23](../target/wave202-query-combined-census-23-result.md) checked all
-23 roots in 91.254 seconds. Only `index.ts` and `subscribable.ts` complete.
+[Query 24](../target/wave202-query-combined-census-24-result.md) checked all
+23 roots in 92.867 seconds. Only `index.ts` and `subscribable.ts` complete.
 The ordinary project check still rejects the class in `timeoutManager.ts`.
 The two cache files get further, but now reject imported `Mutation` and `Query`
 class type references. Neither cache file completes.
 
-[Tests 41](../target/wave202-query-hono-combined-tests-41-result.md) compiled
-all 64 targets and ran all 179 tests. Three unchanged default-parameter tests
-recovered. Four new cache and manager tests pass. The new initializer and
-observer tests still fail. Two returned-arrow cases also pass, but their file
-contains an approved assertion correction. Do not count those as unchanged
-test gains.
+[Tests 42](../target/wave202-query-hono-combined-tests-42-result.md) compiled
+all 66 targets and ran all 181 tests. No old pass was lost. Neither new test
+passed. Later review found an incorrect error location in the zero-argument
+test and an incorrect AST field selector in the cache-import test. Correct
+those separately and do not count a corrected expectation as a checker gain.
+
+The three default-parameter tests passed but took 301.03 seconds. That is a
+separate performance problem. Their repeated trace records are recoverable
+probes, not proof that those probes consumed all five minutes.
 
 [Library 5](../target/wave202-query-hono-checker-lib-5-result.md) ran all
 5,437 tests, with none ignored or filtered. Two generic-method tests recovered.
@@ -37,9 +40,9 @@ pass from library run 2 still fails. Library run 4 did not run tests because
 six test expressions used an outdated optional-symbol API. Those expressions
 are repaired, and all three affected tests pass in run 5.
 
-Query 23 and Tests 41 use `6e7ceab343667c503a623638a82c17565b972e3f`.
+Query 24 and Tests 42 use `d22177564dc5846eb2e493d60bdda860e38e0c54`.
 Library 5 uses `9ed1608143cc76e2f4df831dcf1fd580490a69d7`, which has the
-same production bytes plus the test API repairs. All three runs are closed.
+earlier production bytes plus the test API repairs. All three runs are closed.
 
 ### Why the demo has not advanced
 
@@ -47,10 +50,16 @@ Several fixes clear one unsupported operation and expose another in the same
 file. The cache files are a measured example. The focused tests prove parts of
 the implementation, but do not establish that a complete project works.
 
-Build failures have also delayed feedback. Hono has a separate measured
-slowdown. Its last attempt took about 24 minutes to return an ownership error,
-then reached the 30-minute limit with only four root outcomes. An earlier full
-census took about 10 minutes. The cause is not proved yet.
+Build failures and incorrect test setup have delayed feedback. Hono also has a
+measured slowdown. Its [latest ordinary check](../target/wave202-hono-cost-observation-1-result.md)
+returned the same `SymbolNotOwned` error after 23m48s. It did not reach cold
+checking or replay. No root census ran. Its error trace missed ten constructor
+sites, so that run did not locate the origin. Full input equality is unavailable
+for that failed construction. The saved report records the metadata difference.
+
+The Hono build used Rust optimization level 0. An optimized feedback experiment
+is being prepared with debug assertions and overflow checks kept on. No speed
+gain has been measured, and the acceptance settings have not changed.
 
 Parallel source work has outpaced integration and full-project validation.
 Worker count and commit count are not the success measures. The next useful
@@ -58,21 +67,24 @@ result is a complete original project check with correct diagnostics.
 
 ### Current work and demo order
 
-Query remains the first demo target. One pair owns the imported generic-class
-annotation failures in its two cache files. A second pair owns the unchanged
-observer-class tests. A separate integration pair is combining the reviewed
-zero-argument class-condition fix with the test API repairs. Its next focused
-selection has 65 targets and 180 tests. That new test has not run yet.
+Query remains the first demo target. The next 181-test run is running with the
+observer-class and initializer return-query repairs. A separate integration
+pair has combined five reviewed fixes for Node member tables, callback return
+types, JWT member names, merged global aliases and Promise argument checks.
+Those five fixes have not run yet.
 
-Hono's ordinary project check is running with bounded timing and ownership-error
-observations. It uses the original project configuration. It does not run the
-isolated-root census. The next Hono change must address the measured slowdown
-or the actual ownership failure. Repeating the timed-out census now would not
-provide useful feedback.
+Root committed a seven-line generic-alias repair after an observation identified
+the missing `keyof` operand reference plan. It retains all existing owner, cache
+and constraint checks. Its three unchanged tests are being prepared for a run.
 
-A separate three-test observation confirms that the two generic-alias failures
-construct their errors in the same production helper. It does not yet identify
-the exact failed guard. Those tests remain one pass and two failures.
+A separate seven-test diagnostic run covers DOM overloads, `typeof`, local Set
+construction and returned async functions. Another pair owns the remaining
+cache-import parser-kind gap. Hono ownership coverage and the five-minute
+default-parameter test cost have separate investigations.
+
+Integration and routine test-run review now have direct worker handoffs. Root
+does not need to repeat an unchanged run review. Source fixes, test corrections
+and measured project gains remain separate in the reports.
 
 For each repair, run its focused controls, combine it in a small batch, and run
 the unchanged Query project again. Preserve working cases and native error
