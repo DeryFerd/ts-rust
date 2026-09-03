@@ -49,6 +49,7 @@ use super::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DirectInterfaceBaseKind {
+    /// A class or interface instance, with its original declared identity.
     Interface,
     DefaultLibraryInterface,
     DefaultLibraryArray,
@@ -2903,9 +2904,9 @@ fn plan_direct_interface_heritage_inner(
                             store, host, expression, alias,
                         )
                         .filter(|target| {
-                            store.symbol(*target).is_some_and(|record| {
-                                record.flags().contains(SymbolFlags::CLASS)
-                            })
+                            store
+                                .symbol(*target)
+                                .is_some_and(|record| record.flags().contains(SymbolFlags::CLASS))
                         })
                         .ok_or(DirectInterfaceHeritageError::Invalid)?,
                     )
@@ -3010,7 +3011,8 @@ fn plan_direct_interface_heritage_inner(
                 }
                 (arguments, _)
                     if symbol_record.flags().without(SymbolFlags::TRANSIENT)
-                        == SymbolFlags::INTERFACE =>
+                        == SymbolFlags::INTERFACE
+                        || symbol_record.flags().contains(SymbolFlags::CLASS) =>
                 {
                     plan_interface_type_arguments(
                         store,
@@ -3048,6 +3050,47 @@ fn plan_direct_interface_heritage_inner(
                 expression,
                 symbol,
                 kind: DirectInterfaceBaseKind::DefaultLibraryArray,
+                type_arguments,
+                defaults,
+            });
+            continue;
+        }
+        if symbol_record.flags().contains(SymbolFlags::CLASS) {
+            let source = super::declared::plan_class_interface_source(store, host, symbol)
+                .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+            for declaration in &source.declarations {
+                let record = preflight_node(store, host, *declaration)
+                    .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+                let clauses = match &record.data {
+                    NodeData::ClassDeclaration(class) => class.heritage_clauses.as_ref(),
+                    NodeData::ClassExpression(class) => class.heritage_clauses.as_ref(),
+                    NodeData::InterfaceDeclaration(interface) => {
+                        interface.heritage_clauses.as_ref()
+                    }
+                    _ => return Err(DirectInterfaceHeritageError::Invalid),
+                };
+                if let Some(clauses) = clauses {
+                    if !active.insert(symbol) {
+                        return Err(DirectInterfaceHeritageError::Invalid);
+                    }
+                    let result = plan_direct_interface_heritage_inner(
+                        store,
+                        host,
+                        *declaration,
+                        symbol,
+                        clauses,
+                        active,
+                        depth + 1,
+                    );
+                    assert!(active.remove(&symbol));
+                    result?;
+                }
+            }
+            bases.push(DirectInterfaceBasePlan {
+                node,
+                expression,
+                symbol,
+                kind: DirectInterfaceBaseKind::Interface,
                 type_arguments,
                 defaults,
             });
@@ -3256,6 +3299,21 @@ fn plan_interface_type_arguments(
     base_declarations: &[NodeRef],
     arguments: Option<&NodeList>,
 ) -> Result<(Vec<NodeRef>, Vec<DirectInterfaceDefaultArgument>), DirectInterfaceHeritageError> {
+    if [owner, base].iter().any(|symbol| {
+        store
+            .symbol(*symbol)
+            .is_some_and(|record| record.flags().contains(SymbolFlags::CLASS))
+    }) {
+        return plan_class_interface_type_arguments(
+            store,
+            host,
+            declaration,
+            owner,
+            node,
+            base,
+            arguments,
+        );
+    }
     let unsupported = || DirectInterfaceHeritageError::Unsupported {
         node,
         kind: SyntaxKind::ExpressionWithTypeArguments,
@@ -3517,6 +3575,97 @@ fn plan_interface_type_arguments(
         planned.push(argument);
     }
     Ok((planned, planned_defaults))
+}
+
+/// Selects arguments from the same canonical formals used by ordinary references.
+fn plan_class_interface_type_arguments(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    owner: SemanticSymbolId,
+    node: NodeRef,
+    base: SemanticSymbolId,
+    arguments: Option<&NodeList>,
+) -> Result<(Vec<NodeRef>, Vec<DirectInterfaceDefaultArgument>), DirectInterfaceHeritageError> {
+    let invalid = || DirectInterfaceHeritageError::Invalid;
+    let unsupported = || DirectInterfaceHeritageError::Unsupported {
+        node,
+        kind: SyntaxKind::ExpressionWithTypeArguments,
+    };
+    let owner_plan =
+        super::declared::plan_class_interface_source(store, host, owner).map_err(|_| invalid())?;
+    let base_plan =
+        super::declared::plan_class_interface_source(store, host, base).map_err(|_| invalid())?;
+    if !owner_plan.declarations.contains(&declaration)
+        || arguments
+            .is_some_and(|arguments| arguments.has_trailing_comma || arguments.nodes.is_empty())
+    {
+        return Err(invalid());
+    }
+    let parameters = &base_plan.local_type_parameters;
+    let minimum = parameters
+        .iter()
+        .rposition(|parameter| parameter.default_type.is_none())
+        .map_or(0, |index| index + 1);
+    let supplied = arguments.map_or(&[][..], |arguments| arguments.nodes.as_slice());
+    if supplied.len() < minimum || supplied.len() > parameters.len() {
+        return Err(unsupported());
+    }
+    let record = preflight_node(store, host, node).map_err(|_| invalid())?;
+    let NodeData::ExpressionWithTypeArguments(reference) = &record.data else {
+        return Err(invalid());
+    };
+    let name = NodeRef::new(node.arena, node.file, reference.expression);
+    let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
+    let mut previous_end = name_record.range.end;
+    let mut planned = Vec::with_capacity(parameters.len());
+    for &argument in supplied {
+        let argument = NodeRef::new(node.arena, node.file, argument);
+        let argument_record = preflight_node(store, host, argument).map_err(|_| invalid())?;
+        if argument_record.parent != Some(node.node)
+            || argument_record.range.start < previous_end
+            || arguments.is_none_or(|arguments| {
+                arguments.range.start < name_record.range.end
+                    || arguments.range.end != record.range.end
+                    || argument_record.range.start <= arguments.range.start
+                    || argument_record.range.end >= arguments.range.end
+            })
+        {
+            return Err(invalid());
+        }
+        previous_end = argument_record.range.end;
+        planned.push(argument);
+    }
+    let symbols = parameters
+        .iter()
+        .map(|parameter| parameter.symbol)
+        .collect::<Vec<_>>();
+    let mut defaults = Vec::new();
+    for (index, parameter) in parameters.iter().enumerate().skip(planned.len()) {
+        let default = parameter.default_type.ok_or_else(unsupported)?;
+        if heritage_argument_references_parameters(store, host, default, &symbols[index..], 0)? {
+            return Err(unsupported());
+        }
+        let (argument, earlier_parameter) =
+            plan_heritage_default_argument(store, host, default, &symbols, &planned)?;
+        let declaration = preflight_node(store, host, default)
+            .map_err(|_| invalid())?
+            .parent
+            .map(|parent| NodeRef::new(default.arena, default.file, parent))
+            .ok_or_else(invalid)?;
+        let planned_default = DirectInterfaceDefaultArgument {
+            index,
+            parameter: parameter.symbol,
+            declaration,
+            node: default,
+            argument,
+            earlier_parameter,
+        };
+        validate_heritage_default_cache(store, &planned_default, false)?;
+        defaults.push(planned_default);
+        planned.push(argument);
+    }
+    Ok((planned, defaults))
 }
 
 pub(super) fn validate_heritage_default_cache(

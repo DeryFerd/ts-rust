@@ -859,6 +859,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_node_facts: BTreeMap<NodeArenaId, Vec<Option<SourceNodeFacts>>>,
     source_node_children: BTreeMap<NodeArenaId, Vec<Box<[NodeId]>>>,
     source_symbol_declarations: HashMap<SemanticSymbolId, SourceSymbolDeclarations>,
+    source_merged_declaration_order: HashMap<SemanticSymbolId, Box<[NodeRef]>>,
     source_global_bindings: Option<SourceGlobalBindings>,
     computed_method_name_groups: HashMap<SemanticSymbolId, ComputedMethodNameGroup>,
     source_declaration_owners: HashMap<NodeRef, Vec<SemanticSymbolId>>,
@@ -1092,6 +1093,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_node_facts: BTreeMap::new(),
             source_node_children: BTreeMap::new(),
             source_symbol_declarations,
+            source_merged_declaration_order: HashMap::new(),
             source_global_bindings: None,
             computed_method_name_groups: HashMap::new(),
             source_declaration_owners,
@@ -2834,6 +2836,53 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             && declarations
                 .iter()
                 .all(|declaration| self.source_declaration_belongs_to_symbol(*declaration, symbol))
+    }
+
+    fn source_declaration_order(&self, symbol: SemanticSymbolId) -> Option<&[NodeRef]> {
+        self.source_merged_declaration_order
+            .get(&symbol)
+            .map(AsRef::as_ref)
+            .or_else(|| {
+                self.source_symbol_declarations
+                    .get(&symbol)
+                    .map(|source| source.declarations.as_ref())
+            })
+    }
+
+    /// Records the order used by the merger, independently of later symbol writes.
+    pub(super) fn record_source_symbol_merge(
+        &mut self,
+        target: SemanticSymbolId,
+        left: Option<SemanticSymbolId>,
+        right: SemanticSymbolId,
+    ) {
+        let expected = (|| {
+            let mut declarations = match left {
+                Some(left) => self.source_declaration_order(left)?.to_vec(),
+                None => Vec::new(),
+            };
+            declarations.extend_from_slice(self.source_declaration_order(right)?);
+            (self.symbol(target)?.declarations() == Some(declarations.as_slice()))
+                .then_some(declarations.into_boxed_slice())
+        })();
+        if let Some(expected) = expected {
+            self.source_merged_declaration_order
+                .insert(target, expected);
+        } else {
+            self.source_merged_declaration_order.remove(&target);
+        }
+    }
+
+    pub(super) fn source_merged_symbol_declarations_in_order(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> bool {
+        self.source_merged_symbol_declarations_match(symbol)
+            && self
+                .source_declaration_order(symbol)
+                .is_some_and(|expected| {
+                    self.symbol(symbol).and_then(Symbol::declarations) == Some(expected)
+                })
     }
 
     /// Proves a callable contribution's global block, raw export and local placeholder.
@@ -12718,9 +12767,10 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                         ))
                 })
                 || self.signature(*signature).is_some_and(|record| {
-                    record.declaration().is_some_and(|declaration| {
-                        self.node_is_function_type(declaration)
-                    }) && record.this_parameter().is_some() != this_type.is_some()
+                    record
+                        .declaration()
+                        .is_some_and(|declaration| self.node_is_function_type(declaration))
+                        && record.this_parameter().is_some() != this_type.is_some()
                 })
                 || !self.valid_optional_types(Some(types))
         }) {

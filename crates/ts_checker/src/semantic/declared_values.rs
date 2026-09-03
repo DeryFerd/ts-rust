@@ -1209,7 +1209,6 @@ fn plan_property_owner(
             if parent_node.kind == SyntaxKind::InterfaceDeclaration =>
         {
             if !owner_record.flags().contains(SymbolFlags::INTERFACE)
-                || owner_record.flags().contains(SymbolFlags::CLASS)
                 || interface
                     .members
                     .nodes
@@ -1221,6 +1220,34 @@ fn plan_property_owner(
                 return Err(invalid());
             }
             preflight_class_or_interface_reference(store, host, owner, owner_record.flags())?;
+            if owner_record.flags().contains(SymbolFlags::CLASS) {
+                super::declared::plan_class_interface_source(store, host, owner)?;
+            }
+        }
+        NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_) => {
+            let members = match &parent_node.data {
+                NodeData::ClassDeclaration(class) => &class.members,
+                NodeData::ClassExpression(class) => &class.members,
+                _ => unreachable!(),
+            };
+            let source = super::declared::plan_class_interface_source(store, host, owner)?;
+            if source.class_declaration != Some(parent)
+                || members
+                    .nodes
+                    .iter()
+                    .filter(|member| **member == declaration.node)
+                    .count()
+                    != 1
+                || host.source(declaration).is_some_and(|(arena, _)| {
+                    ts_binder::canonical_has_syntactic_modifier(
+                        arena,
+                        declaration.node,
+                        SyntaxKind::StaticKeyword,
+                    )
+                })
+            {
+                return Err(invalid());
+            }
         }
         NodeData::TypeLiteralNode(literal) if parent_node.kind == SyntaxKind::TypeLiteral => {
             let receiver = store

@@ -4,8 +4,9 @@ use ts_binder::{
     EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeError, IntrinsicBootstrapOptions,
-    SourceCheckError, TypeData, TypeId, TypeNodeUnavailable, types::ObjectFlags,
+    CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeError, DeclaredTypeUnavailable,
+    IntrinsicBootstrapOptions, SourceCheckError, TypeData, TypeId, TypeNodeUnavailable,
+    types::ObjectFlags,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -153,10 +154,16 @@ fn check_once(source: &str, negative: bool, query_first: bool) {
         checker.get_type_at_location(property).unwrap();
     }
     checker.check_source_file(consumer).unwrap_or_else(|error| {
-        if let SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
-            TypeNodeUnavailable::UnsupportedSyntax { node, .. },
-        )) = &error
-        {
+        let source_node = match &error {
+            SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedSyntax { node, .. },
+            ))
+            | SourceCheckError::DeclaredType(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::InvalidInterfaceDeclaration(node),
+            )) => Some(*node),
+            _ => None,
+        };
+        if let Some(node) = source_node {
             let file = node.file.index();
             let range = parsed[file].arena.get(node.node).unwrap().range;
             panic!(

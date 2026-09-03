@@ -399,11 +399,11 @@ fn property_from_validated_members(
 }
 
 #[derive(Clone, Debug)]
-struct SourceMemberName {
-    declaration: NodeRef,
-    symbol: SemanticSymbolId,
-    name: Option<EscapedName>,
-    computed: Option<PlannedComputedMemberKey>,
+pub(super) struct SourceMemberName {
+    pub(super) declaration: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) name: Option<EscapedName>,
+    pub(super) computed: Option<PlannedComputedMemberKey>,
 }
 
 /// Resolves one source member without preparing sibling type annotations.
@@ -2079,7 +2079,10 @@ pub(super) fn validate_cold_source_member_symbol(
     let mut signature_name = None;
     for &declaration in declarations {
         flags |= match store.source_node_kind(declaration) {
-            Some(SyntaxKind::MethodSignature) => SymbolFlags::METHOD,
+            Some(SyntaxKind::MethodSignature | SyntaxKind::MethodDeclaration) => {
+                SymbolFlags::METHOD
+            }
+            Some(SyntaxKind::Constructor) => SymbolFlags::CONSTRUCTOR,
             Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature) => {
                 readonly |= store
                     .source_child_with_kind(declaration, SyntaxKind::ReadonlyKeyword)
@@ -2353,7 +2356,7 @@ fn source_computed_key_error(error: ComputedMemberKeyError) -> SourceCheckError 
     }
 }
 
-fn validate_source_member_name_cache(
+pub(super) fn validate_source_member_name_cache(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     owner: SemanticSymbolId,
@@ -2534,7 +2537,7 @@ fn valid_partial_member_name_table(
         })
 }
 
-fn plan_source_member_names(
+pub(super) fn plan_source_member_names(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     owner: SemanticSymbolId,
@@ -2542,7 +2545,9 @@ fn plan_source_member_names(
     let invalid = || SourceCheckError::RelationUnavailable(RelationUnavailable::Symbol(owner));
     let symbol = store.symbol(owner).ok_or_else(invalid)?;
     let interface_owner = symbol.flags().contains(SymbolFlags::INTERFACE);
+    let class_owner = symbol.flags().contains(SymbolFlags::CLASS);
     let mixed_owner = if interface_owner
+        && !class_owner
         && !source_interface_uses_legacy_single_script_value_owner(store, owner)
     {
         store
@@ -2551,7 +2556,9 @@ fn plan_source_member_names(
     } else {
         None
     };
-    if interface_owner {
+    if class_owner {
+        super::declared::plan_class_interface_source(store, host, owner)?;
+    } else if interface_owner {
         super::declared::preflight_class_or_interface_reference(
             store,
             host,
@@ -2559,14 +2566,19 @@ fn plan_source_member_names(
             symbol.flags(),
         )?;
     }
-    let allowed = if interface_owner {
+    let allowed = if class_owner {
+        SymbolFlags::CLASS
+            | SymbolFlags::INTERFACE
+            | SymbolFlags::NAMESPACE
+            | SymbolFlags::TRANSIENT
+    } else if interface_owner {
         SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT | SymbolFlags::FUNCTION_SCOPED_VARIABLE
     } else {
         SymbolFlags::TYPE_LITERAL
     };
     if symbol.flags().without(allowed) != SymbolFlags::NONE
         || symbol.check_flags() != CheckFlags::NONE
-        || symbol.exports().is_some()
+        || !class_owner && symbol.exports().is_some()
         || symbol.export_symbol().is_some()
         || store.get_merged_symbol(owner) != Some(owner)
     {
@@ -2588,12 +2600,37 @@ fn plan_source_member_names(
     for &declaration in declarations {
         let record = preflight_node(store, host, declaration)?;
         if !host.symbol_matches(store, declaration, owner)
-            || record.flags.0 != 0
+            || !class_owner && record.flags.0 != 0
             || !seen_nodes.insert(declaration)
         {
             return Err(invalid());
         }
         let (members, parameters) = match &record.data {
+            NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_) if class_owner => {
+                let (members, parameters, heritage) = match &record.data {
+                    NodeData::ClassDeclaration(class) => (
+                        &class.members,
+                        class.type_parameters.as_ref(),
+                        class.heritage_clauses.as_ref(),
+                    ),
+                    NodeData::ClassExpression(class) => (
+                        &class.members,
+                        class.type_parameters.as_ref(),
+                        class.heritage_clauses.as_ref(),
+                    ),
+                    _ => unreachable!(),
+                };
+                if symbol.value_declaration() != Some(declaration) {
+                    return Err(invalid());
+                }
+                has_heritage |= heritage.is_some_and(|clauses| {
+                    clauses.nodes.iter().any(|clause| {
+                        matches!(host.node(NodeRef::new(declaration.arena, declaration.file, *clause)).map(|record| &record.data),
+                            Some(NodeData::HeritageClause(heritage)) if heritage.token == SyntaxKind::ExtendsKeyword)
+                    })
+                });
+                (members, parameters)
+            }
             NodeData::InterfaceDeclaration(interface) if interface_owner => {
                 let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
                 if store.source_identifier_text(name) != symbol.name().as_utf8()
@@ -2619,6 +2656,7 @@ fn plan_source_member_names(
                 (&interface.members, interface.type_parameters.as_ref())
             }
             NodeData::TypeLiteralNode(literal) if !interface_owner => (&literal.members, None),
+            NodeData::ModuleDeclaration(_) if class_owner => continue,
             NodeData::VariableDeclaration(_)
                 if interface_owner
                     && symbol
@@ -2657,7 +2695,7 @@ fn plan_source_member_names(
             let member = NodeRef::new(declaration.arena, declaration.file, node);
             let record = preflight_node(store, host, member)?;
             if record.parent != Some(declaration.node)
-                || record.flags.0 != 0
+                || !class_owner && record.flags.0 != 0
                 || !seen_nodes.insert(member)
             {
                 return Err(invalid());
@@ -2671,8 +2709,30 @@ fn plan_source_member_names(
             {
                 return Err(invalid());
             }
+            if class_owner
+                && host.source(member).is_some_and(|(arena, _)| {
+                    ts_binder::canonical_has_syntactic_modifier(
+                        arena,
+                        member.node,
+                        SyntaxKind::StaticKeyword,
+                    )
+                })
+            {
+                if symbol
+                    .exports()
+                    .and_then(|table| store.symbol_table(table))
+                    .and_then(|table| table.get(bound.name()))
+                    .and_then(|raw| store.get_merged_symbol(raw))
+                    != Some(member_symbol)
+                {
+                    return Err(invalid());
+                }
+                continue;
+            }
             seen_symbols.entry(member_symbol).or_default().push(member);
             let name_node = match &record.data {
+                NodeData::MethodDeclaration(method) if class_owner => method.name,
+                NodeData::ConstructorDeclaration(_) if class_owner => continue,
                 NodeData::MethodSignatureDeclaration(method) => method.name,
                 NodeData::PropertyDeclaration(property) => property.name,
                 NodeData::PropertySignatureDeclaration(property) => property.name,
@@ -11958,6 +12018,58 @@ pub(super) fn plan_generic_interface_identity(
     let owner = store
         .symbol(symbol)
         .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+    if owner.flags().contains(SymbolFlags::CLASS) {
+        let source = super::declared::plan_class_interface_source(store, host, symbol)
+            .map_err(|_| PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+        let node = source
+            .class_declaration
+            .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+        let mut heritage = None;
+        for declaration in std::iter::once(node).chain(
+            source
+                .declarations
+                .iter()
+                .copied()
+                .filter(|declaration| *declaration != node),
+        ) {
+            let record = preflight_node(store, host, declaration)
+                .map_err(|_| PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+            let clauses = match &record.data {
+                NodeData::ClassDeclaration(class) => class.heritage_clauses.as_ref(),
+                NodeData::ClassExpression(class) => class.heritage_clauses.as_ref(),
+                NodeData::InterfaceDeclaration(interface) => interface.heritage_clauses.as_ref(),
+                _ => None,
+            };
+            if let Some(clauses) = clauses {
+                let planned =
+                    plan_direct_interface_heritage(store, host, declaration, symbol, clauses)
+                        .map_err(|error| match error {
+                            DirectInterfaceHeritageError::Invalid => {
+                                PropertyObjectError::InvalidInterfaceSymbol(symbol)
+                            }
+                            DirectInterfaceHeritageError::Unsupported { node, kind } => {
+                                PropertyObjectError::UnsupportedMember { node, kind }
+                            }
+                        })?;
+                merge_interface_heritage(store, host, &mut heritage, planned, None, false)?;
+            }
+        }
+        return Ok(GenericInterfaceIdentityPlan {
+            node,
+            symbol,
+            parameters: source
+                .outer_type_parameters
+                .into_iter()
+                .chain(
+                    source
+                        .local_type_parameters
+                        .into_iter()
+                        .map(|parameter| parameter.symbol),
+                )
+                .collect(),
+            heritage,
+        });
+    }
     let mixed_owner = store
         .source_global_interface_value_owner(symbol)
         .map_err(|_| PropertyObjectError::InvalidInterfaceSymbol(symbol))?;

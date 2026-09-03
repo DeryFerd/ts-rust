@@ -678,6 +678,8 @@ where
                     "merged target declarations failed canonical validation",
                 ));
             }
+            self.store
+                .record_source_symbol_merge(target, Some(target), source);
 
             if let Some(source_members) = source_snapshot.members() {
                 let target_members = self.ensure_relationship_table(target, false)?;
@@ -760,6 +762,7 @@ where
             ));
         }
         self.record_merged_symbol(result, symbol)?;
+        self.store.record_source_symbol_merge(result, None, symbol);
         Ok(result)
     }
 

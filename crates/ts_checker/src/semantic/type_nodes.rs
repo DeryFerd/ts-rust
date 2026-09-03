@@ -14237,7 +14237,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let flags = self
             .store
             .symbol(interface)
-            .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(object)))?
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(object))
+            })?
             .flags();
         if flags.without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
             || self.resolve_uncached_type_reference_symbol(target)? != interface
@@ -16167,15 +16169,16 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
                 NodeData::ParenthesizedTypeNode(parenthesized)
                     if parent_record.kind == SyntaxKind::ParenthesizedType
-                        && parenthesized.type_ == child.node => None,
+                        && parenthesized.type_ == child.node =>
+                {
+                    None
+                }
                 NodeData::IntersectionTypeNode(intersection)
                     if parent_record.kind == SyntaxKind::IntersectionType =>
                 {
                     Some(&intersection.types)
                 }
-                NodeData::UnionTypeNode(union)
-                    if parent_record.kind == SyntaxKind::UnionType =>
-                {
+                NodeData::UnionTypeNode(union) if parent_record.kind == SyntaxKind::UnionType => {
                     Some(&union.types)
                 }
                 _ => return Err(invalid()),
@@ -17173,7 +17176,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         &mut self,
         base: &DirectInterfaceBasePlan,
     ) -> Result<(), DeclaredTypeError> {
-        self.plan_generic_interface_declared_members(base.symbol)?;
+        if self
+            .store
+            .symbol(base.symbol)
+            .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
+        {
+            self.plan_generic_interface_heritage(base.symbol)?;
+        } else {
+            self.plan_generic_interface_declared_members(base.symbol)?;
+        }
         for argument in &base.type_arguments {
             self.plan_type_node_in_context(*argument, None, false)?;
         }
@@ -17850,6 +17861,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         &self,
         symbol: SemanticSymbolId,
     ) -> Result<bool, DeclaredTypeError> {
+        if self
+            .store
+            .symbol(symbol)
+            .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
+        {
+            return object_members::plan_generic_interface_identity(self.store, self.host, symbol)
+                .map(|identity| identity.heritage.is_some())
+                .map_err(property_object_error);
+        }
         let react_namespace = self.authenticated_react_interface_namespace(symbol)?;
         if self.store.get_parent_of_symbol(symbol).is_some() && react_namespace.is_none() {
             return Ok(false);
@@ -17920,15 +17940,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let identity_only = self
             .store
             .symbol(symbol)
-            .and_then(|owner| owner.declarations())
-            .is_some_and(|declarations| {
-                declarations.iter().any(|declaration| {
-                    self.host
-                        .bound_file(*declaration)
-                        .and_then(ts_binder::BoundFile::source_facts)
-                        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_default_library)
-                })
-            });
+            .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
+            || self
+                .store
+                .symbol(symbol)
+                .and_then(|owner| owner.declarations())
+                .is_some_and(|declarations| {
+                    declarations.iter().any(|declaration| {
+                        self.host
+                            .bound_file(*declaration)
+                            .and_then(ts_binder::BoundFile::source_facts)
+                            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_default_library)
+                    })
+                });
         let identity = if identity_only {
             Some(
                 object_members::plan_generic_interface_identity(self.store, self.host, symbol)
@@ -24648,6 +24672,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .is_some_and(|base| base.kind == DirectInterfaceBaseKind::Interface)
             {
                 flags.without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+                    && !(flags.contains(SymbolFlags::CLASS)
+                        && super::declared::plan_class_interface_source(
+                            self.store, self.host, symbol,
+                        )
+                        .is_ok())
             } else {
                 flags != SymbolFlags::TYPE_ALIAS
             }
@@ -30390,6 +30419,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 minimum_type_arguments: local_type_parameter_count,
             });
         }
+        if self.store.symbol(symbol).is_some_and(|owner| {
+            owner
+                .flags()
+                .contains(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+        }) {
+            return self.preflight_merged_class_interface_reference_target(
+                node,
+                symbol,
+                local_type_parameter_count,
+                provided_type_argument_count,
+            );
+        }
         if let Some(target) = self.preflight_merged_interface_defaults(
             node,
             symbol,
@@ -30602,13 +30643,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             || parameter_data.constraint.is_none()
                                 && cached.constraint.is_some_and(|constraint| {
                                     !ordinary_interface
-                                        || self.store.intrinsic_bootstrap().is_none_or(|bootstrap| {
-                                            constraint != bootstrap.no_constraint_type
-                                        })
+                                        || self.store.intrinsic_bootstrap().is_none_or(
+                                            |bootstrap| constraint != bootstrap.no_constraint_type,
+                                        )
                                         || self
                                             .store
                                             .source_type_parameter_annotations(parameter)
-                                            .is_none_or(|annotations| annotations.constraint.is_some())
+                                            .is_none_or(|annotations| {
+                                                annotations.constraint.is_some()
+                                            })
                                 })
                             || parameter_data.default_type.is_none()
                                 && cached.resolved_default_type.is_some()
@@ -30675,6 +30718,115 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
     }
 
     /// Selects defaults from the canonical merged formals, never constructor formals.
+    fn preflight_merged_class_interface_reference_target(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+        local_count: usize,
+        provided_count: usize,
+    ) -> Result<PlannedDirectGenericTarget, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let owner = super::declared::plan_class_interface_source(self.store, self.host, symbol)?;
+        let parameters = &owner.local_type_parameters;
+        if parameters.len() != local_count || parameters.is_empty() {
+            return Err(invalid());
+        }
+        let minimum_type_arguments = parameters
+            .iter()
+            .rposition(|parameter| parameter.default_type.is_none())
+            .map_or(0, |index| index + 1);
+        let symbols = parameters
+            .iter()
+            .map(|parameter| parameter.symbol)
+            .collect::<Vec<_>>();
+        let mut constraints = Vec::new();
+        let mut defaults = Vec::new();
+        for (index, parameter) in parameters.iter().enumerate() {
+            if let Some(constraint) = parameter.constraint {
+                constraints.push(PlannedDirectGenericConstraint {
+                    parameter: parameter.symbol,
+                    node: constraint,
+                });
+            }
+            if let Some(default) = parameter.default_type {
+                self.preflight_source_class_default_references(
+                    node,
+                    symbol,
+                    default,
+                    &symbols[index..],
+                )?;
+                if index >= provided_count
+                    && (minimum_type_arguments..=parameters.len()).contains(&provided_count)
+                {
+                    let earlier_parameter = if matches!(
+                        preflight_node(self.store, self.host, default)?.data,
+                        NodeData::TypeReferenceNode(ref reference) if reference.type_arguments.is_none()
+                    ) {
+                        let referenced = self.resolve_uncached_type_reference_symbol(default)?;
+                        symbols[..index].contains(&referenced).then_some(referenced)
+                    } else {
+                        None
+                    };
+                    defaults.push(PlannedDirectGenericDefault {
+                        parameter: parameter.symbol,
+                        node: default,
+                        earlier_parameter,
+                    });
+                }
+            }
+            if let Some(type_) = self
+                .store
+                .declared_type_links(parameter.symbol)
+                .and_then(|links| links.declared_type)
+            {
+                let Some(TypeData::TypeParameter(cached)) =
+                    self.store.type_payload(type_).map(TypeRecord::data)
+                else {
+                    return Err(invalid());
+                };
+                if cached_ordinary_type_parameter_owner(self.store, type_) != Some(parameter.symbol)
+                {
+                    return Err(invalid());
+                }
+                for (written, actual) in [
+                    (parameter.constraint, cached.constraint),
+                    (parameter.default_type, cached.resolved_default_type),
+                ] {
+                    let Some(actual) = actual else {
+                        continue;
+                    };
+                    let expected = if let Some(written) = written {
+                        let expected = self.cached_array_element_identity(written)?;
+                        if parameter.constraint == Some(written)
+                            && self
+                                .store
+                                .intrinsic_bootstrap()
+                                .is_some_and(|bootstrap| expected == Some(bootstrap.any_type))
+                        {
+                            self.store
+                                .intrinsic_bootstrap()
+                                .map(|bootstrap| bootstrap.unknown_type)
+                        } else {
+                            expected
+                        }
+                    } else {
+                        self.store
+                            .intrinsic_bootstrap()
+                            .map(|bootstrap| bootstrap.no_constraint_type)
+                    };
+                    if expected != Some(actual) {
+                        return Err(invalid());
+                    }
+                }
+            }
+        }
+        Ok(PlannedDirectGenericTarget {
+            constraints,
+            defaults,
+            minimum_type_arguments,
+        })
+    }
+
     fn preflight_merged_interface_defaults(
         &self,
         node: NodeRef,
@@ -31387,7 +31539,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     node,
                     symbol,
                     default,
-                    &parameters[index..],
+                    &parameters[index..]
+                        .iter()
+                        .map(|parameter| parameter.symbol)
+                        .collect::<Vec<_>>(),
                 )?;
                 if index >= provided_type_argument_count
                     && (minimum_type_arguments..=parameters.len())
@@ -31473,7 +31628,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         node: NodeRef,
         owner: SemanticSymbolId,
         root: NodeRef,
-        unavailable: &[super::classes::SourceClassTypeParameterPlan],
+        unavailable: &[SemanticSymbolId],
     ) -> Result<(), DeclaredTypeError> {
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
         let mut pending = vec![root];
@@ -31485,10 +31640,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             let record = preflight_node(self.store, self.host, current)?;
             if record.kind == SyntaxKind::TypeReference {
                 let referenced = self.resolve_uncached_type_reference_symbol(current)?;
-                if unavailable
-                    .iter()
-                    .any(|parameter| parameter.symbol == referenced)
-                {
+                if unavailable.contains(&referenced) {
                     return Err(type_node_unavailable(
                         TypeNodeUnavailable::GenericReferenceUnsupported {
                             node: current,
@@ -39938,7 +40090,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     declaration,
                     owner,
                     default,
-                    &parameters[index..],
+                    &parameters[index..]
+                        .iter()
+                        .map(|parameter| parameter.symbol)
+                        .collect::<Vec<_>>(),
                 )?;
             }
             for annotation in [parameter.constraint, parameter.default_type]
@@ -40615,7 +40770,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .map(CanonicalArrayTargets::from_global_types),
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
+        )
+        .with_source_globals(
+            self.global_types
+                .as_ref()
+                .filter(|_| self.instantiation_session.is_some()),
         );
+        planner.source_context = self
+            .global_types
+            .as_ref()
+            .map(|_| self.source_query_context())
+            .transpose()?;
         planner.lazy_interface_values = true;
         match method.kind {
             object_members::PropertyObjectKind::Interface => {
@@ -46230,14 +46395,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 })?;
             return Ok(members.shells().instance_type());
         }
-        if let Some(declared_type) = get_declared_class_interface_or_type_parameter(
-            self.store, self.host, symbol, flags,
-        )
-        .inspect_err(|error| {
-            observe_declared_cache_failure(self.store, "declared_type.identity", None, error);
-        })?
+        if let Some(declared_type) =
+            get_declared_class_interface_or_type_parameter(self.store, self.host, symbol, flags)
+                .inspect_err(|error| {
+                    observe_declared_cache_failure(
+                        self.store,
+                        "declared_type.identity",
+                        None,
+                        error,
+                    );
+                })?
         {
-            if flags.contains(SymbolFlags::INTERFACE) && !flags.contains(SymbolFlags::CLASS) {
+            if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
                 if let Some(header) = plan.interface_headers.get(&symbol) {
                     self.prepare_cached_mapped_interface_aliases(declared_type, header)?;
                     let context = if self.global_types.is_some() {
@@ -48249,9 +48418,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         plan: &TypeQueryPlan,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, DeclaredTypeError> {
-        let invalid = || {
-            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(predicate.node))
-        };
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(predicate.node));
         let method = plan
             .interfaces
             .values()
@@ -52829,7 +52997,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let class_defaults = self
             .store
             .symbol(reference.symbol)
-            .is_some_and(|owner| owner.flags() == SymbolFlags::CLASS);
+            .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS));
         for (position, parameter) in parameters.iter().enumerate().skip(type_arguments.len()) {
             let symbol = cached_ordinary_type_parameter_owner(self.store, *parameter)
                 .ok_or_else(&invalid)?;

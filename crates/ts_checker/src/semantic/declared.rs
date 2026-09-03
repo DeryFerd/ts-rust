@@ -517,6 +517,25 @@ struct InterfacePlan {
     ambient_class_heritage: Option<super::source_imports::SourceAmbientClassHeritage>,
 }
 
+/// The declarations that contribute to one class or interface instance type.
+/// This plan does not resolve bases or read named member annotations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClassInterfaceSourcePlan {
+    pub symbol: SemanticSymbolId,
+    pub declarations: Vec<NodeRef>,
+    pub class_declaration: Option<NodeRef>,
+    pub outer_type_parameters: Vec<SemanticSymbolId>,
+    pub local_type_parameters: Vec<ClassInterfaceTypeParameter>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClassInterfaceTypeParameter {
+    pub symbol: SemanticSymbolId,
+    pub declarations: Vec<NodeRef>,
+    pub constraint: Option<NodeRef>,
+    pub default_type: Option<NodeRef>,
+}
+
 #[derive(Debug)]
 enum RecursiveInterfacePlanNode {
     Class(ClassPlan),
@@ -1223,6 +1242,184 @@ fn preflight_interface_identity(
         },
         interface_declarations,
     ))
+}
+
+/// Uses the same formals as declared identity creation, including merged owners.
+pub(super) fn plan_class_interface_source(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<ClassInterfaceSourcePlan, DeclaredTypeError> {
+    let invalid = || unavailable(DeclaredTypeUnavailable::MissingDeclarations(symbol));
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    if store.get_merged_symbol(symbol) != Some(symbol)
+        || !owner
+            .flags()
+            .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+        || !store.source_merged_symbol_declarations_in_order(symbol)
+        || owner.check_flags() != ts_binder::CheckFlags::NONE
+    {
+        return Err(invalid());
+    }
+    let (parameters, outer_count, class_declaration) = if owner.flags().contains(SymbolFlags::CLASS)
+    {
+        let plan = preflight_class_plan(store, host, symbol)?;
+        (
+            plan.type_parameters,
+            plan.outer_type_parameter_count,
+            owner.value_declaration(),
+        )
+    } else {
+        let (plan, _) = preflight_interface_identity(store, host, symbol)?;
+        (plan.type_parameters, plan.outer_type_parameter_count, None)
+    };
+    let mut declarations = Vec::new();
+    for &declaration in owner.declarations().ok_or_else(invalid)? {
+        let record = preflight_node(store, host, declaration)?;
+        if !host.symbol_matches(store, declaration, symbol) {
+            return Err(invalid());
+        }
+        if matches!(
+            record.data,
+            NodeData::ClassDeclaration(_)
+                | NodeData::ClassExpression(_)
+                | NodeData::InterfaceDeclaration(_)
+        ) {
+            if declarations.contains(&declaration) {
+                return Err(invalid());
+            }
+            declarations.push(declaration);
+        }
+    }
+    if declarations.is_empty()
+        || class_declaration.is_some_and(|class| !declarations.contains(&class))
+    {
+        return Err(invalid());
+    }
+    let members = owner.members().and_then(|table| store.symbol_table(table));
+    let mut local_type_parameters = Vec::new();
+    for &parameter in &parameters[outer_count..] {
+        let record = store.symbol(parameter).ok_or_else(invalid)?;
+        if record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::TYPE_PARAMETER
+            || record.check_flags() != ts_binder::CheckFlags::NONE
+            || record.value_declaration().is_some()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || store.get_parent_of_symbol(parameter) != Some(symbol)
+            || members
+                .and_then(|table| table.get(record.name()))
+                .and_then(|raw| store.get_merged_symbol(raw))
+                != Some(parameter)
+        {
+            return Err(invalid());
+        }
+        let mut parameter_declarations = Vec::new();
+        for &declaration in &declarations {
+            let declaration_record = preflight_node(store, host, declaration)?;
+            let written = match &declaration_record.data {
+                NodeData::ClassDeclaration(data) => data.type_parameters.as_ref(),
+                NodeData::ClassExpression(data) => data.type_parameters.as_ref(),
+                NodeData::InterfaceDeclaration(data) => data.type_parameters.as_ref(),
+                _ => None,
+            };
+            for &node in written.into_iter().flat_map(|list| &list.nodes) {
+                let node = NodeRef::new(declaration.arena, declaration.file, node);
+                if host.symbol_matches(store, node, parameter) {
+                    parameter_declarations.push(node);
+                }
+            }
+        }
+        if parameter_declarations.is_empty()
+            || record.declarations() != Some(parameter_declarations.as_slice())
+        {
+            return Err(invalid());
+        }
+        let mut plan = ClassInterfaceTypeParameter {
+            symbol: parameter,
+            declarations: parameter_declarations.clone(),
+            constraint: None,
+            default_type: None,
+        };
+        for &declaration in &parameter_declarations {
+            let record = preflight_node(store, host, declaration)?;
+            let NodeData::TypeParameterDeclaration(data) = &record.data else {
+                return Err(invalid());
+            };
+            let parent = NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                record.parent.ok_or_else(invalid)?,
+            );
+            if !declarations.contains(&parent)
+                || !host.symbol_matches(store, declaration, parameter)
+            {
+                return Err(invalid());
+            }
+            let parent_record = preflight_node(store, host, parent)?;
+            let written_parameters = match &parent_record.data {
+                NodeData::ClassDeclaration(data) => data.type_parameters.as_ref(),
+                NodeData::ClassExpression(data) => data.type_parameters.as_ref(),
+                NodeData::InterfaceDeclaration(data) => data.type_parameters.as_ref(),
+                _ => None,
+            }
+            .ok_or_else(invalid)?;
+            if written_parameters
+                .nodes
+                .iter()
+                .filter(|node| **node == declaration.node)
+                .count()
+                != 1
+            {
+                return Err(invalid());
+            }
+            for (written, selected) in [
+                (data.constraint, &mut plan.constraint),
+                (data.default_type, &mut plan.default_type),
+            ] {
+                if let Some(written) = written {
+                    let node = NodeRef::new(declaration.arena, declaration.file, written);
+                    if preflight_node(store, host, node)?.parent != Some(declaration.node) {
+                        return Err(invalid());
+                    }
+                    selected.get_or_insert(node);
+                }
+            }
+        }
+        local_type_parameters.push(plan);
+    }
+    if let Some(cached) = store
+        .declared_type_links(symbol)
+        .and_then(|links| links.declared_type)
+    {
+        let Some(TypeData::Interface(data)) = store.type_payload(cached).map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        let cached_parameters = data
+            .reference
+            .resolved_type_arguments
+            .as_deref()
+            .unwrap_or_default();
+        if data.outer_type_parameter_count != outer_count
+            || cached_parameters.len() != parameters.len()
+            || cached_parameters
+                .iter()
+                .zip(&parameters)
+                .any(|(&type_, &parameter)| {
+                    cached_ordinary_type_parameter_owner(store, type_) != Some(parameter)
+                })
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(ClassInterfaceSourcePlan {
+        symbol,
+        declarations,
+        class_declaration,
+        outer_type_parameters: parameters[..outer_count].to_vec(),
+        local_type_parameters,
+    })
 }
 
 fn cached_class_or_interface_has_this_type(
