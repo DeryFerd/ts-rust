@@ -3026,6 +3026,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !valid_group || owner.value_declaration() != functions.first().copied() {
             return None;
         }
+        self.validate_source_merged_namespace_exports(symbol, &namespaces)?;
+        Some(functions)
+    }
+
+    /// Checks every saved export contribution and its canonical namespace member.
+    pub(super) fn validate_source_merged_namespace_exports(
+        &self,
+        symbol: SemanticSymbolId,
+        namespaces: &[NodeRef],
+    ) -> Option<()> {
+        let owner = self.symbol(symbol)?;
         let mut expected_exports = HashMap::new();
         for raw in std::iter::once(symbol).chain(self.merged_symbols.keys().copied()) {
             if self.get_merged_symbol(raw) != Some(symbol) {
@@ -3078,7 +3089,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 }
             }
         }
-        Some(functions)
+        Some(())
     }
 
     /// Proves a call member against every original interface contribution.

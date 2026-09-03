@@ -6554,6 +6554,18 @@ fn resolve_namespace_property(
     let receiver = store
         .type_payload(receiver_type)
         .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    // Go selects a variable or property's value type before its namespace flags.
+    // Apply that order to both the typed receiver and an identifier or alias.
+    let namespace_value_owner = |symbol| -> Result<_, SourcePropertyError> {
+        let owner = store
+            .symbol(symbol)
+            .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+        Ok((owner.flags().intersects(SymbolFlags::MODULE)
+            && !owner
+                .flags()
+                .intersects(SymbolFlags::VARIABLE | SymbolFlags::PROPERTY))
+        .then_some(symbol))
+    };
     let receiver_module = match validated_source_file_namespace_owner(store, receiver_type)
         .map_err(|_| SourcePropertyError::InvalidCache(plan.node))?
     {
@@ -6566,13 +6578,11 @@ fn resolve_namespace_property(
                     .get_merged_symbol(symbol)
                     .ok_or(SourcePropertyError::InvalidCache(plan.node))
             })
-            .transpose()?
-            .filter(|symbol| {
-                store
-                    .symbol(*symbol)
-                    .is_some_and(|record| record.flags().intersects(SymbolFlags::MODULE))
-            }),
-    };
+            .transpose()?,
+    }
+    .map(namespace_value_owner)
+    .transpose()?
+    .flatten();
     let alias_module = if let PlannedExpressionKind::Identifier(read) = &plan.receiver.kind {
         let receiver_symbol = store
             .symbol(read.value_symbol)
@@ -6592,7 +6602,10 @@ fn resolve_namespace_property(
         }
     } else {
         None
-    };
+    }
+    .map(namespace_value_owner)
+    .transpose()?
+    .flatten();
     let module = match (receiver_module, alias_module) {
         (Some(owner), Some(alias)) if owner != alias => {
             return Err(SourcePropertyError::InvalidCache(plan.node));

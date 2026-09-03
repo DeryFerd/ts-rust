@@ -411,12 +411,16 @@ fn plan_global_annotated_value(
         || record.check_flags() != CheckFlags::NONE
         || record.parent().is_some()
         || record.exports().is_some()
+            && !declarations.iter().any(|&declaration| {
+                store.source_node_kind(declaration) == Some(SyntaxKind::ModuleDeclaration)
+            })
         || record.export_symbol().is_some()
         || !record.flags().contains(SymbolFlags::INTERFACE) && record.members().is_some()
     {
         return Err(invalid());
     }
     let mut flags = SymbolFlags::NONE;
+    let mut namespaces = Vec::new();
     for &declaration in declarations {
         let node = preflight_node(store, host, declaration)?;
         let bound = host.bound_file(declaration).ok_or_else(invalid)?;
@@ -433,6 +437,10 @@ fn plan_global_annotated_value(
         match &node.data {
             NodeData::VariableDeclaration(_) if node.kind == SyntaxKind::VariableDeclaration => {
                 flags |= plan_global_variable_declaration(store, host, symbol, declaration)?;
+            }
+            NodeData::ModuleDeclaration(_) if node.kind == SyntaxKind::ModuleDeclaration => {
+                flags |= plan_global_namespace_declaration(store, host, symbol, declaration)?;
+                namespaces.push(declaration);
             }
             NodeData::InterfaceDeclaration(interface)
                 if node.kind == SyntaxKind::InterfaceDeclaration =>
@@ -486,7 +494,112 @@ fn plan_global_annotated_value(
     {
         return Err(invalid());
     }
+    if !namespaces.is_empty()
+        && store
+            .validate_source_merged_namespace_exports(symbol, &namespaces)
+            .is_none()
+    {
+        return Err(invalid());
+    }
     plan_declared_value_cache(store, symbol, annotation, None).map(Some)
+}
+
+/// Keeps the namespace contribution without using it as the variable's value type.
+fn plan_global_namespace_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<SymbolFlags, DeclaredTypeError> {
+    let invalid = || invalid_value(symbol);
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    let node = preflight_node(store, host, declaration)?;
+    let NodeData::ModuleDeclaration(namespace) = &node.data else {
+        return Err(invalid());
+    };
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    let raw = bound.symbol(declaration).ok_or_else(invalid)?;
+    let raw_record = store.symbol(raw).ok_or_else(invalid)?;
+    let flags = raw_record.flags() & (SymbolFlags::MODULE | SymbolFlags::CONST_ENUM_ONLY_MODULE);
+    let name = NodeRef::new(declaration.arena, declaration.file, namespace.name);
+    let name_node = preflight_node(store, host, name)?;
+    let body = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        namespace.body.ok_or_else(invalid)?,
+    );
+    let body_node = preflight_node(store, host, body)?;
+    if node.kind != SyntaxKind::ModuleDeclaration
+        || node.flags.0 != 0
+        || !matches!(
+            namespace.keyword,
+            SyntaxKind::NamespaceKeyword | SyntaxKind::ModuleKeyword
+        )
+        || namespace.symbol.is_some()
+        || namespace.local_symbol.is_some()
+        || namespace.asterisk_token.is_some()
+        || namespace.flow_node.is_some()
+        || namespace.end_flow_node.is_some()
+        || namespace.next_container.is_some()
+        || namespace.facts != 0
+        || store.get_merged_symbol(raw) != Some(symbol)
+        || !flags.intersects(SymbolFlags::MODULE)
+        || name_node.kind != SyntaxKind::Identifier
+        || name_node.flags.0 != 0
+        || name_node.parent != Some(declaration.node)
+        || !matches!(&name_node.data, NodeData::Identifier(name)
+            if name.flow_node.is_none()
+                && owner.name().as_utf8() == Some(name.text.as_str()))
+        || body_node.parent != Some(declaration.node)
+        || body_node.range.start < name_node.range.end
+        || body_node.range.end > node.range.end
+        || !matches!(&body_node.data,
+            NodeData::ModuleBlock(block) if body_node.kind == SyntaxKind::ModuleBlock
+                && body_node.flags.0 == 0 && block.facts == 0
+                && !block.statements.has_trailing_comma)
+            && !matches!(&body_node.data,
+                NodeData::ModuleDeclaration(_) if body_node.kind == SyntaxKind::ModuleDeclaration)
+    {
+        return Err(invalid());
+    }
+    if let Some(modifiers) = &namespace.modifiers {
+        if modifiers.flags.0 != 0 || modifiers.list.has_trailing_comma {
+            return Err(invalid());
+        }
+        let mut exported = false;
+        let mut declared = false;
+        for &modifier in &modifiers.list.nodes {
+            let modifier = NodeRef::new(declaration.arena, declaration.file, modifier);
+            let token = preflight_node(store, host, modifier)?;
+            if token.parent != Some(declaration.node)
+                || token.flags.0 != 0
+                || !matches!(token.data, NodeData::Token(_))
+            {
+                return Err(invalid());
+            }
+            match token.kind {
+                SyntaxKind::ExportKeyword if !exported && !declared => exported = true,
+                SyntaxKind::DeclareKeyword if !declared => declared = true,
+                _ => return Err(invalid()),
+            }
+        }
+    }
+    if node.parent != Some(bound.source_file().node)
+        || bound
+            .source_facts()
+            .is_some_and(|facts| facts.is_external_module())
+    {
+        plan_global_value_augmentation(store, host, symbol, declaration, declaration)?;
+    } else {
+        let source = preflight_node(store, host, bound.source_file())?;
+        if !matches!(&source.data, NodeData::SourceFile(source)
+            if source.statements.nodes.iter().filter(|&&node| node == declaration.node).count() == 1)
+            || bound.local_symbol(declaration).is_some()
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(flags)
 }
 
 #[allow(clippy::too_many_lines)] // Variable syntax and its script or augmentation edge are inseparable.
@@ -582,7 +695,7 @@ fn plan_global_variable_declaration(
             .source_facts()
             .is_some_and(|facts| facts.is_external_module())
     {
-        plan_global_variable_augmentation(store, host, symbol, declaration, statement)?;
+        plan_global_value_augmentation(store, host, symbol, declaration, statement)?;
     } else {
         let source = preflight_node(store, host, bound.source_file())?;
         if statement_node.parent != Some(bound.source_file().node)
@@ -601,7 +714,7 @@ fn plan_global_variable_declaration(
 }
 
 #[allow(clippy::too_many_lines)] // The raw export, local placeholder and global merge are distinct owners.
-fn plan_global_variable_augmentation(
+fn plan_global_value_augmentation(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
@@ -656,19 +769,23 @@ fn plan_global_variable_augmentation(
                 && bound.local_symbol(candidate) == Some(local)
         })
         .collect::<Vec<_>>();
-    let raw_value = raw_declarations
+    let raw_flags = raw_record.flags();
+    let allowed_flags = SymbolFlags::VARIABLE
+        | SymbolFlags::INTERFACE
+        | SymbolFlags::MODULE
+        | SymbolFlags::CONST_ENUM_ONLY_MODULE;
+    let local_flags = if raw_flags.intersects(SymbolFlags::VALUE) {
+        SymbolFlags::EXPORT_VALUE
+    } else {
+        SymbolFlags::NONE
+    };
+    let namespaces = declarations
         .iter()
         .copied()
-        .find(|&node| store.source_node_kind(node) == Some(SyntaxKind::VariableDeclaration));
-    let raw_flags = SymbolFlags::FUNCTION_SCOPED_VARIABLE
-        | if raw_declarations
-            .iter()
-            .any(|&node| store.source_node_kind(node) == Some(SyntaxKind::InterfaceDeclaration))
-        {
-            SymbolFlags::INTERFACE
-        } else {
-            SymbolFlags::NONE
-        };
+        .filter(|&declaration| {
+            store.source_node_kind(declaration) == Some(SyntaxKind::ModuleDeclaration)
+        })
+        .collect::<Vec<_>>();
     if block_node.kind != SyntaxKind::ModuleBlock
         || block_data
             .statements
@@ -700,22 +817,27 @@ fn plan_global_variable_augmentation(
             != Some(raw)
         || raw == symbol
         || store.get_merged_symbol(raw) != Some(symbol)
-        || raw_record.flags() != raw_flags
+        || raw_flags.without(allowed_flags) != SymbolFlags::NONE
+        || !store.source_raw_symbol_declarations_match(raw)
+        || !store.source_symbol_export_table_matches(raw)
         || raw_record.check_flags() != CheckFlags::NONE
         || raw_record.name() != owner.name()
         || raw_record.declarations() != Some(raw_declarations.as_slice())
-        || raw_record.value_declaration() != raw_value
         || raw_record
             .parent()
             .and_then(|parent| store.get_merged_symbol(parent))
             != Some(namespace)
         || raw_record.exports().is_some()
+            && (namespaces.is_empty()
+                || store
+                    .validate_source_merged_namespace_exports(symbol, &namespaces)
+                    .is_none())
         || raw_record.export_symbol().is_some()
         || !raw_flags.contains(SymbolFlags::INTERFACE) && raw_record.members().is_some()
         || local == raw
         || local == symbol
         || store.get_merged_symbol(local) != Some(local)
-        || local_record.flags() != SymbolFlags::EXPORT_VALUE
+        || local_record.flags() != local_flags
         || local_record.check_flags() != CheckFlags::NONE
         || local_record.name() != owner.name()
         || local_declarations != raw_declarations
