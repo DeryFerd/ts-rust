@@ -199,7 +199,13 @@ fn zero_argument_class_conditions_keep_calls_branches_diagnostics_and_replay() {
                 .unwrap()
                 .type_checked
         );
-        let flag_call = call_nodes(&parsed, "needsFlag").0;
+        let flag_access = call_nodes(&parsed, "needsFlag").1;
+        let NodeData::PropertyAccessExpression(access) =
+            &parsed.arena.get(flag_access.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let flag_name = node(&parsed, access.name);
         if invalid {
             let branch_returns = parsed
                 .arena
@@ -218,7 +224,7 @@ fn zero_argument_class_conditions_keep_calls_branches_diagnostics_and_replay() {
             for (code, site) in [
                 (2322, branch_returns[0]),
                 (2322, branch_returns[1]),
-                (2554, flag_call),
+                (2554, flag_name),
             ] {
                 let matches = diagnostics
                     .iter()
