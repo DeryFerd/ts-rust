@@ -17,6 +17,13 @@ const FILE: FileId = FileId::new(202_605);
 // privateIdentifierPropertyAccessDestructuringAssignmentES6.ts still needs its
 // private object field, destructuring assignment, and imported-helper checks.
 fn context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
+    context_with_module(parsed, CanonicalModuleState::Script)
+}
+
+fn context_with_module(
+    parsed: &ParseResult,
+    module: CanonicalModuleState,
+) -> CanonicalCheckerContext<'_> {
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let mut binder = CanonicalBinder::new();
     binder
@@ -28,7 +35,7 @@ fn context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
                 EscapedName::source("\"/project/class-method-annotations.ts\""),
                 CanonicalSourceLanguage::TypeScript,
                 false,
-                CanonicalModuleState::Script,
+                module,
             ),
         )
         .unwrap();
@@ -759,5 +766,130 @@ fn method_object_annotations_keep_generic_identities_and_optional_rest_boundarie
             assert!(context.store().value_symbol_links(owner).is_none());
             assert!(context.diagnostics().is_empty());
         }
+    }
+}
+
+#[test]
+fn exported_generic_method_void_annotations_keep_local_and_export_owners() {
+    let parsed = parse_source_file(
+        "export class Receiver { read<T>(source: { value: T }): void {} }",
+    );
+    let method = method(&parsed, "read");
+    let NodeData::MethodDeclaration(data) =
+        &parsed.arena.get(method.declaration.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let [formal] = data.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+        panic!("the method must keep its one formal")
+    };
+    let formal_node = reference(&parsed, *formal);
+    let return_annotation = reference(&parsed, data.type_.unwrap());
+    assert_eq!(parsed.arena.get(*formal).unwrap().parent, Some(method.declaration.node));
+    assert_eq!(parsed.arena.get(return_annotation.node).unwrap().kind, SyntaxKind::VoidKeyword);
+
+    for query_first in [false, true] {
+        let mut context = context_with_module(&parsed, CanonicalModuleState::External);
+        let exported = symbol(&context, method.class);
+        let method_owner = symbol(&context, method.declaration);
+        let formal_symbol = symbol(&context, formal_node);
+        let bound = context.file(FILE).unwrap().1;
+        let local = context.store().get_merged_symbol(bound.local_symbol(method.class).unwrap()).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let assert_owners = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            assert_ne!(local, exported);
+            assert_eq!(store.symbol(local).unwrap().flags(), SymbolFlags::EXPORT_VALUE);
+            assert_eq!(store.symbol(local).unwrap().export_symbol(), Some(exported));
+            assert_eq!(store.symbol(local).unwrap().declarations(), Some(&[method.class][..]));
+            assert_eq!(store.symbol(exported).unwrap().declarations(), Some(&[method.class][..]));
+            assert_eq!(store.symbol(exported).unwrap().parent(), Some(module));
+            assert_eq!(
+                store.symbol_table(store.symbol(module).unwrap().exports().unwrap())
+                    .unwrap().get(EscapedName::source("Receiver").as_ref()),
+                Some(exported),
+            );
+            assert_eq!(store.symbol(method_owner).unwrap().parent(), Some(exported));
+            assert_eq!(store.symbol(formal_symbol).unwrap().parent(), None);
+            let locals = context.file(FILE).unwrap().1.locals(method.declaration).unwrap();
+            assert_eq!(
+                store.symbol_table(locals).unwrap()
+                    .get(store.symbol(formal_symbol).unwrap().name()),
+                Some(formal_symbol),
+            );
+        };
+        assert_owners(&context);
+        assert!(context.store().declared_type_links(formal_symbol).is_none());
+        assert!(context.store().signature_links(method.declaration).is_none());
+        let early = query_first.then(|| context.get_type_from_type_node(method.annotation).unwrap());
+        context.check_source_file(FILE).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let formal = assert_generic_annotation_formal(&mut context, formal_node);
+        let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+        assert_eq!(context.get_type_from_type_node(return_annotation), Ok(void));
+        let parameter = assert_generic_annotation_property(&mut context, &parsed, &method, formal);
+        if let Some(early) = early {
+            assert_eq!(parameter, early);
+        }
+        let identity = assert_generic_annotation_signature(&mut context, &method, formal, parameter, void);
+        assert_replay(&mut context, &parsed);
+        assert_owners(&context);
+        assert_eq!(assert_generic_annotation_formal(&mut context, formal_node), formal);
+        assert_eq!(context.get_type_from_type_node(return_annotation), Ok(void));
+        assert_eq!(assert_generic_annotation_property(&mut context, &parsed, &method, formal), parameter);
+        assert_eq!(assert_generic_annotation_signature(&mut context, &method, formal, parameter, void), identity);
+    }
+}
+
+#[test]
+fn exported_generic_method_void_body_reports_an_assignment_error() {
+    let source = "export class Receiver { read<T>(source: { value: T }): void { const wrong: string = 1; } }";
+    let parsed = parse_source_file(source);
+    let method = method(&parsed, "read");
+    let NodeData::MethodDeclaration(data) =
+        &parsed.arena.get(method.declaration.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let [formal] = data.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+        panic!("the method must keep its one formal")
+    };
+    let formal_node = reference(&parsed, *formal);
+    let return_annotation = reference(&parsed, data.type_.unwrap());
+    for query_first in [false, true] {
+        let mut context = context_with_module(&parsed, CanonicalModuleState::External);
+        let early = query_first.then(|| context.get_type_from_type_node(method.annotation).unwrap());
+        context.check_source_file(FILE).unwrap();
+        let [error] = context.diagnostics().as_slice() else {
+            panic!("one assignment error: {:?}", context.diagnostics())
+        };
+        assert_eq!(error.diagnostic.code(), 2322);
+        assert_eq!(
+            error.diagnostic.render().unwrap(),
+            "Type 'number' is not assignable to type 'string'."
+        );
+        let node = error.node.unwrap();
+        assert_eq!(node.file, FILE);
+        let range = parsed.arena.get(node.node).unwrap().range;
+        assert_eq!(range.start.get() as usize, source.find("wrong").unwrap());
+        assert_eq!(range.end.get() - range.start.get(), 5);
+        assert!(error.range_override.is_none());
+        assert!(error.related_information.is_empty());
+        assert!(error.diagnostic.details.is_empty());
+        let formal = assert_generic_annotation_formal(&mut context, formal_node);
+        let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+        assert_eq!(context.get_type_from_type_node(return_annotation), Ok(void));
+        let parameter = assert_generic_annotation_property(&mut context, &parsed, &method, formal);
+        if let Some(early) = early {
+            assert_eq!(parameter, early);
+        }
+        let identity =
+            assert_generic_annotation_signature(&mut context, &method, formal, parameter, void);
+        assert_replay(&mut context, &parsed);
+        assert_eq!(assert_generic_annotation_formal(&mut context, formal_node), formal);
+        assert_eq!(
+            assert_generic_annotation_signature(&mut context, &method, formal, parameter, void),
+            identity
+        );
     }
 }
