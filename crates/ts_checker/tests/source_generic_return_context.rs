@@ -444,3 +444,128 @@ fn generic_union_return_context_keeps_argument_literal_identity_and_replays() {
         }
     }
 }
+
+#[test]
+fn generic_return_context_fills_a_formal_without_argument_candidates() {
+    let parsed = parse_source_file(concat!(
+        "function empty<T>(): T | undefined { return undefined; }\n",
+        "const contextual: string | undefined = empty();\n",
+        "const plain = empty();\n",
+    ));
+    let declaration = named(&parsed, "empty");
+    let NodeData::FunctionDeclaration(function) = &parsed.arena.get(declaration.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    assert!(function.parameters.nodes.is_empty());
+    let [formal_node] = function.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+        panic!("expected one real generic formal")
+    };
+    let formal_node = node(&parsed, *formal_node);
+    assert_eq!(
+        parsed.arena.get(formal_node.node).unwrap().parent,
+        Some(declaration.node)
+    );
+    let calls = ["contextual", "plain"].map(|name| {
+        let variable = named(&parsed, name);
+        let NodeData::VariableDeclaration(data) = &parsed.arena.get(variable.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let expression = node(&parsed, data.initializer.unwrap());
+        let record = parsed.arena.get(expression.node).unwrap();
+        assert_eq!(record.parent, Some(variable.node));
+        let NodeData::CallExpression(call) = &record.data else {
+            panic!("expected the actual initializer call")
+        };
+        assert!(call.arguments.nodes.is_empty());
+        assert!(call.type_arguments.is_none());
+        (variable, expression, data.type_.map(|id| node(&parsed, id)))
+    });
+    assert!(calls[0].2.is_some());
+    assert!(calls[1].2.is_none());
+    for call_first in [false, true] {
+        let mut context = context(&parsed);
+        if call_first {
+            context.get_type_at_location(calls[0].1).unwrap();
+        }
+        context.check_source_file(FILE).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let formal_owner = symbol(&context, formal_node);
+        let formal = context.get_declared_type_of_symbol(formal_owner).unwrap();
+        let record = context.store().type_payload(formal).unwrap();
+        assert_eq!(record.flags(), TypeFlags::TYPE_PARAMETER);
+        assert_eq!(record.symbol(), Some(formal_owner));
+        assert_eq!(
+            context.store().symbol(formal_owner).unwrap().declarations(),
+            Some([formal_node].as_slice())
+        );
+        let source_signature = signature(&context, declaration);
+        let record = context.store().signature(source_signature).unwrap();
+        assert_eq!(record.declaration(), Some(declaration));
+        assert_eq!(record.type_parameters(), [formal]);
+        assert!(record.parameters().is_empty());
+        assert_eq!(record.min_argument_count(), 0);
+        assert_eq!(record.this_parameter(), None);
+        assert!(!record.has_rest_parameter());
+        assert_eq!(record.target(), None);
+        assert_eq!(record.mapper(), None);
+        let template = context
+            .get_return_type_of_signature(source_signature)
+            .unwrap();
+        assert_union(&context, template, formal);
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (string, unknown) = (bootstrap.string_type, bootstrap.unknown_type);
+        let contextual = context
+            .get_type_from_type_node(calls[0].2.unwrap())
+            .unwrap();
+        assert_union(&context, contextual, string);
+        let observe = |context: &mut CanonicalCheckerContext<'_>| {
+            calls.map(|(variable, expression, annotation)| {
+                let (argument, expected) = if annotation.is_some() {
+                    (string, contextual)
+                } else {
+                    (unknown, unknown)
+                };
+                assert_eq!(context.get_type_at_location(expression), Ok(expected));
+                let selected = signature(context, expression);
+                assert_ne!(selected, source_signature);
+                let record = context.store().signature(selected).unwrap();
+                assert_eq!(record.declaration(), Some(declaration));
+                assert_eq!(record.target(), Some(source_signature));
+                assert!(record.type_parameters().is_empty());
+                assert!(record.parameters().is_empty());
+                assert_eq!(record.min_argument_count(), 0);
+                assert_eq!(record.this_parameter(), None);
+                assert!(!record.has_rest_parameter());
+                assert_eq!(
+                    context.store().map_type(record.mapper().unwrap(), formal),
+                    Some(argument)
+                );
+                assert_eq!(context.get_return_type_of_signature(selected), Ok(expected));
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(symbol(context, variable))
+                        .unwrap()
+                        .resolved_type,
+                    Some(expected)
+                );
+                (selected, expected)
+            })
+        };
+        let selected = observe(&mut context);
+        assert_ne!(selected[0].0, selected[1].0);
+        let cold = snapshot(&context, &parsed);
+        for recheck in [false, true, true] {
+            if recheck {
+                context.recheck_source_file(FILE).unwrap();
+            } else {
+                context.check_source_file(FILE).unwrap();
+            }
+            assert_eq!(observe(&mut context), selected);
+            assert!(context.diagnostics().is_empty());
+            assert_eq!(snapshot(&context, &parsed), cold);
+        }
+    }
+}
