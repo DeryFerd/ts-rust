@@ -38905,7 +38905,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .type_arguments
             .as_ref()
             .is_some_and(|arguments| !arguments.nodes.is_empty())
-            || planner.resolve_uncached_type_reference_symbol(node)? != header.owner_symbol()
+            || planner.resolve_source_query_reference_symbol(node)? != header.owner_symbol()
         {
             return Ok(());
         }
