@@ -3664,6 +3664,42 @@ impl SourceFlowPlan {
         captured_assignments: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
         captured_array_mutations: impl IntoIterator<Item = SourceFlowCapturedArrayMutation>,
         nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+    ) -> Result<Self, SourceFlowError> {
+        Self::preflight_linear_with_element_assignments(
+            arena,
+            bound,
+            store,
+            host,
+            container,
+            points,
+            conditions,
+            assignments,
+            parameter_assignments,
+            calls,
+            logical_statements,
+            captured_assignments,
+            captured_array_mutations,
+            nullish_assignments,
+            [],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_linear_with_element_assignments(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        container: NodeRef,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceTruthinessCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+        logical_statements: impl IntoIterator<Item = SourceLinearLogicalStatementSyntax>,
+        captured_assignments: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
+        captured_array_mutations: impl IntoIterator<Item = SourceFlowCapturedArrayMutation>,
+        nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
         element_assignments: impl IntoIterator<Item = SourceElementAssignmentProof>,
     ) -> Result<Self, SourceFlowError> {
         Self::preflight_linear_effects(
@@ -16434,6 +16470,7 @@ mod tests {
             updates: HashMap::new(),
             nullish_assignments: HashMap::new(),
             member_assignments: HashMap::new(),
+            element_assignments: HashMap::new(),
             nullish_calls: HashMap::new(),
         };
         let without_payload = FlowNode::new(FlowFlags::START);

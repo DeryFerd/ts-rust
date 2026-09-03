@@ -19044,8 +19044,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let flow = if !nullish.is_empty() || !element_assignments.is_empty() {
-            SourceFlowPlan::preflight_linear_with_nullish_assignments(
+        let flow = if !element_assignments.is_empty() {
+            SourceFlowPlan::preflight_linear_with_element_assignments(
                 self.arena,
                 self.bound,
                 store,
@@ -19066,6 +19066,28 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 captured_array_mutations.iter().copied(),
                 nullish,
                 element_assignments,
+            )
+        } else if !nullish.is_empty() {
+            SourceFlowPlan::preflight_linear_with_nullish_assignments(
+                self.arena,
+                self.bound,
+                store,
+                host,
+                callable.declaration,
+                points,
+                conditions,
+                assignments,
+                parameter_assignments,
+                calls.chain(nullish_calls),
+                logical_statements,
+                statements.iter().filter_map(|statement| match statement {
+                    PlannedLinearFunctionStatement::CapturedAssignment(assignment) => {
+                        Some(assignment.flow)
+                    }
+                    _ => None,
+                }),
+                captured_array_mutations.iter().copied(),
+                nullish,
             )
         } else if has_captured_assignment || !captured_array_mutations.is_empty() {
             SourceFlowPlan::preflight_linear_with_conditions_and_captured_effects(
