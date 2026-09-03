@@ -1,6 +1,6 @@
 # Query core member resolution
 
-Updated 2026-09-03. This is the next implementation task, not a completed fix.
+Updated 2026-09-03. The focused behavior passes. Integration remains rejected.
 Root is the only implementer. One reviewer checks the change. Use the existing
 `query-core-integration` branch. Do not start another feature branch.
 
@@ -10,49 +10,59 @@ Complete the shared class/interface member operation. It must retain member
 symbols before it reads named member types. It must resolve inherited members
 with the actual type arguments, `this` type and source query context.
 
-The [new test baseline](../target/query-core-merged-members-baseline-5-result.md)
-is committed as `37179715d`. Both tests compile and fail at the actual `Emitter`
-base reference. Pinned Go passes the positive fixture and reports exactly
-TS2322 for the separate negative fixture. The assertions after Rust's failure
-have not executed. The fixture does not yet cover Query's import/alias route.
+The [complete tests](../target/query-core-source-member-operation-2-result.md)
+now pass at checkpoint `5a1882c5d`, built on the earlier owner and Pending/Resolved
+changes. Both source-first and query-first cases retain actual inherited types,
+default arguments, class properties, method identity and stable replay. The
+negative case reports the exact TS2322 diagnostic. The unused generic method
+remains unresolved. Pinned Go agrees on both unchanged TypeScript inputs.
+The fixture does not cover all of Query's import and alias paths.
 
-Query's last unchanged run still completes only 2 of 23 isolated roots.
-Ordinary project checking does not complete. There is no new Query gain.
+The [full regression selection](../target/query-core-source-member-operation-regression-2-result.md)
+loses 54 previous checker passes. It retains 6,272 of 6,326 previous integration
+passes and adds the two passing member tests. Against the accepted compiler,
+5,765 of 6,055 passes remain, 277 fail and 13 exact names are absent. The batch
+is rejected. No expectation change is approved.
 
-The first [implementation checkpoint](../target/query-core-merged-members-implementation-3-result.md),
-`af2597745`, compiles but is not accepted. Both complete tests still fail.
-The [new Query run](../target/query-core-merged-members-query-1-result.md) has
-the same 244 checking records as the previous run. Do not add more base
-admission rules before changing the shared member-value state below.
-
-The [pending-value checkpoint](../target/query-core-pending-members-3-result.md),
-`d86970236`, changes that shared state and compiles. Both complete tests still
-fail. Its [unchanged Query run](../target/query-core-pending-members-query-1-result.md)
-has no changed checking record or completed-root gain. Nothing is accepted.
-
-The draft retains names and canonical formals, keeps Pending distinct from
-Resolved, and uses the existing signature publisher. The reviewer checked the
-new state transitions. Missing checks for value links, formal ownership,
-signature identity, readonly flags and Pending original symbols were repaired.
-This does not prove full behavior. The final positive, negative and replay
-assertions still have not executed.
+[Unchanged Query](../target/query-core-source-member-operation-query-2-result.md)
+still completes only 2 of 23 isolated roots. Ordinary checking no longer stops
+at the unread Node `send` method. It fails at a void annotation instead. No
+additional root completes and diagnostics remain unchanged. This is not a demo.
 
 ## Current dependency path
 
-The earlier eager generic-base call in `plan_interface` now uses the shared name
-plan. That exposes an inconsistent namespace-local owner proof. The actual
-`Emitter` group contains a class. `canonical.rs::declare_module_member` gives
-its local symbol `EXPORT_VALUE`, since the class has value meaning. But
-`declared_namespace_type_parent` recognizes this marker only for an interface
-merged with a variable. It expects `NONE` for a class/interface group.
-`InvalidInterfaceSymbol` then becomes the misleading `MissingDeclarations` error.
+The local export-owner mismatch is repaired. The shared proof derives
+`EXPORT_VALUE` from the actual declarations that share the local symbol. It
+does not infer the local marker from the final merged owner's flags. File and
+namespace exports use the same proof. Nonambient const-enum-only modules retain
+the binder's value-export meaning.
 
-Derive the local marker from the actual declarations that share that local
-symbol. Do not use the final merged owner's flags alone. A value contribution
-in another namespace block can share the exported owner without sharing the
-same local placeholder. Retain exact local declaration order, export identity,
-name and parent checks. Check the file-export helper as part of this change.
-It still assumes a single type-only local declaration.
+The source member operation now connects ambient global reads, nongeneric
+inherited lookup and applied generic bases. It retains names before demanding
+one member value. That exposed failures in existing consumers and validators.
+Repair these failures before advancing Query's next stopping point.
+
+1. Restore base-state validation. The new `generic_member_names` return in
+   `execute_declared_type_worker` skips the old lazy DOM route's checks for
+   stored heritage provenance and partial base/member state. Authenticate that
+   state before returning or publishing identity. Keep legitimate warm state.
+   Do not clear caches or copy a cold-only rejection into every request.
+2. Trace the inherited callable and property failures through the shared name,
+   value and proxy states. Start with the existing public cases in
+   `source_interface_heritage`, `native_merged_interface_bases` and
+   `merged_global_interfaces`. Preserve their full cold, warm and caller-context
+   checks. A names-complete table must not imply values-complete state.
+3. Recheck all 54 newly lost names and both new complete member tests. Then run
+   the full accepted selections. Every earlier accepted loss also stays open.
+4. Rerun unchanged Query. Its current void failure needs bounded metadata for
+   the rejecting reader, ownership role, plan membership and cache fields. The
+   keyword planner, executor and cache readers already support void. Do not
+   add another syntax admission rule.
+
+The negative DOM test's exact private corruption is not visible in the log.
+The missing production validation is proved, but attribution to that mutation
+is not. Do not change its expectation. No private test body or held Query source
+body was read.
 
 The rest of the same operation remains open:
 
@@ -61,11 +71,12 @@ The rest of the same operation remains open:
 - Complete computed names through their real key publisher. The new name planner
   currently reports them as unsupported.
 - Complete the class base-constructor state and argument counts described below.
-- Connect nongeneric inherited consumers, including Query's `Process` annotation,
-  to the same name-first operation. Keep full declaration checking separate.
+- Keep full source declaration checks separate from lazy consumer lookup. The
+  current routes remain separate, but changed cache expectations need concrete
+  pinned-Go evidence before any test change.
 
 No further worker is needed for this dependency path. Keep one implementer and
-one reviewer. Rerun the complete tests and unchanged Query after completing it.
+one reviewer. Do not promote the checkpoint while any regression is unresolved.
 
 ## What the source comparison established
 
@@ -85,11 +96,10 @@ Rust already has the merged identity operation. `declared.rs::preflight_class_pl
 collects the actual class and interface formals. Its declared-type dispatcher
 chooses class identity first. Reuse this implementation.
 
-The missing work is downstream. Current default planning excludes merged class
-owners. Interface heritage has no general class-instance base path. Both the
-selected interface method planner and selected class method planner exclude
-the merged generic owner. Changing only the global-read guard cannot fix these
-callers.
+The checkpoint adds merged-owner defaults and the measured class/interface
+instance-base path. General runtime class bases and selected class methods
+remain unfinished. The shared member operation also has the regression gaps
+listed above. Changing only the global-read guard does not finish these callers.
 
 ## Implementation
 
@@ -197,7 +207,7 @@ diagnostic changes and whether ordinary checking completes. The small fixture
 does not replace this check, especially for imports and aliases.
 
 Before promotion, run the accepted regression selections and compare every
-old passing name and diagnostic record. The current 253 failures, 13 absent
+old passing name and diagnostic record. The current 277 failures, 13 absent
 names and changed corpus records remain open blockers. New passes do not offset
 them. Do not change an accepted expectation without concrete pinned-Go evidence.
 

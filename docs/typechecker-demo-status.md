@@ -10,68 +10,60 @@ check. All earlier worker runs have closed. Root owns the integration branch
 
 ## Latest checkpoint
 
-The [pending-member draft](../target/query-core-pending-members-3-result.md)
-is saved as unaccepted integration checkpoint `d86970236`. Implementation and
-test code compile. Both complete tests still fail at the actual merged `Emitter`
-declaration. No final type, diagnostic or replay assertion has passed. The
-Go-checked TypeScript inputs are unchanged.
+The shared-member work is saved as signed, unaccepted checkpoint `5a1882c5d`.
+Both [complete member tests now pass](../target/query-core-source-member-operation-2-result.md).
+They check source-first and query-first reads, actual inherited types, class
+members, defaulted arguments, method identity, the exact TS2322 diagnostic,
+unread method state and stable replay. Their Go-checked inputs are unchanged.
 
-The draft separates Pending and Resolved named values. It retains source names
-and exact formal symbols, uses the existing declaration publisher, keeps proxy
-mapping stable, and checks readonly and signature state on replay. The reviewer
-found missing checks for named value links, formal ownership, signature identity,
-readonly flags and Pending original symbols. Those checks are now in the draft.
-Class methods, computed names, class-base state and nongeneric consumers remain
-unfinished. This is not complete member resolution.
+The [complete regression selection](../target/query-core-source-member-operation-regression-2-result.md)
+rejects this batch. It loses 54 previous checker passes: 46 library tests and
+eight public tests. It retains 6,272 of the previous integration's 6,326 passes.
+Both added tests pass. Compiler and fixture outcomes are unchanged.
 
-The current `MissingDeclarations` error does not mean source declarations are
-absent. The namespace-local group includes a class, so the binder marks its local
-symbol `EXPORT_VALUE`. The shared interface helper expects `NONE` and rejects it.
-The next fix must derive this marker from the actual local declaration group,
-while retaining the declaration, export and parent checks. Keep this work in the
-same shared member operation.
+| Current selection | Pass | Fail |
+| --- | ---: | ---: |
+| Checker library | 5,020 | 417 |
+| Public checker tests | 695 | 40 |
+| Compiler | 297 | 0 |
+| Fixture library, binaries and integrations | 262 | 4 |
+| Total | 6,274 | 461 |
 
-The [base-resolution repair](../target/query-core-base-resolution-repair-1-result.md)
-is committed on the integration branch as `031420b74`. The complete diagnostic
-selection now finishes without a process crash. A bounded native backtrace
-identified repeated generic target and base resolution in
-`conditionalTypeSimplification.ts`. The repair follows Go's separation of
-target identity, base publication and later heritage constraint checks.
-The full schema tests still fail. This is not conditional-type acceptance.
+Against the last accepted compiler, 5,765 of 6,055 passes remain. There are
+277 failures, 13 absent exact names and no unrun harnesses. This adds 24 accepted
+losses. Every loss is listed in the [exact comparison](../target/query-core-source-member-operation-regression-2-comparison.json).
+Causes are not all known. None is accepted as a normal inherited failure.
+The comparison covers the combined changes since the last complete selection,
+not only the latest commit.
 
-In that earlier full regression run, all 6,325 previous integration passes
-remained. No full regression selection ran on `d86970236`. Against the
-accepted compiler, counts are unchanged: 5,789 of 6,055 passes retained,
-253 failures and 13 absent exact names. Every loss remains a promotion blocker.
-One debug-order assertion now passes, which is not a proved semantic gain.
+The reviewer found a real missing check. The new identity return bypasses the
+old lazy DOM route's checks for stored heritage provenance and partial base/member
+state. A negative test now accepts forged DOM base data. The omitted check is
+proved, but the log does not identify that test's exact corruption. Other losses
+include inherited callable types and nongeneric inherited properties. These
+shared paths must be repaired before more Query feature work.
 
-The [complete corpus comparison](../target/query-core-base-resolution-repair-1-corpus-result.md)
-retains 400 of 423 previously exact diagnostic records. There are 23 changed
-exact records and 12 fatal records. One changed record keeps an exact status
-but has a different diagnostic path. These results remain blocked. The previous
-integration run aborted, so this comparison cannot attribute all losses to the
-new repair. All 95 type/symbol variant rows match baseline 2. Accepted retention
-stays at 57 of 60 diagnostic records, 52 of 55 type metadata rows and 58 of 62
-symbol metadata rows. Metadata equality does not independently prove rendered
-payload parity.
+[Unchanged Query on the exact regression tree](../target/query-core-source-member-operation-query-2-result.md)
+still completes 2 of 23 isolated roots. Ordinary checking fails. The member
+operation clears the unread `send` method rejection in Node's declarations,
+then fails at a `VoidKeyword` in `timeoutManager.ts`. Void is already supported.
+The next diagnosis needs the rejecting ownership or cache guard, not another
+keyword rule. Three checking records changed in the first member-operation
+run. All 244 records match its fresh rerun. Diagnostics and input graph remain
+unchanged. No complete root or exact diagnostic is gained.
 
-[Unchanged Query](../target/query-core-pending-members-query-1-result.md)
-still completes 2 of 23 isolated roots. Ordinary checking does not complete.
-All 244 checking records, outcomes, diagnostics and graph data match the
-previous shared-member run. The new build took 113 seconds and the census
-took 18.735 seconds.
-The earlier caller observation still identifies full global-annotation
-preflight as the rejecting path. The base needs merged generic class/interface
-handling, not only an interface-heritage guard change.
+The corpus was not rerun on this rejected batch. Its [last complete comparison](../target/query-core-base-resolution-repair-1-corpus-result.md)
+retains 400 of 423 old exact diagnostic records, with 23 changed records and
+12 fatal records. Those losses remain blockers. Earlier type/symbol metadata
+results are not fresh passes or full rendered-payload parity for this tree.
 
-All runtime checks are closed. The preserved six-file reference-flow draft
-remains uncommitted. No expectation changed, and nothing was promoted to the
-accepted compiler. One implementer and one reviewer remain the work model.
+All runtime checks are closed. The measured file bytes are unchanged after the
+commit. The older six-file reference-flow draft remains separate and uncommitted.
+No expectation changed, and nothing was promoted to the accepted compiler.
 
-Next, finish the [shared declared-value and inherited-member operation](query-core-member-resolution.md)
-with its real source context, base substitutions and state. Do not add the
-isolated conditional admission follow-up. Keep every regression open until it
-is repaired or has concrete pinned-Go evidence for a changed contract.
+Next, repair all 54 newly lost passes in the [shared member operation](query-core-member-resolution.md).
+Keep both complete new tests passing. Then rerun the regression selection and
+unchanged Query. Do not add another feature branch or isolated admission rule.
 
 ## Previous implementation checkpoint
 
@@ -194,10 +186,11 @@ project has gained a complete isolated root in the latest comparisons.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
-| Query, pending-member draft | 2 of 23 isolated roots complete | All 244 checking records unchanged. Both complete member tests still fail. Nothing promoted |
+| Query, source-member checkpoint | 2 of 23 isolated roots complete | Unread Node method rejection cleared. Ordinary check now fails a void annotation invariant. Diagnostics unchanged |
+| Complete merged-member tests | 2 pass, 0 fail | Positive, exact negative diagnostic, source/query order and replay all pass |
 | Query, base-resolution repair | 2 of 23 isolated roots complete | All 244 checking records unchanged. Ordinary checking remains unsupported |
 | Full diagnostic corpus | 511 variants completed. 400 of 423 old exact records retained | Process crash fixed. 23 old exact records changed and 12 fatal records block promotion |
-| Current accepted test selection | 5,789 old passes retained, 253 fail, 13 absent | All 6,325 previous integration passes retained. No accepted loss cleared |
+| Current accepted test selection | 5,765 old passes retained, 277 fail, 13 absent | 54 previous integration passes lost, including 24 accepted passes. Batch rejected |
 | Query, merged variable-and-namespace repair | 2 of 23 isolated roots complete | Ownership error cleared. Ordinary checking stops at a method signature in process.d.ts. All diagnostics unchanged |
 | Variable-and-namespace tests | Library 5,065 pass, 372 fail. Public 40 pass, 6 fail | All three new cases pass. All 5,087 first-run passes retained. Existing failures still block promotion |
 | Query, reference-flow draft | 2 of 23 isolated roots complete | Ordinary checking fails with SymbolNotOwned. All diagnostic records remain unchanged |

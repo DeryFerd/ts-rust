@@ -21,19 +21,17 @@ Use the existing `query-core-integration` branch in
 `target/worktrees/query-hono-project-integration-2`. Reuse the current build
 target, `target/worktrees/next-core-build-1`. Root owns both. The candidate is not
 accepted, and no pending feature branch joins automatically.
-The last committed integration checkpoint is `37179715d`, the Go-checked
-merged-member behavior tests. Both complete tests still fail at the merged
-generic base. The last production change is `031420b74`, the reviewed generic
-base-resolution crash repair. The full diagnostic selection now completes,
-but the full schema tests remain red. A separate reference-flow draft still
-changes six files in that worktree. It is not committed or promoted. Query still
-does not complete. Its latest result and regression losses are in the status
-document. The accepted compiler remains unchanged.
+The last integration checkpoint is `5a1882c5d`. Both complete, Go-checked
+merged-member tests now pass, but the regression selection loses 54 previous
+checker passes. The checkpoint is rejected for promotion. Repair those losses
+before more Query feature work. A separate reference-flow draft still changes
+six files in that worktree. It is not committed or promoted. Query still does
+not complete. The accepted compiler remains unchanged.
 
 The [next shared member-resolution task](query-core-member-resolution.md)
 records the exact Go order, reusable Rust identity code, default/base/member
-gaps and caller changes. Start implementation there. Do not repeat a broad
-source audit or add another isolated admission rule.
+gaps, caller changes and current regression repair order. Continue there.
+Do not repeat a broad source audit or add another isolated admission rule.
 
 ### Regression baseline
 
@@ -108,11 +106,17 @@ row matches baseline 2, including its old losses. None of these results permits
 promotion. The previous diagnostic run aborted, so the new complete loss list
 does not establish which batch caused each loss.
 
-Return to the shared Query operation below, with every regression still open.
-The next implementation must carry the merged generic class/interface base,
-real source context, substitutions and member state. Do not add the separate
-conditional alias admission patch. Full conditional method-return support
-also needs source-aware evaluation and replay, not only a wider validator.
+The [latest complete selection](../target/query-core-source-member-operation-regression-2-result.md)
+at `5a1882c5d` plus the unchanged reference-flow draft retains 5,765 accepted
+passes, loses 277 and has 13 absent names. It loses 54 passes from the previous
+integration selection, including 24 accepted passes. Both new complete member
+tests pass. Compiler and fixture outcomes are unchanged. Every new and old loss
+remains a promotion blocker. No expectation changed. The corpus was not rerun
+on this rejected batch, and its earlier losses remain open.
+
+Repair the shared member-state validation and inherited callable paths first.
+Do not add the separate conditional alias admission patch. Full conditional
+method-return support also needs source-aware evaluation and replay.
 
 ### Work loop
 
