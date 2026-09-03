@@ -143,11 +143,11 @@ struct Nodes {
 fn nodes(consumer: &ParseResult, provider: &ParseResult, runtime: bool) -> Nodes {
     let (binding, binding_name, expression) = variable(consumer, "normalize");
     let (_, _, call) = variable(consumer, "result");
-    let NodeData::VariableDeclaration(variable) = &consumer.arena.get(binding.node).unwrap().data
+    let NodeData::VariableDeclaration(variable_data) = &consumer.arena.get(binding.node).unwrap().data
     else {
         unreachable!();
     };
-    let query = NodeRef::new(consumer.arena.id(), CONSUMER, variable.type_.unwrap());
+    let query = NodeRef::new(consumer.arena.id(), CONSUMER, variable_data.type_.unwrap());
     assert_eq!(
         consumer.arena.get(query.node).unwrap().parent,
         Some(binding.node)
