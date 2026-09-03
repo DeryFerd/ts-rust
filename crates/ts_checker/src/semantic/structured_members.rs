@@ -513,7 +513,8 @@ pub(super) fn distinct_later_interface_base_is_supported(
         && store.symbol(symbol).is_some_and(|owner| {
             (owner.flags() == SymbolFlags::INTERFACE
                 || authenticated_nongeneric_global_interface_owner(store, symbol))
-                && owner.members() == interface.declared_members
+                && (owner.members() == interface.declared_members
+                    || valid_declared_member_table(store, symbol, interface.declared_members))
         })
         && (valid_thisless_interface_identity(interface) || reference_identity)
         && interface.base_types_resolved
