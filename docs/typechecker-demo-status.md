@@ -9,26 +9,29 @@ project has gained a complete isolated root in the latest comparisons.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
-| Query, combined census 38 | 1 of 23 isolated roots complete | Regressed from 2. Six roots now hit a call invariant |
+| Query, combined census 41 | 2 of 23 isolated roots complete | Restored the lost root and cleared six call invariants. No gain against census 36 |
 | Query, separate repairs 37 and 40 | 2 of 23 isolated roots complete | Later first errors, no additional complete roots |
 | Hono, census 25 | 33 of 188 isolated roots complete | No complete-root gains. One new internal call error |
-| Focused tests, run 56 | 191 pass, 32 fail | Four new cases pass, but three old passes are lost |
-| Checker library, run 56 | 5,062 pass, 375 fail | Two more old passes are lost against run 54 |
+| Return-context repair, six public targets | 19 pass, 0 fail | All three lost public passes restored |
+| Checker library, return-context repair | 5,064 pass, 373 fail | Both lost library passes restored. Every outcome matches run 54 |
 
 An isolated root is one original entry file checked on its own. These counts
 are not full-project passes or percentages of TypeScript support.
 
-[Query 38](../target/wave202-query-combined-census-38-result.md) loses the
-previously complete `subscribable.ts`. Its `.bind(this)` call also blocks five
-dependent roots. The new return-context inference rejects the valid alias-owned
-conditional return in the real library overload. The repair is in progress.
-Ordinary checking still stops in `timeoutManager.ts`.
+[Query 41](../target/wave202-query-combined-census-41-result.md) restores
+`subscribable.ts`, lost in Query 38. The six `.bind(this)` call invariants are
+gone. The other five affected roots return to their earlier unsupported errors.
+All 23 raw diagnostic records match Query 36, and 22 full root outcomes match.
+The remaining `utils.ts` outcome differs but is still unsupported. Ordinary
+checking still stops in `timeoutManager.ts`. This is a regression recovery,
+not a new complete root against the earlier best result.
 
 [Query 37](../target/wave202-query-combined-census-37-result.md) gets five roots
 past the shared heritage error and stops at a later method in `timeoutManager.ts`.
 [Query 40](../target/wave202-query-combined-census-40-result.md) checks the real
 `replaceAt<T>` body, then stops at the following class. Both repairs branch from
-the earlier combined candidate. Neither proves that the Query 38 regression is fixed.
+the earlier combined candidate. Their changes still need combined verification
+with the Query 41 repair.
 
 [Hono 25](../target/wave202-hono-combined-census-25-result.md) keeps the same
 33 complete roots. Ordinary checking still fails in `http-exception.ts`.
@@ -36,12 +39,13 @@ The new `basic-auth` call failure is in `Promise.all`. Its special call path
 rejects valid merged library declarations. That repair is separate from the
 ordinary-check property-context repair.
 
-[Tests 56](../target/wave202-query-hono-combined-tests-56-result.md) executes all
-5,437 library cases and 223 public cases. Its five lost passes include the
-three class bind/returned-arrow cases and two identity-call cache cases.
-Against the older accepted set of 4,839 library names, 4,596 now pass, 233 fail,
-and 10 exact names are absent. Name continuity does not prove unchanged test bodies.
-No new source candidate is accepted.
+[The return-context repair](../target/wave202-query-return-context-repair-1-result.md)
+restores all five passes lost in Tests 56. All 5,437 library outcomes match
+Tests 54 exactly. All 19 selected public tests pass, including the new control
+that requires return-context inference when arguments supply no type candidate.
+Against the older accepted set of 4,839 library names, 4,598 pass, 231 fail,
+and 10 exact names are absent. The remaining library failures and original
+corpus regressions still prevent acceptance of this candidate.
 
 The [original corpus checks](../target/wave202-measured-core-corpus-1-result.md)
 also reject the earlier combined candidate `b4fe2618`. Its diagnostic selection aborts with a stack
@@ -51,28 +55,36 @@ cases and gains three others. It also has two supported mismatches.
 
 ## Current work
 
-- Restore Query's five lost tests and the real bind call. Preserve working
-  return-context inference. The reviewed source and new control are committed.
-  Their combined test gate is running, followed by the unchanged Query census.
+- Combine the verified Query 41 repair, indexed writes, merged-interface cache
+  validation, and TS6504 path handling in one new candidate. One writer owns
+  the integration tree and one reviewer checks the complete combined change.
+  No new production candidate is accepted.
 - Diagnose the later method error from Query 37. The remaining new-test failure
   comes from replay omitting three explicit relation queries. The correction
   repeats those same queries and keeps the complete snapshot assertion.
   Query 42's observation locates the method failure in keyword-only union
-  parameter checking. General canonical union annotation support is in progress.
+  parameter checking. General canonical union annotation support is committed.
+  Its full library and 24 public cases are running before Query 43.
 - Hono's property-context repair passes all three public tests. Its full library
   run has 5,065 passes and 372 failures. [Hono ordinary 6](../target/wave202-hono-ordinary-6-result.md)
   gets past the missing-member error, then fails cached-type validation in
   `http-exception.ts`. Its log identifies the array-capability query and the
-  current `Response` owner. The inner failing condition is still under diagnosis.
+  current `Response` owner. Source inspection identifies a constructor reader
+  that drops the query context needed by conditional interface bases. The next
+  repair must retain that context through final validation. It is not tested yet.
 - Repair merged Promise call authentication. The test must keep the original
   inline call's exact tuple result. An array-only result is not a substitute.
-- Keep optional-call testing separate until its full cases pass. The generic
-  indexed-write repair passes both complete tests and moves one real project stop.
+- Keep optional-call testing separate until its full cases pass. Its observation
+  run confirms that callback validation rejects a cold Promise receiver after
+  accepting the callback's actual owner and mapper. The next repair reuses the
+  existing selected-method proof for that cold state. All current tests stay fixed.
 - The corpus crash is isolated to `conditionalTypeSimplification.ts`. The first
   lazy-reference repair compiles. The original fixture now returns an unsupported
   generic reference instead of aborting, and both full-feature tests still fail.
   Its library comparison also loses six passes and gains one. The repair remains
-  incomplete, with every original expectation retained.
+  incomplete, with every original expectation retained. The follow-up restores
+  shared base demand and checks written constraints after base publication.
+  Its source review is in progress, with no new test result yet.
 - The TS6504 root-path repair passes all 312 selected compiler tests. Its
   [unchanged semantic selection](../target/wave202-root-javascript-semantic-1-result.md)
   has 61 exact matches instead of 60. All other full records are unchanged.
