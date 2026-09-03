@@ -2187,7 +2187,10 @@ impl SourceClassAnnotationTypeImportPlan {
                     .source_child_with_kind(self.member, SyntaxKind::Identifier)
                     .ok_or_else(invalid)?;
                 if self.holder != self.member
-                    || store.source_node_kind(self.member) != Some(SyntaxKind::PropertySignature)
+                    || !matches!(
+                        store.source_node_kind(self.member),
+                        Some(SyntaxKind::PropertySignature | SyntaxKind::PropertyDeclaration)
+                    )
                     || store.source_direct_type_annotation(self.member) != Some(self.root())
                     || member.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::PROPERTY
                     || member.check_flags() != CheckFlags::NONE
@@ -2377,7 +2380,10 @@ pub(super) fn plan_source_class_annotation_type_import(
         let owner_kind = checked_node(arena, bound, store, declaration)?.kind;
         if !matches!(
             (member_kind, owner_kind),
-            (SyntaxKind::PropertySignature, SyntaxKind::InterfaceDeclaration)
+            (
+                SyntaxKind::PropertySignature | SyntaxKind::PropertyDeclaration,
+                SyntaxKind::InterfaceDeclaration,
+            )
                 | (
                     SyntaxKind::PropertyDeclaration | SyntaxKind::Constructor,
                     SyntaxKind::ClassDeclaration,
