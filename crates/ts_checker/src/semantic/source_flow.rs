@@ -843,7 +843,7 @@ impl SourceFlowCondition {
 
     const fn symbol(self) -> Option<SemanticSymbolId> {
         Some(match self {
-            Self::ClassExpression(_) => unreachable!("class expression conditions need preflight"),
+            Self::ClassExpression(_) => panic!("class expression conditions need preflight"),
             Self::Unchanged(_)
             | Self::ClassPropertyTruthiness(_)
             | Self::ClassPropertyEquality(_)
