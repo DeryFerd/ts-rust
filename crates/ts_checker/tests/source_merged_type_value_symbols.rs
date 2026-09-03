@@ -218,7 +218,7 @@ fn assert_queries(
         let name = child(parsed, pair.body, query.expr_name);
         assert_eq!(
             context.get_symbol_at_location(name),
-            Ok(Some(pair.resolved))
+            Ok(Some(pair.owner))
         );
         assert_eq!(
             context
