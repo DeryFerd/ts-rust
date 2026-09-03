@@ -9,21 +9,28 @@ project has gained a complete isolated root in the latest comparisons.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
-| Query core, census 27 | 2 of 23 isolated roots complete | No gain or loss. Two cache files reach later alias errors |
-| Hono, last complete census 22 | 33 of 188 isolated roots complete | New ordinary check identifies the failing Buffer lookup |
-| Focused tests, run 46 | 161 pass, 20 fail | One unchanged test recovered, no lost passes, two corrected cases now pass |
+| Query core, census 28 | 2 of 23 isolated roots complete | No gain or loss. Five files reach one later call failure |
+| Hono, last complete census 22 | 33 of 188 isolated roots complete | Ordinary check 3 clears Buffer ownership, then fails an object-type comparison |
+| Focused tests, run 48 | 165 pass, 19 fail | Two unchanged JWT tests recovered, no pass lost. One new callback test passes |
 | Checker library, run 5 | 5,072 pass, 365 fail | Three recoveries since run 3, no pass lost |
 
 An isolated root is one original entry file checked on its own. These counts
 are not full-project passes or percentages of TypeScript support.
 
-[Query 27](../target/wave202-query-combined-census-27-result.md) completed all
+[Query 28](../target/wave202-query-combined-census-28-result.md) completed all
 244 records and 23 root attempts. Only `index.ts` and `subscribable.ts` complete.
 The ordinary project check still rejects the class in `timeoutManager.ts`.
-The `mutationCache.ts` and `queryCache.ts` errors changed from imported type
-references to alias resolution. Those are later failures, not recovered files.
-The other 21 outcomes match Query 26. The census took 14.683 seconds.
+Five roots, `mutation.ts`, `mutationCache.ts`, `query.ts`, `queryCache.ts` and
+`removable.ts`, now reach one unsupported call in `removable.ts` instead of
+alias-resolution failures. Those are later failures, not recovered files.
+The other 18 outcomes match Query 27. The census took 15.157 seconds.
 The original project inputs, options and libraries stayed fixed.
+
+[Tests 48](../target/wave202-query-hono-combined-tests-48-result.md) ran all
+184 cases in 69 targets. Both original JWT cases recovered without test changes.
+No old pass was lost. The new imported-callback test also passes. The 183
+unchanged cases have 164 passes and 19 failures. Compilation took 2m05s.
+Tests 48 and Query 28 use `c0153e05b95d37f72e33fc9e3698a05a9e584736`.
 
 [Tests 46](../target/wave202-query-hono-combined-tests-46-result.md) compiled
 all 66 targets and ran all 181 cases. The imported generic-class interface
@@ -37,8 +44,18 @@ The symbol corrections follow the pinned Go implementation. Public queries
 return the export owner. Internal lexical caches retain their local symbol.
 These corrections do not erase the two measured failures in Tests 45.
 
+[Tests 47](../target/wave202-query-hono-combined-tests-47-result.md) ran all
+183 cases in 68 targets. All 181 earlier outcomes match Tests 46. The new global
+augmentation ownership test passes. The new intersection-property test fails
+an unused-branch cache assertion after source checking. The Rust and pinned Go
+implementations both check the written branch during source checking, even when
+the conditional result uses the other branch. A separate test-only correction
+is committed but unrun. It is not included in run 48 or counted as a checker gain.
+Compilation took 2m07s with four build jobs.
+
 Tests 46 and Query 27 use `4a3796f4ecf12a10e048100520bca42b76b1a7b3`.
-Neither result accepts that source batch. The last accepted primary source
+Tests 47 uses `a2b7b5fb9a3feea95353944b3164a81e447eb766`.
+None of these results accepts the source batch. The last accepted primary source
 remains `8f4943ac`, whose code matches the measured `5c7c7bd2` checkpoint.
 
 ## Why the demo has not advanced
@@ -51,37 +68,56 @@ Parallel source work has also outpaced integration and project validation.
 Worker count and commit count are not evidence that Query or Hono works.
 The current priority is the errors returned by the unchanged real projects.
 
-Slow feedback added to this delay. The latest
-[Hono ordinary check](../target/wave202-hono-origin-timing-observation-2-result.md)
-still fails with `SymbolNotOwned`, but now names `Buffer` and the exact
-`owner.parent().is_some()` guard. It took 140.565 seconds, compared with
-1427.890 seconds before. Source, diagnostics, optimization, job count and target
-all changed, so that difference cannot be assigned to one cause. No new full
-Hono census ran. The failed construction still returns no complete input identity.
+Slow feedback added to this delay. Earlier Hono ordinary checks took about
+24 minutes. The latest checks take about 2.5 minutes. Source, diagnostics,
+optimization, job count and target changed, so this difference does not isolate
+a cause. No new full Hono census ran.
+
+[Hono ordinary check 3](../target/wave202-hono-ordinary-3-result.md) clears
+the `Buffer` ownership failure. It now returns `R01.RELATION`, an unsupported
+object-type comparison, in `http-exception.ts`. The type's identity is not yet
+known. The build took 1m57s and the ordinary check took 154.069 seconds.
+The failed check still returns no complete graph, input identity or replay.
+This is a cleared first failure, not a complete file or project pass.
 
 ## Current work and next checks
 
-The next batch has three production changes, plus focused new tests:
-
-- Route augmentation-owned globals through the existing source-owner checks.
-  The reviewed Buffer fix keeps all canonical identity checks and the
-  parentless requirement for script-owned globals. It is committed but unrun.
-- Preserve closed function references after a return resolves to `Promise<void>`.
-  This addresses the measured Hono `Next` callback failure.
-- Accept validated union, `keyof`, and nongeneric conditional property forms
-  through the existing intersection evaluator. This addresses a Set library
-  type dependency. It is not yet a complete Set pass.
+Tests 47 includes the Buffer ownership fix, closed Promise-reference support,
+and intersection-property forms. Only the new ownership test passes. No existing
+Promise or Set case recovered. Hono ordinary check 3 used that same source and
+completed without a root census. Its next relation failure is under review.
 
 The Buffer change follows the pinned Go rule that a global augmentation can
 retain its module parent. A separate public test checks the real global table
 and retained ownership. This change does not add every augmentation value query.
 
-Two Query investigations run alongside that integration. One will identify
-the exact producer of the class heritage rejection. It uses a bounded temporary
-record, without changing the error or reading held project source. The other
-traces the two new cache-file alias failures. Neither is a completed repair.
+Run 48 measured two more reviewed production fixes:
 
-The next test and Hono ordinary runs will use four Cargo build jobs with the
+- Query callback checks now decline imported aliases before demanding their
+  target values. The two affected checks only support local variables and
+  parameters. Normal import checking remains unchanged. A new focused callback
+  test includes a real type error and repeated checks, and passes. Five real
+  Query roots now reach the later shared call failure.
+- Hono's cached interface query now uses the existing validated alias resolver.
+  The two JWT cases previously completed their initial checks, then failed on
+  repeated checking. This one-call-site fix preserves their original tests.
+  Both tests now pass.
+
+Run 48 and Query census 28 used separate build targets in parallel. Both are
+closed. Source acceptance remains separate from these feedback checks.
+
+The next diagnosis pairs cover the shared Query call, Hono's object comparison,
+and the later errors in the existing async-function and Set tests. Each pair has
+one owner and one reviewer. These tasks address measured failures. The work
+must preserve the real project inputs and existing tests.
+
+The [Query class trace](../target/wave202-query-heritage-origin-1-result.md)
+located the final heritage rejection in the implementation-target check.
+The next small observation is committed. It will distinguish a self-target from
+rejected symbol flags. Its runtime is not released. The real project error
+remains unchanged. No held source body was read.
+
+The test and project feedback runs now use four Cargo build jobs with the
 same optimization level, assertions, overflow checks and memory limits.
 A [compile-only comparison](../target/wave202-opt1-four-job-feedback-1-result.md)
 built all 66 targets in 121.0 seconds, compared with 194.9 seconds with two jobs.
