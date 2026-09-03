@@ -3036,6 +3036,7 @@ pub(super) fn plan_source_class_members_with_imports(
                             SyntaxKind::PropertyAccessExpression
                                 | SyntaxKind::ArrowFunction
                                 | SyntaxKind::NewExpression
+                                | SyntaxKind::NonNullExpression
                                 | SyntaxKind::Identifier
                                 | SyntaxKind::NullKeyword
                                 | SyntaxKind::TrueKeyword
@@ -16304,6 +16305,7 @@ fn plan_property_with_body_mode(
                 NodeData::PropertyAccessExpression(_)
                 | NodeData::ArrowFunction(_)
                 | NodeData::NewExpression(_)
+                | NodeData::NonNullExpression(_)
                     if source_body && merged_auto_accessor.is_none() =>
                 {
                     None
@@ -16467,6 +16469,7 @@ fn plan_property_with_body_mode(
                 NodeData::PropertyAccessExpression(_)
                 | NodeData::ArrowFunction(_)
                 | NodeData::NewExpression(_)
+                | NodeData::NonNullExpression(_)
                     if source_body && merged_auto_accessor.is_none() =>
                 {
                     (None, None, None, None)

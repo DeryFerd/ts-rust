@@ -36956,6 +36956,13 @@ fn non_null_expression_type(
     let record = store
         .type_payload(type_)
         .ok_or(RelationUnavailable::Type(type_))?;
+    // These types need the full NonNullable query, not just nullable-leaf removal.
+    if record
+        .flags()
+        .intersects(TypeFlags::INSTANTIABLE | TypeFlags::INTERSECTION)
+    {
+        return Err(RelationUnavailable::UnsupportedStructuredType(type_).into());
+    }
     if record.flags().intersects(TypeFlags::UNKNOWN) {
         return Ok(unknown_empty_object);
     }
@@ -36974,6 +36981,9 @@ fn non_null_expression_type(
             .type_payload(*constituent)
             .map(TypeRecord::flags)
             .ok_or(RelationUnavailable::Type(*constituent))?;
+        if flags.intersects(TypeFlags::INSTANTIABLE | TypeFlags::INTERSECTION) {
+            return Err(RelationUnavailable::UnsupportedStructuredType(*constituent).into());
+        }
         if !flags.intersects(TypeFlags::NULLABLE | TypeFlags::VOID) {
             retained.push(*constituent);
         }
