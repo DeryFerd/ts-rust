@@ -16094,6 +16094,7 @@ mod tests {
         let container = NodeRef::new(arena.id(), file, NodeId::new(1));
         let start = FlowRef::new(arena.id(), file, FlowNodeId(3));
         let mut plan = SourceFlowPlan {
+            class_expression_conditions: HashMap::new(),
             container,
             start_container: container,
             start,
