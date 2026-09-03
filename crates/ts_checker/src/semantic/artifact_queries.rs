@@ -541,7 +541,10 @@ impl CanonicalCheckerContext<'_> {
             )
             && let Some(symbol) = self.cached_artifact_symbol(node)?
         {
-            if matches!(parent, None | Some(LocationParent::ElementAccess(_))) {
+            if matches!(
+                parent,
+                None | Some(LocationParent::ElementAccess(_) | LocationParent::TypeQuery(_))
+            ) {
                 return self.expression_export_artifact_symbol(node, symbol).map(Some);
             }
             return Ok(Some(symbol));
@@ -633,7 +636,9 @@ impl CanonicalCheckerContext<'_> {
             }
             Some(LocationParent::TypeQuery(query)) => {
                 self.get_type_from_type_node(query)?;
-                self.cached_artifact_symbol(node)
+                self.cached_artifact_symbol(node)?
+                    .map(|symbol| self.expression_export_artifact_symbol(node, symbol))
+                    .transpose()
             }
             Some(
                 LocationParent::PropertyAccess(access) | LocationParent::ElementAccess(access),
@@ -2297,7 +2302,14 @@ impl CanonicalCheckerContext<'_> {
         };
         let (_, _, parent) =
             self.validated_artifact_node(NodeRef::new(node.arena, node.file, parent))?;
-        if is_type_syntax(&parent.data)
+        let direct_type_query_name = record.kind == SyntaxKind::Identifier
+            && parent.kind == SyntaxKind::TypeQuery
+            && matches!(
+                &parent.data,
+                NodeData::TypeQueryNode(query)
+                    if query.expr_name == node.node && query.type_arguments.is_none()
+            );
+        if is_type_syntax(&parent.data) && !direct_type_query_name
             || matches!(
                 parent.data,
                 NodeData::QualifiedName(_)
