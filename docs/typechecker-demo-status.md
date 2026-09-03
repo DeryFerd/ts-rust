@@ -10,17 +10,26 @@ check. All earlier worker runs have closed. Root owns the integration branch
 
 ## Latest checkpoint
 
-The [shared member draft](../target/query-core-merged-members-implementation-3-result.md)
-is saved as unaccepted integration checkpoint `af2597745`. Implementation and
-test code compile. Both complete tests still fail, now at the actual merged
-`Emitter` interface declaration. No final type, diagnostic or replay assertion
-has passed. The Go-checked TypeScript inputs are unchanged.
+The [pending-member draft](../target/query-core-pending-members-3-result.md)
+is saved as unaccepted integration checkpoint `d86970236`. Implementation and
+test code compile. Both complete tests still fail at the actual merged `Emitter`
+declaration. No final type, diagnostic or replay assertion has passed. The
+Go-checked TypeScript inputs are unchanged.
 
-The draft preserves merge order and canonical formals, shares default planning,
-and keeps the selected method caller's source context. The pending member-value
-operation is not implemented. The reviewer also found four unfinished class-base
-paths. The next change must update shared state and its callers together, not
-add another exception for the current rejected declaration.
+The draft separates Pending and Resolved named values. It retains source names
+and exact formal symbols, uses the existing declaration publisher, keeps proxy
+mapping stable, and checks readonly and signature state on replay. The reviewer
+found missing checks for named value links, formal ownership, signature identity,
+readonly flags and Pending original symbols. Those checks are now in the draft.
+Class methods, computed names, class-base state and nongeneric consumers remain
+unfinished. This is not complete member resolution.
+
+The current `MissingDeclarations` error does not mean source declarations are
+absent. The namespace-local group includes a class, so the binder marks its local
+symbol `EXPORT_VALUE`. The shared interface helper expects `NONE` and rejects it.
+The next fix must derive this marker from the actual local declaration group,
+while retaining the declaration, export and parent checks. Keep this work in the
+same shared member operation.
 
 The [base-resolution repair](../target/query-core-base-resolution-repair-1-result.md)
 is committed on the integration branch as `031420b74`. The complete diagnostic
@@ -31,7 +40,7 @@ target identity, base publication and later heritage constraint checks.
 The full schema tests still fail. This is not conditional-type acceptance.
 
 In that earlier full regression run, all 6,325 previous integration passes
-remained. No full regression selection ran on `af2597745`. Against the
+remained. No full regression selection ran on `d86970236`. Against the
 accepted compiler, counts are unchanged: 5,789 of 6,055 passes retained,
 253 failures and 13 absent exact names. Every loss remains a promotion blocker.
 One debug-order assertion now passes, which is not a proved semantic gain.
@@ -46,11 +55,11 @@ stays at 57 of 60 diagnostic records, 52 of 55 type metadata rows and 58 of 62
 symbol metadata rows. Metadata equality does not independently prove rendered
 payload parity.
 
-[Unchanged Query](../target/query-core-merged-members-query-1-result.md)
+[Unchanged Query](../target/query-core-pending-members-query-1-result.md)
 still completes 2 of 23 isolated roots. Ordinary checking does not complete.
 All 244 checking records, outcomes, diagnostics and graph data match the
-previous base-resolution run. The new build took 114 seconds and the census
-took 18.604 seconds.
+previous shared-member run. The new build took 113 seconds and the census
+took 18.735 seconds.
 The earlier caller observation still identifies full global-annotation
 preflight as the rejecting path. The base needs merged generic class/interface
 handling, not only an interface-heritage guard change.
@@ -59,7 +68,7 @@ All runtime checks are closed. The preserved six-file reference-flow draft
 remains uncommitted. No expectation changed, and nothing was promoted to the
 accepted compiler. One implementer and one reviewer remain the work model.
 
-Next, implement the [shared declared-value and inherited-member operation](query-core-member-resolution.md)
+Next, finish the [shared declared-value and inherited-member operation](query-core-member-resolution.md)
 with its real source context, base substitutions and state. Do not add the
 isolated conditional admission follow-up. Keep every regression open until it
 is repaired or has concrete pinned-Go evidence for a changed contract.
@@ -185,6 +194,7 @@ project has gained a complete isolated root in the latest comparisons.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
+| Query, pending-member draft | 2 of 23 isolated roots complete | All 244 checking records unchanged. Both complete member tests still fail. Nothing promoted |
 | Query, base-resolution repair | 2 of 23 isolated roots complete | All 244 checking records unchanged. Ordinary checking remains unsupported |
 | Full diagnostic corpus | 511 variants completed. 400 of 423 old exact records retained | Process crash fixed. 23 old exact records changed and 12 fatal records block promotion |
 | Current accepted test selection | 5,789 old passes retained, 253 fail, 13 absent | All 6,325 previous integration passes retained. No accepted loss cleared |

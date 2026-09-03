@@ -25,6 +25,48 @@ The [new Query run](../target/query-core-merged-members-query-1-result.md) has
 the same 244 checking records as the previous run. Do not add more base
 admission rules before changing the shared member-value state below.
 
+The [pending-value checkpoint](../target/query-core-pending-members-3-result.md),
+`d86970236`, changes that shared state and compiles. Both complete tests still
+fail. Its [unchanged Query run](../target/query-core-pending-members-query-1-result.md)
+has no changed checking record or completed-root gain. Nothing is accepted.
+
+The draft retains names and canonical formals, keeps Pending distinct from
+Resolved, and uses the existing signature publisher. The reviewer checked the
+new state transitions. Missing checks for value links, formal ownership,
+signature identity, readonly flags and Pending original symbols were repaired.
+This does not prove full behavior. The final positive, negative and replay
+assertions still have not executed.
+
+## Current dependency path
+
+The earlier eager generic-base call in `plan_interface` now uses the shared name
+plan. That exposes an inconsistent namespace-local owner proof. The actual
+`Emitter` group contains a class. `canonical.rs::declare_module_member` gives
+its local symbol `EXPORT_VALUE`, since the class has value meaning. But
+`declared_namespace_type_parent` recognizes this marker only for an interface
+merged with a variable. It expects `NONE` for a class/interface group.
+`InvalidInterfaceSymbol` then becomes the misleading `MissingDeclarations` error.
+
+Derive the local marker from the actual declarations that share that local
+symbol. Do not use the final merged owner's flags alone. A value contribution
+in another namespace block can share the exported owner without sharing the
+same local placeholder. Retain exact local declaration order, export identity,
+name and parent checks. Check the file-export helper as part of this change.
+It still assumes a single type-only local declaration.
+
+The rest of the same operation remains open:
+
+- Resolve class methods through their existing source method proof. Do not send
+  a `MethodDeclaration` through a validator limited to `MethodSignature`.
+- Complete computed names through their real key publisher. The new name planner
+  currently reports them as unsupported.
+- Complete the class base-constructor state and argument counts described below.
+- Connect nongeneric inherited consumers, including Query's `Process` annotation,
+  to the same name-first operation. Keep full declaration checking separate.
+
+No further worker is needed for this dependency path. Keep one implementer and
+one reviewer. Rerun the complete tests and unchanged Query after completing it.
+
 ## What the source comparison established
 
 The Go checkout is pinned to `dc37b5249ab60e2bbce936f71b883e6c8136167e`.
