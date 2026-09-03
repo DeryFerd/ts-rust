@@ -10132,6 +10132,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.plan.lazy_property_alias_leaf(self.store, node)?,
                 Some(LazyPropertyAliasLeaf::Ready(_))
             )
+            && !self.plan.functions.get(&node).is_some_and(|function| {
+                record.kind == SyntaxKind::FunctionType
+                    && function.node == node
+                    && function.alias_symbol.is_some()
+                    && !function.alias_parameters.is_empty()
+                    && matches!(
+                        functions::function_type_state(self.store, function, false),
+                        Ok(functions::FunctionTypeState::Resolved { type_, .. })
+                            if links.and_then(|links| links.resolved_type) == Some(type_)
+                    )
+            })
         {
             return Err(invalid());
         }
