@@ -36956,11 +36956,17 @@ fn non_null_expression_type(
     let record = store
         .type_payload(type_)
         .ok_or(RelationUnavailable::Type(type_))?;
+    let flags = record.flags();
+    let is_known_non_nullable = |type_: TypeId, flags: TypeFlags| {
+        flags.intersects(TypeFlags::DEFINITELY_NON_NULLABLE)
+            || flags == TypeFlags::INDEX
+                && super::keyof_types::validate_generic_keyof_index_type(store, type_).is_ok()
+    };
+    if is_known_non_nullable(type_, flags) {
+        return Ok(type_);
+    }
     // These types need the full NonNullable query, not just nullable-leaf removal.
-    if record
-        .flags()
-        .intersects(TypeFlags::INSTANTIABLE | TypeFlags::INTERSECTION)
-    {
+    if flags.intersects(TypeFlags::INSTANTIABLE | TypeFlags::INTERSECTION) {
         return Err(RelationUnavailable::UnsupportedStructuredType(type_).into());
     }
     if record.flags().intersects(TypeFlags::UNKNOWN) {
@@ -36981,7 +36987,9 @@ fn non_null_expression_type(
             .type_payload(*constituent)
             .map(TypeRecord::flags)
             .ok_or(RelationUnavailable::Type(*constituent))?;
-        if flags.intersects(TypeFlags::INSTANTIABLE | TypeFlags::INTERSECTION) {
+        if !is_known_non_nullable(*constituent, flags)
+            && flags.intersects(TypeFlags::INSTANTIABLE | TypeFlags::INTERSECTION)
+        {
             return Err(RelationUnavailable::UnsupportedStructuredType(*constituent).into());
         }
         if !flags.intersects(TypeFlags::NULLABLE | TypeFlags::VOID) {
