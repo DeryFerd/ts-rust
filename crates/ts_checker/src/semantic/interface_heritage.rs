@@ -1672,6 +1672,48 @@ pub(super) fn source_interface_alias_base_state(
     let Some(type_) = cached else {
         return Ok(SourceInterfaceAliasBaseState::Pending { edges, conditional });
     };
+    validate_source_interface_alias_cached_type(store, request, type_, array_targets)?;
+    edges.push(type_);
+    if store
+        .type_alias_links(request.symbol)
+        .and_then(|links| links.declared_type)
+        != Some(type_)
+    {
+        return Ok(SourceInterfaceAliasBaseState::Pending { edges, conditional });
+    }
+    Ok(SourceInterfaceAliasBaseState::Ready { type_, edges })
+}
+
+/// A warm identity query can restore query proofs, but not missing alias caches.
+pub(super) fn validate_source_interface_alias_cached_result(
+    store: &CanonicalTypeMapperStore,
+    request: &SourceInterfaceAliasBaseRequest,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Result<(), DeclaredTypeError> {
+    let invalid = || source_heritage_error(request.rhs);
+    let (cached, _, _) = source_alias_base_metadata(store, request, array_targets, query)?;
+    let type_ = cached.ok_or_else(invalid)?;
+    if request.reference.is_none() {
+        if store
+            .type_alias_links(request.symbol)
+            .and_then(|links| links.declared_type)
+            != Some(type_)
+        {
+            return Err(invalid());
+        }
+        validate_source_interface_alias_cached_type(store, request, type_, array_targets)?;
+    }
+    Ok(())
+}
+
+fn validate_source_interface_alias_cached_type(
+    store: &CanonicalTypeMapperStore,
+    request: &SourceInterfaceAliasBaseRequest,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), DeclaredTypeError> {
+    let invalid = || source_heritage_error(request.rhs);
     if !matches!(
         super::object_members::validate_resolved_declared_property_object(store, type_),
         super::object_members::DeclaredPropertyObjectValidation::Valid(
@@ -1689,15 +1731,7 @@ pub(super) fn source_interface_alias_base_state(
         None => store.validate_cached_array_capability(type_),
     }
     .map_err(|_| invalid())?;
-    edges.push(type_);
-    if store
-        .type_alias_links(request.symbol)
-        .and_then(|links| links.declared_type)
-        != Some(type_)
-    {
-        return Ok(SourceInterfaceAliasBaseState::Pending { edges, conditional });
-    }
-    Ok(SourceInterfaceAliasBaseState::Ready { type_, edges })
+    Ok(())
 }
 
 /// Replays the canonical alias cache with the source formals in declaration order.

@@ -38982,10 +38982,24 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             arrays,
             Some(&context.heritage()),
         )?;
+        self.prepare_pending_source_interface_aliases(receiver, &header)
+    }
+
+    // Replay missing query-local proofs through the existing guarded alias demand.
+    fn prepare_pending_source_interface_aliases(
+        &mut self,
+        receiver: TypeId,
+        header: &super::interface_heritage::SourceInterfaceHeritageHeader,
+    ) -> Result<(), DeclaredTypeError> {
+        let arrays = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types);
+        let context = self.source_query_context()?;
         for base in
             super::interface_heritage::effective_source_interface_heritage_bases_with_query_context(
                 self.store,
-                &header,
+                header,
                 arrays,
                 Some(&context.heritage()),
             )?
@@ -44769,6 +44783,28 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 for request in header.bases().iter().filter_map(|base| base.alias()) {
                     self.get_declared_type_of_symbol(request.symbol())?;
                 }
+            } else if matches!(self.store.type_payload(identity).map(|record| record.data()),
+                Some(TypeData::Interface(interface)) if interface.base_types_resolved)
+            {
+                // Validate every published alias before replay can fill any cache.
+                for request in header.bases().iter().filter_map(|base| base.alias()) {
+                    super::interface_heritage::validate_source_interface_alias_cached_result(
+                        self.store,
+                        request,
+                        arrays,
+                        Some(&context.heritage()),
+                    )
+                    .map_err(|_| {
+                        DeclaredTypeError::Unavailable(
+                            DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                                symbol,
+                                declared_type: identity,
+                            },
+                        )
+                    })?;
+                }
+                // Warm base validation needs current proofs, not new member resolution.
+                self.prepare_pending_source_interface_aliases(identity, &header)?;
             }
         }
         // A declared identity does not demand the interface's member annotations.
