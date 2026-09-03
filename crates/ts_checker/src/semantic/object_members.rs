@@ -1026,6 +1026,24 @@ fn resolve_instantiated_object_property_by_key_with_source(
         return resolve_object_property_by_key(store, Some(global_types), receiver, name, session)
             .map_err(Into::into);
     }
+    if let Some(method) = super::instantiated_members::selected_generic_interface_method_source(
+        store,
+        receiver,
+        name,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+    )
+    .map_err(|error| source_generic_member_error(receiver, &error))?
+    {
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .prepare_generic_interface_method_callback_returns(receiver, method)?;
+    }
     let members = resolve_members_with_array_targets_and_session(
         store,
         receiver,

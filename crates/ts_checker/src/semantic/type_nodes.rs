@@ -40286,12 +40286,34 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         self.complete_type_query(result, &plan, &mut prepared)
     }
 
+    /// Reads selected callback returns before the method mapper needs their types.
+    pub(super) fn prepare_generic_interface_method_callback_returns(
+        &mut self,
+        receiver: TypeId,
+        method: SemanticSymbolId,
+    ) -> Result<(), super::SourceCheckError> {
+        if self.global_types.is_none() || self.instantiation_session.is_none() {
+            return Err(type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery).into());
+        }
+        let pending = super::instantiated_members::pending_generic_interface_callback_returns(
+            self.store,
+            receiver,
+            method,
+        )
+        .map_err(|error| object_members::source_generic_member_error(receiver, &error))?;
+        for signature in pending {
+            self.get_return_type_of_signature(signature)?;
+        }
+        Ok(())
+    }
+
     /// Specializes a published method with this source query's capabilities and limits.
     pub(super) fn get_type_of_instantiated_interface_method(
         &mut self,
         receiver: TypeId,
         method: SemanticSymbolId,
     ) -> Result<TypeId, super::SourceCheckError> {
+        self.prepare_generic_interface_method_callback_returns(receiver, method)?;
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery);
         let globals = self.global_types.clone().ok_or_else(invalid)?;
         let session = self
@@ -40323,15 +40345,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ) -> Result<TypeId, super::SourceCheckError> {
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery);
         let globals = self.global_types.clone().ok_or_else(invalid)?;
-        let session = self
-            .instantiation_session
-            .as_deref_mut()
-            .ok_or_else(invalid)?;
         let method = self
             .store
             .value_symbol_links(property)
             .and_then(|links| links.target)
             .unwrap_or(property);
+        self.prepare_generic_interface_method_callback_returns(receiver, method)?;
+        let session = self
+            .instantiation_session
+            .as_deref_mut()
+            .ok_or_else(invalid)?;
         let mut source = MethodConditionalBranchSource {
             host: self.host,
             global_types: globals.clone(),

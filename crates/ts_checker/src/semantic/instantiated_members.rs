@@ -6811,6 +6811,77 @@ struct GenericInterfaceCallbackOwner {
     signature: SignatureId,
 }
 
+/// Selects an original method before its callback returns can be classified.
+pub(super) fn selected_generic_interface_method_source(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+    name: EscapedNameRef<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<SemanticSymbolId>, GenericInterfaceMemberError> {
+    let reference = validate_direct_generic_reference(store, receiver)?;
+    if store
+        .type_payload(reference.target)
+        .is_some_and(|record| record.object_flags().contains(ObjectFlags::CLASS))
+    {
+        return Ok(None);
+    }
+    let (_, _, _, properties, _) =
+        declared_target_header(store, reference.target, array_targets)?;
+    Ok(properties.into_iter().find_map(|property| {
+        (property.method
+            && store
+                .symbol(property.symbol)
+                .is_some_and(|symbol| symbol.name() == name))
+        .then_some(property.symbol)
+    }))
+}
+
+/// Finds only the selected method's authenticated callbacks with unread returns.
+pub(super) fn pending_generic_interface_callback_returns(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+    method: SemanticSymbolId,
+) -> Result<Vec<SignatureId>, GenericInterfaceMemberError> {
+    let Some((owner, target)) = store.authenticated_interface_method_owner(method) else {
+        return Ok(Vec::new());
+    };
+    let reference = validate_direct_generic_reference(store, receiver)?;
+    if reference.target != target {
+        return Err(GenericInterfaceMemberError::InvalidTarget(receiver));
+    }
+    let (callable, _, _) = published_interface_method_value(store, owner, method)?;
+    let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+        super::callable_sets::validate_stored_declared_method_callable_set(store, callable)
+    else {
+        return Err(GenericInterfaceMemberError::InvalidMember(method));
+    };
+    let mut pending = Vec::new();
+    for signature in &projection.call_signatures {
+        for &parameter in &signature.parameters {
+            let callback = optional_function_member(store, parameter)?
+                .map_or(parameter, |optional| optional.callback);
+            let Some(callback_owner) = generic_interface_callback_owner(store, callback) else {
+                continue;
+            };
+            if callback_owner.method != method
+                || callback_owner.target != target
+                || callback_owner.signature != signature.signature
+            {
+                return Err(GenericInterfaceMemberError::InvalidMember(method));
+            }
+            let (_, callback_signature, _) = function_member_parameters(store, callback)
+                .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+            let record = store
+                .signature(callback_signature)
+                .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+            if record.resolved_return_type().is_none() && !pending.contains(&callback_signature) {
+                pending.push(callback_signature);
+            }
+        }
+    }
+    Ok(pending)
+}
+
 /// Proves the actual callback annotation and its declared generic interface method.
 #[allow(clippy::too_many_lines)] // Annotation ancestry and the method's source identity form one proof.
 fn generic_interface_callback_owner(
