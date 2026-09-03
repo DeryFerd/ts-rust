@@ -58869,7 +58869,7 @@ fn check_deferred_statement_list_arrows(
             callable,
             local,
             arrow,
-            Some(global_types.array_targets),
+            Some(CanonicalArrayTargets::from_global_types(global_types)),
         )?;
         let local_start = host
             .node(local.declaration)
@@ -59427,7 +59427,7 @@ fn check_callable_statement_nodes(
                         callable,
                         local,
                         arrow,
-                        Some(global_types.array_targets),
+                        Some(CanonicalArrayTargets::from_global_types(global_types)),
                     )?;
                     let snapshot = frame
                         .snapshot_at(store, global_types, local.name)
