@@ -2137,7 +2137,7 @@ fn completed_source_class_import_value_in_context(
     }
     Ok(Some(SourceClassImportValue {
         owner,
-        members: members.clone(),
+        members,
         array_targets: CanonicalArrayTargets::from_global_types(global_types),
         type_context: type_context.clone(),
     }))
@@ -2161,19 +2161,42 @@ pub(super) fn completed_source_class_import_type(
     .map(|members| members.map(|members| members.shells.instance_type))
 }
 
-fn completed_source_class_import_members_in_context<'store>(
-    store: &'store CanonicalTypeMapperStore,
+fn completed_source_class_import_members_in_context(
+    store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     type_context: &ClassTypeQueryContext,
     owner: SourceClassImportOwner,
-) -> Result<Option<&'store ClassMembers>, ClassError> {
+) -> Result<Option<ClassMembers>, ClassError> {
     let invalid = || invariant(ClassInvariant::InvalidOwnerSymbol(owner.symbol));
     if source_class_import_owner(store, host, owner.symbol)? != Some(owner) {
         return Err(invalid());
     }
     let Some(provenance) = store.source_class_provenance_for_symbol(owner.symbol) else {
-        return Ok(None);
+        if !store
+            .source_file_links(owner.source)
+            .is_some_and(|links| links.type_checked)
+        {
+            return Ok(None);
+        }
+        // The direct member producer does not publish source-class provenance.
+        let plan = match plan_nongeneric_class_member_query_with_type_context(
+            store,
+            host,
+            owner.symbol,
+            Some(type_context),
+        ) {
+            Ok(plan) => plan,
+            Err(ClassError::Unsupported(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if plan.declaration() != owner.declaration
+            || plan.symbol() != owner.symbol
+            || plan.export_local().unwrap_or(owner.symbol) != owner.export_local
+        {
+            return Err(invalid());
+        }
+        return completed_nongeneric_class_member_query(store, host, &plan);
     };
     let array_targets = CanonicalArrayTargets::from_global_types(global_types);
     if provenance.prepared.plan.array_targets != Some(array_targets)
@@ -2196,7 +2219,7 @@ fn completed_source_class_import_members_in_context<'store>(
     {
         return Ok(None);
     }
-    Ok(Some(&provenance.members))
+    Ok(Some(provenance.members.clone()))
 }
 
 pub(super) fn validate_source_class_import_value(
