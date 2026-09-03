@@ -77762,9 +77762,9 @@ fn check_source_plan(
             global_types,
             options,
             session,
-            &mut type_import_preflight_diagnostics,
+            diagnostics,
         )?
-        .preflight_type_from_type_node(type_node)?;
+        .preflight_source_type_from_type_node(type_node)?;
     }
     for class in &ambient_class_reads {
         preflight_nongeneric_class_member_query(store, host, class)

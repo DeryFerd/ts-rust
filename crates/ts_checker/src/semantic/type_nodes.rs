@@ -39005,6 +39005,27 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         self.require_type_reference_alias_roots_capability(roots)
     }
 
+    /// Restores source alias proofs before a source-check cache preflight.
+    pub(super) fn preflight_source_type_from_type_node(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<(), DeclaredTypeError> {
+        self.require_type_reference_alias_root_capability(node)?;
+        if !self.pending_function_parameters.is_empty() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionType(node),
+            ));
+        }
+        if let Some(cached) = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+        {
+            self.prepare_cached_source_interface_aliases(node, cached)?;
+        }
+        self.preflight_type_from_type_node(node)
+    }
+
     /// Proves one complete type-node dependency closure without executing or
     /// publishing any part of its semantic graph.
     pub(super) fn preflight_type_from_type_node(
@@ -39062,6 +39083,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .filter(|_| self.instantiation_session.is_some()),
         )
         .with_enclosing_source_callable_scope(node)?;
+        planner.source_context = self
+            .global_types
+            .as_ref()
+            .map(|_| self.source_query_context())
+            .transpose()?;
         let direct_alias = planner.direct_type_alias_owner(node)?;
         if direct_alias.is_some() && !self.type_reference_alias_targets.is_empty() {
             self.reject_type_reference_alias_capabilities()?;
