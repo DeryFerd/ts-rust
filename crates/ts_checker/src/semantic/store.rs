@@ -2304,10 +2304,57 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || owner.declarations() != Some(declarations)
             || !self.source_merged_symbol_declarations_match(symbol)
             || owner.check_flags() != CheckFlags::NONE
-            || owner.parent().is_some()
             || owner.exports().is_some()
             || owner.export_symbol().is_some()
         {
+            return Err(invalid());
+        }
+
+        // The first merged declaration determines the retained parent. This
+        // receipt applies to script globals, not owners introduced by an augmentation.
+        let first = declarations[0];
+        let facts = self
+            .source_file_facts
+            .get(&first.file)
+            .ok_or_else(invalid)?;
+        let source = self
+            .source_files
+            .get(&first.file)
+            .map(|source| source.node_ref())
+            .ok_or_else(invalid)?;
+        if facts.is_javascript_file()
+            || facts.is_common_js_module()
+            || self.source_file_rank(first.file).is_none()
+            || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || self.source_node_parent(source) != Some(SourceNodeParent::Root)
+        {
+            return Err(invalid());
+        }
+        let statement = match self.source_node_kind(first) {
+            Some(SyntaxKind::InterfaceDeclaration) => first,
+            Some(SyntaxKind::VariableDeclaration) => {
+                let Some(SourceNodeParent::Parent(list)) = self.source_node_parent(first) else {
+                    return Err(invalid());
+                };
+                let Some(SourceNodeParent::Parent(statement)) = self.source_node_parent(list)
+                else {
+                    return Err(invalid());
+                };
+                if self.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+                    || self.source_node_kind(statement) != Some(SyntaxKind::VariableStatement)
+                {
+                    return Err(invalid());
+                }
+                statement
+            }
+            _ => return Err(invalid()),
+        };
+        if facts.is_external_module()
+            || self.source_node_parent(statement) != Some(SourceNodeParent::Parent(source))
+        {
+            return Ok(None);
+        }
+        if owner.parent().is_some() {
             return Err(invalid());
         }
 
