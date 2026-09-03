@@ -3752,10 +3752,12 @@ fn validate_generic_call_signature_shape_worker(
             return Err(GenericCallVectorUnsupported::RestSignature(callable.signature).into());
         }
         if minimum_argument_count != fixed_parameter_count
-            && signature
-                .declaration()
-                .and_then(|declaration| store.source_node_kind(declaration))
-                != Some(SyntaxKind::CallSignature)
+            && !matches!(
+                signature
+                    .declaration()
+                    .and_then(|declaration| store.source_node_kind(declaration)),
+                Some(SyntaxKind::CallSignature | SyntaxKind::MethodSignature)
+            )
         {
             return Err(
                 GenericCallVectorUnsupported::NonRequiredParameter(callable.signature).into(),
