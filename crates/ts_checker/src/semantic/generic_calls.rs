@@ -108,6 +108,7 @@ use super::{
         valid_fixed_generic_source_parameter_type, valid_optional_type,
         validate_stored_source_callable,
     },
+    source_calls::SourceCallReturnContext,
     source_overloads::source_overload_signature_type_query,
     store::{
         CachedSignatureLookup, SourceCallableFamily, SourceCallableReturnProvenance,
@@ -466,7 +467,7 @@ struct GenericCallSignatureShape {
     rest_tuple_template: Option<TypeId>,
     strict_function_types: Option<bool>,
     this_argument: Option<TypeId>,
-    contextual_return_type: Option<TypeId>,
+    contextual_return_type: Option<SourceCallReturnContext>,
     minimum_argument_count: usize,
     return_type: TypeId,
     return_requires_exact_cache: bool,
@@ -663,7 +664,7 @@ pub(super) fn resolve_generic_call_vector_with_return_context(
     session: &mut InstantiationSession,
     this_argument: Option<TypeId>,
     source: &mut dyn ConditionalBranchSource,
-    contextual_return_type: Option<TypeId>,
+    contextual_return_type: Option<SourceCallReturnContext>,
 ) -> Result<GenericCallVectorResolution, GenericCallVectorError> {
     validate_generic_call_vector_request(store, request)?;
     let callable = match validate_stored_single_callable(store, request.callee) {
@@ -865,7 +866,7 @@ pub(super) fn check_generic_call_candidate_with_return_context(
     session: &mut InstantiationSession,
     this_argument: Option<TypeId>,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
-    contextual_return_type: Option<TypeId>,
+    contextual_return_type: Option<SourceCallReturnContext>,
 ) -> Result<GenericCallVectorCandidate, GenericCallVectorError> {
     let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
     if generic_call_signature_candidate(store, request.callee, callable.signature, array_targets)?
@@ -2778,7 +2779,7 @@ fn check_validated_generic_call_candidate_with_receiver(
     this_argument: Option<TypeId>,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
     strict_function_types: Option<bool>,
-    contextual_return_type: Option<TypeId>,
+    contextual_return_type: Option<SourceCallReturnContext>,
     mut is_assignable: impl FnMut(
         &mut CanonicalTypeMapperStore,
         &mut InstantiationSession,
@@ -5951,16 +5952,30 @@ fn infer_generic_call_type_arguments_with_receiver(
     ) -> Result<bool, RelationUnavailable>,
     session: &mut InstantiationSession,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
-    contextual_return_type: Option<TypeId>,
+    contextual_return_type: Option<SourceCallReturnContext>,
 ) -> Result<Vec<TypeId>, GenericCallVectorError> {
     let return_limit_mark = session.limit_event_mark();
-    let return_inference = collect_generic_call_return_inferences(
-        store,
-        shape,
-        contextual_return_type,
-        global_types,
-        session,
-    )?;
+    let return_inference = if contextual_return_type
+        .is_some_and(|context| context.has_inert_argument_expression(arguments))
+        && ordinary_inference_covers_return_context(
+            store,
+            shape,
+            arguments,
+            this_argument,
+            noninferring_conditionals,
+            global_types,
+        )
+    {
+        None
+    } else {
+        collect_generic_call_return_inferences(
+            store,
+            shape,
+            contextual_return_type.map(SourceCallReturnContext::type_),
+            global_types,
+            session,
+        )?
+    };
     let mut contextual_arguments = arguments.to_vec();
     if let Some(return_inference) = return_inference.as_ref() {
         let selected = (0..return_inference.type_parameters.len())
@@ -6004,6 +6019,9 @@ fn infer_generic_call_type_arguments_with_receiver(
                 session,
             )?;
             for (index, argument) in contextual_arguments.iter_mut().enumerate() {
+                if !generic_call_argument_may_contain_literal(store, *argument) {
+                    continue;
+                }
                 let Some(parameter) = shape
                     .parameter_templates
                     .get(index)
@@ -6098,6 +6116,162 @@ fn infer_generic_call_type_arguments_with_receiver(
         Some(&return_priority),
     )?;
     Ok(inference.arguments)
+}
+
+// A failed proof leaves the normal contextual inference path unchanged. This
+// reader does not collect candidates or create mapper, type, or signature caches.
+fn ordinary_inference_covers_return_context(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    arguments: &[TypeId],
+    this_argument: Option<TypeId>,
+    noninferring_conditionals: &[TypeId],
+    global_types: Option<&CanonicalGlobalTypes>,
+) -> bool {
+    let Some(globals) = global_types else {
+        return false;
+    };
+    if shape.has_rest_parameter()
+        || shape.class_constructor.is_some()
+        || shape.named_constructor
+        || shape.type_parameters.is_empty()
+        || arguments.len() > shape.parameter_templates.len()
+        || !arguments
+            .iter()
+            .all(|&argument| generic_call_argument_is_context_inert(store, argument, globals))
+    {
+        return false;
+    }
+    let parameters = shape
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.type_)
+        .collect::<Vec<_>>();
+    let mut covered = vec![false; parameters.len()];
+    let mut cover = |argument, target| {
+        let Some(index) = parameters.iter().position(|&parameter| parameter == target) else {
+            return false;
+        };
+        if !matches!(
+            is_non_inferrable_inference_source(store, argument, shape.array_targets),
+            Ok(false)
+        ) || validate_call_inference_candidate(store, argument, globals).is_err()
+        {
+            return false;
+        }
+        covered[index] = true;
+        true
+    };
+    match generic_call_this_parameter(store, shape.signature) {
+        Ok(Some((_, target))) if !valid_fixed_generic_source_parameter_type(store, target) => {
+            let Some(argument) = this_argument else {
+                return false;
+            };
+            if !cover(argument, target) {
+                return false;
+            }
+        }
+        Ok(_) => {}
+        Err(_) => return false,
+    }
+    for (index, &argument) in arguments.iter().enumerate() {
+        let parameter = shape.parameter_templates[index];
+        if store
+            .source_callable_type_query(shape.signature)
+            .and_then(|evidence| {
+                source_default_parameter_base(
+                    store,
+                    evidence,
+                    shape.signature,
+                    index,
+                    parameter,
+                    shape.array_targets,
+                )
+            })
+            .is_some()
+        {
+            continue;
+        }
+        let parameter = if index >= shape.minimum_argument_count {
+            match optional_generic_parameter_template(
+                store,
+                parameter,
+                &parameters,
+                shape.array_targets,
+                shape.signature,
+            ) {
+                Ok(template) => template.unwrap_or(parameter),
+                Err(_) => return false,
+            }
+        } else {
+            parameter
+        };
+        if !valid_fixed_generic_source_parameter_type(store, parameter)
+            && !noninferring_conditionals.contains(&parameter)
+            && !cover(argument, parameter)
+        {
+            return false;
+        }
+    }
+    covered.into_iter().all(|covered| covered)
+}
+
+fn generic_call_argument_is_context_inert(
+    store: &CanonicalTypeMapperStore,
+    argument: TypeId,
+    globals: &CanonicalGlobalTypes,
+) -> bool {
+    let Some(record) = store.type_payload(argument) else {
+        return false;
+    };
+    let shape_is_inert = match record.data() {
+        TypeData::Intrinsic(_) => !record.flags().intersects(TypeFlags::LITERAL),
+        TypeData::TypeParameter(parameter)
+            if super::classes::source_class_this_type_owner(store, argument).is_some() =>
+        {
+            parameter
+                .constraint
+                .and_then(|constraint| store.type_payload(constraint))
+                .and_then(|record| record.data().structured())
+                .is_some_and(|structured| {
+                    structured.call_signature_count == 0
+                        && structured.signatures.as_ref().is_none_or(Vec::is_empty)
+                })
+        }
+        // A generic callable argument can be instantiated by its context before
+        // literal treatment. Deferred and structured arguments need that path too.
+        _ => false,
+    };
+    shape_is_inert && validate_call_inference_candidate(store, argument, globals).is_ok()
+}
+
+fn generic_call_argument_may_contain_literal(
+    store: &CanonicalTypeMapperStore,
+    argument: TypeId,
+) -> bool {
+    let mut pending = vec![argument];
+    let mut visited = Vec::new();
+    while let Some(type_) = pending.pop() {
+        // An unproved or recursive graph must retain the old contextual path.
+        if visited.contains(&type_) {
+            return true;
+        }
+        visited.push(type_);
+        let Some(record) = store.type_payload(type_) else {
+            return true;
+        };
+        if record.flags().intersects(TypeFlags::LITERAL) {
+            return true;
+        }
+        match record.data() {
+            TypeData::Union(union) => pending.extend_from_slice(&union.union.types),
+            TypeData::Intersection(intersection) => {
+                pending.extend_from_slice(&intersection.intersection.types);
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11849,6 +12023,52 @@ fn source_declared_inference_proof(
         return Ok(None);
     };
     Ok(Some(SourceDeclaredInferenceProof { candidate }))
+}
+
+/// The source identity provider still authenticates the full declared property
+/// graph before publication. This reader proves only that return context cannot
+/// change its one ordinary, non-callable inference candidate.
+pub(super) fn source_identity_return_context_is_inert(
+    store: &CanonicalTypeMapperStore,
+    callee: TypeId,
+    arguments: &[TypeId],
+) -> bool {
+    let [argument] = arguments else {
+        return false;
+    };
+    if !source_declared_inference_candidate_is_exported(store, *argument) {
+        return false;
+    }
+    let Some(record) = store.type_payload(*argument) else {
+        return false;
+    };
+    let Some(structured) = record.data().structured() else {
+        return false;
+    };
+    if !record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
+        || record
+            .object_flags()
+            .intersects(ObjectFlags::REQUIRES_WIDENING)
+        || structured.call_signature_count != 0
+        || structured
+            .signatures
+            .as_ref()
+            .is_some_and(|signatures| !signatures.is_empty())
+    {
+        return false;
+    }
+    let StoredSingleCallableValidation::Valid { callable, .. } =
+        validate_stored_single_callable(store, callee)
+    else {
+        return false;
+    };
+    validate_identity_signature_shape(
+        store,
+        callee,
+        &callable,
+        identity_type_parameter_cache_provenance(store, callee, &callable),
+    )
+    .is_ok()
 }
 
 /// The source-only override exists solely for a cross-module boundary. Local

@@ -62,6 +62,7 @@ use super::{
         instantiate_generic_signature_in_fixed_context,
         resolve_source_identity_generic_call_with_session,
         source_declared_inference_candidate_is_exported,
+        source_identity_return_context_is_inert,
     },
     generic_method_calls::{
         GenericMethodCallDiagnostic, GenericMethodCallError, GenericMethodCallResolution,
@@ -5718,13 +5719,80 @@ enum SourceCallResolutionError {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(super) struct SourceCallReturnContext {
+    type_: TypeId,
+    reference_argument: Option<TypeId>,
+}
+
+impl SourceCallReturnContext {
+    pub(super) fn type_(self) -> TypeId {
+        self.type_
+    }
+
+    pub(super) fn has_inert_argument_expression(self, arguments: &[TypeId]) -> bool {
+        matches!(arguments, [argument] if Some(*argument) == self.reference_argument)
+    }
+}
+
+// Only a checked reference read can use the context-inert inference proof.
+// Nested calls and deferred expressions must keep the full contextual path.
+fn source_call_return_context(
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceCallPlan,
+    arguments: &[TypeId],
+    type_: TypeId,
+) -> SourceCallReturnContext {
+    let reference_argument = (|| {
+        let [argument] = arguments else {
+            return None;
+        };
+        let [planned] = plan.arguments.as_slice() else {
+            return None;
+        };
+        let syntax = host.node(plan.node)?;
+        let NodeData::CallExpression(call) = &syntax.data else {
+            return None;
+        };
+        if syntax.kind != SyntaxKind::CallExpression
+            || planned.node.arena != plan.node.arena
+            || planned.node.file != plan.node.file
+            || call.arguments.nodes.as_slice() != [planned.node.node]
+        {
+            return None;
+        }
+        let mut node = planned.node;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(node) {
+                return None;
+            }
+            let syntax = host.node(node)?;
+            match syntax.kind {
+                SyntaxKind::Identifier | SyntaxKind::ThisKeyword => return Some(*argument),
+                SyntaxKind::PropertyAccessExpression => {
+                    let NodeData::PropertyAccessExpression(property) = &syntax.data else {
+                        return None;
+                    };
+                    node = NodeRef::new(node.arena, node.file, property.expression);
+                }
+                _ => return None,
+            }
+        }
+    })();
+    SourceCallReturnContext {
+        type_,
+        reference_argument,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct SourceCallResolutionRequest<'a> {
     form: DirectCallForm,
     callee_type: TypeId,
     argument_types: &'a [TypeId],
     explicit_type_arguments: Option<&'a [TypeId]>,
     receiver: Option<TypeId>,
-    contextual_return_type: Option<TypeId>,
+    contextual_return_type: Option<SourceCallReturnContext>,
 }
 
 fn resolve_source_call_once(
@@ -6028,7 +6096,15 @@ fn resolve_source_call_once(
         }
         Err(error)
             if (contextual_return_type.is_none()
-                || explicit_type_arguments.is_some_and(|arguments| !arguments.is_empty()))
+                || explicit_type_arguments.is_some_and(|arguments| !arguments.is_empty())
+                || contextual_return_type.is_some_and(|context| {
+                    context.has_inert_argument_expression(argument_types)
+                        && source_identity_return_context_is_inert(
+                            store,
+                            callee_type,
+                            argument_types,
+                        )
+                }))
                 && source_identity_fallback_is_exact(
                     store,
                     explicit_type_arguments,
@@ -9542,6 +9618,8 @@ pub(super) fn check_direct_source_call_with_return_context(
                 .ok_or(SourceCheckError::Call(plan.node))
         })
         .transpose()?;
+    let contextual_return_type = contextual_return_type
+        .map(|type_| source_call_return_context(host, plan, argument_types, type_));
     let resolution = loop {
         match resolve_source_call_once(
             store,

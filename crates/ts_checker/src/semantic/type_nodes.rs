@@ -38514,7 +38514,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         request: super::generic_calls::GenericCallVectorRequest<'_>,
         existing_call_signature: Option<SignatureId>,
         this_argument: Option<TypeId>,
-        contextual_return_type: Option<TypeId>,
+        contextual_return_type: Option<super::source_calls::SourceCallReturnContext>,
     ) -> Result<
         Option<(
             super::generic_method_calls::GenericMethodCallResolution,
@@ -38631,7 +38631,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         request: super::generic_calls::GenericCallVectorRequest<'_>,
         existing_call_signature: Option<SignatureId>,
         this_argument: Option<TypeId>,
-        contextual_return_type: Option<TypeId>,
+        contextual_return_type: Option<super::source_calls::SourceCallReturnContext>,
     ) -> Result<
         (
             super::generic_calls::GenericCallVectorResolution,

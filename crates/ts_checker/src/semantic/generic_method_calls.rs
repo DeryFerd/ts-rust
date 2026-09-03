@@ -32,6 +32,7 @@ use super::{
     },
     instantiate::InstantiationSession,
     relation::RelationKind,
+    source_calls::SourceCallReturnContext,
     type_records::TypeData,
 };
 
@@ -218,7 +219,7 @@ fn check_candidate(
     session: &mut InstantiationSession,
     this_argument: Option<TypeId>,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
-    contextual_return_type: Option<TypeId>,
+    contextual_return_type: Option<SourceCallReturnContext>,
 ) -> Result<CheckedMethodCandidate, GenericMethodCallError> {
     if !store
         .signature(callable.signature)
@@ -334,7 +335,7 @@ fn check_candidate_with_context(
     context: Option<&PreparedGenericConstructorContext>,
     this_argument: Option<TypeId>,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
-    contextual_return_type: Option<TypeId>,
+    contextual_return_type: Option<SourceCallReturnContext>,
 ) -> Result<CheckedMethodCandidate, GenericMethodCallError> {
     match context {
         None => check_candidate(
@@ -460,7 +461,7 @@ pub(super) fn resolve_generic_method_call_with_return_context(
     session: &mut InstantiationSession,
     this_argument: Option<TypeId>,
     source: &mut dyn ConditionalBranchSource,
-    contextual_return_type: Option<TypeId>,
+    contextual_return_type: Option<SourceCallReturnContext>,
 ) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
     resolve_generic_method_call_worker(
         store,
@@ -485,7 +486,7 @@ fn resolve_generic_method_call_worker(
     session: &mut InstantiationSession,
     this_argument: Option<TypeId>,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
-    contextual_return_type: Option<TypeId>,
+    contextual_return_type: Option<SourceCallReturnContext>,
 ) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
     if request.form != DirectCallForm::Call || request.optional_chain || request.has_spread_argument
     {
@@ -724,7 +725,7 @@ fn resolve_generic_candidates_with_context(
     context: Option<&PreparedGenericConstructorContext>,
     this_argument: Option<TypeId>,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
-    contextual_return_type: Option<TypeId>,
+    contextual_return_type: Option<SourceCallReturnContext>,
 ) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
     let array_targets = Some(CanonicalArrayTargets::from_global_types(globals));
     let ordered = reorder_direct_call_candidates(store, request.callee, candidates)?;
