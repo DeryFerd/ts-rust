@@ -7558,6 +7558,13 @@ pub(super) fn authenticated_function_object_parameter_bindings(
     parameter: NodeRef,
 ) -> Option<Vec<PlannedObjectBindingElement>> {
     let (arena, bound) = host.source(declaration)?;
+    let NodeData::ParameterDeclaration(syntax) = &host.node(parameter)?.data else {
+        return None;
+    };
+    let name = NodeRef::new(parameter.arena, parameter.file, syntax.name);
+    if host.node(name)?.kind != SyntaxKind::ObjectBindingPattern {
+        return None;
+    }
     let queried_generic_function = host.node(declaration).is_some_and(|record| {
         record.kind == SyntaxKind::FunctionDeclaration
             && matches!(&record.data, NodeData::FunctionDeclaration(function)
@@ -7594,9 +7601,6 @@ pub(super) fn authenticated_function_object_parameter_bindings(
         // Keep union and intersection parents intact until property lookup.
         return Some(bindings);
     }
-    let NodeData::ParameterDeclaration(syntax) = &host.node(parameter)?.data else {
-        return None;
-    };
     let annotation = NodeRef::new(parameter.arena, parameter.file, syntax.type_?);
     let parent = source_object_parameter_annotation_plan(store, host, annotation)?;
     // Named lookup cannot yet supply a property from an index signature.
