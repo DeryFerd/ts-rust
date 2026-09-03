@@ -31178,7 +31178,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     || self.is_default_library_dom_interface_argument(
                         constraint,
                         constraint_symbol,
-                    ))
+                    )
+                    || self
+                        .store
+                        .source_global_interface_value_owner(constraint_symbol)?
+                        .is_some())
                     && preflight_class_or_interface_reference(
                         self.store,
                         self.host,
@@ -31604,7 +31608,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     {
                         return Err(unsupported());
                     }
-                    // A top-level interface cannot capture an outer formal.
+                    let global_owner = self.store.source_global_interface_value_owner(earlier)?;
+                    // A source-file interface or an authenticated global augmentation
+                    // cannot capture an outer formal.
                     let mut has_interface = false;
                     for &declaration in target.declarations().ok_or_else(&unsupported)? {
                         let declaration_record =
@@ -31616,6 +31622,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                 self.host.bound_file(declaration).ok_or_else(&unsupported)?;
                             if declaration_record.kind != SyntaxKind::InterfaceDeclaration
                                 || declaration_record.parent != Some(bound.source_file().node)
+                                    && global_owner.as_ref().is_none_or(|owner| {
+                                        !owner.interfaces().contains(&declaration)
+                                    })
                                 || interface.type_parameters.is_some()
                                 || !self.host.symbol_matches(self.store, declaration, earlier)
                             {
