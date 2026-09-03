@@ -8382,6 +8382,54 @@ fn source_class_method_target(
     callee_type: TypeId,
     access: &ClassBodyAccessToken,
 ) -> Result<ClassBodyCallable, SourceCheckError> {
+    let query_context = super::classes::ClassTypeQueryContext::new(globals, options);
+    source_class_method_target_with(
+        store,
+        host,
+        plan,
+        callee_type,
+        access,
+        |receiver_type, member| {
+            super::classes::class_body_method_callable_with_query_context(
+                store,
+                host,
+                access,
+                receiver_type,
+                member,
+                &query_context,
+            )
+        },
+    )
+}
+
+/// Rechecks the actual class target before reading its completed call effects.
+pub(super) fn source_class_method_effect_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceCallPlan,
+    callee_type: TypeId,
+    access: &ClassBodyAccessToken,
+) -> Result<ClassBodyCallable, SourceCheckError> {
+    source_class_method_target_with(
+        store,
+        host,
+        plan,
+        callee_type,
+        access,
+        |receiver_type, member| {
+            super::classes::class_body_method_callable(store, host, access, receiver_type, member)
+        },
+    )
+}
+
+fn source_class_method_target_with(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceCallPlan,
+    callee_type: TypeId,
+    access: &ClassBodyAccessToken,
+    target: impl FnOnce(TypeId, SemanticSymbolId) -> Result<ClassBodyCallable, ClassError>,
+) -> Result<ClassBodyCallable, SourceCheckError> {
     let invalid = || SourceCheckError::Call(plan.node);
     let (arena, _) = host.source(plan.node).ok_or_else(invalid)?;
     let syntax = plan_direct_source_call_syntax(arena, store, plan.node)?;
@@ -8472,16 +8520,8 @@ fn source_class_method_target(
     {
         return Err(invalid());
     }
-    let query_context = super::classes::ClassTypeQueryContext::new(globals, options);
-    let target = super::classes::class_body_method_callable_with_query_context(
-        store,
-        host,
-        access,
-        receiver_type,
-        member,
-        &query_context,
-    )
-    .map_err(|error| class_call_error(plan.node, error))?;
+    let target = target(receiver_type, member)
+        .map_err(|error| class_call_error(plan.node, error))?;
     if target.kind() != SignatureKind::Call
         || target.callable().owner != callee_type
         || target.class_symbol() != source.declaring_class

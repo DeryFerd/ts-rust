@@ -37,7 +37,10 @@ use super::{
     RelationUnavailable, SignatureId, SymbolNodeLinks, TypeId, TypeNodeLinks, TypePredicateId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::{LiteralTypeCacheError, UnionReduction},
-    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
+    callable_sets::{
+        CallableSetProjection, StoredCallableSetValidation,
+        validate_stored_callable_set_with_array_targets,
+    },
     classes::{
         ClassBodyAccessToken, ClassBodyKind, ClassBodyPlan, ClassMemberOrigin, ClassMemberSource,
         ClassPropertySide, class_body_identities, class_member_source,
@@ -52,7 +55,7 @@ use super::{
     source::{CheckedClassPropertyAssignment, PlannedExpressionKind, PlannedIdentifierRead},
     source_calls::{
         CheckedSourceCall, SourceCallPlan, plan_direct_source_call_syntax,
-        resolve_source_call_effects_signature,
+        resolve_source_call_effects_signature, source_class_method_effect_target,
     },
     source_properties::{
         ClassAccessContext, ClassPropertyTruthinessSource, OwnClassPropertyWritePlan,
@@ -5286,16 +5289,62 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         {
             return Err(invalid().into());
         }
-        let projection = match validate_stored_callable_set_with_array_targets(
-            store,
-            completed.callee_type,
-            Some(completed.arrays),
-        ) {
-            StoredCallableSetValidation::Valid { projection, .. } => projection,
-            StoredCallableSetValidation::Malformed { .. } => return Err(invalid().into()),
-            StoredCallableSetValidation::NotCallable
-            | StoredCallableSetValidation::Pending { .. } => {
-                return Err(unsupported());
+        let class_method = matches!(
+            &completed.plan.callee.unparenthesized().kind,
+            PlannedExpressionKind::Property(property)
+                if property.class_access_context().is_some()
+                    && completed.callee_symbol.resolved_symbol.is_some_and(|member| {
+                        store.symbol(member).is_some_and(|symbol| {
+                            symbol.flags().contains(SymbolFlags::METHOD)
+                        }) && class_member_source(store, host, member)
+                            .is_ok_and(|source| source.origin == ClassMemberOrigin::Method)
+                    })
+        );
+        let projection = if class_method {
+            let target = source_class_method_effect_target(
+                store,
+                host,
+                &completed.plan,
+                completed.callee_type,
+                &completed.access,
+            )
+            .map_err(|_| invalid())?;
+            let call_signatures = target.overloads().map_or_else(
+                || vec![target.callable().clone()],
+                |overloads| overloads.signatures.clone(),
+            );
+            for callable in &call_signatures {
+                for edge in callable
+                    .parameters
+                    .iter()
+                    .copied()
+                    .chain(callable.rest_parameter)
+                    .chain(callable.return_type)
+                {
+                    store
+                        .validate_cached_array_capability_with_pending_functions(
+                            Some(completed.arrays),
+                            edge,
+                            &[],
+                        )
+                        .map_err(|_| invalid())?;
+                }
+            }
+            CallableSetProjection {
+                owner: completed.callee_type,
+                call_signatures: call_signatures.into_boxed_slice(),
+                construct_signatures: Box::new([]),
+            }
+        } else {
+            match validate_stored_callable_set_with_array_targets(
+                store,
+                completed.callee_type,
+                Some(completed.arrays),
+            ) {
+                StoredCallableSetValidation::Valid { projection, .. } => projection,
+                StoredCallableSetValidation::Malformed { .. } => return Err(invalid().into()),
+                StoredCallableSetValidation::NotCallable
+                | StoredCallableSetValidation::Pending { .. } => return Err(unsupported()),
             }
         };
         if projection.owner != completed.callee_type
