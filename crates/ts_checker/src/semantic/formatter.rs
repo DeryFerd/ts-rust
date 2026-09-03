@@ -61,7 +61,7 @@ use super::{
     source_callables::{
         SourceCallableDisplayError, SourceCallableState, SourceCallableUnsupported,
         StoredSourceCallableValidation, plan_source_callable, source_callable_state,
-        validate_stored_source_callable,
+        valid_optional_type, validate_stored_source_callable,
     },
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
     store::{SourceCallableFamily, SourceNodeParent},
@@ -4194,9 +4194,8 @@ fn append_source_signature_parameters(
     let parameter_types = store
         .callable_signature_parameter_types(signature)
         .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
-    // Source display can reuse an optional annotation without changing the value type.
-    let display_parameters = if state.location.is_some()
-        && let Some(provenance) = store.source_callable_provenance(owner)
+    // Source display keeps default body types separate from optional call types.
+    let display_parameters = if let Some(provenance) = store.source_callable_provenance(owner)
         && provenance.signature == signature
         && let Some(evidence) = store.source_callable_type_query(signature)
         && let Some(record) = store.signature(signature)
@@ -4219,12 +4218,38 @@ fn append_source_signature_parameters(
         {
             return Err(TypeDisplayUnavailable::MalformedType(owner));
         }
+        let minimum = usize::try_from(record.min_argument_count())
+            .map_err(|_| TypeDisplayUnavailable::MalformedType(owner))?;
         Some(
             plan.parameters
                 .iter()
                 .zip(parameter_types)
-                .map(|(parameter, value_type)| {
-                    if !parameter.optional || parameter.initializer.is_some() || parameter.rest {
+                .enumerate()
+                .map(|(index, (parameter, value_type))| {
+                    if parameter.has_string_default_type() {
+                        let base = evidence
+                            .parameter_type(store, parameter)
+                            .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+                        let strict = store
+                            .intrinsic_bootstrap()
+                            .ok_or(TypeDisplayUnavailable::MalformedType(owner))?
+                            .options
+                            .strict_null_checks;
+                        let valid_call_type = if strict {
+                            valid_optional_type(store, plan.array_targets, base, *value_type)
+                        } else {
+                            base == *value_type
+                        };
+                        if !valid_call_type {
+                            return Err(TypeDisplayUnavailable::MalformedType(owner));
+                        }
+                        return Ok(if index >= minimum { base } else { *value_type });
+                    }
+                    if state.location.is_none()
+                        || !parameter.optional
+                        || parameter.initializer.is_some()
+                        || parameter.rest
+                    {
                         return Ok(*value_type);
                     }
                     let Some(NodeData::ParameterDeclaration(data)) =
@@ -4292,6 +4317,8 @@ fn append_validated_signature_parameters(
     if parameter_types.len() != signature_record.parameters().len() {
         return Err(TypeDisplayUnavailable::MalformedType(owner));
     }
+    let minimum = usize::try_from(signature_record.min_argument_count())
+        .map_err(|_| TypeDisplayUnavailable::MalformedType(owner))?;
     result.push('(');
     state.add(2);
     for (index, (parameter, type_)) in signature_record
@@ -4336,7 +4363,7 @@ fn append_validated_signature_parameters(
         }
         result.push_str(&identifier.text);
         state.add(identifier.text.len());
-        if data.question_token.is_some() || data.initializer.is_some() {
+        if data.question_token.is_some() || data.initializer.is_some() && index >= minimum {
             result.push('?');
             state.add(1);
         }
