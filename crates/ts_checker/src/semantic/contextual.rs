@@ -1783,7 +1783,11 @@ fn is_literal_of_contextual_type(
             return Err(RelationUnavailable::UnsupportedStructuredType(contextual_type).into());
         }
         if flags.intersects(TypeFlags::FRESHABLE) {
-            store.validate_union_constituent(contextual_type)?;
+            store
+                .validate_union_constituent(contextual_type)
+                .map_err(|error| {
+                    super::relater::union_validation_unavailable(contextual_type, error)
+                })?;
         }
         Ok(match kind {
             LiteralKind::String => flags.intersects(TypeFlags::STRING_LITERAL),
