@@ -902,12 +902,12 @@ fn check_fixed_parameter_callback(position: CallbackCallPosition, bad_argument: 
         panic!("the receiver must keep its one fixed property")
     };
     let property = child(&parsed, receiver_annotation, *property);
-    let NodeData::PropertySignatureDeclaration(property_data) =
+    let NodeData::PropertyDeclaration(property_data) =
         &parsed.arena.get(property.node).unwrap().data
     else {
         unreachable!()
     };
-    let callee_annotation = child(&parsed, property, property_data.type_);
+    let callee_annotation = child(&parsed, property, property_data.type_.unwrap());
     let target_annotation = fixed_callback_parameter_annotation(&parsed, callee_annotation);
     let element_annotation = fixed_callback_parameter_annotation(&parsed, target_annotation);
     let outer = node(
