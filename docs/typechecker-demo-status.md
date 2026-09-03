@@ -1,6 +1,6 @@
 # Typechecker demo status
 
-Updated 2026-09-02. Neither Query nor Hono has passed a full Rust type check.
+Updated 2026-09-03. Neither Query nor Hono has passed a full Rust type check.
 
 ## Current result
 
@@ -10,7 +10,7 @@ project has gained a complete isolated root in the latest comparisons.
 | Check | Latest result | Change |
 | --- | --- | --- |
 | Query, combined census 41 | 2 of 23 isolated roots complete | Restored the lost root and cleared six call invariants. No gain against census 36 |
-| Query, separate repairs 37 and 40 | 2 of 23 isolated roots complete | Later first errors, no additional complete roots |
+| Query, separate method candidate 43 | 2 of 23 isolated roots complete | Five roots now fail internal type-literal checks. Candidate remains excluded |
 | Hono, census 25 | 33 of 188 isolated roots complete | No complete-root gains. One new internal call error |
 | Return-context repair, six public targets | 19 pass, 0 fail | All three lost public passes restored |
 | Checker library, return-context repair | 5,064 pass, 373 fail | Both lost library passes restored. Every outcome matches run 54 |
@@ -55,46 +55,63 @@ cases and gains three others. It also has two supported mismatches.
 
 ## Current work
 
-- Combine the verified Query 41 repair, indexed writes, merged-interface cache
-  validation, and TS6504 path handling in one new candidate. One writer owns
-  the integration tree and one reviewer checks the complete combined change.
-  No new production candidate is accepted.
-- Diagnose the later method error from Query 37. The remaining new-test failure
-  comes from replay omitting three explicit relation queries. The correction
-  repeats those same queries and keeps the complete snapshot assertion.
-  Query 42's observation locates the method failure in keyword-only union
-  parameter checking. General canonical union annotation support is committed.
-  Its full library and 24 public cases are running before Query 43.
-- Hono's property-context repair passes all three public tests. Its full library
-  run has 5,065 passes and 372 failures. [Hono ordinary 6](../target/wave202-hono-ordinary-6-result.md)
-  gets past the missing-member error, then fails cached-type validation in
-  `http-exception.ts`. Its log identifies the array-capability query and the
-  current `Response` owner. Source inspection identifies a constructor reader
-  that drops the query context needed by conditional interface bases. The next
-  repair must retain that context through final validation. It is not tested yet.
-- Repair merged Promise call authentication. The test must keep the original
-  inline call's exact tuple result. An array-only result is not a substitute.
-- Keep optional-call testing separate until its full cases pass. Its observation
-  run confirms that callback validation rejects a cold Promise receiver after
-  accepting the callback's actual owner and mapper. The next repair reuses the
-  existing selected-method proof for that cold state. All current tests stay fixed.
-- The corpus crash is isolated to `conditionalTypeSimplification.ts`. The first
-  lazy-reference repair compiles. The original fixture now returns an unsupported
-  generic reference instead of aborting, and both full-feature tests still fail.
-  Its library comparison also loses six passes and gains one. The repair remains
-  incomplete, with every original expectation retained. The follow-up restores
-  shared base demand and checks written constraints after base publication.
-  Its source review is in progress, with no new test result yet.
-- The TS6504 root-path repair passes all 312 selected compiler tests. Its
-  [unchanged semantic selection](../target/wave202-root-javascript-semantic-1-result.md)
-  has 61 exact matches instead of 60. All other full records are unchanged.
-  The candidate still has other failures. This is not a project gain.
+1. Run both projects on one combined candidate. Commit `eb996907` contains the
+   Query 41 repair, indexed writes, merged-interface cache validation and TS6504
+   path handling. The complete change passed source review and compiled. Its
+   full library and 94 public test targets are running. Query 44 and Hono 26
+   follow on the same frozen source and build target. No candidate is accepted.
+2. Repair Query's class and method path. [Query 43](../target/wave202-query-combined-census-43-result.md)
+   has no complete-root gain. Its separate method candidate has five internal
+   type-literal errors and a later unsupported variable operation. Its test gate
+   also loses two inherited-constructor passes. The constructor reader accepts
+   inherited plans but only selects written constructors. That repair is active.
+   The new replay test separately compares operational counters and unordered
+   debug output. Its correction must preserve actual semantic state and results.
+3. Keep Hono's ordinary check moving. [Hono ordinary 6](../target/wave202-hono-ordinary-6-result.md)
+   still fails cached-type validation in `http-exception.ts`. The reviewed
+   constructor repair now retains the source query through annotation demand,
+   candidate validation and argument checks. Its full library and nine public
+   targets must run before the next ordinary Hono check.
+4. Complete shared async and Promise behavior. The
+   [callable syntax repair](../target/wave202-callable-syntax-authenticity-5-result.md)
+   passes all four new controls and recovers four old ownership checks, with no
+   old pass loss. It is ready for a later combined candidate. Parameterized async
+   arrow support is still being implemented. The
+   [Promise.all tests](../target/wave202-hono-merged-promise-call-2-result.md)
+   both still fail. The next repair must use canonical generic inference and
+   mapped tuple results. Returning an array for the inline tuple is incorrect.
+   [Optional catch calls](../target/wave202-optional-call-3-result.md) also remain
+   incomplete after the cold callback proof repair.
+5. Preserve working native cases while these features change. The
+   [second conditional-schema repair](../target/wave202-conditional-simplification-stack-2-result.md)
+   restores all six library regressions and no longer overflows the stack.
+   Its original fixture and both full public tests still fail. The next fix
+   reuses existing alias-conditional validation in method members. Separate
+   repairs address lazy Exclude branches and static class self construction.
+   The TS6504 fix retains its measured gain of 61 exact semantic variants
+   instead of 60. None of these results proves a full-project pass.
 
 The next useful results are successful ordinary project checks, additional
 complete roots, and preserved native diagnostics. More commits or focused test
 passes do not replace those results. Parallel patches and review have outpaced
 integration. The project-check cycle needs to stay short, while a separate
 regression track protects previously working behavior.
+
+## Demo requirement
+
+Query is the first full-project target. A useful demo must finish the unchanged
+project with matching native diagnostics, no unsupported operation and no
+internal error. It must also preserve the negative tests that require errors.
+Hono has the same requirement. A later first error or an isolated-root count
+does not meet it.
+
+The immediate measure is the result from the shared build, not the number of
+active workers. The current runner permits three concurrent Cargo jobs. Source
+work can run in parallel, but another source worker cannot remove that test
+limit. Query 41 spent 1m 50s building and 18.931s checking. Query 43 spent
+2m 19s building and 25.390s checking. Reusing one build target and combining
+library and public tests reduce repeated setup. No build-speed improvement is
+claimed until it is measured.
 
 ## Earlier checkpoints
 
