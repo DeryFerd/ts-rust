@@ -49909,6 +49909,26 @@ fn union_assignment_detail(
     ) {
         return Ok(None);
     }
+    union_assignability_detail(
+        store,
+        host,
+        global_types,
+        source_type,
+        target,
+        options,
+        session,
+    )
+}
+
+pub(super) fn union_assignability_detail(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target: TypeId,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+) -> Result<Option<String>, SourceCheckError> {
     let source = store
         .type_payload(source_type)
         .ok_or(RelationUnavailable::Type(source_type))?;

@@ -6857,7 +6857,7 @@ fn prepare_source_argument_mismatch_diagnostics(
             options,
             session,
         )?;
-        if details.is_empty() {
+        let mut details = if details.is_empty() {
             if let Some(detail) = short_rest_tuple_argument_detail(
                 store,
                 argument.unparenthesized().node,
@@ -6870,7 +6870,29 @@ fn prepare_source_argument_mismatch_diagnostics(
             }
         } else {
             details
+        };
+        if details.is_empty() {
+            let target = store
+                .type_payload(parameter_type)
+                .ok_or(RelationUnavailable::Type(parameter_type))?;
+            if target.flags().intersects(TypeFlags::PRIMITIVE)
+                && !target.flags().intersects(TypeFlags::UNION)
+            {
+                details.extend(
+                    super::source::union_assignability_detail(
+                        store,
+                        host,
+                        global_types,
+                        argument_type,
+                        parameter_type,
+                        options,
+                        session,
+                    )?
+                    .map(|detail| format!("  {detail}")),
+                );
+            }
         }
+        details
     };
 
     Ok(vec![CanonicalCheckerDiagnostic {
