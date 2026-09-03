@@ -180,7 +180,7 @@ fn assert_queries(
         Ok(value_type)
     );
     assert_eq!(context.get_type_at_location(read), Ok(value_type));
-    assert_eq!(context.get_symbol_at_location(read), Ok(Some(pair.resolved)));
+    assert_eq!(context.get_symbol_at_location(read), Ok(Some(pair.owner)));
     for name in [pair.value.name, pair.alias_name] {
         assert_eq!(context.get_symbol_at_location(name), Ok(Some(pair.owner)));
     }
