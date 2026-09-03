@@ -340,9 +340,19 @@ impl SymbolData {
 }
 
 /// Store-owned map from exact escaped names to canonical symbols.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct SymbolTable {
     entries: HashMap<EscapedName, SemanticSymbolId>,
+}
+
+impl std::fmt::Debug for SymbolTable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let entries: BTreeMap<_, _> = self.entries.iter().collect();
+        formatter
+            .debug_struct("SymbolTable")
+            .field("entries", &entries)
+            .finish()
+    }
 }
 
 /// An empty symbol table whose entry capacity was allocated before a
