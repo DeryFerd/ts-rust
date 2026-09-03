@@ -17,14 +17,15 @@ specific read-only questions, but must not create production or test changes.
 All existing branches, commits and dirty drafts stay preserved. Runtime owners
 may close checks that started before this reset, with no follow-on stages.
 
-Use one integration branch, `query-core-integration`, at the existing candidate
-`eb99690774e90e6333bc606e1402b6770259d371`. Reuse its current worktree and build
-target. Hono 26 has closed and root owns both. The candidate is not accepted,
-and no pending feature branch joins automatically.
-The last committed integration checkpoint is `f38238f76`. A reference-flow draft
-now changes six files in that worktree. It is not committed or promoted. Query
-still does not complete. Its latest result and regression losses are in the
-status document.
+Use the existing `query-core-integration` branch in
+`target/worktrees/query-hono-project-integration-2`. Reuse the current build
+target, `target/worktrees/next-core-build-1`. Root owns both. The candidate is not
+accepted, and no pending feature branch joins automatically.
+The last committed integration checkpoint is `de557d99c`, the reviewed merged
+global variable-and-namespace repair. A separate reference-flow draft still
+changes six files in that worktree. It is not committed or promoted. Query still
+does not complete. Its latest result and regression losses are in the status
+document. The accepted compiler remains unchanged.
 
 ### Regression baseline
 
@@ -187,16 +188,18 @@ fixed types, symbols, errors and replay checks. Three previous library passes
 now fail unsupported-result assertions. They remain blockers until the original
 cases have concrete pinned-Go comparisons. No expectation has changed.
 
-Unchanged Query still has only two complete isolated roots. Its ordinary check
-now reports SymbolNotOwned. Every diagnostic record is unchanged. The
-[ownership observation](../target/query-core-declared-owner-observation-3-result.md)
-identifies a merged variable-and-namespace symbol whose export table is rejected
-by the global-value planner. Pinned Go dispatches variable flags before module
-flags. Complete this shared declared-value path before adding more conditions.
-Prove the namespace contributions and their exact merged export table, then use
-the selected variable annotation through the existing value checker. Reuse the
-saved export-merge checks from merged function namespaces. Keep all declaration,
-scope, cache and replay checks. No numeric-ID or flags-only exception is valid.
+The merged variable-and-namespace repair is now committed as `de557d99c`.
+It proves the namespace contributions and complete export merge, then retains
+the selected variable annotation. The shared property reader follows the same
+value-selection order. All three new public cases pass with exact diagnostics,
+ownership, cold queries and replay. Pinned Go confirms their diagnostic results.
+No existing expectation changed. These results cover the combined working tree.
+
+[Unchanged Query](../target/query-core-variable-namespaces-query-1-result.md)
+still has only two complete isolated roots and unchanged diagnostics. The old
+ownership error is gone. Ordinary checking now rejects the optional `send`
+method in Node's `process.d.ts`. This is evidence for the next shared-path check,
+not a complete project gain.
 
 The complete reference-flow operation also needs retained checked member-write
 state. The existing shared assignment path checks the RHS but does not keep its
@@ -208,6 +211,28 @@ arrow path must keep their behavior.
 
 Before promotion, rerun the full accepted selections and original corpus on the
 final bytes. The new focused passes do not offset old failures or absent tests.
+
+### Next shared operation: inherited interface member lookup
+
+First confirm the actual caller for the new failure. The source already shows
+one likely cause. `cross_file_global_interface_supports_lazy_members` rejects
+interfaces with heritage. `check_source_plan` then uses full type-node checking
+in both preflight and execution. The library declares `process: NodeJS.Process`,
+and `Process` extends `EventEmitter`.
+
+Pinned Go keeps separate work for declaration identity, member tables and base
+types, and the selected member's type. Its member-table resolver does not obtain
+every named method's type. Port that behavior through the actual Rust callers
+with their real query context and retained state. Keep base substitutions,
+canonical member owners, call/construct/index signatures and warm-cache checks.
+Complete declaration checking must still run when that phase is requested.
+
+Do not only remove the heritage guard or add a special case for `send`. Test
+inherited property reads without resolving unrelated named method types. Then
+query a method explicitly and require its correct type. Include deliberate
+errors, source-first and query-first checks, and replay. Compile all test code,
+run the focused cases, rerun unchanged Query, then run the accepted selections
+before promotion. Keep the existing one-implementer and one-reviewer setup.
 
 ### Immediate milestone
 

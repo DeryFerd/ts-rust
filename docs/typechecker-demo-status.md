@@ -10,31 +10,41 @@ check. All earlier worker runs have closed. Root owns the integration branch
 
 ## Latest checkpoint
 
-The integration branch is at `f38238f76` with an uncommitted reference-flow
-draft. Nothing is promoted to the accepted compiler. Root remains the sole
-implementer. The single reviewer makes no production changes.
+The integration branch is at `de557d99c`. The merged global variable-and-namespace
+repair is committed, following a test-helper rename in `6f7319419`. The separate
+six-file reference-flow draft remains uncommitted. Nothing is promoted to the
+accepted compiler. Root remains the sole implementer, with one read-only reviewer.
 
-The [third draft test run](../target/query-core-reference-conditions-3-result.md)
-compiled implementation and test code. All three new public cases pass. They
-check both branches, receiver identity, a parent write, exact types and symbols,
-negative diagnostics, cold queries and replay. The library has 5,066 passes and
-371 failures. Against the previous integration run, 5,065 library passes remain,
-three old passes now fail and one old failure passes. All three new failures
-expect unsupported results, but none has an approved expectation change.
-Four other public failures still need a pre-draft comparison.
+The [new test run](../target/query-core-variable-namespaces-3-result.md) passes
+all three variable-and-namespace cases. They check script merging, global
+augmentation, local shadowing, exact types and owners, deliberate diagnostics,
+cold queries and replay. The [pinned Go comparison](../target/query-core-variable-namespaces-go-1/result.md)
+confirms all three positive cases and the exact negative diagnostics.
 
-[Unchanged Query](../target/query-core-reference-conditions-query-1-result.md)
-still completes only 2 of 23 isolated roots. Ordinary checking now fails with a
-symbol-ownership error instead of the condition rejection. Every diagnostic
-record is unchanged. This is not a completed feature.
+The library has 5,065 passes and 372 failures. The 12 public targets have 40
+passes and six failures. Every one of the first run's 5,087 passes remains, and
+the two new namespace failures now pass. Against the earlier reference-flow
+run, one library test fails only because identical HashMap entries print in a
+different order. The reviewer checked both complete state dumps. No expectation
+changed. The three earlier unsupported-expectation losses remain unresolved.
+Four public property-truthiness failures still need a pre-draft comparison.
+Two type-only namespace tests now compile, but stop at an unsupported callable
+expression. Their target has no result in the compared earlier selections.
 
-The [ownership observation](../target/query-core-declared-owner-observation-3-result.md)
-identifies a merged variable-and-namespace symbol. The global-value planner
-rejects its export table. Pinned Go checks the variable's value type before
-module flags. The next repair must preserve both the selected variable type
-and the complete namespace export merge. It must not allow export tables
-without checking their source. Complete named and nested write state also
-remains unfinished. All runtime checks are closed and temporary traces removed.
+[Unchanged Query](../target/query-core-variable-namespaces-query-1-result.md)
+still completes only 2 of 23 isolated roots. The ownership error is gone.
+Ordinary checking now stops at the optional `send` method in Node's `process.d.ts`.
+All diagnostic snapshots and the full input graph are unchanged. This is no
+complete-root or diagnostic gain. The results cover the combined working tree,
+not the namespace commit in isolation. All measured file bytes remain unchanged
+after the two commits, and all runtime checks have closed.
+
+The next check follows the shared inherited-interface path. Rust's global-read
+helper rejects lazy lookup for interfaces with heritage, and `Process` extends
+`EventEmitter`. Go separates member-table resolution from the types of named
+methods. Confirm the actual caller before changing it. Complete that lookup
+path instead of adding an isolated `send` rule. Complete named and nested write
+state also remains unfinished.
 
 The last full integration selection at `f38238f76` had 5,068 library passes with
 369 failures and 687 public passes with 24 failures. Against the accepted checker
@@ -119,6 +129,8 @@ project has gained a complete isolated root in the latest comparisons.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
+| Query, merged variable-and-namespace repair | 2 of 23 isolated roots complete | Ownership error cleared. Ordinary checking stops at a method signature in process.d.ts. All diagnostics unchanged |
+| Variable-and-namespace tests | Library 5,065 pass, 372 fail. Public 40 pass, 6 fail | All three new cases pass. All 5,087 first-run passes retained. Existing failures still block promotion |
 | Query, reference-flow draft | 2 of 23 isolated roots complete | Ordinary checking fails with SymbolNotOwned. All diagnostic records remain unchanged |
 | Reference-flow draft tests | Library 5,066 pass, 371 fail. Selected public cases 12 pass, 4 fail | Three new cases pass. Three previous library passes fail. One previous failure passes. Nothing promoted |
 | Query, interface repair | 2 of 23 isolated roots complete | Every outcome and diagnostic matches census 44. Ordinary checking still stops |
