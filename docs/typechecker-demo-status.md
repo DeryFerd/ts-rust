@@ -9,10 +9,10 @@ project has gained a complete isolated root in the latest comparisons.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
-| Query core, census 32 | 2 of 23 isolated roots complete | Eight completed censuses without a new complete root. One new invariant failure |
+| Query core, census 33 | 2 of 23 isolated roots complete | Nine completed censuses without a new complete root. Six invariant failures |
 | Hono, census 24 | 33 of 188 isolated roots complete | No complete-root gains. Internal errors fell from 6 to 2, becoming unsupported stops |
 | Focused tests, run 53 | 177 pass, 31 fail | One unchanged case recovered, no old pass lost. New cases: 11 pass, 12 fail |
-| Checker library, run 6 | Compile failure, no tests ran | Run 5 remains the last result: 5,072 pass, 365 fail |
+| Checker library, run 7 | 5,068 pass, 369 fail | Seven lost passes, three recoveries. Source acceptance remains blocked |
 
 An isolated root is one original entry file checked on its own. These counts
 are not full-project passes or percentages of TypeScript support.
@@ -25,6 +25,14 @@ rejects its legal trailing comma. No complete root was gained or lost.
 The ordinary `timeoutManager.ts` failure is unchanged. The census took 20.009
 seconds after a 2m05s build.
 
+[Query 33](../target/wave202-query-combined-census-33-result.md) then tested
+the class-global repair. It still completes only two roots. The five shared
+`removable.ts` failures changed from unsupported reads to class invariants.
+The other 18 outcomes and the ordinary failure are unchanged. All recorded
+inputs match. A follow-up condition repair clears the focused test's
+`UnknownCondition` failure, but reaches `InvalidCallEffect` instead. The next
+project run stays held until that control passes.
+
 [Hono 24](../target/wave202-hono-combined-census-24-result.md) completed all
 188 roots with unchanged recorded inputs. It has 152 unsupported roots,
 two internal errors and one original skip. The same 33 roots complete.
@@ -32,6 +40,13 @@ The ordinary check still fails in `http-exception.ts`. A separate observation
 identifies the reported symbol as the merged global `Response`. Its precise
 rejecting guard is still under investigation. The complete census took
 716.068 seconds after a 1m58s build.
+
+[Hono ordinary 5](../target/wave202-hono-ordinary-5-result.md) clears the
+symbol-ownership failure with a reviewed five-line change. It reuses the
+existing proof for all declarations of a merged global. The next failure is
+`R01.RELATION`, requiring resolved structured members in `http-exception.ts`.
+The check took 310.482 seconds after a 1m56s build. It still returns no graph
+or replay, and does not establish a completed file or project.
 
 [Tests 53](../target/wave202-query-hono-combined-tests-53-result.md) ran all
 208 cases in 77 targets. The 185 old cases have 166 passes and 19 failures.
@@ -44,17 +59,28 @@ compile its test harness. A test-only `SourceFlowPlan` initializer lacks the
 new `class_expression_conditions` field. All 5,437 baseline cases are unrun.
 Normal-library compilation did not catch this test-only error.
 
-The class-global repair has since passed its two new focused tests. Its old
-logical-call control still fails. Query 33 is released to measure the repair
-against the original project. This is not yet a complete-root gain.
+[Library 7](../target/wave202-query-hono-checker-lib-7-result.md) ran all
+5,437 cases after the one-line initializer repair. It has seven lost passes
+and three recoveries against run 5. One loss is a real sort-callback routing
+regression. Another is only map ordering in a debug snapshot. The remaining
+five involve changed support, member state, or an unsupported-error category
+and need further checks. All seven remain measured failures. No test
+expectation has changed, and the source batch is not accepted.
+
+The [constructor repair](../target/wave202-constructor-trailing-comma-1-result.md)
+passes both new tests. [Generic defaults, run 3](../target/wave202-function-parameter-default-3-result.md)
+passes four of five tests. Two new controls now pass in full and both old
+numeric controls retain their passes. The remaining new case fails a
+contextual literal identity check. Its expected result matches the pinned Go
+checker. These focused gains are not complete-project gains.
 
 ## Next project milestones
 
 1. Finish the shared `removable.ts` path used by five Query roots. Check each
    small repair on the real project immediately. A changed first error is not
    completion. The next useful result is a complete root with correct checking.
-2. Remove Hono's first internal error for the merged global `Response`, with
-   correct declaration ownership. Then rerun the ordinary project check.
+2. Resolve the members needed by Hono's next type comparison. Keep the exact
+   declaration ownership and use the existing member-resolution path.
 3. Keep the compiler and test harness buildable. Integrate small tested changes
    instead of collecting another large batch of uncompiled worker changes.
 
@@ -221,14 +247,16 @@ Query 32 and Hono 24 are complete on the same production source and unchanged
 recorded inputs. Neither gained a complete root. The separate observation
 identified `Response`; its symbol and both type caches were present at the
 observation point. This does not identify the exact earlier rejecting guard.
-Library 6 is closed after the test-harness compile failure described above.
+Library 6 is closed after its test-harness compile failure. Library 7 now has
+the full results above. Hono ordinary 5 clears the ownership failure but stops
+at the next comparison.
 
 The next repairs target the measured class-global read, constructor trailing
 comma and generic default-parameter failures. The default-parameter source
-and tests compiled, but all three new tests failed. Both old numeric-default
-tests passed. A one-file generic-call follow-up is committed after review and
-has not run. The constructor trailing-comma repair has two new controls and
-is released for its first compiler and test check.
+and tests reached four passes and one failure in run 3. The constructor
+trailing-comma repair passed both new controls. Neither has established a new
+complete project root. The callback-owner repair is committed and its focused
+checks are running separately, with the known helper correction counted apart.
 
 The workflow now requires a fast compiler check before a donor enters a
 project batch. Repeated commands no longer need another preparation reviewer
