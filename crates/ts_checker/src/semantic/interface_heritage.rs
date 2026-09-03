@@ -313,12 +313,6 @@ pub(super) enum DirectInterfaceHeritageError {
     Unsupported { node: NodeRef, kind: SyntaxKind },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HeritageTypeParameterAnnotations {
-    Defaults,
-    Defer,
-}
-
 pub(super) const MAX_INTERFACE_HERITAGE_DEPTH: usize = 16;
 const MAX_REACT_FORWARDED_INTERFACE_ARGUMENT_DEPTH: usize = 3;
 
@@ -2667,6 +2661,15 @@ pub(super) fn plan_interface_alias_base_reference(
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
 ) -> Result<Option<DirectInterfaceBasePlan>, DirectInterfaceHeritageError> {
+    Ok(plan_interface_type_base_reference(store, host, node)?
+        .filter(|base| base.kind.is_instantiated_alias()))
+}
+
+pub(super) fn plan_interface_type_base_reference(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Option<DirectInterfaceBasePlan>, DirectInterfaceHeritageError> {
     let invalid = || DirectInterfaceHeritageError::Invalid;
     let record = preflight_node(store, host, node).map_err(|_| invalid())?;
     let clause = record
@@ -2692,7 +2695,12 @@ pub(super) fn plan_interface_alias_base_reference(
     Ok(plan
         .bases
         .into_iter()
-        .find(|base| base.node == node && base.kind.is_instantiated_alias()))
+        .find(|base| {
+            base.node == node
+                && (base.kind.is_instantiated_alias()
+                    || base.kind == DirectInterfaceBaseKind::Interface
+                        && !base.type_arguments.is_empty())
+        }))
 }
 
 fn plan_direct_interface_heritage_inner(
@@ -3301,7 +3309,6 @@ fn plan_interface_type_arguments(
                 NodeRef::new(declaration.arena, declaration.file, *parameter),
                 *symbol,
                 node,
-                HeritageTypeParameterAnnotations::Defer,
             )?;
         }
     }
@@ -3319,9 +3326,7 @@ fn plan_interface_type_arguments(
         if record.kind != SyntaxKind::InterfaceDeclaration
             || record.flags.0 != 0
             || !host.symbol_matches(store, base_declaration, base)
-            || base_parameters.is_some_and(|parameters| {
-                parameters.has_trailing_comma || parameters.nodes.is_empty()
-            })
+            || base_parameters.is_some_and(|parameters| parameters.nodes.is_empty())
         {
             return Err(unsupported());
         }
@@ -3355,11 +3360,6 @@ fn plan_interface_type_arguments(
                 parameter,
                 *symbol,
                 node,
-                if react_namespace.is_some() || owner_parameters.is_empty() {
-                    HeritageTypeParameterAnnotations::Defer
-                } else {
-                    HeritageTypeParameterAnnotations::Defaults
-                },
             )?;
             let parameter_record = preflight_node(store, host, parameter)
                 .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
@@ -3441,10 +3441,8 @@ fn plan_interface_type_arguments(
                 &argument_record.data,
                 NodeData::TypeReferenceNode(reference) if reference.type_arguments.is_some()
             )
+            && let Some(namespace) = react_namespace
         {
-            let Some(namespace) = react_namespace else {
-                return Err(unsupported());
-            };
             authenticate_react_forwarded_interface_argument(
                 store,
                 host,
@@ -4094,7 +4092,6 @@ fn authenticate_concrete_interface_type_argument(
                     NodeRef::new(declaration.0.arena, declaration.0.file, *parameter),
                     *parameter_symbol,
                     argument,
-                    HeritageTypeParameterAnnotations::Defer,
                 )?;
             }
         }
@@ -4222,7 +4219,6 @@ fn authenticate_heritage_type_parameter(
     parameter: NodeRef,
     symbol: SemanticSymbolId,
     heritage: NodeRef,
-    annotations: HeritageTypeParameterAnnotations,
 ) -> Result<NodeRef, DirectInterfaceHeritageError> {
     let unsupported = || DirectInterfaceHeritageError::Unsupported {
         node: heritage,
@@ -4249,7 +4245,6 @@ fn authenticate_heritage_type_parameter(
     if record.kind != SyntaxKind::TypeParameter
         || record.flags.0 != 0
         || record.parent != Some(declaration.node)
-        || annotations == HeritageTypeParameterAnnotations::Defaults && data.constraint.is_some()
         || data.expression.is_some()
         || data.modifiers.is_some()
         || data.symbol.is_some()
