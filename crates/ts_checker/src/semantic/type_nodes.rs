@@ -33165,9 +33165,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 return Ok(None);
             }
         }
-        let Some(resolved) =
-            source_imports::plan_source_named_type_import_target(self.store, self.host, node)
-                .map_err(|error| property_type_import_error(node, error))?
+        let Some(resolved) = source_imports::plan_source_named_type_import_target(
+            self.store, self.host, node, self.array_targets,
+        )
+        .map_err(|error| property_type_import_error(node, error))?
         else {
             return Ok(None);
         };
@@ -33274,8 +33275,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 return Err(invalid());
             }
         }
-        source_imports::plan_source_type_import_reference(
-            self.store, self.host, &resolved, node, node,
+        source_imports::plan_source_type_import_reference_with_array_targets(
+            self.store, self.host, &resolved, node, node, self.array_targets,
         )
         .map(Some)
         .map_err(|error| property_type_import_error(node, error))

@@ -6506,6 +6506,7 @@ pub(super) fn plan_source_named_type_import_target(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     reference: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<ResolvedSourceTypeImportBinding>, SourceImportError> {
     let Some((import, binding)) =
         plan_named_type_import_at_reference(store, host, reference, &mut None)?
@@ -6513,7 +6514,9 @@ pub(super) fn plan_source_named_type_import_target(
         return Ok(None);
     };
     let (resolved, _) = plan_named_type_import_target(store, host, &import, &binding)?;
-    validate_source_type_import_reference_source(store, host, &resolved, reference)?;
+    validate_source_type_import_reference_source_with_array_targets(
+        store, host, &resolved, reference, array_targets,
+    )?;
     Ok(Some(resolved))
 }
 
@@ -7570,6 +7573,19 @@ pub(super) fn plan_source_type_import_reference(
     root: NodeRef,
     reference: NodeRef,
 ) -> Result<CanonicalTypeReferenceAliasTarget, SourceImportError> {
+    plan_source_type_import_reference_with_array_targets(
+        store, host, resolved, root, reference, None,
+    )
+}
+
+pub(super) fn plan_source_type_import_reference_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    resolved: &ResolvedSourceTypeImportBinding,
+    root: NodeRef,
+    reference: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<CanonicalTypeReferenceAliasTarget, SourceImportError> {
     let binding = &resolved.binding;
     if !root.is_for(binding.declaration.arena, binding.declaration.file)
         || !reference.is_for(root.arena, root.file)
@@ -7584,7 +7600,9 @@ pub(super) fn plan_source_type_import_reference(
             reference,
         )));
     }
-    validate_source_type_import_reference_source(store, host, resolved, reference)?;
+    validate_source_type_import_reference_source_with_array_targets(
+        store, host, resolved, reference, array_targets,
+    )?;
     Ok(CanonicalTypeReferenceAliasTarget::new(
         root,
         reference,
@@ -7601,6 +7619,18 @@ fn validate_source_type_import_reference_source(
     host: &DeclaredTypeHost<'_>,
     resolved: &ResolvedSourceTypeImportBinding,
     reference: NodeRef,
+) -> Result<(), SourceImportError> {
+    validate_source_type_import_reference_source_with_array_targets(
+        store, host, resolved, reference, None,
+    )
+}
+
+fn validate_source_type_import_reference_source_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    resolved: &ResolvedSourceTypeImportBinding,
+    reference: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), SourceImportError> {
     let binding = &resolved.binding;
     let source_class = store
@@ -7767,6 +7797,7 @@ fn validate_source_type_import_reference_source(
                 reference,
                 target_type,
                 cached,
+                array_targets,
             )?;
         }
     }
@@ -7775,7 +7806,7 @@ fn validate_source_type_import_reference_source(
 }
 
 /// A missing argument list still instantiates a generic provider's defaults.
-/// Defaulted object wrappers must retain their exact source request.
+/// Function aliases and object wrappers retain their own exact source request.
 #[allow(clippy::too_many_lines)] // Keep source parameters, the written request, and its mapped result together.
 fn validate_omitted_type_import_reference_cache(
     store: &CanonicalTypeMapperStore,
@@ -7784,6 +7815,7 @@ fn validate_omitted_type_import_reference_cache(
     reference: NodeRef,
     declared_type: Option<TypeId>,
     cached: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), SourceImportError> {
     let invalid = || invariant(SourceImportInvariant::InvalidTypeReferenceCache(reference));
     let (arena, bound) = host
@@ -7814,6 +7846,95 @@ fn validate_omitted_type_import_reference_cache(
         };
     };
     let declared_type = declared_type.ok_or_else(invalid)?;
+    if let Some(source) = super::functions::generic_function_alias_projection(store, declared_type)
+        .map_err(|_| invalid())?
+    {
+        let actual = super::functions::generic_function_alias_projection(store, cached)
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+        let links = store
+            .type_alias_links(resolved.target_symbol)
+            .ok_or_else(invalid)?;
+        let key = super::type_nodes::type_alias_instantiation_cache_key(&[], None);
+        if source.type_ != source.target
+            || source.symbol != resolved.target_symbol
+            || source.parameters.len() != parameters.nodes.len()
+            || actual.target != source.target
+            || actual.symbol != source.symbol
+            || actual.parameters != source.parameters
+            || links.declared_type != Some(declared_type)
+            || links.type_parameters.as_deref() != Some(source.parameters.as_slice())
+            || links.is_constructor_declared_property
+            || links
+                .instantiations
+                .as_ref()
+                .and_then(|entries| entries.get(&key))
+                != Some(&cached)
+        {
+            return Err(invalid());
+        }
+        let mut arguments = Vec::with_capacity(source.parameters.len());
+        for (&parameter_node, &parameter_type) in parameters.nodes.iter().zip(&source.parameters) {
+            let parameter_node = NodeRef::new(
+                resolved.target_declaration.arena,
+                resolved.target_declaration.file,
+                parameter_node,
+            );
+            let parameter_record = checked_node(arena, bound, store, parameter_node)?;
+            let NodeData::TypeParameterDeclaration(parameter) = &parameter_record.data else {
+                return Err(invalid());
+            };
+            let owner = super::declared::cached_ordinary_type_parameter_owner(store, parameter_type)
+                .ok_or_else(invalid)?;
+            if parameter_record.kind != SyntaxKind::TypeParameter
+                || parameter_record.parent != Some(resolved.target_declaration.node)
+                || !host.symbol_matches(store, parameter_node, owner)
+            {
+                return Err(invalid());
+            }
+            let default = NodeRef::new(
+                parameter_node.arena,
+                parameter_node.file,
+                parameter.default_type.ok_or_else(invalid)?,
+            );
+            if checked_node(arena, bound, store, default)?.parent != Some(parameter_node.node) {
+                return Err(invalid());
+            }
+            let raw = super::source_callables::cached_annotation_identity(store, default, false)
+                .ok_or_else(invalid)?;
+            if !matches!(store.type_payload(parameter_type).map(TypeRecord::data),
+                Some(TypeData::TypeParameter(data)) if data.resolved_default_type == Some(raw))
+            {
+                return Err(invalid());
+            }
+            let argument = super::instantiate::cached_instantiation_with_vector(
+                store,
+                raw,
+                &source.parameters[..arguments.len()],
+                &arguments,
+                array_targets,
+                None,
+            )
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+            arguments.push(argument);
+        }
+        if actual.arguments != arguments
+            || super::instantiate::cached_instantiation_with_vector(
+                store,
+                declared_type,
+                &source.parameters,
+                &arguments,
+                array_targets,
+                None,
+            )
+            .map_err(|_| invalid())?
+                != Some(cached)
+        {
+            return Err(invalid());
+        }
+        return Ok(());
+    }
     let source = super::object_aliases::property_object_alias_projection(store, declared_type)
         .map_err(|_| invalid())?
         .ok_or_else(invalid)?;

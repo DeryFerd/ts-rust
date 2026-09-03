@@ -101,7 +101,9 @@ use std::{
 #[cfg(test)]
 use super::classes::{plan_source_class_members, prepare_source_class_members};
 #[cfg(test)]
-use super::source_imports::preflight_prepared_source_import_publications_with_host;
+use super::source_imports::{
+    plan_source_type_import_reference, preflight_prepared_source_import_publications_with_host,
+};
 #[cfg(test)]
 use super::source_properties::check_class_property_write_target;
 
@@ -285,7 +287,7 @@ use super::{
         plan_source_class_import_read, plan_source_class_type_import,
         plan_source_import_default_arrow_export, plan_source_import_identifier_read,
         plan_source_jsdoc_typedef_import, plan_source_property_type_import,
-        plan_source_type_import_reference, plan_top_level_import_equals,
+        plan_source_type_import_reference_with_array_targets, plan_top_level_import_equals,
         plan_top_level_javascript_require, plan_top_level_named_reexport,
         plan_top_level_named_specifier_type_import, plan_top_level_named_type_import,
         plan_top_level_named_value_import,
@@ -64865,9 +64867,15 @@ fn prepare_imported_default_arrow_capabilities(
         let binding = resolved_bindings
             .get(&reference.alias_symbol)
             .ok_or(SourceCheckError::Import(reference.node))?;
-        let capability =
-            plan_source_type_import_reference(store, host, binding, reference.root, reference.node)
-                .map_err(|error| SourcePlanner::import_plan_error(reference.node, &error))?;
+        let capability = plan_source_type_import_reference_with_array_targets(
+            store,
+            host,
+            binding,
+            reference.root,
+            reference.node,
+            Some(CanonicalArrayTargets::from_global_types(global_types)),
+        )
+        .map_err(|error| SourcePlanner::import_plan_error(reference.node, &error))?;
         capabilities
             .entry(reference.root)
             .or_default()
@@ -77623,12 +77631,13 @@ fn check_source_plan(
         let resolved = resolved_type_imports
             .get(&reference.alias_symbol)
             .ok_or(SourceCheckError::Import(reference.node))?;
-        let capability = plan_source_type_import_reference(
+        let capability = plan_source_type_import_reference_with_array_targets(
             store,
             host,
             resolved,
             reference.root,
             reference.node,
+            Some(CanonicalArrayTargets::from_global_types(global_types)),
         )
         .map_err(|error| SourcePlanner::import_plan_error(reference.node, &error))?;
         if !type_import_capability_references.insert(reference.node) {

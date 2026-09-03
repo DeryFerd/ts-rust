@@ -491,8 +491,9 @@ fn plan_contextual_target_syntax_shape(
     type_node: NodeRef,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(SourceContextualSignatureShape, NodeRef, Vec<NodeRef>), SourceContextualArrowError> {
-    let (function, alias) =
-        contextual_function_type_syntax(store, host, type_node, None, &mut HashSet::new())?;
+    let (function, alias) = contextual_function_type_syntax(
+        store, host, type_node, None, &mut HashSet::new(), array_targets,
+    )?;
     let function_record = preflight_node(store, host, function)?;
     let (parameter_types, return_type) = match function_record.kind {
         SyntaxKind::FunctionType => {
@@ -772,6 +773,7 @@ fn contextual_function_type_syntax(
     node: NodeRef,
     alias: Option<SemanticSymbolId>,
     active_aliases: &mut HashSet<SemanticSymbolId>,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(NodeRef, Option<SemanticSymbolId>), SourceContextualArrowError> {
     let record = preflight_node(store, host, node)?;
     match (&record.kind, &record.data) {
@@ -800,7 +802,9 @@ fn contextual_function_type_syntax(
                     SourceContextualArrowInvariant::InvalidVariableType(child),
                 ));
             }
-            contextual_function_type_syntax(store, host, child, alias, active_aliases)
+            contextual_function_type_syntax(
+                store, host, child, alias, active_aliases, array_targets,
+            )
         }
         (SyntaxKind::TypeReference, NodeData::TypeReferenceNode(reference)) => {
             if reference.type_arguments.is_some() {
@@ -824,9 +828,10 @@ fn contextual_function_type_syntax(
                     SourceContextualArrowInvariant::InvalidVariableType(name),
                 ));
             }
-            let imported =
-                super::source_imports::plan_source_named_type_import_target(store, host, node)
-                    .map_err(|error| super::type_nodes::property_type_import_error(node, error))?;
+            let imported = super::source_imports::plan_source_named_type_import_target(
+                store, host, node, array_targets,
+            )
+            .map_err(|error| super::type_nodes::property_type_import_error(node, error))?;
             let symbol = if let Some(imported) = imported {
                 imported.target_symbol
             } else {
@@ -917,8 +922,9 @@ fn contextual_function_type_syntax(
                     SourceContextualArrowInvariant::InvalidVariableType(body),
                 ));
             }
-            let alias_target =
-                contextual_function_type_syntax(store, host, body, Some(symbol), active_aliases);
+            let alias_target = contextual_function_type_syntax(
+                store, host, body, Some(symbol), active_aliases, array_targets,
+            );
             active_aliases.remove(&symbol);
             alias_target
         }
@@ -940,6 +946,7 @@ fn contextual_function_type_syntax(
                     constituent,
                     None,
                     active_aliases,
+                    array_targets,
                 ) {
                     Ok(found) if callable.replace(found).is_some() => {
                         return Err(contextual_unsupported(
