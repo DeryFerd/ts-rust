@@ -21,8 +21,10 @@ Use one integration branch, `query-core-integration`, at the existing candidate
 `eb99690774e90e6333bc606e1402b6770259d371`. Reuse its current worktree and build
 target. Hono 26 has closed and root owns both. The candidate is not accepted,
 and no pending feature branch joins automatically.
-The latest tested integration checkpoint is `f38238f76`. It is committed with a
-clean worktree, but is not promoted. Query still does not complete.
+The last committed integration checkpoint is `f38238f76`. A reference-flow draft
+now changes six files in that worktree. It is not committed or promoted. Query
+still does not complete. Its latest result and regression losses are in the
+status document.
 
 ### Regression baseline
 
@@ -102,7 +104,7 @@ reassess the dependency path. More workers are not the fallback. Run Hono after
 a meaningful Query milestone or a shared-path change that needs a cross-project
 check, rather than after every local edit.
 
-### Next operation: merged ambient global values
+### Earlier operation: merged ambient global values
 
 The [current class observation](../target/query-core-class-annotation-observation-1-result.md)
 did not reproduce the earlier type-literal cache failure on the integration
@@ -175,6 +177,37 @@ Its flow query separately narrows the referenced type for the true or false
 branch. This is the structure to port. The actual Query operand form remains
 unread under the source restrictions. Confirm the rejecting predicate with a
 bounded trace or a focused case before editing this path.
+
+### Current reference-flow draft
+
+The bounded condition observation identified a property access compared with a
+string using !==. The draft now carries reference identity and checked condition
+values through real binder branch edges. All three new public cases pass with
+fixed types, symbols, errors and replay checks. Three previous library passes
+now fail unsupported-result assertions. They remain blockers until the original
+cases have concrete pinned-Go comparisons. No expectation has changed.
+
+Unchanged Query still has only two complete isolated roots. Its ordinary check
+now reports SymbolNotOwned. Every diagnostic record is unchanged. The
+[ownership observation](../target/query-core-declared-owner-observation-3-result.md)
+identifies a merged variable-and-namespace symbol whose export table is rejected
+by the global-value planner. Pinned Go dispatches variable flags before module
+flags. Complete this shared declared-value path before adding more conditions.
+Prove the namespace contributions and their exact merged export table, then use
+the selected variable annotation through the existing value checker. Reuse the
+saved export-merge checks from merged function namespaces. Keep all declaration,
+scope, cache and replay checks. No numeric-ID or flags-only exception is valid.
+
+The complete reference-flow operation also needs retained checked member-write
+state. The existing shared assignment path checks the RHS but does not keep its
+member value in the frame. Reuse the real member lookup, normal RHS checker and
+assignment reduction. Keep the live class frame through receiver and RHS checks.
+Exact writes must use their checked flow type. Prefix writes must reset nested
+references. Unrelated writes must retain facts. Direct-this writes and the old
+arrow path must keep their behavior.
+
+Before promotion, rerun the full accepted selections and original corpus on the
+final bytes. The new focused passes do not offset old failures or absent tests.
 
 ### Immediate milestone
 

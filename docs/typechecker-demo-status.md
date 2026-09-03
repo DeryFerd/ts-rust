@@ -10,17 +10,37 @@ check. All earlier worker runs have closed. Root owns the integration branch
 
 ## Latest checkpoint
 
-Candidate `f38238f76` is committed on the integration branch. Its worktree is
-clean. It retains every previous integration test outcome and repairs the three
-failures introduced by its first draft. All 39 focused tests pass. The full
-checker selection has 5,068 library passes with 369 failures and 687 public
-passes with 24 failures. Against the accepted checker selection, 248 old passes
-still fail and 12 names are absent. Those remain blockers.
+The integration branch is at `f38238f76` with an uncommitted reference-flow
+draft. Nothing is promoted to the accepted compiler. Root remains the sole
+implementer. The single reviewer makes no production changes.
 
-[Fresh Query](../target/query-core-ambient-global-values-query-2-result.md) still
-does not complete. It has 2 of 23 complete isolated roots and no diagnostic gain.
-The next operation is class condition checking together with branch flow. All
-runtime checks are closed. The candidate is not promoted to the accepted compiler.
+The [third draft test run](../target/query-core-reference-conditions-3-result.md)
+compiled implementation and test code. All three new public cases pass. They
+check both branches, receiver identity, a parent write, exact types and symbols,
+negative diagnostics, cold queries and replay. The library has 5,066 passes and
+371 failures. Against the previous integration run, 5,065 library passes remain,
+three old passes now fail and one old failure passes. All three new failures
+expect unsupported results, but none has an approved expectation change.
+Four other public failures still need a pre-draft comparison.
+
+[Unchanged Query](../target/query-core-reference-conditions-query-1-result.md)
+still completes only 2 of 23 isolated roots. Ordinary checking now fails with a
+symbol-ownership error instead of the condition rejection. Every diagnostic
+record is unchanged. This is not a completed feature.
+
+The [ownership observation](../target/query-core-declared-owner-observation-3-result.md)
+identifies a merged variable-and-namespace symbol. The global-value planner
+rejects its export table. Pinned Go checks the variable's value type before
+module flags. The next repair must preserve both the selected variable type
+and the complete namespace export merge. It must not allow export tables
+without checking their source. Complete named and nested write state also
+remains unfinished. All runtime checks are closed and temporary traces removed.
+
+The last full integration selection at `f38238f76` had 5,068 library passes with
+369 failures and 687 public passes with 24 failures. Against the accepted checker
+selection, 248 old passes failed and 12 names were absent. That full selection,
+the compiler tests and the original corpus must run again before this draft can
+be promoted. Older results are not fresh passes for the draft.
 
 ## Earlier checks
 
@@ -99,6 +119,8 @@ project has gained a complete isolated root in the latest comparisons.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
+| Query, reference-flow draft | 2 of 23 isolated roots complete | Ordinary checking fails with SymbolNotOwned. All diagnostic records remain unchanged |
+| Reference-flow draft tests | Library 5,066 pass, 371 fail. Selected public cases 12 pass, 4 fail | Three new cases pass. Three previous library passes fail. One previous failure passes. Nothing promoted |
 | Query, interface repair | 2 of 23 isolated roots complete | Every outcome and diagnostic matches census 44. Ordinary checking still stops |
 | Query, current bounded observations | 2 of 23 isolated roots complete | Ordinary checking reaches a merged global-variable rejection. No diagnostic gain |
 | Query, repaired ambient global values | 2 of 23 isolated roots complete | Variable rejection cleared. Ordinary checking still stops at its enclosing binary expression. No diagnostic gain |
