@@ -3596,6 +3596,10 @@ enum PlannedLinearFunctionStatement {
     ParameterAssignment(Box<PlannedLinearParameterAssignment>),
     CompoundParameterAssignment(Box<PlannedLinearParameterCompoundAssignment>),
     CapturedAssignment(Box<PlannedCapturedLocalAssignment>),
+    ElementAssignment {
+        assignment: Box<PlannedElementAssignment>,
+        flow: super::source_flow::SourceElementAssignmentProof,
+    },
     Expression {
         statement: NodeRef,
         expression: Box<PlannedExpression>,
@@ -3614,6 +3618,7 @@ impl PlannedLinearFunctionStatement {
             Self::ParameterAssignment(assignment) => Some(assignment.statement),
             Self::CompoundParameterAssignment(assignment) => Some(assignment.statement),
             Self::CapturedAssignment(assignment) => Some(assignment.flow.statement),
+            Self::ElementAssignment { flow, .. } => Some(flow.statement),
             Self::Function(_) | Self::Enum(_) => None,
         }
     }
@@ -10369,6 +10374,55 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             expression: assignment.expression,
             element,
             right,
+        }))
+    }
+
+    fn plan_linear_element_assignment(
+        &mut self,
+        callable: &SourceCallablePlan,
+        statement: NodeRef,
+        expression: NodeRef,
+    ) -> Result<Option<PlannedLinearFunctionStatement>, SourceCheckError> {
+        let NodeData::BinaryExpression(binary) = &self.node(expression)?.data else {
+            return Ok(None);
+        };
+        if self.node(self.reference(binary.left))?.kind != SyntaxKind::ElementAccessExpression
+            || self.node(self.reference(binary.operator_token))?.kind != SyntaxKind::EqualsToken
+        {
+            return Ok(None);
+        }
+        let Some((store, host)) = self.semantic else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let Some(flow) = super::source_flow::source_element_assignment_proof(store, host, expression)
+            .map_err(|error| Self::source_flow_plan_error(callable, error))?
+        else {
+            return Ok(None);
+        };
+        if flow.statement != statement {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let syntax =
+            plan_direct_source_element_write_syntax(self.arena, store, flow.target, expression)
+                .map_err(|error| Self::element_plan_error(flow.target, error))?;
+        let receiver = self.plan_expression(flow.receiver)?;
+        if !matches!(&receiver.kind, PlannedExpressionKind::Identifier(read)
+            if read.kind == PlannedIdentifierReadKind::Variable && read.value_symbol == flow.symbol)
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let index = self.plan_expression(flow.index)?;
+        let element = finish_direct_source_element_plan(syntax, receiver, index)
+            .map_err(|error| Self::element_plan_error(flow.target, error))?;
+        self.primitive_binary_position_roots.insert(flow.right);
+        let right = self.plan_expression(flow.right)?;
+        Ok(Some(PlannedLinearFunctionStatement::ElementAssignment {
+            assignment: Box::new(PlannedElementAssignment {
+                expression,
+                element,
+                right,
+            }),
+            flow,
         }))
     }
 
@@ -18703,6 +18757,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     statement,
                     expression,
                 } => {
+                    if let Some(assignment) =
+                        self.plan_linear_element_assignment(callable, statement, expression)?
+                    {
+                        statements.push(assignment);
+                        continue;
+                    }
                     if let Some(assignment) = self.plan_linear_annotated_local_assignment(
                         callable, &locals, statement, expression,
                     )? {
@@ -18820,6 +18880,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 PlannedLinearFunctionStatement::CapturedAssignment(assignment) => {
                     Some(assignment.flow.statement)
                 }
+                PlannedLinearFunctionStatement::ElementAssignment { flow, .. } => {
+                    Some(flow.statement)
+                }
                 PlannedLinearFunctionStatement::Expression { statement, .. }
                 | PlannedLinearFunctionStatement::Throw { statement, .. } => Some(*statement),
             })
@@ -18881,6 +18944,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 PlannedLinearFunctionStatement::CapturedAssignment(assignment) => {
                     collect_eager_logical_truthiness_conditions(&assignment.right, &mut conditions);
                 }
+                PlannedLinearFunctionStatement::ElementAssignment { assignment, .. } => {
+                    for expression in [
+                        &assignment.element.receiver,
+                        &assignment.element.index,
+                        &assignment.right,
+                    ] {
+                        collect_eager_logical_truthiness_conditions(expression, &mut conditions);
+                    }
+                }
                 PlannedLinearFunctionStatement::Expression { expression, .. }
                 | PlannedLinearFunctionStatement::Throw { expression, .. } => {
                     collect_eager_logical_truthiness_conditions(expression, &mut conditions);
@@ -18938,12 +19010,19 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 PlannedVariableInitializer::Expression(expression) => Some(expression),
                 _ => None,
             })
-            .chain(statements.iter().filter_map(|statement| match statement {
+            .chain(statements.iter().flat_map(|statement| match statement {
                 PlannedLinearFunctionStatement::Expression { expression, .. }
                 | PlannedLinearFunctionStatement::Throw { expression, .. } => {
-                    Some(expression.as_ref())
+                    vec![expression.as_ref()]
                 }
-                _ => None,
+                PlannedLinearFunctionStatement::ElementAssignment { assignment, .. } => {
+                    vec![
+                        &assignment.element.receiver,
+                        &assignment.element.index,
+                        &assignment.right,
+                    ]
+                }
+                _ => Vec::new(),
             }))
             .chain(return_expression.as_ref());
         for expression in expressions {
@@ -18958,7 +19037,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     .map(|call| call.node),
             );
         }
-        let flow = if !nullish.is_empty() {
+        let element_assignments = statements
+            .iter()
+            .filter_map(|statement| match statement {
+                PlannedLinearFunctionStatement::ElementAssignment { flow, .. } => Some(*flow),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let flow = if !nullish.is_empty() || !element_assignments.is_empty() {
             SourceFlowPlan::preflight_linear_with_nullish_assignments(
                 self.arena,
                 self.bound,
@@ -18979,6 +19065,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 }),
                 captured_array_mutations.iter().copied(),
                 nullish,
+                element_assignments,
             )
         } else if has_captured_assignment || !captured_array_mutations.is_empty() {
             SourceFlowPlan::preflight_linear_with_conditions_and_captured_effects(
@@ -34819,6 +34906,15 @@ fn arrow_has_deferred_object_members(arrow: &PlannedArrow) -> bool {
                     | PlannedLinearFunctionStatement::Throw { expression, .. } => {
                         expression_has_deferred_object_members(expression)
                     }
+                    PlannedLinearFunctionStatement::ElementAssignment { assignment, .. } => {
+                        [
+                            &assignment.element.receiver,
+                            &assignment.element.index,
+                            &assignment.right,
+                        ]
+                        .into_iter()
+                        .any(expression_has_deferred_object_members)
+                    }
                     _ => false,
                 })
         })
@@ -35547,6 +35643,15 @@ fn preflight_inferred_function_return_dependencies(
             }
             PlannedLinearFunctionStatement::Expression { expression, .. } => {
                 expression_is_closed(expression, parameters, locals, functions)
+            }
+            PlannedLinearFunctionStatement::ElementAssignment { assignment, .. } => {
+                [
+                    &assignment.element.receiver,
+                    &assignment.element.index,
+                    &assignment.right,
+                ]
+                .into_iter()
+                .all(|expression| expression_is_closed(expression, parameters, locals, functions))
             }
             _ => false,
         })
@@ -46405,6 +46510,7 @@ fn check_contextual_object_literal_method(
                     PlannedLinearFunctionStatement::ParameterAssignment(_)
                         | PlannedLinearFunctionStatement::CompoundParameterAssignment(_)
                         | PlannedLinearFunctionStatement::CapturedAssignment(_)
+                        | PlannedLinearFunctionStatement::ElementAssignment { .. }
                 )
             })
         })
@@ -49283,7 +49389,40 @@ fn check_planned_element_assignment(
     deferred: &mut Vec<DeferredAssertion>,
     assignment: &PlannedElementAssignment,
 ) -> Result<(), SourceCheckError> {
-    let receiver = check_expression_type(
+    check_planned_element_assignment_with_capture_context(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        flow_types,
+        type_import_execution,
+        deferred,
+        assignment,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_planned_element_assignment_with_capture_context(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    assignment: &PlannedElementAssignment,
+    mut class_flow: Option<&mut ClassBodyExecutionContext<'_, '_, '_>>,
+    arrow_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<(), SourceCheckError> {
+    let receiver = check_expression_type_with_capture_context(
         store,
         host,
         global_types,
@@ -49296,8 +49435,10 @@ fn check_planned_element_assignment(
         &assignment.element.receiver,
         None,
         deferred,
+        class_flow.as_deref_mut(),
+        arrow_capture,
     )?;
-    let index = check_expression_type(
+    let index = check_expression_type_with_capture_context(
         store,
         host,
         global_types,
@@ -49310,6 +49451,8 @@ fn check_planned_element_assignment(
         &assignment.element.index,
         None,
         deferred,
+        class_flow.as_deref_mut(),
+        arrow_capture,
     )?;
     let checked = check_direct_source_element_write_with_source::<SourceElementReadError>(
         store,
@@ -49331,7 +49474,7 @@ fn check_planned_element_assignment(
     if let Some(diagnostic) = checked.diagnostic {
         merge_retry_diagnostic(diagnostics, diagnostic);
     }
-    check_assignment_to_type(
+    check_assignment_to_type_with_capture_context(
         store,
         host,
         global_types,
@@ -49347,6 +49490,8 @@ fn check_planned_element_assignment(
         &assignment.right,
         assignment.element.node,
         Some(assignment.expression),
+        class_flow,
+        arrow_capture,
     )?;
     Ok(())
 }
@@ -56888,6 +57033,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
             | PlannedLinearFunctionStatement::ParameterAssignment(_)
             | PlannedLinearFunctionStatement::CompoundParameterAssignment(_)
             | PlannedLinearFunctionStatement::CapturedAssignment(_)
+            | PlannedLinearFunctionStatement::ElementAssignment { .. }
             | PlannedLinearFunctionStatement::Expression { .. }
             | PlannedLinearFunctionStatement::Throw { .. } => {}
         }
@@ -57277,6 +57423,68 @@ fn check_planned_linear_function_statements_with_capture_entries(
             }
             PlannedLinearFunctionStatement::CompoundParameterAssignment(_) => {
                 return Err(SourcePlanner::unsupported_function_body(callable));
+            }
+            PlannedLinearFunctionStatement::ElementAssignment { assignment, flow } => {
+                let snapshot = frame
+                    .snapshot_at(store, global_types, flow.statement)
+                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                let receiver = snapshot
+                    .types()
+                    .get(&flow.symbol)
+                    .copied()
+                    .ok_or_else(|| SourcePlanner::unsupported_function_body(callable))?;
+                // Typed arrays retain their receiver type. Evolving arrays need element inference.
+                if store
+                    .canonical_array_reference(global_types, receiver)?
+                    .is_none()
+                {
+                    return Err(SourcePlanner::unsupported_function_body(callable));
+                }
+                check_planned_element_assignment_with_capture_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    snapshot.types(),
+                    type_import_execution,
+                    deferred,
+                    assignment,
+                    class_flow.as_deref_mut(),
+                    arrow_capture,
+                )?;
+                if store
+                    .type_node_links(flow.receiver)
+                    .and_then(|links| links.resolved_type)
+                    != Some(receiver)
+                {
+                    return Err(SourceCheckError::Element(flow.target));
+                }
+                for expression in [
+                    &assignment.element.receiver,
+                    &assignment.element.index,
+                    &assignment.right,
+                ] {
+                    complete_nullish_assignment_effects(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        &mut frame,
+                        type_import_execution,
+                        expression,
+                        snapshot.types(),
+                    )?;
+                }
+                for target in flow.targets() {
+                    frame
+                        .complete_assignment(target, flow.symbol, receiver)
+                        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                }
             }
             PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
                 let current_type = check_planned_parameter_assignment(
@@ -78803,6 +79011,7 @@ fn check_source_plan(
                         | PlannedLinearFunctionStatement::ParameterAssignment(_)
                         | PlannedLinearFunctionStatement::CompoundParameterAssignment(_)
                         | PlannedLinearFunctionStatement::CapturedAssignment(_)
+                        | PlannedLinearFunctionStatement::ElementAssignment { .. }
                         | PlannedLinearFunctionStatement::Expression { .. }
                         | PlannedLinearFunctionStatement::Throw { .. } => None,
                         PlannedLinearFunctionStatement::Function(function) => {

@@ -10293,6 +10293,13 @@ impl SyntaxPlanner<'_> {
                     && property.flow_node.is_none()
                     && property.facts == 0
             }
+            NodeData::ElementAccessExpression(element) => {
+                target.kind == SyntaxKind::ElementAccessExpression
+                    && token.kind == SyntaxKind::EqualsToken
+                    && element.question_dot_token.is_none()
+                    && element.flow_node.is_none()
+                    && element.facts == 0
+            }
             _ => false,
         };
         if target.flags.0 != 0 || !supported {
