@@ -837,6 +837,7 @@ fn validate_global_this_relation_inputs(
     context: Option<GlobalThisRelationContext<'_>>,
     require_complete_heritage: bool,
 ) -> Result<bool, RelationUnavailable> {
+    let identical = source == target;
     let mut types = vec![target, source];
     let mut signatures = Vec::new();
     let mut seen_types = HashSet::new();
@@ -914,7 +915,13 @@ fn validate_global_this_relation_inputs(
                 })?
             };
             depends_on_global_this = true;
-            types.extend(edges);
+            if !identical {
+                types.extend(edges);
+            }
+        }
+        // Equal endpoints retain root checks without demanding their child types.
+        if identical {
+            continue;
         }
         if let Some(alias) = record.alias().and_then(|alias| store.type_alias(alias)) {
             types.extend(alias.type_arguments().into_iter().flatten());
