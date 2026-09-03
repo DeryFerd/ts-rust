@@ -6309,11 +6309,32 @@ fn validate_closed_function_value_edges(
             TypeData::TypeReference(_) | TypeData::Interface(_) => {
                 let targets = array_targets
                     .ok_or(RelationUnavailable::UnavailableCanonicalArrayTarget(type_))?;
-                let array = store
+                if let Some(array) = store
                     .canonical_array_reference_with_targets(targets, type_)
                     .map_err(|_| RelationUnavailable::MalformedCanonicalArrayReference(type_))?
-                    .ok_or(RelationUnavailable::UnsupportedStructuredType(type_))?;
-                pending.push(array.element_type);
+                {
+                    pending.push(array.element_type);
+                } else {
+                    let target = match record.data() {
+                        TypeData::TypeReference(reference) => reference.object.target,
+                        TypeData::Interface(interface) => interface.reference.object.target,
+                        _ => unreachable!("the reference family was matched above"),
+                    };
+                    // A different registered array target cannot use the generic-reference path.
+                    if record
+                        .symbol()
+                        .is_some_and(|symbol| store.symbol_is_registered_global_array(symbol))
+                        || target
+                            .and_then(|target| store.type_payload(target))
+                            .and_then(super::TypeRecord::symbol)
+                            .is_some_and(|symbol| store.symbol_is_registered_global_array(symbol))
+                    {
+                        return Err(RelationUnavailable::UnsupportedStructuredType(type_));
+                    }
+                    let reference = validate_direct_generic_reference(store, type_)
+                        .map_err(|_| RelationUnavailable::UnsupportedStructuredType(type_))?;
+                    pending.extend(reference.type_arguments);
+                }
             }
             TypeData::Object(_) if store.type_has_function_type_provenance(type_) => {
                 let edges = closed_declared_function_type_edges(store, type_)?
