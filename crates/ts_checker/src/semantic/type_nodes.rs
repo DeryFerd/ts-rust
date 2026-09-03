@@ -80,7 +80,7 @@ use super::{
         cached_source_alias_indexed_bound, finish_concrete_indexed_access,
         finish_named_interface_keyof_indexed_access,
         finish_source_alias_indexed_bound_with_session, get_deferred_indexed_access_type,
-        plan_concrete_indexed_access,
+        get_instantiated_indexed_access_type, plan_concrete_indexed_access,
         plan_named_interface_keyof_indexed_access, plan_recursive_indexed_access,
         plan_source_alias_indexed_bound,
     },
@@ -2136,6 +2136,12 @@ impl TypeQueryPlan {
             children.push(*target);
         } else if let Some(indexed) = self.named_interface_indexed_accesses.get(&node) {
             children.extend([indexed.object(), indexed.index()]);
+        } else if let Some(indexed) = self
+            .mapped_indexed_accesses
+            .get(&node)
+            .filter(|indexed| indexed.named_interface_key.is_some())
+        {
+            children.extend([indexed.object, indexed.index]);
         } else if let Some(indexed) = self.source_callable_indexed_return(store, callable, node)? {
             children.extend([indexed.object, indexed.index]);
         } else if let Some(union) = self.unions.get(&node) {
@@ -3032,6 +3038,18 @@ impl TypeQueryPlan {
                     store, indexed, object, index, array_targets,
                 )
                 .map_err(|error| indexed_access_error(error, node))?
+            } else {
+                None
+            }
+        } else if let Some(indexed) = self
+            .mapped_indexed_accesses
+            .get(&node)
+            .filter(|indexed| indexed.named_interface_key.is_some())
+        {
+            let object = child(indexed.object, active)?;
+            let index = child(indexed.index, active)?;
+            if let (Some(object), Some(index)) = (object, index) {
+                indexed.cached_named_interface_key(store, node, object, index)?
             } else {
                 None
             }
@@ -7288,6 +7306,36 @@ struct PlannedMappedIndexedAccess {
     index: NodeRef,
     /// Present only for the direct return of an ordinary generic source function.
     source_callable: Option<NodeRef>,
+    /// The named object and its written `K extends keyof I` parameter.
+    named_interface_key: Option<(SemanticSymbolId, SemanticSymbolId)>,
+}
+
+impl PlannedMappedIndexedAccess {
+    fn cached_named_interface_key(
+        self,
+        store: &CanonicalTypeMapperStore,
+        node: NodeRef,
+        object: TypeId,
+        index: TypeId,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidIndexedAccessType(node));
+        let (interface, parameter) = self.named_interface_key.ok_or_else(&invalid)?;
+        if self.source_callable.is_some()
+            || store
+                .declared_type_links(interface)
+                .and_then(|links| links.declared_type)
+                != Some(object)
+            || store.type_payload(object).is_none_or(|record| {
+                record.symbol() != Some(interface)
+                    || !matches!(record.data(), TypeData::Interface(_))
+            })
+            || cached_ordinary_type_parameter_owner(store, index) != Some(parameter)
+        {
+            return Err(invalid());
+        }
+        cached_deferred_indexed_access_type(store, object, index, AccessFlags::NONE)
+            .map_err(|_| invalid())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9919,7 +9967,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .mapped_indexed_accesses
                 .iter()
                 .filter_map(|(node, indexed)| {
-                    (indexed.source_callable == Some(callable.declaration)).then_some(*node)
+                    (indexed.source_callable == Some(callable.declaration)
+                        || indexed.named_interface_key.is_some())
+                    .then_some(*node)
                 }),
         );
         for &node in self.plan.unions.keys() {
@@ -10004,6 +10054,28 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
         let record = preflight_node(self.store, self.host, node)?;
         let links = self.store.type_node_links(node);
+        if let Some(indexed) = self
+            .plan
+            .mapped_indexed_accesses
+            .get(&node)
+            .filter(|indexed| indexed.named_interface_key.is_some())
+        {
+            let cached = links.and_then(|links| links.resolved_type);
+            let object = object_members::cached_planned_type_identity(self.store, indexed.object);
+            let index = object_members::cached_planned_type_identity(self.store, indexed.index);
+            if links.is_some_and(|links| links.outer_type_parameters.is_some()) {
+                return Err(invalid());
+            }
+            if let (Some(object), Some(index)) = (object, index) {
+                let expected = indexed.cached_named_interface_key(self.store, node, object, index)?;
+                if cached.is_some() && cached != expected {
+                    return Err(invalid());
+                }
+            } else if cached.is_some() {
+                return Err(invalid());
+            }
+            return Ok(());
+        }
         if let Some(indexed) = self.plan.named_interface_indexed_accesses.get(&node) {
             let cached = links.and_then(|links| links.resolved_type);
             let object = object_members::cached_planned_type_identity(self.store, indexed.object());
@@ -12389,6 +12461,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             object,
             index,
             source_callable: None,
+            named_interface_key: None,
         };
         if let Some(existing) = self.plan.mapped_indexed_accesses.insert(node, planned)
             && existing != planned
@@ -13940,6 +14013,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if alias_owner.is_none() && self.try_plan_source_callable_indexed_return(node)? {
             return Ok(());
         }
+        if alias_owner.is_none() && self.try_plan_named_interface_generic_indexed_access(node)? {
+            return Ok(());
+        }
         if let Some(alias) = alias_owner
             && self
                 .plan
@@ -14012,6 +14088,121 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Defers `I[K]` when the actual parameter declares `K extends keyof I`.
+    #[allow(clippy::too_many_lines)] // Keep the written key constraint and both resolved owners together.
+    fn try_plan_named_interface_generic_indexed_access(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<bool, DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::IndexedAccessTypeNode(indexed) = &record.data else {
+            return Ok(false);
+        };
+        let object = NodeRef::new(node.arena, node.file, indexed.object_type);
+        let index = NodeRef::new(node.arena, node.file, indexed.index_type);
+        for operand in [object, index] {
+            let operand_record = preflight_node(self.store, self.host, operand)?;
+            let NodeData::TypeReferenceNode(reference) = &operand_record.data else {
+                return Ok(false);
+            };
+            let name = NodeRef::new(operand.arena, operand.file, reference.type_name);
+            if reference.type_arguments.is_some()
+                || preflight_node(self.store, self.host, name)?.kind != SyntaxKind::Identifier
+            {
+                return Ok(false);
+            }
+        }
+        let parameter = self.resolve_uncached_type_reference_symbol(index)?;
+        let Some([declaration]) = self.store.symbol(parameter).and_then(|owner| {
+            (owner.flags() == SymbolFlags::TYPE_PARAMETER)
+                .then(|| owner.declarations())
+                .flatten()
+        }) else {
+            return Ok(false);
+        };
+        let declaration = *declaration;
+        let parameter_record = preflight_node(self.store, self.host, declaration)?;
+        let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return Ok(false);
+        };
+        let Some(constraint) = parameter_data.constraint else {
+            return Ok(false);
+        };
+        let constraint = NodeRef::new(declaration.arena, declaration.file, constraint);
+        let constraint_record = preflight_node(self.store, self.host, constraint)?;
+        let NodeData::TypeOperatorNode(operator) = &constraint_record.data else {
+            return Ok(false);
+        };
+        if operator.operator != SyntaxKind::KeyOfKeyword {
+            return Ok(false);
+        }
+        let target = NodeRef::new(constraint.arena, constraint.file, operator.type_);
+        let target_record = preflight_node(self.store, self.host, target)?;
+        let NodeData::TypeReferenceNode(reference) = &target_record.data else {
+            return Ok(false);
+        };
+        if reference.type_arguments.is_some() {
+            return Ok(false);
+        }
+        let interface = self.resolve_uncached_type_reference_symbol(object)?;
+        let flags = self
+            .store
+            .symbol(interface)
+            .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(object)))?
+            .flags();
+        if flags.without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || self.resolve_uncached_type_reference_symbol(target)? != interface
+            || preflight_class_or_interface_reference(self.store, self.host, interface, flags)? != 0
+        {
+            return Ok(false);
+        }
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidIndexedAccessType(node));
+        let object_record = preflight_node(self.store, self.host, object)?;
+        let index_record = preflight_node(self.store, self.host, index)?;
+        if record.kind != SyntaxKind::IndexedAccessType
+            || object == index
+            || object_record.parent != Some(node.node)
+            || index_record.parent != Some(node.node)
+            || object_record.range.start != record.range.start
+            || object_record.range.end > index_record.range.start
+            || index_record.range.end >= record.range.end
+            || constraint_record.kind != SyntaxKind::TypeOperator
+            || constraint_record.parent != Some(declaration.node)
+            || target_record.parent != Some(constraint.node)
+            || !self.host.symbol_matches(self.store, declaration, parameter)
+            || self
+                .store
+                .type_node_links(node)
+                .is_some_and(|links| links.outer_type_parameters.is_some())
+            || self
+                .store
+                .symbol_node_links(node)
+                .is_some_and(|links| links != &SymbolNodeLinks::default())
+        {
+            return Err(invalid());
+        }
+        preflight_type_parameter_symbol(self.store, self.host, parameter, &mut HashSet::new())?;
+        self.plan_type_node(constraint)?;
+        self.plan_type_node_in_context(object, None, false)?;
+        self.plan_type_node_in_context(index, None, false)?;
+        let planned = PlannedMappedIndexedAccess {
+            object,
+            index,
+            source_callable: None,
+            named_interface_key: Some((interface, parameter)),
+        };
+        if self
+            .plan
+            .mapped_indexed_accesses
+            .insert(node, planned)
+            .is_some_and(|existing| existing != planned)
+        {
+            return Err(invalid());
+        }
+        self.validate_replayed_annotation_cache(node)?;
+        Ok(true)
     }
 
     /// Keeps a written `Model[Key]` return on the existing deferred producer.
@@ -14103,6 +14294,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             object,
             index,
             source_callable: Some(declaration),
+            named_interface_key: None,
         };
         if let Some(existing) = self.plan.mapped_indexed_accesses.insert(node, planned)
             && existing != planned
@@ -15733,6 +15925,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             object,
             index,
             source_callable: None,
+            named_interface_key: None,
         };
         if let Some(existing) = self.plan.mapped_indexed_accesses.insert(node, planned)
             && existing != planned
@@ -48885,6 +49078,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             })?;
         let object_type = self.execute_type_node(indexed.object, plan, prepared)?;
         let index_type = self.execute_type_node(indexed.index, plan, prepared)?;
+        let canonical = if indexed.named_interface_key.is_some() {
+            indexed.cached_named_interface_key(self.store, node, object_type, index_type)?
+        } else {
+            None
+        };
         if let Some(cached) = self
             .store
             .type_node_links(node)
@@ -48892,7 +49090,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         {
             return match self.store.type_payload(cached).map(TypeRecord::data) {
                 Some(TypeData::IndexedAccess(access))
-                    if access.object_type == object_type && access.index_type == index_type =>
+                    if access.object_type == object_type
+                        && access.index_type == index_type
+                        && (indexed.named_interface_key.is_none() || canonical == Some(cached)) =>
                 {
                     Ok(cached)
                 }
@@ -48901,7 +49101,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 )),
             };
         }
-        let resolved = if cached_ordinary_type_parameter_owner(self.store, object_type).is_some()
+        let resolved = if indexed.named_interface_key.is_some() {
+            get_instantiated_indexed_access_type(
+                self.store,
+                object_type,
+                index_type,
+                AccessFlags::NONE,
+            )
+        } else if cached_ordinary_type_parameter_owner(self.store, object_type).is_some()
             && cached_ordinary_type_parameter_owner(self.store, index_type).is_some()
         {
             get_deferred_indexed_access_type(self.store, object_type, index_type, AccessFlags::NONE)
