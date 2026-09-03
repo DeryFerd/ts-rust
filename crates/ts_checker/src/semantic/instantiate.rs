@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use super::{
     CanonicalGlobalTypes, SignatureId, TypeAliasId, TypeId, TypeMapperId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
-    bootstrap::LiteralTypeCacheError,
+    bootstrap::{LiteralTypeCacheError, UnionReduction},
     callable_sets::{CallableSetProjection, StoredCallableSetValidation},
     callables::{CallableFamily, ValidatedSingleCallable},
     conditional_types::{
@@ -1484,6 +1484,162 @@ pub(super) fn instantiate_type_with_vector_and_source(
             branches: source,
         }),
     )
+}
+
+/// Maps contextual instantiable leaves without entering object member types.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn instantiate_instantiable_types_with_vector_and_session(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    type_parameters: &[TypeId],
+    sources: &[TypeId],
+    targets: &[TypeId],
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<TypeId, InstantiationError> {
+    if sources.len() != targets.len()
+        || sources
+            .iter()
+            .any(|source| !type_parameters.contains(source))
+    {
+        return Err(InstantiationError::InvalidType(type_));
+    }
+    for endpoint in sources.iter().chain(targets) {
+        if store.type_payload(*endpoint).is_none() {
+            return Err(InstantiationError::InvalidType(*endpoint));
+        }
+    }
+    validate_instantiable_member_type(
+        store,
+        type_,
+        type_parameters,
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+    )?;
+    let mut pending = vec![type_];
+    let mut visited = HashSet::new();
+    let mut contains_instantiable = false;
+    while let Some(candidate) = pending.pop() {
+        if !visited.insert(candidate) {
+            continue;
+        }
+        let record = store
+            .type_payload(candidate)
+            .ok_or(InstantiationError::InvalidType(candidate))?;
+        if record.flags().intersects(TypeFlags::INSTANTIABLE) {
+            contains_instantiable = true;
+            break;
+        }
+        match record.data() {
+            TypeData::Union(union) => pending.extend_from_slice(&union.union.types),
+            TypeData::Intersection(_) => pending.extend(
+                instantiable_intersection_projection(
+                    store,
+                    candidate,
+                    Some(CanonicalArrayTargets::from_global_types(globals)),
+                )?
+                .types,
+            ),
+            _ => {}
+        }
+    }
+    if !contains_instantiable {
+        return Ok(type_);
+    }
+    instantiate_instantiable_types_worker(
+        store,
+        type_,
+        sources,
+        targets,
+        globals,
+        session,
+        source,
+        &mut HashSet::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn instantiate_instantiable_types_worker(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+    active: &mut HashSet<TypeId>,
+) -> Result<TypeId, InstantiationError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(InstantiationError::InvalidType(type_))?;
+    if record.flags().intersects(TypeFlags::INSTANTIABLE) {
+        return match source.as_deref_mut() {
+            Some(source) => instantiate_type_with_vector_and_source(
+                store, type_, sources, targets, globals, session, source,
+            ),
+            None => instantiate_type_with_vector_and_session(
+                store,
+                type_,
+                sources,
+                targets,
+                Some(CanonicalArrayTargets::from_global_types(globals)),
+                session,
+            ),
+        };
+    }
+    let array_targets = Some(CanonicalArrayTargets::from_global_types(globals));
+    let (types, is_union) = match record.data() {
+        TypeData::Union(union) => (union.union.types.clone(), true),
+        TypeData::Intersection(_) => (
+            instantiable_intersection_projection(store, type_, array_targets)?.types,
+            false,
+        ),
+        _ => return Ok(type_),
+    };
+    let depth = session.depth.saturating_add(active.len());
+    if depth >= session.limits.max_depth {
+        return session.handle_limit(
+            store,
+            InstantiationError::DepthLimit {
+                depth,
+                limit: session.limits.max_depth,
+            },
+        );
+    }
+    if !active.insert(type_) {
+        return Err(InstantiationError::UnsupportedType(type_));
+    }
+    let result = (|| {
+        let mut mapped = Vec::with_capacity(types.len());
+        for constituent in types {
+            mapped.push(instantiate_instantiable_types_worker(
+                store,
+                constituent,
+                sources,
+                targets,
+                globals,
+                session,
+                source,
+                active,
+            )?);
+        }
+        if is_union {
+            store
+                .expression_union_type_with_global_types_and_session(
+                    globals,
+                    &mapped,
+                    UnionReduction::None,
+                    session,
+                )
+                .map_err(Into::into)
+        } else {
+            store
+                .canonical_intersection_type_with_array_targets(&mapped, None, array_targets)
+                .map_err(|error| deferred_intersection_error(type_, error))
+        }
+    })();
+    assert!(active.remove(&type_));
+    result
 }
 
 pub(super) fn instantiate_type_with_source(

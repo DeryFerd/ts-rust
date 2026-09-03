@@ -38501,6 +38501,28 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         )>,
         super::generic_method_calls::GenericMethodCallError,
     > {
+        self.resolve_source_generic_method_call_with_return_context(
+            request,
+            existing_call_signature,
+            this_argument,
+            None,
+        )
+    }
+
+    pub(super) fn resolve_source_generic_method_call_with_return_context(
+        &mut self,
+        request: super::generic_calls::GenericCallVectorRequest<'_>,
+        existing_call_signature: Option<SignatureId>,
+        this_argument: Option<TypeId>,
+        contextual_return_type: Option<TypeId>,
+    ) -> Result<
+        Option<(
+            super::generic_method_calls::GenericMethodCallResolution,
+            SignatureId,
+            TypeId,
+        )>,
+        super::generic_method_calls::GenericMethodCallError,
+    > {
         let source_error = |error| {
             super::generic_method_calls::GenericMethodCallError::Generic(
                 super::generic_calls::GenericCallVectorError::Instantiation(
@@ -38528,7 +38550,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             };
             let result = (|| {
                 let Some(resolution) =
-                    super::generic_method_calls::resolve_generic_method_call_with_source(
+                    super::generic_method_calls::resolve_generic_method_call_with_return_context(
                         self.store,
                         &globals,
                         strict,
@@ -38537,6 +38559,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         session,
                         this_argument,
                         &mut adapter,
+                        contextual_return_type,
                     )?
                 else {
                     return Ok(None);
@@ -38595,6 +38618,28 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         ),
         super::generic_calls::GenericCallVectorError,
     > {
+        self.resolve_source_generic_call_vector_with_return_context(
+            request,
+            existing_call_signature,
+            this_argument,
+            None,
+        )
+    }
+
+    pub(super) fn resolve_source_generic_call_vector_with_return_context(
+        &mut self,
+        request: super::generic_calls::GenericCallVectorRequest<'_>,
+        existing_call_signature: Option<SignatureId>,
+        this_argument: Option<TypeId>,
+        contextual_return_type: Option<TypeId>,
+    ) -> Result<
+        (
+            super::generic_calls::GenericCallVectorResolution,
+            SignatureId,
+            TypeId,
+        ),
+        super::generic_calls::GenericCallVectorError,
+    > {
         let source_error = |error| {
             super::generic_calls::GenericCallVectorError::Instantiation(
                 super::instantiate::InstantiationError::Declared(error),
@@ -38619,16 +38664,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 diagnostics: self.diagnostics,
             };
             let result = (|| {
-                let resolution = super::generic_calls::resolve_generic_call_vector_with_source(
-                    self.store,
-                    &globals,
-                    strict,
-                    request,
-                    existing_call_signature,
-                    session,
-                    this_argument,
-                    &mut adapter,
-                )?;
+                let resolution =
+                    super::generic_calls::resolve_generic_call_vector_with_return_context(
+                        self.store,
+                        &globals,
+                        strict,
+                        request,
+                        existing_call_signature,
+                        session,
+                        this_argument,
+                        &mut adapter,
+                        contextual_return_type,
+                    )?;
                 let materialized =
                     super::generic_calls::materialize_generic_call_vector_source_with_source(
                         self.store,

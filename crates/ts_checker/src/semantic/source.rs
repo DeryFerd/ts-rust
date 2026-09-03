@@ -42481,7 +42481,7 @@ fn check_expression_type_with_capture_context(
                     }
                 }
             } else {
-                check_direct_source_call(
+                super::source_calls::check_direct_source_call_with_return_context(
                     store,
                     host,
                     global_types,
@@ -42491,6 +42491,7 @@ fn check_expression_type_with_capture_context(
                     call,
                     callee.result,
                     &argument_types,
+                    contextual_type,
                 )
                 .map_err(|error| {
                     observe_loop_failure(

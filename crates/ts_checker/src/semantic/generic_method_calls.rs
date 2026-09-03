@@ -22,7 +22,7 @@ use super::{
         GenericCallVectorError, GenericCallVectorRequest, GenericCallVectorResolution,
         GenericConstructorContextMethod, PreparedGenericConstructorContext,
         check_generic_call_candidate_with_context,
-        check_generic_call_candidate_with_receiver_context,
+        check_generic_call_candidate_with_return_context,
         demand_generic_call_vector_return_with_source, finish_generic_call_candidate_with_source,
         generic_class_constructor_candidates, generic_class_constructor_type_argument_bounds,
         generic_method_signature_callee, generic_method_type_argument_bounds,
@@ -218,6 +218,7 @@ fn check_candidate(
     session: &mut InstantiationSession,
     this_argument: Option<TypeId>,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
+    contextual_return_type: Option<TypeId>,
 ) -> Result<CheckedMethodCandidate, GenericMethodCallError> {
     if !store
         .signature(callable.signature)
@@ -225,7 +226,7 @@ fn check_candidate(
         .type_parameters()
         .is_empty()
     {
-        return check_generic_call_candidate_with_receiver_context(
+        return check_generic_call_candidate_with_return_context(
             store,
             globals,
             strict_function_types,
@@ -236,6 +237,7 @@ fn check_candidate(
             session,
             this_argument,
             source,
+            contextual_return_type,
         )
         .map(CheckedMethodCandidate::Generic)
         .map_err(Into::into);
@@ -332,6 +334,7 @@ fn check_candidate_with_context(
     context: Option<&PreparedGenericConstructorContext>,
     this_argument: Option<TypeId>,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
+    contextual_return_type: Option<TypeId>,
 ) -> Result<CheckedMethodCandidate, GenericMethodCallError> {
     match context {
         None => check_candidate(
@@ -344,6 +347,7 @@ fn check_candidate_with_context(
             session,
             this_argument,
             source,
+            contextual_return_type,
         ),
         Some(context) => check_generic_call_candidate_with_context(
             store,
@@ -418,6 +422,7 @@ pub(super) fn resolve_generic_method_call(
         session,
         None,
         &mut None,
+        None,
     )
 }
 
@@ -432,6 +437,31 @@ pub(super) fn resolve_generic_method_call_with_source(
     this_argument: Option<TypeId>,
     source: &mut dyn ConditionalBranchSource,
 ) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
+    resolve_generic_method_call_with_return_context(
+        store,
+        globals,
+        strict_function_types,
+        request,
+        existing_call_signature,
+        session,
+        this_argument,
+        source,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_generic_method_call_with_return_context(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: GenericCallVectorRequest<'_>,
+    existing_call_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
+    this_argument: Option<TypeId>,
+    source: &mut dyn ConditionalBranchSource,
+    contextual_return_type: Option<TypeId>,
+) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
     resolve_generic_method_call_worker(
         store,
         globals,
@@ -441,6 +471,7 @@ pub(super) fn resolve_generic_method_call_with_source(
         session,
         this_argument,
         &mut Some(source),
+        contextual_return_type,
     )
 }
 
@@ -454,6 +485,7 @@ fn resolve_generic_method_call_worker(
     session: &mut InstantiationSession,
     this_argument: Option<TypeId>,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
+    contextual_return_type: Option<TypeId>,
 ) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
     if request.form != DirectCallForm::Call || request.optional_chain || request.has_spread_argument
     {
@@ -517,6 +549,7 @@ fn resolve_generic_method_call_worker(
         None,
         this_argument,
         source,
+        contextual_return_type,
     )
 }
 
@@ -602,6 +635,7 @@ pub(super) fn resolve_generic_class_constructor_with_context(
         context,
         None,
         &mut None,
+        None,
     )?;
     if session.limit_event_occurred_since(limit_mark) {
         return Err(GenericMethodCallError::Unsupported(request.callee));
@@ -673,6 +707,7 @@ fn resolve_generic_candidates(
         None,
         None,
         &mut None,
+        None,
     )
 }
 
@@ -689,6 +724,7 @@ fn resolve_generic_candidates_with_context(
     context: Option<&PreparedGenericConstructorContext>,
     this_argument: Option<TypeId>,
     source: &mut Option<&mut dyn ConditionalBranchSource>,
+    contextual_return_type: Option<TypeId>,
 ) -> Result<Option<GenericMethodCallResolution>, GenericMethodCallError> {
     let array_targets = Some(CanonicalArrayTargets::from_global_types(globals));
     let ordered = reorder_direct_call_candidates(store, request.callee, candidates)?;
@@ -736,6 +772,7 @@ fn resolve_generic_candidates_with_context(
                 context,
                 this_argument,
                 source,
+                contextual_return_type,
             )?;
             if candidate.applicable() {
                 return finish_candidate(
@@ -803,6 +840,7 @@ fn resolve_generic_candidates_with_context(
                 context,
                 this_argument,
                 source,
+                contextual_return_type,
             )?
             .diagnostic()
         } else if eligible.is_empty() {
@@ -852,6 +890,7 @@ fn resolve_generic_candidates_with_context(
                 context,
                 this_argument,
                 source,
+                contextual_return_type,
             )?;
             if candidate.applicable() {
                 return Err(GenericMethodCallError::Invalid(request.callee));
@@ -896,6 +935,7 @@ fn resolve_generic_candidates_with_context(
             context,
             this_argument,
             source,
+            contextual_return_type,
         )?;
         finish_candidate(
             store,
