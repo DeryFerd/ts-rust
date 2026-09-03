@@ -23994,7 +23994,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 || class.arguments() != type_arguments
                 || self
                     .source_class_annotation
-                    .is_some_and(|owner| owner != class.owner())
+                    .zip(class.class_owner())
+                    .is_some_and(|(owner, actual)| owner != actual)
                 || exact_import.is_some_and(|capability| !class.matches_capability(&capability))
             {
                 return Err(type_node_unavailable(
@@ -33848,7 +33849,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         {
             if self
                 .source_class_annotation
-                .is_some_and(|owner| owner != class.owner())
+                .zip(class.class_owner())
+                .is_some_and(|(owner, actual)| owner != actual)
                 || self.plan.references.get(&node).is_some_and(|reference| {
                     reference.class_annotation_import.as_ref() != Some(&class)
                         || reference.symbol != class.target_symbol()
@@ -45084,6 +45086,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 self.resolve_ordinary_import_alias_chain(node, alias, import)?;
             }
             if let Some(class) = &reference.class_annotation_import {
+                if let Some(import) = class.ordinary_import() {
+                    self.resolve_ordinary_import_alias_chain(node, class.alias_symbol(), import)?;
+                }
                 source_imports::prepare_source_class_annotation_type_import(
                     self.store, self.host, class,
                 )
