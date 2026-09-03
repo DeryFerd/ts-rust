@@ -9,13 +9,61 @@ project has gained a complete isolated root in the latest comparisons.
 
 | Check | Latest result | Change |
 | --- | --- | --- |
-| Query core, census 29 | 2 of 23 isolated roots complete | Seven completed censuses without a new complete root |
-| Hono, last complete census 22 | 33 of 188 isolated roots complete | Ordinary check 4 clears the earlier relation error, then fails symbol ownership |
-| Focused tests, run 49 | 165 pass, 20 fail | All 184 old outcomes unchanged. New conditional test fails on missing diagnostic detail |
-| Checker library, run 5 | 5,072 pass, 365 fail | Three recoveries since run 3, no pass lost |
+| Query core, census 32 | 2 of 23 isolated roots complete | Eight completed censuses without a new complete root. One new invariant failure |
+| Hono, census 24 | 33 of 188 isolated roots complete | No complete-root gains. Internal errors fell from 6 to 2, becoming unsupported stops |
+| Focused tests, run 53 | 177 pass, 31 fail | One unchanged case recovered, no old pass lost. New cases: 11 pass, 12 fail |
+| Checker library, run 6 | Compile failure, no tests ran | Run 5 remains the last result: 5,072 pass, 365 fail |
 
 An isolated root is one original entry file checked on its own. These counts
 are not full-project passes or percentages of TypeScript support.
+
+[Query 32](../target/wave202-query-combined-census-32-result.md) completed all
+23 roots and 244 records with unchanged project inputs. It has 20 unsupported
+roots and one invariant failure. Five roots now stop at the `Math` reference
+in `removable.ts`. `mutationObserver.ts` reaches a constructor guard that
+rejects its legal trailing comma. No complete root was gained or lost.
+The ordinary `timeoutManager.ts` failure is unchanged. The census took 20.009
+seconds after a 2m05s build.
+
+[Hono 24](../target/wave202-hono-combined-census-24-result.md) completed all
+188 roots with unchanged recorded inputs. It has 152 unsupported roots,
+two internal errors and one original skip. The same 33 roots complete.
+The ordinary check still fails in `http-exception.ts`. A separate observation
+identifies the reported symbol as the merged global `Response`. Its precise
+rejecting guard is still under investigation. The complete census took
+716.068 seconds after a 1m58s build.
+
+[Tests 53](../target/wave202-query-hono-combined-tests-53-result.md) ran all
+208 cases in 77 targets. The 185 old cases have 166 passes and 19 failures.
+The unchanged conditional-call diagnostic case recovered. The 23 new cases
+have 11 passes and 12 failures. Two new callback cases hit a provenance
+publication debug assertion. These failures still need repair.
+
+[Library 6](../target/wave202-query-hono-checker-lib-6-result.md) failed to
+compile its test harness. A test-only `SourceFlowPlan` initializer lacks the
+new `class_expression_conditions` field. All 5,437 baseline cases are unrun.
+Normal-library compilation did not catch this test-only error.
+
+The class-global repair has since passed its two new focused tests. Its old
+logical-call control still fails. Query 33 is released to measure the repair
+against the original project. This is not yet a complete-root gain.
+
+## Next project milestones
+
+1. Finish the shared `removable.ts` path used by five Query roots. Check each
+   small repair on the real project immediately. A changed first error is not
+   completion. The next useful result is a complete root with correct checking.
+2. Remove Hono's first internal error for the merged global `Response`, with
+   correct declaration ownership. Then rerun the ordinary project check.
+3. Keep the compiler and test harness buildable. Integrate small tested changes
+   instead of collecting another large batch of uncompiled worker changes.
+
+More workers have not increased the measured project completion rate in the
+latest comparisons. Each project needs a short edit, test and project-check
+cycle. Independent workers can fix the next measured blockers in parallel.
+Neither project has evidence of being close to a full correct check yet.
+
+## Earlier results
 
 [Query 29](../target/wave202-query-combined-census-29-result.md) checked all
 244 records and 23 original roots. The conditional-call repair changes the
@@ -92,7 +140,7 @@ acceptance remain required.
 Slow feedback added to this delay. Earlier Hono ordinary checks took about
 24 minutes. The latest checks take about 2.5 minutes. Source, diagnostics,
 optimization, job count and target changed, so this difference does not isolate
-a cause. No new full Hono census ran.
+a cause. Hono 24 now provides the newer full census shown above.
 
 [Hono ordinary check 3](../target/wave202-hono-ordinary-3-result.md) clears
 the `Buffer` ownership failure. It now returns `R01.RELATION`, an unsupported
@@ -111,8 +159,9 @@ copy while test writing continued separately.
 
 [Hono ordinary check 4](../target/wave202-hono-ordinary-4-result.md) clears the prior
 `R01.RELATION` stop. It next returns `INV.SOURCE.RELATION` in `http-exception.ts`
-because a symbol is not store-owned. The symbol's name and rejecting check are
-not yet proved. The ordinary check took 311.957 seconds, compared with 154.069
+because a symbol is not store-owned. The later observation identifies `Response`,
+but its exact rejecting check is not yet proved. The ordinary check took
+311.957 seconds, compared with 154.069
 seconds in check 3. It still returns no graph, complete diagnostics or replay.
 No file or project pass follows from the changed error.
 
@@ -162,10 +211,24 @@ check before another project build. That [check passed in 32.13 seconds](../targ
 The checked source is committed as `722260115`. Tests, inputs and options are
 unchanged. This is a Rust compilation result, not a TypeScript recovery.
 
-Tests 52 now checks the same 77 targets and 208 cases. Tests 49 remains the
-measured baseline, with 185 cases. Keep the 23 added cases separate. Query 32
-and Hono 24 wait for the focused build to compile and close. The library run
-remains held. New feature changes stay outside this frozen batch.
+Tests 52 then compiled the checker but failed to compile one new test. Root
+fixed its `NodeId` API use in a separate source copy. Tests 53 compiled all
+77 targets and ran all 208 cases. Its results are above. A later test-only
+correction uses the actual parser property-node variant. That correction
+passed a compiler check but does not count as a checker recovery.
+
+Query 32 and Hono 24 are complete on the same production source and unchanged
+recorded inputs. Neither gained a complete root. The separate observation
+identified `Response`; its symbol and both type caches were present at the
+observation point. This does not identify the exact earlier rejecting guard.
+Library 6 is closed after the test-harness compile failure described above.
+
+The next repairs target the measured class-global read, constructor trailing
+comma and generic default-parameter failures. The default-parameter source
+and tests compiled, but all three new tests failed. Both old numeric-default
+tests passed. A one-file generic-call follow-up is committed after review and
+has not run. The constructor trailing-comma repair has two new controls and
+is released for its first compiler and test check.
 
 The workflow now requires a fast compiler check before a donor enters a
 project batch. Repeated commands no longer need another preparation reviewer
