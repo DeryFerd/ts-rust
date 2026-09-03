@@ -1181,6 +1181,7 @@ struct SourceInterfaceConditionWalk {
     owners: Vec<SourceInterfaceConditionOwner>,
     pending: Vec<SourceInterfaceConditionRequest>,
     deferred_complete: bool,
+    plain_heritage_only: bool,
 }
 
 enum SourceInterfaceConditionBase {
@@ -1455,6 +1456,9 @@ fn source_interface_condition_owner(
     }
     let planned_header =
         super::interface_heritage::plan_source_interface_heritage_header(store, host, owner)?;
+    if walk.plain_heritage_only && planned_header.is_some() {
+        return Ok(false);
+    }
     match (
         store.source_interface_heritage_header(type_),
         planned_header.as_ref(),
@@ -1808,6 +1812,88 @@ pub(super) fn preflight_source_interface_member_names(
         }
     }
     Ok(())
+}
+
+/// Checks cold mixed-global inheritance without requesting member types.
+pub(super) fn cold_merged_global_interface_heritage_edges(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    receiver: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Result<Option<Vec<TypeId>>, DeclaredTypeError> {
+    let Some(record) = store.type_payload(receiver) else {
+        return Ok(None);
+    };
+    let TypeData::Interface(interface) = record.data() else {
+        return Ok(None);
+    };
+    if interface.declared_members_resolved
+        || record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        return Ok(None);
+    }
+    let owner = record
+        .symbol()
+        .ok_or(super::TypeNodeUnavailable::InvalidCachedUnionType(receiver))?;
+    let invalid = || source_interface_condition_error(owner, receiver);
+    let symbol = store.symbol(owner).ok_or_else(invalid)?;
+    if store
+        .source_global_bindings()
+        .and_then(|globals| globals.get(symbol.name()))
+        .is_none_or(|binding| binding.symbol != owner)
+    {
+        return Ok(None);
+    }
+    let declarations = symbol.declarations().ok_or_else(invalid)?;
+    let mut interfaces = declarations.iter().copied().filter(|declaration| {
+        store.source_node_kind(*declaration) == Some(SyntaxKind::InterfaceDeclaration)
+    });
+    if !interfaces
+        .clone()
+        .any(|declaration| store.source_is_default_library_declaration(declaration))
+        || !interfaces
+            .clone()
+            .any(|declaration| !store.source_is_default_library_declaration(declaration))
+        || !interfaces.any(|declaration| {
+            matches!(host.node(declaration).map(|node| &node.data),
+                Some(NodeData::InterfaceDeclaration(interface))
+                    if interface.heritage_clauses.is_some())
+        })
+    {
+        return Ok(None);
+    }
+    if store.declared_type_initialization_in_progress(owner)
+        || query.is_some_and(|query| query.array_targets != array_targets)
+    {
+        return Err(invalid());
+    }
+    let mut walk = SourceInterfaceConditionWalk {
+        plain_heritage_only: true,
+        ..SourceInterfaceConditionWalk::default()
+    };
+    if !source_interface_condition_owner(store, host, receiver, array_targets, query, &mut walk)?
+        || walk.deferred_complete
+        || !walk.pending.is_empty()
+    {
+        return Ok(None);
+    }
+    if walk
+        .owners
+        .iter()
+        .any(|owner| store.declared_type_initialization_in_progress(owner.symbol))
+    {
+        return Err(invalid());
+    }
+    // Every owner in this graph has passed the source and cache checks above.
+    // Return all other edges so the caller keeps one array walk across bases.
+    Ok(Some(
+        walk.owners
+            .iter()
+            .flat_map(|owner| owner.edges.iter().copied())
+            .filter(|edge| !walk.complete.contains(edge))
+            .collect(),
+    ))
 }
 
 /// Retains published member and annotation edges while the interface stays cold.

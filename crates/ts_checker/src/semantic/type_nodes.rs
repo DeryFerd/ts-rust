@@ -12783,6 +12783,26 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 )
                 .map(Some);
         }
+        if !interface.declared_members_resolved
+            && symbol.declarations().is_some_and(|declarations| {
+                declarations
+                    .iter()
+                    .all(|declaration| self.host.source(*declaration).is_some())
+            })
+            && let Some(edges) = object_members::cold_merged_global_interface_heritage_edges(
+                self.store,
+                self.host,
+                cached,
+                self.array_targets,
+                self.source_context
+                    .as_ref()
+                    .map(SourceTypeQueryContext::heritage)
+                    .as_ref(),
+            )
+            .map_err(|_| invalid())?
+        {
+            return Ok(Some(edges));
+        }
         if object_members::authenticated_default_library_interface_owner(self.store, owner)
             || symbol
                 .declarations()

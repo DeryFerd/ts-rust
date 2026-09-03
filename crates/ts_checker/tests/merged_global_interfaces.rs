@@ -863,6 +863,77 @@ fn merged_global_interface_inherited_members_survive_source_and_query_order() {
 }
 
 #[test]
+fn cold_merged_inheritance_keeps_prewarmed_recursive_array_members() {
+    let library = parse_source_file(concat!(
+        "interface Array<T> {}\n",
+        "interface ReadonlyArray<T> {}\n",
+        "interface SignalPacket extends Middle { original: string; }\n",
+    ));
+    let empty = parse_source_file(EMPTY);
+    let added = parse_source_file(concat!(
+        "interface Root { children: SignalPacket[]; }\n",
+        "interface Middle extends Root { inherited: boolean; }\n",
+        "interface SignalPacket { added: number; }\n",
+    ));
+    let consumer = parse_source_file(concat!(
+        "declare const packet: SignalPacket;\n",
+        "const children: SignalPacket[] = packet.children;\n",
+        "const wrong: string = packet.added;\n",
+    ));
+    for prewarm_member in [false, true] {
+        let mut checker = context(&library, &empty, &added, &consumer);
+        let owner = merged_symbol(&checker, interface(&library, LIBRARY_FILE));
+        let type_ = checker.get_declared_type_of_symbol(owner).unwrap();
+        let children = member(&added, ADDED_FILE, "children").0;
+        let early_children =
+            prewarm_member.then(|| checker.get_type_at_location(children).unwrap());
+        let (_, _, annotation) = variable(&consumer, CONSUMER_FILE, "packet");
+        assert_eq!(checker.get_type_from_type_node(annotation), Ok(type_));
+        let TypeData::Interface(data) = checker.store().type_payload(type_).unwrap().data() else {
+            panic!("expected the merged interface identity");
+        };
+        assert!(!data.base_types_resolved);
+        assert!(!data.declared_members_resolved);
+        for file in [EMPTY_FILE, ADDED_FILE, CONSUMER_FILE] {
+            checker.check_source_file(file).unwrap();
+        }
+        let children_type = checker.get_type_at_location(children).unwrap();
+        if let Some(early) = early_children {
+            assert_eq!(early, children_type);
+        }
+        let TypeData::TypeReference(array) =
+            checker.store().type_payload(children_type).unwrap().data()
+        else {
+            panic!("expected an array reference");
+        };
+        assert_eq!(
+            array.resolved_type_arguments.as_deref(),
+            Some([type_].as_slice())
+        );
+        let [diagnostic] = checker.diagnostics().as_slice() else {
+            panic!("only the wrong assignment must fail");
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(diagnostic.diagnostic.arguments, ["number", "string"]);
+        assert_eq!(
+            diagnostic.node,
+            Some(variable(&consumer, CONSUMER_FILE, "wrong").1)
+        );
+        let diagnostics = checker.diagnostics().clone();
+        let warm = counts(&checker);
+        for _ in 0..2 {
+            for file in [ADDED_FILE, EMPTY_FILE, CONSUMER_FILE] {
+                checker.recheck_source_file(file).unwrap();
+            }
+            assert_eq!(checker.get_type_from_type_node(annotation), Ok(type_));
+            assert_eq!(checker.get_type_at_location(children), Ok(children_type));
+            assert_eq!(checker.diagnostics(), &diagnostics);
+            assert_eq!(counts(&checker), warm);
+        }
+    }
+}
+
+#[test]
 #[allow(clippy::too_many_lines)] // Keep cold type queries, source value publication, and replay together.
 fn merged_global_interface_named_constructor_annotation_survives_source_value_reads() {
     let library = parse_source_file(concat!(
