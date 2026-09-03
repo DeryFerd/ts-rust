@@ -2402,7 +2402,6 @@ fn plan_source_class_constructor(
         || data.type_.is_some()
         || data.type_parameters.is_some()
         || data.facts != 0
-        || data.parameters.has_trailing_comma
     {
         return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
     }

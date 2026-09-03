@@ -37,7 +37,10 @@ use super::{
     RelationUnavailable, SignatureId, SymbolNodeLinks, TypeId, TypeNodeLinks, TypePredicateId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::{LiteralTypeCacheError, UnionReduction},
-    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
+    callable_sets::{
+        CallableSetProjection, StoredCallableSetValidation,
+        validate_stored_callable_set_with_array_targets,
+    },
     classes::{
         ClassBodyAccessToken, ClassBodyKind, ClassBodyPlan, ClassMemberOrigin, ClassMemberSource,
         ClassPropertySide, class_body_identities, class_member_source,
@@ -52,7 +55,7 @@ use super::{
     source::{CheckedClassPropertyAssignment, PlannedExpressionKind, PlannedIdentifierRead},
     source_calls::{
         CheckedSourceCall, SourceCallPlan, plan_direct_source_call_syntax,
-        resolve_source_call_effects_signature,
+        resolve_source_call_effects_signature, source_class_method_effect_target,
     },
     source_properties::{
         ClassAccessContext, ClassPropertyTruthinessSource, OwnClassPropertyWritePlan,
@@ -5182,6 +5185,13 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
             return Ok(());
         }
         let invalid = || SourceFlowInvariant::InvalidCallEffect(plan.node);
+        if class_call_flow_container(store, host, plan.node)? != self.body.declaration {
+            if self.is_expression_condition_call(plan.node) {
+                return Err(invalid().into());
+            }
+            // Deferred arrows use the class token, but keep their own call effects.
+            return Ok(());
+        }
         let signature = store
             .signature_links(plan.node)
             .and_then(|links| links.resolved_signature.signature())
@@ -5221,6 +5231,9 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         let unsupported = || SourceFlowError::Unsupported(SourceFlowUnsupported::Call(call));
         let (arena, bound) = host.source(call).ok_or_else(invalid)?;
         class_body_identities(store, host, &self.access).map_err(|_| invalid())?;
+        if class_call_flow_container(store, host, call)? != self.body.declaration {
+            return Err(invalid().into());
+        }
         let expression_condition = self.is_expression_condition_call(call);
         let statement = if expression_condition {
             let proof = self
@@ -5276,16 +5289,62 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         {
             return Err(invalid().into());
         }
-        let projection = match validate_stored_callable_set_with_array_targets(
-            store,
-            completed.callee_type,
-            Some(completed.arrays),
-        ) {
-            StoredCallableSetValidation::Valid { projection, .. } => projection,
-            StoredCallableSetValidation::Malformed { .. } => return Err(invalid().into()),
-            StoredCallableSetValidation::NotCallable
-            | StoredCallableSetValidation::Pending { .. } => {
-                return Err(unsupported());
+        let class_method = matches!(
+            &completed.plan.callee.unparenthesized().kind,
+            PlannedExpressionKind::Property(property)
+                if property.class_access_context().is_some()
+                    && completed.callee_symbol.resolved_symbol.is_some_and(|member| {
+                        store.symbol(member).is_some_and(|symbol| {
+                            symbol.flags().contains(SymbolFlags::METHOD)
+                        }) && class_member_source(store, host, member)
+                            .is_ok_and(|source| source.origin == ClassMemberOrigin::Method)
+                    })
+        );
+        let projection = if class_method {
+            let target = source_class_method_effect_target(
+                store,
+                host,
+                &completed.plan,
+                completed.callee_type,
+                &completed.access,
+            )
+            .map_err(|_| invalid())?;
+            let call_signatures = target.overloads().map_or_else(
+                || vec![target.callable().clone()],
+                |overloads| overloads.signatures.clone(),
+            );
+            for callable in &call_signatures {
+                for edge in callable
+                    .parameters
+                    .iter()
+                    .copied()
+                    .chain(callable.rest_parameter)
+                    .chain(callable.return_type)
+                {
+                    store
+                        .validate_cached_array_capability_with_pending_functions(
+                            Some(completed.arrays),
+                            edge,
+                            &[],
+                        )
+                        .map_err(|_| invalid())?;
+                }
+            }
+            CallableSetProjection {
+                owner: completed.callee_type,
+                call_signatures: call_signatures.into_boxed_slice(),
+                construct_signatures: Box::new([]),
+            }
+        } else {
+            match validate_stored_callable_set_with_array_targets(
+                store,
+                completed.callee_type,
+                Some(completed.arrays),
+            ) {
+                StoredCallableSetValidation::Valid { projection, .. } => projection,
+                StoredCallableSetValidation::Malformed { .. } => return Err(invalid().into()),
+                StoredCallableSetValidation::NotCallable
+                | StoredCallableSetValidation::Pending { .. } => return Err(unsupported()),
             }
         };
         if projection.owner != completed.callee_type
@@ -11607,6 +11666,68 @@ fn validate_class_property_predicate_condition(
     Ok((source, [true_edge, false_edge]))
 }
 
+/// Calls use the recorded flow of their actual callee, not a call-node flow record.
+fn class_call_flow_container(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    call: NodeRef,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(call);
+    let (arena, bound) = host.source(call).ok_or_else(invalid)?;
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || !call.is_for(arena.id(), bound.file_id())
+        || !bound.contains(call)
+    {
+        return Err(invalid().into());
+    }
+    let syntax = plan_direct_source_call_syntax(arena, store, call).map_err(|_| invalid())?;
+    let mut parent = call;
+    let mut current = syntax.callee();
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current) || visited.len() > FLOW_DEPTH_LIMIT {
+            return Err(invalid().into());
+        }
+        let parent_record = class_flow_source_node(store, host, parent).map_err(|_| invalid())?;
+        let record = class_flow_source_node(store, host, current).map_err(|_| invalid())?;
+        if record.flags.0 != 0
+            || record.parent != Some(parent.node)
+            || record.range.start < parent_record.range.start
+            || record.range.end > parent_record.range.end
+        {
+            return Err(invalid().into());
+        }
+        if let Some(container) = bound.flow_container(current) {
+            let flow = bound.flow_at(current).ok_or_else(invalid)?;
+            flow_node(bound.flow_graph(), flow)?;
+            validate_container(bound.flow_graph(), container)?;
+            return Ok(container);
+        }
+        let child = match &record.data {
+            NodeData::ParenthesizedExpression(wrapper)
+                if record.kind == SyntaxKind::ParenthesizedExpression =>
+            {
+                wrapper.expression
+            }
+            NodeData::PropertyAccessExpression(property)
+                if record.kind == SyntaxKind::PropertyAccessExpression =>
+            {
+                property.expression
+            }
+            NodeData::CallExpression(_) if record.kind == SyntaxKind::CallExpression => {
+                plan_direct_source_call_syntax(arena, store, current)
+                    .map_err(|_| invalid())?
+                    .callee()
+                    .node
+            }
+            _ => return Err(invalid().into()),
+        };
+        parent = current;
+        current = NodeRef::new(call.arena, call.file, child);
+    }
+}
+
 fn validate_class_body_call(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -12131,7 +12252,6 @@ fn validate_class_expression_condition(
         || expression.parent != Some(source.owner.node)
         || owner.flags.0 != 0
         || !source_node_is_descendant_of(arena, source.owner, body.body.node)
-        || bound.flow_container(source.expression) != Some(body.declaration)
     {
         return Err(invalid().into());
     }
@@ -12222,6 +12342,7 @@ fn validate_class_expression_condition(
                     .map(|node| NodeRef::new(reference.arena, reference.file, node))
                     != parameter.annotation
                 || bound.container(parameter.declaration) != Some(body.declaration)
+                || bound.flow_container(reference) != Some(body.declaration)
                 || bound
                     .symbol(parameter.declaration)
                     .and_then(|raw| store.get_merged_symbol(raw))
@@ -12265,6 +12386,7 @@ fn validate_class_expression_condition(
                 || call.symbol.is_some()
                 || call.facts != 0
                 || !syntax.arguments().is_empty()
+                || class_call_flow_container(store, host, source.expression)? != body.declaration
             {
                 return Err(invalid().into());
             }
