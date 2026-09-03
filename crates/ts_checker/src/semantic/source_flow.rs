@@ -1706,6 +1706,41 @@ pub(super) struct SourceFlowArrayMutation {
     pub(super) symbol: SemanticSymbolId,
 }
 
+/// An indexed write keeps both binder edges, without assigning the receiver binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceElementAssignmentProof {
+    pub(super) statement: NodeRef,
+    pub(super) expression: NodeRef,
+    pub(super) target: NodeRef,
+    pub(super) receiver: NodeRef,
+    pub(super) index: NodeRef,
+    pub(super) right: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    container: NodeRef,
+    assignment: Option<FlowRef>,
+    mutation: FlowRef,
+    revision: NodeArenaRevision,
+}
+
+impl SourceElementAssignmentProof {
+    pub(super) fn targets(self) -> impl Iterator<Item = NodeRef> {
+        [self.assignment.map(|_| self.target), Some(self.expression)]
+            .into_iter()
+            .flatten()
+    }
+
+    fn flow_at(self, node: NodeRef) -> Option<FlowRef> {
+        if node == self.expression {
+            Some(self.mutation)
+        } else if node == self.target {
+            self.assignment
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceFlowCapturedArrayMutation {
     pub(super) mutation: SourceFlowArrayMutation,
@@ -1980,6 +2015,7 @@ pub(super) struct SourceFlowPlan {
     updates: HashMap<NodeRef, SourceFlowUpdate>,
     nullish_assignments: HashMap<NodeRef, SourceNullishAssignmentProof>,
     member_assignments: HashMap<NodeRef, SourceMemberAssignmentProof>,
+    element_assignments: HashMap<NodeRef, SourceElementAssignmentProof>,
     nullish_calls: HashMap<NodeRef, FlowRef>,
 }
 
@@ -2384,8 +2420,42 @@ struct SourceFlowEffects {
     updates: HashMap<NodeRef, SourceFlowUpdate>,
     nullish_assignments: HashMap<NodeRef, SourceNullishAssignmentProof>,
     member_assignments: HashMap<NodeRef, SourceMemberAssignmentProof>,
+    element_assignments: HashMap<NodeRef, SourceElementAssignmentProof>,
     nullish_calls: HashMap<NodeRef, FlowRef>,
     region_points: HashMap<NodeRef, FlowRef>,
+}
+
+fn prepare_element_assignment(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    container: NodeRef,
+    proof: SourceElementAssignmentProof,
+    effects: &mut SourceFlowEffects,
+    assignments: &mut Vec<SourceFlowAssignment>,
+) -> Result<(), SourceFlowError> {
+    if proof.container != container
+        || source_element_assignment_proof(store, host, proof.expression)? != Some(proof)
+        || effects
+            .element_assignments
+            .insert(proof.expression, proof)
+            .is_some()
+    {
+        return Err(SourceFlowInvariant::InvalidArrayMutation(proof.expression).into());
+    }
+    for target in proof.targets() {
+        if effects
+            .assignment_declarations
+            .insert(target, proof.declaration)
+            .is_some()
+        {
+            return Err(SourceFlowInvariant::DuplicateAssignment(target).into());
+        }
+        assignments.push(SourceFlowAssignment {
+            declaration: target,
+            symbol: proof.symbol,
+        });
+    }
+    Ok(())
 }
 
 const TRUE_CONDITION_EDGE: u8 = 1 << 0;
@@ -2827,6 +2897,14 @@ impl SourceFlowPlan {
             ..SourceFlowEffects::default()
         };
         for expression in syntax.expression_statements() {
+            if let Some(proof) = source_element_assignment_proof(store, host, expression)? {
+                if syntax.expression_scope(expression) != bound.block_scope_container(expression) {
+                    return Err(SourceFlowInvariant::InvalidArrayMutation(expression).into());
+                }
+                prepare_element_assignment(
+                    store, host, container, proof, &mut effects, &mut assignments,
+                )?;
+            }
             if let Some(proof) = source_member_assignment_proof(store, host, expression)? {
                 if proof.container != container
                     || syntax.expression_scope(expression)
@@ -3459,6 +3537,7 @@ impl SourceFlowPlan {
             [],
             [],
             [],
+            [],
         )
     }
 
@@ -3492,6 +3571,7 @@ impl SourceFlowPlan {
             logical_statements,
             captured_assignments,
             captured_array_mutations,
+            [],
             [],
         )
     }
@@ -3572,6 +3652,7 @@ impl SourceFlowPlan {
             captured_assignments,
             captured_array_mutations,
             [],
+            [],
         )
     }
 
@@ -3604,6 +3685,7 @@ impl SourceFlowPlan {
             [],
             [],
             [],
+            [],
         )
     }
 
@@ -3624,6 +3706,43 @@ impl SourceFlowPlan {
         captured_array_mutations: impl IntoIterator<Item = SourceFlowCapturedArrayMutation>,
         nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
     ) -> Result<Self, SourceFlowError> {
+        Self::preflight_linear_with_element_assignments(
+            arena,
+            bound,
+            store,
+            host,
+            container,
+            points,
+            conditions,
+            assignments,
+            parameter_assignments,
+            calls,
+            logical_statements,
+            captured_assignments,
+            captured_array_mutations,
+            nullish_assignments,
+            [],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_linear_with_element_assignments(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        container: NodeRef,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceTruthinessCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+        logical_statements: impl IntoIterator<Item = SourceLinearLogicalStatementSyntax>,
+        captured_assignments: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
+        captured_array_mutations: impl IntoIterator<Item = SourceFlowCapturedArrayMutation>,
+        nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+        element_assignments: impl IntoIterator<Item = SourceElementAssignmentProof>,
+    ) -> Result<Self, SourceFlowError> {
         Self::preflight_linear_effects(
             arena,
             bound,
@@ -3639,6 +3758,7 @@ impl SourceFlowPlan {
             captured_assignments,
             captured_array_mutations,
             nullish_assignments,
+            element_assignments,
         )
     }
 
@@ -3658,6 +3778,7 @@ impl SourceFlowPlan {
         captured_assignments: impl IntoIterator<Item = SourceFlowCapturedAssignment>,
         captured_array_mutations: impl IntoIterator<Item = SourceFlowCapturedArrayMutation>,
         nullish_assignments: impl IntoIterator<Item = SourceFlowNullishAssignment>,
+        element_assignments: impl IntoIterator<Item = SourceElementAssignmentProof>,
     ) -> Result<Self, SourceFlowError> {
         if bound.node_arena_id() != arena.id()
             || bound.node_arena_revision() != arena.revision()
@@ -3669,6 +3790,12 @@ impl SourceFlowPlan {
         let nullish_assignments = nullish_assignments.into_iter().collect::<Vec<_>>();
         let mut planned_assignments = assignments.into_iter().collect::<Vec<_>>();
         let mut effects = SourceFlowEffects::default();
+        for proof in element_assignments {
+            let host = host.ok_or(SourceFlowInvariant::InvalidArrayMutation(proof.expression))?;
+            prepare_element_assignment(
+                store, host, container, proof, &mut effects, &mut planned_assignments,
+            )?;
+        }
         for assignment in parameter_assignments {
             validate_parameter_assignment(arena, bound, store, host, container, assignment)?;
             if effects
@@ -4016,6 +4143,7 @@ impl SourceFlowPlan {
             updates: effects.updates,
             nullish_assignments: effects.nullish_assignments,
             member_assignments: effects.member_assignments,
+            element_assignments: effects.element_assignments,
             nullish_calls: effects.nullish_calls,
         };
         plan.validate_flow_paths(bound)?;
@@ -4043,6 +4171,11 @@ impl SourceFlowPlan {
         bound: &'graph BoundFile,
         base: SourceFlowTypes,
     ) -> Result<SourceFlowFrame<'plan, 'graph>, SourceFlowError> {
+        for proof in self.element_assignments.values() {
+            if source_element_assignment_proof(store, host, proof.expression)? != Some(*proof) {
+                return Err(SourceFlowInvariant::InvalidArrayMutation(proof.expression).into());
+            }
+        }
         for proof in self.member_assignments.values() {
             if source_member_assignment_proof(store, host, proof.expression)? != Some(*proof) {
                 return Err(SourceFlowInvariant::InvalidParameterAssignment(proof.target).into());
@@ -4186,6 +4319,11 @@ impl SourceFlowPlan {
     ) -> Result<SourceFlowFrame<'plan, 'graph>, SourceFlowError> {
         let graph = bound.flow_graph();
         validate_container(graph, self.container)?;
+        for proof in self.element_assignments.values() {
+            if bound.node_arena_revision() != proof.revision || proof.container != self.container {
+                return Err(SourceFlowInvariant::InvalidArrayMutation(proof.expression).into());
+            }
+        }
         for proof in self.nullish_assignments.values() {
             if bound.node_arena_revision() != proof.revision {
                 return Err(SourceFlowInvariant::InvalidParameterAssignment(
@@ -4372,7 +4510,12 @@ impl SourceFlowPlan {
         for (&target, &declaration) in &self.assignment_declarations {
             let invalid = || SourceFlowInvariant::InvalidParameterAssignment(target);
             let assignment = self.assignments.get(&target).ok_or_else(invalid)?;
-            if host.node(target).ok_or_else(invalid)?.kind == SyntaxKind::CallExpression {
+            if host.node(target).ok_or_else(invalid)?.kind == SyntaxKind::CallExpression
+                || self
+                    .element_assignments
+                    .values()
+                    .any(|proof| proof.flow_at(target).is_some())
+            {
                 continue;
             }
             assignments.push(SourceFlowParameterAssignment {
@@ -4430,6 +4573,13 @@ impl SourceFlowPlan {
         for target in self.member_assignments.keys() {
             if !coverage.assignments.contains(target) {
                 return Err(SourceFlowInvariant::UnreachedAssignment(*target).into());
+            }
+        }
+        for proof in self.element_assignments.values() {
+            if !coverage.assignments.contains(&proof.expression)
+                || proof.assignment.is_some() && !coverage.assignments.contains(&proof.target)
+            {
+                return Err(SourceFlowInvariant::UnreachedAssignment(proof.expression).into());
             }
         }
         for (target, assignment) in &self.property_assignments {
@@ -4520,6 +4670,15 @@ impl SourceFlowPlan {
             SourceFlowKind::Assignment | SourceFlowKind::ArrayMutation => {
                 let antecedent = linear_antecedent(flow, &node)?;
                 let declaration = ast_payload(flow, &node)?;
+                if let Some(expected) = self
+                    .element_assignments
+                    .values()
+                    .find_map(|proof| proof.flow_at(declaration))
+                {
+                    if expected != flow {
+                        return Err(SourceFlowInvariant::InvalidPayload(flow).into());
+                    }
+                }
                 if let Some(origin) = self.captured_origins.get(&declaration) {
                     validate_captured_origin_flow_node(*origin, flow, &node)?;
                 }
@@ -9387,6 +9546,168 @@ pub(super) fn validate_source_nullish_assignment(
     assignment: SourceFlowNullishAssignment,
 ) -> Result<(), SourceFlowError> {
     source_nullish_assignment_proof(arena, bound, store, host, container, assignment).map(|_| ())
+}
+
+/// Proves a direct callable-owned indexed write and its actual binder edges.
+#[allow(clippy::too_many_lines)]
+pub(super) fn source_element_assignment_proof(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+) -> Result<Option<SourceElementAssignmentProof>, SourceFlowError> {
+    let (arena, bound) = host
+        .source(expression)
+        .ok_or(SourceFlowInvariant::ForeignNode(expression))?;
+    let record = own_class_flow_node(store, host, expression)?;
+    let NodeData::BinaryExpression(binary) = &record.data else {
+        return Ok(None);
+    };
+    let reference = |node| NodeRef::new(expression.arena, expression.file, node);
+    let target = reference(binary.left);
+    let target_record = own_class_flow_node(store, host, target)?;
+    if !matches!(target_record.data, NodeData::ElementAccessExpression(_)) {
+        return Ok(None);
+    }
+    let invalid = || SourceFlowInvariant::InvalidArrayMutation(expression);
+    let operator = reference(binary.operator_token);
+    let operator_record = own_class_flow_node(store, host, operator)?;
+    if operator_record.kind != SyntaxKind::EqualsToken {
+        return Ok(None);
+    }
+    let syntax = super::source_elements::plan_direct_source_element_write_syntax(
+        arena,
+        store,
+        target,
+        expression,
+    )
+    .map_err(|_| SourceFlowUnsupported::PropertyWrite(target))?;
+    let receiver = syntax.receiver();
+    let index = syntax.index();
+    let right = reference(binary.right);
+    let statement = record.parent.map(reference).ok_or_else(invalid)?;
+    let statement_record = own_class_flow_node(store, host, statement)?;
+    let container = bound.container(statement).ok_or_else(invalid)?;
+    let body = statement_record.parent.map(reference).ok_or_else(invalid)?;
+    let body_record = own_class_flow_node(store, host, body)?;
+    let owner = own_class_flow_node(store, host, container)?;
+    let owns_body = match &owner.data {
+        NodeData::FunctionDeclaration(data) => data.body == Some(body.node),
+        NodeData::ArrowFunction(data) => data.body == body.node,
+        NodeData::MethodDeclaration(data) => {
+            data.body == Some(body.node)
+                && bound.symbol(container).is_some_and(|symbol| {
+                    store.source_object_literal_method_owner_is_exact(container, symbol)
+                })
+        }
+        _ => false,
+    };
+    let receiver_record = own_class_flow_node(store, host, receiver)?;
+    let index_record = own_class_flow_node(store, host, index)?;
+    let right_record = own_class_flow_node(store, host, right)?;
+    if !owns_body
+        || body_record.kind != SyntaxKind::Block
+        || body_record.parent != Some(container.node)
+        || !matches!(&body_record.data, NodeData::Block(block)
+            if block.statements.nodes.contains(&statement.node))
+        || record.kind != SyntaxKind::BinaryExpression
+        || record.flags.0 != 0
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.modifiers.is_some()
+        || binary.facts != 0
+        || statement_record.kind != SyntaxKind::ExpressionStatement
+        || statement_record.flags.0 != 0
+        || !matches!(&statement_record.data, NodeData::ExpressionStatement(data)
+            if data.expression == expression.node && data.flow_node.is_none())
+        || receiver_record.kind != SyntaxKind::Identifier
+        || receiver_record.flags.0 != 0
+        || !matches!(&receiver_record.data, NodeData::Identifier(identifier)
+            if !identifier.text.is_empty() && identifier.flow_node.is_none())
+        || operator_record.parent != Some(expression.node)
+        || operator_record.flags.0 != 0
+        || !matches!(operator_record.data, NodeData::Token(_))
+        || right_record.parent != Some(expression.node)
+        || record.range.start > target_record.range.start
+        || target_record.range.end > operator_record.range.start
+        || operator_record.range.end > right_record.range.start
+        || right_record.range.end > record.range.end
+        || target_record.range.start > receiver_record.range.start
+        || receiver_record.range.end > index_record.range.start
+        || index_record.range.end > target_record.range.end
+        || arena.id() != bound.node_arena_id()
+        || arena.revision() != bound.node_arena_revision()
+        || bound.flow_graph().container_is_complete(container) != Some(true)
+        || bound.symbol(container).is_none()
+        || bound.symbol(container) != store.source_declaration_symbol(container)
+    {
+        return Err(SourceFlowUnsupported::PropertyWrite(target).into());
+    }
+    for node in [statement, expression, target, receiver, index, operator, right] {
+        validate_bound_node(bound, bound.flow_graph(), node)?;
+        if bound.container(node) != Some(container)
+            || bound.block_scope_container(node) != Some(container)
+        {
+            return Err(invalid().into());
+        }
+    }
+    let symbol = own_class_flow_symbol(store, host, bound, receiver)?;
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    let declaration = owner.value_declaration().ok_or_else(invalid)?;
+    if !owner.flags().intersects(SymbolFlags::VARIABLE)
+        || bound.container(declaration) != Some(container)
+        || bound.symbol(declaration) != Some(symbol)
+        || !matches!(
+            own_class_flow_node(store, host, declaration)?.kind,
+            SyntaxKind::VariableDeclaration | SyntaxKind::Parameter
+        )
+    {
+        return Err(SourceFlowUnsupported::PropertyWrite(target).into());
+    }
+    let mut assignment = None;
+    let mut mutation = None;
+    for (position, node) in bound.flow_graph().nodes().iter().enumerate() {
+        let expected = if node.payload == Some(FlowNodePayload::Ast(target))
+            && node.flags.intersects(FlowFlags::ASSIGNMENT)
+        {
+            Some((SourceFlowKind::Assignment, &mut assignment))
+        } else if node.payload == Some(FlowNodePayload::Ast(expression))
+            && node.flags.intersects(FlowFlags::ARRAY_MUTATION)
+        {
+            Some((SourceFlowKind::ArrayMutation, &mut mutation))
+        } else {
+            None
+        };
+        if let Some((kind, slot)) = expected {
+            let flow = FlowRef::new(
+                arena.id(),
+                bound.file_id(),
+                FlowNodeId(u32::try_from(position).map_err(|_| invalid())?),
+            );
+            if slot.replace(flow).is_some() || source_flow_kind(flow, node.flags)? != kind {
+                return Err(invalid().into());
+            }
+            linear_antecedent(flow, node)?;
+        }
+    }
+    let mutation = mutation.ok_or_else(invalid)?;
+    let preceding = linear_antecedent(mutation, &flow_node(bound.flow_graph(), mutation)?)?;
+    if assignment.is_some_and(|assignment| assignment != preceding) {
+        return Err(invalid().into());
+    }
+    Ok(Some(SourceElementAssignmentProof {
+        statement,
+        expression,
+        target,
+        receiver,
+        index,
+        right,
+        symbol,
+        declaration,
+        container,
+        assignment,
+        mutation,
+        revision: arena.revision(),
+    }))
 }
 
 #[allow(clippy::too_many_lines)] // Match the AST, lexical owner and retained mutation together.
@@ -16171,6 +16492,7 @@ mod tests {
             updates: HashMap::new(),
             nullish_assignments: HashMap::new(),
             member_assignments: HashMap::new(),
+            element_assignments: HashMap::new(),
             nullish_calls: HashMap::new(),
         };
         let without_payload = FlowNode::new(FlowFlags::START);
