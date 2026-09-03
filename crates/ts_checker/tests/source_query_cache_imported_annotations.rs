@@ -270,8 +270,8 @@ fn assert_annotation(
     ];
     assert!(arguments.iter().all(|argument| !formals.contains(argument)));
 
-    let property = only_node(consumer, CONSUMER, SyntaxKind::PropertySignature);
-    let NodeData::PropertySignatureDeclaration(field) =
+    let property = only_node(consumer, CONSUMER, SyntaxKind::PropertyDeclaration);
+    let NodeData::PropertyDeclaration(field) =
         &consumer.arena.get(property.node).unwrap().data
     else {
         unreachable!()
@@ -281,7 +281,7 @@ fn assert_annotation(
         consumer.arena.get(property.node).unwrap().parent,
         Some(interface.node)
     );
-    let annotation = NodeRef::new(consumer.arena.id(), CONSUMER, field.type_);
+    let annotation = NodeRef::new(consumer.arena.id(), CONSUMER, field.type_.unwrap());
     assert_eq!(
         consumer.arena.get(annotation.node).unwrap().parent,
         Some(property.node)
