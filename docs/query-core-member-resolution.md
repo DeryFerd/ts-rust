@@ -1,6 +1,7 @@
 # Query core member resolution
 
-Updated 2026-09-03. Four lost tests recovered. Integration remains rejected.
+Updated 2026-09-03. Forty-three recent lost tests recovered. Eleven remain.
+Integration remains rejected.
 Root is the only implementer. One reviewer checks code changes. Use the existing
 `query-core-integration` branch. Do not start another feature branch.
 
@@ -18,18 +19,23 @@ negative case reports the exact TS2322 diagnostic. The unused generic method
 remains unresolved. Pinned Go agrees on both unchanged TypeScript inputs.
 The fixture does not cover all of Query's import and alias paths.
 
-The [latest full regression selection](../target/query-core-member-regression-full-1-result.md)
-has 6,278 passes and 457 failures across 6,735 tests. It retains all 6,274
-previous passes and recovers four losses. Fifty of the 54 recent lost passes
-remain. Against the accepted compiler, 5,769 of 6,055 pass, 273 fail and 13
-exact names are absent. The batch is rejected. No expectation change is approved.
-The three-file repair is saved as signed checkpoint `ae2f42ac2`. The separate
-reference-flow draft remains unchanged and unstaged.
+The [latest full regression selection](../target/query-core-member-regression-full-3-result.md)
+has 6,319 passes and 418 failures across 6,737 tests. Compared with full-1,
+it retains all 6,278 previous passes, recovers 39 failures and adds two passing
+tests. Forty-three of the original 54 recent losses now pass. Eleven remain.
+Against the accepted compiler, 5,779 of 6,055 pass, 263 fail and 13 exact names
+are absent. No name is unrun. The batch is rejected. No expectation changed.
+The source is saved as signed checkpoint `cbc2649e7`, with separate public
+tests in `38dd63699`. The reference-flow draft is unchanged and unstaged.
 
-[Unchanged Query](../target/query-core-member-regression-query-2-result.md)
-still completes only 2 of 23 isolated roots. Ordinary checking no longer stops
-at the unread Node `send` method. It fails at a void annotation instead. No
-additional root completes and diagnostics remain unchanged. This is not a demo.
+[Unchanged Query](../target/query-core-member-plan-query-2-result.md)
+still completes only 2 of 23 isolated roots. The void annotation failure is
+fixed. Ordinary checking now stops at a TypeQuery. All 244 checking records
+match the preceding Query run. Diagnostics are unchanged. This is not a demo.
+The [bounded observation](../target/query-core-type-query-observation-1-result.md)
+proves that the direct typeof planner rejects a four-declaration function/module
+symbol at its single-declaration guard. Its value cache is cold. The operand
+name and workload body remain unread. Temporary traces were removed.
 
 ## Current dependency path
 
@@ -44,24 +50,34 @@ inherited lookup and applied generic bases. It retains names before demanding
 one member value. That exposed failures in existing consumers and validators.
 Repair these failures before advancing Query's next stopping point.
 
-1. Separate full and name-only member plans. A full request must upgrade an
-   earlier name-only plan. A later lazy request must not downgrade a full plan.
-   Preserve caller mode when planning concrete generic bases. Select strict
-   completed generic reuse during planning, before optional-union and receiver
-   preparation. Compute expected member types from source, not stored values.
-2. Complete the remaining shared source demand. Direct completed heritage must
-   use the source-aware property provider. Empty intermediate interfaces need
+Full and name-only member plans now retain the correct request mode. Full
+upgrades an earlier name-only plan. Later lazy requests cannot downgrade it.
+Concrete generic bases preserve caller mode. Strict completed generic reuse
+is selected during planning, before optional-union and receiver preparation.
+Expected member types still come from source, not stored values.
+
+Exported generic methods now retain their actual class and method owners.
+Two public controls pass in both query orders and on replay. The negative
+control reports the exact TS2322 assignment error. Malformed method ownership
+still returns an invariant error before fallback. No old assertion changed.
+
+Next work:
+
+1. Complete the remaining shared source demand. Direct completed heritage now
+   uses the source-aware property provider. Empty intermediate interfaces need
    an empty member plan. Proved nongeneric source bases must retain identity
    through the instantiation classifier. Carry written-base owner proofs into
    reference planning and preserve legal repeated bases. The
    [parallel audit](../target/query-core-member-regression-parallel-audit.md)
-   records the concrete paths and limits on each finding.
-3. Recheck all 50 remaining recent losses and both complete member tests. Then run
-   the full accepted selections. Every earlier accepted loss also stays open.
-4. Rerun unchanged Query. Its current void failure needs bounded metadata for
-   the rejecting reader, ownership role, plan membership and cache fields. The
-   keyword planner, executor and cache readers already support void. Do not
-   add another syntax admission rule.
+   and [next-batch notes](../target/query-core-member-next-batch-notes.md)
+   record the concrete paths and limits on each finding.
+2. Recheck all 11 remaining recent losses and both complete member tests. Then
+   run the full accepted selections. Every earlier accepted loss stays open.
+3. Connect typeof to the existing merged global callable and overload value
+   operation. Retain cold value demand, actual signatures, namespace members,
+   source context and replay checks. Removing the single-declaration guard
+   alone does not complete this operation. Rerun unchanged Query after focused
+   positive and negative controls.
 
 The latest patch restores source heritage validation before identity reuse,
 fills ordinary Pending values without replacing names or proxies, and connects
@@ -75,8 +91,9 @@ Query source body was read.
 
 The rest of the same operation remains open:
 
-- Resolve class methods through their existing source method proof. Do not send
-  a `MethodDeclaration` through a validator limited to `MethodSignature`.
+- Keep selected class methods on their existing source method proof. The
+  exported generic owner path is repaired. Other merged overload paths still
+  need complete verification.
 - Complete computed names through their real key publisher. The new name planner
   currently reports them as unsupported.
 - Complete the class base-constructor state and argument counts described below.
@@ -84,9 +101,14 @@ The rest of the same operation remains open:
   current routes remain separate, but changed cache expectations need concrete
   pinned-Go evidence before any test change.
 
-Eighteen read-only investigations ran in parallel. Keep one production writer
-and one code reviewer. Give extra workers bounded source and evidence checks.
-Do not promote the checkpoint while any regression is unresolved.
+Sixteen disjoint [accepted-loss audits](../target/query-core-accepted-failure-audit-result.md)
+account for all 286 full-1 losses against the accepted roster. Ten now pass.
+The remaining 263 failures and 13 absent names stay open. Source comparisons
+do not waive an entire test when a private branch remains unobserved.
+Seven more workers checked the next typeof operation, public controls, counts
+and the trace patch. Keep one production writer and one code reviewer. Give
+extra workers bounded source and evidence checks. Do not promote the checkpoint
+while any regression is unresolved.
 
 ## What the source comparison established
 
@@ -107,7 +129,7 @@ collects the actual class and interface formals. Its declared-type dispatcher
 chooses class identity first. Reuse this implementation.
 
 The checkpoint adds merged-owner defaults and the measured class/interface
-instance-base path. General runtime class bases and selected class methods
+instance-base path. General runtime class bases and merged method overloads
 remain unfinished. The shared member operation also has the regression gaps
 listed above. Changing only the global-read guard does not finish these callers.
 
@@ -223,7 +245,7 @@ diagnostic changes and whether ordinary checking completes. The small fixture
 does not replace this check, especially for imports and aliases.
 
 Before promotion, run the accepted regression selections and compare every
-old passing name and diagnostic record. The current 273 failures, 13 absent
+old passing name and diagnostic record. The current 263 failures, 13 absent
 names and changed corpus records remain open blockers. New passes do not offset
 them. Do not change an accepted expectation without concrete pinned-Go evidence.
 
