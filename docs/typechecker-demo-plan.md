@@ -19,8 +19,8 @@ may close checks that started before this reset, with no follow-on stages.
 
 Use one integration branch, `query-core-integration`, at the existing candidate
 `eb99690774e90e6333bc606e1402b6770259d371`. Reuse its current worktree and build
-target. Do not change that worktree until its running Hono check closes. The
-candidate is not accepted, and no pending feature branch joins automatically.
+target. Hono 26 has closed and root owns both. The candidate is not accepted,
+and no pending feature branch joins automatically.
 
 ### Regression baseline
 
@@ -30,25 +30,34 @@ at `8f4943ac6dffa6785165e18a07a5b369a6811da7`. Recent failing candidates are
 not substitutes for this baseline.
 
 The [accepted gate](../target/wave202-core-class-call-integration-2-receipt.md)
-passed all 6,055 selected tests in 120 harnesses. Exact name comparison with
-the current shared gate gives:
+passed all 6,055 selected tests in 120 harnesses. The new
+[complete checker selection](../target/query-core-accepted-checker-baseline-1-result.md)
+ran all 110 accepted public targets with the checker library on unchanged
+`eb996907`. Exact name comparison gives:
 
 | Accepted selection | Retained passes | Failures | Missing or not run |
 | --- | ---: | ---: | ---: |
 | Checker library, 4,839 tests | 4,601 | 228 | 10 |
-| Public checker tests, 677 tests | 48 | 3 | 626 |
+| Public checker tests, 677 tests | 651 | 24 | 2 |
 | Compiler library, 285 tests | 0 | 0 | 285 |
 | Fixture library, 188 tests | 0 | 0 | 188 |
 | Fixture binary tests, 4 tests | 0 | 0 | 4 |
 | Fixture integration tests, 61 tests | 0 | 0 | 61 |
 | Complete original class fixture, 1 test | 0 | 0 | 1 |
-| Total | 4,649 | 231 | 1,175 |
+| Total | 5,252 | 252 | 551 |
 
-These 231 failures are unresolved regressions. The 1,175 missing or unrun
+These 252 failures require an explanation or a repair. The 551 missing or unrun
 tests are coverage gaps, not passes. New passing tests cannot offset either
 group. Record each old test by harness and full name, with its current outcome,
 cause, evidence and disposition. Keep unknown causes explicit. A changed
 expectation needs a concrete pinned TypeScript-Go comparison before approval.
+
+The [first contract correction](../target/query-core-interface-demand-1-result.md)
+accounts for two of those failures. Go's interface identity query leaves
+inherited members cold. Both tests now demand a real inherited property before
+checking complete caches. All earlier behavior checks remain, and both complete
+tests pass. This test-only change is committed as `2bf54614a`. It is not a
+production repair or a Query improvement. The original baseline is unchanged.
 
 The [accepted original corpus](../target/wave202-core-class-call-corpus-2-receipt.md)
 has 423 exact diagnostic records in 511 executed variants and 60 exact semantic

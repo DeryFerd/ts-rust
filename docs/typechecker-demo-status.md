@@ -5,12 +5,21 @@ Updated 2026-09-03. Neither Query nor Hono has passed a full Rust type check.
 The [execution reset](typechecker-demo-plan.md#execution-reset) now controls
 the work. Root is the sole implementer, with one reviewer. Query core is first.
 All other production drafts are frozen. Hono remains a periodic cross-project
-check. Checks already in progress may finish, with no new follow-on stages.
+check. All earlier worker runs have closed. Root owns the integration branch
+`query-core-integration` and its build target.
 
-Against the last accepted compiler, the current shared gate retains 4,649 of
-6,055 selected test passes, loses 231, and leaves 1,175 missing or unrun.
-These are unresolved regressions and coverage gaps. Comparisons with recent
-failing candidates below do not replace that accepted baseline.
+Against the last accepted compiler, the
+[complete checker baseline](../target/query-core-accepted-checker-baseline-1-result.md)
+retains 5,252 of 6,055 selected passes, loses 252, and leaves 551 missing or
+unrun. All 110 accepted public checker targets now ran. The gaps are 12 absent
+names and 539 unrun compiler and fixture tests. Comparisons with recent failing
+candidates below do not replace this accepted baseline.
+
+Two failures are now explained by a concrete Go comparison and corrected in
+`2bf54614a`. Those tests demanded complete member caches from an identity-only
+query. The corrected tests pass with all earlier behavior checks intact.
+That leaves 250 baseline failures without an accepted disposition. No production
+repair or new Query completion is claimed for this test correction.
 
 ## Current result
 
@@ -21,7 +30,8 @@ project has gained a complete isolated root in the latest comparisons.
 | --- | --- | --- |
 | Query, combined census 44 | 2 of 23 isolated roots complete | No gain or loss against census 41. No internal errors |
 | Query, separate method candidate 43 | 2 of 23 isolated roots complete | Five roots now fail internal type-literal checks. Candidate remains excluded |
-| Hono, census 25 | 33 of 188 isolated roots complete | No complete-root gains. One new internal call error |
+| Hono, census 26 | 33 of 188 isolated roots complete | Every outcome and diagnostic matches census 25 |
+| Accepted checker baseline 1 | Library 5,067 pass, 370 fail. Public 669 pass, 27 fail | All 111 harnesses completed. 252 accepted passes lost, 12 names absent |
 | Return-context repair, six public targets | 19 pass, 0 fail | All three lost public passes restored |
 | Checker library, return-context repair | 5,064 pass, 373 fail | Both lost library passes restored. Every outcome matches run 54 |
 | Shared candidate, integration 2 | Library 5,067 pass, 370 fail. Public 239 pass, 35 fail | Three library recoveries. No old pass lost against runs 54 or 56 |
@@ -49,9 +59,9 @@ past the shared heritage error and stops at a later method in `timeoutManager.ts
 the earlier combined candidate. Their changes still need combined verification
 with the Query 41 repair.
 
-[Hono 25](../target/wave202-hono-combined-census-25-result.md) keeps the same
+[Hono 26](../target/wave202-hono-combined-census-26-result.md) keeps the same
 33 complete roots. Ordinary checking still fails in `http-exception.ts`.
-The new `basic-auth` call failure is in `Promise.all`. Its special call path
+The `basic-auth` call failure is in `Promise.all`. Its special call path
 rejects valid merged library declarations. That repair is separate from the
 ordinary-check property-context repair.
 
