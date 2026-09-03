@@ -246,12 +246,18 @@ impl SourceClassProviderDemand {
     }
 }
 
-/// An implements reference keeps the ordinary alias route and declared class owner.
+/// A type dependency keeps its written import proof and declared class owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceClassTypeImportDemand {
     reference: NodeRef,
-    import: OrdinaryImportAliasChain,
+    import: SourceClassTypeImportOrigin,
     pub(super) owner: SourceClassImportOwner,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceClassTypeImportOrigin {
+    Implementation(OrdinaryImportAliasChain),
+    InterfaceAnnotation(Box<SourceClassAnnotationTypeImportPlan>),
 }
 
 impl SourceClassTypeImportDemand {
@@ -260,9 +266,17 @@ impl SourceClassTypeImportDemand {
         store: &CanonicalTypeMapperStore,
         host: &DeclaredTypeHost<'_>,
     ) -> Result<(), SourceImportError> {
-        if self.import.target() != self.owner.symbol
-            || plan_source_class_type_import(store, host, self.reference)?.as_ref() != Some(self)
-        {
+        let (target, current) = match &self.import {
+            SourceClassTypeImportOrigin::Implementation(import) => (
+                import.target(),
+                plan_source_class_type_import(store, host, self.reference)?,
+            ),
+            SourceClassTypeImportOrigin::InterfaceAnnotation(import) => (
+                import.target_symbol(),
+                plan_source_interface_class_annotation_provider(store, host, self.reference)?,
+            ),
+        };
+        if target != self.owner.symbol || current.as_ref() != Some(self) {
             return Err(invariant(SourceImportInvariant::ReadBindingMismatch(
                 self.reference,
             )));
@@ -306,7 +320,42 @@ pub(super) fn plan_source_class_type_import(
     }
     Ok(Some(SourceClassTypeImportDemand {
         reference,
-        import,
+        import: SourceClassTypeImportOrigin::Implementation(import),
+        owner,
+    }))
+}
+
+/// Requests the source provider without publishing a value for the import alias.
+pub(super) fn plan_source_interface_class_annotation_provider(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    reference: NodeRef,
+) -> Result<Option<SourceClassTypeImportDemand>, SourceImportError> {
+    let Some(import) = plan_source_class_annotation_type_import(store, host, reference)? else {
+        return Ok(None);
+    };
+    let Some(chain) = import.ordinary_import() else {
+        return Ok(None);
+    };
+    let target = import.target_symbol();
+    if import.interface_property.is_none() || chain.target() != target {
+        return Err(invariant(SourceImportInvariant::ReadBindingMismatch(
+            reference,
+        )));
+    }
+    let Some(owner) = source_class_import_owner(store, host, target)
+        .map_err(|error| imported_ambient_class_error(target, reference, error))?
+    else {
+        return Ok(None);
+    };
+    if owner.source.file() == reference.file {
+        return Err(invariant(SourceImportInvariant::ReadBindingMismatch(
+            reference,
+        )));
+    }
+    Ok(Some(SourceClassTypeImportDemand {
+        reference,
+        import: SourceClassTypeImportOrigin::InterfaceAnnotation(Box::new(import)),
         owner,
     }))
 }

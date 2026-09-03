@@ -5703,66 +5703,72 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             });
                             continue;
                         }
-                        if let Err(error) =
-                            super::object_members::plan_interface(store, host, symbol)
+                        let plan = match super::object_members::plan_interface(store, host, symbol)
                         {
-                            if let super::object_members::PropertyObjectError::UnsupportedMember {
-                                node,
-                                kind: SyntaxKind::CallSignature,
-                            } = &error
-                                && self.authenticated_generic_predicate_interface_call(
-                                    statement, symbol, *node,
-                                )?
-                            {
-                                statements.push(PlannedStatement::Interface(symbol));
-                                continue;
-                            }
-                            if let Some(owner) = store.symbol(symbol)
-                                && owner.flags() == (SymbolFlags::CLASS | SymbolFlags::INTERFACE)
-                                && let Some([class, interface]) = owner.declarations()
-                                && *interface == statement
-                                && statements.iter().any(|planned| {
-                                    matches!(
-                                        planned,
-                                        PlannedStatement::ClassGrammar(grammar)
-                                            if grammar.symbol == symbol
-                                                && grammar.declaration == *class
-                                                && matches!(
-                                                    grammar.diagnostics.as_slice(),
-                                                    [static_side, constructor]
-                                                        if static_side.code == 2417
-                                                            && constructor.code == 17005
-                                                )
-                                    )
-                                })
-                                && plan_class_grammar_diagnostics(store, host, symbol)
-                                    .is_some_and(|grammar| grammar.declaration == *class)
-                            {
-                                continue;
-                            }
-                            if let Some(conflict) =
-                                self.plan_merged_interface_conflict(statement, symbol)?
-                            {
-                                if conflict.declaration == statement {
-                                    statements.push(PlannedStatement::InterfaceConflict(conflict));
+                            Ok(plan) => plan,
+                            Err(error) => {
+                                if let super::object_members::PropertyObjectError::UnsupportedMember {
+                                    node,
+                                    kind: SyntaxKind::CallSignature,
+                                } = &error
+                                    && self.authenticated_generic_predicate_interface_call(
+                                        statement, symbol, *node,
+                                    )?
+                                {
+                                    statements.push(PlannedStatement::Interface(symbol));
+                                    continue;
                                 }
-                                continue;
+                                if let Some(owner) = store.symbol(symbol)
+                                    && owner.flags()
+                                        == (SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+                                    && let Some([class, interface]) = owner.declarations()
+                                    && *interface == statement
+                                    && statements.iter().any(|planned| {
+                                        matches!(
+                                            planned,
+                                            PlannedStatement::ClassGrammar(grammar)
+                                                if grammar.symbol == symbol
+                                                    && grammar.declaration == *class
+                                                    && matches!(
+                                                        grammar.diagnostics.as_slice(),
+                                                        [static_side, constructor]
+                                                            if static_side.code == 2417
+                                                                && constructor.code == 17005
+                                                    )
+                                        )
+                                    })
+                                    && plan_class_grammar_diagnostics(store, host, symbol)
+                                        .is_some_and(|grammar| grammar.declaration == *class)
+                                {
+                                    continue;
+                                }
+                                if let Some(conflict) =
+                                    self.plan_merged_interface_conflict(statement, symbol)?
+                                {
+                                    if conflict.declaration == statement {
+                                        statements
+                                            .push(PlannedStatement::InterfaceConflict(conflict));
+                                    }
+                                    continue;
+                                }
+                                if let Some(grammar) = self
+                                    .plan_interface_construct_signature_grammar(statement, symbol)?
+                                {
+                                    statements.push(PlannedStatement::InterfaceGrammar(grammar));
+                                    continue;
+                                }
+                                if let Some(parameter) =
+                                    self.plan_invalid_bigint_index_signature(statement, symbol)?
+                                {
+                                    statements.push(PlannedStatement::InvalidBigIntIndexSignature(
+                                        parameter,
+                                    ));
+                                    continue;
+                                }
+                                return Err(self.interface_plan_error(statement, error));
                             }
-                            if let Some(grammar) =
-                                self.plan_interface_construct_signature_grammar(statement, symbol)?
-                            {
-                                statements.push(PlannedStatement::InterfaceGrammar(grammar));
-                                continue;
-                            }
-                            if let Some(parameter) =
-                                self.plan_invalid_bigint_index_signature(statement, symbol)?
-                            {
-                                statements
-                                    .push(PlannedStatement::InvalidBigIntIndexSignature(parameter));
-                                continue;
-                            }
-                            return Err(self.interface_plan_error(statement, error));
-                        }
+                        };
+                        self.plan_interface_class_annotation_providers(statement, &plan)?;
                     }
                     statements.push(PlannedStatement::Interface(symbol));
                 }
@@ -9709,6 +9715,90 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             Err(error) => return Err(DeclaredTypeError::from(error).into()),
         })
+    }
+
+    /// Ask the source driver to complete class providers before interface member reads.
+    fn plan_interface_class_annotation_providers(
+        &self,
+        declaration: NodeRef,
+        plan: &super::object_members::PropertyObjectPlan,
+    ) -> Result<(), SourceCheckError> {
+        let Some(request) = self.source_class_import_demand else {
+            return Ok(());
+        };
+        let Some((store, host)) = self.semantic else {
+            return Ok(());
+        };
+        // The retained annotation proof requires one exact interface declaration.
+        if plan.declarations.as_slice() != [declaration]
+            || store.symbol(plan.symbol).is_none_or(|owner| {
+                owner.flags() != SymbolFlags::INTERFACE
+                    || owner.declarations() != Some(&[declaration])
+            })
+        {
+            return Ok(());
+        }
+        for property in &plan.properties {
+            let mut pending = vec![property.type_node];
+            let mut seen = HashSet::new();
+            while let Some(reference) = pending.pop() {
+                if !seen.insert(reference) {
+                    return Err(SourceCheckError::Import(reference));
+                }
+                let record = self.node(reference)?;
+                if !matches!(
+                    record.kind,
+                    SyntaxKind::TypeReference
+                        | SyntaxKind::ParenthesizedType
+                        | SyntaxKind::ArrayType
+                        | SyntaxKind::UnionType
+                        | SyntaxKind::TypeOperator
+                ) {
+                    continue;
+                }
+                if record.kind == SyntaxKind::TypeReference
+                    && let Some(demand) =
+                        super::source_imports::plan_source_interface_class_annotation_provider(
+                            store, host, reference,
+                        )
+                        .map_err(|error| Self::import_plan_error(reference, &error))?
+                {
+                    let globals = self
+                        .global_types
+                        .ok_or(SourceCheckError::Import(reference))?;
+                    let options = self
+                        .meta_options
+                        .ok_or(SourceCheckError::Import(reference))?;
+                    if demand
+                        .completed_type(store, host, globals, options)
+                        .map_err(|error| Self::import_plan_error(reference, &error))?
+                        .is_none()
+                    {
+                        if request
+                            .replace(Some(SourceClassProviderDemand::Type(Box::new(demand))))
+                            .is_some()
+                        {
+                            return Err(SourceCheckError::Import(reference));
+                        }
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Import(reference),
+                        ));
+                    }
+                }
+                let children = store
+                    .source_direct_children(reference)
+                    .ok_or(SourceCheckError::Import(reference))?;
+                for child in children {
+                    if !child.is_for(reference.arena, reference.file)
+                        || self.node(child)?.parent != Some(reference.node)
+                    {
+                        return Err(SourceCheckError::Import(child));
+                    }
+                    pending.push(child);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn plan_type_import_annotation_root(&mut self, root: NodeRef) -> Result<(), SourceCheckError> {
