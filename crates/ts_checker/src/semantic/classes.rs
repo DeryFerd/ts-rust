@@ -14521,20 +14521,46 @@ fn plan_class_method_parameter_with_body_mode(
             && data.question_token.is_none()
             && matches!(type_record.data, NodeData::UnionTypeNode(_))
         {
-            let cached =
-                preflight_primitive_union_annotation(store, host, type_node).map_err(|error| {
-                    match error {
-                        DeclaredTypeError::TypeNodeUnavailable(
-                            TypeNodeUnavailable::UnsupportedSyntax { .. },
-                        ) => reject(),
-                        error => ClassError::DeclaredType(error),
+            match preflight_primitive_union_annotation(store, host, type_node) {
+                Ok(cached) => (
+                    Some(type_node),
+                    ClassBodyParameterType::PrimitiveUnion(type_node),
+                    cached,
+                ),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax { .. },
+                )) => {
+                    let context = type_context.ok_or_else(reject)?;
+                    let owner = source_owner.ok_or_else(reject)?;
+                    if !matches!(source_class_annotation_role(store, host, owner, type_node)?,
+                        Some(SourceClassAnnotationRole::MethodParameter {
+                            method: actual_method,
+                            parameter: actual_parameter,
+                        }) if actual_method == method && actual_parameter == parameter)
+                        && !annotations::source_class_method_annotation_is_owned(
+                            store, host, owner, type_node,
+                        )
+                    {
+                        return Err(reject());
                     }
-                })?;
-            (
-                Some(type_node),
-                ClassBodyParameterType::PrimitiveUnion(type_node),
-                cached,
-            )
+                    // Broader unions use the same owner-aware annotation query as named types.
+                    let cached = preflight_source_class_annotation(
+                        store,
+                        host,
+                        &context.global_types,
+                        context.options,
+                        type_node,
+                        owner,
+                    )?
+                    .cached_type(store, host, Some(&context.global_types))?;
+                    (
+                        Some(type_node),
+                        ClassBodyParameterType::Annotation(type_node),
+                        cached,
+                    )
+                }
+                Err(error) => return Err(ClassError::DeclaredType(error)),
+            }
         } else if source_body
             && type_context.is_some()
             && data.question_token.is_none()

@@ -765,8 +765,11 @@ fn source_nongeneric_class_method_annotation_is_owned(
 ) -> bool {
     let owned = || {
         let annotation_record = host.node(annotation)?;
-        if annotation_record.kind != SyntaxKind::TypeLiteral
-            || !matches!(annotation_record.data, NodeData::TypeLiteralNode(_))
+        if !matches!(
+            (annotation_record.kind, &annotation_record.data),
+            (SyntaxKind::TypeLiteral, NodeData::TypeLiteralNode(_))
+                | (SyntaxKind::UnionType, NodeData::UnionTypeNode(_))
+        )
         {
             return None;
         }

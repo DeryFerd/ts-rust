@@ -81,7 +81,7 @@ pub(super) fn plan_declared_value(
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
 ) -> Result<DeclaredValuePlan, DeclaredTypeError> {
-    if let Some(plan) = plan_global_type_literal_value(store, host, symbol)? {
+    if let Some(plan) = plan_ambient_global_value(store, host, symbol)? {
         return Ok(plan);
     }
     let invalid = || invalid_value(symbol);
@@ -317,7 +317,7 @@ pub(super) fn plan_global_type_literal_value(
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
 ) -> Result<Option<DeclaredValuePlan>, DeclaredTypeError> {
-    plan_global_annotated_value(store, host, symbol, SyntaxKind::TypeLiteral)
+    plan_global_annotated_value(store, host, symbol, Some(SyntaxKind::TypeLiteral))
 }
 
 /// A named constructor keeps the same selected value and complete global merge.
@@ -326,7 +326,16 @@ pub(super) fn plan_global_named_constructor_value(
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
 ) -> Result<Option<DeclaredValuePlan>, DeclaredTypeError> {
-    plan_global_annotated_value(store, host, symbol, SyntaxKind::TypeReference)
+    plan_global_annotated_value(store, host, symbol, Some(SyntaxKind::TypeReference))
+}
+
+/// Reads a script-origin ambient global through its complete saved merge.
+pub(super) fn plan_ambient_global_value(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Option<DeclaredValuePlan>, DeclaredTypeError> {
+    plan_global_annotated_value(store, host, symbol, None)
 }
 
 #[allow(clippy::too_many_lines)] // The complete merge and selected source form one proof.
@@ -334,7 +343,7 @@ fn plan_global_annotated_value(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
-    annotation_kind: SyntaxKind,
+    library_annotation_kind: Option<SyntaxKind>,
 ) -> Result<Option<DeclaredValuePlan>, DeclaredTypeError> {
     let invalid = || invalid_value(symbol);
     let Some(globals) = store.source_global_bindings() else {
@@ -354,10 +363,19 @@ fn plan_global_annotated_value(
     let Some(annotation) = store.source_direct_type_annotation(selected) else {
         return Ok(None);
     };
-    if !store.source_is_default_library_declaration(selected)
-        || store.source_node_kind(annotation) != Some(annotation_kind)
-    {
-        return Ok(None);
+    if let Some(kind) = library_annotation_kind {
+        if !store.source_is_default_library_declaration(selected)
+            || store.source_node_kind(annotation) != Some(kind)
+        {
+            return Ok(None);
+        }
+    } else {
+        let Some(facts) = host.bound_file(selected).and_then(|bound| bound.source_facts()) else {
+            return Ok(None);
+        };
+        if !facts.is_declaration_file() || facts.is_external_or_common_js_module() {
+            return Ok(None);
+        }
     }
     // The type-side and value-side readers share this ordered mixed-owner proof.
     // The variable-only route retains its complete host proof below.

@@ -68,7 +68,7 @@ pub(super) struct PlannedIdentifierRead {
     pub(super) value_symbol: SemanticSymbolId,
 }
 
-/// One authenticated global read backed by an ambient declaration in another script.
+/// One authenticated global read backed by an ambient declaration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PlannedCrossFileGlobalRead {
     pub(super) type_node: NodeRef,
@@ -2115,6 +2115,50 @@ pub(super) fn plan_identifier_read(
 }
 
 /// Authenticates an explicitly annotated ambient declaration in the global scope.
+pub(super) fn plan_ambient_global_identifier_read(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    name: &str,
+) -> Result<Option<PlannedCrossFileGlobalRead>, VariablePlanError> {
+    let Some(routed) = resolve_cross_file_global_value_symbol(arena, bound, store, host, node, name)?
+    else {
+        return Ok(None);
+    };
+    if store.symbol(routed.target).is_some_and(|record| {
+        record.flags().intersects(
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        )
+    }) {
+        validate_value_links(store, routed.target)?;
+    }
+    let Some(value) = super::declared_values::plan_ambient_global_value(store, host, routed.target)
+        .map_err(VariablePlanError::DeclaredType)?
+    else {
+        return Ok(None);
+    };
+    if store.symbol_node_links(node).is_some_and(|links| {
+        links.resolved_symbol.is_some_and(|cached| cached != routed.resolved)
+    }) {
+        return Err(VariableInvariant::InvalidSymbolNodeCache {
+            node,
+            cached: store.symbol_node_links(node).and_then(|links| links.resolved_symbol),
+            expected: routed.resolved,
+        }
+        .into());
+    }
+    Ok(Some(PlannedCrossFileGlobalRead {
+        type_node: value.annotation,
+        read: PlannedIdentifierRead {
+            resolved_symbol: routed.resolved,
+            value_symbol: routed.target,
+        },
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn plan_cross_file_global_identifier_read(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -2214,32 +2258,39 @@ fn resolve_cross_file_global_value_symbol(
     node: NodeRef,
     name: &str,
 ) -> Result<Option<RoutedValueSymbol>, VariablePlanError> {
+    let Some(global) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source(name))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(None);
+    };
     let mut callback_host = host
         .name_resolver_host(store)
         .map_err(VariablePlanError::DeclaredType)?;
     let mut name_lookup =
         CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
             .map_err(|error| name_resolution_error(node, error))?;
-    let Some(resolved) = name_lookup
-        .resolve(
+    let resolved = match name_lookup.resolve(
             Some(CanonicalResolutionLocation::Bound(node)),
             name,
             SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
             None,
             false,
             false,
-        )
-        .map_err(|error| name_resolution_error(node, error))?
-    else {
+        ) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(name_resolution_error(node, error)),
+    };
+    if store.get_merged_symbol(resolved) != Some(global) {
         return Ok(None);
     };
     let routed = route_value_symbol(store, node, resolved)?;
-    let global = store
-        .intrinsic_bootstrap()
-        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
-        .and_then(|globals| globals.get_source(name))
-        .and_then(|symbol| store.get_merged_symbol(symbol));
-    Ok((routed.export_local.is_none() && global == Some(routed.target)).then_some(routed))
+    Ok((routed.export_local.is_none() && global == routed.target).then_some(routed))
 }
 
 fn authenticated_cross_file_global_declaration(

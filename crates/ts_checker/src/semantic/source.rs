@@ -378,7 +378,8 @@ use super::{
         PlannedArrayBindingElement, PlannedCrossFileGlobalRead,
         PlannedIdentifierRead as PlannedVariableRead, PlannedObjectBindingElement,
         VariableBindingKind, VariablePlanError, plan_class_value_identifier_read,
-        plan_cross_file_global_identifier_read, plan_declared_value_identifier_read,
+        plan_ambient_global_identifier_read, plan_cross_file_global_identifier_read,
+        plan_declared_value_identifier_read,
         plan_identifier_read, plan_recovered_anonymous_module_identifier_read,
         plan_recovered_anonymous_module_variable, plan_redeclared_top_level_variable,
         plan_top_level_array_binding_elements, plan_top_level_object_binding_elements,
@@ -28318,6 +28319,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         PlannedExpressionKind::Identifier(PlannedIdentifierRead::unresolved(
                             bootstrap.unknown_symbol,
                         )),
+                    ));
+                }
+                if let Some(read) = plan_ambient_global_identifier_read(
+                    self.arena, self.bound, store, host, expression, &name,
+                )
+                .map_err(Self::variable_plan_error)?
+                {
+                    self.identifier_reads.push((expression, read.read.resolved_symbol));
+                    self.cross_file_global_reads.push(read);
+                    return Ok(PlannedExpression::new(
+                        expression,
+                        PlannedExpressionKind::Identifier(PlannedIdentifierRead::variable(read.read)),
                     ));
                 }
                 let variable_read = plan_identifier_read(
@@ -78844,6 +78857,19 @@ fn check_source_plan(
     for read in &cross_file_global_reads {
         if !preflighted_cross_file_globals.insert(read.read.value_symbol) {
             continue;
+        }
+        let declared_value = super::declared_values::plan_ambient_global_value(
+            store,
+            host,
+            read.read.value_symbol,
+        )?;
+        if declared_value
+            .as_ref()
+            .is_some_and(|value| value.annotation != read.type_node)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(read.read.value_symbol),
+            ));
         }
         if cross_file_global_uses_only_object_factory_calls(host, &identifier_reads, read) {
             lazy_cross_file_globals.insert(read.read.value_symbol);
