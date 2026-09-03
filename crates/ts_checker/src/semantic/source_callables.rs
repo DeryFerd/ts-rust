@@ -8444,7 +8444,7 @@ pub(super) fn source_direct_call_statement_container<TypePayload, MapperPayload>
 }
 
 /// Keeps a returned or locally initialized call tied to its real callable body.
-fn source_direct_call_value_container<TypePayload, MapperPayload>(
+pub(super) fn source_direct_call_value_container<TypePayload, MapperPayload>(
     store: &SemanticStore<TypePayload, MapperPayload>,
     call: NodeRef,
 ) -> Option<(NodeRef, NodeRef)> {
