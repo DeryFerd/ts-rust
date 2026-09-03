@@ -327,6 +327,11 @@ fn ordinary_interface_preserves_three_ordered_bases_cold_and_warm() {
         let early = query_first.then(|| {
             let type_ = checker.get_declared_type_of_symbol(owners[3]).unwrap();
             let data = interface_data(&checker, type_);
+            assert!(!data.base_types_resolved);
+            assert!(!data.declared_members_resolved);
+            let string_type = checker.store().intrinsic_bootstrap().unwrap().string_type;
+            assert_eq!(checker.get_type_at_location(accesses[0]), Ok(string_type));
+            let data = interface_data(&checker, type_);
             assert!(data.base_types_resolved);
             assert!(data.declared_members_resolved);
             let bases = owners[..3]
@@ -757,6 +762,11 @@ fn leaf_interface_preserves_properties_from_a_three_base_interface() {
         );
         let early = query_first.then(|| {
             let type_ = checker.get_declared_type_of_symbol(owners[4]).unwrap();
+            let data = interface_data(&checker, type_);
+            assert!(!data.base_types_resolved);
+            assert!(!data.declared_members_resolved);
+            let string_type = checker.store().intrinsic_bootstrap().unwrap().string_type;
+            assert_eq!(checker.get_type_at_location(accesses[0]), Ok(string_type));
             let data = interface_data(&checker, type_);
             assert!(data.base_types_resolved);
             assert!(data.declared_members_resolved);
