@@ -1,34 +1,99 @@
 # First complete project demos
 
-Updated 2026-08-31. The full port goal remains active.
+Updated 2026-09-03. The full port goal remains active.
 
 Read the [current demo status](typechecker-demo-status.md) first. It has the
 latest complete Hono and Query measurements, build failures and next work.
 The detailed results below retain earlier checkpoints and their evidence.
 
-## Decision
+## Execution reset
 
-Use Hono and TanStack Query core as the two complete-project demo targets.
-Keep Hono as the main integration target. The full Query census is now complete.
-Choose the first demo from complete measured results, not source-file counts.
-Three unchanged Hono class-annotation tests now pass,
-including rejected status codes and renamed imports. The full Hono run still
-stops on an unavailable interface declaration in `http-exception.ts`.
-The latest trace identifies the merged DOM and Node `Response` declarations.
-The library batch already addresses the observed declaration guard. It still
-needs a complete runtime check on the combined source.
-Query still needs more source-language features before its next complete check.
-This changes the work order, not the acceptance criteria.
-Use their existing production typecheck configurations, not a new app
-or a reduced source list. These are selected targets, not projects proved close
-to passing. No complete real-world project has passed in Rust yet.
+Query core is the immediate target. Hono is a periodic cross-project check.
+Do not add more demo libraries or feature branches.
 
-New checker work should address a measured failure in one of these projects,
-a shared dependency of that failure, or a regression that prevents integration.
-Finish the current bounded patches. Do not start more unrelated feature
-batches while the demo path remains unmeasured.
+Root is the sole implementer and owns the integration index. The agent
+`query_timer_context_peer` is the sole reviewer. Other agents may answer
+specific read-only questions, but must not create production or test changes.
+All existing branches, commits and dirty drafts stay preserved. Runtime owners
+may close checks that started before this reset, with no follow-on stages.
 
-## Current evidence
+Use one integration branch, `query-core-integration`, at the existing candidate
+`eb99690774e90e6333bc606e1402b6770259d371`. Reuse its current worktree and build
+target. Do not change that worktree until its running Hono check closes. The
+candidate is not accepted, and no pending feature branch joins automatically.
+
+### Regression baseline
+
+Compare with the last accepted compiler, measured at
+`5c7c7bd20cb45ebc8f2171eed8478fa2797e8343` and promoted as equivalent source
+at `8f4943ac6dffa6785165e18a07a5b369a6811da7`. Recent failing candidates are
+not substitutes for this baseline.
+
+The [accepted gate](../target/wave202-core-class-call-integration-2-receipt.md)
+passed all 6,055 selected tests in 120 harnesses. Exact name comparison with
+the current shared gate gives:
+
+| Accepted selection | Retained passes | Failures | Missing or not run |
+| --- | ---: | ---: | ---: |
+| Checker library, 4,839 tests | 4,601 | 228 | 10 |
+| Public checker tests, 677 tests | 48 | 3 | 626 |
+| Compiler library, 285 tests | 0 | 0 | 285 |
+| Fixture library, 188 tests | 0 | 0 | 188 |
+| Fixture binary tests, 4 tests | 0 | 0 | 4 |
+| Fixture integration tests, 61 tests | 0 | 0 | 61 |
+| Complete original class fixture, 1 test | 0 | 0 | 1 |
+| Total | 4,649 | 231 | 1,175 |
+
+These 231 failures are unresolved regressions. The 1,175 missing or unrun
+tests are coverage gaps, not passes. New passing tests cannot offset either
+group. Record each old test by harness and full name, with its current outcome,
+cause, evidence and disposition. Keep unknown causes explicit. A changed
+expectation needs a concrete pinned TypeScript-Go comparison before approval.
+
+The [accepted original corpus](../target/wave202-core-class-call-corpus-2-receipt.md)
+has 423 exact diagnostic records in 511 executed variants and 60 exact semantic
+records in 95 variants. Preserve each accepted diagnostic, type and symbol
+payload, not just the total count. Run these same selections before promoting
+a batch. Missing outputs, crashes and new mismatches block promotion.
+
+### Work loop
+
+1. Select one failing Query operation. Trace it through the pinned Go checker
+   and the actual Rust callers. Identify the required context, state and
+   publication order. If successive changes hit cache or ownership checks,
+   examine the shared path before adding another exception.
+2. Implement the complete operation on the integration branch. Keep original
+   project inputs, compiler options, libraries and expected diagnostics fixed.
+3. Compile implementation and test code. Run focused positive and negative
+   cases, then rerun unchanged Query on that build. Use the existing runner,
+   normal logs, actual tool permissions and resource limits.
+4. Have the single reviewer check the complete change and results. Do not add
+   preparation reviewers, repeated approval messages or new feature owners.
+5. Run the accepted regression selections before promotion. Account for every
+   lost pass, absent test and changed native record. Do not accept a batch with
+   unexplained regressions or unrun required tests.
+6. Report retained and lost passes, exact diagnostic changes and whether
+   ordinary Query checking completes. A later first failure is diagnostic
+   evidence, not a completed feature.
+
+After two batches without a meaningful Query result, stop adding patches and
+reassess the dependency path. More workers are not the fallback. Run Hono after
+a meaningful Query milestone or a shared-path change that needs a cross-project
+check, rather than after every local edit.
+
+### Immediate milestone
+
+Complete ordinary Query core checking with diagnostics matching pinned Go.
+Then introduce a deliberate type error in a separate copy and require the
+correct diagnostic. Do not change the original project to obtain a pass.
+
+Full type, symbol and replay parity remain requirements for the finished
+compiler. This first milestone does not waive them.
+
+## Earlier evidence
+
+The sections below preserve historical results. They do not authorize work
+under the reset above.
 
 The latest complete core check passed all 6,422 tests in 136 harnesses on
 `57e743da`. All eleven stages and all 228 required controls passed, including

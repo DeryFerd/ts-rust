@@ -2,6 +2,16 @@
 
 Updated 2026-09-03. Neither Query nor Hono has passed a full Rust type check.
 
+The [execution reset](typechecker-demo-plan.md#execution-reset) now controls
+the work. Root is the sole implementer, with one reviewer. Query core is first.
+All other production drafts are frozen. Hono remains a periodic cross-project
+check. Checks already in progress may finish, with no new follow-on stages.
+
+Against the last accepted compiler, the current shared gate retains 4,649 of
+6,055 selected test passes, loses 231, and leaves 1,175 missing or unrun.
+These are unresolved regressions and coverage gaps. Comparisons with recent
+failing candidates below do not replace that accepted baseline.
+
 ## Current result
 
 Full-project progress is stalled. Focused tests still recover cases, but neither
@@ -59,7 +69,11 @@ overflow and produces no final scorecard. The semantic selection stays at
 60 exact matches out of 95 executed variants, but loses three previously exact
 cases and gains three others. It also has two supported mismatches.
 
-## Current work
+## Preserved work at the reset
+
+This is the state before the reset. These branches and drafts are preserved,
+not released for further implementation or integration. Only checks already
+started may finish.
 
 1. Run both projects on one combined candidate. Commit `eb996907` contains the
    Query 41 repair, indexed writes, merged-interface cache validation and TS6504
