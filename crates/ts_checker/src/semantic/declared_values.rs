@@ -1627,10 +1627,14 @@ fn cold_member_names_are_exact(
     for &declaration in declarations {
         if store.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration) {
             if store.source_node_kind(declaration) == Some(SyntaxKind::VariableDeclaration)
-                && record.value_declaration() == Some(declaration)
                 && record
                     .flags()
                     .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                && (record.value_declaration() == Some(declaration)
+                    || store
+                        .source_global_interface_value_owner(owner)
+                        .map_err(|_| invalid())?
+                        .is_some_and(|proof| proof.variables().contains(&declaration)))
             {
                 continue;
             }

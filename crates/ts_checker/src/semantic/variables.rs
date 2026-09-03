@@ -3123,6 +3123,14 @@ fn single_variable_declaration(
             Some(SyntaxKind::ModuleDeclaration)
                 if flags.contains(SymbolFlags::NAMESPACE_MODULE) => {}
             _ => {
+                if store.source_node_kind(declaration) == Some(SyntaxKind::VariableDeclaration)
+                    && flags.contains(SymbolFlags::INTERFACE)
+                    && let Some(owner) = store
+                        .source_global_interface_value_owner(symbol)
+                        .map_err(VariablePlanError::DeclaredType)?
+                {
+                    return Ok(owner.value_declaration());
+                }
                 return Err(VariablePlanError::Unsupported(
                     VariableUnsupported::NonUniqueDeclaration {
                         node,
