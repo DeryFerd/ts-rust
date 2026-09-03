@@ -19148,9 +19148,36 @@ fn validate_object_record(
             }
             if object_flags == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
                 && valid_declared_structured_members(store, object, plan, property_alias)
-                && resolved_property_links(store, plan)
             {
-                return Some(PropertyObjectState::Resolved(type_));
+                if resolved_property_links(store, plan) {
+                    return Some(PropertyObjectState::Resolved(type_));
+                }
+                if property_alias
+                    && plan.properties.iter().enumerate().all(|(index, property)| {
+                        if store
+                            .value_symbol_links(property.symbol)
+                            .is_some_and(|links| links.resolved_type.is_some())
+                            && store.declared_value_provenance(property.symbol).is_none()
+                        {
+                            return false;
+                        }
+                        matches!(
+                            super::declared_values::selected_planned_declared_property(
+                                store,
+                                type_,
+                                plan.node,
+                                plan.symbol,
+                                &plan.properties,
+                                index,
+                            ),
+                            Ok(super::declared_values::SelectedDeclaredProperty::Unresolved(_)
+                                | super::declared_values::SelectedDeclaredProperty::Resolved(_))
+                        )
+                    })
+                {
+                    // Alias member names can be ready before their property values.
+                    return Some(PropertyObjectState::Shell(type_));
+                }
             }
         }
         PropertyObjectKind::ObjectLiteral => {
@@ -19599,8 +19626,12 @@ fn validate_resolved_declared_property_object_detailed(
                         return NotDeclared;
                     }
                     let plan = property_object_alias_source_plan(store, projection);
+                    let state = validate_object_record(store, &plan, type_);
+                    if matches!(state, Some(PropertyObjectState::Shell(_))) {
+                        return NotDeclared;
+                    }
                     return if matches!(
-                        validate_object_record(store, &plan, type_),
+                        state,
                         Some(PropertyObjectState::Resolved(_))
                     ) && plan.properties.iter().all(|property| {
                         store

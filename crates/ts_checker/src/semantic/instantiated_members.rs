@@ -2529,11 +2529,7 @@ fn validate_property_object_alias_source_members(
     for (index, property) in projection.properties().iter().enumerate() {
         let type_ = match selected_source_property_object_property(store, projection, index)? {
             SelectedDeclaredProperty::Resolved(property) => Some(property.type_),
-            SelectedDeclaredProperty::Unresolved(symbol)
-                if symbol == property.symbol && !complete =>
-            {
-                None
-            }
+            SelectedDeclaredProperty::Unresolved(symbol) if symbol == property.symbol => None,
             _ => return Err(invalid()),
         };
         original_types.push(type_);
@@ -2596,14 +2592,36 @@ pub(super) fn resolve_property_object_alias_members_with_array_targets(
             array_targets,
         ),
     }?;
-    if let Some(members) = members {
-        return Ok(members);
-    }
     let projection = source_property_object_projection(store, receiver)?
         .ok_or(RelationUnavailable::UnsupportedStructuredType(receiver))?;
     let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
+    let (source_members, original_types) =
+        validate_property_object_alias_source_members(store, &projection)?;
+    if !store
+        .type_payload(projection.target())
+        .ok_or_else(invalid)?
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        // Instance member demand first resolves the template's names, not its values.
+        let properties = projection
+            .properties()
+            .iter()
+            .map(|property| property.symbol)
+            .collect::<Vec<_>>();
+        assert!(store.set_structured_type_members(
+            projection.target(),
+            source_members,
+            (!properties.is_empty()).then_some(properties),
+            None,
+            None,
+            None,
+        ));
+    }
+    if let Some(members) = members {
+        return Ok(members);
+    }
     let mapper = projection.mapper().ok_or_else(invalid)?;
-    let (_, original_types) = validate_property_object_alias_source_members(store, &projection)?;
     let mut properties = Vec::with_capacity(projection.properties().len());
     let mut proxy_count = 0;
     for (source, original) in projection.properties().iter().zip(original_types) {
