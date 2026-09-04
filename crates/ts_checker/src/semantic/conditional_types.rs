@@ -229,6 +229,16 @@ pub(super) trait ConditionalBranchSource {
         Err(missing_source_query())
     }
 
+    fn resolve_namespace_member_value(
+        &mut self,
+        _store: &mut CanonicalTypeMapperStore,
+        _receiver: TypeId,
+        _member: SemanticSymbolId,
+        _session: &mut InstantiationSession,
+    ) -> Result<GlobalThisMemberValueProof, DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
     fn validate_global_this_member_value_proof(
         &self,
         _store: &CanonicalTypeMapperStore,
@@ -345,6 +355,19 @@ impl<T: ConditionalBranchSource + ?Sized> super::relater::GlobalThisRelationSour
         session: &mut InstantiationSession,
     ) -> Result<GlobalThisMemberValueProof, Self::Error> {
         ConditionalBranchSource::resolve_global_this_member(self, store, receiver, member, session)
+    }
+
+    fn resolve_namespace_member_value(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        receiver: TypeId,
+        member: SemanticSymbolId,
+        session: &mut InstantiationSession,
+    ) -> Result<Option<GlobalThisMemberValueProof>, Self::Error> {
+        ConditionalBranchSource::resolve_namespace_member_value(
+            self, store, receiver, member, session,
+        )
+        .map(Some)
     }
 
     fn validate_global_this_member_value_proof(
@@ -1231,6 +1254,40 @@ impl ConditionalBranchSource for RecordingConditionalSource<'_> {
             .source
             .resolve_global_this_member(store, receiver, member, session)?;
         self.validate_reads(store, session)?;
+        self.member_values.push(proof.clone());
+        Ok(proof)
+    }
+
+    fn resolve_namespace_member_value(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        receiver: TypeId,
+        member: SemanticSymbolId,
+        session: &mut InstantiationSession,
+    ) -> Result<GlobalThisMemberValueProof, DeclaredTypeError> {
+        self.validate_options()?;
+        let proof = self
+            .source
+            .resolve_namespace_member_value(store, receiver, member, session)?;
+        self.validate_options()?;
+        self.nested
+            .extend(self.source.take_completed_source_conditionals());
+        self.validate_reads(store, session)?;
+        if !proof.is_namespace_value()
+            || proof.receiver() != receiver
+            || proof.member() != member
+            || store
+                .intrinsic_bootstrap()
+                .is_some_and(|bootstrap| proof.type_id() == bootstrap.error_type)
+        {
+            return Err(missing_source_query());
+        }
+        self.source.validate_global_this_member_value_proof(
+            store,
+            &proof,
+            self.globals,
+            self.options.strict_function_types,
+        )?;
         self.member_values.push(proof.clone());
         Ok(proof)
     }

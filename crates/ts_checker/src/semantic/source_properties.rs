@@ -2506,6 +2506,7 @@ enum NamespaceProperty {
         type_: TypeId,
     },
     Missing,
+    SourceOverload,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2530,6 +2531,7 @@ enum CanonicalArrayProperty {
 enum SourcePropertyLookup {
     Own,
     ArrayProperty(SemanticSymbolId),
+    NamespaceValue,
 }
 
 /// Proves property syntax and existing access caches before recursive receiver
@@ -2846,7 +2848,7 @@ pub(super) fn check_direct_source_property_with_session(
         session,
         true,
         |store, receiver, name, lookup, session| match lookup {
-            SourcePropertyLookup::Own => {
+            SourcePropertyLookup::Own | SourcePropertyLookup::NamespaceValue => {
                 resolve_direct_source_own_property(store, global_types, receiver, name, session)
             }
             SourcePropertyLookup::ArrayProperty(_) => Ok(None),
@@ -3211,6 +3213,32 @@ fn check_direct_source_property_with_source_mode(
         session,
         publish,
         |store, receiver, name, lookup, session| {
+            if matches!(lookup, SourcePropertyLookup::NamespaceValue) {
+                let (arena, _) = host
+                    .source(plan.node)
+                    .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+                let syntax =
+                    plan_direct_source_property_syntax_at(arena, store, plan.node, plan.position)?;
+                if syntax.receiver != plan.receiver.node
+                    || syntax.name_node != plan.name_node
+                    || syntax.name != plan.name
+                    || syntax.privacy != plan.privacy
+                    || syntax.optional != plan.optional
+                {
+                    return Err(SourcePropertyError::InvalidCache(plan.node).into());
+                }
+                return super::object_members::resolve_object_property_by_key_with_source(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    receiver,
+                    EscapedNameRef::source(name),
+                    session,
+                    diagnostics,
+                )
+                .map_err(SourcePropertyQueryError::Source);
+            }
             if let SourcePropertyLookup::ArrayProperty(symbol) = lookup {
                 return super::object_members::resolve_source_array_property(
                     store,
@@ -3890,9 +3918,21 @@ where
         None => resolve_namespace_property(store, global_types, plan, receiver_type)?,
     };
     let (type_, property, diagnostic) = if let Some(declared_property) = declared_property {
-        match declared_property {
-            NamespaceProperty::Present { symbol, type_ } => (type_, Some(symbol), None),
-            NamespaceProperty::Missing if plan.is_read() => (
+        let selected = match declared_property {
+            NamespaceProperty::Present { symbol, type_ } => Some((symbol, type_)),
+            NamespaceProperty::Missing => None,
+            NamespaceProperty::SourceOverload => resolve_own_property(
+                store,
+                receiver_type,
+                &plan.name,
+                SourcePropertyLookup::NamespaceValue,
+                session,
+            )?
+            .map(|property| (property.symbol, property.type_)),
+        };
+        match selected {
+            Some((symbol, type_)) => (type_, Some(symbol), None),
+            None if plan.is_read() => (
                 error_type,
                 None,
                 Some(SourcePropertyDiagnostic {
@@ -3904,7 +3944,7 @@ where
                     accessibility: None,
                 }),
             ),
-            NamespaceProperty::Missing => {
+            None => {
                 return Err(SourcePropertyError::Unsupported(
                     SourcePropertyUnsupported::MissingOwnProperty {
                         node: plan.node,
@@ -6549,6 +6589,8 @@ fn resolve_namespace_property(
     plan: &SourcePropertyPlan,
     receiver_type: TypeId,
 ) -> Result<Option<NamespaceProperty>, SourcePropertyError> {
+    let source_overload =
+        super::object_members::is_source_overload_namespace_receiver(store, receiver_type)?;
     let receiver = store
         .type_payload(receiver_type)
         .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
@@ -6707,6 +6749,12 @@ fn resolve_namespace_property(
             Some((symbol, type_)) => NamespaceProperty::Present { symbol, type_ },
             None => NamespaceProperty::Missing,
         }));
+    }
+    if source_overload {
+        if receiver.symbol() != Some(module) {
+            return Err(SourcePropertyError::InvalidCache(plan.node));
+        }
+        return Ok(Some(NamespaceProperty::SourceOverload));
     }
     let exports = store
         .module_symbol_links(module)

@@ -86,11 +86,11 @@ use super::{
         valid_planned_callable_type_predicate, valid_stored_callable_type_predicate,
     },
     source_namespaces::{
-        ModuleValueMembers, authenticated_merged_namespace_interface,
-        validated_module_value_members,
+        ModuleValueMembers, NamespaceValueMembers, NamespaceValueProvider,
+        authenticated_merged_namespace_interface, validated_namespace_value_members,
     },
     store::SourceNodeParent,
-    type_nodes::CanonicalTypeQuery,
+    type_nodes::{CanonicalTypeQuery, GlobalThisMemberValueProof},
     type_records::{
         ConstrainedTypeData, InterfaceTypeData, ObjectTypeData, StructuredTypeData, TypeCacheState,
         TypeData, TypeRecord,
@@ -140,8 +140,8 @@ pub(super) fn resolve_object_property_by_key_with_alias_operand(
             global_types.map(CanonicalArrayTargets::from_global_types),
         );
     }
-    if let Some(members) = validated_module_value_members(store, receiver)? {
-        return property_from_module_value_members(store, members, name);
+    if let Some(view) = validated_namespace_value_members(store, receiver)? {
+        return property_from_namespace_value_members(store, &view, name, None);
     }
     if source_property_object_projection(store, receiver)?.is_some() {
         let members = match validate_property_object_alias_members_with_array_targets(
@@ -340,20 +340,101 @@ pub(super) fn property_from_module_value_members(
     members: ModuleValueMembers<'_>,
     name: EscapedNameRef<'_>,
 ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
-    let property = members
-        .members()
-        .and_then(|table| store.symbol_table(table))
-        .and_then(|table| table.get(name));
-    if property.is_none_or(|property| !members.properties().contains(&property)) {
-        // The binder keeps type-only exports in the same table as values.
-        return Ok(None);
+    let view = validated_namespace_value_members(store, members.type_())?
+        .filter(|view| view.provider() == NamespaceValueProvider::PureModule)
+        .ok_or(RelationUnavailable::InvalidStructuredMembers(members.type_()))?;
+    property_from_namespace_value_members(store, &view, name, None)
+}
+
+pub(super) fn namespace_value_member_type(
+    store: &CanonicalTypeMapperStore,
+    view: &NamespaceValueMembers,
+    raw: SemanticSymbolId,
+    proof: Option<&GlobalThisMemberValueProof>,
+) -> Result<TypeId, RelationUnavailable> {
+    let member = view
+        .member(raw)
+        .ok_or(RelationUnavailable::UnsupportedProperty(raw))?;
+    match view.provider() {
+        NamespaceValueProvider::PureModule => store
+            .value_symbol_links(member.symbol())
+            .and_then(|links| links.resolved_type)
+            .ok_or(RelationUnavailable::UnresolvedPropertyType(member.symbol())),
+        NamespaceValueProvider::SourceOverloads => {
+            let proof = proof.ok_or(RelationUnavailable::NamespaceValueDemand {
+                receiver: view.receiver(),
+                member: raw,
+            })?;
+            if !proof.is_namespace_value()
+                || proof.receiver() != view.receiver()
+                || proof.member() != raw
+                || proof.source_symbol() != member.symbol()
+                || store
+                    .value_symbol_links(member.symbol())
+                    .and_then(|links| links.resolved_type)
+                    != Some(proof.type_id())
+            {
+                return Err(RelationUnavailable::UnsupportedProperty(raw));
+            }
+            Ok(proof.type_id())
+        }
     }
-    property_from_validated_members(store, members.type_(), name).map(|property| {
-        property.map(|mut property| {
-            property.readonly |= members.is_readonly(property.symbol);
-            property
-        })
-    })
+}
+
+pub(super) fn property_from_namespace_value_members(
+    store: &CanonicalTypeMapperStore,
+    view: &NamespaceValueMembers,
+    name: EscapedNameRef<'_>,
+    proof: Option<&GlobalThisMemberValueProof>,
+) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+    let Some(table) = view.members() else {
+        return Ok(None);
+    };
+    let Some(raw) = store
+        .symbol_table(table)
+        .ok_or(RelationUnavailable::InvalidStructuredMembers(view.receiver()))?
+        .get(name)
+    else {
+        return Ok(None);
+    };
+    let Some(member) = view.member(raw) else {
+        return Ok(None);
+    };
+    let type_ = namespace_value_member_type(store, view, raw, proof)?;
+    let record = store
+        .symbol(member.symbol())
+        .ok_or(RelationUnavailable::Symbol(member.symbol()))?;
+    Ok(Some(ResolvedOwnProperty {
+        symbol: member.symbol(),
+        type_,
+        optional: record.flags().contains(SymbolFlags::OPTIONAL),
+        readonly: member.readonly(),
+    }))
+}
+
+pub(super) fn is_source_overload_namespace_receiver(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+) -> Result<bool, RelationUnavailable> {
+    use super::source_overloads::{
+        StoredSourceOverloadValidation, validate_stored_source_overload,
+    };
+
+    match validate_stored_source_overload(store, receiver) {
+        StoredSourceOverloadValidation::NotSourceOverload => Ok(false),
+        StoredSourceOverloadValidation::Malformed => {
+            Err(RelationUnavailable::MalformedFunctionType(receiver))
+        }
+        StoredSourceOverloadValidation::Pending
+        | StoredSourceOverloadValidation::Valid(_) => {
+            let owner = store
+                .type_payload(receiver)
+                .and_then(TypeRecord::symbol)
+                .and_then(|owner| store.symbol(owner))
+                .ok_or(RelationUnavailable::MalformedFunctionType(receiver))?;
+            Ok(owner.flags().intersects(SymbolFlags::MODULE))
+        }
+    }
 }
 
 fn property_from_validated_members(
@@ -803,6 +884,17 @@ pub(super) fn resolve_object_property_by_key_with_source(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
+    if is_source_overload_namespace_receiver(store, receiver)? {
+        return CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_source_overload_namespace_property(receiver, name);
+    }
     if store.source_interface_heritage_header(receiver).is_some()
         || store.direct_interface_heritage_provenance(receiver).is_some()
     {

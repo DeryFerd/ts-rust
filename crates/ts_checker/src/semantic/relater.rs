@@ -81,7 +81,8 @@ use super::{
     object_aliases::source_property_object_projection,
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
-        authenticated_nongeneric_global_interface_owner, property_from_module_value_members,
+        authenticated_nongeneric_global_interface_owner, namespace_value_member_type,
+        property_from_namespace_value_members,
         valid_thisless_interface_identity, validate_resolved_declared_property_object,
     },
     reference_types::validate_direct_generic_reference,
@@ -92,7 +93,10 @@ use super::{
     },
     signatures::{ElementFlags, SignatureFlags, Ternary, TupleElementInfo},
     source_callables::validate_source_callable_signature_identity,
-    source_namespaces::validated_module_value_members,
+    source_namespaces::{
+        NamespaceValueMember, NamespaceValueMembers, NamespaceValueProvider,
+        validated_namespace_value_members,
+    },
     source_overloads::source_overload_signature_type_query,
     store::{RelationObservationToken, SemanticStore, SourceNodeParent},
     structured_members::{
@@ -180,6 +184,10 @@ pub enum RelationUnavailable {
         receiver: TypeId,
     },
     GlobalThisValueDemand {
+        receiver: TypeId,
+        member: SemanticSymbolId,
+    },
+    NamespaceValueDemand {
         receiver: TypeId,
         member: SemanticSymbolId,
     },
@@ -442,6 +450,10 @@ impl std::fmt::Display for RelationUnavailable {
                 formatter,
                 "global object {receiver:?} requires the current value query for {member:?}"
             ),
+            Self::NamespaceValueDemand { receiver, member } => write!(
+                formatter,
+                "namespace value {receiver:?} requires the current value query for {member:?}"
+            ),
             Self::SourceInterfaceHeaderDemand { receiver } => write!(
                 formatter,
                 "interface {receiver:?} requires its current source member query"
@@ -627,6 +639,16 @@ pub(super) trait GlobalThisRelationSource {
         session: &mut InstantiationSession,
     ) -> Result<GlobalThisMemberValueProof, Self::Error>;
 
+    fn resolve_namespace_member_value(
+        &mut self,
+        _store: &mut CanonicalTypeMapperStore,
+        _receiver: TypeId,
+        _member: SemanticSymbolId,
+        _session: &mut InstantiationSession,
+    ) -> Result<Option<GlobalThisMemberValueProof>, Self::Error> {
+        Ok(None)
+    }
+
     fn validate_global_this_member_value_proof(
         &self,
         store: &CanonicalTypeMapperStore,
@@ -769,10 +791,6 @@ impl<'query> GlobalThisRelationContext<'query> {
         if origin.callable != request.source && origin.callable != request.target {
             return Err(invalid());
         }
-        let member = self
-            .members(store, origin.receiver)?
-            .member(origin.member)
-            .ok_or_else(invalid)?;
         let proof = self
             .member_values
             .iter()
@@ -783,7 +801,7 @@ impl<'query> GlobalThisRelationContext<'query> {
             })
             .ok_or_else(invalid)?;
         if store
-            .value_symbol_links(member.symbol())
+            .value_symbol_links(proof.source_symbol())
             .and_then(|links| links.resolved_type)
             != Some(origin.callable)
         {
@@ -908,6 +926,19 @@ fn validate_global_this_relation_inputs(
         let Some(record) = store.type_payload(type_) else {
             continue;
         };
+        if store.source_overload_provenance(type_)
+            .is_some_and(|proof| proof.namespace_exports.is_some())
+            || store.source_overload_identity(type_).is_some_and(|identity| {
+                store.symbol(identity.owner_symbol)
+                    .and_then(ts_binder::semantic::Symbol::declarations)
+                    .is_some_and(|declarations| declarations.iter().any(|declaration| {
+                        store.source_node_kind(*declaration) == Some(SyntaxKind::ModuleDeclaration)
+                    }))
+            })
+        {
+            // Namespace values require a fresh source receipt on each relation query.
+            depends_on_global_this = true;
+        }
         if let Some(header) = store.source_interface_heritage_header(type_) {
             let edges = if require_complete_heritage {
                 source_interface_heritage_relation_edges(
@@ -1832,6 +1863,7 @@ pub(super) fn validated_synthetic_structural_property(
 enum ObjectPropertyOrigin {
     Declared,
     GlobalThis(TypeId),
+    NamespaceValue(TypeId),
     InterfaceHeritage(TypeId),
     ValidatedClass(TypeId),
     SyntheticStructural(TypeId),
@@ -2257,6 +2289,34 @@ impl<'store> RelaterSession<'store> {
         self.global_this
             .ok_or(RelationUnavailable::UnsupportedStructuredType(receiver))?
             .members(self.store, receiver)
+    }
+
+    fn namespace_value_members(
+        &mut self,
+        receiver: TypeId,
+    ) -> Result<Option<NamespaceValueMembers>, RelationUnavailable> {
+        self.observe_type_surface(receiver);
+        let Some(view) = validated_namespace_value_members(self.store, receiver)? else {
+            return Ok(None);
+        };
+        if let Some(table) = view.members() {
+            self.observe_symbol_table(table);
+            let raw_symbols = self
+                .store
+                .symbol_table(table)
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?
+                .iter()
+                .map(|(_, symbol)| symbol)
+                .collect::<Vec<_>>();
+            for raw in raw_symbols {
+                self.observe_symbol(raw);
+                let canonical = self
+                    .observe_merged_symbol_lookup(raw)
+                    .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+                self.observe_symbol(canonical);
+            }
+        }
+        Ok(Some(view))
     }
 
     fn ensure_source_relation_completed(
@@ -5396,10 +5456,15 @@ impl<'store> RelaterSession<'store> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let target_table = target_members_id
-            .and_then(|members| self.store.symbol_table(members))
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
+        self.store.symbol_table(target_table)
             .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
         for name in source_names {
-            if target_table.get(name.as_ref()).is_some() {
+            let property = self.store.symbol_table(target_table)
+                .and_then(|table| table.get(name.as_ref()));
+            if let Some(property) = property
+                && self.is_value_property(property, target_members.property_origin)?
+            {
                 return Ok(false);
             }
         }
@@ -5451,11 +5516,12 @@ impl<'store> RelaterSession<'store> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let target_table = match target_members_id {
-            Some(members) => Some(
+            Some(members) => {
                 self.store
                     .symbol_table(members)
-                    .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?,
-            ),
+                    .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
+                Some(members)
+            }
             None if target_members.properties.is_empty()
                 && !target_members.index_infos.is_empty() =>
             {
@@ -5464,7 +5530,14 @@ impl<'store> RelaterSession<'store> {
             None => return Err(RelationUnavailable::InvalidStructuredMembers(target)),
         };
         for name in source_names {
-            if target_table.is_none_or(|table| table.get(name.as_ref()).is_none())
+            let property = target_table
+                .and_then(|table| self.store.symbol_table(table))
+                .and_then(|table| table.get(name.as_ref()));
+            let known = match property {
+                Some(property) => self.is_value_property(property, target_members.property_origin)?,
+                None => false,
+            };
+            if !known
                 && !self.index_signature_accepts_name(
                     target,
                     &target_members.index_infos,
@@ -5529,6 +5602,9 @@ impl<'store> RelaterSession<'store> {
                 else {
                     continue;
                 };
+                if !self.is_value_property(property, members.property_origin)? {
+                    continue;
+                }
                 property_types.push(self.property_type(property, members.property_origin)?);
                 property_symbols.push(property);
             }
@@ -5566,6 +5642,9 @@ impl<'store> RelaterSession<'store> {
                 else {
                     continue;
                 };
+                if !self.is_value_property(property, members.property_origin)? {
+                    continue;
+                }
                 let target_type = self.property_type(property, members.property_origin)?;
                 if self.property_types_related(&[source_type], &[target_type])? == Ternary::False {
                     mismatched.push(index);
@@ -5599,7 +5678,9 @@ impl<'store> RelaterSession<'store> {
                     .members
                     .and_then(|members| self.store.symbol_table(members))
                     .and_then(|members| members.get(name.as_ref()));
-                if let Some(property) = property {
+                if let Some(property) = property
+                    && self.is_value_property(property, members.property_origin)?
+                {
                     known = true;
                     let optional = self
                         .property_symbol(property, members.property_origin)?
@@ -5707,17 +5788,17 @@ impl<'store> RelaterSession<'store> {
 
         let mut result = Ternary::True;
         for source_property in &source_members.properties {
-            let (name, source_optional, source_readonly, source_declaration) = {
+            let (name, source_optional, source_declaration) = {
                 let source =
                     self.property_symbol(*source_property, source_members.property_origin)?;
                 (
                     source.name().to_owned(),
                     source.flags().intersects(SymbolFlags::OPTIONAL),
-                    source.check_flags().contains(CheckFlags::READONLY)
-                        || source.flags() == SymbolFlags::GET_ACCESSOR,
                     source.value_declaration(),
                 )
             };
+            let source_readonly =
+                self.property_is_readonly(*source_property, source_members.property_origin)?;
             let target_property = self
                 .store
                 .symbol_table(target_table)
@@ -5726,24 +5807,19 @@ impl<'store> RelaterSession<'store> {
             let Some(target_property) = target_property else {
                 return Ok(Ternary::False);
             };
-            if let ObjectPropertyOrigin::GlobalThis(receiver) = target_members.property_origin
-                && self
-                    .global_this_members(receiver)?
-                    .member(target_property)
-                    .is_none()
-            {
+            if !self.is_value_property(target_property, target_members.property_origin)? {
                 return Ok(Ternary::False);
             }
-            let (target_optional, target_readonly, target_declaration) = {
+            let (target_optional, target_declaration) = {
                 let target =
                     self.property_symbol(target_property, target_members.property_origin)?;
                 (
                     target.flags().intersects(SymbolFlags::OPTIONAL),
-                    target.check_flags().contains(CheckFlags::READONLY)
-                        || target.flags() == SymbolFlags::GET_ACCESSOR,
                     target.value_declaration(),
                 )
             };
+            let target_readonly =
+                self.property_is_readonly(target_property, target_members.property_origin)?;
             let visibility = |origin, declaration: Option<NodeRef>| {
                 if matches!(origin, ObjectPropertyOrigin::ValidatedClass(_)) {
                     declaration.map_or(ClassConstructorVisibility::Public, |declaration| {
@@ -7433,26 +7509,24 @@ impl<'store> RelaterSession<'store> {
         target_origin: ObjectPropertyOrigin,
         mut failure: Option<&mut Option<InterfaceHeritagePropertyRelationFailure>>,
     ) -> Result<Ternary, RelationUnavailable> {
-        let (source_flags, source_readonly, source_declaration, source_owner) = {
+        let (source_flags, source_declaration, source_owner) = {
             let source = self.property_symbol(source_property, source_origin)?;
             (
                 source.flags(),
-                source.check_flags().contains(CheckFlags::READONLY)
-                    || source.flags() == SymbolFlags::GET_ACCESSOR,
                 source.value_declaration(),
                 source.parent(),
             )
         };
-        let (target_flags, target_readonly, target_declaration, target_owner) = {
+        let source_readonly = self.property_is_readonly(source_property, source_origin)?;
+        let (target_flags, target_declaration, target_owner) = {
             let target = self.property_symbol(target_property, target_origin)?;
             (
                 target.flags(),
-                target.check_flags().contains(CheckFlags::READONLY)
-                    || target.flags() == SymbolFlags::GET_ACCESSOR,
                 target.value_declaration(),
                 target.parent(),
             )
         };
+        let target_readonly = self.property_is_readonly(target_property, target_origin)?;
         let visibility = |origin, declaration: Option<NodeRef>| {
             if matches!(origin, ObjectPropertyOrigin::ValidatedClass(_)) {
                 declaration.map_or(ClassConstructorVisibility::Public, |declaration| {
@@ -7527,22 +7601,17 @@ impl<'store> RelaterSession<'store> {
                 source_flags.intersects(SymbolFlags::OPTIONAL)
                     && self.relation != RelationKind::Comparable,
             )?;
-            let origin = match (source_origin, target_origin) {
-                (ObjectPropertyOrigin::GlobalThis(receiver), _) => {
-                    Some(SourceSignatureGlobalMember {
-                        receiver,
-                        member: source_property,
-                        callable: source_type,
-                    })
-                }
-                (_, ObjectPropertyOrigin::GlobalThis(receiver)) => {
-                    Some(SourceSignatureGlobalMember {
-                        receiver,
-                        member: target_property,
-                        callable: target_type,
-                    })
-                }
-                _ => None,
+            let origin = match self.property_signature_return_origin(
+                source_property,
+                source_origin,
+                source_type,
+            )? {
+                Some(origin) => Some(origin),
+                None => self.property_signature_return_origin(
+                    target_property,
+                    target_origin,
+                    target_type,
+                )?,
             };
             let previous_origin = std::mem::replace(&mut self.signature_global_member, origin);
             let mut source_component = None;
@@ -7761,6 +7830,19 @@ impl<'store> RelaterSession<'store> {
         symbol: SemanticSymbolId,
         origin: ObjectPropertyOrigin,
     ) -> Result<TypeId, RelationUnavailable> {
+        if let ObjectPropertyOrigin::NamespaceValue(receiver) = origin {
+            let view = self
+                .namespace_value_members(receiver)?
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+            let proof = self.global_this.and_then(|context| {
+                context.member_values.iter().find(|proof| {
+                    proof.is_namespace_value()
+                        && proof.receiver() == receiver
+                        && proof.member() == symbol
+                })
+            });
+            return namespace_value_member_type(self.store, &view, symbol, proof);
+        }
         if let ObjectPropertyOrigin::ValidatedClass(receiver) = origin
             && completed_source_class_origin_member_mapping(
                 self.store,
@@ -7932,14 +8014,7 @@ impl<'store> RelaterSession<'store> {
                 .ok_or(RelationUnavailable::InvalidStructuredMembers(source))?
                 .get(name.as_ref());
             if let Some(property) = property {
-                let is_value = match source_members.property_origin {
-                    ObjectPropertyOrigin::GlobalThis(receiver) => self
-                        .global_this_members(receiver)?
-                        .member(property)
-                        .is_some(),
-                    _ => true,
-                };
-                if is_value {
+                if self.is_value_property(property, source_members.property_origin)? {
                     self.property_symbol(property, source_members.property_origin)?;
                     return Ok(Some(property));
                 }
@@ -8564,12 +8639,87 @@ impl<'store> RelaterSession<'store> {
         }
     }
 
+    fn is_value_property(
+        &mut self,
+        symbol: SemanticSymbolId,
+        origin: ObjectPropertyOrigin,
+    ) -> Result<bool, RelationUnavailable> {
+        match origin {
+            ObjectPropertyOrigin::GlobalThis(receiver) => {
+                Ok(self.global_this_members(receiver)?.member(symbol).is_some())
+            }
+            ObjectPropertyOrigin::NamespaceValue(receiver) => {
+                let view = self
+                    .namespace_value_members(receiver)?
+                    .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+                Ok(view.member(symbol).is_some())
+            }
+            _ => Ok(true),
+        }
+    }
+
+    fn property_is_readonly(
+        &mut self,
+        symbol: SemanticSymbolId,
+        origin: ObjectPropertyOrigin,
+    ) -> Result<bool, RelationUnavailable> {
+        if let ObjectPropertyOrigin::NamespaceValue(receiver) = origin {
+            let view = self
+                .namespace_value_members(receiver)?
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+            return view
+                .member(symbol)
+                .map(NamespaceValueMember::readonly)
+                .ok_or(RelationUnavailable::UnsupportedProperty(symbol));
+        }
+        let record = self.property_symbol(symbol, origin)?;
+        Ok(record.check_flags().contains(CheckFlags::READONLY)
+            || record.flags() == SymbolFlags::GET_ACCESSOR)
+    }
+
+    fn property_signature_return_origin(
+        &mut self,
+        member: SemanticSymbolId,
+        origin: ObjectPropertyOrigin,
+        callable: TypeId,
+    ) -> Result<Option<SourceSignatureGlobalMember>, RelationUnavailable> {
+        let receiver = match origin {
+            ObjectPropertyOrigin::GlobalThis(receiver) => receiver,
+            ObjectPropertyOrigin::NamespaceValue(receiver) => {
+                let view = self
+                    .namespace_value_members(receiver)?
+                    .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+                if view.provider() == NamespaceValueProvider::PureModule {
+                    return Ok(None);
+                }
+                if self.property_type(member, origin)? != callable {
+                    return Err(RelationUnavailable::UnsupportedProperty(member));
+                }
+                receiver
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(SourceSignatureGlobalMember { receiver, member, callable }))
+    }
+
     fn property_symbol(
         &mut self,
         symbol: SemanticSymbolId,
         origin: ObjectPropertyOrigin,
     ) -> Result<&ts_binder::semantic::Symbol, RelationUnavailable> {
         let origin = self.property_origin_for_symbol(symbol, origin)?;
+        if let ObjectPropertyOrigin::NamespaceValue(receiver) = origin {
+            let view = self
+                .namespace_value_members(receiver)?
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+            let member = view
+                .member(symbol)
+                .ok_or(RelationUnavailable::UnsupportedProperty(symbol))?;
+            return self
+                .store
+                .symbol(member.symbol())
+                .ok_or(RelationUnavailable::Symbol(member.symbol()));
+        }
         if let ObjectPropertyOrigin::GlobalThis(receiver) = origin {
             let canonical = self
                 .global_this_members(receiver)?
@@ -8623,7 +8773,7 @@ impl<'store> RelaterSession<'store> {
             .symbol(symbol)
             .ok_or(RelationUnavailable::Symbol(symbol))?;
         match origin {
-            ObjectPropertyOrigin::GlobalThis(_) => {
+            ObjectPropertyOrigin::GlobalThis(_) | ObjectPropertyOrigin::NamespaceValue(_) => {
                 unreachable!("global members return after source validation")
             }
             ObjectPropertyOrigin::Mapped(_) | ObjectPropertyOrigin::PropertyObjectAlias(_) => {
@@ -8856,6 +9006,7 @@ impl<'store> RelaterSession<'store> {
                     SymbolFlags::INTERFACE | SymbolFlags::TYPE_LITERAL
                 }
                 ObjectPropertyOrigin::GlobalThis(_)
+                | ObjectPropertyOrigin::NamespaceValue(_)
                 | ObjectPropertyOrigin::FreshObjectLiteral(_)
                 | ObjectPropertyOrigin::DerivedObjectLiteral { .. }
                 | ObjectPropertyOrigin::Intersection(_)
@@ -9620,12 +9771,19 @@ impl<'store> RelaterSession<'store> {
         Ok(Some(callable))
     }
 
-    /// Keeps every real method overload for structural comparison. Callback
+    /// Keeps every public overload for structural comparison. Callback
     /// extraction continues to use the exact-single reader above.
     fn project_structural_callable_signatures(
         &mut self,
         type_: TypeId,
     ) -> Result<Vec<ValidatedSingleCallable>, RelationUnavailable> {
+        if let Some(projection) = self.store.authenticated_source_overload_set(
+            type_,
+            self.strict_function_types,
+            self.global_types.map(|globals| globals.array_targets),
+        )? {
+            return Ok(projection.call_signatures.into_vec());
+        }
         if let Some(projection) = self.store.authenticated_method_overload_set(
             type_,
             self.global_types.map(|globals| globals.array_targets),
@@ -9650,23 +9808,69 @@ impl<'store> RelaterSession<'store> {
         type_: TypeId,
         allow_fresh_literal: bool,
     ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
-        if self.store.admit_callable_relation_type_with_array_targets(
+        let namespace = self.namespace_value_members(type_)?;
+        let is_function = self.store.admit_callable_relation_type_with_array_targets(
             type_,
             self.strict_function_types,
             self.global_types.map(|globals| globals.array_targets),
-        )? {
-            self.ensure_supported_object_kind(type_, allow_fresh_literal)
-                .map_err(|_| RelationUnavailable::MalformedFunctionType(type_))?;
+        )?;
+        if let Some(view) = namespace {
+            if view.provider() == NamespaceValueProvider::SourceOverloads {
+                if !is_function {
+                    return Err(RelationUnavailable::MalformedFunctionType(type_));
+                }
+                self.ensure_supported_object_kind(type_, allow_fresh_literal)
+                    .map_err(|_| RelationUnavailable::MalformedFunctionType(type_))?;
+            }
             return Ok(ResolvedObjectMembers {
-                members: None,
-                properties: Vec::new(),
+                members: view.members(),
+                properties: view.properties().to_vec(),
                 index_infos: Vec::new(),
-                property_origin: ObjectPropertyOrigin::Declared,
+                property_origin: ObjectPropertyOrigin::NamespaceValue(type_),
                 call_signatures: Vec::new(),
-                exact_callable: true,
+                exact_callable: view.provider() == NamespaceValueProvider::SourceOverloads,
             });
         }
+        if is_function {
+            self.ensure_supported_object_kind(type_, allow_fresh_literal)
+                .map_err(|_| RelationUnavailable::MalformedFunctionType(type_))?;
+            return self.resolved_callable_object_members(type_, Vec::new());
+        }
         self.resolved_object_members(type_, allow_fresh_literal)
+    }
+
+    /// Keeps the admitted callable provider's properties and indexes with its calls.
+    fn resolved_callable_object_members(
+        &mut self,
+        receiver: TypeId,
+        call_signatures: Vec<ValidatedSingleCallable>,
+    ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
+        let record = self.store.type_payload(receiver)
+            .ok_or(RelationUnavailable::MalformedFunctionType(receiver))?;
+        let structured = record.data().structured().cloned()
+            .ok_or(RelationUnavailable::MalformedFunctionType(receiver))?;
+        let origin = if record.object_flags().contains(ObjectFlags::REFERENCE) {
+            ObjectPropertyOrigin::GenericReference(receiver)
+        } else if self.store.direct_interface_heritage_provenance(receiver).is_some() {
+            ObjectPropertyOrigin::InterfaceHeritage(receiver)
+        } else {
+            ObjectPropertyOrigin::Declared
+        };
+        let properties = structured.properties.unwrap_or_default();
+        if let Some(table) = structured.members {
+            self.observe_symbol_table(table);
+        }
+        for &property in &properties {
+            self.property_symbol(property, origin)?;
+        }
+        Ok(ResolvedObjectMembers {
+            members: structured.members,
+            properties,
+            index_infos: structured.index_infos.unwrap_or_default(),
+            property_origin: origin,
+            call_signatures,
+            exact_callable: true,
+        })
     }
 
     fn project_non_nullable_callable_signature(
@@ -10008,21 +10212,18 @@ impl<'store> RelaterSession<'store> {
             });
         }
         let call_signatures = self.project_structural_callable_signatures(type_id)?;
-        if !call_signatures.is_empty() {
-            let members = self
-                .store
-                .type_payload(type_id)
-                .and_then(|record| record.data().structured())
-                .map(|structured| structured.members)
-                .ok_or(RelationUnavailable::MalformedFunctionType(type_id))?;
+        if let Some(view) = self.namespace_value_members(type_id)? {
             return Ok(ResolvedObjectMembers {
-                members,
-                properties: Vec::new(),
+                members: view.members(),
+                properties: view.properties().to_vec(),
                 index_infos: Vec::new(),
-                property_origin: ObjectPropertyOrigin::Declared,
+                property_origin: ObjectPropertyOrigin::NamespaceValue(type_id),
                 call_signatures,
-                exact_callable: true,
+                exact_callable: view.provider() == NamespaceValueProvider::SourceOverloads,
             });
+        }
+        if !call_signatures.is_empty() {
+            return self.resolved_callable_object_members(type_id, call_signatures);
         }
         let (record_object_flags, record_symbol, structured, object) = self
             .store
@@ -10780,6 +10981,45 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     /// Selects only complete required nongeneric method overloads. The shared
     /// provider proves every declaration and the hidden class implementation.
     /// Other callable families retain their existing exact-single boundary.
+    /// Projects public overloads after source and caller Array validation.
+    fn authenticated_source_overload_set(
+        &self,
+        type_: TypeId,
+        strict_function_types: Option<bool>,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<Option<CallableSetProjection>, RelationUnavailable> {
+        let projection = match validate_stored_callable_set_with_array_targets(
+            self, type_, array_targets,
+        ) {
+            StoredCallableSetValidation::Valid {
+                family: CallableFamily::SourceFunctionOverloads,
+                projection,
+                ..
+            } => projection,
+            _ => return Ok(None),
+        };
+        if projection.owner != type_
+            || projection.call_signatures.is_empty()
+            || !projection.construct_signatures.is_empty()
+            || projection.call_signatures.iter().any(|callable| {
+                callable.owner != type_ || callable.strict_variance_exempt
+            })
+        {
+            return Err(RelationUnavailable::MalformedFunctionType(type_));
+        }
+        if strict_function_types.is_none() {
+            return Err(RelationUnavailable::StructuredSignatures(type_));
+        }
+        match array_targets {
+            Some(targets) => {
+                self.validate_cached_array_capability_with_array_targets(targets, type_)
+            }
+            None => self.validate_cached_array_capability(type_),
+        }
+        .map_err(|error| union_validation_unavailable(type_, error))?;
+        Ok(Some(projection))
+    }
+
     fn authenticated_method_overload_set(
         &self,
         type_: TypeId,
@@ -10897,6 +11137,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         strict_function_types: Option<bool>,
         array_targets: Option<CanonicalArrayTargets>,
     ) -> Result<bool, RelationUnavailable> {
+        if self
+            .authenticated_source_overload_set(type_, strict_function_types, array_targets)?
+            .is_some()
+        {
+            return Ok(true);
+        }
         match validate_stored_single_callable_with_array_targets(self, type_, array_targets) {
             StoredSingleCallableValidation::NotCallable => Ok(self
                 .authenticated_method_overload_set(type_, array_targets)?
@@ -11123,8 +11369,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         global_types: Option<&CanonicalGlobalTypes>,
         instantiation_session: Option<&mut InstantiationSession>,
     ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
-        if let Some(members) = validated_module_value_members(self, type_id)? {
-            return property_from_module_value_members(self, members, name);
+        if let Some(view) = validated_namespace_value_members(self, type_id)? {
+            return property_from_namespace_value_members(self, &view, name, None);
         }
         let bootstrap = self.relation_bootstrap_facts()?;
         let mut session = RelaterSession::new_with_global_types_options_and_session(
@@ -12370,24 +12616,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         strict_function_types,
                     )
                     .map_err(SourceRelationError::Source)?;
-                let context = GlobalThisRelationContext {
-                    globals,
-                    members: query.global_this_members(),
-                    member_values: &member_values,
-                    signature_returns: &signature_returns,
-                    signature_return_query: query.source_signature_return_query(),
-                    limit_mark,
-                    heritage: query.source_interface_heritage_query_context(),
-                };
-                let member = context
-                    .members(self, proof.receiver())
-                    .map_err(SourceRelationError::Relation)?
-                    .member(proof.member())
-                    .ok_or(SourceRelationError::Relation(
-                        RelationUnavailable::UnsupportedProperty(proof.member()),
-                    ))?;
                 if self
-                    .value_symbol_links(member.symbol())
+                    .value_symbol_links(proof.source_symbol())
                     .and_then(|links| links.resolved_type)
                     != Some(proof.type_id())
                 {
@@ -12487,11 +12717,57 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     let proof = query
                         .resolve_global_this_member(self, receiver, member, session)
                         .map_err(SourceRelationError::Source)?;
-                    if proof.receiver() != receiver
+                    if proof.is_namespace_value()
+                        || proof.receiver() != receiver
                         || proof.member() != member
                         || self
                             .intrinsic_bootstrap()
                             .is_some_and(|bootstrap| proof.type_id() == bootstrap.error_type)
+                    {
+                        return Err(SourceRelationError::Relation(
+                            RelationUnavailable::UnsupportedProperty(member),
+                        ));
+                    }
+                    member_values.push(proof);
+                }
+                Err(RelationUnavailable::NamespaceValueDemand { receiver, member }) => {
+                    if member_values
+                        .iter()
+                        .any(|proof| proof.receiver() == receiver && proof.member() == member)
+                    {
+                        return Err(SourceRelationError::Relation(
+                            RelationUnavailable::UnsupportedProperty(member),
+                        ));
+                    }
+                    let proof = query
+                        .resolve_namespace_member_value(self, receiver, member, session)
+                        .map_err(SourceRelationError::Source)?
+                        .ok_or(SourceRelationError::Relation(
+                            RelationUnavailable::NamespaceValueDemand { receiver, member },
+                        ))?;
+                    if !proof.is_namespace_value()
+                        || proof.receiver() != receiver
+                        || proof.member() != member
+                        || self
+                            .intrinsic_bootstrap()
+                            .is_some_and(|bootstrap| proof.type_id() == bootstrap.error_type)
+                    {
+                        return Err(SourceRelationError::Relation(
+                            RelationUnavailable::UnsupportedProperty(member),
+                        ));
+                    }
+                    query
+                        .validate_global_this_member_value_proof(
+                            self,
+                            &proof,
+                            globals,
+                            strict_function_types,
+                        )
+                        .map_err(SourceRelationError::Source)?;
+                    if self
+                        .value_symbol_links(proof.source_symbol())
+                        .and_then(|links| links.resolved_type)
+                        != Some(proof.type_id())
                     {
                         return Err(SourceRelationError::Relation(
                             RelationUnavailable::UnsupportedProperty(member),

@@ -1176,6 +1176,7 @@ fn relation_error_is_unsupported(error: &RelationUnavailable) -> bool {
         | RelationUnavailable::UnresolvedGlobalObject(_)
         | RelationUnavailable::GlobalThisMembersDemand { .. }
         | RelationUnavailable::GlobalThisValueDemand { .. }
+        | RelationUnavailable::NamespaceValueDemand { .. }
         | RelationUnavailable::SourceInterfaceHeaderDemand { .. }
         | RelationUnavailable::SourceInterfaceAliasDemand { .. }
         | RelationUnavailable::SourceSignatureReturnDemand { .. }

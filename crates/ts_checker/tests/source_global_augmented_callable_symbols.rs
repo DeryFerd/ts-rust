@@ -880,3 +880,126 @@ fn qualified_signature_type_query_reuses_the_pending_callable() {
         check_augmented_callable_type_query_inputs(inputs, Some(*return_query));
     }
 }
+
+#[allow(clippy::too_many_lines)] // Keep cold demand and replay in one fixture.
+fn check_overload_namespace_property_relation(with_call_signature: bool) {
+    let mut inputs = Inputs::new(false);
+    let call = if with_call_signature { "(value: string): number;" } else { "" };
+    inputs.source = parse_source_file(&format!(
+        "type Parser = typeof parseInt;\n\
+         type Compatible = {{ {call} label: string }};\n\
+         type Wrong = {{ {call} label: number }};\n{CONSUMER}"
+    ));
+    let declarations = Declarations::new(&inputs);
+    let aliases = ["Parser", "Compatible", "Wrong"].map(|expected| {
+        inputs.source.arena.iter().find_map(|(_, record)| {
+            let NodeData::TypeAliasDeclaration(alias) = &record.data
+            else { return None };
+            let NodeData::Identifier(name) = &inputs.source.arena.get(alias.name)?.data
+            else { return None };
+            (name.text == expected).then_some(NodeRef::new(
+                inputs.source.arena.id(), SOURCE, alias.type_,
+            ))
+        }).unwrap_or_else(|| panic!("missing alias {expected}"))
+    });
+
+    // Each result also runs as the first relation against a fresh pending value.
+    // None covers whole-source checking before any direct relation query.
+    for first in [None, Some(0_usize), Some(1_usize)] {
+        let mut context = inputs.context();
+        if first.is_none() {
+            context.check_source_file(SOURCE).unwrap();
+        }
+        let [callable, compatible, wrong] = aliases.map(|node| {
+            context.get_type_from_type_node(node).unwrap()
+        });
+        let owner = symbol(&context, declarations.functions[0]);
+        assert_eq!(value_type(&context, owner), callable);
+        assert_eq!(context.store().type_payload(callable).unwrap().symbol(), Some(owner));
+        let pairs = [(compatible, true), (wrong, false)];
+
+        if let Some(index) = first {
+            let TypeData::Object(object) = context.store().type_payload(callable).unwrap().data()
+            else { panic!("the pending callable must remain an object") };
+            assert!(object.structured.signatures.is_none());
+            assert!(object.structured.members.is_none());
+            for declaration in declarations.functions {
+                assert!(context.store().signature_links(declaration)
+                    .is_none_or(|links| links.resolved_signature.signature().is_none()));
+            }
+            assert!(!context.store().source_file_links(context.source_file(SOURCE).unwrap())
+                .is_some_and(|links| links.type_checked));
+            assert_providers_unchecked(&context);
+            assert!(context.diagnostics().is_empty());
+
+            let (target, expected) = pairs[index];
+            assert_eq!(context.is_type_assignable_to(callable, target), Ok(expected),
+                "first={first:?}, source={callable:?}, target={target:?}");
+            assert_eq!(context.get_type_from_type_node(aliases[0]), Ok(callable));
+            assert_eq!(value_type(&context, owner), callable);
+            assert!(!context.store().source_file_links(context.source_file(SOURCE).unwrap())
+                .is_some_and(|links| links.type_checked));
+            assert_providers_unchecked(&context);
+            assert!(context.diagnostics().is_empty());
+            assert!(context.store().type_resolution_is_empty());
+
+            let before = (
+                snapshot(&context, &declarations),
+                context.store().relation_state_snapshot(),
+                context.store().value_symbol_links(owner).cloned(),
+            );
+            assert_eq!(context.is_type_assignable_to(callable, target), Ok(expected));
+            assert_eq!((
+                snapshot(&context, &declarations),
+                context.store().relation_state_snapshot(),
+                context.store().value_symbol_links(owner).cloned(),
+            ), before);
+        }
+
+        for (target, expected) in pairs {
+            assert_eq!(context.is_type_assignable_to(callable, target), Ok(expected),
+                "first={first:?}, source={callable:?}, target={target:?}");
+        }
+        context.check_source_file(SOURCE).unwrap();
+        let merged = assert_merged_callable(&context, &declarations);
+        assert_eq!(merged.callable, callable);
+        assert_queries(&mut context, &inputs.source, &merged);
+        assert_failures(&mut context, &inputs.source, &declarations, &merged);
+        assert_providers_unchecked(&context);
+        for (target, expected) in pairs {
+            assert_eq!(context.is_type_assignable_to(callable, target), Ok(expected));
+        }
+        let before = (
+            snapshot(&context, &declarations),
+            context.store().relation_state_snapshot(),
+            context.store().value_symbol_links(owner).cloned(),
+        );
+        for _ in 0..2 {
+            context.recheck_source_file(SOURCE).unwrap();
+            assert_eq!(aliases.map(|node| context.get_type_from_type_node(node).unwrap()),
+                [callable, compatible, wrong]);
+            assert_eq!(assert_merged_callable(&context, &declarations), merged);
+            assert_queries(&mut context, &inputs.source, &merged);
+            assert_failures(&mut context, &inputs.source, &declarations, &merged);
+            for (target, expected) in pairs {
+                assert_eq!(context.is_type_assignable_to(callable, target), Ok(expected));
+            }
+            assert_providers_unchecked(&context);
+            assert_eq!((
+                snapshot(&context, &declarations),
+                context.store().relation_state_snapshot(),
+                context.store().value_symbol_links(owner).cloned(),
+            ), before);
+        }
+    }
+}
+
+#[test]
+fn overload_namespace_property_relations_keep_the_callable_identity() {
+    check_overload_namespace_property_relation(false);
+}
+
+#[test]
+fn overload_callable_relations_do_not_skip_namespace_property_types() {
+    check_overload_namespace_property_relation(true);
+}

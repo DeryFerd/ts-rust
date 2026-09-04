@@ -50699,13 +50699,24 @@ fn source_type_is_assignable_to(
     let mut resolved_members = HashSet::new();
     let mut resolved_properties = HashSet::new();
     loop {
-        match store.is_type_assignable_to_with_session(
+        let result = match super::source_properties::relate_source_types_with_global_this(
+            store,
+            host,
+            global_types,
+            options,
             source,
             target,
-            Some(global_types),
-            Some(options.strict_function_types),
+            super::RelationKind::Assignable,
             session,
+            diagnostics,
         ) {
+            Ok(assignable) => Ok(assignable),
+            Err(super::relater::SourceRelationError::Relation(error)) => Err(error),
+            Err(super::relater::SourceRelationError::Source(error)) => {
+                return Err(SourceCheckError::DeclaredType(error));
+            }
+        };
+        match result {
             Ok(assignable) => return Ok(assignable),
             Err(RelationUnavailable::UnresolvedSignatureReturn(signature)) => {
                 if !resolved_signatures.insert(signature) {

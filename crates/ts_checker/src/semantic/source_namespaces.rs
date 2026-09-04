@@ -496,6 +496,150 @@ impl<'a> ModuleValueMembers<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NamespaceValueProvider {
+    PureModule,
+    SourceOverloads,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct NamespaceValueMember {
+    table_symbol: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    value_declaration: Option<NodeRef>,
+    readonly: bool,
+}
+
+impl NamespaceValueMember {
+    pub(super) const fn table_symbol(&self) -> SemanticSymbolId { self.table_symbol }
+    pub(super) const fn symbol(&self) -> SemanticSymbolId { self.symbol }
+    pub(super) const fn value_declaration(&self) -> Option<NodeRef> { self.value_declaration }
+    pub(super) const fn readonly(&self) -> bool { self.readonly }
+}
+
+/// Owns value rows without changing a pending callable's member or signature state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct NamespaceValueMembers {
+    receiver: TypeId,
+    provider: NamespaceValueProvider,
+    proof: Arc<NamespaceExportProof>,
+    properties: Box<[SemanticSymbolId]>,
+    values: Box<[NamespaceValueMember]>,
+}
+
+impl NamespaceValueMembers {
+    fn new(receiver: TypeId, provider: NamespaceValueProvider, proof: Arc<NamespaceExportProof>) -> Self {
+        let values = proof.exports.iter()
+            .filter(|row| row.value_record.flags.intersects(SymbolFlags::VALUE))
+            .map(|row| NamespaceValueMember {
+                table_symbol: row.table_symbol,
+                symbol: row.symbol,
+                value_declaration: row.value_record.value_declaration,
+                readonly: row.readonly,
+            }).collect::<Box<[_]>>();
+        let properties = values.iter().map(|row| row.table_symbol).collect();
+        Self { receiver, provider, proof, properties, values }
+    }
+
+    pub(super) const fn receiver(&self) -> TypeId { self.receiver }
+    pub(super) const fn provider(&self) -> NamespaceValueProvider { self.provider }
+    pub(super) fn members(&self) -> Option<SymbolTableId> { self.proof.members }
+    pub(super) fn properties(&self) -> &[SemanticSymbolId] { &self.properties }
+    pub(super) fn member(&self, table_symbol: SemanticSymbolId) -> Option<&NamespaceValueMember> {
+        self.values.iter().find(|row| row.table_symbol == table_symbol)
+    }
+
+    pub(super) fn validate_source(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+    ) -> Result<(), DeclaredTypeError> {
+        if namespace_value_members_with_source(store, host, self.receiver)?.as_ref() != Some(self) {
+            return Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidPreparedTypeQuery,
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn validated_namespace_value_members(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+) -> Result<Option<NamespaceValueMembers>, RelationUnavailable> {
+    if let Some(module) = validated_module_value_members(store, receiver)? {
+        let owner = store.type_payload(module.type_()).and_then(TypeRecord::symbol)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+        let identity = store.module_value_identity(owner)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+        return Ok(Some(NamespaceValueMembers::new(
+            receiver, NamespaceValueProvider::PureModule, identity.plan.export_proof.clone(),
+        )));
+    }
+    match source_overloads::validate_stored_source_overload(store, receiver) {
+        source_overloads::StoredSourceOverloadValidation::NotSourceOverload => Ok(None),
+        source_overloads::StoredSourceOverloadValidation::Pending => {
+            Err(RelationUnavailable::UnresolvedFunctionType(receiver))
+        }
+        source_overloads::StoredSourceOverloadValidation::Malformed => {
+            Err(RelationUnavailable::MalformedFunctionType(receiver))
+        }
+        source_overloads::StoredSourceOverloadValidation::Valid(_) => {
+            let provenance = store.source_overload_provenance(receiver)
+                .ok_or(RelationUnavailable::MalformedFunctionType(receiver))?;
+            Ok(provenance.namespace_exports.as_ref().map(|proof| NamespaceValueMembers::new(
+                receiver, NamespaceValueProvider::SourceOverloads, proof.clone(),
+            )))
+        }
+    }
+}
+
+/// Reads pending namespace rows from source without requesting owner signatures.
+pub(super) fn namespace_value_members_with_source(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    receiver: TypeId,
+) -> Result<Option<NamespaceValueMembers>, DeclaredTypeError> {
+    let invalid = || DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery);
+    if store.source_overload_identity(receiver).is_some() {
+        if !source_overloads::validate_pending_source_overload(store, receiver) {
+            return Err(invalid());
+        }
+        let identity = store.source_overload_identity(receiver).ok_or_else(invalid)?;
+        let owner = store.symbol(identity.owner_symbol).ok_or_else(invalid)?;
+        let namespaces = owner.declarations().unwrap_or_default().iter().copied()
+            .filter(|&node| store.source_node_kind(node) == Some(SyntaxKind::ModuleDeclaration))
+            .collect::<Vec<_>>();
+        if namespaces.is_empty() {
+            return if source_overloads::source_overload_namespace_exports_match(store, identity.owner_symbol, None) {
+                Ok(None)
+            } else { Err(invalid()) };
+        }
+        let proof = Arc::new(plan_namespace_export_proof(
+            store, host, identity.owner_symbol, &namespaces, owner.exports(),
+        ).map_err(|_| invalid())?);
+        if !source_overloads::source_overload_namespace_exports_match(store, identity.owner_symbol, Some(&proof)) {
+            return Err(invalid());
+        }
+        return Ok(Some(NamespaceValueMembers::new(
+            receiver, NamespaceValueProvider::SourceOverloads, proof,
+        )));
+    }
+    let Some(view) = validated_namespace_value_members(store, receiver).map_err(|_| invalid())? else {
+        return Ok(None);
+    };
+    if view.provider == NamespaceValueProvider::PureModule {
+        validate_module_value_identity(store, host, receiver).map_err(|_| invalid())?;
+    }
+    let current = plan_namespace_export_proof(
+        store, host, view.proof.owner, &view.proof.namespaces, view.proof.members,
+    ).map_err(|_| invalid())?;
+    if current != *view.proof {
+        return Err(invalid());
+    }
+    Ok(Some(view))
+}
+
 pub(super) fn has_pure_module_flags(flags: SymbolFlags) -> bool {
     flags.intersects(SymbolFlags::MODULE)
         && flags.without(

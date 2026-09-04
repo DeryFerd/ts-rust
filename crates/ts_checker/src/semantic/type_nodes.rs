@@ -36088,11 +36088,57 @@ enum GlobalThisValueSource {
     Callable(SourceCallablePlan),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceMemberValueIdentity {
+    GlobalThis(GlobalThisMember),
+    Namespace(super::source_namespaces::NamespaceValueMember),
+}
+
+impl SourceMemberValueIdentity {
+    fn table_symbol(&self) -> SemanticSymbolId {
+        match self {
+            Self::GlobalThis(member) => member.table_symbol(),
+            Self::Namespace(member) => member.table_symbol(),
+        }
+    }
+
+    fn symbol(&self) -> SemanticSymbolId {
+        match self {
+            Self::GlobalThis(member) => member.symbol(),
+            Self::Namespace(member) => member.symbol(),
+        }
+    }
+
+    fn value_declaration(&self) -> Option<NodeRef> {
+        match self {
+            Self::GlobalThis(member) => member.value_declaration(),
+            Self::Namespace(member) => member.value_declaration(),
+        }
+    }
+
+    fn builtin_value_type(&self) -> Option<TypeId> {
+        match self {
+            Self::GlobalThis(member) => member.builtin_value_type(),
+            Self::Namespace(_) => None,
+        }
+    }
+
+    fn invalid(&self, receiver: TypeId) -> DeclaredTypeError {
+        match self {
+            Self::GlobalThis(member) => DeclaredTypeUnavailable::InvalidGlobalThisMember {
+                receiver,
+                symbol: member.table_symbol(),
+            }.into(),
+            Self::Namespace(_) => type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery),
+        }
+    }
+}
+
 /// Only a successful normal value query can create this local receipt.
 #[derive(Clone, Debug)]
 pub(super) struct GlobalThisMemberValueProof {
     receiver: TypeId,
-    member: GlobalThisMember,
+    member: SourceMemberValueIdentity,
     type_: TypeId,
     globals: CanonicalGlobalTypes,
     options: CanonicalTypeQueryOptions,
@@ -36108,6 +36154,14 @@ impl GlobalThisMemberValueProof {
 
     pub(super) fn member(&self) -> SemanticSymbolId {
         self.member.table_symbol()
+    }
+
+    pub(super) fn source_symbol(&self) -> SemanticSymbolId {
+        self.member.symbol()
+    }
+
+    pub(super) fn is_namespace_value(&self) -> bool {
+        matches!(self.member, SourceMemberValueIdentity::Namespace(_))
     }
 
     pub(super) const fn type_id(&self) -> TypeId {
@@ -36468,6 +36522,34 @@ impl<'host, 'arena> SourceTypeQueryContext<'host, 'arena> {
         planner
     }
 
+    fn validate_source_member_value_identity(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        receiver: TypeId,
+        member: &SourceMemberValueIdentity,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid = || member.invalid(receiver);
+        match member {
+            SourceMemberValueIdentity::GlobalThis(row) => {
+                let members = self.members.as_ref().ok_or_else(invalid)?;
+                members.validate(store)?;
+                if members.receiver() != receiver || members.member(row.table_symbol()) != Some(row) {
+                    return Err(invalid());
+                }
+            }
+            SourceMemberValueIdentity::Namespace(row) => {
+                let members = super::source_namespaces::namespace_value_members_with_source(
+                    store, self.host, receiver,
+                )?.ok_or_else(invalid)?;
+                if members.receiver() != receiver || members.member(row.table_symbol()) != Some(row) {
+                    return Err(invalid());
+                }
+                members.validate_source(store, self.host)?;
+            }
+        }
+        Ok(())
+    }
+
     fn validate_value(
         &self,
         store: &CanonicalTypeMapperStore,
@@ -36475,21 +36557,13 @@ impl<'host, 'arena> SourceTypeQueryContext<'host, 'arena> {
         globals: &CanonicalGlobalTypes,
         strict_function_types: Option<bool>,
     ) -> Result<(), DeclaredTypeError> {
-        let invalid = || {
-            DeclaredTypeError::from(DeclaredTypeUnavailable::InvalidGlobalThisMember {
-                receiver: proof.receiver,
-                symbol: proof.member(),
-            })
-        };
-        let members = self.members.as_ref().ok_or_else(invalid)?;
-        members.validate(store)?;
+        let invalid = || proof.member.invalid(proof.receiver);
+        self.validate_source_member_value_identity(store, proof.receiver, &proof.member)?;
         if globals != &self.globals
             || globals != &proof.globals
             || self.options != proof.options
             || strict_function_types != self.options.strict_function_types
-            || members.receiver() != proof.receiver
-            || members.member(proof.member()) != Some(&proof.member)
-            || store.value_symbol_links(proof.member.symbol())
+            || store.value_symbol_links(proof.source_symbol())
                 != Some(&ValueSymbolLinks {
                     resolved_type: Some(proof.type_),
                     ..ValueSymbolLinks::default()
@@ -37953,6 +38027,19 @@ impl ConditionalBranchSource for SourceTypeQueryAdapter<'_, '_, '_> {
             })
     }
 
+    fn resolve_namespace_member_value(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        receiver: TypeId,
+        member: SemanticSymbolId,
+        session: &mut InstantiationSession,
+    ) -> Result<GlobalThisMemberValueProof, DeclaredTypeError> {
+        self.context
+            .query(store, session, self.diagnostics, |query| {
+                query.resolve_namespace_member_value(receiver, member)
+            })
+    }
+
     fn validate_global_this_member_value_proof(
         &self,
         store: &CanonicalTypeMapperStore,
@@ -38841,14 +38928,90 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             })
         };
         let row = members.member(member).cloned().ok_or_else(invalid)?;
-        let globals = self.global_types.clone().ok_or_else(invalid)?;
+        let globals = self.global_types.as_ref().ok_or_else(invalid)?;
         if members.receiver() != globals.global_this_value_type
             || self.instantiation_session.is_none()
         {
             return Err(invalid());
         }
         self.global_this_members = Some(members.clone());
-        let key = (members.receiver(), member);
+        self.resolve_source_member_value(members.receiver(), SourceMemberValueIdentity::GlobalThis(row))
+    }
+
+    pub(super) fn resolve_namespace_member_value(
+        &mut self,
+        receiver: TypeId,
+        table_symbol: SemanticSymbolId,
+    ) -> Result<GlobalThisMemberValueProof, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery);
+        let members = super::source_namespaces::namespace_value_members_with_source(
+            self.store, self.host, receiver,
+        )?.ok_or_else(invalid)?;
+        let row = members.member(table_symbol).cloned().ok_or_else(invalid)?;
+        self.resolve_source_member_value(receiver, SourceMemberValueIdentity::Namespace(row))
+    }
+
+    pub(super) fn get_source_overload_namespace_property(
+        &mut self,
+        receiver: TypeId,
+        name: EscapedNameRef<'_>,
+    ) -> Result<Option<super::relater::ResolvedOwnProperty>, super::source::SourceCheckError> {
+        let invalid_receiver = || super::RelationUnavailable::InvalidStructuredMembers(receiver);
+        let view = super::source_namespaces::namespace_value_members_with_source(
+            self.store, self.host, receiver,
+        )?.ok_or_else(invalid_receiver)?;
+        if view.provider() != super::source_namespaces::NamespaceValueProvider::SourceOverloads {
+            return Err(invalid_receiver().into());
+        }
+        let Some(table) = view.members() else {
+            return Ok(None);
+        };
+        let Some(raw) = self.store.symbol_table(table)
+            .ok_or_else(invalid_receiver)?.get(name)
+        else {
+            return Ok(None);
+        };
+        let Some(member) = view.member(raw).cloned() else {
+            return Ok(None);
+        };
+        let proof = self.resolve_namespace_member_value(receiver, raw)?;
+        self.validate_global_this_member_value_proof(&proof)?;
+        if !proof.is_namespace_value()
+            || proof.receiver() != receiver
+            || proof.member() != raw
+            || proof.source_symbol() != member.symbol()
+        {
+            return Err(super::RelationUnavailable::UnsupportedProperty(raw).into());
+        }
+        let current = super::source_namespaces::namespace_value_members_with_source(
+            self.store, self.host, receiver,
+        )?.ok_or_else(invalid_receiver)?;
+        if current.provider() != super::source_namespaces::NamespaceValueProvider::SourceOverloads
+            || current.member(raw) != Some(&member)
+        {
+            return Err(super::RelationUnavailable::UnsupportedProperty(raw).into());
+        }
+        let property = super::object_members::property_from_namespace_value_members(
+            self.store, &current, name, Some(&proof),
+        )?.ok_or(super::RelationUnavailable::UnsupportedProperty(raw))?;
+        if property.symbol != proof.source_symbol() || property.type_ != proof.type_id() {
+            return Err(super::RelationUnavailable::UnsupportedProperty(raw).into());
+        }
+        self.validate_global_this_member_value_proof(&proof)?;
+        Ok(Some(property))
+    }
+
+    fn resolve_source_member_value(
+        &mut self,
+        receiver: TypeId,
+        row: SourceMemberValueIdentity,
+    ) -> Result<GlobalThisMemberValueProof, DeclaredTypeError> {
+        let invalid = || row.invalid(receiver);
+        let globals = self.global_types.clone().ok_or_else(invalid)?;
+        if self.instantiation_session.is_none() {
+            return Err(invalid());
+        }
+        let key = (receiver, row.table_symbol());
         if !self.active_global_values.insert(key) {
             return Err(invalid());
         }
@@ -38918,10 +39081,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             {
                 return Err(invalid());
             }
-            members.validate(self.store)?;
+            self.source_query_context()?.validate_source_member_value_identity(self.store, receiver, &row)?;
             Ok(GlobalThisMemberValueProof {
-                receiver: members.receiver(),
-                member: row,
+                receiver,
+                member: row.clone(),
                 type_,
                 globals,
                 options: self.options,
@@ -39182,8 +39345,40 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .map(InstantiationSession::limit_event_mark);
             let semantic_mark = self.source_branch_recoveries.len();
             let mut returns = HashSet::new();
+            let mut overloads = HashSet::new();
+            let array_targets = self.global_types.as_ref()
+                .map(CanonicalArrayTargets::from_global_types);
             loop {
                 match self.relate_source_types_worker(source, target, relation) {
+                    Err(SourceRelationError::Relation(
+                        error @ super::RelationUnavailable::UnresolvedFunctionType(type_),
+                    )) if matches!(
+                        super::callable_sets::validate_stored_callable_set_with_array_targets(
+                            self.store, type_, array_targets,
+                        ),
+                        super::callable_sets::StoredCallableSetValidation::Pending {
+                            family: super::callables::CallableFamily::SourceFunctionOverloads,
+                        }
+                    ) && overloads.insert(type_) => {
+                        if limit_mark.is_some_and(|mark| {
+                            self.instantiation_session.as_deref()
+                                .is_some_and(|session| session.limit_event_occurred_since(mark))
+                        }) || self.source_semantic_recovery_since(semantic_mark)
+                            .map_err(SourceRelationError::Source)?
+                        {
+                            return Err(SourceRelationError::Relation(error));
+                        }
+                        self.demand_source_overload_signatures(type_)
+                            .map_err(SourceRelationError::Source)?;
+                        if limit_mark.is_some_and(|mark| {
+                            self.instantiation_session.as_deref()
+                                .is_some_and(|session| session.limit_event_occurred_since(mark))
+                        }) || self.source_semantic_recovery_since(semantic_mark)
+                            .map_err(SourceRelationError::Source)?
+                        {
+                            return Err(SourceRelationError::Relation(error));
+                        }
+                    }
                     Err(SourceRelationError::Relation(
                         error @ super::RelationUnavailable::UnresolvedSignatureReturn(signature),
                     )) if returns.insert(signature) => {
@@ -40867,6 +41062,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             Some(alias) if self.planned_property_object_alias(alias, &plan)? => Some(alias),
             _ => None,
         };
+        let direct_property_literal_alias = direct_alias.filter(|alias| {
+            plan.aliases.get(alias).is_some_and(|alias| {
+                alias.type_parameters.is_empty()
+                    && self
+                        .direct_type_literal_plan_node(alias.type_node, &plan)
+                        .is_some()
+            })
+        });
         let direct_property_intersection_alias = direct_alias.filter(|alias| {
             plan.aliases.get(alias).is_some_and(|alias| {
                 self.direct_deferred_intersection_plan_node(alias.type_node, &plan)
@@ -40911,6 +41114,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let result = match direct_callable_alias
                 .or(direct_import_alias)
                 .or(direct_property_object_alias)
+                .or(direct_property_literal_alias)
                 .or(direct_property_intersection_alias)
             {
                 Some(alias) => self.execute_declared_type(alias, &plan, &mut prepared),
