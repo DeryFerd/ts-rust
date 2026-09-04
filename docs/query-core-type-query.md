@@ -5,7 +5,63 @@ Use query-core-integration. Root owns production code, tests and the index.
 One reviewer checks the complete change. Other workers investigate bounded
 questions and write separate reports. Do not start another feature branch.
 
-## Overload relation batch
+## Namespace relation checkpoint
+
+Commit cbdea53ca preserves namespace value properties when Rust compares an
+overloaded function with an object or another callable. Selected values use
+the live source query, the caller's session and checked source proofs. Pending
+overloads resolve once and retain their TypeId. Comparisons retain the complete
+ordered public call set. Type-only exports do not become value properties.
+
+The batch also completes the declared-type cache when a caller directly queries
+an ordinary type-literal alias body. The old path created the literal and its
+alias metadata but did not publish the alias's declared-type link. The fix uses
+the existing alias executor. It does not relax either property validator.
+
+| Completed check | Pass | Fail | Previous passes lost |
+| --- | ---: | ---: | ---: |
+| Focused controls | 26 | 5 | 0 |
+| Public selection | 107 | 7 | 0 |
+| Exact library selection | 18 | 0 | 0 |
+| Selected accepted cases | 107 | 2 | 0 |
+
+These selections overlap. Do not add their counts. The focused run gains one
+old ReturnType case and two new positive/negative namespace relation controls.
+All 104 previous public passes remain. All 109 accepted names remain, with the
+same two failures. See the [focused comparison](../target/query-core-namespace-relations-focused-3-comparison.json),
+[public comparison](../target/query-core-namespace-relations-regression-1-comparison.json),
+[library result](../target/query-core-namespace-relations-library-1-result.json),
+and [accepted selection](../target/query-core-namespace-relations-accepted-selection-1.json).
+
+Query still stops at ReturnType's constraint. All 244 checking records match
+the previous run. Two of 23 isolated roots complete. Ordinary checking does
+not complete. There is no diagnostic improvement. See the
+[Query comparison](../target/query-core-namespace-relations-trace-2-comparison.json).
+The corrected bounded trace
+identifies StructuredSignatures on source type 111 while comparing it with
+constraint type 107. The source has three resolved public signatures. The
+target has one. Both queries use the live globals and caller session. This is
+a relation failure, not a diagnostic-formatting failure. The first source
+signature has no own type parameters. That does not describe the other two
+signatures. Do not assume which rejection branch ran from these IDs alone.
+
+The next step is to trace this exact relation rejection. The qualified typeof
+proposal and the lazy signature-erasure proposals are still unapplied. Keep
+Query as the project target. Do not start more production branches.
+
+One lower-level write-plan limitation remains open. A prebuilt namespace write
+plan can no longer use the old warm value-cache shortcut. The existing ordinary
+assignment path uses the source-aware write checker. No ordinary-program
+regression was established, but this lower-level API is not fixed. See the
+[write-path audit](../target/query-core-namespace-source-write-path.md).
+
+All runs are closed. Temporary traces are removed. The tested integration
+worktree, including the separate six-file reference-flow draft, has fingerprint
+b38a26039de5f9a1e384f3bbdf8aff208878a9754f66d377eda9a822cf147fc1.
+The signed commit excludes that draft. This checkpoint does not promote a new
+accepted compiler. Full regression, Hono and corpus checks were not rerun.
+
+## Earlier overload relation batch
 
 Commit 65df0072a adds the real library ReturnType control. It first requests the
 pending global callable, then saves the alias result before a direct constraint
@@ -61,7 +117,7 @@ The concrete [value-proof edits](../target/query-core-namespace-value-proof-conc
 and [property-reader edits](../target/query-core-namespace-property-readers-concrete-diff.md)
 are ready for root integration. They have not been applied or compiled.
 
-## Measured failure
+## Earlier measured failure
 
 The latest unchanged Query run reports GenericAliasConstraintUnsupported for
 ReturnType's formal in lib.es5.d.ts, bytes 75173..75204. The old blanket
