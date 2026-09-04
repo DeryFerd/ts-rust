@@ -11,7 +11,7 @@ use ts_ast::{Node, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
 
 use super::{
-    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, SignatureId, TypeId,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     callables::ValidatedSingleCallable,
@@ -151,6 +151,7 @@ pub(super) enum SourceOverloadError {
     Unsupported(NodeRef),
     Callable(SourceCallableError),
     Literal(LiteralTypeCacheError),
+    EmptyReturnBootstrap,
     Invariant(SourceOverloadInvariant),
 }
 
@@ -165,7 +166,8 @@ impl SourceOverloadError {
                 | SourceOverloadInvariant::Publication(node)
                 | SourceOverloadInvariant::Capacity(node),
             ) => Some(node),
-            Self::Literal(_) | Self::Invariant(SourceOverloadInvariant::EmptyGroup) => None,
+            Self::Literal(_) | Self::EmptyReturnBootstrap
+            | Self::Invariant(SourceOverloadInvariant::EmptyGroup) => None,
         }
     }
 }
@@ -173,6 +175,12 @@ impl SourceOverloadError {
 impl From<SourceCallableError> for SourceOverloadError {
     fn from(error: SourceCallableError) -> Self {
         Self::Callable(error)
+    }
+}
+
+impl From<DeclaredTypeError> for SourceOverloadError {
+    fn from(error: DeclaredTypeError) -> Self {
+        Self::Callable(SourceCallableError::DeclaredType(error))
     }
 }
 

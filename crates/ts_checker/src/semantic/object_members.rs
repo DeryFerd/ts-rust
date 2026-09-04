@@ -7548,6 +7548,7 @@ pub(super) fn declared_signature_parameter_is_rest(
                     | SyntaxKind::UnionType
                     | SyntaxKind::InferType
                     | SyntaxKind::NeverKeyword
+                    | SyntaxKind::AnyKeyword
             )
         )
     {

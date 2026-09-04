@@ -13650,6 +13650,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ),
             SourceOverloadError::Callable(error) => Self::callable_plan_error(error),
             SourceOverloadError::Literal(error) => error.into(),
+            SourceOverloadError::EmptyReturnBootstrap => {
+                SourceCheckError::DerivedType(DerivedTypeError::BootstrapUninitialized)
+            }
             SourceOverloadError::Invariant(_) => SourceCheckError::Function(
                 SourceFunctionInvariant::Callable(error.node().unwrap_or(fallback)),
             ),
@@ -65408,6 +65411,10 @@ fn materialize_source_overloads(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     overloads: &[SourceOverloadPlan],
 ) -> Result<Vec<MaterializedSourceOverload>, SourceCheckError> {
+    let fallback = overloads
+        .first()
+        .and_then(|overload| overload.declarations.first())
+        .map(|plan| plan.declaration);
     let materialized = {
         let mut query = FullSourceOverloadQuery {
             store,
@@ -65417,7 +65424,12 @@ fn materialize_source_overloads(
             session,
             diagnostics,
         };
-        materialize_source_overload_values(&mut query, overloads)?
+        materialize_source_overload_values(&mut query, overloads).map_err(|error| {
+            SourcePlanner::overload_plan_error(
+                fallback.expect("the overload worker fails only after finding a first declaration"),
+                error,
+            )
+        })?
     };
     for (overload, published) in overloads.iter().zip(&materialized) {
         let Some(implementation) = overload.implementation else {
@@ -65554,20 +65566,16 @@ impl<'host, 'arena> SourceOverloadQuery<'host, 'arena>
 pub(super) fn materialize_source_overload_values<'host, 'arena>(
     query: &mut impl SourceOverloadQuery<'host, 'arena>,
     overloads: &[SourceOverloadPlan],
-) -> Result<Vec<MaterializedSourceOverload>, SourceCheckError> {
-    let Some(batch_fallback) = overloads
+) -> Result<Vec<MaterializedSourceOverload>, SourceOverloadError> {
+    if overloads
         .first()
         .and_then(|overload| overload.declarations.first())
-        .map(|plan| plan.declaration)
-    else {
+        .is_none()
+    {
         return Ok(Vec::new());
-    };
+    }
     let mut prepared = Vec::with_capacity(overloads.len());
     for overload in overloads {
-        let fallback = overload
-            .declarations
-            .first()
-            .map_or(batch_fallback, |plan| plan.declaration);
         let mut resolved = Vec::with_capacity(overload.declarations.len());
         for declaration in &overload.declarations {
             let query_evidence = query.query(|query| {
@@ -65630,10 +65638,12 @@ pub(super) fn materialize_source_overload_values<'host, 'arena>(
                 })
             {
                 // The normal body pass checks this same empty return again.
-                empty_source_return_for_context(query.store(), None)?
+                query.store().intrinsic_bootstrap()
+                    .ok_or(SourceOverloadError::EmptyReturnBootstrap)?
+                    .void_type
             } else {
-                return Err(SourceCheckError::Function(
-                    SourceFunctionInvariant::Callable(declaration.declaration),
+                return Err(SourceOverloadError::Invariant(
+                    super::source_overloads::SourceOverloadInvariant::Publication(declaration.declaration),
                 ));
             };
             resolved.push(ResolvedSourceOverloadSignature {
@@ -65647,14 +65657,12 @@ pub(super) fn materialize_source_overload_values<'host, 'arena>(
                 store, globals, overload, &resolved, session,
             ),
             None => prepare_source_overload_publication(store, globals, overload, &resolved),
-        })?
-        .map_err(|error| SourcePlanner::overload_plan_error(fallback, error))?;
+        })??;
         prepared.push(publication);
     }
     query.with_publication(|store, _, _| {
         publish_source_overload_batch(store, overloads, &prepared)
     })?
-    .map_err(|error| SourcePlanner::overload_plan_error(batch_fallback, error))
 }
 
 #[allow(clippy::too_many_arguments)] // Keeps callable source capabilities explicit.

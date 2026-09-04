@@ -1,7 +1,7 @@
 //! Exact function-type signatures for the dependency-closed type-node cut.
 //!
 //! This module owns nongeneric function types, authenticated implicit, explicit
-//! `any[]`, typed and variadic type-parameter rest parameters, identifier and
+//! `any`, `any[]`, typed and variadic type-parameter rest parameters, identifier and
 //! assertion predicates, generic function aliases, and generic function types
 //! with outer lexical constraints and source-owned conditional returns.
 //! The type-node planner/executor only supplies recursive annotation callbacks;
@@ -549,7 +549,10 @@ pub(super) fn plan_function_type(
             && (tuple_rest
                 || matches!(
                     preflight_node(store, host, type_node)?.kind,
-                    SyntaxKind::ArrayType | SyntaxKind::InferType | SyntaxKind::NeverKeyword
+                    SyntaxKind::ArrayType
+                        | SyntaxKind::InferType
+                        | SyntaxKind::NeverKeyword
+                        | SyntaxKind::AnyKeyword
                 ));
         let rest_type_parameter = if data.dot_dot_dot_token.is_some()
             && !implicit_any_rest
@@ -620,7 +623,7 @@ pub(super) fn plan_function_type(
                             false
                         }
                         NodeData::KeywordTypeNode(_)
-                            if type_record.kind == SyntaxKind::NeverKeyword =>
+                            if matches!(type_record.kind, SyntaxKind::NeverKeyword | SyntaxKind::AnyKeyword) =>
                         {
                             type_record.flags.0 != 0
                         }
@@ -3169,6 +3172,7 @@ pub(super) fn validate_stored_function_type(
                                     | SyntaxKind::UnionType
                                     | SyntaxKind::InferType
                                     | SyntaxKind::NeverKeyword
+                                    | SyntaxKind::AnyKeyword
                             )
                         ) =>
                     {
@@ -4101,6 +4105,7 @@ fn function_parameter_base_type(
                     | SyntaxKind::UnionType
                     | SyntaxKind::InferType
                     | SyntaxKind::NeverKeyword
+                    | SyntaxKind::AnyKeyword
             )
         )
     {

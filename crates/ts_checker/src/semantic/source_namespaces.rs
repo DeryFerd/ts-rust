@@ -6615,6 +6615,9 @@ fn namespace_overload_error(declaration: NodeRef, error: SourceOverloadError) ->
         ),
         SourceOverloadError::Callable(error) => namespace_callable_error(declaration, error),
         SourceOverloadError::Literal(error) => error.into(),
+        SourceOverloadError::EmptyReturnBootstrap => {
+            SourceCheckError::DerivedType(super::DerivedTypeError::BootstrapUninitialized)
+        }
         SourceOverloadError::Invariant(_) => {
             SourceCheckError::Function(SourceFunctionInvariant::Callable(declaration))
         }

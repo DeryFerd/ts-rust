@@ -239,6 +239,15 @@ pub(super) trait ConditionalBranchSource {
         Err(missing_source_query())
     }
 
+    fn demand_source_overload_signatures(
+        &mut self,
+        _store: &mut CanonicalTypeMapperStore,
+        _type_: TypeId,
+        _session: &mut InstantiationSession,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
     fn source_signature_return_query(&self) -> Option<&dyn SourceSignatureReturnQuery> {
         None
     }
@@ -1240,6 +1249,21 @@ impl ConditionalBranchSource for RecordingConditionalSource<'_> {
             globals,
             strict_function_types,
         )
+    }
+
+    fn demand_source_overload_signatures(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        type_: TypeId,
+        session: &mut InstantiationSession,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        self.source
+            .demand_source_overload_signatures(store, type_, session)?;
+        self.validate_options()?;
+        self.nested
+            .extend(self.source.take_completed_source_conditionals());
+        self.validate_reads(store, session)
     }
 
     fn source_signature_return_query(&self) -> Option<&dyn SourceSignatureReturnQuery> {
@@ -7177,6 +7201,16 @@ fn validate_conditional_operand_with_source(
         return Ok(());
     }
     let mut dependencies = Vec::new();
+    match super::source_overloads::validate_stored_source_overload(store, type_) {
+        super::source_overloads::StoredSourceOverloadValidation::Malformed => {
+            return Err(RelationUnavailable::MalformedFunctionType(type_).into());
+        }
+        super::source_overloads::StoredSourceOverloadValidation::Valid(edges) => {
+            dependencies.extend(edges);
+        }
+        super::source_overloads::StoredSourceOverloadValidation::Pending
+        | super::source_overloads::StoredSourceOverloadValidation::NotSourceOverload => {}
+    }
     if let Some(alias) = record.alias() {
         let alias_record = store
             .type_alias(alias)
@@ -8750,6 +8784,19 @@ fn structured_inference_shape(
     array_targets: Option<CanonicalArrayTargets>,
     query: Option<&dyn ConditionalBranchSource>,
 ) -> Result<StructuredInferenceShape, ConditionalTypeError> {
+    use super::source_overloads::{
+        StoredSourceOverloadValidation, validate_stored_source_overload,
+    };
+    match validate_stored_source_overload(store, type_) {
+        StoredSourceOverloadValidation::Pending => {
+            return Err(RelationUnavailable::UnresolvedStructuredMembers(type_).into());
+        }
+        StoredSourceOverloadValidation::Malformed => {
+            return Err(RelationUnavailable::MalformedFunctionType(type_).into());
+        }
+        StoredSourceOverloadValidation::NotSourceOverload
+        | StoredSourceOverloadValidation::Valid(_) => {}
+    }
     let query = query.filter(|source| source.source_query_options().is_some());
     validate_conditional_operand_with_source(
         store,
@@ -8808,7 +8855,42 @@ fn infer_from_structured_types(
     session: &mut InstantiationSession,
     query: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<bool, ConditionalTypeError> {
+    use super::source_overloads::{
+        StoredSourceOverloadValidation, validate_stored_source_overload,
+    };
     let mark = session.limit_event_mark();
+    let semantic_mark = source_semantic_recovery_mark(query);
+    for endpoint in [source, target] {
+        match validate_stored_source_overload(store, endpoint) {
+            StoredSourceOverloadValidation::NotSourceOverload
+            | StoredSourceOverloadValidation::Valid(_) => continue,
+            StoredSourceOverloadValidation::Malformed => {
+                return Err(RelationUnavailable::MalformedFunctionType(endpoint).into());
+            }
+            StoredSourceOverloadValidation::Pending => {}
+        }
+        let provider = query
+            .as_deref_mut()
+            .filter(|provider| provider.source_query_options().is_some())
+            .ok_or(RelationUnavailable::UnresolvedStructuredMembers(endpoint))?;
+        provider.demand_source_overload_signatures(store, endpoint, session)?;
+        if source_recovery_type(session, mark, query)?.is_some() {
+            return Ok(false);
+        }
+        if source_semantic_recovery_since(store, semantic_mark, session, query)? {
+            return Err(missing_source_query().into());
+        }
+        match validate_stored_source_overload(store, endpoint) {
+            StoredSourceOverloadValidation::Valid(_) => {}
+            StoredSourceOverloadValidation::Pending => {
+                return Err(RelationUnavailable::UnresolvedStructuredMembers(endpoint).into());
+            }
+            StoredSourceOverloadValidation::NotSourceOverload
+            | StoredSourceOverloadValidation::Malformed => {
+                return Err(RelationUnavailable::MalformedFunctionType(endpoint).into());
+            }
+        }
+    }
     if is_source_query(query) {
         for endpoint in [source, target] {
             if super::object_aliases::source_property_object_projection(store, endpoint)?.is_some()
@@ -8963,21 +9045,22 @@ fn infer_from_structured_types(
                     .global_types
                     .map(CanonicalArrayTargets::from_global_types),
             )?;
-            let target_never_rest = store
+            let target_any_or_never_rest = store
                 .signature(target_signature)
                 .is_some_and(|signature| signature.has_rest_parameter())
                 && store.intrinsic_bootstrap().is_some_and(|bootstrap| {
                     target_parameters.as_slice() == [bootstrap.never_type]
+                        || target_parameters.as_slice() == [bootstrap.any_type]
                 });
-            if !target_never_rest && source_minimum > target_parameters.len() {
+            if !target_any_or_never_rest && source_minimum > target_parameters.len() {
                 return Ok(false);
             }
-            // A sole never rest type accepts every source parameter list and
-            // contains no inference parameters. Its receiver still participates.
+            // A sole any or never rest type has no parameter inference targets
+            // and no finite arity limit. Receiver and return inference still run.
             let value_pairs = source_parameters
                 .into_iter()
                 .zip(target_parameters)
-                .filter(|_| !target_never_rest);
+                .filter(|_| !target_any_or_never_rest);
             // An absent source receiver produces no inference candidate.
             for (source_parameter, target_parameter) in
                 source_this.zip(target_this).into_iter().chain(value_pairs)

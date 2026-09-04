@@ -8455,6 +8455,33 @@ fn source_callable_signature_error(
     }
 }
 
+fn source_overload_error(
+    fallback: NodeRef,
+    error: super::source_overloads::SourceOverloadError,
+) -> DeclaredTypeError {
+    use super::source_overloads::SourceOverloadError;
+    match error {
+        SourceOverloadError::Callable(error) => {
+            source_callable_error(error, SourceCallableFamily::FunctionDeclaration)
+        }
+        SourceOverloadError::Literal(error) => type_construction_error(error),
+        SourceOverloadError::EmptyReturnBootstrap => DeclaredTypeError::Unavailable(
+            DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+        ),
+        SourceOverloadError::Unsupported(node) => {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node,
+                kind: SyntaxKind::FunctionDeclaration,
+            })
+        }
+        error @ SourceOverloadError::Invariant(_) => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(
+                error.node().unwrap_or(fallback),
+            ))
+        }
+    }
+}
+
 fn tuple_type_node_error(error: TupleTypeNodeError) -> DeclaredTypeError {
     match error {
         TupleTypeNodeError::DeclaredType(error) => error,
@@ -33308,6 +33335,16 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             | SyntaxKind::NeverKeyword
             | SyntaxKind::ObjectKeyword
             | SyntaxKind::LiteralType => Ok(()),
+            SyntaxKind::FunctionType => functions::plan_function_type(
+                self.store,
+                self.host,
+                node,
+                None,
+                false,
+                self.array_targets,
+            )
+            .map(|_| ())
+            .map_err(function_type_error),
             SyntaxKind::ParenthesizedType => {
                 let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
                     return Err(unsupported());
@@ -35967,6 +36004,8 @@ pub(super) struct CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
     source_branch_recoveries: Vec<SourceConditionalRecoveryProof>,
     source_conditional_recoveries: Vec<ConditionalSourceSemanticRecovery>,
     active_source_returns: HashSet<SourceSignatureReturnRequest>,
+    active_source_overloads: HashSet<TypeId>,
+    source_overload_publication_mark: Option<(InstantiationLimitEventMark, usize)>,
     source_signature_return_request: Option<SourceSignatureReturnRequest>,
     completed_source_returns: Vec<SourceSignatureReturnProof>,
 }
@@ -35996,6 +36035,13 @@ impl<'host, 'arena> super::source::SourceOverloadQuery<'host, 'arena>
         ) -> R,
     ) -> Result<R, DeclaredTypeError> {
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery);
+        let (mark, semantic_mark) = self.source_overload_publication_mark.ok_or_else(invalid)?;
+        if self.instantiation_session.as_deref()
+            .is_none_or(|session| session.limit_event_occurred_since(mark))
+            || self.source_semantic_recovery_since(semantic_mark)?
+        {
+            return Err(invalid());
+        }
         let globals = self.global_types.as_ref().ok_or_else(invalid)?;
         let session = self.instantiation_session.as_deref_mut().ok_or_else(invalid)?;
         Ok(operation(self.store, globals, Some(session)))
@@ -36327,6 +36373,7 @@ pub(super) struct SourceTypeQueryContext<'host, 'arena> {
     semantic_results: Vec<ConditionalSourceSemanticRecovery>,
     diagnostics: CanonicalCheckerDiagnostics,
     active_returns: HashSet<SourceSignatureReturnRequest>,
+    active_overloads: HashSet<TypeId>,
     returns: Vec<SourceSignatureReturnProof>,
 }
 
@@ -36376,6 +36423,7 @@ impl<'host, 'arena> SourceTypeQueryContext<'host, 'arena> {
             .source_conditional_recoveries
             .clone_from(&self.semantic_results);
         query.active_source_returns.clone_from(&self.active_returns);
+        query.active_source_overloads.clone_from(&self.active_overloads);
         query.completed_source_returns.clone_from(&self.returns);
         let result = operation(&mut query);
         self.members = query.global_this_members;
@@ -37593,6 +37641,18 @@ impl ConditionalBranchSource for SourceTypeQueryContext<'_, '_> {
 }
 
 impl ConditionalBranchSource for SourceTypeQueryAdapter<'_, '_, '_> {
+    fn demand_source_overload_signatures(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        type_: TypeId,
+        session: &mut InstantiationSession,
+    ) -> Result<(), DeclaredTypeError> {
+        self.context
+            .query(store, session, self.diagnostics, |query| {
+                query.demand_source_overload_signatures(type_)
+            })
+    }
+
     fn preflight(
         &self,
         store: &CanonicalTypeMapperStore,
@@ -38243,6 +38303,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             source_branch_recoveries: Vec::new(),
             source_conditional_recoveries: Vec::new(),
             active_source_returns: HashSet::new(),
+            active_source_overloads: HashSet::new(),
+            source_overload_publication_mark: None,
             source_signature_return_request: None,
             completed_source_returns: Vec::new(),
         })
@@ -38308,6 +38370,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             semantic_results: self.source_conditional_recoveries.clone(),
             diagnostics: self.diagnostics.clone(),
             active_returns: self.active_source_returns.clone(),
+            active_overloads: self.active_source_overloads.clone(),
             returns: self.completed_source_returns.clone(),
         })
     }
@@ -39101,7 +39164,39 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         relation: super::RelationKind,
     ) -> Result<SourceRelationResult, SourceRelationError<DeclaredTypeError>> {
         self.begin_source_query();
-        let result = self.relate_source_types_worker(source, target, relation);
+        let result = (|| {
+            let limit_mark = self.instantiation_session.as_deref()
+                .map(InstantiationSession::limit_event_mark);
+            let semantic_mark = self.source_branch_recoveries.len();
+            let mut returns = HashSet::new();
+            loop {
+                match self.relate_source_types_worker(source, target, relation) {
+                    Err(SourceRelationError::Relation(
+                        error @ super::RelationUnavailable::UnresolvedSignatureReturn(signature),
+                    )) if returns.insert(signature) => {
+                        if limit_mark.is_some_and(|mark| {
+                            self.instantiation_session.as_deref()
+                                .is_some_and(|session| session.limit_event_occurred_since(mark))
+                        }) {
+                            return Err(SourceRelationError::Relation(error));
+                        }
+                        let return_type = self.get_return_type_of_signature(signature)
+                            .map_err(SourceRelationError::Source)?;
+                        if limit_mark.is_some_and(|mark| {
+                            self.instantiation_session.as_deref()
+                                .is_some_and(|session| session.limit_event_occurred_since(mark))
+                        }) || self.source_semantic_recovery_since(semantic_mark)
+                            .map_err(SourceRelationError::Source)?
+                            || self.store.intrinsic_bootstrap()
+                                .is_some_and(|bootstrap| return_type == bootstrap.error_type)
+                        {
+                            return Err(SourceRelationError::Relation(error));
+                        }
+                    }
+                    result => return result,
+                }
+            }
+        })();
         self.finish_source_query();
         result
     }
@@ -41766,16 +41861,59 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     pub(super) fn materialize_source_overload_values(
         &mut self,
         overloads: &[super::source_overloads::SourceOverloadPlan],
-    ) -> Result<Vec<super::source_overloads::MaterializedSourceOverload>, super::source::SourceCheckError> {
+    ) -> Result<Vec<super::source_overloads::MaterializedSourceOverload>, super::source_overloads::SourceOverloadError> {
         if self.global_types.is_none() || self.instantiation_session.is_none() {
-            return Err(super::source::SourceCheckError::DeclaredType(type_node_unavailable(
+            return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidPreparedTypeQuery,
-            )));
+            ).into());
         }
         self.begin_source_query();
+        let mark = self.instantiation_session.as_deref()
+            .expect("the live overload query requires a session")
+            .limit_event_mark();
+        let previous = self.source_overload_publication_mark
+            .replace((mark, self.source_branch_recoveries.len()));
         let result = super::source::materialize_source_overload_values(self, overloads);
+        self.source_overload_publication_mark = previous;
         self.finish_source_query();
         result
+    }
+
+    pub(super) fn demand_source_overload_signatures(
+        &mut self,
+        type_: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        match validate_stored_source_overload(self.store, type_) {
+            StoredSourceOverloadValidation::NotSourceOverload
+            | StoredSourceOverloadValidation::Valid(_) => return Ok(()),
+            StoredSourceOverloadValidation::Malformed => {
+                return Err(type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery));
+            }
+            StoredSourceOverloadValidation::Pending => {}
+        }
+        let identity = self.store.source_overload_identity(type_).cloned().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery)
+        })?;
+        let first = *identity.declarations.first().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery)
+        })?;
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(first));
+        let arrays = self.global_types.as_ref().map(CanonicalArrayTargets::from_global_types);
+        let plan = super::source_overloads::plan_source_ambient_overload_group(
+            self.store, self.host, identity.owner_symbol, &identity.declarations, arrays,
+        ).map_err(|error| source_overload_error(first, error))?;
+        if !self.active_source_overloads.insert(type_) {
+            return Err(invalid());
+        }
+        let result = self.materialize_source_overload_values(&[plan]);
+        self.active_source_overloads.remove(&type_);
+        let materialized = result.map_err(|error| source_overload_error(first, error))?;
+        if !matches!(materialized.as_slice(), [value] if value.type_ == type_)
+            || !matches!(validate_stored_source_overload(self.store, type_), StoredSourceOverloadValidation::Valid(_))
+        {
+            return Err(invalid());
+        }
+        Ok(())
     }
 
     /// Resolves a real overload row without publishing a singleton callable.
@@ -53880,9 +54018,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let assignable = loop {
                 match self.compare_constraint_types(comparison_argument, constraint) {
                     Ok(assignable) => break assignable,
-                    Err(super::RelationUnavailable::UnresolvedStructuredMembers(type_))
+                    Err(SourceRelationError::Relation(
+                        super::RelationUnavailable::UnresolvedStructuredMembers(type_),
+                    ))
                         if demanded.insert(type_)
                             && self.prepare_constraint_interface_members(type_)? => {}
+                    Err(SourceRelationError::Source(error)) => return Err(error),
                     Err(_) => return Err(unsupported()),
                 }
             };
@@ -56819,6 +56960,26 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     reference.symbol,
                 ))
             })?;
+            if self.store.type_has_function_type_provenance(constraint) {
+                self.flush_pending_function_parameters(plan, prepared)?;
+                if !matches!(
+                    functions::validate_stored_function_type(self.store, constraint),
+                    functions::StoredFunctionTypeValidation::Valid(_)
+                ) {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(reference.symbol),
+                    ));
+                }
+                let signatures = self.store.type_payload(constraint)
+                    .and_then(|record| record.data().structured())
+                    .and_then(|structured| structured.signatures.as_deref());
+                let Some([signature]) = signatures else {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(reference.symbol),
+                    ));
+                };
+                self.get_return_type_of_signature(*signature)?;
+            }
             let keyof_source = self.source_generic_alias_keyof_constraint(
                 reference.symbol,
                 metadata,
@@ -56946,11 +57107,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 assignable
             } else {
                 let result = self.compare_constraint_types(comparison_argument, constraint);
-                result.map_err(|_| {
-                    type_node_unavailable(TypeNodeUnavailable::GenericAliasConstraintUnsupported {
+                result.map_err(|error| match error {
+                    SourceRelationError::Source(error) => error,
+                    SourceRelationError::Relation(_) => type_node_unavailable(TypeNodeUnavailable::GenericAliasConstraintUnsupported {
                         alias: reference.symbol,
                         parameter: parameter.declaration,
-                    })
+                    }),
                 })?
             };
             if limit_mark.is_some_and(|mark| {
@@ -57277,11 +57439,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             )?;
             let assignable = self
                 .compare_constraint_types(source_type, target_type)
-                .map_err(|_| {
-                    type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported {
+                .map_err(|error| match error {
+                    SourceRelationError::Source(error) => error,
+                    SourceRelationError::Relation(_) => type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported {
                         node: chain[0].node,
                         symbol: derived_symbol,
-                    })
+                    }),
                 })?;
             if !assignable || source_optional && !target_optional {
                 return Ok(Some(false));
@@ -57294,7 +57457,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         source: TypeId,
         target: TypeId,
-    ) -> Result<bool, super::RelationUnavailable> {
+    ) -> Result<bool, SourceRelationError<DeclaredTypeError>> {
+        if self.global_types.is_some() && self.instantiation_session.is_some() {
+            return self.relate_source_types(source, target, super::RelationKind::Assignable)
+                .map(|result| result.related());
+        }
+        let result = (|| {
         if let Some(session) = self.instantiation_session.as_deref_mut() {
             self.store.is_type_assignable_to_with_session(
                 source,
@@ -57335,6 +57503,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         } else {
             self.store.is_type_assignable_to(source, target)
         }
+        })();
+        result.map_err(SourceRelationError::Relation)
     }
 
     fn forwarded_generic_interface_chain(
@@ -58178,6 +58348,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 mapped_parameters,
                 type_arguments,
                 None,
+            );
+        }
+        if self.ordinary_function_alias_operand_is_exact(symbol, type_)? {
+            let mapped_parameters = mapped_parameters.get(..type_arguments.len()).ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(symbol))
+            })?;
+            return self.instantiate_dependent_alias_type(
+                symbol, type_, mapped_parameters, type_arguments, None,
             );
         }
         if self.is_authenticated_dependent_alias_union(symbol, type_, mapped_parameters)? {
@@ -59065,6 +59243,32 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(callable)
     }
 
+    fn ordinary_function_alias_operand_is_exact(
+        &self,
+        alias: SemanticSymbolId,
+        type_: TypeId,
+    ) -> Result<bool, DeclaredTypeError> {
+        if !self.store.type_has_function_type_provenance(type_)
+            || self.store.type_payload(type_).is_some_and(|record| record.alias().is_some())
+        {
+            return Ok(false);
+        }
+        let shape = super::instantiate::function_instantiation_shape(self.store, type_)
+            .map_err(|error| match error {
+                super::instantiate::InstantiationError::Declared(error) => error,
+                super::instantiate::InstantiationError::UnsupportedType(_) => {
+                    type_node_unavailable(TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                        alias,
+                        declared_type: type_,
+                    })
+                }
+                _ => type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(alias)),
+            })?;
+        Ok(self.store.signature(shape.signature)
+            .and_then(Signature::declaration)
+            .and_then(|node| self.store.source_node_kind(node)) == Some(SyntaxKind::FunctionType))
+    }
+
     fn validate_direct_alias_type(
         &self,
         symbol: SemanticSymbolId,
@@ -59084,6 +59288,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             })?
             .is_some()
         {
+            return Ok(());
+        }
+        if self.ordinary_function_alias_operand_is_exact(symbol, type_)? {
             return Ok(());
         }
         if super::object_aliases::property_object_alias_projection(self.store, type_)
