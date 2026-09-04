@@ -750,6 +750,99 @@ fn ambient_module_global_type_query_keeps_lazy_identity_through_overload_demand(
 }
 
 #[test]
+fn return_type_checks_pending_global_overload_constraints_and_replays() {
+    for nested in [false, true] {
+        let inputs = Inputs {
+            source: parse_source_file(concat!(
+                "export {};\n",
+                "type Actual = ReturnType<typeof parseInt>;\n",
+            )),
+            ..Inputs::new(nested)
+        };
+        let declarations = Declarations::new(&inputs);
+        let arena = &inputs.source.arena;
+        let query = arena.iter().find_map(|(id, node)| {
+            (node.kind == SyntaxKind::TypeQuery)
+                .then_some(NodeRef::new(arena.id(), SOURCE, id))
+        }).unwrap();
+        let actual = arena.iter().find_map(|(_, node)| {
+            let NodeData::TypeAliasDeclaration(alias) = &node.data else { return None };
+            let NodeData::Identifier(name) = &arena.get(alias.name)?.data else { return None };
+            (name.text == "Actual")
+                .then_some(NodeRef::new(arena.id(), SOURCE, alias.type_))
+        }).unwrap();
+        let library = &inputs.library.arena;
+        let constraint = library.iter().find_map(|(_, node)| {
+            let NodeData::TypeAliasDeclaration(alias) = &node.data else { return None };
+            let NodeData::Identifier(name) = &library.get(alias.name)?.data else { return None };
+            if name.text != "ReturnType" {
+                return None;
+            }
+            let [parameter] = alias.type_parameters.as_ref()?.nodes.as_slice() else {
+                panic!("ReturnType must have one formal");
+            };
+            let NodeData::TypeParameterDeclaration(parameter) = &library.get(*parameter)?.data
+            else { panic!("expected the ReturnType formal") };
+            Some(NodeRef::new(library.id(), LIBRARY, parameter.constraint?))
+        }).unwrap();
+        for query_first in [true, false] {
+            let mut context = inputs.context();
+            let expected = context.store().intrinsic_bootstrap().unwrap().boolean_type;
+            let early = query_first.then(|| {
+                let callable = context.get_type_from_type_node(query).unwrap();
+                let TypeData::Object(object) = context.store().type_payload(callable).unwrap().data()
+                else { panic!("expected a pending callable") };
+                assert!(object.structured.signatures.is_none());
+                assert!(object.structured.members.is_none());
+                let result = context.get_type_from_type_node(actual);
+                let constraint_type = context.get_type_from_type_node(constraint).unwrap();
+                let TypeData::Object(constraint_object) = context.store()
+                    .type_payload(constraint_type).unwrap().data()
+                else { panic!("expected the ReturnType function constraint") };
+                let [constraint_signature] = constraint_object.structured.signatures
+                    .as_deref().unwrap() else {
+                    panic!("ReturnType must retain one constraint signature");
+                };
+                let constraint_signature = *constraint_signature;
+                context.get_return_type_of_signature(constraint_signature).unwrap();
+                assert_eq!(
+                    context.is_type_assignable_to(callable, constraint_type),
+                    Ok(true),
+                    "ReturnType alias result: {result:?}",
+                );
+                assert_eq!(result, Ok(expected));
+                assert_providers_unchecked(&context);
+                assert!(!context.store().source_file_links(context.source_file(SOURCE).unwrap())
+                    .is_some_and(|links| links.type_checked));
+                assert_eq!(context.get_type_from_type_node(query), Ok(callable));
+                callable
+            });
+            context.check_source_file(SOURCE).unwrap();
+            assert!(context.diagnostics().is_empty(), "{:?}", context.diagnostics());
+            assert_eq!(context.get_type_from_type_node(actual), Ok(expected));
+            let callable = context.get_type_from_type_node(query).unwrap();
+            assert!(early.is_none_or(|early| early == callable));
+            let owner = symbol(&context, declarations.functions[0]);
+            assert_eq!(value_type(&context, owner), callable);
+            let signatures = declarations.functions.map(|node| signature(&context, node));
+            let TypeData::Object(object) = context.store().type_payload(callable).unwrap().data()
+            else { panic!("expected the completed callable") };
+            assert_eq!(object.structured.signatures.as_deref(), Some(signatures.as_slice()));
+            assert_eq!(context.get_return_type_of_signature(signatures[2]), Ok(expected));
+            assert_providers_unchecked(&context);
+            let before = (snapshot(&context, &declarations), context.store().relation_state_snapshot());
+            for _ in 0..2 {
+                context.recheck_source_file(SOURCE).unwrap();
+                assert_eq!(context.get_type_from_type_node(query), Ok(callable));
+                assert_eq!(context.get_type_from_type_node(actual), Ok(expected));
+                assert_providers_unchecked(&context);
+                assert_eq!((snapshot(&context, &declarations), context.store().relation_state_snapshot()), before);
+            }
+        }
+    }
+}
+
+#[test]
 fn qualified_signature_type_query_reuses_the_pending_callable() {
     let body = concat!(
         "function parseInt(value: string, radix: number): typeof parseInt.label;\n",
