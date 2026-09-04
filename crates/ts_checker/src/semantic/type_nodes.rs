@@ -35971,6 +35971,37 @@ pub(super) struct CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
     completed_source_returns: Vec<SourceSignatureReturnProof>,
 }
 
+impl<'host, 'arena> super::source::SourceOverloadQuery<'host, 'arena>
+    for CanonicalTypeQuery<'_, 'host, 'arena, '_>
+{
+    fn store(&self) -> &CanonicalTypeMapperStore {
+        self.store
+    }
+
+    fn query<R>(
+        &mut self,
+        operation: impl FnOnce(
+            &mut CanonicalTypeQuery<'_, 'host, 'arena, '_>,
+        ) -> Result<R, DeclaredTypeError>,
+    ) -> Result<R, DeclaredTypeError> {
+        operation(self)
+    }
+
+    fn with_publication<R>(
+        &mut self,
+        operation: impl FnOnce(
+            &mut CanonicalTypeMapperStore,
+            &CanonicalGlobalTypes,
+            Option<&mut InstantiationSession>,
+        ) -> R,
+    ) -> Result<R, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery);
+        let globals = self.global_types.as_ref().ok_or_else(invalid)?;
+        let session = self.instantiation_session.as_deref_mut().ok_or_else(invalid)?;
+        Ok(operation(self.store, globals, Some(session)))
+    }
+}
+
 /// This proof is used immediately with the source check's unchanged type pair.
 pub(super) struct SourceConditionTypeProof {
     raw_type: TypeId,
@@ -41730,6 +41761,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
         }
         Ok(plan)
+    }
+
+    pub(super) fn materialize_source_overload_values(
+        &mut self,
+        overloads: &[super::source_overloads::SourceOverloadPlan],
+    ) -> Result<Vec<super::source_overloads::MaterializedSourceOverload>, super::source::SourceCheckError> {
+        if self.global_types.is_none() || self.instantiation_session.is_none() {
+            return Err(super::source::SourceCheckError::DeclaredType(type_node_unavailable(
+                TypeNodeUnavailable::InvalidPreparedTypeQuery,
+            )));
+        }
+        self.begin_source_query();
+        let result = super::source::materialize_source_overload_values(self, overloads);
+        self.finish_source_query();
+        result
     }
 
     /// Resolves a real overload row without publishing a singleton callable.

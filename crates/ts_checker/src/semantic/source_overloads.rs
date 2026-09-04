@@ -981,6 +981,26 @@ pub(super) fn prepare_source_overload_publication(
     plan: &SourceOverloadPlan,
     resolved: &[ResolvedSourceOverloadSignature],
 ) -> Result<PreparedSourceOverloadPublication, SourceOverloadError> {
+    prepare_source_overload_publication_worker(store, global_types, plan, resolved, None)
+}
+
+pub(super) fn prepare_source_overload_publication_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    plan: &SourceOverloadPlan,
+    resolved: &[ResolvedSourceOverloadSignature],
+    session: &mut InstantiationSession,
+) -> Result<PreparedSourceOverloadPublication, SourceOverloadError> {
+    prepare_source_overload_publication_worker(store, global_types, plan, resolved, Some(session))
+}
+
+fn prepare_source_overload_publication_worker(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    plan: &SourceOverloadPlan,
+    resolved: &[ResolvedSourceOverloadSignature],
+    mut session: Option<&mut InstantiationSession>,
+) -> Result<PreparedSourceOverloadPublication, SourceOverloadError> {
     let first = plan
         .declarations
         .first()
@@ -1009,14 +1029,14 @@ pub(super) fn prepare_source_overload_publication(
         .flat_map(|declaration| &declaration.parameters)
         .filter(|parameter| parameter.optional || parameter.has_string_default_type())
         .count();
-    let mut prepared_types = store.prepare_type_query_types_with_global_types(
-        &[],
-        &[],
-        &[],
-        optional_count,
-        0,
-        global_types,
-    )?;
+    let mut prepared_types = match session.as_deref_mut() {
+        Some(session) => store.prepare_type_query_types_with_global_types_and_session(
+            &[], &[], &[], optional_count, 0, global_types, session,
+        ),
+        None => store.prepare_type_query_types_with_global_types(
+            &[], &[], &[], optional_count, 0, global_types,
+        ),
+    }?;
     let mut signatures = Vec::with_capacity(plan.declarations.len());
     for (declaration, resolved) in plan.declarations.iter().zip(resolved) {
         if declaration.parameters.len() != resolved.parameter_types.len()
@@ -1123,12 +1143,21 @@ pub(super) fn prepare_source_overload_publication(
             }
             let optional = parameter.optional || default_parameter.is_some();
             let call_type = if strict && optional {
-                store.literal_union_type_prepared_with_global_types(
-                    global_types,
-                    &[*base_type, undefined],
-                    None,
-                    &mut prepared_types,
-                )?
+                match session.as_deref_mut() {
+                    Some(session) => store.literal_union_type_prepared_with_global_types_and_session(
+                        global_types,
+                        &[*base_type, undefined],
+                        None,
+                        &mut prepared_types,
+                        session,
+                    ),
+                    None => store.literal_union_type_prepared_with_global_types(
+                        global_types,
+                        &[*base_type, undefined],
+                        None,
+                        &mut prepared_types,
+                    ),
+                }?
             } else {
                 *base_type
             };

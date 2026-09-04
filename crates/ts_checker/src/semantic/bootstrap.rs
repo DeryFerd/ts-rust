@@ -7314,6 +7314,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    pub(super) fn literal_union_type_prepared_with_global_types_and_session(
+        &mut self,
+        global_types: &CanonicalGlobalTypes,
+        types: &[TypeId],
+        alias_symbol: Option<SemanticSymbolId>,
+        prepared: &mut PreparedTypeQueryTypes,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        self.union_type_prepared(
+            types,
+            UnionReduction::Literal,
+            alias_symbol.map(|symbol| UnionAliasCacheKey::new(symbol, &[])),
+            prepared,
+            UnionArrayValidation::GlobalTypes(global_types),
+            Some(session),
+        )
+    }
+
     /// Keeps the alias symbol and ordered arguments in the canonical union key.
     pub(super) fn literal_union_type_with_alias_prepared(
         &mut self,

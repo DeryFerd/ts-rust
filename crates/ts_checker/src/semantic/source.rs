@@ -65408,162 +65408,17 @@ fn materialize_source_overloads(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     overloads: &[SourceOverloadPlan],
 ) -> Result<Vec<MaterializedSourceOverload>, SourceCheckError> {
-    let Some(batch_fallback) = overloads
-        .first()
-        .and_then(|overload| overload.declarations.first())
-        .map(|plan| plan.declaration)
-    else {
-        return Ok(Vec::new());
+    let materialized = {
+        let mut query = FullSourceOverloadQuery {
+            store,
+            host,
+            globals: global_types,
+            options,
+            session,
+            diagnostics,
+        };
+        materialize_source_overload_values(&mut query, overloads)?
     };
-    let mut prepared = Vec::with_capacity(overloads.len());
-    for overload in overloads {
-        let fallback = overload
-            .declarations
-            .first()
-            .map_or(batch_fallback, |plan| plan.declaration);
-        let mut resolved = Vec::with_capacity(overload.declarations.len());
-        for declaration in &overload.declarations {
-            session.reset_query();
-            let mut generic_diagnostics = CanonicalCheckerDiagnostics::default();
-            let query_evidence = CanonicalTypeQuery::new_with_global_types_and_session(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                &mut generic_diagnostics,
-            )?
-            .get_source_overload_type_query(declaration);
-            merge_retry_diagnostics(diagnostics, generic_diagnostics);
-            let query_evidence = query_evidence?;
-            session.reset_query();
-            let mut default_diagnostics = CanonicalCheckerDiagnostics::default();
-            let default_types = CanonicalTypeQuery::new_with_global_types_and_session(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                &mut default_diagnostics,
-            )?
-            .source_callable_string_default_types(declaration);
-            merge_retry_diagnostics(diagnostics, default_diagnostics);
-            let default_types = default_types?;
-            let mut parameter_types = Vec::with_capacity(declaration.parameters.len());
-            for parameter in &declaration.parameters {
-                if let Some((base_type, proof)) = default_types.get(&parameter.symbol) {
-                    parameter_types.push((*base_type, Some(*proof)));
-                    continue;
-                }
-                session.reset_query();
-                let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
-                let result = CanonicalTypeQuery::new_with_global_types_and_session(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    &mut annotation_diagnostics,
-                )?
-                .get_type_from_type_node(parameter.type_node);
-                merge_retry_diagnostics(diagnostics, annotation_diagnostics);
-                let parameter_type = result?;
-                if overload.declarations.len() > 1
-                    && store.source_node_kind(parameter.type_node) == Some(SyntaxKind::FunctionType)
-                    && let StoredSingleCallableValidation::Valid { callable, .. } =
-                        validate_stored_single_callable(store, parameter_type)
-                    && callable.return_type.is_none()
-                    && (callable.parameters.len() == 1
-                        && callable.min_argument_count == 1
-                        && callable.rest_parameter.is_none()
-                        || query_evidence.as_ref().is_some_and(|evidence| {
-                            evidence.annotation_type(parameter.type_node) == Some(parameter_type)
-                                && store
-                                    .source_global_function_namespace_declarations(overload.owner_symbol)
-                                    .is_some_and(|declarations| {
-                                        declarations.contains(&declaration.declaration)
-                                    })
-                        }))
-                    && store
-                        .signature(callable.signature)
-                        .is_some_and(|signature| {
-                            signature.type_parameters().is_empty()
-                                && signature.this_parameter().is_none()
-                        })
-                {
-                    session.reset_query();
-                    let mut callback_diagnostics = CanonicalCheckerDiagnostics::default();
-                    let return_type = CanonicalTypeQuery::new_with_global_types_and_session(
-                        store,
-                        host,
-                        global_types,
-                        options,
-                        session,
-                        &mut callback_diagnostics,
-                    )?
-                    .get_return_type_of_signature(callable.signature);
-                    merge_retry_diagnostics(diagnostics, callback_diagnostics);
-                    return_type?;
-                }
-                parameter_types.push((parameter_type, None));
-            }
-            let return_type = if let Some(return_node) = declaration.return_type.type_node() {
-                session.reset_query();
-                let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
-                let return_type = CanonicalTypeQuery::new_with_global_types_and_session(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    &mut return_diagnostics,
-                )?
-                .get_type_from_type_node(return_node);
-                merge_retry_diagnostics(diagnostics, return_diagnostics);
-                return_type?
-            } else if declaration.return_type.is_inferred()
-                && declaration.body_mode == SourceCallableBodyMode::Present
-                && declaration.type_parameters.is_empty()
-                && !declaration.is_async
-                && overload.implementation.is_some_and(|implementation| {
-                    implementation.declaration == declaration.declaration
-                        && implementation.body == declaration.body
-                        && store.source_empty_overload_implementation_is_exact(
-                            overload.owner_symbol,
-                            implementation,
-                        )
-                })
-            {
-                // The normal body pass below checks this same empty return again.
-                let inferred = empty_source_return_for_context(store, None)?;
-                source_callable_inferred_return_type(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    diagnostics,
-                    declaration,
-                    inferred,
-                )?
-            } else {
-                return Err(SourceCheckError::Function(
-                    SourceFunctionInvariant::Callable(declaration.declaration),
-                ));
-            };
-            resolved.push(ResolvedSourceOverloadSignature {
-                query_evidence,
-                parameter_types,
-                return_type,
-            });
-        }
-        prepared.push(
-            prepare_source_overload_publication(store, global_types, overload, &resolved)
-                .map_err(|error| SourcePlanner::overload_plan_error(fallback, error))?,
-        );
-    }
-    let materialized = publish_source_overload_batch(store, overloads, &prepared)
-        .map_err(|error| SourcePlanner::overload_plan_error(batch_fallback, error))?;
     for (overload, published) in overloads.iter().zip(&materialized) {
         let Some(implementation) = overload.implementation else {
             continue;
@@ -65622,6 +65477,184 @@ fn materialize_source_overloads(
         }
     }
     Ok(materialized)
+}
+
+/// Keeps live overload demand in the caller's query and instantiation session.
+pub(super) trait SourceOverloadQuery<'host, 'arena> {
+    fn store(&self) -> &CanonicalTypeMapperStore;
+
+    fn query<R>(
+        &mut self,
+        operation: impl FnOnce(
+            &mut CanonicalTypeQuery<'_, 'host, 'arena, '_>,
+        ) -> Result<R, DeclaredTypeError>,
+    ) -> Result<R, DeclaredTypeError>;
+
+    fn with_publication<R>(
+        &mut self,
+        operation: impl FnOnce(
+            &mut CanonicalTypeMapperStore,
+            &CanonicalGlobalTypes,
+            Option<&mut InstantiationSession>,
+        ) -> R,
+    ) -> Result<R, DeclaredTypeError>;
+}
+
+struct FullSourceOverloadQuery<'a, 'host, 'arena> {
+    store: &'a mut CanonicalTypeMapperStore,
+    host: &'host DeclaredTypeHost<'arena>,
+    globals: &'a CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &'a mut InstantiationSession,
+    diagnostics: &'a mut CanonicalCheckerDiagnostics,
+}
+
+impl<'host, 'arena> SourceOverloadQuery<'host, 'arena>
+    for FullSourceOverloadQuery<'_, 'host, 'arena>
+{
+    fn store(&self) -> &CanonicalTypeMapperStore {
+        self.store
+    }
+
+    fn query<R>(
+        &mut self,
+        operation: impl FnOnce(
+            &mut CanonicalTypeQuery<'_, 'host, 'arena, '_>,
+        ) -> Result<R, DeclaredTypeError>,
+    ) -> Result<R, DeclaredTypeError> {
+        self.session.reset_query();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let result = {
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                self.store,
+                self.host,
+                self.globals,
+                self.options,
+                self.session,
+                &mut diagnostics,
+            )?;
+            operation(&mut query)
+        };
+        merge_retry_diagnostics(self.diagnostics, diagnostics);
+        result
+    }
+
+    fn with_publication<R>(
+        &mut self,
+        operation: impl FnOnce(
+            &mut CanonicalTypeMapperStore,
+            &CanonicalGlobalTypes,
+            Option<&mut InstantiationSession>,
+        ) -> R,
+    ) -> Result<R, DeclaredTypeError> {
+        Ok(operation(self.store, self.globals, None))
+    }
+}
+
+pub(super) fn materialize_source_overload_values<'host, 'arena>(
+    query: &mut impl SourceOverloadQuery<'host, 'arena>,
+    overloads: &[SourceOverloadPlan],
+) -> Result<Vec<MaterializedSourceOverload>, SourceCheckError> {
+    let Some(batch_fallback) = overloads
+        .first()
+        .and_then(|overload| overload.declarations.first())
+        .map(|plan| plan.declaration)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut prepared = Vec::with_capacity(overloads.len());
+    for overload in overloads {
+        let fallback = overload
+            .declarations
+            .first()
+            .map_or(batch_fallback, |plan| plan.declaration);
+        let mut resolved = Vec::with_capacity(overload.declarations.len());
+        for declaration in &overload.declarations {
+            let query_evidence = query.query(|query| {
+                query.get_source_overload_type_query(declaration)
+            })?;
+            let default_types = query.query(|query| {
+                query.source_callable_string_default_types(declaration)
+            })?;
+            let mut parameter_types = Vec::with_capacity(declaration.parameters.len());
+            for parameter in &declaration.parameters {
+                if let Some((base_type, proof)) = default_types.get(&parameter.symbol) {
+                    parameter_types.push((*base_type, Some(*proof)));
+                    continue;
+                }
+                let parameter_type = query.query(|query| {
+                    query.get_type_from_type_node(parameter.type_node)
+                })?;
+                let store = query.store();
+                if overload.declarations.len() > 1
+                    && store.source_node_kind(parameter.type_node) == Some(SyntaxKind::FunctionType)
+                    && let StoredSingleCallableValidation::Valid { callable, .. } =
+                        validate_stored_single_callable(store, parameter_type)
+                    && callable.return_type.is_none()
+                    && (callable.parameters.len() == 1
+                        && callable.min_argument_count == 1
+                        && callable.rest_parameter.is_none()
+                        || query_evidence.as_ref().is_some_and(|evidence| {
+                            evidence.annotation_type(parameter.type_node) == Some(parameter_type)
+                                && store
+                                    .source_global_function_namespace_declarations(overload.owner_symbol)
+                                    .is_some_and(|declarations| {
+                                        declarations.contains(&declaration.declaration)
+                                    })
+                        }))
+                    && store
+                        .signature(callable.signature)
+                        .is_some_and(|signature| {
+                            signature.type_parameters().is_empty()
+                                && signature.this_parameter().is_none()
+                        })
+                {
+                    let signature = callable.signature;
+                    query.query(|query| query.get_return_type_of_signature(signature))?;
+                }
+                parameter_types.push((parameter_type, None));
+            }
+            let return_type = if let Some(return_node) = declaration.return_type.type_node() {
+                query.query(|query| query.get_type_from_type_node(return_node))?
+            } else if declaration.return_type.is_inferred()
+                && declaration.body_mode == SourceCallableBodyMode::Present
+                && declaration.type_parameters.is_empty()
+                && !declaration.is_async
+                && overload.implementation.is_some_and(|implementation| {
+                    implementation.declaration == declaration.declaration
+                        && implementation.body == declaration.body
+                        && query.store().source_empty_overload_implementation_is_exact(
+                            overload.owner_symbol,
+                            implementation,
+                        )
+                })
+            {
+                // The normal body pass checks this same empty return again.
+                empty_source_return_for_context(query.store(), None)?
+            } else {
+                return Err(SourceCheckError::Function(
+                    SourceFunctionInvariant::Callable(declaration.declaration),
+                ));
+            };
+            resolved.push(ResolvedSourceOverloadSignature {
+                query_evidence,
+                parameter_types,
+                return_type,
+            });
+        }
+        let publication = query.with_publication(|store, globals, session| match session {
+            Some(session) => super::source_overloads::prepare_source_overload_publication_with_session(
+                store, globals, overload, &resolved, session,
+            ),
+            None => prepare_source_overload_publication(store, globals, overload, &resolved),
+        })?
+        .map_err(|error| SourcePlanner::overload_plan_error(fallback, error))?;
+        prepared.push(publication);
+    }
+    query.with_publication(|store, _, _| {
+        publish_source_overload_batch(store, overloads, &prepared)
+    })?
+    .map_err(|error| SourcePlanner::overload_plan_error(batch_fallback, error))
 }
 
 #[allow(clippy::too_many_arguments)] // Keeps callable source capabilities explicit.
