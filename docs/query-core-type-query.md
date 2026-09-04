@@ -1,13 +1,25 @@
 # Query core type-query work
 
-Updated 2026-09-03. This is the next implementation plan, not a completed fix.
+Updated 2026-09-04. Implementation has started. The operation is not complete.
 Use query-core-integration. Root owns production code, tests and the index.
 One reviewer checks the complete change. Other workers investigate bounded
 questions and write separate reports. Do not start another feature branch.
 
 ## Measured failure
 
-Ordinary Query checking stops at TypeQuery, file 20, node 82, bytes 1196..1213.
+The latest unchanged Query run passes the old TypeQuery stop. It now stops at
+GenericAliasConstraintUnsupported in lib.es5.d.ts, bytes 75173..75204. Those
+bytes are the ReturnType constraint `T extends (...args: any) => any`.
+The planner rejects FunctionType constraints before comparing the argument.
+The run still has 244 records and 24 attempts. Only the ordinary attempt and
+isolated root 20 change their stopping point. Two of 23 isolated roots complete.
+Ordinary checking remains incomplete. No diagnostic changes.
+See the [exact comparison](../target/query-core-pending-overload-query-1-comparison.json).
+The [final committed-byte rerun](../target/query-core-pending-overload-query-2-result.md)
+matches all 244 checking records from that run. The final focused check and
+Query rerun are both closed. No runtime is left active.
+
+The prior ordinary Query stop was TypeQuery, file 20, node 82, bytes 1196..1213.
 The bounded observation found an Identifier query with no type arguments.
 Its resolved symbol has four declarations, no parent, no export-symbol link
 and no cached value type. Its flags are TRANSIENT | FUNCTION | VALUE_MODULE.
@@ -15,12 +27,81 @@ plan_value_type_query rejects the declaration list because it requires exactly
 one declaration. It never asks for the value type.
 
 The held operand name and declaration bodies remain unread. Four declarations
-do not prove four signatures. The actual global merge proof and declaration
-split still need confirmation. See the [run result](../target/query-core-type-query-observation-1-result.md).
+do not prove four signatures. The new type query reaches the authenticated
+global owner path. Its later constraint failure does not prove that signature
+demand is complete. See the [prior observation](../target/query-core-type-query-observation-1-result.md).
 
-The run has the same 244 checking records as the clean checkpoint. Two of 23
-isolated roots complete. Ordinary checking does not complete. No diagnostic
-changed. All temporary traces were removed and the clean fingerprint restored.
+All temporary traces from that observation were removed before implementation.
+
+## Implemented checkpoint
+
+Three commits are on the existing query-core-integration branch:
+
+- 567e3a460 retains an authenticated Pending merged callable identity. Plain
+  typeof does not query annotations. Later overload publication reuses its TypeId.
+- 90efbaf82 shares overload annotation and publication work. Full-source checking
+  keeps its old resets and implementation diagnostics. The live adapter borrows
+  the actual query and session. Optional unions retain that session.
+- df6b23c93 adds a qualified return-query reproducer. It is still failing.
+
+Source review passed for both production changes and the new test. The focused
+identity and worker selections retained all ten baseline passes and added two
+passing typeof controls. Their one earlier failure remains. The qualified-query
+selection has 12 passes and two failures. It retains every earlier pass. Its
+new failure is UnsupportedSyntax on the inner qualified TypeQuery. The test
+keeps that annotation uncached before source demand. No old expectation changed.
+See the [worker comparison](../target/query-core-pending-overload-worker-1-comparison.json)
+and [qualified-query comparison](../target/query-core-pending-overload-recursion-2-comparison.json).
+
+The six-file reference-flow draft remains separate and unstaged. Unrelated
+formatter changes were removed. The committed checkpoint with that preserved
+draft has fingerprint
+d5bd6dfdcd647f1384792a7db5da79eaab06148c07856f5d480098952ffec5ce.
+The [final focused check](../target/query-core-pending-overload-checkpoint-1-comparison.json)
+on these exact bytes retains all 12 passes and the same two failures.
+No earlier pass was lost in this selection.
+This is not a compiler promotion. The accepted regression and corpus gates
+remain required. Hono has not been rerun for this partial change.
+
+## Immediate dependency path
+
+Finish one callable operation. Do not replace each rejection with a new exception.
+
+1. Plan and execute ordinary FunctionType constraints. ReturnType uses scalar
+   `...args: any` in both its constraint and conditional extends type. The current
+   function planner also rejects that rest annotation. Retain real parameter
+   identity and the rest flag. Carry function constraints through the existing
+   instantiation and return-query operation, including captured formals. Do not
+   rewrite the library or replace any with any[].
+2. Request pending overload signatures before constraint comparison and before
+   conditional inference reads the signature arrays. A missing array must not
+   look like a complete empty callable. Reuse the shared live worker and keep
+   overload order. Complete source-function overload relations remain required.
+   Scalar-any rest inference must retain the last visible overload's return even
+   when that overload has more than one required parameter. A new cold ReturnType
+   control must cover this before ordinary source checking and on replay.
+3. Add direct-global qualified value lookup beside the existing import lookup.
+   Use the complete merged owner and export proof. Keep import restrictions in
+   the import path. Resolve only the selected member's annotation and preserve
+   its declaration, parent and cache proof. Do not force the owner's signatures
+   for `typeof parseInt.label`. The current selector accepts import namespaces
+   only, so the new control fails before it reaches recursive member readiness.
+4. Carry a group-level active-demand set through live queries and their source
+   callbacks. Restore it on failure. Existing query-depth and return-signature
+   guards do not protect a pending group that has no SignatureId yet. Check
+   recovery and work-limit state before publication, not only after it.
+5. Connect ordinary calls before argument context, early effects, generic calls,
+   conditional inference and source-aware display. Preserve declaration errors
+   through call resolution. Do not flatten them to an unrelated unsupported result.
+
+The [complete ReturnType audit](../target/query-core-pending-overload-alias-constraint.md)
+maps planning, rest syntax, constraint instantiation, relation and inference.
+Parallel reports also cover [call demand](../target/query-core-pending-overload-call-api.md),
+[conditional demand](../target/query-core-pending-overload-conditional-api.md),
+[qualified lookup](../target/query-core-pending-overload-qualified-query.md),
+[recursive state](../target/query-core-pending-overload-recursion.md) and
+[display](../target/query-core-pending-overload-display-api.md).
+Root remains the sole code and test writer. One reviewer checks integration.
 
 ## Complete the value operation
 
@@ -33,10 +114,9 @@ Each signature retains its own source declaration and parameters. Return types
 remain deferred until needed. Full declaration checks remain a separate step.
 
 Rust has an authenticated merged-global owner proof and an overload provider.
-It does not yet have the same lazy overload-value state. SourceOverloadState
-accepts only Cold or Resolved. Resolved requires the complete signature and
-parameter publication, reverse maps and namespace member table. A partially
-published value is currently a cache error.
+SourceOverloadState now accepts Cold, authenticated Pending and Resolved.
+Resolved still requires the complete signature and parameter publication,
+reverse maps and namespace member table. Pending is not a completed callable.
 
 Do not solve this by selecting one declaration, trusting the flags, or forcing
 the full source checker from inside typeof. Use the existing owner proof and

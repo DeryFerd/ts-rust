@@ -1,6 +1,6 @@
 # Query core member resolution
 
-Updated 2026-09-03. Forty-three recent lost tests recovered. Eleven remain.
+Updated 2026-09-04. Forty-three recent lost tests recovered. Eleven remain.
 Integration remains rejected.
 Root is the only implementer. One reviewer checks code changes. Use the existing
 `query-core-integration` branch. Do not start another feature branch.
@@ -28,10 +28,15 @@ are absent. No name is unrun. The batch is rejected. No expectation changed.
 The source is saved as signed checkpoint `cbc2649e7`, with separate public
 tests in `38dd63699`. The reference-flow draft is unchanged and unstaged.
 
-[Unchanged Query](../target/query-core-member-plan-query-2-result.md)
-still completes only 2 of 23 isolated roots. The void annotation failure is
-fixed. Ordinary checking now stops at a TypeQuery. All 244 checking records
-match the preceding Query run. Diagnostics are unchanged. This is not a demo.
+The [latest unchanged Query run](../target/query-core-pending-overload-query-1-comparison.json)
+gets past the TypeQuery stop. It now rejects ReturnType's FunctionType constraint
+in the bundled ES5 library. It still completes only 2 of 23 isolated roots.
+Ordinary checking remains incomplete. Diagnostics are unchanged. This is not a demo.
+The [type-query work record](query-core-type-query.md) has the new commits,
+focused test counts and complete callable dependency path.
+
+The [earlier Query run](../target/query-core-member-plan-query-2-result.md)
+had already passed the void annotation failure and stopped at TypeQuery.
 The [bounded observation](../target/query-core-type-query-observation-1-result.md)
 proves that the direct typeof planner rejects a four-declaration function/module
 symbol at its single-declaration guard. Its value cache is cold. The operand
@@ -73,11 +78,11 @@ Next work:
    record the concrete paths and limits on each finding.
 2. Recheck all 11 remaining recent losses and both complete member tests. Then
    run the full accepted selections. Every earlier accepted loss stays open.
-3. Connect typeof to the existing merged global callable and overload value
-   operation. Retain cold value demand, actual signatures, namespace members,
-   source context and replay checks. Removing the single-declaration guard
-   alone does not complete this operation. Rerun unchanged Query after focused
-   positive and negative controls.
+3. Finish the merged callable value operation. Plain typeof now retains Pending
+   identity and a shared live overload worker exists. FunctionType constraints,
+   scalar-any rest parameters, direct qualified namespace queries and signature
+   demand in callers remain. Keep namespace members, source context and replay
+   checks. Rerun unchanged Query after focused positive and negative controls.
 
 The latest patch restores source heritage validation before identity reuse,
 fills ordinary Pending values without replacing names or proxies, and connects
