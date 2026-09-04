@@ -7,18 +7,19 @@ questions and write separate reports. Do not start another feature branch.
 
 ## Measured failure
 
-The latest unchanged Query run reaches the ReturnType conditional in
-lib.es5.d.ts, bytes 75208..75253. It reports UnsupportedSyntax on ConditionalType.
-The earlier FunctionType constraint rejection is gone. This does not mean
-ReturnType works. Its declaration validator still requires a return that is
-intentionally lazy, before the actual inference operation can request it.
+The latest unchanged Query run reports GenericAliasConstraintUnsupported for
+ReturnType's formal in lib.es5.d.ts, bytes 75173..75204. The old blanket
+FunctionType syntax rejection is gone. Plain required/scalar ReturnType and
+pending global overload inference now pass separate controls. The outer Query
+error does not expose its exact inner relation or formatting failure.
 The run still has 244 records and 24 attempts. Only the ordinary attempt and
 isolated root 20 change their stopping point. Two of 23 isolated roots complete.
 Ordinary checking remains incomplete. No diagnostic changes.
-See the [exact comparison](../target/query-core-return-type-query-1-comparison.json).
+See the [exact comparison](../target/query-core-return-type-query-2-comparison.json)
+and [result](../target/query-core-return-type-query-2-result.md).
 The focused checks, Query run, accepted regression selection, and pinned Go
 controls are closed. Their complete source fingerprint is
-8a11e280556aebc02fa94766aadcc2c1be9b34e24ffd36666f4e246ae431ef27.
+5cb542a9343878233682e102a12bee84d12c867afa9135f5b8bfc225554a89a9.
 
 The prior ordinary Query stop was TypeQuery, file 20, node 82, bytes 1196..1213.
 The bounded observation found an Identifier query with no type arguments.
@@ -46,24 +47,31 @@ These commits are on the existing query-core-integration branch:
 - df6b23c93 adds a qualified return-query reproducer. It is still failing.
 - 78655c224 checks ordinary function-valued alias constraints, including captured
   formals. It accepts declared scalar-any rest types and keeps source errors
-  through the shared overload worker. The live conditional demand path is added,
-  but an earlier conditional validator still prevents the ReturnType controls.
+  through the shared overload worker. It also adds live conditional demand.
 - 91b954d1e adds public constraint and ReturnType controls without changing old
-  expectations. The ordinary constraint case passes. The ReturnType cases fail.
+  expectations.
+- 2ef992da1 keeps valid function headers lazy and resolves selected returns
+  through the existing source proof. It fixes plain ReturnType and pending
+  global overload inference, including cold/warm identity and replay.
 
-The latest focused run has 28 tests, 21 passes and seven failures. It retains
-all 21 passes from the prior run. The earlier publication assertion panic is
+The [latest focused run](../target/query-core-return-type-constraints-4-result.md)
+has 28 tests, 23 passes and five failures. It recovers two cases and retains
+all 21 prior passes. The earlier publication assertion panic is
 fixed with the common rest-parameter predicate, with assertions still enabled.
-The [85-case regression selection](../target/query-core-return-type-regression-1-audit.json)
+The [85-case regression selection](../target/query-core-return-type-regression-2-comparison.json)
 retains all 83 Full3 passes and the same two accepted-baseline failures. No names
 are missing. This selection does not replace the full accepted regression gate.
+The checker unit tests and 13 selected public harnesses also
+[compile successfully](../target/query-core-return-type-test-build-1-result.md).
+This compilation did not execute the private unit tests.
 
 [Pinned Go controls](../target/query-core-return-type-go-controls-1/result.md)
 confirm the new TS2344 text and position. Separate assignment witnesses confirm
 the string and number ReturnType results, last-overload selection, and exclusion
-of the implementation signature. They reject an any fallback. Rust does not yet
-pass those ReturnType controls. Go CLI diagnostics do not measure internal cache
-identity or warm replay.
+of the implementation signature. They reject an any fallback. Rust's plain
+FunctionType ReturnType control now passes. Both exported-overload controls
+still fail before full checking. Go CLI diagnostics do not measure internal
+cache identity or warm replay.
 
 The paragraphs below record the earlier overload checkpoint and its baseline.
 
@@ -90,21 +98,20 @@ remain required. Hono has not been rerun for this partial change.
 
 Finish one callable operation. Do not replace each rejection with a new exception.
 
-1. Finish lazy callable validation and selected-return inference. Ordinary
-   FunctionType constraints and declared scalar `...args: any` now pass their
-   focused control. The conditional validator must use the existing validated
-   callable header without forcing every constraint return. Actual inference
-   must demand the selected return through the live query and retain its source
-   proof. Keep free type parameters deferred. Do not rewrite the library or
-   replace declared any with any[]. See the
-   [shared operation trace](../target/query-core-return-type-next-operation.md).
-2. Request pending overload signatures before constraint comparison and before
-   conditional inference reads the signature arrays. A missing array must not
-   look like a complete empty callable. Reuse the shared live worker and keep
-   overload order. Complete source-function overload relations remain required.
-   Scalar-any rest inference must retain the last visible overload's return even
-   when that overload has more than one required parameter. A new cold ReturnType
-   control must cover this before ordinary source checking and on replay.
+1. Add real `ReturnType<typeof parseInt>` to the existing public pending-global
+   augmentation fixture. Keep its declarations and order unchanged. The passing
+   unconstrained Last control tests later inference, not the earlier argument
+   constraint. Retain the inner relation error in this public control. Do not
+   read or alter held Query inputs to create a passing reduction.
+2. Complete overload relations through shared operations. Pending source overloads
+   need live signature demand and retry. Valid multi-overload sets need ordered
+   signature projection and the real namespace export properties. Keep property
+   origins, selected value demand, caller Array authority, and recovery state.
+   The existing top-signature rule can then handle the scalar-any constraint.
+   Do not admit overloads as propertyless objects. The
+   [current path audit](../target/query-core-return-type-query-2-constraint-path.md)
+   identifies these source gaps but does not assign a hidden Query failure cause.
+   Preserve the completed lazy-header and selected-return operation.
 3. Add direct-global qualified value lookup beside the existing import lookup.
    Use the complete merged owner and export proof. Keep import restrictions in
    the import path. Resolve only the selected member's annotation and preserve
@@ -129,6 +136,25 @@ Parallel reports also cover [call demand](../target/query-core-pending-overload-
 [recursive state](../target/query-core-pending-overload-recursion.md) and
 [display](../target/query-core-pending-overload-display-api.md).
 Root remains the sole code and test writer. One reviewer checks integration.
+
+## Retained regressions and build cost
+
+The two failures in the 85-case selection remain blocking. The
+[instantiation-limit audit](../target/query-core-instantiation-limit-regression-path.md)
+finds a real operation loss: source-aware generic parameter demand rejects an
+ordinary recovered array mapping. Repair cold demand, cache validation, and warm
+replay together. Keep constructor rejection and source-derived return proofs.
+The [ambient publication audit](../target/query-core-ambient-publication-regression-path.md)
+finds an error-contract mismatch before execution. Its later state assertions
+have not run. Do not remove those assertions or waive the failure.
+
+The [build audit](../target/query-core-test-query-build-reuse.md) explains the
+second checker compilation. Query enables serde_core/result through serde.
+The focused tests do not. Those dependency graphs produce separate checker
+artifacts despite equal checker settings and source bytes. Reordering the same
+commands does not remove this cost. Keep both cached variants. Any future
+feature-graph alignment needs a separate measured change, not a hidden change
+to the current regression command.
 
 ## Complete the value operation
 
