@@ -7,17 +7,18 @@ questions and write separate reports. Do not start another feature branch.
 
 ## Measured failure
 
-The latest unchanged Query run passes the old TypeQuery stop. It now stops at
-GenericAliasConstraintUnsupported in lib.es5.d.ts, bytes 75173..75204. Those
-bytes are the ReturnType constraint `T extends (...args: any) => any`.
-The planner rejects FunctionType constraints before comparing the argument.
+The latest unchanged Query run reaches the ReturnType conditional in
+lib.es5.d.ts, bytes 75208..75253. It reports UnsupportedSyntax on ConditionalType.
+The earlier FunctionType constraint rejection is gone. This does not mean
+ReturnType works. Its declaration validator still requires a return that is
+intentionally lazy, before the actual inference operation can request it.
 The run still has 244 records and 24 attempts. Only the ordinary attempt and
 isolated root 20 change their stopping point. Two of 23 isolated roots complete.
 Ordinary checking remains incomplete. No diagnostic changes.
-See the [exact comparison](../target/query-core-pending-overload-query-1-comparison.json).
-The [final committed-byte rerun](../target/query-core-pending-overload-query-2-result.md)
-matches all 244 checking records from that run. The final focused check and
-Query rerun are both closed. No runtime is left active.
+See the [exact comparison](../target/query-core-return-type-query-1-comparison.json).
+The focused checks, Query run, accepted regression selection, and pinned Go
+controls are closed. Their complete source fingerprint is
+8a11e280556aebc02fa94766aadcc2c1be9b34e24ffd36666f4e246ae431ef27.
 
 The prior ordinary Query stop was TypeQuery, file 20, node 82, bytes 1196..1213.
 The bounded observation found an Identifier query with no type arguments.
@@ -35,7 +36,7 @@ All temporary traces from that observation were removed before implementation.
 
 ## Implemented checkpoint
 
-Three commits are on the existing query-core-integration branch:
+These commits are on the existing query-core-integration branch:
 
 - 567e3a460 retains an authenticated Pending merged callable identity. Plain
   typeof does not query annotations. Later overload publication reuses its TypeId.
@@ -43,6 +44,28 @@ Three commits are on the existing query-core-integration branch:
   keeps its old resets and implementation diagnostics. The live adapter borrows
   the actual query and session. Optional unions retain that session.
 - df6b23c93 adds a qualified return-query reproducer. It is still failing.
+- 78655c224 checks ordinary function-valued alias constraints, including captured
+  formals. It accepts declared scalar-any rest types and keeps source errors
+  through the shared overload worker. The live conditional demand path is added,
+  but an earlier conditional validator still prevents the ReturnType controls.
+- 91b954d1e adds public constraint and ReturnType controls without changing old
+  expectations. The ordinary constraint case passes. The ReturnType cases fail.
+
+The latest focused run has 28 tests, 21 passes and seven failures. It retains
+all 21 passes from the prior run. The earlier publication assertion panic is
+fixed with the common rest-parameter predicate, with assertions still enabled.
+The [85-case regression selection](../target/query-core-return-type-regression-1-audit.json)
+retains all 83 Full3 passes and the same two accepted-baseline failures. No names
+are missing. This selection does not replace the full accepted regression gate.
+
+[Pinned Go controls](../target/query-core-return-type-go-controls-1/result.md)
+confirm the new TS2344 text and position. Separate assignment witnesses confirm
+the string and number ReturnType results, last-overload selection, and exclusion
+of the implementation signature. They reject an any fallback. Rust does not yet
+pass those ReturnType controls. Go CLI diagnostics do not measure internal cache
+identity or warm replay.
+
+The paragraphs below record the earlier overload checkpoint and its baseline.
 
 Source review passed for both production changes and the new test. The focused
 identity and worker selections retained all ten baseline passes and added two
@@ -67,12 +90,14 @@ remain required. Hono has not been rerun for this partial change.
 
 Finish one callable operation. Do not replace each rejection with a new exception.
 
-1. Plan and execute ordinary FunctionType constraints. ReturnType uses scalar
-   `...args: any` in both its constraint and conditional extends type. The current
-   function planner also rejects that rest annotation. Retain real parameter
-   identity and the rest flag. Carry function constraints through the existing
-   instantiation and return-query operation, including captured formals. Do not
-   rewrite the library or replace any with any[].
+1. Finish lazy callable validation and selected-return inference. Ordinary
+   FunctionType constraints and declared scalar `...args: any` now pass their
+   focused control. The conditional validator must use the existing validated
+   callable header without forcing every constraint return. Actual inference
+   must demand the selected return through the live query and retain its source
+   proof. Keep free type parameters deferred. Do not rewrite the library or
+   replace declared any with any[]. See the
+   [shared operation trace](../target/query-core-return-type-next-operation.md).
 2. Request pending overload signatures before constraint comparison and before
    conditional inference reads the signature arrays. A missing array must not
    look like a complete empty callable. Reuse the shared live worker and keep
@@ -86,10 +111,12 @@ Finish one callable operation. Do not replace each rejection with a new exceptio
    its declaration, parent and cache proof. Do not force the owner's signatures
    for `typeof parseInt.label`. The current selector accepts import namespaces
    only, so the new control fails before it reaches recursive member readiness.
-4. Carry a group-level active-demand set through live queries and their source
-   callbacks. Restore it on failure. Existing query-depth and return-signature
-   guards do not protect a pending group that has no SignatureId yet. Check
-   recovery and work-limit state before publication, not only after it.
+4. Retain the implemented group-level active-demand set and live publication
+   guard. Restore the active state on failure. Existing query-depth and return
+   guards do not protect a pending group that has no SignatureId yet. The
+   [recovery audit](../target/query-core-overload-demand-recovery-fix.md) confirms
+   that the outer source-conditional entrypoints inspect fresh limits even when
+   demand returns an error. Do not add a general error whitelist.
 5. Connect ordinary calls before argument context, early effects, generic calls,
    conditional inference and source-aware display. Preserve declaration errors
    through call resolution. Do not flatten them to an unrelated unsupported result.
