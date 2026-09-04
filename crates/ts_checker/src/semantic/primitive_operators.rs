@@ -28,6 +28,7 @@ use super::{
     },
     instantiate::InstantiationSession,
     instantiated_members::{GenericInterfaceMemberError, validate_generic_interface_members},
+    source::SourceCheckError,
     type_records::{LiteralValue, TypeData},
     types::{ObjectFlags, TypeFlags},
 };
@@ -123,7 +124,15 @@ pub(super) enum PrimitiveBinaryError {
     Invariant(PrimitiveBinaryInvariant),
     Literal(LiteralTypeCacheError),
     Relation(RelationUnavailable),
+    Source(SourceCheckError),
     Display(TypeDisplayUnavailable),
+}
+
+/// Whole unions require the source reference-condition operation.
+#[derive(Clone, Copy)]
+pub(super) enum PrimitiveEqualityOperands {
+    Ordinary,
+    SourceReference,
 }
 
 impl From<PrimitiveBinaryUnsupported> for PrimitiveBinaryError {
@@ -366,6 +375,31 @@ pub(super) fn check_primitive_binary_with_session(
     session: &mut InstantiationSession,
     request: PrimitiveBinaryRequest,
 ) -> Result<PrimitiveBinaryResolution, PrimitiveBinaryError> {
+    check_primitive_binary_with_relation(
+        store, host, global_types, display_flags, session, request,
+        PrimitiveEqualityOperands::Ordinary,
+        |store, session, left, right| {
+            store.is_type_related_to_with_session(
+                left, right, RelationKind::Comparable, Some(global_types),
+                Some(strict_function_types), session,
+            ).map_err(Into::into)
+        },
+    )
+}
+
+/// Uses the caller's relation driver for each reached equality comparison.
+pub(super) fn check_primitive_binary_with_relation(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    display_flags: CanonicalTypeFormatFlags,
+    session: &mut InstantiationSession,
+    request: PrimitiveBinaryRequest,
+    operands: PrimitiveEqualityOperands,
+    mut relate: impl FnMut(
+        &mut CanonicalTypeMapperStore, &mut InstantiationSession, TypeId, TypeId,
+    ) -> Result<bool, PrimitiveBinaryError>,
+) -> Result<PrimitiveBinaryResolution, PrimitiveBinaryError> {
     if !matches!(
         PrimitiveBinaryOperator::from_syntax(request.operator)?,
         PrimitiveBinaryOperator::Equality(_)
@@ -373,29 +407,33 @@ pub(super) fn check_primitive_binary_with_session(
         return check_primitive_binary(store, request);
     }
 
-    let left_base = equality_binary_operand(
-        store,
-        global_types,
-        request.left,
-        request.left_type,
-        request.left_recovery,
-    )?;
-    let right_base = equality_binary_operand(
-        store,
-        global_types,
-        request.right,
-        request.right_type,
-        request.right_recovery,
-    )?;
-    check_equality_with_session(
+    let [left_base, right_base] = match operands {
+        PrimitiveEqualityOperands::Ordinary => [
+            equality_binary_operand(
+                store, global_types, request.left, request.left_type, request.left_recovery,
+            )?,
+            equality_binary_operand(
+                store, global_types, request.right, request.right_type, request.right_recovery,
+            )?,
+        ],
+        PrimitiveEqualityOperands::SourceReference => [
+            equality_operand_with_session(
+                store, global_types, request.left, request.left_type, request.left_recovery, session,
+            )?,
+            equality_operand_with_session(
+                store, global_types, request.right, request.right_type, request.right_recovery, session,
+            )?,
+        ],
+    };
+    check_equality_with_relation(
         store,
         host,
         global_types,
-        strict_function_types,
         display_flags,
         session,
         request,
         [left_base, right_base],
+        &mut relate,
     )
 }
 
@@ -479,6 +517,37 @@ pub(super) fn check_nullish_union_equality_with_session(
     )
 }
 
+/// Equality uses each complete operand. Its literal base is only for diagnostics.
+fn equality_operand_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    node: NodeRef,
+    type_: TypeId,
+    recovery: Option<PrimitiveBinaryRecovery>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, PrimitiveBinaryError> {
+    let record = store.type_payload(type_)
+        .ok_or(PrimitiveBinaryInvariant::InvalidType(type_))?;
+    if recovery.is_some() || record.flags().intersects(TypeFlags::ENUM_LIKE) {
+        return equality_binary_operand(store, global_types, node, type_, recovery);
+    }
+    let TypeData::Union(union) = record.data() else {
+        return equality_binary_operand(store, global_types, node, type_, recovery);
+    };
+    let members = union.union.types.clone();
+    store.validate_union_constituent_with_global_types(global_types, type_)?;
+    let mut bases = Vec::with_capacity(members.len());
+    for member in &members {
+        bases.push(equality_operand_with_session(store, global_types, node, *member, None, session)?);
+    }
+    if bases == members {
+        return Ok(type_);
+    }
+    Ok(store.expression_union_type_with_global_types_and_session(
+        global_types, &bases, super::bootstrap::UnionReduction::Literal, session,
+    )?)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_equality_with_session(
     store: &mut CanonicalTypeMapperStore,
@@ -490,6 +559,31 @@ fn check_equality_with_session(
     request: PrimitiveBinaryRequest,
     [left_base, right_base]: [TypeId; 2],
 ) -> Result<PrimitiveBinaryResolution, PrimitiveBinaryError> {
+    check_equality_with_relation(
+        store, host, global_types, display_flags, session, request,
+        [left_base, right_base],
+        &mut |store: &mut CanonicalTypeMapperStore, session: &mut InstantiationSession, left, right| {
+            store.is_type_related_to_with_session(
+                left, right, RelationKind::Comparable, Some(global_types),
+                Some(strict_function_types), session,
+            ).map_err(Into::into)
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_equality_with_relation(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    display_flags: CanonicalTypeFormatFlags,
+    session: &mut InstantiationSession,
+    request: PrimitiveBinaryRequest,
+    [left_base, right_base]: [TypeId; 2],
+    relate: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore, &mut InstantiationSession, TypeId, TypeId,
+    ) -> Result<bool, PrimitiveBinaryError>,
+) -> Result<PrimitiveBinaryResolution, PrimitiveBinaryError> {
     let boolean = store
         .intrinsic_bootstrap()
         .map(|bootstrap| bootstrap.boolean_type)
@@ -497,24 +591,22 @@ fn check_equality_with_session(
     store.validate_union_constituent(boolean)?;
 
     let limit_mark = session.limit_event_mark();
-    let comparable = equality_types_are_comparable_with_session(
+    let comparable = equality_types_are_comparable_with_relation(
         store,
-        global_types,
-        strict_function_types,
         session,
         request.left_type,
         request.right_type,
+        relate,
     )?;
     let display_types = if comparable {
         None
     } else {
-        let bases_are_comparable = equality_types_are_comparable_with_session(
+        let bases_are_comparable = equality_types_are_comparable_with_relation(
             store,
-            global_types,
-            strict_function_types,
             session,
             left_base,
             right_base,
+            relate,
         )?;
         Some(if bases_are_comparable {
             (request.left_type, request.right_type)
@@ -646,13 +738,14 @@ fn nullish_equality_binary_operand(
     Ok(type_)
 }
 
-fn equality_types_are_comparable_with_session(
+fn equality_types_are_comparable_with_relation(
     store: &mut CanonicalTypeMapperStore,
-    global_types: &CanonicalGlobalTypes,
-    strict_function_types: bool,
     session: &mut InstantiationSession,
     left: TypeId,
     right: TypeId,
+    relate: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore, &mut InstantiationSession, TypeId, TypeId,
+    ) -> Result<bool, PrimitiveBinaryError>,
 ) -> Result<bool, PrimitiveBinaryError> {
     let left_flags = store
         .type_payload(left)
@@ -663,28 +756,12 @@ fn equality_types_are_comparable_with_session(
         .ok_or(PrimitiveBinaryInvariant::InvalidType(right))?
         .flags();
     if right_flags.intersects(TypeFlags::NULLABLE)
-        || store.is_type_related_to_with_session(
-            left,
-            right,
-            RelationKind::Comparable,
-            Some(global_types),
-            Some(strict_function_types),
-            session,
-        )?
+        || relate(store, session, left, right)?
         || left_flags.intersects(TypeFlags::NULLABLE)
     {
         return Ok(true);
     }
-    store
-        .is_type_related_to_with_session(
-            right,
-            left,
-            RelationKind::Comparable,
-            Some(global_types),
-            Some(strict_function_types),
-            session,
-        )
-        .map_err(Into::into)
+    relate(store, session, right, left)
 }
 
 fn primitive_binary_operand(

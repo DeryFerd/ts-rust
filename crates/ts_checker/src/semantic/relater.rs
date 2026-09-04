@@ -14519,7 +14519,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(symbol)
     }
 
-    fn is_empty_anonymous_object_type(
+    pub(super) fn is_empty_anonymous_object_type(
         &self,
         type_id: TypeId,
         any_function_type: TypeId,

@@ -2882,6 +2882,36 @@ pub(super) fn check_direct_source_property_with_source(
     .map(|(checked, _)| checked)
 }
 
+/// Resolves the declared member first and publishes only the checked flow read.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_source_property_with_reference_flow(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow: &ClassInitializationFrame<'_, '_>,
+) -> Result<CheckedSourceProperty, SourcePropertyQueryError> {
+    preflight_property_links(store, plan.node)?;
+    let (mut checked, member) = check_direct_source_property_with_source_publication(
+        store, host, global_types, options, plan, receiver_type, session, diagnostics, false, true,
+    )?;
+    checked.type_ = flow.reference_read_type_with_relation(
+        store, host, global_types, session, plan.node, checked.type_,
+        &mut |store, session, left, right| {
+            super::source::source_type_is_related_to(
+                store, host, global_types, options, session, diagnostics,
+                left, right, super::RelationKind::Comparable,
+            )
+        },
+    ).map_err(SourcePropertyError::Flow)?;
+    publish_property_links(store, plan.node, member, checked.type_)?;
+    Ok(checked)
+}
+
 /// Checks a read/write property target without publishing an ordinary read first.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_source_property_assignment_target(
@@ -3101,6 +3131,24 @@ fn check_direct_source_property_with_source_mode(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     publish: bool,
 ) -> Result<(CheckedSourceProperty, Option<SemanticSymbolId>), SourcePropertyQueryError> {
+    check_direct_source_property_with_source_publication(
+        store, host, global_types, options, plan, receiver_type, session, diagnostics, publish, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_direct_source_property_with_source_publication(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    publish: bool,
+    defer_flow_type: bool,
+) -> Result<(CheckedSourceProperty, Option<SemanticSymbolId>), SourcePropertyQueryError> {
     if matches!(
         plan.position,
         SourcePropertyPosition::WriteTarget(_) | SourcePropertyPosition::DestructuringWrite { .. }
@@ -3191,6 +3239,8 @@ fn check_direct_source_property_with_source_mode(
             .map_err(|error| SourcePropertyQueryError::Source(error.into()))?;
         if publish {
             publish_property_links(store, plan.node, member, type_)?;
+        } else if defer_flow_type {
+            preflight_property_links(store, plan.node)?;
         } else {
             validate_property_link_targets(store, plan.node, member, type_)?;
         }
@@ -4716,6 +4766,23 @@ pub(super) fn check_direct_source_property_with_class_context_and_session(
     session: &mut InstantiationSession,
     flow: Option<&mut ClassInitializationFrame<'_, '_>>,
 ) -> Result<CheckedSourceProperty, SourcePropertyError> {
+    check_direct_source_property_with_class_context_and_relation(
+        store, host, globals, options, plan, receiver_type, session, flow, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_direct_source_property_with_class_context_and_relation(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: Option<&CanonicalGlobalTypes>,
+    options: CanonicalCheckerOptions,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+    session: &mut InstantiationSession,
+    flow: Option<&mut ClassInitializationFrame<'_, '_>>,
+    relate: Option<&mut super::source_flow::SourceFlowRelation<'_>>,
+) -> Result<CheckedSourceProperty, SourcePropertyError> {
     if plan_class_access_context(store, host, plan.receiver.node)? != plan.class_access {
         return Err(SourcePropertyError::InvalidCache(plan.node));
     }
@@ -4905,17 +4972,16 @@ pub(super) fn check_direct_source_property_with_class_context_and_session(
     let mut type_ = declared_type;
     if !private_error && !matches!(member.origin, ClassMemberOrigin::Method) {
         if let Some(flow) = flow.filter(|_| !context.is_deferred()) {
-            let read = flow.property_read_with_session(
-                store,
-                host,
-                globals,
-                &context,
-                plan.node,
-                &member,
-                declared_type,
-                options,
-                session,
-            )?;
+            let read = match relate {
+                Some(relate) => flow.property_read_with_relation(
+                    store, host, globals, &context, plan.node, &member,
+                    declared_type, options, session, relate,
+                ),
+                None => flow.property_read_with_session(
+                    store, host, globals, &context, plan.node, &member,
+                    declared_type, options, session,
+                ),
+            }?;
             validate_class_property_flow_read(store, host, plan.node, &read)?;
             if read.used_before_assignment() {
                 push(ClassAccessDiagnosticKind::UsedBeforeAssignment(read));

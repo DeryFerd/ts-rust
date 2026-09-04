@@ -101,6 +101,8 @@ use std::{
 #[cfg(test)]
 use super::classes::{plan_source_class_members, prepare_source_class_members};
 #[cfg(test)]
+use super::primitive_operators::check_primitive_binary_with_session;
+#[cfg(test)]
 use super::source_callables::publish_contextual_source_callable;
 #[cfg(test)]
 use super::source_imports::{
@@ -200,8 +202,9 @@ use super::{
     primitive_operators::{
         PrimitiveBigIntExponentiationTarget, PrimitiveBinaryError, PrimitiveBinaryRecovery,
         PrimitiveBinaryRequest, PrimitiveBinaryUnsupported,
-        check_nullish_union_equality_with_session, check_primitive_binary,
-        check_primitive_binary_with_session, compound_assignment_binary_operator,
+        PrimitiveEqualityOperands,
+        check_primitive_binary,
+        check_primitive_binary_with_relation, compound_assignment_binary_operator,
     },
     reference_types::validate_direct_generic_reference,
     relater::ResolvedOwnProperty,
@@ -900,6 +903,9 @@ fn loop_statement_failure_info(error: &SourceFunctionStatementsError) -> LoopFai
 }
 
 fn loop_flow_failure_info(error: &SourceFlowError) -> LoopFailureInfo {
+    if let SourceFlowError::Source(error) = error {
+        return loop_source_failure_info(error);
+    }
     use super::source_flow::{
         SourceFlowInvariant as Invariant, SourceFlowUnsupported as Unsupported,
     };
@@ -908,6 +914,7 @@ fn loop_flow_failure_info(error: &SourceFlowError) -> LoopFailureInfo {
         ..LoopFailureInfo::default()
     };
     info.variant = match error {
+        SourceFlowError::Source(_) => unreachable!("source failures were handled above"),
         SourceFlowError::Array(_) => "array",
         SourceFlowError::Relation(_) => "relation",
         SourceFlowError::Narrowing { condition, .. } => {
@@ -12165,6 +12172,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         error: SourceFlowError,
     ) -> SourceCheckError {
         match error {
+            SourceFlowError::Source(error) => error,
             SourceFlowError::Array(error) => error.into(),
             SourceFlowError::Relation(error) => error.into(),
             SourceFlowError::Unsupported(_)
@@ -12602,6 +12610,35 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 self.preflight_class_body_expression(&condition)?;
                 let negated = negations.len() % 2 == 1;
                 let flow = match &condition.unparenthesized().kind {
+                    PlannedExpressionKind::Binary(binary)
+                        if !negations.is_empty()
+                            || !match (&binary.left.kind, &binary.right.kind) {
+                                (PlannedExpressionKind::Property(property), PlannedExpressionKind::GlobalUndefined)
+                                | (PlannedExpressionKind::GlobalUndefined, PlannedExpressionKind::Property(property)) =>
+                                    matches!(property.receiver.unparenthesized().kind, PlannedExpressionKind::ClassReceiver(_)),
+                                _ => false,
+                            } =>
+                    {
+                        SourceFlowCondition::ClassExpression(
+                            super::source_flow::SourceClassExpressionCondition {
+                                owner: statement,
+                                expression: root,
+                                kind: super::source_flow::SourceClassExpressionConditionKind::Reference,
+                            },
+                        )
+                    }
+                    PlannedExpressionKind::Logical(_) => SourceFlowCondition::Unchanged(root),
+                    PlannedExpressionKind::Property(property)
+                        if !matches!(property.receiver.unparenthesized().kind, PlannedExpressionKind::ClassReceiver(_)) =>
+                    {
+                        SourceFlowCondition::ClassExpression(
+                            super::source_flow::SourceClassExpressionCondition {
+                                owner: statement,
+                                expression: root,
+                                kind: super::source_flow::SourceClassExpressionConditionKind::Reference,
+                            },
+                        )
+                    }
                     PlannedExpressionKind::Identifier(read)
                         if read.kind == PlannedIdentifierReadKind::Variable =>
                     {
@@ -34601,6 +34638,9 @@ fn collect_class_operand_condition(
         {
             SourceClassExpressionConditionKind::Call
         }
+        PlannedExpressionKind::Binary(_) | PlannedExpressionKind::Property(_) if !nullish => {
+            SourceClassExpressionConditionKind::Reference
+        }
         _ => return,
     };
     conditions.push(SourceFlowCondition::ClassExpression(
@@ -34612,9 +34652,33 @@ fn collect_class_operand_condition(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
+fn class_flow_snapshot_at(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow: &mut ClassInitializationFrame<'_, '_>,
+    node: NodeRef,
+) -> Result<super::source_flow::SourceFlowSnapshot, SourceFlowError> {
+    let mut relate = |store: &mut CanonicalTypeMapperStore, session: &mut InstantiationSession, left, right| {
+        source_type_is_related_to(
+            store, host, globals, options, session, diagnostics,
+            left, right, super::RelationKind::Comparable,
+        )
+    };
+    flow.snapshot_at_with_source(
+        store, host, globals, node,
+        super::source_flow::SourceFlowCaller { session, relate: &mut relate },
+    )
+}
+
 fn class_body_flow_error(node: NodeRef, error: SourceFlowError) -> SourceCheckError {
     eprintln!("source_class_flow_error node={node:?} error={error:?}");
     match error {
+        SourceFlowError::Source(error) => error,
         SourceFlowError::Array(error) => error.into(),
         SourceFlowError::Relation(error) => error.into(),
         SourceFlowError::Unsupported(_) => {
@@ -39743,6 +39807,35 @@ fn check_expression_type_with_capture_context(
     mut class_flow: Option<&mut ClassBodyExecutionContext<'_, '_, '_>>,
     arrow_capture: Option<SourceArrowCaptureContext<'_>>,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    let checked = check_expression_type_with_capture_context_worker(
+        store, host, global_types, source, options, session, diagnostics,
+        current_flow_types, type_import_execution, expression, contextual_type,
+        deferred, class_flow.as_deref_mut(), arrow_capture,
+    )?;
+    if let Some(context) = class_flow {
+        context.flow.complete_reference_condition(store, host, expression.node, checked.raw)
+            .map_err(|error| class_body_flow_error(expression.node, error))?;
+    }
+    Ok(checked)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_expression_type_with_capture_context_worker(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    expression: &PlannedExpression,
+    contextual_type: Option<TypeId>,
+    deferred: &mut Vec<DeferredAssertion>,
+    mut class_flow: Option<&mut ClassBodyExecutionContext<'_, '_, '_>>,
+    arrow_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
     session.reset_query();
     emit_enum_use_before_declaration_diagnostics(store, host, options, diagnostics, expression)?;
     issue_invalid_const_enum_value_diagnostic(store, host, diagnostics, expression)?;
@@ -40687,7 +40780,18 @@ fn check_expression_type_with_capture_context(
                     property.node,
                 )?;
             }
-            let checked = if let Some(checked) = check_source_selected_method_property(
+            let checked = if property.class_access_context().is_none()
+                && class_flow.as_ref().is_some_and(|context| context.flow.has_reference_conditions())
+            {
+                let context = class_flow.as_ref().ok_or(SourceCheckError::Class(property.node))?;
+                super::source_properties::check_source_property_with_reference_flow(
+                    store, host, global_types, options, property, receiver.result,
+                    session, diagnostics, &context.flow,
+                ).map_err(|error| match error {
+                    SourcePropertyQueryError::Property(error) => SourcePlanner::property_plan_error(expression.node, error),
+                    SourcePropertyQueryError::Source(error) => error,
+                })?
+            } else if let Some(checked) = check_source_selected_method_property(
                 store,
                 host,
                 global_types,
@@ -40722,8 +40826,7 @@ fn check_expression_type_with_capture_context(
                     receiver.result,
                     session,
                     diagnostics,
-                )
-                .map_err(|error| match error {
+                ).map_err(|error| match error {
                     SourcePropertyQueryError::Property(error) => {
                         SourcePlanner::property_plan_error(expression.node, error)
                     }
@@ -40732,7 +40835,7 @@ fn check_expression_type_with_capture_context(
             } else {
                 let mut demanded = HashSet::new();
                 loop {
-                    match check_direct_source_property_with_class_context_and_session(
+                    match super::source_properties::check_direct_source_property_with_class_context_and_relation(
                         store,
                         host,
                         Some(global_types),
@@ -40741,6 +40844,12 @@ fn check_expression_type_with_capture_context(
                         receiver.result,
                         session,
                         class_flow.as_deref_mut().map(|context| &mut context.flow),
+                        Some(&mut |store, session, left, right| {
+                            source_type_is_related_to(
+                                store, host, global_types, options, session, diagnostics,
+                                left, right, super::RelationKind::Comparable,
+                            )
+                        }),
                     ) {
                         Ok(checked) => break checked,
                         Err(SourcePropertyError::PendingClassProperty(demand)) => {
@@ -40887,8 +40996,7 @@ fn check_expression_type_with_capture_context(
                     receiver.result,
                     session,
                     diagnostics,
-                )
-                .map_err(|error| {
+                ).map_err(|error| {
                     let error = match error {
                         SourcePropertyQueryError::Property(error) => {
                             SourcePlanner::property_plan_error(expression.node, error)
@@ -41684,29 +41792,33 @@ fn check_expression_type_with_capture_context(
                         right_recovery,
                         bigint_exponentiation_target: bigint_exponentiation_target(options),
                     };
-                    let resolution = if class_flow.as_deref().is_some_and(|context| {
-                        context.flow.has_property_equality_condition(node)
-                    }) {
-                        check_nullish_union_equality_with_session(
-                            store,
-                            host,
-                            global_types,
-                            options.strict_function_types,
-                            display_flags,
-                            session,
-                            request,
-                        )
+                    let operands = if let Some(context) = class_flow.as_deref() {
+                        if context.flow.has_property_equality_condition(node)
+                            || context.flow.has_reference_equality_condition(store, host, &request)
+                                .map_err(|error| class_body_flow_error(node, error))?
+                        {
+                            PrimitiveEqualityOperands::SourceReference
+                        } else {
+                            PrimitiveEqualityOperands::Ordinary
+                        }
                     } else {
-                        check_primitive_binary_with_session(
+                        PrimitiveEqualityOperands::Ordinary
+                    };
+                    let resolution = check_primitive_binary_with_relation(
                             store,
                             host,
                             global_types,
-                            options.strict_function_types,
                             display_flags,
                             session,
                             request,
+                            operands,
+                            |store, session, left, right| {
+                                source_type_is_related_to(
+                                    store, host, global_types, options, session, diagnostics,
+                                    left, right, super::RelationKind::Comparable,
+                                ).map_err(PrimitiveBinaryError::Source)
+                            },
                         )
-                    }
                     .map_err(|error| primitive_binary_check_error(host, node, &error))?;
                     for mut diagnostic in resolution.diagnostics {
                         if diagnostic.diagnostic.code() == 2447 {
@@ -44438,10 +44550,21 @@ fn check_class_statements(
                     .flow
                     .class_property_access()
                     .or_else(|| zero_argument_target.map(|(property, _)| property.node))
+                    .or_else(|| {
+                        matches!(branch.flow, SourceFlowCondition::ClassExpression(_)
+                            | SourceFlowCondition::Unchanged(_))
+                            .then(|| class_expression_nodes(&branch.condition).ok())
+                            .flatten()
+                            .and_then(|nodes| nodes.into_iter().find(|expression| matches!(expression.kind,
+                                PlannedExpressionKind::Identifier(_) | PlannedExpressionKind::Property(_)
+                                    | PlannedExpressionKind::ClassReceiver(_))))
+                            .map(|expression| expression.node)
+                    })
                     .unwrap_or(branch.condition.unparenthesized().node);
-                let snapshot = context
-                    .flow
-                    .snapshot_at(store, global_types, point)
+                let snapshot = class_flow_snapshot_at(
+                    store, host, global_types, options, session, diagnostics,
+                    &mut context.flow, point,
+                )
                     .map_err(|error| class_body_flow_error(branch.flow.expression(), error))?;
                 let checked = check_expression_type_with_class_context(
                     store,
@@ -44459,7 +44582,10 @@ fn check_class_statements(
                     Some(&mut *context),
                 )?;
                 let snapshot_matches = match branch.flow {
-                    SourceFlowCondition::Unchanged(_) => zero_argument_target.is_some(),
+                    SourceFlowCondition::Unchanged(_) => zero_argument_target.is_some()
+                        || matches!(branch.condition.unparenthesized().kind, PlannedExpressionKind::Logical(_)),
+                    SourceFlowCondition::ClassExpression(condition) =>
+                        condition.kind == super::source_flow::SourceClassExpressionConditionKind::Reference,
                     SourceFlowCondition::Truthiness(condition) => {
                         snapshot.type_of(condition.symbol) == Some(checked.raw)
                     }
@@ -44555,6 +44681,10 @@ fn check_class_statements(
                 for node in branch.negations.iter().rev() {
                     publish_expression_type(store, *node, boolean)?;
                 }
+                context.flow.complete_reference_condition(
+                    store, host, branch.flow.expression(),
+                    if branch.negations.is_empty() { checked.raw } else { boolean },
+                ).map_err(|error| class_body_flow_error(branch.flow.expression(), error))?;
                 check_class_statements(
                     store,
                     host,
@@ -44596,9 +44726,10 @@ fn check_class_statements(
                 statement,
                 expression,
             } => {
-                let snapshot = context
-                    .flow
-                    .snapshot_at(store, global_types, *statement)
+                let snapshot = class_flow_snapshot_at(
+                    store, host, global_types, options, session, diagnostics,
+                    &mut context.flow, *statement,
+                )
                     .map_err(|error| class_body_flow_error(*statement, error))?;
                 check_expression_type_with_class_context(
                     store,
@@ -44632,9 +44763,10 @@ fn check_class_statements(
                 statement,
                 expression,
             } => {
-                let snapshot = context
-                    .flow
-                    .snapshot_at(store, global_types, *statement)
+                let snapshot = class_flow_snapshot_at(
+                    store, host, global_types, options, session, diagnostics,
+                    &mut context.flow, *statement,
+                )
                     .map_err(|error| class_body_flow_error(*statement, error))?;
                 if let Some(expression) = expression {
                     let type_ = if context.is_async {
@@ -44759,9 +44891,10 @@ fn check_class_statements(
                     .flow
                     .preflight_property_assignment(store, host, plan)
                     .map_err(|error| class_body_flow_error(plan.target(), error))?;
-                let snapshot = context
-                    .flow
-                    .snapshot_at(store, global_types, plan.statement())
+                let snapshot = class_flow_snapshot_at(
+                    store, host, global_types, options, session, diagnostics,
+                    &mut context.flow, plan.statement(),
+                )
                     .map_err(|error| class_body_flow_error(plan.target(), error))?;
                 let receiver = check_expression_type_with_class_context(
                     store,
@@ -44859,9 +44992,10 @@ fn check_class_statements(
                     .map_err(|error| class_body_flow_error(plan.target(), error))?;
             }
             PlannedClassStatement::ObjectBinding(binding) => {
-                let snapshot = context
-                    .flow
-                    .snapshot_at(store, global_types, binding.receiver.node)
+                let snapshot = class_flow_snapshot_at(
+                    store, host, global_types, options, session, diagnostics,
+                    &mut context.flow, binding.receiver.node,
+                )
                     .map_err(|error| class_body_flow_error(binding.receiver.node, error))?;
                 let receiver = check_expression_type_with_class_context(
                     store,
@@ -44944,9 +45078,10 @@ fn check_class_statements(
                 }
                 super::object_members::object_literal_state(store, &assignment.object)
                     .map_err(source_object_execution_error)?;
-                let snapshot = context
-                    .flow
-                    .snapshot_at(store, global_types, assignment.receiver.node)
+                let snapshot = class_flow_snapshot_at(
+                    store, host, global_types, options, session, diagnostics,
+                    &mut context.flow, assignment.receiver.node,
+                )
                     .map_err(|error| class_body_flow_error(assignment.receiver.node, error))?;
                 let receiver = check_expression_type_with_class_context(
                     store,
@@ -45083,9 +45218,10 @@ fn check_class_statements(
                     else {
                         return Err(SourceCheckError::Class(variable.declaration));
                     };
-                    let snapshot = context
-                        .flow
-                        .snapshot_at(store, global_types, variable.name)
+                    let snapshot = class_flow_snapshot_at(
+                        store, host, global_types, options, session, diagnostics,
+                        &mut context.flow, variable.name,
+                    )
                         .map_err(|error| class_body_flow_error(variable.declaration, error))?;
                     let assignment = if let Some(annotation) = variable.type_node {
                         session.reset_query();
@@ -45193,9 +45329,10 @@ fn check_class_private_object_assignment(
     context: &mut ClassBodyExecutionContext<'_, '_, '_>,
     assignment: &PlannedClassPrivateObjectAssignment,
 ) -> Result<(), SourceCheckError> {
-    let snapshot = context
-        .flow
-        .snapshot_at(store, global_types, assignment.statement)
+    let snapshot = class_flow_snapshot_at(
+        store, host, global_types, options, session, diagnostics,
+        &mut context.flow, assignment.statement,
+    )
         .map_err(|error| class_body_flow_error(assignment.statement, error))?;
     let value = check_expression_type_with_class_context(
         store,
@@ -45260,9 +45397,10 @@ fn check_class_private_object_assignment(
         )
         .map_err(|error| SourcePlanner::property_plan_error(plan.target(), error))?;
         let assigned_type = selected.assigned_type();
-        let snapshot = context
-            .flow
-            .snapshot_at(store, global_types, receiver.node)
+        let snapshot = class_flow_snapshot_at(
+            store, host, global_types, options, session, diagnostics,
+            &mut context.flow, receiver.node,
+        )
             .map_err(|error| class_body_flow_error(receiver.node, error))?;
         let receiver = check_expression_type_with_class_context(
             store,
@@ -47563,6 +47701,7 @@ fn conditional_equality_branch_flow(
         None,
     )
     .map_err(|error| match error {
+        SourceEqualityNarrowingError::Source(error) => error,
         SourceEqualityNarrowingError::Union(error) => error.into(),
         SourceEqualityNarrowingError::Relation(error) => error.into(),
         SourceEqualityNarrowingError::UnsupportedType(_) => {
@@ -48965,6 +49104,7 @@ fn primitive_binary_check_error(
         PrimitiveBinaryError::Invariant(_) => SourceCheckError::PrimitiveOperator(expression),
         PrimitiveBinaryError::Literal(error) => (*error).into(),
         PrimitiveBinaryError::Relation(error) => (*error).into(),
+        PrimitiveBinaryError::Source(error) => *error,
         PrimitiveBinaryError::Display(error) => (*error).into(),
     }
 }
@@ -50646,7 +50786,27 @@ fn source_type_is_assignable_to(
     source: TypeId,
     target: TypeId,
 ) -> Result<bool, SourceCheckError> {
-    if authenticated_active_recursive_arrow_query(store, host, target) {
+    source_type_is_related_to(
+        store, host, global_types, options, session, diagnostics, source, target,
+        super::RelationKind::Assignable,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Each retry keeps the caller's source state and session.
+pub(super) fn source_type_is_related_to(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    source: TypeId,
+    target: TypeId,
+    relation: super::RelationKind,
+) -> Result<bool, SourceCheckError> {
+    if relation == super::RelationKind::Assignable
+        && authenticated_active_recursive_arrow_query(store, host, target)
+    {
         store
             .claim_strict_function_types(options.strict_function_types)
             .map_err(
@@ -50711,7 +50871,7 @@ fn source_type_is_assignable_to(
             options,
             source,
             target,
-            super::RelationKind::Assignable,
+            relation,
             session,
             diagnostics,
         ) {
@@ -50820,6 +50980,7 @@ fn source_type_is_assignable_to(
                 ..
             }) if actual_source == source
                 && actual_target == target
+                && relation == super::RelationKind::Assignable
                 && is_unconstrained_jsdoc_callable_type_parameter(store, host, target) =>
             {
                 return Ok(false);
@@ -50829,7 +50990,10 @@ fn source_type_is_assignable_to(
                 observe_source_member_cache_failure(
                     store,
                     host,
-                    "assignability",
+                    match relation {
+                        super::RelationKind::Comparable => "comparability",
+                        _ => "assignability",
+                    },
                     None,
                     &[("source", source), ("target", target)],
                     &error,
@@ -51037,14 +51201,27 @@ fn source_member_retry_intersection_error(
     }
 }
 
-/// Expands only the exact stored intersection edges, without demanding member values.
+/// Follows stored union and intersection members without demanding their property types.
 fn source_member_retry_candidates(
     store: &CanonicalTypeMapperStore,
     candidates: &[TypeId],
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Vec<SourceMemberRetryCandidate>, SourceCheckError> {
-    let mut result = Vec::new();
+    let mut expanded = Vec::new();
     for &candidate in candidates {
+        if let Some(TypeData::Union(union)) = store.type_payload(candidate).map(TypeRecord::data) {
+            store.validate_union_query_metadata(candidate)?;
+            expanded.try_reserve(union.union.types.len())
+                .map_err(|_| RelationUnavailable::UnionValidationCapacity(candidate))?;
+            expanded.extend_from_slice(&union.union.types);
+        } else {
+            expanded.try_reserve(1)
+                .map_err(|_| RelationUnavailable::UnionValidationCapacity(candidate))?;
+            expanded.push(candidate);
+        }
+    }
+    let mut result = Vec::new();
+    for candidate in expanded {
         if let Some(record) = store.type_payload(candidate)
             && matches!(record.data(), TypeData::Intersection(_))
         {
@@ -54361,6 +54538,7 @@ fn check_planned_object_shorthand_assignment(
 
 fn ordinary_for_flow_error(node: NodeRef, error: SourceFlowError) -> SourceCheckError {
     match error {
+        SourceFlowError::Source(error) => error,
         SourceFlowError::Array(error) => error.into(),
         SourceFlowError::Relation(error) => error.into(),
         SourceFlowError::Join { error, .. }
@@ -56056,6 +56234,7 @@ fn check_planned_loop_function_statements_with_capture_context(
                 None,
             )
             .map_err(|error| match error {
+                SourceEqualityNarrowingError::Source(error) => error,
                 SourceEqualityNarrowingError::Union(error) => error.into(),
                 error => SourcePlanner::source_flow_plan_error(
                     callable,
@@ -58769,11 +58948,10 @@ fn check_planned_equality_condition(
     if options.no_error_truncation {
         display_flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
     }
-    match check_primitive_binary_with_session(
+    match check_primitive_binary_with_relation(
         store,
         host,
         global_types,
-        options.strict_function_types,
         display_flags,
         session,
         PrimitiveBinaryRequest {
@@ -58786,6 +58964,13 @@ fn check_planned_equality_condition(
             left_recovery: left.primitive_binary_recovery,
             right_recovery: right.primitive_binary_recovery,
             bigint_exponentiation_target: PrimitiveBigIntExponentiationTarget::Unknown,
+        },
+        PrimitiveEqualityOperands::Ordinary,
+        |store, session, left, right| {
+            source_type_is_related_to(
+                store, host, global_types, options, session, diagnostics,
+                left, right, super::RelationKind::Comparable,
+            ).map_err(PrimitiveBinaryError::Source)
         },
     ) {
         Ok(resolution) => {
@@ -58975,6 +59160,7 @@ fn trace_callable_flow_frame_error(
     error: &SourceFlowError,
 ) {
     let (tag, operation) = match error {
+        SourceFlowError::Source(_) => ("Source", None),
         SourceFlowError::Array(_) => ("Array", None),
         SourceFlowError::Relation(RelationUnavailable::SourceInterfaceAliasDemand {
             root, ..
@@ -68889,6 +69075,7 @@ fn checked_contextual_binding_literal_key(
 
 fn contextual_arrow_flow_error(node: NodeRef, error: SourceFlowError) -> SourceCheckError {
     match error {
+        SourceFlowError::Source(error) => error,
         SourceFlowError::Array(error) => error.into(),
         SourceFlowError::Relation(error) => error.into(),
         SourceFlowError::Join { error, .. }

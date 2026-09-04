@@ -6483,10 +6483,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             )?;
         }
 
+        self.validate_union_origin_members(union, origin, normalized)
+    }
+
+    /// Checks origin membership without reading object members or callable returns.
+    pub(super) fn validate_union_origin_members(
+        &self,
+        union: TypeId,
+        origin: TypeId,
+        normalized: &[TypeId],
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_union_origin_structure(union, origin)?;
+        let Some(TypeData::Union(data)) = self.type_payload(origin).map(TypeRecord::data) else {
+            return Ok(());
+        };
         let mut flattened = Vec::new();
         let mut leaf_count = 0usize;
         let mut flattening = HashSet::new();
         for constituent in &data.union.types {
+            if matches!(self.type_payload(*constituent).map(TypeRecord::data), Some(TypeData::Union(_))) {
+                self.validate_union_query_metadata(*constituent)?;
+            }
             self.flatten_supported_union_type(
                 *constituent,
                 &mut flattened,

@@ -7,7 +7,11 @@
 //! allocated-empty slices, while explicit `HashMap` states preserve nil versus
 //! allocated-empty maps without turning checker hot paths into linear scans.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    sync::Arc,
+};
 
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{EscapedName, InternalSymbolName, SemanticSymbolId, SymbolTableId};
@@ -68,11 +72,23 @@ pub(super) fn type_list_key(types: &[TypeId]) -> CacheHashKey {
 }
 
 /// Nil versus allocated state of an upstream type-instantiation map.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub enum TypeCacheState {
     #[default]
     Unallocated,
     Allocated(HashMap<CacheHashKey, TypeId>),
+}
+
+impl fmt::Debug for TypeCacheState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unallocated => formatter.write_str("Unallocated"),
+            Self::Allocated(entries) => formatter
+                .debug_tuple("Allocated")
+                .field(&entries.iter().collect::<BTreeMap<_, _>>())
+                .finish(),
+        }
+    }
 }
 
 /// Nil versus allocated state of `map[*Type]*Type`.

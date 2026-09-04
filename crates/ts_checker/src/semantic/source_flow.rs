@@ -21,6 +21,8 @@ use std::{
     sync::Arc,
 };
 
+mod references;
+
 use ts_ast::{
     FlowFlags, FlowNode, FlowNodeArena, FlowNodeId, FlowNodePayload, FlowRef, NodeArena,
     NodeArenaRevision, NodeData, NodeRef, SyntaxKind,
@@ -52,7 +54,7 @@ use super::{
     },
     relation::RelationKind,
     signatures::TypePredicateKind,
-    source::{CheckedClassPropertyAssignment, PlannedExpressionKind, PlannedIdentifierRead},
+    source::{CheckedClassPropertyAssignment, PlannedExpressionKind, PlannedIdentifierRead, SourceCheckError},
     source_calls::{
         CheckedSourceCall, SourceCallPlan, plan_direct_source_call_syntax,
         resolve_source_call_effects_signature, source_class_method_effect_target,
@@ -80,6 +82,33 @@ const FLOW_DEPTH_LIMIT: usize = 2_000;
 const FLOW_METADATA_BITS: u32 = FlowFlags::REFERENCED.bits() | FlowFlags::SHARED.bits();
 
 pub(super) type SourceFlowTypes = HashMap<SemanticSymbolId, TypeId>;
+
+pub(super) type SourceFlowRelation<'a> = dyn FnMut(
+    &mut CanonicalTypeMapperStore,
+    &mut InstantiationSession,
+    TypeId,
+    TypeId,
+) -> Result<bool, SourceCheckError> + 'a;
+
+/// One flow query borrows the source caller. Frames and caches never retain it.
+pub(super) struct SourceFlowCaller<'a, 'env> {
+    pub(super) session: &'a mut InstantiationSession,
+    pub(super) relate: &'a mut SourceFlowRelation<'env>,
+}
+
+fn source_flow_union_type(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    types: &[TypeId],
+    caller: &mut Option<SourceFlowCaller<'_, '_>>,
+) -> Result<TypeId, LiteralTypeCacheError> {
+    match caller {
+        Some(caller) => store.expression_union_type_with_global_types_and_session(
+            globals, types, UnionReduction::Literal, caller.session,
+        ),
+        None => store.expression_union_type_with_global_types(globals, types, UnionReduction::Literal),
+    }
+}
 
 /// Checked source writes for one source-check invocation, keyed by their real targets.
 #[derive(Default)]
@@ -696,6 +725,7 @@ pub(super) enum SourceClassExpressionConditionKind {
     Nullish(SemanticSymbolId),
     Truthiness(SemanticSymbolId, bool),
     Call,
+    Reference,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -816,6 +846,7 @@ pub(super) struct SourceInCondition {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceFlowCondition {
     ClassExpression(SourceClassExpressionCondition),
+    Reference(NodeRef),
     Unchanged(NodeRef),
     Nullish(SourceNullishCondition),
     Truthiness(SourceTruthinessCondition),
@@ -832,6 +863,7 @@ impl SourceFlowCondition {
     pub(super) const fn expression(self) -> NodeRef {
         match self {
             Self::ClassExpression(condition) => condition.expression,
+            Self::Reference(expression) => expression,
             Self::Unchanged(expression) => expression,
             Self::Nullish(condition) => condition.expression,
             Self::Truthiness(condition) => condition.expression,
@@ -848,6 +880,7 @@ impl SourceFlowCondition {
         Some(match self {
             Self::ClassExpression(_) => panic!("class expression conditions need preflight"),
             Self::Unchanged(_)
+            | Self::Reference(_)
             | Self::ClassPropertyTruthiness(_)
             | Self::ClassPropertyEquality(_)
             | Self::ClassPropertyPredicate(_) => return None,
@@ -2079,20 +2112,57 @@ struct ClassPropertyFlowQuery<'query> {
 }
 
 /// Initialization queries cannot allocate types or borrow a new caller.
-enum ClassPropertyFlowTypes<'a> {
+enum ClassPropertyFlowTypes<'a, 'env> {
     Initialization(&'a CanonicalTypeMapperStore),
     Read {
         store: &'a mut CanonicalTypeMapperStore,
         globals: Option<&'a CanonicalGlobalTypes>,
         session: Option<&'a mut InstantiationSession>,
     },
+    SourceRead {
+        store: &'a mut CanonicalTypeMapperStore,
+        globals: Option<&'a CanonicalGlobalTypes>,
+        session: Option<&'a mut InstantiationSession>,
+        relate: &'a mut SourceFlowRelation<'env>,
+    },
 }
 
-impl ClassPropertyFlowTypes<'_> {
+struct ClassPropertyFlowReadTypes<'a, 'env> {
+    store: &'a mut CanonicalTypeMapperStore,
+    globals: Option<&'a CanonicalGlobalTypes>,
+    session: Option<&'a mut InstantiationSession>,
+    relate: Option<&'a mut SourceFlowRelation<'env>>,
+}
+
+impl<'a, 'env> ClassPropertyFlowTypes<'a, 'env> {
+    fn with_source(
+        store: &'a mut CanonicalTypeMapperStore,
+        globals: Option<&'a CanonicalGlobalTypes>,
+        session: Option<&'a mut InstantiationSession>,
+        relate: Option<&'a mut SourceFlowRelation<'env>>,
+    ) -> Self {
+        match relate {
+            Some(relate) => Self::SourceRead { store, globals, session, relate },
+            None => Self::Read { store, globals, session },
+        }
+    }
+
+    fn read_types(&mut self) -> Option<ClassPropertyFlowReadTypes<'_, 'env>> {
+        match self {
+            Self::Initialization(_) => None,
+            Self::Read { store, globals, session } => Some(ClassPropertyFlowReadTypes {
+                store, globals: *globals, session: session.as_deref_mut(), relate: None,
+            }),
+            Self::SourceRead { store, globals, session, relate } => Some(ClassPropertyFlowReadTypes {
+                store, globals: *globals, session: session.as_deref_mut(), relate: Some(&mut **relate),
+            }),
+        }
+    }
+
     fn store(&self) -> &CanonicalTypeMapperStore {
         match self {
             Self::Initialization(store) => store,
-            Self::Read { store, .. } => store,
+            Self::Read { store, .. } | Self::SourceRead { store, .. } => store,
         }
     }
 
@@ -2104,11 +2174,12 @@ impl ClassPropertyFlowTypes<'_> {
         type_: TypeId,
         assumption: TruthinessAssumption,
     ) -> Result<TypeId, SourceFlowError> {
-        let Self::Read {
+        let Some(ClassPropertyFlowReadTypes {
             store,
             globals: Some(globals),
             session: Some(session),
-        } = self
+            ..
+        }) = self.read_types()
         else {
             return Err(SourceFlowUnsupported::FlowKind { flow, flags }.into());
         };
@@ -2124,11 +2195,12 @@ impl ClassPropertyFlowTypes<'_> {
         value: TypeId,
         require_match: bool,
     ) -> Result<TypeId, SourceFlowError> {
-        let Self::Read {
+        let Some(ClassPropertyFlowReadTypes {
             store,
             globals: Some(globals),
             session: Some(session),
-        } = self
+            mut relate,
+        }) = self.read_types()
         else {
             return Err(SourceFlowUnsupported::FlowKind { flow, flags }.into());
         };
@@ -2141,8 +2213,10 @@ impl ClassPropertyFlowTypes<'_> {
             require_match,
             None,
             Some(session),
+            relate.as_deref_mut(),
         )
         .map_err(|error| match error {
+            SourceEqualityNarrowingError::Source(error) => SourceFlowError::Source(error),
             SourceEqualityNarrowingError::Union(error) => SourceFlowError::Join { flow, error },
             error => SourceFlowInvariant::EqualityNarrowing(error).into(),
         })
@@ -2157,11 +2231,12 @@ impl ClassPropertyFlowTypes<'_> {
         predicate: TypeId,
         assume_true: bool,
     ) -> Result<TypeId, SourceFlowError> {
-        let Self::Read {
+        let Some(ClassPropertyFlowReadTypes {
             store,
             globals: Some(globals),
             session: Some(session),
-        } = self
+            ..
+        }) = self.read_types()
         else {
             return Err(SourceFlowUnsupported::FlowKind { flow, flags }.into());
         };
@@ -2177,11 +2252,12 @@ impl ClassPropertyFlowTypes<'_> {
         types: &[TypeId],
         declared: TypeId,
     ) -> Result<TypeId, SourceFlowError> {
-        let Self::Read {
+        let Some(ClassPropertyFlowReadTypes {
             store,
             globals: Some(globals),
             session: Some(session),
-        } = self
+            ..
+        }) = self.read_types()
         else {
             return Err(SourceFlowUnsupported::FlowKind { flow, flags }.into());
         };
@@ -2280,6 +2356,7 @@ pub(super) enum SourceFlowInvariant {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceFlowError {
+    Source(SourceCheckError),
     Array(ArrayTypeError),
     Relation(RelationUnavailable),
     Unsupported(SourceFlowUnsupported),
@@ -2309,6 +2386,7 @@ pub(super) enum SourceTypeofNarrowingError {
 /// Invalid equality operands or unavailable authenticated discriminant values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceEqualityNarrowingError {
+    Source(SourceCheckError),
     MissingBootstrap,
     InvalidType(TypeId),
     MissingValue(NodeRef),
@@ -4491,6 +4569,7 @@ impl SourceFlowPlan {
             completed_expression_calls: HashSet::new(),
             call_effects: HashMap::new(),
             condition_values: HashMap::new(),
+            reference_conditions: HashMap::new(),
             in_conditions: HashMap::new(),
             memo: HashMap::new(),
             visiting: HashSet::new(),
@@ -4770,6 +4849,7 @@ pub(super) struct SourceFlowFrame<'plan, 'graph> {
     completed_expression_calls: HashSet<NodeRef>,
     call_effects: HashMap<NodeRef, SourceFlowCallEffect>,
     condition_values: HashMap<NodeRef, TypeId>,
+    reference_conditions: HashMap<NodeRef, references::CheckedReferenceCondition>,
     in_conditions: HashMap<NodeRef, CompletedInCondition>,
     memo: HashMap<(FlowRef, Option<SemanticSymbolId>), SourceFlowSnapshot>,
     visiting: HashSet<(FlowRef, Option<SemanticSymbolId>)>,
@@ -4905,7 +4985,8 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
             .plan
             .conditions
             .values()
-            .any(|condition| condition.class_property_access().is_some())
+            .any(|condition| condition.class_property_access().is_some()
+                || matches!(condition, SourceFlowCondition::Reference(_)))
     }
 
     pub(super) fn is_expression_condition_call(&self, call: NodeRef) -> bool {
@@ -5589,6 +5670,24 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         self.flow.snapshot_at(store, globals, node)
     }
 
+    pub(super) fn snapshot_at_with_source(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        globals: &CanonicalGlobalTypes,
+        node: NodeRef,
+        caller: SourceFlowCaller<'_, '_>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        for completed in self.flow.reference_conditions.values() {
+            completed.validate(store, host, self.flow.bound, self.body)?;
+        }
+        // Source proofs belong to this call, not to an earlier snapshot query.
+        let saved_memo = std::mem::take(&mut self.flow.memo);
+        let result = self.flow.snapshot_at_worker(store, globals, node, &mut Some(caller));
+        self.flow.memo = saved_memo;
+        result
+    }
+
     pub(super) fn complete_assignment(
         &mut self,
         declaration: NodeRef,
@@ -5814,6 +5913,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
             options,
             None,
             None,
+            None,
         )
     }
 
@@ -5839,6 +5939,27 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
             options,
             globals,
             Some(session),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn property_read_with_relation(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        globals: Option<&CanonicalGlobalTypes>,
+        context: &ClassAccessContext,
+        access: NodeRef,
+        member: &ClassMemberSource,
+        declared_type: TypeId,
+        options: CanonicalCheckerOptions,
+        session: &mut InstantiationSession,
+        relate: &mut SourceFlowRelation<'_>,
+    ) -> Result<ClassPropertyFlowRead, SourceFlowError> {
+        self.property_read_worker(
+            store, host, context, access, member, declared_type, options,
+            globals, Some(session), Some(relate),
         )
     }
 
@@ -5853,6 +5974,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         options: CanonicalCheckerOptions,
         globals: Option<&CanonicalGlobalTypes>,
         session: Option<&mut InstantiationSession>,
+        relate: Option<&mut SourceFlowRelation<'_>>,
     ) -> Result<ClassPropertyFlowRead, SourceFlowError> {
         let invalid = || SourceFlowInvariant::InvalidClassProperty(access);
         class_body_identities(store, host, &self.access).map_err(|_| invalid())?;
@@ -5928,11 +6050,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                 _ => false,
             };
         let state = self.property_state_at(
-            &mut ClassPropertyFlowTypes::Read {
-                store,
-                globals,
-                session,
-            },
+            &mut ClassPropertyFlowTypes::with_source(store, globals, session, relate),
             host,
             flow,
             &ClassPropertyFlowQuery {
@@ -6022,7 +6140,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
 
     fn property_state_at(
         &self,
-        types: &mut ClassPropertyFlowTypes<'_>,
+        types: &mut ClassPropertyFlowTypes<'_, '_>,
         host: &DeclaredTypeHost<'_>,
         flow: FlowRef,
         query: &ClassPropertyFlowQuery<'_>,
@@ -6179,6 +6297,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                 if !matches!(
                     condition,
                     SourceFlowCondition::Truthiness(_)
+                        | SourceFlowCondition::Reference(_)
                         | SourceFlowCondition::ClassPropertyTruthiness(_)
                         | SourceFlowCondition::ClassPropertyEquality(_)
                         | SourceFlowCondition::ClassPropertyPredicate(_)
@@ -6214,6 +6333,21 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                     visiting,
                     depth + 1,
                 )?;
+                if matches!(condition, SourceFlowCondition::Reference(_)) {
+                    let completed = self.flow.reference_conditions.get(&expression)
+                        .ok_or(SourceFlowInvariant::UnreachedCondition(expression))?;
+                    completed.validate(types.store(), host, self.flow.bound, self.body)?;
+                    if let Some(current) = state.type_ {
+                        state.type_ = Some(completed.narrow(
+                            types,
+                            flow,
+                            node.flags,
+                            &references::ReferenceKey::class_property(query.reference),
+                            current,
+                            kind == SourceFlowKind::TrueCondition,
+                        )?);
+                    }
+                }
                 if !matches!(condition, SourceFlowCondition::ClassPropertyPredicate(_))
                     && let Some(access) = condition.class_property_access()
                 {
@@ -6477,6 +6611,7 @@ impl SourceFlowFrame<'_, '_> {
         store: &mut CanonicalTypeMapperStore,
         globals: &CanonicalGlobalTypes,
         point: NodeRef,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         let mut symbols = self.base.types().keys().copied().collect::<Vec<_>>();
         for (declaration, state) in &self.assignment_states {
@@ -6498,7 +6633,11 @@ impl SourceFlowFrame<'_, '_> {
                 visible.push(symbol);
             }
         }
-        let snapshot = self.snapshot_for_symbols_at(store, globals, point, visible.iter().copied())?;
+        let flow = *self.plan.points.get(&point)
+            .ok_or(SourceFlowInvariant::MissingFlowPoint(point))?;
+        let snapshot = self.snapshot_for_symbols_with_caller(
+            store, globals, flow, visible.iter().copied(), caller,
+        )?;
         let types = snapshot
             .types()
             .iter()
@@ -6712,10 +6851,21 @@ impl SourceFlowFrame<'_, '_> {
         flow: FlowRef,
         symbols: impl IntoIterator<Item = SemanticSymbolId>,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        self.snapshot_for_symbols_with_caller(store, globals, flow, symbols, &mut None)
+    }
+
+    fn snapshot_for_symbols_with_caller(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        flow: FlowRef,
+        symbols: impl IntoIterator<Item = SemanticSymbolId>,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         let mut result = self.base.clone();
         for symbol in symbols {
             let previous = self.reference.replace(symbol);
-            let snapshot = self.resolve_flow(store, globals, flow, 0);
+            let snapshot = self.resolve_flow_with_caller(store, globals, flow, 0, caller);
             self.reference = previous;
             let snapshot = snapshot?;
             if snapshot.incomplete {
@@ -6779,8 +6929,18 @@ impl SourceFlowFrame<'_, '_> {
         globals: &CanonicalGlobalTypes,
         node: NodeRef,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        self.snapshot_at_worker(store, globals, node, &mut None)
+    }
+
+    fn snapshot_at_worker(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        node: NodeRef,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         if self.uses_callable_loop_queries() {
-            return self.snapshot_callable_for_of_at(store, globals, node);
+            return self.snapshot_callable_for_of_at(store, globals, node, caller);
         }
         let flow = self
             .plan
@@ -6788,7 +6948,7 @@ impl SourceFlowFrame<'_, '_> {
             .get(&node)
             .copied()
             .ok_or(SourceFlowInvariant::MissingFlowPoint(node))?;
-        let snapshot = self.resolve_flow(store, globals, flow, 0)?;
+        let snapshot = self.resolve_flow_with_caller(store, globals, flow, 0, caller)?;
         let mut finalized = None;
         for (&symbol, &type_) in snapshot.types() {
             let value = Self::finalize_flow_type(store, globals, flow, type_)?;
@@ -7011,6 +7171,17 @@ impl SourceFlowFrame<'_, '_> {
         flow: FlowRef,
         depth: usize,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        self.resolve_flow_with_caller(store, globals, flow, depth, &mut None)
+    }
+
+    fn resolve_flow_with_caller(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        flow: FlowRef,
+        depth: usize,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         let key = (flow, self.reference);
         if self.plan.region.is_some_and(|region| region.entry == flow) {
             let mut snapshot = self.query_base();
@@ -7033,7 +7204,7 @@ impl SourceFlowFrame<'_, '_> {
         if !self.visiting.insert(key) {
             return Err(SourceFlowInvariant::Cycle(flow).into());
         }
-        let result = self.resolve_flow_uncached(store, globals, flow, depth);
+        let result = self.resolve_flow_uncached(store, globals, flow, depth, caller);
         let removed = self.visiting.remove(&key);
         debug_assert!(removed);
         if let Ok(snapshot) = &result
@@ -7051,6 +7222,7 @@ impl SourceFlowFrame<'_, '_> {
         globals: &CanonicalGlobalTypes,
         flow: FlowRef,
         depth: usize,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         let node = flow_node(self.graph, flow)?;
         match source_flow_kind(flow, node.flags)? {
@@ -7081,7 +7253,7 @@ impl SourceFlowFrame<'_, '_> {
                 let antecedent = linear_antecedent(flow, &node)?;
                 let declaration = ast_payload(flow, &node)?;
                 if let Some(proof) = self.plan.member_assignments.get(&declaration).copied() {
-                    let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
+                    let prior = self.resolve_flow_with_caller(store, globals, antecedent, depth + 1, caller)?;
                     if !prior.reachable
                         || self.reference.is_some_and(|symbol| symbol != proof.receiver_symbol)
                     {
@@ -7097,7 +7269,7 @@ impl SourceFlowFrame<'_, '_> {
                 if let Some(proof) = self.plan.nullish_assignments.get(&declaration).copied()
                     && proof.assignment.symbol.is_none()
                 {
-                    let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
+                    let prior = self.resolve_flow_with_caller(store, globals, antecedent, depth + 1, caller)?;
                     if proof.assignment.readonly || !prior.reachable {
                         return Ok(prior);
                     }
@@ -7116,7 +7288,7 @@ impl SourceFlowFrame<'_, '_> {
                     return Ok(prior.with_type(receiver, declared));
                 }
                 if self.plan.property_assignments.contains_key(&declaration) {
-                    return self.resolve_flow(store, globals, antecedent, depth + 1);
+                    return self.resolve_flow_with_caller(store, globals, antecedent, depth + 1, caller);
                 }
                 let assignment = *self
                     .plan
@@ -7140,7 +7312,7 @@ impl SourceFlowFrame<'_, '_> {
                     }
                     return Ok(self.query_base().with_type(assignment.symbol, *current_type));
                 }
-                let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
+                let prior = self.resolve_flow_with_caller(store, globals, antecedent, depth + 1, caller)?;
                 if self
                     .reference
                     .is_some_and(|symbol| symbol != assignment.symbol)
@@ -7187,7 +7359,7 @@ impl SourceFlowFrame<'_, '_> {
                 validate_planned_call_container(
                     self.bound, self.plan, call, statement, antecedent,
                 )?;
-                let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
+                let prior = self.resolve_flow_with_caller(store, globals, antecedent, depth + 1, caller)?;
                 let Some(effect) = self.call_effects.get(&call).copied() else {
                     return if self.plan.region.is_some()
                         || self.plan.nullish_calls.contains_key(&call)
@@ -7263,7 +7435,15 @@ impl SourceFlowFrame<'_, '_> {
                 {
                     return Err(SourceFlowInvariant::UnreachedCondition(condition_node).into());
                 }
-                let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
+                let prior = self.resolve_flow_with_caller(store, globals, antecedent, depth + 1, caller)?;
+                if matches!(condition, SourceFlowCondition::Reference(_)) {
+                    let completed = self.reference_conditions.get(&condition_node)
+                        .ok_or(SourceFlowInvariant::UnreachedCondition(condition_node))?;
+                    return completed.narrow_snapshot(
+                        store, globals, flow, node.flags, prior,
+                        self.reference, kind == SourceFlowKind::TrueCondition, caller,
+                    );
+                }
                 let Some(symbol) = condition.symbol() else {
                     return Ok(prior);
                 };
@@ -7289,6 +7469,7 @@ impl SourceFlowFrame<'_, '_> {
                 };
                 let narrowed = match condition {
                     SourceFlowCondition::ClassExpression(_)
+                    | SourceFlowCondition::Reference(_)
                     | SourceFlowCondition::Unchanged(_)
                     | SourceFlowCondition::ClassPropertyTruthiness(_)
                     | SourceFlowCondition::ClassPropertyEquality(_)
@@ -7302,6 +7483,7 @@ impl SourceFlowFrame<'_, '_> {
                             .null_type;
                         narrow_by_equality(store, globals, current, null, false, !assume_true, None)
                             .map_err(|error| match error {
+                                SourceEqualityNarrowingError::Source(error) => SourceFlowError::Source(error),
                                 SourceEqualityNarrowingError::Union(error) => {
                                     SourceFlowError::Join { flow, error }
                                 }
@@ -7372,7 +7554,11 @@ impl SourceFlowFrame<'_, '_> {
                                     error,
                                 ))
                             })?;
-                        narrow_by_equality(
+                        let (session, relate) = match caller.as_mut() {
+                            Some(caller) => (Some(&mut *caller.session), Some(&mut *caller.relate)),
+                            None => (None, None),
+                        };
+                        narrow_by_equality_worker(
                             store,
                             globals,
                             current,
@@ -7381,8 +7567,11 @@ impl SourceFlowFrame<'_, '_> {
                             assume_true
                                 == matches!(condition.comparison, SourceTypeofComparison::Equal),
                             discriminant.as_deref(),
+                            session,
+                            relate,
                         )
                         .map_err(|error| match error {
+                                SourceEqualityNarrowingError::Source(error) => SourceFlowError::Source(error),
                             SourceEqualityNarrowingError::Union(error) => {
                                 SourceFlowError::Join { flow, error }
                             }
@@ -7423,10 +7612,10 @@ impl SourceFlowFrame<'_, '_> {
                 Ok(prior.with_type(symbol, narrowed))
             }
             SourceFlowKind::BranchLabel => {
-                self.resolve_branch_label(store, globals, flow, &node, depth)
+                self.resolve_branch_label(store, globals, flow, &node, depth, caller)
             }
             SourceFlowKind::LoopLabel => {
-                self.resolve_loop_label(store, globals, flow, &node, depth)
+                self.resolve_loop_label_with_caller(store, globals, flow, &node, depth, caller)
             }
         }
     }
@@ -7438,12 +7627,13 @@ impl SourceFlowFrame<'_, '_> {
         flow: FlowRef,
         node: &FlowNode,
         depth: usize,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         let antecedents = label_antecedents(flow, node)?;
-        let mut joined = self.resolve_flow(store, globals, antecedents[0], depth + 1)?;
+        let mut joined = self.resolve_flow_with_caller(store, globals, antecedents[0], depth + 1, caller)?;
         for antecedent in &antecedents[1..] {
-            let next = self.resolve_flow(store, globals, *antecedent, depth + 1)?;
-            joined = self.join_snapshots(store, globals, flow, &joined, &next)?;
+            let next = self.resolve_flow_with_caller(store, globals, *antecedent, depth + 1, caller)?;
+            joined = self.join_snapshots_with_caller(store, globals, flow, &joined, &next, caller)?;
         }
         Ok(joined)
     }
@@ -7456,8 +7646,20 @@ impl SourceFlowFrame<'_, '_> {
         node: &FlowNode,
         depth: usize,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        self.resolve_loop_label_with_caller(store, globals, flow, node, depth, &mut None)
+    }
+
+    fn resolve_loop_label_with_caller(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        flow: FlowRef,
+        node: &FlowNode,
+        depth: usize,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         let antecedents = label_antecedents(flow, node)?;
-        let mut current = self.resolve_flow(store, globals, antecedents[0], depth + 1)?;
+        let mut current = self.resolve_flow_with_caller(store, globals, antecedents[0], depth + 1, caller)?;
         let declared = self
             .reference
             .filter(|_| self.uses_callable_loop_queries())
@@ -7482,13 +7684,13 @@ impl SourceFlowFrame<'_, '_> {
                 let next = if reference_loop {
                     // The backedge can repeat the demand's prefix before reaching this loop.
                     let outer_visiting = std::mem::take(&mut self.visiting);
-                    let result = self.resolve_flow(store, globals, *antecedent, depth + 1);
+                    let result = self.resolve_flow_with_caller(store, globals, *antecedent, depth + 1, caller);
                     self.visiting = outer_visiting;
                     result
                 } else {
-                    self.resolve_flow(store, globals, *antecedent, depth + 1)
+                    self.resolve_flow_with_caller(store, globals, *antecedent, depth + 1, caller)
                 }?;
-                current = self.join_snapshots(store, globals, flow, &current, &next)?;
+                current = self.join_snapshots_with_caller(store, globals, flow, &current, &next, caller)?;
                 self.loop_snapshots.insert(key, current.clone());
                 if declared.is_some_and(|(symbol, type_)| current.type_of(symbol) == Some(type_)) {
                     break;
@@ -7502,13 +7704,14 @@ impl SourceFlowFrame<'_, '_> {
         result
     }
 
-    fn join_snapshots(
+    fn join_snapshots_with_caller(
         &self,
         store: &mut CanonicalTypeMapperStore,
         globals: &CanonicalGlobalTypes,
         flow: FlowRef,
         then_snapshot: &SourceFlowSnapshot,
         else_snapshot: &SourceFlowSnapshot,
+        caller: &mut Option<SourceFlowCaller<'_, '_>>,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         if !then_snapshot.reachable {
             return Ok(else_snapshot.clone());
@@ -7543,21 +7746,13 @@ impl SourceFlowFrame<'_, '_> {
             }) {
                 let left = store.evolving_array_element_type(then_type)?;
                 let right = store.evolving_array_element_type(else_type)?;
-                let element = store
-                    .expression_union_type_with_global_types(
-                        globals,
-                        &[left, right],
-                        UnionReduction::Literal,
-                    )
+                let element = source_flow_union_type(store, globals, &[left, right], caller)
                     .map_err(|error| SourceFlowError::Join { flow, error })?;
                 store.create_evolving_array_type(element)?
             } else {
-                let anonymous = store
-                    .expression_union_type_with_global_types(
-                        globals,
-                        &[then_type, else_type],
-                        UnionReduction::Literal,
-                    )
+                let anonymous = source_flow_union_type(
+                    store, globals, &[then_type, else_type], caller,
+                )
                     .map_err(|error| SourceFlowError::Join { flow, error })?;
                 Self::preferred_join_identity(store, anonymous, &candidates)
             };
@@ -8110,6 +8305,7 @@ pub(super) fn narrow_by_equality(
         require_match,
         discriminant,
         None,
+        None,
     )
 }
 
@@ -8123,6 +8319,7 @@ fn narrow_by_equality_worker(
     require_match: bool,
     discriminant: Option<&str>,
     mut session: Option<&mut InstantiationSession>,
+    mut relate: Option<&mut SourceFlowRelation<'_>>,
 ) -> Result<TypeId, SourceEqualityNarrowingError> {
     let bootstrap = store
         .intrinsic_bootstrap()
@@ -8136,6 +8333,20 @@ fn narrow_by_equality_worker(
         bootstrap.never_type,
         bootstrap.options.strict_null_checks,
     );
+    if input == any && session.is_some() && relate.is_some() {
+        return Ok(input);
+    }
+    if discriminant.is_none()
+        && session.is_some()
+        && relate.is_some()
+        && source_equality_is_object_value(store, value)?
+    {
+        if let (Some(session), Some(relate)) = (session.as_deref_mut(), relate.as_deref_mut()) {
+            return narrow_by_object_equality(
+                store, globals, input, value, strict, require_match, session, relate,
+            );
+        }
+    }
     let value_kind = source_equality_value_kind(store, value)?;
     if !strict_null_checks
         && matches!(
@@ -8207,6 +8418,7 @@ fn narrow_by_equality_worker(
                 require_match,
                 None,
                 session.as_deref_mut(),
+                relate.as_deref_mut(),
             )?;
             if narrowed != never {
                 retained.push(*leaf);
@@ -8329,6 +8541,136 @@ fn narrow_by_equality_worker(
         }
         .map_err(SourceEqualityNarrowingError::Union),
     }
+}
+
+/// Object equality filters comparable input types. It does not replace them with the value type.
+#[allow(clippy::too_many_arguments)]
+fn narrow_by_object_equality(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    input: TypeId,
+    value: TypeId,
+    strict: bool,
+    require_match: bool,
+    session: &mut InstantiationSession,
+    relate: &mut SourceFlowRelation<'_>,
+) -> Result<TypeId, SourceEqualityNarrowingError> {
+    // Callers replay the checked source condition before narrowing. Validate union
+    // identity here without forcing unrelated object members or function returns.
+    for type_ in [input, value] {
+        let record = store
+            .type_payload(type_)
+            .ok_or(SourceEqualityNarrowingError::InvalidType(type_))?;
+        if record.flags().intersects(TypeFlags::UNION) || matches!(record.data(), TypeData::Union(_)) {
+            store.validate_union_query_metadata(type_)
+                .map_err(SourceEqualityNarrowingError::Union)?;
+        }
+    }
+    if !require_match {
+        return Ok(input);
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceEqualityNarrowingError::MissingBootstrap)?;
+    let (unknown, never, non_primitive, any_function) = (
+        bootstrap.unknown_type,
+        bootstrap.never_type,
+        bootstrap.non_primitive_type,
+        bootstrap.any_function_type,
+    );
+    let (leaves, origin) = match store.type_payload(input).map(TypeRecord::data) {
+        Some(TypeData::Union(union)) => (union.union.types.clone(), union.origin),
+        Some(_) => (vec![input], None),
+        None => return Err(SourceEqualityNarrowingError::InvalidType(input)),
+    };
+    if strict && store.type_payload(value).is_some_and(|record| {
+        record.flags().intersects(TypeFlags::OBJECT | TypeFlags::NON_PRIMITIVE)
+    }) {
+        let mut has_empty = input == unknown;
+        for leaf in &leaves {
+            has_empty |= source_equality_empty_object(store, *leaf, any_function)?;
+        }
+        if has_empty {
+            return if value == non_primitive
+                || source_equality_empty_object(store, value, any_function)?
+            {
+                Ok(value)
+            } else {
+                Ok(non_primitive)
+            };
+        }
+    }
+    let mut retained = Vec::with_capacity(leaves.len());
+    for leaf in &leaves {
+        if relate(store, session, *leaf, value).map_err(SourceEqualityNarrowingError::Source)?
+            || relate(store, session, value, *leaf).map_err(SourceEqualityNarrowingError::Source)?
+        {
+            retained.push(*leaf);
+        }
+    }
+    if retained.len() == leaves.len() {
+        return Ok(input);
+    }
+    if let Some(origin) = origin {
+        store.validate_union_origin_members(input, origin, &leaves)
+            .map_err(SourceEqualityNarrowingError::Union)?;
+        if let Some(TypeData::Union(union)) = store.type_payload(origin).map(TypeRecord::data) {
+            let entries = union.union.types.clone();
+            let mut filtered_origin = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                let record = store
+                    .type_payload(*entry)
+                    .ok_or(SourceEqualityNarrowingError::InvalidType(*entry))?;
+                if record.flags().intersects(TypeFlags::UNION) || retained.contains(entry) {
+                    filtered_origin.push(*entry);
+                }
+            }
+            if entries.len() - filtered_origin.len() == leaves.len() - retained.len() {
+                retained = filtered_origin;
+            }
+        }
+    }
+    match retained.as_slice() {
+        [] => Ok(never),
+        [only] => Ok(*only),
+        _ => store
+            .expression_union_type_with_global_types_and_session(
+                globals, &retained, UnionReduction::None, session,
+            )
+            .map_err(SourceEqualityNarrowingError::Union),
+    }
+}
+
+fn source_equality_is_object_value(
+    store: &CanonicalTypeMapperStore,
+    value: TypeId,
+) -> Result<bool, SourceEqualityNarrowingError> {
+    let record = store.type_payload(value)
+        .ok_or(SourceEqualityNarrowingError::InvalidType(value))?;
+    if let TypeData::Union(union) = record.data() {
+        store.validate_union_query_metadata(value)
+            .map_err(SourceEqualityNarrowingError::Union)?;
+        return Ok(union.union.types.iter().all(|type_| {
+            store.type_payload(*type_).is_some_and(|record| {
+                record.flags().intersects(TypeFlags::OBJECT | TypeFlags::NON_PRIMITIVE)
+            })
+        }));
+    }
+    Ok(record.flags().intersects(TypeFlags::OBJECT | TypeFlags::NON_PRIMITIVE))
+}
+
+fn source_equality_empty_object(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    any_function: TypeId,
+) -> Result<bool, SourceEqualityNarrowingError> {
+    if let Some(source) = super::object_aliases::source_property_object_projection(store, type_)
+        .map_err(SourceEqualityNarrowingError::Relation)?
+    {
+        return Ok(source.properties().is_empty());
+    }
+    store.is_empty_anonymous_object_type(type_, any_function)
+        .map_err(SourceEqualityNarrowingError::Relation)
 }
 
 /// Same-domain numbers need no loose-equality coercion. Check every input before filtering.
@@ -12608,6 +12950,11 @@ fn validate_class_expression_condition(
         {
             false
         }
+        NodeData::IfStatement(statement)
+            if owner.kind == SyntaxKind::IfStatement
+                && statement.expression == source.expression.node
+                && statement.flow_node.is_none()
+                && statement.facts == 0 => false,
         _ => return Err(invalid().into()),
     };
     if nullish != matches!(source.kind, SourceClassExpressionConditionKind::Nullish(_)) {
@@ -12718,6 +13065,10 @@ fn validate_class_expression_condition(
                 return Err(invalid().into());
             }
             Ok(SourceFlowCondition::Unchanged(source.expression))
+        }
+        SourceClassExpressionConditionKind::Reference => {
+            references::validate_condition_syntax(store, host, bound, body, source.expression)?;
+            Ok(SourceFlowCondition::Reference(source.expression))
         }
     }
 }
