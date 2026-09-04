@@ -42,12 +42,16 @@ struct Inputs {
 
 impl Inputs {
     fn new(nested: bool) -> Self {
+        Self::with_augmentation_body(nested, AUGMENTATION_BODY)
+    }
+
+    fn with_augmentation_body(nested: bool, body: &str) -> Self {
         let augmentation = if nested {
             format!(
-                "declare module 'callable-augmentation' {{ global {{\n{AUGMENTATION_BODY}}} }}\n"
+                "declare module 'callable-augmentation' {{ global {{\n{body}}} }}\n"
             )
         } else {
-            format!("export {{}};\ndeclare global {{\n{AUGMENTATION_BODY}}}\n")
+            format!("export {{}};\ndeclare global {{\n{body}}}\n")
         };
         Self {
             library: parse_source_file(include_str!("../../ts_bundled/libs/lib.es5.d.ts")),
@@ -566,6 +570,10 @@ fn ambient_module_global_augmentation_keeps_library_overloads_members_and_replay
 fn check_augmented_callable_type_query(nested: bool) {
     let mut inputs = Inputs::new(nested);
     inputs.source = parse_source_file(&format!("type Parser = typeof parseInt;\n{CONSUMER}"));
+    check_augmented_callable_type_query_inputs(inputs, None);
+}
+
+fn check_augmented_callable_type_query_inputs(inputs: Inputs, return_query: Option<NodeRef>) {
     let declarations = Declarations::new(&inputs);
     let queries = inputs
         .source
@@ -636,6 +644,14 @@ fn check_augmented_callable_type_query(nested: bool) {
         } else {
             None
         };
+        if let Some(return_query) = return_query {
+            assert!(
+                context
+                    .store()
+                    .type_node_links(return_query)
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+        }
         context.check_source_file(SOURCE).unwrap();
         let merged = assert_merged_callable(&context, &declarations);
         if let Some(early) = early {
@@ -666,4 +682,43 @@ fn external_global_type_query_keeps_lazy_identity_through_overload_demand() {
 #[test]
 fn ambient_module_global_type_query_keeps_lazy_identity_through_overload_demand() {
     check_augmented_callable_type_query(true);
+}
+
+#[test]
+fn qualified_signature_type_query_reuses_the_pending_callable() {
+    let body = concat!(
+        "function parseInt(value: string, radix: number): typeof parseInt.label;\n",
+        "export function parseInt(value: boolean): boolean;\n",
+        "namespace parseInt { const label: string; const radix: number; }\n",
+    );
+    for nested in [false, true] {
+        let mut inputs = Inputs::with_augmentation_body(nested, body);
+        inputs.source = parse_source_file(&format!("type Parser = typeof parseInt;\n{CONSUMER}"));
+        let declarations = Declarations::new(&inputs);
+        let queries = inputs
+            .augmentation
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::TypeQueryNode(query) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(inputs.augmentation.arena.id(), AUGMENTATION, node),
+                    record.parent,
+                    query.expr_name,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let [(return_query, parent, name)] = queries.as_slice() else {
+            panic!("one qualified return query is required");
+        };
+        assert_eq!(*parent, Some(declarations.functions[1].node));
+        assert_eq!(
+            inputs.augmentation.arena.get(*name).unwrap().kind,
+            SyntaxKind::QualifiedName,
+        );
+        // Keep the return query cold until source demand resolves the overload.
+        check_augmented_callable_type_query_inputs(inputs, Some(*return_query));
+    }
 }
