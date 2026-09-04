@@ -101,6 +101,8 @@ use std::{
 #[cfg(test)]
 use super::classes::{plan_source_class_members, prepare_source_class_members};
 #[cfg(test)]
+use super::source_callables::publish_contextual_source_callable;
+#[cfg(test)]
 use super::source_imports::{
     plan_source_type_import_reference, preflight_prepared_source_import_publications_with_host,
 };
@@ -225,7 +227,7 @@ use super::{
         materialize_parameterless_source_function_expression, plan_callable_type_predicate,
         plan_javascript_duplicate_function_implementation, plan_source_callable,
         publish_array_filter_predicate_source_callable,
-        publish_contextual_source_callable,
+        publish_contextual_source_callable_with_array_targets,
         publish_inferred_source_callable_return, publish_jsdoc_contextual_source_callable,
         publish_jsdoc_parameterized_source_callable, source_array_filter_predicate_arrow_is_exact,
         source_direct_call_argument_arrow_is_exact, source_object_property_arrow_symbol,
@@ -46517,7 +46519,7 @@ fn check_contextual_object_property_arrow(
     };
     let return_type = widened_fresh_literal_type(store, checked.result)?;
     let return_type = store.get_widened_type_with_global_types(return_type, global_types)?;
-    let callable = publish_contextual_source_callable(
+    let callable = publish_contextual_source_callable_with_array_targets(
         store,
         &PreparedContextualSourceCallable {
             declaration: arrow.callable.declaration,
@@ -46529,6 +46531,7 @@ fn check_contextual_object_property_arrow(
             min_argument_count: arrow.callable.min_argument_count,
             return_type,
         },
+        CanonicalArrayTargets::from_global_types(global_types),
     )
     .map_err(SourcePlanner::callable_plan_error)?;
     publish_expression_type(store, arrow.callable.declaration, callable)?;
@@ -46722,7 +46725,7 @@ fn check_contextual_object_literal_method(
             empty_source_return_for_context(store, target.return_type)?
         }
     };
-    let type_ = publish_contextual_source_callable(
+    let type_ = publish_contextual_source_callable_with_array_targets(
         store,
         &PreparedContextualSourceCallable {
             declaration: callable.declaration,
@@ -46734,6 +46737,7 @@ fn check_contextual_object_literal_method(
             min_argument_count: callable.min_argument_count,
             return_type,
         },
+        CanonicalArrayTargets::from_global_types(global_types),
     )
     .map_err(SourcePlanner::callable_plan_error)?;
     publish_staged_variable_state(
@@ -47127,7 +47131,7 @@ fn check_contextual_direct_call_arrow_worker(
         &[],
     )?;
     let callable =
-        super::source_callables::publish_contextual_direct_call_source_callable_with_resolution(
+        super::source_callables::publish_contextual_direct_call_source_callable_with_resolution_and_array_targets(
             store,
             &PreparedContextualDirectCallSourceCallable {
                 declaration: arrow.callable.declaration,
@@ -47139,6 +47143,7 @@ fn check_contextual_direct_call_arrow_worker(
                 min_argument_count: arrow.callable.min_argument_count,
                 return_type,
             },
+            CanonicalArrayTargets::from_global_types(global_types),
         )
         .map_err(SourcePlanner::callable_plan_error)?;
     publish_expression_type(store, arrow.callable.declaration, callable)?;
@@ -69286,7 +69291,7 @@ fn materialize_contextual_source_arrow(
     if !store.try_reserve_value_symbol_links(missing_binding_links) {
         return Err(SourceCheckError::Arrow(plan.declaration));
     }
-    let callable = publish_contextual_source_callable(
+    let callable = publish_contextual_source_callable_with_array_targets(
         store,
         &PreparedContextualSourceCallable {
             declaration: plan.declaration,
@@ -69298,6 +69303,7 @@ fn materialize_contextual_source_arrow(
             min_argument_count,
             return_type,
         },
+        CanonicalArrayTargets::from_global_types(global_types),
     )
     .map_err(SourcePlanner::callable_plan_error)?;
     for (symbol, links) in binding_types {

@@ -294,6 +294,112 @@ fn assert_diagnostics(
     }
 }
 
+const CONTEXTUAL_INTERFACE_ARRAY_DECLARATIONS: &str = concat!(
+    "interface Payload { values: number[]; }\n",
+    "interface WrongPayload { values: string[]; }\n",
+    "declare const good: Payload;\n",
+    "declare const bad: WrongPayload;\n",
+    "interface Factory { make(seed: number): Payload; }\n",
+    "declare function consume(make: (seed: number) => Payload): Payload;\n",
+);
+
+fn contextual_return_interfaces(parsed: &ParseResult) -> [(NodeRef, NodeRef); 2] {
+    let node = |id| NodeRef::new(parsed.arena.id(), FILE, id);
+    ["Payload", "WrongPayload"].map(|expected| {
+        parsed.arena.iter().find_map(|(id, record)| {
+            let NodeData::InterfaceDeclaration(interface) = &record.data else { return None };
+            let NodeData::Identifier(name) = &parsed.arena.get(interface.name)?.data
+            else { return None };
+            if name.text != expected { return None; }
+            let [property] = interface.members.nodes.as_slice() else {
+                panic!("the return interface must keep its one array property");
+            };
+            let NodeData::PropertyDeclaration(property) = &parsed.arena.get(*property)?.data
+            else { return None };
+            Some((node(id), node(property.type_.unwrap())))
+        }).unwrap()
+    })
+}
+
+fn assert_contextual_return_arrays(checker: &CanonicalCheckerContext<'_>, arrays: [TypeId; 2]) {
+    let bootstrap = checker.store().intrinsic_bootstrap().unwrap();
+    for (array, element) in arrays.into_iter().zip([bootstrap.number_type, bootstrap.string_type]) {
+        let TypeData::TypeReference(reference) =
+            checker.store().type_payload(array).unwrap().data()
+        else { panic!("the nested return must keep its real Array reference") };
+        assert_eq!(reference.object.target, Some(checker.global_types().array_type));
+        assert_eq!(reference.resolved_type_arguments.as_deref(), Some(&[element][..]));
+    }
+}
+
+#[test]
+fn contextual_method_interface_array_returns_keep_real_arrays_and_replay() {
+    let library = parse_source_file(ES5);
+    for (returned, expected) in [("good", true), ("bad", false)] {
+        let source = format!(
+            concat!(
+                "{declarations}",
+                "const object: Factory = {{ make(seed) {{ return {returned}; }} }};\n",
+                "const anchored = object.make(1);\n",
+            ),
+            declarations = CONTEXTUAL_INTERFACE_ARRAY_DECLARATIONS,
+            returned = returned,
+        );
+        let parsed = parse_source_file(&source);
+        let node = |id| NodeRef::new(parsed.arena.id(), FILE, id);
+        let interfaces = contextual_return_interfaces(&parsed);
+        let declaration = method(&parsed, "make");
+        let NodeData::MethodDeclaration(make) = &parsed.arena.get(declaration.node).unwrap().data
+        else { unreachable!() };
+        let method_name = node(make.name);
+        let call = initializer(&parsed, "anchored");
+        let mut checker = context(&library, &parsed);
+        let roots = interfaces.map(|(declaration, _)| {
+            let owner = symbol(&checker, declaration);
+            checker.get_declared_type_of_symbol(owner).unwrap()
+        });
+        let arrays = interfaces.map(|(_, annotation)| {
+            checker.get_type_from_type_node(annotation).unwrap()
+        });
+        let number = checker.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_contextual_return_arrays(&checker, arrays);
+        assert!(checker.store().signature_links(declaration)
+            .and_then(|links| links.resolved_signature.signature()).is_none());
+        checker.get_type_at_location(declaration).unwrap();
+        let method = method_state(&mut checker, &parsed, declaration);
+        let actual_return = roots[usize::from(!expected)];
+        let actual = checker.get_return_type_of_signature(method.signature).unwrap();
+        assert_eq!(actual, actual_return);
+        assert!(matches!(checker.store().type_payload(actual).unwrap().data(),
+            TypeData::Interface(_)));
+        assert_eq!(checker.is_type_assignable_to(actual, roots[0]), Ok(expected));
+        assert_eq!(method.returned, actual_return);
+        assert_eq!(method.parameters[0].1, number);
+        assert_eq!(checker.get_type_at_location(call), Ok(roots[0]));
+        let actual_diagnostics = checker.diagnostics().as_slice().iter().map(|diagnostic| {
+            assert_eq!(diagnostic.range_override, None);
+            (diagnostic.diagnostic.code(), diagnostic.node)
+        }).collect::<Vec<_>>();
+        let expected_diagnostics = if expected {
+            Vec::new()
+        } else {
+            vec![(2322, Some(method_name))]
+        };
+        assert_eq!(actual_diagnostics, expected_diagnostics);
+        assert!(checker.store().type_resolution_is_empty());
+        assert_replay(
+            &mut checker,
+            &parsed,
+            &[declaration],
+            &[call, interfaces[0].1, interfaces[1].1],
+        );
+        assert_contextual_return_arrays(&checker, arrays);
+        assert_eq!(checker.get_return_type_of_signature(method.signature), Ok(actual_return));
+        assert_eq!(checker.is_type_assignable_to(actual_return, roots[0]), Ok(expected));
+        assert!(checker.store().type_resolution_is_empty());
+    }
+}
+
 #[test]
 fn annotated_and_inferred_object_methods_keep_real_call_signatures_and_replay() {
     let library = parse_source_file(ES5);

@@ -1379,6 +1379,7 @@ struct PreparedContextualSourceCallableView<'a> {
     flags: SignatureFlags,
     min_argument_count: i32,
     return_type: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14351,6 +14352,22 @@ pub(super) fn publish_contextual_source_callable(
     store: &mut CanonicalTypeMapperStore,
     prepared: &PreparedContextualSourceCallable,
 ) -> Result<TypeId, SourceCallableError> {
+    publish_contextual_source_callable_worker(store, prepared, None)
+}
+
+pub(super) fn publish_contextual_source_callable_with_array_targets(
+    store: &mut CanonicalTypeMapperStore,
+    prepared: &PreparedContextualSourceCallable,
+    array_targets: CanonicalArrayTargets,
+) -> Result<TypeId, SourceCallableError> {
+    publish_contextual_source_callable_worker(store, prepared, Some(array_targets))
+}
+
+fn publish_contextual_source_callable_worker(
+    store: &mut CanonicalTypeMapperStore,
+    prepared: &PreparedContextualSourceCallable,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<TypeId, SourceCallableError> {
     publish_prepared_contextual_source_callable(
         store,
         &PreparedContextualSourceCallableView {
@@ -14363,6 +14380,7 @@ pub(super) fn publish_contextual_source_callable(
             flags: prepared.flags,
             min_argument_count: prepared.min_argument_count,
             return_type: prepared.return_type,
+            array_targets,
         },
     )
 }
@@ -14371,6 +14389,26 @@ pub(super) fn publish_contextual_source_callable(
 pub(super) fn publish_contextual_direct_call_source_callable_with_resolution(
     store: &mut CanonicalTypeMapperStore,
     prepared: &PreparedContextualDirectCallSourceCallable,
+) -> Result<TypeId, SourceCallableError> {
+    publish_contextual_direct_call_source_callable_with_resolution_worker(store, prepared, None)
+}
+
+pub(super) fn publish_contextual_direct_call_source_callable_with_resolution_and_array_targets(
+    store: &mut CanonicalTypeMapperStore,
+    prepared: &PreparedContextualDirectCallSourceCallable,
+    array_targets: CanonicalArrayTargets,
+) -> Result<TypeId, SourceCallableError> {
+    publish_contextual_direct_call_source_callable_with_resolution_worker(
+        store,
+        prepared,
+        Some(array_targets),
+    )
+}
+
+fn publish_contextual_direct_call_source_callable_with_resolution_worker(
+    store: &mut CanonicalTypeMapperStore,
+    prepared: &PreparedContextualDirectCallSourceCallable,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<TypeId, SourceCallableError> {
     let declaration = prepared.declaration;
     if store.source_promise_executor_was_registered(declaration) {
@@ -14383,7 +14421,8 @@ pub(super) fn publish_contextual_direct_call_source_callable_with_resolution(
             store.fail_source_promise_executor_resolution(declaration);
             return Err(invariant(SourceCallableInvariant::InvalidTypeCache(declaration)));
         }
-        let result = publish_contextual_direct_call_source_callable(store, prepared);
+        let result =
+            publish_contextual_direct_call_source_callable_worker(store, prepared, array_targets);
         if result.is_err() || !store.finish_source_promise_executor_resolution(declaration) {
             store.fail_source_promise_executor_resolution(declaration);
             return result.and_then(|_| {
@@ -14393,7 +14432,11 @@ pub(super) fn publish_contextual_direct_call_source_callable_with_resolution(
         return result;
     }
     if !store.source_direct_call_resolution_was_registered(declaration) {
-        return publish_contextual_direct_call_source_callable(store, prepared);
+        return publish_contextual_direct_call_source_callable_worker(
+            store,
+            prepared,
+            array_targets,
+        );
     }
     if store
         .source_direct_call_resolution(declaration)
@@ -14407,7 +14450,8 @@ pub(super) fn publish_contextual_direct_call_source_callable_with_resolution(
             declaration,
         )));
     }
-    let result = publish_contextual_direct_call_source_callable(store, prepared);
+    let result =
+        publish_contextual_direct_call_source_callable_worker(store, prepared, array_targets);
     if result.is_err() || !store.finish_source_direct_call_resolution(declaration) {
         store.fail_source_direct_call_resolution(declaration);
         return result.and_then(|_| {
@@ -14424,6 +14468,14 @@ pub(super) fn publish_contextual_direct_call_source_callable(
     store: &mut CanonicalTypeMapperStore,
     prepared: &PreparedContextualDirectCallSourceCallable,
 ) -> Result<TypeId, SourceCallableError> {
+    publish_contextual_direct_call_source_callable_worker(store, prepared, None)
+}
+
+fn publish_contextual_direct_call_source_callable_worker(
+    store: &mut CanonicalTypeMapperStore,
+    prepared: &PreparedContextualDirectCallSourceCallable,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<TypeId, SourceCallableError> {
     publish_prepared_contextual_source_callable(
         store,
         &PreparedContextualSourceCallableView {
@@ -14436,8 +14488,22 @@ pub(super) fn publish_contextual_direct_call_source_callable(
             flags: prepared.flags,
             min_argument_count: prepared.min_argument_count,
             return_type: prepared.return_type,
+            array_targets,
         },
     )
+}
+
+fn validate_contextual_source_callable_return_array_capability(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    return_type: TypeId,
+) -> Result<(), LiteralTypeCacheError> {
+    match array_targets {
+        Some(targets) => {
+            store.validate_cached_array_capability_with_array_targets(targets, return_type)
+        }
+        None => store.validate_cached_array_capability(return_type),
+    }
 }
 
 fn publish_prepared_contextual_source_callable(
@@ -14478,6 +14544,7 @@ fn publish_prepared_contextual_source_callable(
                 && provenance.owner_symbol == prepared.owner_symbol
                 && provenance.owner_parent == owner_parent
                 && provenance.export_local.is_none()
+                && provenance.array_targets == prepared.array_targets
                 && provenance.contextual_target == Some(prepared.contextual_target)
                 && provenance.contextual_variable == prepared.variable_symbol
                 && provenance.captured_assignment == prepared.captured_assignment
@@ -14669,6 +14736,10 @@ fn publish_prepared_contextual_source_callable(
         || minimum.is_none_or(|minimum| minimum > parameter_count)
         || store.type_payload(prepared.contextual_target).is_none()
         || store.type_payload(prepared.return_type).is_none()
+        || prepared.array_targets.is_some_and(|targets| {
+            store.type_payload(targets.array_type()).is_none()
+                || store.type_payload(targets.readonly_array_type()).is_none()
+        })
         || store
             .source_callable_type_for_declaration(prepared.declaration)
             .is_some()
@@ -14683,9 +14754,12 @@ fn publish_prepared_contextual_source_callable(
             prepared.declaration,
         )));
     }
-    if store
-        .validate_cached_array_capability(prepared.return_type)
-        .is_err()
+    if validate_contextual_source_callable_return_array_capability(
+        store,
+        prepared.array_targets,
+        prepared.return_type,
+    )
+    .is_err()
         || !store.try_reserve_types(1)
         || !store.try_reserve_signatures(1)
         || !store.try_reserve_source_callable_provenance(1)
@@ -14732,7 +14806,7 @@ fn publish_prepared_contextual_source_callable(
             signature,
             flags: prepared.flags,
             return_provenance: SourceCallableReturnProvenance::Inferred,
-            array_targets: None,
+            array_targets: prepared.array_targets,
             generic_return_type_parameter: None,
             contextual_target: Some(prepared.contextual_target),
             contextual_variable: prepared.variable_symbol,
@@ -17386,7 +17460,12 @@ pub(super) fn validate_stored_source_callable(
         let return_type = signature_record.resolved_return_type();
         let return_valid = store.intrinsic_bootstrap().is_some()
             && return_type.is_some_and(|return_type| {
-                store.validate_cached_array_capability(return_type).is_ok()
+                validate_contextual_source_callable_return_array_capability(
+                    store,
+                    provenance.array_targets,
+                    return_type,
+                )
+                .is_ok()
             })
             && store
                 .function_signature_return_annotation(signature)
