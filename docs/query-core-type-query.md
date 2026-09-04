@@ -5,6 +5,62 @@ Use query-core-integration. Root owns production code, tests and the index.
 One reviewer checks the complete change. Other workers investigate bounded
 questions and write separate reports. Do not start another feature branch.
 
+## Overload relation batch
+
+Commit 65df0072a adds the real library ReturnType control. It first requests the
+pending global callable, then saves the alias result before a direct constraint
+relation. The measured inner error is UnresolvedFunctionType. The outer alias
+error is GenericAliasConstraintUnsupported. All 23 previous focused passes
+remain. The new test is the sixth focused failure. No old test changed.
+See the [baseline comparison](../target/query-core-overload-relations-baseline-2-comparison.json).
+
+Commit 3163b7bd7 makes the namespace export proof retain raw table symbols and canonical
+value symbols. Pure-module values and source overload publication share it.
+Cold publication and replay check declaration ownership, parent, table order,
+readonly source proof and existing value links. Cached namespace value types
+remain graph edges. Unresolved values remain lazy. Source review found and
+closed two pre-publication gaps before this checkpoint.
+
+The [combined public run](../target/query-core-namespace-export-proof-regression-3-comparison.json)
+has 112 tests, 104 passes and the same eight failures. All 104 prior passes
+remain, with no missing names. The [18 exact library cases](../target/query-core-overload-library-selection-1-result.json)
+also pass. The 109 selected accepted cases have 107 passes and the same two
+failures. The unit test target compiled. This is not complete overload relation
+support. The [unchanged Query run](../target/query-core-namespace-export-proof-query-1-result.md)
+has the same 244 checking records, including the same diagnostics and stopping
+point. Ordinary checking is incomplete. Two of 23 isolated roots complete.
+This batch has no Query completion improvement and is not a compiler promotion.
+
+The [pinned Go baseline](../target/query-core-overload-relation-go-controls-1/result.md)
+accepts the ReturnType consumer but reports four declaration errors in each
+unchanged augmentation provider. Its export spellings are mixed. The separate
+[assignment witness](../target/query-core-overload-returntype-go-witness-1/result.md)
+confirms the boolean result and rejects an any fallback. Both ordinary and
+generic namespace controls retain a number property and report the deliberate
+wrong string assignment correctly. No Go cache-identity claim follows from
+these ordinary CLI runs.
+
+The remaining shared operation has four parts:
+
+1. Use the retained namespace rows in property lookup and relations. Keep raw
+   lookup keys separate from canonical value symbols. Resolve selected values
+   through the existing live source query and proof vectors.
+2. Demand an authenticated pending overload once per query, retain the same
+   TypeId and session, then retry the original relation.
+3. Preserve all public overloads and namespace properties in structural
+   comparison. Do not change the exact-single callback reader.
+4. Erase both signatures for a multi-overload pair as Go does. Create real
+   erased signature records and map only reached parameter, rest, this and
+   return values. Keep the original signature return proof before mapping.
+   Do not replace this operation with a ReturnType-only or top-signature rule.
+
+See the [namespace plan](../target/query-core-overload-namespace-properties-diff.md),
+[pending retry](../target/query-core-overload-relation-pending-diff.md), and
+[lazy erasure design](../target/query-core-overload-relation-valid-set-diff.md).
+The concrete [value-proof edits](../target/query-core-namespace-value-proof-concrete-diff.md)
+and [property-reader edits](../target/query-core-namespace-property-readers-concrete-diff.md)
+are ready for root integration. They have not been applied or compiled.
+
 ## Measured failure
 
 The latest unchanged Query run reports GenericAliasConstraintUnsupported for
@@ -12,14 +68,13 @@ ReturnType's formal in lib.es5.d.ts, bytes 75173..75204. The old blanket
 FunctionType syntax rejection is gone. Plain required/scalar ReturnType and
 pending global overload inference now pass separate controls. The outer Query
 error does not expose its exact inner relation or formatting failure.
-The run still has 244 records and 24 attempts. Only the ordinary attempt and
-isolated root 20 change their stopping point. Two of 23 isolated roots complete.
-Ordinary checking remains incomplete. No diagnostic changes.
-See the [exact comparison](../target/query-core-return-type-query-2-comparison.json)
-and [result](../target/query-core-return-type-query-2-result.md).
-The focused checks, Query run, accepted regression selection, and pinned Go
-controls are closed. Their complete source fingerprint is
-5cb542a9343878233682e102a12bee84d12c867afa9135f5b8bfc225554a89a9.
+The run still has 244 records and 24 attempts. All checking records match the
+previous run. Two of 23 isolated roots complete. Ordinary checking remains
+incomplete. No diagnostic changes.
+See the [exact comparison](../target/query-core-namespace-export-proof-query-1-comparison.json)
+and [result](../target/query-core-namespace-export-proof-query-1-result.md).
+All current runs are closed. The complete Rust source fingerprint is
+7dc3cb38163d0e9a300fa1d86a5723400b9bc743559faa4a7bddb5bb343eb261.
 
 The prior ordinary Query stop was TypeQuery, file 20, node 82, bytes 1196..1213.
 The bounded observation found an Identifier query with no type arguments.
@@ -53,8 +108,12 @@ These commits are on the existing query-core-integration branch:
 - 2ef992da1 keeps valid function headers lazy and resolves selected returns
   through the existing source proof. It fixes plain ReturnType and pending
   global overload inference, including cold/warm identity and replay.
+- 65df0072a adds the failing real ReturnType constraint control and retains its
+  inner relation error without changing existing tests.
+- 3163b7bd7 retains and validates namespace exports through source overload
+  publication. Its preflight rejects invalid cached value links before writes.
 
-The [latest focused run](../target/query-core-return-type-constraints-4-result.md)
+The [earlier focused run](../target/query-core-return-type-constraints-4-result.md)
 has 28 tests, 23 passes and five failures. It recovers two cases and retains
 all 21 prior passes. The earlier publication assertion panic is
 fixed with the common rest-parameter predicate, with assertions still enabled.
