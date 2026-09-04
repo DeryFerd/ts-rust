@@ -513,9 +513,16 @@ impl SourceSignatureGlobalMember {
     }
 }
 
-/// One return read reached by the existing comparison of these exact callables.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum SourceSignatureReturnRole {
+    Relation,
+    ConditionalInference,
+}
+
+/// One return read reached by relation or conditional inference.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct SourceSignatureReturnRequest {
+    role: SourceSignatureReturnRole,
     source: TypeId,
     source_signature: SignatureId,
     target: TypeId,
@@ -525,6 +532,22 @@ pub(super) struct SourceSignatureReturnRequest {
 }
 
 impl SourceSignatureReturnRequest {
+    pub(super) const fn conditional_inference(owner: TypeId, signature: SignatureId) -> Self {
+        Self {
+            role: SourceSignatureReturnRole::ConditionalInference,
+            source: owner,
+            source_signature: signature,
+            target: owner,
+            target_signature: signature,
+            signature,
+            global_member: None,
+        }
+    }
+
+    pub(super) const fn is_conditional_inference(self) -> bool {
+        matches!(self.role, SourceSignatureReturnRole::ConditionalInference)
+    }
+
     pub(super) const fn source(self) -> TypeId {
         self.source
     }
@@ -6114,6 +6137,7 @@ impl<'store> RelaterSession<'store> {
             return Err(RelationUnavailable::MalformedFunctionType(reached.owner));
         }
         let request = SourceSignatureReturnRequest {
+            role: SourceSignatureReturnRole::Relation,
             source: source.owner,
             source_signature: source.signature,
             target: target.owner,
@@ -12484,6 +12508,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     global_member,
                 }) => {
                     let request = SourceSignatureReturnRequest {
+                        role: SourceSignatureReturnRole::Relation,
                         source: callable_source,
                         source_signature,
                         target: callable_target,

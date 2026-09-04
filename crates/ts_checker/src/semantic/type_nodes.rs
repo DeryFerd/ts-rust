@@ -37382,6 +37382,19 @@ impl SourceSignatureReturnQuery for SourceTypeQueryContext<'_, '_> {
         {
             return Err(invalid());
         }
+        if request.is_conditional_inference() {
+            if request.source() != request.target()
+                || request.source_signature() != request.target_signature()
+                || request.global_member().is_some()
+                || origin.is_some()
+            {
+                return Err(invalid());
+            }
+            return Ok(matches!(
+                self.signature_return_source(store, request.source(), request.signature())?,
+                Some(SourceSignatureReturnSource::FunctionType(_))
+            ));
+        }
         let source =
             self.signature_return_annotation(store, request.source(), request.source_signature())?;
         let target =

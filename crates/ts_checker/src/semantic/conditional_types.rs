@@ -6056,7 +6056,7 @@ fn evaluate_conditional_worker(
 
     let mut resolved_check_parameters = HashSet::new();
     for (parameter, argument) in mapped_parameters.iter().zip(type_arguments) {
-        if !contains_type_parameter_with_array_targets(
+        if !conditional_operand_is_deferred(
             store,
             *argument,
             &HashSet::new(),
@@ -7211,6 +7211,35 @@ fn validate_conditional_operand_with_source(
         super::source_overloads::StoredSourceOverloadValidation::Pending
         | super::source_overloads::StoredSourceOverloadValidation::NotSourceOverload => {}
     }
+    let function_header = if store.type_has_function_type_provenance(type_) {
+        match super::callables::validate_stored_single_callable_with_array_targets(
+            store,
+            type_,
+            array_targets,
+        ) {
+            super::callables::StoredSingleCallableValidation::Valid {
+                family: super::callables::CallableFamily::FunctionType,
+                callable,
+                edges,
+            } if callable.owner == type_ => {
+                if store
+                    .declared_call_set_type_for_signature(callable.signature)
+                    .is_some_and(|owner| owner != type_)
+                {
+                    return Err(RelationUnavailable::MalformedFunctionType(type_).into());
+                }
+                // The provider validates the header while the return stays lazy.
+                dependencies.extend(edges);
+                true
+            }
+            super::callables::StoredSingleCallableValidation::Malformed { .. } => {
+                return Err(RelationUnavailable::MalformedFunctionType(type_).into());
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
     if let Some(alias) = record.alias() {
         let alias_record = store
             .type_alias(alias)
@@ -7249,6 +7278,7 @@ fn validate_conditional_operand_with_source(
     }
 
     if generic_callable.is_none()
+        && !function_header
         && let Some(structured) = record.data().structured()
     {
         let signatures = structured.signatures.as_deref().unwrap_or_default();
@@ -8104,6 +8134,14 @@ fn conditional_operand_is_deferred(
     excluded: &HashSet<TypeId>,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<bool, ConditionalTypeError> {
+    match super::source_overloads::validate_stored_source_overload(store, type_) {
+        super::source_overloads::StoredSourceOverloadValidation::Pending => return Ok(false),
+        super::source_overloads::StoredSourceOverloadValidation::Malformed => {
+            return Err(RelationUnavailable::MalformedFunctionType(type_).into());
+        }
+        super::source_overloads::StoredSourceOverloadValidation::NotSourceOverload
+        | super::source_overloads::StoredSourceOverloadValidation::Valid(_) => {}
+    }
     let record = store
         .type_payload(type_)
         .ok_or(ConditionalTypeError::InvalidType(type_))?;
@@ -9037,14 +9075,26 @@ fn infer_from_structured_types(
                     session,
                     query,
                 )?;
+            if source_recovery_type(session, mark, query)?.is_some() {
+                return Ok(false);
+            }
+            if source_semantic_recovery_since(store, semantic_mark, session, query)? {
+                return Err(missing_source_query().into());
+            }
             let (target_this, target_parameters, _, target_return) = inference_signature_parts(
                 store,
                 target,
                 target_signature,
-                context
-                    .global_types
-                    .map(CanonicalArrayTargets::from_global_types),
+                context.global_types,
+                session,
+                query,
             )?;
+            if source_recovery_type(session, mark, query)?.is_some() {
+                return Ok(false);
+            }
+            if source_semantic_recovery_since(store, semantic_mark, session, query)? {
+                return Err(missing_source_query().into());
+            }
             let target_any_or_never_rest = store
                 .signature(target_signature)
                 .is_some_and(|signature| signature.has_rest_parameter())
@@ -9358,12 +9408,95 @@ fn conditional_signature_this_type(
     }
 }
 
-fn inference_signature_parts(
-    store: &CanonicalTypeMapperStore,
+fn inference_signature_return(
+    store: &mut CanonicalTypeMapperStore,
     owner: TypeId,
     signature: SignatureId,
-    array_targets: Option<CanonicalArrayTargets>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+    query: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<TypeId, ConditionalTypeError> {
+    if !store.type_has_function_type_provenance(owner) {
+        return store
+            .signature(signature)
+            .and_then(super::signatures::Signature::resolved_return_type)
+            .ok_or_else(|| invalid_conditional_signature(store, signature));
+    }
+    let array_targets = global_types.map(CanonicalArrayTargets::from_global_types);
+    let callable = match super::callables::validate_stored_single_callable_with_array_targets(
+        store,
+        owner,
+        array_targets,
+    ) {
+        super::callables::StoredSingleCallableValidation::Valid {
+            family: super::callables::CallableFamily::FunctionType,
+            callable,
+            ..
+        } if callable.owner == owner && callable.signature == signature => callable,
+        _ => return Err(invalid_conditional_signature(store, signature)),
+    };
+    let stored_return = callable
+        .return_type
+        .ok_or(RelationUnavailable::UnresolvedSignatureReturn(signature));
+    let Some(globals) = global_types else {
+        return stored_return.map_err(Into::into);
+    };
+    let Some(source) = query
+        .as_deref_mut()
+        .filter(|source| source.source_query_options().is_some())
+    else {
+        return stored_return.map_err(Into::into);
+    };
+    let options = source.source_query_options().ok_or_else(missing_source_query)?;
+    let request = SourceSignatureReturnRequest::conditional_inference(owner, signature);
+    let eligible = source
+        .source_signature_return_query()
+        .ok_or(RelationUnavailable::UnresolvedSignatureReturn(signature))?
+        .signature_return_is_eligible(
+            store,
+            request,
+            None,
+            globals,
+            options.strict_function_types,
+        )?;
+    if !eligible {
+        return stored_return.map_err(Into::into);
+    }
+    let proof = source.resolve_source_signature_return(store, request, None, session)?;
+    source.validate_source_signature_return_proof(
+        store,
+        &proof,
+        globals,
+        options.strict_function_types,
+    )?;
+    if proof.request() != request || proof.signature() != signature {
+        return Err(missing_source_query().into());
+    }
+    match super::callables::validate_stored_single_callable_with_array_targets(
+        store,
+        owner,
+        array_targets,
+    ) {
+        super::callables::StoredSingleCallableValidation::Valid {
+            family: super::callables::CallableFamily::FunctionType,
+            callable,
+            ..
+        } if callable.owner == owner
+            && callable.signature == signature
+            && callable.return_type == Some(proof.type_id()) => Ok(proof.type_id()),
+        _ => Err(invalid_conditional_signature(store, signature)),
+    }
+}
+
+fn inference_signature_parts(
+    store: &mut CanonicalTypeMapperStore,
+    owner: TypeId,
+    signature: SignatureId,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+    query: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<(Option<TypeId>, Vec<TypeId>, usize, TypeId), ConditionalTypeError> {
+    let array_targets = global_types.map(CanonicalArrayTargets::from_global_types);
     let record = store
         .signature(signature)
         .ok_or_else(|| invalid_conditional_signature(store, signature))?;
@@ -9374,9 +9507,8 @@ fn inference_signature_parts(
     if minimum > parameters.len() {
         return Err(invalid_conditional_signature(store, signature));
     }
-    let return_type = record
-        .resolved_return_type()
-        .ok_or_else(|| invalid_conditional_signature(store, signature))?;
+    let return_type =
+        inference_signature_return(store, owner, signature, global_types, session, query)?;
     Ok((this_type, parameters, minimum, return_type))
 }
 
@@ -9392,7 +9524,9 @@ fn base_inference_signature_parts(
         store,
         owner,
         signature,
-        global_types.map(CanonicalArrayTargets::from_global_types),
+        global_types,
+        session,
+        query,
     )?;
     let local_parameters = store
         .signature(signature)
