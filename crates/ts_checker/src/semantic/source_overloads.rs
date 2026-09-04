@@ -33,7 +33,7 @@ use super::{
     store::{
         PreparedSourceOverloadParameter, PreparedSourceOverloadPublication,
         PreparedSourceOverloadSignature, SourceCallableFamily, SourceNodeParent,
-        SourceOverloadImplementation,
+        SourceOverloadIdentity, SourceOverloadImplementation,
     },
     type_nodes::SourceCallableTypeQueryEvidence,
     type_records::{ConstrainedTypeData, TypeCacheState, TypeData},
@@ -132,6 +132,7 @@ pub(super) struct MaterializedSourceOverload {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum StoredSourceOverloadValidation {
     NotSourceOverload,
+    Pending,
     Valid(Vec<TypeId>),
     Malformed,
 }
@@ -1315,7 +1316,9 @@ pub(super) fn publish_source_overload_batch(
             ));
         }
         match source_overload_state(store, plan)? {
-            SourceOverloadState::Cold => cold.push(publication.clone()),
+            SourceOverloadState::Cold | SourceOverloadState::Pending { .. } => {
+                cold.push(publication.clone())
+            }
             SourceOverloadState::Resolved { .. } => {}
         }
     }
@@ -1348,6 +1351,9 @@ pub(super) fn publish_source_overload_batch(
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SourceOverloadState {
     Cold,
+    Pending {
+        type_: TypeId,
+    },
     Resolved {
         type_: TypeId,
         signatures: Box<[SignatureId]>,
@@ -1447,9 +1453,25 @@ fn source_overload_state(
                 .map(|declaration| declaration.declaration)
                 .collect::<Vec<_>>(),
         );
+    if let Some(type_) = owner_links.and_then(|links| links.resolved_type)
+        && let Some(identity) = store.source_overload_identity(type_)
+    {
+        return if identity.owner_symbol == plan.owner_symbol
+            && identity.declarations.as_ref() == declaration_nodes
+            && plan.implementation.is_none()
+            && validate_pending_source_overload(store, type_)
+        {
+            Ok(SourceOverloadState::Pending { type_ })
+        } else {
+            Err(SourceOverloadError::Invariant(
+                SourceOverloadInvariant::Cache(first.declaration),
+            ))
+        };
+    }
     if owner_links.is_none_or(|links| links == &ValueSymbolLinks::default())
         && declarations_cold
         && maps_cold
+        && !store.source_overload_identity_conflicts(plan.owner_symbol, &declaration_nodes, None)
     {
         return Ok(SourceOverloadState::Cold);
     }
@@ -1613,10 +1635,147 @@ fn prepared_matches_plan(
             })
 }
 
+pub(super) fn source_overload_identity_header_is_exact(
+    store: &CanonicalTypeMapperStore,
+    identity: &SourceOverloadIdentity,
+) -> bool {
+    store
+        .source_global_function_namespace_declarations(identity.owner_symbol)
+        .as_deref()
+        == Some(identity.declarations.as_ref())
+        && store
+            .symbol(identity.owner_symbol)
+            .is_some_and(|owner| owner.exports() == identity.members)
+}
+
+pub(super) fn source_overload_identity_links_are_cold(
+    store: &CanonicalTypeMapperStore,
+    identity: &SourceOverloadIdentity,
+) -> bool {
+    !store.source_overload_provenance_claims(identity.owner_symbol, &identity.declarations)
+        && store
+            .source_overload_type_for_owner(identity.owner_symbol)
+            .is_none()
+        && store
+            .source_callable_type_for_owner(identity.owner_symbol)
+            .is_none()
+        && identity.declarations.iter().all(|&declaration| {
+            store
+                .signature_links(declaration)
+                .is_none_or(|links| links == &SignatureLinks::default())
+                && store
+                    .source_overload_type_for_declaration(declaration)
+                    .is_none()
+                && store
+                    .source_callable_type_for_declaration(declaration)
+                    .is_none()
+                && store
+                    .source_direct_children(declaration)
+                    .is_some_and(|children| {
+                        children
+                            .into_iter()
+                            .filter(|&node| {
+                                store.source_node_kind(node) == Some(SyntaxKind::Parameter)
+                            })
+                            .all(|node| {
+                                store.source_declaration_symbol(node).is_some_and(|symbol| {
+                                    store
+                                        .value_symbol_links(symbol)
+                                        .is_none_or(|links| links == &ValueSymbolLinks::default())
+                                })
+                            })
+                    })
+        })
+}
+
+pub(super) fn validate_pending_source_overload(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> bool {
+    let Some(identity) = store.source_overload_identity(type_) else {
+        return false;
+    };
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    source_overload_identity_header_is_exact(store, identity)
+        && source_overload_identity_links_are_cold(store, identity)
+        && !store.source_overload_identity_conflicts(
+            identity.owner_symbol,
+            &identity.declarations,
+            Some(type_),
+        )
+        && record.symbol() == Some(identity.owner_symbol)
+        && record.flags() == TypeFlags::OBJECT
+        && record.object_flags() == ObjectFlags::ANONYMOUS
+        && record.alias().is_none()
+        && matches!(record.data(), TypeData::Object(object) if object == &super::type_records::ObjectTypeData::default())
+        && store.value_symbol_links(identity.owner_symbol)
+            == Some(&ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+}
+
+/// Plans a merged value identity without requesting its signature annotations.
+pub(super) fn plan_source_overload_value_identity(
+    store: &CanonicalTypeMapperStore,
+    owner_symbol: SemanticSymbolId,
+) -> Result<(SourceOverloadIdentity, Option<TypeId>), SourceOverloadError> {
+    let owner = store
+        .symbol(owner_symbol)
+        .ok_or(SourceOverloadError::Invariant(
+            SourceOverloadInvariant::EmptyGroup,
+        ))?;
+    let declaration = owner
+        .value_declaration()
+        .ok_or(SourceOverloadError::Invariant(
+            SourceOverloadInvariant::EmptyGroup,
+        ))?;
+    let invalid = || SourceOverloadError::Invariant(SourceOverloadInvariant::Cache(declaration));
+    let declarations = store
+        .source_global_function_namespace_declarations(owner_symbol)
+        .ok_or(SourceOverloadError::Unsupported(declaration))?;
+    let identity = SourceOverloadIdentity {
+        owner_symbol,
+        declarations: declarations.into_boxed_slice(),
+        members: owner.exports(),
+    };
+    let links = store.value_symbol_links(owner_symbol);
+    if links.is_none_or(|links| links == &ValueSymbolLinks::default()) {
+        if !source_overload_identity_links_are_cold(store, &identity)
+            || store.source_overload_identity_conflicts(owner_symbol, &identity.declarations, None)
+        {
+            return Err(invalid());
+        }
+        return Ok((identity, None));
+    }
+    let type_ = links
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    if !matches!(
+        validate_stored_source_overload(store, type_),
+        StoredSourceOverloadValidation::Pending | StoredSourceOverloadValidation::Valid(_)
+    ) || store
+        .type_payload(type_)
+        .is_none_or(|record| record.symbol() != Some(owner_symbol))
+    {
+        return Err(invalid());
+    }
+    Ok((identity, Some(type_)))
+}
+
 pub(super) fn validate_stored_source_overload(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> StoredSourceOverloadValidation {
+    if store.source_overload_identity(type_).is_some() {
+        return if validate_pending_source_overload(store, type_) {
+            StoredSourceOverloadValidation::Pending
+        } else {
+            StoredSourceOverloadValidation::Malformed
+        };
+    }
     let provenance = store.source_overload_provenance(type_);
     let malformed_or_not = || {
         if provenance.is_some() {

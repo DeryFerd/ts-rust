@@ -562,3 +562,108 @@ fn external_global_augmentation_keeps_library_overloads_members_and_replay() {
 fn ambient_module_global_augmentation_keeps_library_overloads_members_and_replay() {
     check_augmented_callable(true);
 }
+
+fn check_augmented_callable_type_query(nested: bool) {
+    let mut inputs = Inputs::new(nested);
+    inputs.source = parse_source_file(&format!("type Parser = typeof parseInt;\n{CONSUMER}"));
+    let declarations = Declarations::new(&inputs);
+    let queries = inputs
+        .source
+        .arena
+        .iter()
+        .filter_map(|(node, record)| {
+            let NodeData::TypeQueryNode(query) = &record.data else {
+                return None;
+            };
+            Some((
+                NodeRef::new(inputs.source.arena.id(), SOURCE, node),
+                query.expr_name,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let [(query, name)] = queries.as_slice() else {
+        panic!("one direct type query is required");
+    };
+    let query = *query;
+    let name = NodeRef::new(query.arena, SOURCE, *name);
+    for query_first in [false, true] {
+        let mut context = inputs.context();
+        let owner = symbol(&context, declarations.functions[0]);
+        assert!(
+            context
+                .store()
+                .value_symbol_links(owner)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        );
+        let early = if query_first {
+            let type_ = context.get_type_from_type_node(query).unwrap();
+            assert_eq!(value_type(&context, owner), type_);
+            let payload = context.store().type_payload(type_).unwrap();
+            assert_eq!(payload.symbol(), Some(owner));
+            let TypeData::Object(object) = payload.data() else {
+                panic!("a callable value must be an object");
+            };
+            assert!(object.structured.signatures.is_none());
+            assert!(object.structured.members.is_none());
+            for declaration in declarations.functions {
+                assert!(
+                    context
+                        .store()
+                        .signature_links(declaration)
+                        .is_none_or(|links| links.resolved_signature.signature().is_none())
+                );
+            }
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(name)
+                    .unwrap()
+                    .resolved_symbol,
+                Some(owner)
+            );
+            assert_providers_unchecked(&context);
+            assert!(
+                !context
+                    .store()
+                    .source_file_links(context.source_file(SOURCE).unwrap())
+                    .is_some_and(|links| links.type_checked)
+            );
+            let before = snapshot(&context, &declarations);
+            assert_eq!(context.get_type_from_type_node(query), Ok(type_));
+            assert_eq!(snapshot(&context, &declarations), before);
+            Some(type_)
+        } else {
+            None
+        };
+        context.check_source_file(SOURCE).unwrap();
+        let merged = assert_merged_callable(&context, &declarations);
+        if let Some(early) = early {
+            assert_eq!(early, merged.callable);
+        }
+        assert_eq!(context.get_type_from_type_node(query), Ok(merged.callable));
+        assert_queries(&mut context, &inputs.source, &merged);
+        assert_failures(&mut context, &inputs.source, &declarations, &merged);
+        assert_providers_unchecked(&context);
+        let before = snapshot(&context, &declarations);
+        for _ in 0..2 {
+            context.recheck_source_file(SOURCE).unwrap();
+            assert_eq!(context.get_type_from_type_node(query), Ok(merged.callable));
+            assert_eq!(assert_merged_callable(&context, &declarations), merged);
+            assert_queries(&mut context, &inputs.source, &merged);
+            assert_failures(&mut context, &inputs.source, &declarations, &merged);
+            assert_providers_unchecked(&context);
+            assert_eq!(snapshot(&context, &declarations), before);
+        }
+    }
+}
+
+#[test]
+fn external_global_type_query_keeps_lazy_identity_through_overload_demand() {
+    check_augmented_callable_type_query(false);
+}
+
+#[test]
+fn ambient_module_global_type_query_keeps_lazy_identity_through_overload_demand() {
+    check_augmented_callable_type_query(true);
+}

@@ -174,6 +174,9 @@ pub(super) fn validate_stored_callable_set_with_array_targets(
     let family = CallableFamily::SourceFunctionOverloads;
     match validate_stored_source_overload(store, type_) {
         StoredSourceOverloadValidation::NotSourceOverload => {}
+        StoredSourceOverloadValidation::Pending => {
+            return StoredCallableSetValidation::Pending { family };
+        }
         StoredSourceOverloadValidation::Malformed => {
             return StoredCallableSetValidation::Malformed { family };
         }

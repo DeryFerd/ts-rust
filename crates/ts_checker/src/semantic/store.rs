@@ -623,6 +623,14 @@ pub(super) struct SourceOverloadProvenance {
     pub(super) array_targets: Option<CanonicalArrayTargets>,
 }
 
+/// Source ownership for a callable value whose signatures have not been requested.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceOverloadIdentity {
+    pub(super) owner_symbol: SemanticSymbolId,
+    pub(super) declarations: Box<[NodeRef]>,
+    pub(super) members: Option<SymbolTableId>,
+}
+
 /// Fully resolved parameter row staged before overload publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PreparedSourceOverloadParameter {
@@ -933,6 +941,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_file_namespace_wrapper_aliases: HashMap<SemanticSymbolId, SemanticSymbolId>,
     source_file_namespace_wrapper_defaults: HashMap<SemanticSymbolId, SemanticSymbolId>,
     source_overload_provenance: HashMap<TypeId, SourceOverloadProvenance>,
+    source_overload_identities: HashMap<TypeId, SourceOverloadIdentity>,
     source_overload_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_overload_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
     source_overload_types_by_signature: HashMap<SignatureId, TypeId>,
@@ -1156,6 +1165,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_file_namespace_wrapper_aliases: HashMap::new(),
             source_file_namespace_wrapper_defaults: HashMap::new(),
             source_overload_provenance: HashMap::new(),
+            source_overload_identities: HashMap::new(),
             source_overload_types_by_declaration: HashMap::new(),
             source_overload_types_by_owner: HashMap::new(),
             source_overload_types_by_signature: HashMap::new(),
@@ -5586,6 +5596,32 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     #[must_use]
+    pub(super) fn source_overload_identity(
+        &self,
+        type_: TypeId,
+    ) -> Option<&SourceOverloadIdentity> {
+        self.observe_relation_type_read(type_);
+        self.source_overload_identities.get(&type_)
+    }
+
+    pub(super) fn source_overload_identity_conflicts(
+        &self,
+        owner: SemanticSymbolId,
+        declarations: &[NodeRef],
+        expected: Option<TypeId>,
+    ) -> bool {
+        self.source_overload_identities
+            .iter()
+            .any(|(&type_, identity)| {
+                Some(type_) != expected
+                    && (identity.owner_symbol == owner
+                        || identity
+                            .declarations
+                            .iter()
+                            .any(|node| declarations.contains(node)))
+            })
+    }
+
     pub(super) fn source_overload_provenance(
         &self,
         type_: TypeId,
@@ -12822,6 +12858,45 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
     /// first callable identity is allocated. Once allocation begins, all
     /// reverse-map and link writes are infallible assertions over the reserved
     /// batch.
+    pub(super) fn publish_source_overload_identity(
+        &mut self,
+        identity: SourceOverloadIdentity,
+    ) -> Option<TypeId> {
+        if !super::source_overloads::source_overload_identity_header_is_exact(self, &identity)
+            || !super::source_overloads::source_overload_identity_links_are_cold(self, &identity)
+            || self
+                .value_symbol_links(identity.owner_symbol)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+            || self.source_overload_identity_conflicts(
+                identity.owner_symbol,
+                &identity.declarations,
+                None,
+            )
+            || !self.try_reserve_types(1)
+            || !self.links.value_symbol.try_reserve(1)
+            || self.source_overload_identities.try_reserve(1).is_err()
+        {
+            return None;
+        }
+        let type_ = self.alloc_plain_object_type(
+            super::types::ObjectFlags::ANONYMOUS,
+            Some(identity.owner_symbol),
+        )?;
+        assert!(self.set_value_symbol_links(
+            identity.owner_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert!(
+            self.source_overload_identities
+                .insert(type_, identity)
+                .is_none()
+        );
+        Some(type_)
+    }
+
     pub(super) fn publish_source_overload_batch(
         &mut self,
         prepared: Vec<PreparedSourceOverloadPublication>,
@@ -12860,6 +12935,20 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                     .source_global_function_namespace_declarations(group.owner_symbol)
                     .as_deref()
                     == Some(declaration_order.as_slice());
+            let pending = self
+                .value_symbol_links(group.owner_symbol)
+                .and_then(|links| links.resolved_type)
+                .filter(|&type_| self.source_overload_identities.contains_key(&type_));
+            if let Some(type_) = pending {
+                let identity = self.source_overload_identity(type_)?;
+                if !global_namespace
+                    || identity.owner_symbol != group.owner_symbol
+                    || identity.declarations.as_ref() != declaration_order
+                    || !super::source_overloads::validate_pending_source_overload(self, type_)
+                {
+                    return None;
+                }
+            }
             if group.signatures.len() < 2 && !global_namespace
                 || group.implementation.is_some_and(|implementation| {
                     declaration_order.last().copied() != Some(implementation.declaration)
@@ -12895,9 +12984,10 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                     SourceNodeParent::Parent(parent) => self.source_node_kind(parent),
                     SourceNodeParent::Root => None,
                 }) != Some(SyntaxKind::SourceFile)
-                || self
-                    .value_symbol_links(group.owner_symbol)
-                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+                || pending.is_none()
+                    && self
+                        .value_symbol_links(group.owner_symbol)
+                        .is_some_and(|links| links != &ValueSymbolLinks::default())
                 || self
                     .source_callable_types_by_owner
                     .contains_key(&group.owner_symbol)
@@ -13144,12 +13234,20 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         let mut published = Vec::with_capacity(group_count);
         for group in prepared {
             let members = self.symbol(group.owner_symbol).and_then(Symbol::exports);
-            let type_ = self
-                .alloc_plain_object_type(
+            let pending = self
+                .value_symbol_links(group.owner_symbol)
+                .and_then(|links| links.resolved_type)
+                .filter(|&type_| self.source_overload_identities.contains_key(&type_));
+            let type_ = if let Some(type_) = pending {
+                assert!(self.source_overload_identities.remove(&type_).is_some());
+                type_
+            } else {
+                self.alloc_plain_object_type(
                     super::types::ObjectFlags::ANONYMOUS,
                     Some(group.owner_symbol),
                 )
-                .expect("source overload owner was prevalidated");
+                .expect("source overload owner was prevalidated")
+            };
             let mut signature_ids = Vec::with_capacity(group.signatures.len());
             for signature in &group.signatures {
                 let signature_id = self

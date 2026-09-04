@@ -6031,6 +6031,7 @@ struct TypeQueryPlan {
     class_type_queries: BTreeMap<SemanticSymbolId, ClassMemberQueryPlan>,
     imported_callable_type_queries:
         BTreeMap<SemanticSymbolId, source_callables::SourceCallablePlan>,
+    overload_type_queries: BTreeMap<SemanticSymbolId, super::store::SourceOverloadIdentity>,
     literals: BTreeMap<NodeRef, PlannedLiteralType>,
     unions: BTreeMap<NodeRef, PlannedUnionType>,
     defaulted_interface_unions: BTreeSet<NodeRef>,
@@ -22826,6 +22827,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if symbol_record.flags().intersects(SymbolFlags::ALIAS) {
             return self.plan_namespace_alias_type_query(node, name, symbol);
         }
+        if self
+            .store
+            .source_global_function_namespace_declarations(symbol)
+            .is_some()
+        {
+            return self.plan_overload_value_type_query(node, name, resolved_symbol, symbol);
+        }
         let declaration = if merged_read.is_some() {
             super::variables::merged_type_value_declarations(self.store, symbol)
                 .ok_or_else(unsupported)?
@@ -23167,6 +23175,64 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         {
             return Err(invalid());
         }
+        Ok(())
+    }
+
+    fn plan_overload_value_type_query(
+        &mut self,
+        node: NodeRef,
+        name: NodeRef,
+        resolved_symbol: SemanticSymbolId,
+        symbol: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let (identity, type_) =
+            super::source_overloads::plan_source_overload_value_identity(self.store, symbol)
+                .map_err(|_| invalid())?;
+        let cached_type = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type);
+        let cached_symbol = self
+            .store
+            .symbol_node_links(name)
+            .and_then(|links| links.resolved_symbol);
+        if self
+            .store
+            .type_node_links(node)
+            .is_some_and(|links| links.outer_type_parameters.is_some())
+            || self
+                .store
+                .symbol_node_links(node)
+                .is_some_and(|links| links.resolved_symbol.is_some())
+            || cached_type.is_some_and(|cached| Some(cached) != type_)
+            || cached_symbol.is_some_and(|cached| cached != resolved_symbol)
+            || cached_type.is_some() != cached_symbol.is_some()
+        {
+            return Err(invalid());
+        }
+        let query = PlannedValueTypeQuery {
+            name,
+            symbol,
+            resolved_symbol,
+            source_node: None,
+            type_,
+        };
+        if self
+            .plan
+            .overload_type_queries
+            .get(&symbol)
+            .is_some_and(|old| old != &identity)
+            || self
+                .plan
+                .type_queries
+                .get(&node)
+                .is_some_and(|old| old != &query)
+        {
+            return Err(invalid());
+        }
+        self.plan.overload_type_queries.insert(symbol, identity);
+        self.plan.type_queries.insert(node, query);
         Ok(())
     }
 
@@ -52707,6 +52773,25 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 nested.get_type_of_source_callable(callable.declaration, callable.owner_symbol)
             })
             .transpose()?;
+        let overload_value = if let Some(identity) = plan.overload_type_queries.get(&query.symbol) {
+            let (current, value) = super::source_overloads::plan_source_overload_value_identity(
+                self.store,
+                query.symbol,
+            )
+            .map_err(|_| invalid())?;
+            if current != *identity {
+                return Err(invalid());
+            }
+            Some(match value {
+                Some(value) => value,
+                None => self
+                    .store
+                    .publish_source_overload_identity(current)
+                    .ok_or_else(invalid)?,
+            })
+        } else {
+            None
+        };
         let source_type = match query.source_node {
             Some(source_node) => {
                 match self
@@ -52735,6 +52820,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .or(source_type)
             .or(class_value)
             .or(callable_value)
+            .or(overload_value)
             .or(namespace_value)
             .ok_or_else(invalid)?;
         let value_type = self
@@ -52745,6 +52831,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             || source_type.is_some_and(|type_| type_ != expected)
             || class_value.is_some_and(|type_| type_ != expected)
             || callable_value.is_some_and(|type_| type_ != expected)
+            || overload_value.is_some_and(|type_| type_ != expected)
             || namespace_value.is_some_and(|type_| type_ != expected)
             || value_type.is_none()
                 && source_type != Some(expected)
