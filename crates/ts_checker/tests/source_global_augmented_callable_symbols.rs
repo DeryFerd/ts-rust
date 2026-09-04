@@ -680,6 +680,71 @@ fn external_global_type_query_keeps_lazy_identity_through_overload_demand() {
 }
 
 #[test]
+fn conditional_return_inference_demands_pending_global_overloads() {
+    for nested in [false, true] {
+        let inputs = Inputs {
+            source: parse_source_file(concat!(
+                "export {};\n",
+                "type Last<T> = T extends (...args: any) => infer R ? R : never;\n",
+                "type Actual = Last<typeof parseInt>;\n",
+            )),
+            ..Inputs::new(nested)
+        };
+        let declarations = Declarations::new(&inputs);
+        let arena = &inputs.source.arena;
+        let query = arena.iter().find_map(|(id, node)| {
+            (node.kind == SyntaxKind::TypeQuery)
+                .then_some(NodeRef::new(arena.id(), SOURCE, id))
+        }).unwrap();
+        let actual = arena.iter().find_map(|(_, node)| {
+            let NodeData::TypeAliasDeclaration(alias) = &node.data else { return None };
+            let NodeData::Identifier(name) = &arena.get(alias.name)?.data else { return None };
+            (name.text == "Actual")
+                .then_some(NodeRef::new(arena.id(), SOURCE, alias.type_))
+        }).unwrap();
+        for query_first in [true, false] {
+            let mut context = inputs.context();
+            let early = query_first.then(|| {
+                let callable = context.get_type_from_type_node(query).unwrap();
+                let TypeData::Object(object) = context.store().type_payload(callable).unwrap().data()
+                else { panic!("expected a pending callable") };
+                assert!(object.structured.signatures.is_none());
+                assert!(object.structured.members.is_none());
+                let expected = context.store().intrinsic_bootstrap().unwrap().boolean_type;
+                assert_eq!(context.get_type_from_type_node(actual), Ok(expected));
+                assert_providers_unchecked(&context);
+                assert!(!context.store().source_file_links(context.source_file(SOURCE).unwrap())
+                    .is_some_and(|links| links.type_checked));
+                assert_eq!(context.get_type_from_type_node(query), Ok(callable));
+                callable
+            });
+            context.check_source_file(SOURCE).unwrap();
+            assert!(context.diagnostics().is_empty(), "{:?}", context.diagnostics());
+            let expected = context.store().intrinsic_bootstrap().unwrap().boolean_type;
+            assert_eq!(context.get_type_from_type_node(actual), Ok(expected));
+            let callable = context.get_type_from_type_node(query).unwrap();
+            assert!(early.is_none_or(|early| early == callable));
+            let owner = symbol(&context, declarations.functions[0]);
+            assert_eq!(value_type(&context, owner), callable);
+            let signatures = declarations.functions.map(|node| signature(&context, node));
+            let TypeData::Object(object) = context.store().type_payload(callable).unwrap().data()
+            else { panic!("expected the completed callable") };
+            assert_eq!(object.structured.signatures.as_deref(), Some(signatures.as_slice()));
+            assert_eq!(context.get_return_type_of_signature(signatures[2]), Ok(expected));
+            assert_providers_unchecked(&context);
+            let before = (snapshot(&context, &declarations), context.store().relation_state_snapshot());
+            for _ in 0..2 {
+                context.recheck_source_file(SOURCE).unwrap();
+                assert_eq!(context.get_type_from_type_node(query), Ok(callable));
+                assert_eq!(context.get_type_from_type_node(actual), Ok(expected));
+                assert_providers_unchecked(&context);
+                assert_eq!((snapshot(&context, &declarations), context.store().relation_state_snapshot()), before);
+            }
+        }
+    }
+}
+
+#[test]
 fn ambient_module_global_type_query_keeps_lazy_identity_through_overload_demand() {
     check_augmented_callable_type_query(true);
 }
