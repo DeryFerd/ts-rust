@@ -6,6 +6,7 @@
 //! An exported class can merge with one namespace that exports its constructor.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use ts_ast::{ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{
@@ -299,18 +300,144 @@ struct ModuleValuePlan {
     declarations: Box<[NodeRef]>,
     value_declaration: Option<NodeRef>,
     exports: Option<SymbolTableId>,
-    export_members: Box<[ModuleValueExport]>,
+    export_proof: Arc<NamespaceExportProof>,
     parent: Option<SemanticSymbolId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ModuleValueExport {
+pub(super) struct NamespaceExportProof {
+    owner: SemanticSymbolId,
+    namespaces: Box<[NodeRef]>,
+    members: Option<SymbolTableId>,
+    exports: Box<[NamespaceExportRow]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NamespaceExportRow {
     name: EscapedName,
+    table_symbol: SemanticSymbolId,
     symbol: SemanticSymbolId,
+    table_record: NamespaceExportSymbol,
+    value_record: NamespaceExportSymbol,
+    readonly: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NamespaceExportSymbol {
     declarations: Box<[NodeRef]>,
     flags: SymbolFlags,
     value_declaration: Option<NodeRef>,
-    readonly: bool,
+    parent: Option<SemanticSymbolId>,
+}
+
+impl NamespaceExportSymbol {
+    fn capture(record: &ts_binder::semantic::Symbol) -> Self {
+        Self {
+            declarations: record.declarations().unwrap_or_default().into(),
+            flags: record.flags(),
+            value_declaration: record.value_declaration(),
+            parent: record.parent(),
+        }
+    }
+
+    fn matches(&self, record: &ts_binder::semantic::Symbol) -> bool {
+        record.check_flags() == CheckFlags::NONE
+            && record.flags() == self.flags
+            && record.declarations() == Some(self.declarations.as_ref())
+            && record.value_declaration() == self.value_declaration
+            && record.parent() == self.parent
+    }
+}
+
+impl NamespaceExportProof {
+    pub(super) fn cached_value_types(
+        &self,
+        store: &CanonicalTypeMapperStore,
+    ) -> Option<Vec<TypeId>> {
+        let mut types = Vec::new();
+        for row in &self.exports {
+            if !row.value_record.flags.intersects(SymbolFlags::VALUE) {
+                continue;
+            }
+            let Some(links) = store.value_symbol_links(row.symbol) else { continue };
+            let expected = ValueSymbolLinks {
+                resolved_type: links.resolved_type,
+                ..ValueSymbolLinks::default()
+            };
+            if links != &expected {
+                return None;
+            }
+            if let Some(type_) = links.resolved_type {
+                store.type_payload(type_)?;
+                types.push(type_);
+            }
+        }
+        Some(types)
+    }
+
+    pub(super) fn validate(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        owner: SemanticSymbolId,
+        namespaces: &[NodeRef],
+        members: Option<SymbolTableId>,
+    ) -> bool {
+        if self.owner != owner
+            || self.namespaces.as_ref() != namespaces
+            || self.members != members
+            || store.get_merged_symbol(owner) != Some(owner)
+            || store.symbol(owner).is_none_or(|record| record.exports() != members)
+            || namespaces.iter().any(|&node| {
+                store.source_node_kind(node) != Some(SyntaxKind::ModuleDeclaration)
+                    || !store.source_declaration_belongs_to_symbol(node, owner)
+            })
+        {
+            return false;
+        }
+        let table = match members {
+            Some(table) => match store.symbol_table(table) {
+                Some(table) => Some(table),
+                None => return false,
+            },
+            None => None,
+        };
+        if table.map_or(0, ts_binder::semantic::SymbolTable::len) != self.exports.len() {
+            return false;
+        }
+        if table.is_some_and(|table| {
+            table.iter().zip(self.exports.iter()).any(|((name, symbol), export)| {
+                name != export.name.as_ref() || symbol != export.table_symbol
+            })
+        }) {
+            return false;
+        }
+        for export in &self.exports {
+            let Some(raw) = store.symbol(export.table_symbol) else { return false };
+            let Some(value) = store.symbol(export.symbol) else { return false };
+            if table.and_then(|table| table.get(export.name.as_ref())) != Some(export.table_symbol)
+                || store.get_merged_symbol(export.table_symbol) != Some(export.symbol)
+                || store.get_merged_symbol(export.symbol) != Some(export.symbol)
+                || raw.name() != export.name.as_ref()
+                || value.name() != export.name.as_ref()
+                || !export.table_record.matches(raw)
+                || !export.value_record.matches(value)
+                || raw.parent().and_then(|parent| store.get_merged_symbol(parent)) != Some(owner)
+                || value.parent().and_then(|parent| store.get_merged_symbol(parent)) != Some(owner)
+                || store.get_parent_of_symbol(export.symbol) != Some(owner)
+                || export.table_symbol != export.symbol
+                    && !store.source_raw_symbol_declarations_match(export.table_symbol)
+                || export.value_record.declarations.iter().any(|&declaration| {
+                    !store.source_declaration_belongs_to_symbol(declaration, export.symbol)
+                })
+                || export.value_record.value_declaration.is_some_and(|node| {
+                    !export.value_record.declarations.contains(&node)
+                })
+            {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 struct ModuleExportDeclaration {
@@ -346,7 +473,7 @@ pub(super) struct ModuleValueMembers<'a> {
     type_: TypeId,
     members: Option<SymbolTableId>,
     properties: &'a [SemanticSymbolId],
-    exports: &'a [ModuleValueExport],
+    exports: &'a [NamespaceExportRow],
 }
 
 impl<'a> ModuleValueMembers<'a> {
@@ -365,7 +492,7 @@ impl<'a> ModuleValueMembers<'a> {
     pub(super) fn is_readonly(&self, symbol: SemanticSymbolId) -> bool {
         self.exports
             .iter()
-            .any(|export| export.symbol == symbol && export.readonly)
+            .any(|export| export.table_symbol == symbol && export.readonly)
     }
 }
 
@@ -499,7 +626,7 @@ pub(super) fn validate_module_export_table(
     declarations: &[NodeRef],
     exports: Option<SymbolTableId>,
 ) -> Result<(), SourceCheckError> {
-    module_value_exports(store, host, owner, declarations, exports).map(|_| ())
+    plan_namespace_export_proof(store, host, owner, declarations, exports).map(|_| ())
 }
 
 /// Proves the source parent of an alias replaced by a native ambient export merge.
@@ -620,13 +747,13 @@ fn module_value_export_readonly(
     Ok(flags & (NODE_FLAG_CONST | NODE_FLAG_USING) != 0)
 }
 
-fn module_value_exports(
+pub(super) fn plan_namespace_export_proof(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     owner: SemanticSymbolId,
     declarations: &[NodeRef],
     exports: Option<SymbolTableId>,
-) -> Result<Box<[ModuleValueExport]>, SourceCheckError> {
+) -> Result<NamespaceExportProof, SourceCheckError> {
     let invalid = || SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(owner));
     let mut expected = BTreeMap::<EscapedName, Vec<ModuleExportDeclaration>>::new();
     for &declaration in declarations {
@@ -645,7 +772,12 @@ fn module_value_exports(
     let native = validate_native_ambient_module_exports(store, host, owner, &expected)?;
     let Some(exports) = exports else {
         return if expected.is_empty() {
-            Ok(Box::default())
+            Ok(NamespaceExportProof {
+                owner,
+                namespaces: declarations.into(),
+                members: None,
+                exports: Box::default(),
+            })
         } else {
             Err(invalid())
         };
@@ -655,7 +787,8 @@ fn module_value_exports(
         return Err(invalid());
     }
     let mut members = Vec::with_capacity(expected.len());
-    for (name, symbol) in table.iter() {
+    for (name, table_symbol) in table.iter() {
+        let symbol = store.get_merged_symbol(table_symbol).ok_or_else(invalid)?;
         let source = expected.get(&name.to_owned()).ok_or_else(invalid)?;
         let source = source
             .iter()
@@ -664,6 +797,7 @@ fn module_value_exports(
                     || store.get_merged_symbol(export.symbol) == store.get_merged_symbol(symbol)
             })
             .collect::<Vec<_>>();
+        let raw = store.symbol(table_symbol).ok_or_else(invalid)?;
         let record = store.symbol(symbol).ok_or_else(invalid)?;
         let Some(actual) = record.declarations() else {
             return Err(invalid());
@@ -674,7 +808,19 @@ fn module_value_exports(
         if allowed_flags.intersects(SymbolFlags::MODULE) {
             allowed_flags |= SymbolFlags::CONST_ENUM_ONLY_MODULE;
         }
-        if record.name() != name
+        if store.get_merged_symbol(symbol) != Some(symbol)
+            || raw.name() != name
+            || raw.check_flags() != CheckFlags::NONE
+            || raw.parent().and_then(|parent| store.get_merged_symbol(parent)) != Some(owner)
+            || table_symbol != symbol && !store.source_raw_symbol_declarations_match(table_symbol)
+            || raw.declarations().is_none_or(|declarations| {
+                declarations.iter().any(|&node| {
+                    !actual.contains(&node)
+                        || !store.source_declaration_belongs_to_symbol(node, symbol)
+                        || !host.symbol_matches(store, node, symbol)
+                }) || raw.value_declaration().is_some_and(|node| !declarations.contains(&node))
+            })
+            || record.name() != name
             || record.check_flags() != CheckFlags::NONE
             || record.flags().without(allowed_flags) != SymbolFlags::NONE
             || record.flags().contains(SymbolFlags::TRANSIENT)
@@ -689,6 +835,8 @@ fn module_value_exports(
                 !actual.contains(&export.node)
                     || !record.flags().intersects(export.flags)
                     || store.get_merged_symbol(export.symbol) != store.get_merged_symbol(symbol)
+                    || !store.source_declaration_belongs_to_symbol(export.node, symbol)
+                    || !host.symbol_matches(store, export.node, symbol)
             })
             || record
                 .value_declaration()
@@ -697,16 +845,21 @@ fn module_value_exports(
         {
             return Err(invalid());
         }
-        members.push(ModuleValueExport {
+        members.push(NamespaceExportRow {
             name: name.to_owned(),
+            table_symbol,
             symbol,
-            declarations: actual.into(),
-            flags: record.flags(),
-            value_declaration: record.value_declaration(),
+            table_record: NamespaceExportSymbol::capture(raw),
+            value_record: NamespaceExportSymbol::capture(record),
             readonly: module_value_export_readonly(store, host, symbol)?,
         });
     }
-    Ok(members.into_boxed_slice())
+    Ok(NamespaceExportProof {
+        owner,
+        namespaces: declarations.into(),
+        members: Some(exports),
+        exports: members.into_boxed_slice(),
+    })
 }
 
 fn native_ambient_export_table_is_exact(
@@ -1083,14 +1236,16 @@ fn plan_module_value(
     if owner.flags().contains(SymbolFlags::TRANSIENT) && !merged_declaration {
         return Err(invalid());
     }
-    let export_members = module_value_exports(store, host, symbol, declarations, exports)?;
+    let export_proof = Arc::new(plan_namespace_export_proof(
+        store, host, symbol, declarations, exports,
+    )?);
     Ok(ModuleValuePlan {
         symbol,
         flags: owner.flags(),
         declarations: declarations.into(),
         value_declaration: owner.value_declaration(),
         exports,
-        export_members,
+        export_proof,
         parent: expected_parent.flatten(),
     })
 }
@@ -1161,10 +1316,10 @@ fn module_value_type_matches(
         return false;
     }
     let properties = plan
-        .export_members
+        .export_proof.exports
         .iter()
-        .filter(|export| export.flags.intersects(SymbolFlags::VALUE))
-        .map(|export| export.symbol)
+        .filter(|export| export.value_record.flags.intersects(SymbolFlags::VALUE))
+        .map(|export| export.table_symbol)
         .collect::<Vec<_>>();
     object.structured.properties.as_deref().unwrap_or_default() == properties
 }
@@ -1243,33 +1398,8 @@ pub(super) fn validated_module_value_members(
             }
         }
     }
-    let table = plan
-        .exports
-        .map(|exports| store.symbol_table(exports).ok_or_else(invalid))
-        .transpose()?;
-    if table.map_or(0, ts_binder::semantic::SymbolTable::len) != plan.export_members.len() {
+    if !plan.export_proof.validate(store, symbol, &plan.declarations, plan.exports) {
         return Err(invalid());
-    }
-    for export in &plan.export_members {
-        let member = store.symbol(export.symbol).ok_or_else(invalid)?;
-        let canonical = store.get_merged_symbol(export.symbol).ok_or_else(invalid)?;
-        if table.and_then(|table| table.get(export.name.as_ref())) != Some(export.symbol)
-            || member.name() != export.name.as_ref()
-            || member.flags() != export.flags
-            || member.check_flags() != CheckFlags::NONE
-            || member.declarations() != Some(export.declarations.as_ref())
-            || member.value_declaration() != export.value_declaration
-            || member
-                .parent()
-                .and_then(|parent| store.get_merged_symbol(parent))
-                != Some(symbol)
-            || store.get_parent_of_symbol(export.symbol) != Some(symbol)
-            || export.declarations.iter().any(|&declaration| {
-                !store.source_declaration_belongs_to_symbol(declaration, canonical)
-            })
-        {
-            return Err(invalid());
-        }
     }
     if !record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED) {
         return Err(RelationUnavailable::UnresolvedStructuredMembers(type_));
@@ -1283,7 +1413,7 @@ pub(super) fn validated_module_value_members(
         type_,
         members: plan.exports,
         properties,
-        exports: &plan.export_members,
+        exports: &plan.export_proof.exports,
     }))
 }
 
@@ -12848,7 +12978,7 @@ fn validate_ambient_module_merge_dependencies(
     let owner = store.symbol(plan.symbol).ok_or_else(invalid)?;
     let declarations = owner.declarations().ok_or_else(invalid)?;
     if store.native_ambient_module_exports(plan.symbol).is_some() {
-        return module_value_exports(store, host, plan.symbol, declarations, owner.exports())
+        return plan_namespace_export_proof(store, host, plan.symbol, declarations, owner.exports())
             .map(drop)
             .map_err(|_| invalid());
     }

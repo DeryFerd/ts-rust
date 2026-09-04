@@ -621,6 +621,7 @@ pub(super) struct SourceOverloadProvenance {
     pub(super) signatures: Box<[SourceOverloadSignatureProvenance]>,
     pub(super) implementation: Option<SourceOverloadImplementation>,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
+    pub(super) namespace_exports: Option<Arc<super::source_namespaces::NamespaceExportProof>>,
 }
 
 /// Source ownership for a callable value whose signatures have not been requested.
@@ -664,6 +665,7 @@ pub(super) struct PreparedSourceOverloadPublication {
     pub(super) signatures: Vec<PreparedSourceOverloadSignature>,
     pub(super) implementation: Option<SourceOverloadImplementation>,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
+    pub(super) namespace_exports: Option<Arc<super::source_namespaces::NamespaceExportProof>>,
 }
 
 /// Immutable syntax-plan edges for the admitted direct-interface heritage slice.
@@ -12949,7 +12951,9 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                     return None;
                 }
             }
-            if group.signatures.len() < 2 && !global_namespace
+            if !super::source_overloads::source_overload_namespace_exports_match(
+                self, group.owner_symbol, group.namespace_exports.as_deref(),
+            ) || group.signatures.len() < 2 && !global_namespace
                 || group.implementation.is_some_and(|implementation| {
                     declaration_order.last().copied() != Some(implementation.declaration)
                         || self.source_node_kind(implementation.body) != Some(SyntaxKind::Block)
@@ -13327,6 +13331,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                             signatures: provenance_rows,
                             implementation: group.implementation,
                             array_targets: group.array_targets,
+                            namespace_exports: group.namespace_exports.clone(),
                         },
                     )
                     .is_none()

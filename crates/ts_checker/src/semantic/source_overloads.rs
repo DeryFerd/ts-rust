@@ -46,6 +46,7 @@ pub(super) struct SourceOverloadPlan {
     pub(super) declarations: Vec<SourceCallablePlan>,
     pub(super) implementation: Option<SourceOverloadImplementation>,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
+    pub(super) namespace_exports: Option<Arc<super::source_namespaces::NamespaceExportProof>>,
 }
 
 /// One annotated parameter retained without publishing a namespace overload.
@@ -846,6 +847,16 @@ fn plan_source_overload_group(
             SourceOverloadInvariant::Group(first),
         ));
     }
+    let namespaces = owner.declarations().unwrap_or_default().iter().copied()
+        .filter(|&node| store.source_node_kind(node) == Some(SyntaxKind::ModuleDeclaration))
+        .collect::<Vec<_>>();
+    let namespace_exports = if namespaces.is_empty() {
+        None
+    } else {
+        Some(Arc::new(super::source_namespaces::plan_namespace_export_proof(
+            store, host, owner_symbol, &namespaces, owner.exports(),
+        ).map_err(|_| SourceOverloadError::Invariant(SourceOverloadInvariant::Group(first)))?))
+    };
     reject_conflicting_top_level_variables(host, first, owner.name().as_utf8())?;
     let mut plans = Vec::with_capacity(declarations.len());
     for declaration in declarations {
@@ -919,6 +930,7 @@ fn plan_source_overload_group(
         declarations: plans,
         implementation,
         array_targets,
+        namespace_exports,
     };
     validate_plan_state(store, &plan)?;
     Ok(plan)
@@ -1015,7 +1027,9 @@ fn prepare_source_overload_publication_worker(
         .ok_or(SourceOverloadError::Invariant(
             SourceOverloadInvariant::EmptyGroup,
         ))?;
-    if plan.declarations.len() != resolved.len() {
+    if plan.declarations.len() != resolved.len()
+        || !source_overload_namespace_exports_match(store, plan.owner_symbol, plan.namespace_exports.as_deref())
+    {
         return Err(SourceOverloadError::Invariant(
             SourceOverloadInvariant::Publication(first.declaration),
         ));
@@ -1208,6 +1222,7 @@ fn prepare_source_overload_publication_worker(
         signatures,
         implementation: plan.implementation,
         array_targets: plan.array_targets,
+        namespace_exports: plan.namespace_exports.clone(),
     })
 }
 
@@ -1424,7 +1439,8 @@ fn source_overload_state(
             .source_global_function_namespace_declarations(plan.owner_symbol)
             .as_deref()
             == Some(declaration_nodes.as_slice());
-    if plan.declarations.len() < 2 && !global_namespace
+    if !source_overload_namespace_exports_match(store, plan.owner_symbol, plan.namespace_exports.as_deref())
+        || plan.declarations.len() < 2 && !global_namespace
         || plan
             .declarations
             .iter()
@@ -1544,6 +1560,7 @@ fn source_overload_state(
     if provenance.owner_symbol != plan.owner_symbol
         || provenance.implementation != plan.implementation
         || provenance.array_targets != plan.array_targets
+        || provenance.namespace_exports != plan.namespace_exports
         || provenance.signatures.len() != plan.declarations.len()
     {
         return Err(SourceOverloadError::Invariant(
@@ -1614,6 +1631,8 @@ fn prepared_matches_plan(
     group.owner_symbol == prepared.owner_symbol
         && group.implementation == prepared.implementation
         && group.array_targets == prepared.array_targets
+        && group.namespace_exports == prepared.namespace_exports
+        && source_overload_namespace_exports_match(store, group.owner_symbol, group.namespace_exports.as_deref())
         && group.declarations.len() == prepared.signatures.len()
         && group
             .declarations
@@ -1670,6 +1689,25 @@ fn prepared_matches_plan(
                         }
                     }
             })
+}
+
+pub(super) fn source_overload_namespace_exports_match(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    proof: Option<&super::source_namespaces::NamespaceExportProof>,
+) -> bool {
+    let Some(record) = store.symbol(owner) else { return false };
+    let namespaces = record.declarations().unwrap_or_default().iter().copied()
+        .filter(|&node| store.source_node_kind(node) == Some(SyntaxKind::ModuleDeclaration))
+        .collect::<Vec<_>>();
+    if namespaces.is_empty() {
+        proof.is_none() && record.exports().is_none()
+    } else {
+        proof.is_some_and(|proof| {
+            proof.validate(store, owner, &namespaces, record.exports())
+                && proof.cached_value_types(store).is_some()
+        })
+    }
 }
 
 pub(super) fn source_overload_identity_header_is_exact(
@@ -1862,6 +1900,7 @@ pub(super) fn validate_stored_source_overload(
         return StoredSourceOverloadValidation::Malformed;
     };
     if provenance.owner_symbol != owner_symbol
+        || !source_overload_namespace_exports_match(store, owner_symbol, provenance.namespace_exports.as_deref())
         || provenance.signatures.len() < 2 && !global_namespace
         || !global_namespace
             && (owner.flags() != SymbolFlags::FUNCTION
@@ -1924,7 +1963,13 @@ pub(super) fn validate_stored_source_overload(
         return StoredSourceOverloadValidation::Malformed;
     }
 
-    let mut edges = Vec::new();
+    let mut edges = match provenance.namespace_exports.as_deref() {
+        Some(proof) => match proof.cached_value_types(store) {
+            Some(edges) => edges,
+            None => return StoredSourceOverloadValidation::Malformed,
+        },
+        None => Vec::new(),
+    };
     let Some(strict_null_checks) = store
         .intrinsic_bootstrap()
         .map(|bootstrap| bootstrap.options.strict_null_checks)
