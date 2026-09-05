@@ -304,7 +304,7 @@ pub(super) fn single_callable_display_projection(
     }
 }
 
-/// Reads nonempty fixed method parameters after the source and stored owners agree.
+/// Reads a fixed method signature after the source and stored owners agree.
 pub(super) fn fixed_method_display_projection(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -423,8 +423,7 @@ pub(super) fn fixed_method_display_projection(
             ),
             _ => return Ok(None),
         };
-    if parameters.is_empty()
-        || type_parameters.is_some()
+    if type_parameters.is_some()
         || method_record.name().is_private_identifier()
         || method_record.name().is_reserved_member_name()
         || method_record.name().is_late_bound()
