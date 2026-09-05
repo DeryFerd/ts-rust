@@ -5871,6 +5871,7 @@ impl SourceMappedLookupReferenceProof {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ConditionalAliasReferenceProof {
     reference: NodeRef,
+    reference_kind: SyntaxKind,
     conditional_type: TypeId,
     root_type_arguments: Vec<TypeId>,
     alias_symbol: Option<SemanticSymbolId>,
@@ -5897,7 +5898,7 @@ impl ConditionalAliasReferenceProof {
     ) -> bool {
         self.conditional_type == conditional_type
             && self.root_type_arguments == type_arguments
-            && store.source_node_kind(self.reference) == Some(SyntaxKind::TypeReference)
+            && store.source_node_kind(self.reference) == Some(self.reference_kind)
     }
 }
 
@@ -54791,6 +54792,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         plan: &TypeQueryPlan,
     ) -> Result<ConditionalAliasReferenceProof, DeclaredTypeError> {
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let reference_kind = match self.store.source_node_kind(node) {
+            Some(SyntaxKind::TypeReference) => SyntaxKind::TypeReference,
+            Some(SyntaxKind::ExpressionWithTypeArguments) => {
+                let owner = source_class_implementation_owner(self.store, self.host, node)?
+                    .ok_or_else(&invalid)?;
+                if self.source_class_heritage != Some(node)
+                    || self.source_class_annotation != Some(owner)
+                    || alias.is_some()
+                {
+                    return Err(invalid());
+                }
+                SyntaxKind::ExpressionWithTypeArguments
+            }
+            _ => return Err(invalid()),
+        };
         let expected = plan.references.get(&node).ok_or_else(invalid)?;
         if expected.symbol != reference.symbol
             || expected.alias_owner != reference.alias_owner
@@ -54801,7 +54817,6 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .type_alias_links(reference.symbol)
                 .and_then(|links| links.declared_type)
                 != Some(declared_type)
-            || self.store.source_node_kind(node) != Some(SyntaxKind::TypeReference)
             || alias.map(|(symbol, _)| *symbol) != reference.alias_owner
         {
             return Err(invalid());
@@ -54834,6 +54849,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
         Ok(ConditionalAliasReferenceProof {
             reference: node,
+            reference_kind,
             conditional_type: declared_type,
             root_type_arguments: root_arguments.to_vec(),
             alias_symbol: alias.map(|(symbol, _)| *symbol),
