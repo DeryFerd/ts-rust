@@ -1,5 +1,10 @@
 # Query core member resolution
 
+Read [accountability](typechecker-accountability.md),
+[saved state](typechecker-accountability-state.json) and the
+[September 5 reset plan](typechecker-reset-plan.md) before using this record.
+The task instructions below are historical and do not authorize feature work.
+
 Updated 2026-09-04. Forty-three recent lost tests recovered. Eleven remain.
 Integration remains rejected.
 Root is the only implementer. One reviewer checks code changes. Use the existing

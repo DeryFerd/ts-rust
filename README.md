@@ -4,6 +4,10 @@ This repository is a Rust port of
 [`microsoft/typescript-go`](https://github.com/microsoft/typescript-go). It is
 under active development and is not yet a replacement for `tsgo` or `tsc`.
 
+Current typechecker work follows the [reset plan](docs/typechecker-reset-plan.md)
+and [accountability rules](docs/typechecker-accountability.md). Read the
+[saved state](docs/typechecker-accountability-state.json) before resuming work.
+
 The current sellable experiment is the deliberately narrow
 [minimal working v0](docs/minimal-working-v0.md): `--noCheck`, ESNext,
 preserved ESM, type erasure, and preserved JSX with explicit parity and

@@ -1,5 +1,10 @@
 # Typechecker demo status
 
+Current execution rules are in [accountability](typechecker-accountability.md),
+[saved state](typechecker-accountability-state.json) and the
+[September 5 reset plan](typechecker-reset-plan.md). The status below is
+historical. Its next-task links do not authorize resuming compiler work.
+
 Updated 2026-09-03. Neither Query nor Hono has passed a full Rust type check.
 
 The [execution reset](typechecker-demo-plan.md#execution-reset) now controls

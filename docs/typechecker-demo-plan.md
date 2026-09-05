@@ -1,5 +1,10 @@
 # First complete project demos
 
+Current execution rules are in [accountability](typechecker-accountability.md),
+[saved state](typechecker-accountability-state.json) and the
+[September 5 reset plan](typechecker-reset-plan.md). The execution instructions
+below are historical. Full port requirements remain in force.
+
 Updated 2026-09-03. The full port goal remains active.
 
 Read the [current demo status](typechecker-demo-status.md) first. It has the

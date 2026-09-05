@@ -1,5 +1,11 @@
 # Goal: complete typescript-go core typechecking in Rust
 
+Current execution rules are in [accountability](typechecker-accountability.md),
+[saved state](typechecker-accountability-state.json) and the
+[September 5 reset plan](typechecker-reset-plan.md). The active status and
+scheduling below are historical. They do not override the current pause or
+authorize more feature branches. Full port requirements remain in force.
+
 - Status: active; execution approved
 - Plan date: 2026-07-16
 - Integration branch: `july-ultra`

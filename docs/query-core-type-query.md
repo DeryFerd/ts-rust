@@ -1,5 +1,10 @@
 # Query core type-query work
 
+Read [accountability](typechecker-accountability.md),
+[saved state](typechecker-accountability-state.json) and the
+[September 5 reset plan](typechecker-reset-plan.md) before using this record.
+The task instructions below are historical and do not authorize feature work.
+
 Updated 2026-09-04. Implementation has started. The operation is not complete.
 Use query-core-integration. Root owns production code, tests and the index.
 One reviewer checks the complete change. Other workers investigate bounded

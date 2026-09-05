@@ -1,5 +1,11 @@
 # Goal: typescript-go core typechecking parity in Rust
 
+Current execution rules are in [accountability](typechecker-accountability.md),
+[saved state](typechecker-accountability-state.json) and the
+[September 5 reset plan](typechecker-reset-plan.md). Older scheduling and
+next-task instructions do not authorize resuming work. Full port requirements
+remain in force.
+
 > **2026-07-16 planning checkpoint:** a proposed completion strategy,
 > parallel dependency DAG, staffing model, and updated acceptance gates are in
 > [`typechecker-completion-goal.md`](typechecker-completion-goal.md). This file
