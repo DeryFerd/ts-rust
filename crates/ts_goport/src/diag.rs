@@ -13,17 +13,20 @@ pub static Trailing_comma_not_allowed: &Message = &CATALOG[5];
 pub static Asterisk_Slash_expected: &Message = &CATALOG[6];
 pub static An_element_access_expression_should_take_an_argument: &Message = &CATALOG[7];
 pub static Unexpected_token: &Message = &CATALOG[8];
-pub static A_rest_parameter_or_binding_pattern_may_not_have_a_trailing_comma: &Message = &CATALOG[9];
+pub static A_rest_parameter_or_binding_pattern_may_not_have_a_trailing_comma: &Message =
+    &CATALOG[9];
 pub static A_rest_parameter_must_be_last_in_a_parameter_list: &Message = &CATALOG[10];
 pub static Parameter_cannot_have_question_mark_and_initializer: &Message = &CATALOG[11];
 pub static A_required_parameter_cannot_follow_an_optional_parameter: &Message = &CATALOG[12];
 pub static An_index_signature_cannot_have_a_rest_parameter: &Message = &CATALOG[13];
-pub static An_index_signature_parameter_cannot_have_an_accessibility_modifier: &Message = &CATALOG[14];
+pub static An_index_signature_parameter_cannot_have_an_accessibility_modifier: &Message =
+    &CATALOG[14];
 pub static An_index_signature_parameter_cannot_have_a_question_mark: &Message = &CATALOG[15];
 pub static An_index_signature_parameter_cannot_have_an_initializer: &Message = &CATALOG[16];
 pub static An_index_signature_must_have_a_type_annotation: &Message = &CATALOG[17];
 pub static An_index_signature_parameter_must_have_a_type_annotation: &Message = &CATALOG[18];
-pub static X_readonly_modifier_can_only_appear_on_a_property_declaration_or_index_signature: &Message = &CATALOG[19];
+pub static X_readonly_modifier_can_only_appear_on_a_property_declaration_or_index_signature:
+    &Message = &CATALOG[19];
 pub static An_index_signature_cannot_have_a_trailing_comma: &Message = &CATALOG[20];
 pub static Accessibility_modifier_already_seen: &Message = &CATALOG[21];
 pub static X_0_modifier_must_precede_1_modifier: &Message = &CATALOG[22];
@@ -46,25 +49,32 @@ pub static A_set_accessor_parameter_cannot_have_an_initializer: &Message = &CATA
 pub static A_set_accessor_cannot_have_rest_parameter: &Message = &CATALOG[39];
 pub static A_get_accessor_cannot_have_parameters: &Message = &CATALOG[40];
 pub static Type_0_is_not_a_valid_async_function_return_type_in_ES5_because_it_does_not_refer_to_a_Promise_compatible_constructor_value: &Message = &CATALOG[41];
-pub static Accessors_are_only_available_when_targeting_ECMAScript_5_and_higher: &Message = &CATALOG[42];
+pub static Accessors_are_only_available_when_targeting_ECMAScript_5_and_higher: &Message =
+    &CATALOG[42];
 pub static The_return_type_of_an_async_function_must_either_be_a_valid_promise_or_must_not_contain_a_callable_then_member: &Message = &CATALOG[43];
 pub static A_promise_must_have_a_then_method: &Message = &CATALOG[44];
-pub static The_first_parameter_of_the_then_method_of_a_promise_must_be_a_callback: &Message = &CATALOG[45];
+pub static The_first_parameter_of_the_then_method_of_a_promise_must_be_a_callback: &Message =
+    &CATALOG[45];
 pub static Enum_member_must_have_initializer: &Message = &CATALOG[46];
 pub static Type_is_referenced_directly_or_indirectly_in_the_fulfillment_callback_of_its_own_then_method: &Message = &CATALOG[47];
 pub static An_export_assignment_cannot_be_used_in_a_namespace: &Message = &CATALOG[48];
 pub static The_return_type_of_an_async_function_or_method_must_be_the_global_Promise_T_type_Did_you_mean_to_write_Promise_0: &Message = &CATALOG[49];
-pub static The_return_type_of_an_async_function_or_method_must_be_the_global_Promise_T_type: &Message = &CATALOG[50];
-pub static In_ambient_enum_declarations_member_initializer_must_be_constant_expression: &Message = &CATALOG[51];
-pub static Unexpected_token_A_constructor_method_accessor_or_property_was_expected: &Message = &CATALOG[52];
-pub static Unexpected_token_A_type_parameter_name_was_expected_without_curly_braces: &Message = &CATALOG[53];
+pub static The_return_type_of_an_async_function_or_method_must_be_the_global_Promise_T_type:
+    &Message = &CATALOG[50];
+pub static In_ambient_enum_declarations_member_initializer_must_be_constant_expression: &Message =
+    &CATALOG[51];
+pub static Unexpected_token_A_constructor_method_accessor_or_property_was_expected: &Message =
+    &CATALOG[52];
+pub static Unexpected_token_A_type_parameter_name_was_expected_without_curly_braces: &Message =
+    &CATALOG[53];
 pub static X_0_modifier_cannot_appear_on_a_type_member: &Message = &CATALOG[54];
 pub static X_0_modifier_cannot_appear_on_an_index_signature: &Message = &CATALOG[55];
 pub static A_0_modifier_cannot_be_used_with_an_import_declaration: &Message = &CATALOG[56];
 pub static Invalid_reference_directive_syntax: &Message = &CATALOG[57];
 pub static X_0_modifier_cannot_appear_on_a_constructor_declaration: &Message = &CATALOG[58];
 pub static X_0_modifier_cannot_appear_on_a_parameter: &Message = &CATALOG[59];
-pub static Only_a_single_variable_declaration_is_allowed_in_a_for_in_statement: &Message = &CATALOG[60];
+pub static Only_a_single_variable_declaration_is_allowed_in_a_for_in_statement: &Message =
+    &CATALOG[60];
 pub static Type_parameters_cannot_appear_on_a_constructor_declaration: &Message = &CATALOG[61];
 pub static Type_annotation_cannot_appear_on_a_constructor_declaration: &Message = &CATALOG[62];
 pub static An_accessor_cannot_have_type_parameters: &Message = &CATALOG[63];
@@ -77,21 +87,29 @@ pub static Invalid_use_of_0_in_strict_mode: &Message = &CATALOG[69];
 pub static X_with_statements_are_not_allowed_in_strict_mode: &Message = &CATALOG[70];
 pub static X_delete_cannot_be_called_on_an_identifier_in_strict_mode: &Message = &CATALOG[71];
 pub static X_for_await_loops_are_only_allowed_within_async_functions_and_at_the_top_levels_of_modules: &Message = &CATALOG[72];
-pub static A_continue_statement_can_only_be_used_within_an_enclosing_iteration_statement: &Message = &CATALOG[73];
-pub static A_break_statement_can_only_be_used_within_an_enclosing_iteration_or_switch_statement: &Message = &CATALOG[74];
+pub static A_continue_statement_can_only_be_used_within_an_enclosing_iteration_statement: &Message =
+    &CATALOG[73];
+pub static A_break_statement_can_only_be_used_within_an_enclosing_iteration_or_switch_statement:
+    &Message = &CATALOG[74];
 pub static The_left_hand_side_of_a_for_of_statement_may_not_be_async: &Message = &CATALOG[75];
 pub static Jump_target_cannot_cross_function_boundary: &Message = &CATALOG[76];
 pub static A_return_statement_can_only_be_used_within_a_function_body: &Message = &CATALOG[77];
 pub static Expression_expected: &Message = &CATALOG[78];
 pub static Type_expected: &Message = &CATALOG[79];
 pub static Private_field_0_must_be_declared_in_an_enclosing_class: &Message = &CATALOG[80];
-pub static A_default_clause_cannot_appear_more_than_once_in_a_switch_statement: &Message = &CATALOG[81];
+pub static A_default_clause_cannot_appear_more_than_once_in_a_switch_statement: &Message =
+    &CATALOG[81];
 pub static Duplicate_label_0: &Message = &CATALOG[82];
-pub static A_continue_statement_can_only_jump_to_a_label_of_an_enclosing_iteration_statement: &Message = &CATALOG[83];
-pub static A_break_statement_can_only_jump_to_a_label_of_an_enclosing_statement: &Message = &CATALOG[84];
-pub static An_object_literal_cannot_have_multiple_properties_with_the_same_name: &Message = &CATALOG[85];
-pub static An_object_literal_cannot_have_multiple_get_Slashset_accessors_with_the_same_name: &Message = &CATALOG[86];
-pub static An_object_literal_cannot_have_property_and_accessor_with_the_same_name: &Message = &CATALOG[87];
+pub static A_continue_statement_can_only_jump_to_a_label_of_an_enclosing_iteration_statement:
+    &Message = &CATALOG[83];
+pub static A_break_statement_can_only_jump_to_a_label_of_an_enclosing_statement: &Message =
+    &CATALOG[84];
+pub static An_object_literal_cannot_have_multiple_properties_with_the_same_name: &Message =
+    &CATALOG[85];
+pub static An_object_literal_cannot_have_multiple_get_Slashset_accessors_with_the_same_name:
+    &Message = &CATALOG[86];
+pub static An_object_literal_cannot_have_property_and_accessor_with_the_same_name: &Message =
+    &CATALOG[87];
 pub static An_export_assignment_cannot_have_modifiers: &Message = &CATALOG[88];
 pub static Octal_literals_are_not_allowed_Use_the_syntax_0: &Message = &CATALOG[89];
 pub static Variable_declaration_list_cannot_be_empty: &Message = &CATALOG[90];
@@ -117,8 +135,10 @@ pub static X_or_expected: &Message = &CATALOG[109];
 pub static X_or_JSX_element_expected: &Message = &CATALOG[110];
 pub static Declaration_expected: &Message = &CATALOG[111];
 pub static Import_declarations_in_a_namespace_cannot_reference_a_module: &Message = &CATALOG[112];
-pub static Cannot_use_imports_exports_or_module_augmentations_when_module_is_none: &Message = &CATALOG[113];
-pub static File_name_0_differs_from_already_included_file_name_1_only_in_casing: &Message = &CATALOG[114];
+pub static Cannot_use_imports_exports_or_module_augmentations_when_module_is_none: &Message =
+    &CATALOG[113];
+pub static File_name_0_differs_from_already_included_file_name_1_only_in_casing: &Message =
+    &CATALOG[114];
 pub static X_0_declarations_must_be_initialized: &Message = &CATALOG[115];
 pub static X_0_declarations_can_only_be_declared_inside_a_block: &Message = &CATALOG[116];
 pub static Unterminated_template_literal: &Message = &CATALOG[117];
@@ -147,28 +167,38 @@ pub static An_implementation_cannot_be_declared_in_ambient_contexts: &Message = 
 pub static Modifiers_cannot_appear_here: &Message = &CATALOG[140];
 pub static Merge_conflict_marker_encountered: &Message = &CATALOG[141];
 pub static A_rest_element_cannot_have_an_initializer: &Message = &CATALOG[142];
-pub static A_parameter_property_may_not_be_declared_using_a_binding_pattern: &Message = &CATALOG[143];
-pub static Only_a_single_variable_declaration_is_allowed_in_a_for_of_statement: &Message = &CATALOG[144];
-pub static The_variable_declaration_of_a_for_in_statement_cannot_have_an_initializer: &Message = &CATALOG[145];
-pub static The_variable_declaration_of_a_for_of_statement_cannot_have_an_initializer: &Message = &CATALOG[146];
+pub static A_parameter_property_may_not_be_declared_using_a_binding_pattern: &Message =
+    &CATALOG[143];
+pub static Only_a_single_variable_declaration_is_allowed_in_a_for_of_statement: &Message =
+    &CATALOG[144];
+pub static The_variable_declaration_of_a_for_in_statement_cannot_have_an_initializer: &Message =
+    &CATALOG[145];
+pub static The_variable_declaration_of_a_for_of_statement_cannot_have_an_initializer: &Message =
+    &CATALOG[146];
 pub static An_import_declaration_cannot_have_modifiers: &Message = &CATALOG[147];
 pub static Module_0_has_no_default_export: &Message = &CATALOG[148];
 pub static An_export_declaration_cannot_have_modifiers: &Message = &CATALOG[149];
 pub static Export_declarations_are_not_permitted_in_a_namespace: &Message = &CATALOG[150];
 pub static X_export_Asterisk_does_not_re_export_a_default: &Message = &CATALOG[151];
-pub static Catch_clause_variable_type_annotation_must_be_any_or_unknown_if_specified: &Message = &CATALOG[152];
+pub static Catch_clause_variable_type_annotation_must_be_any_or_unknown_if_specified: &Message =
+    &CATALOG[152];
 pub static Catch_clause_variable_cannot_have_an_initializer: &Message = &CATALOG[153];
-pub static An_extended_Unicode_escape_value_must_be_between_0x0_and_0x10FFFF_inclusive: &Message = &CATALOG[154];
+pub static An_extended_Unicode_escape_value_must_be_between_0x0_and_0x10FFFF_inclusive: &Message =
+    &CATALOG[154];
 pub static Unterminated_Unicode_escape_sequence: &Message = &CATALOG[155];
 pub static Line_terminator_not_permitted_before_arrow: &Message = &CATALOG[156];
 pub static Import_assignment_cannot_be_used_when_targeting_ECMAScript_modules_Consider_using_import_Asterisk_as_ns_from_mod_import_a_from_mod_import_d_from_mod_or_another_module_format_instead: &Message = &CATALOG[157];
 pub static Export_assignment_cannot_be_used_when_targeting_ECMAScript_modules_Consider_using_export_default_or_another_module_format_instead: &Message = &CATALOG[158];
-pub static Re_exporting_a_type_when_0_is_enabled_requires_using_export_type: &Message = &CATALOG[159];
+pub static Re_exporting_a_type_when_0_is_enabled_requires_using_export_type: &Message =
+    &CATALOG[159];
 pub static Decorators_are_not_valid_here: &Message = &CATALOG[160];
-pub static Decorators_cannot_be_applied_to_multiple_get_Slashset_accessors_of_the_same_name: &Message = &CATALOG[161];
-pub static Invalid_optional_chain_from_new_expression_Did_you_mean_to_call_0: &Message = &CATALOG[162];
+pub static Decorators_cannot_be_applied_to_multiple_get_Slashset_accessors_of_the_same_name:
+    &Message = &CATALOG[161];
+pub static Invalid_optional_chain_from_new_expression_Did_you_mean_to_call_0: &Message =
+    &CATALOG[162];
 pub static Code_contained_in_a_class_is_evaluated_in_JavaScript_s_strict_mode_which_does_not_allow_this_use_of_0_For_more_information_see_https_Colon_Slash_Slashdeveloper_mozilla_org_Slashen_US_Slashdocs_SlashWeb_SlashJavaScript_SlashReference_SlashStrict_mode: &Message = &CATALOG[163];
-pub static A_class_declaration_without_the_default_modifier_must_have_a_name: &Message = &CATALOG[164];
+pub static A_class_declaration_without_the_default_modifier_must_have_a_name: &Message =
+    &CATALOG[164];
 pub static Identifier_expected_0_is_a_reserved_word_in_strict_mode: &Message = &CATALOG[165];
 pub static Identifier_expected_0_is_a_reserved_word_in_strict_mode_Class_definitions_are_automatically_in_strict_mode: &Message = &CATALOG[166];
 pub static Identifier_expected_0_is_a_reserved_word_in_strict_mode_Modules_are_automatically_in_strict_mode: &Message = &CATALOG[167];
@@ -182,56 +212,85 @@ pub static Signature_0_must_be_a_type_predicate: &Message = &CATALOG[174];
 pub static Cannot_find_parameter_0: &Message = &CATALOG[175];
 pub static Type_predicate_0_is_not_assignable_to_1: &Message = &CATALOG[176];
 pub static Parameter_0_is_not_in_the_same_position_as_parameter_1: &Message = &CATALOG[177];
-pub static A_type_predicate_is_only_allowed_in_return_type_position_for_functions_and_methods: &Message = &CATALOG[178];
+pub static A_type_predicate_is_only_allowed_in_return_type_position_for_functions_and_methods:
+    &Message = &CATALOG[178];
 pub static A_type_predicate_cannot_reference_a_rest_parameter: &Message = &CATALOG[179];
-pub static A_type_predicate_cannot_reference_element_0_in_a_binding_pattern: &Message = &CATALOG[180];
-pub static An_export_assignment_must_be_at_the_top_level_of_a_file_or_module_declaration: &Message = &CATALOG[181];
-pub static An_import_declaration_can_only_be_used_at_the_top_level_of_a_namespace_or_module: &Message = &CATALOG[182];
-pub static An_export_declaration_can_only_be_used_at_the_top_level_of_a_namespace_or_module: &Message = &CATALOG[183];
-pub static An_ambient_module_declaration_is_only_allowed_at_the_top_level_in_a_file: &Message = &CATALOG[184];
-pub static A_namespace_declaration_is_only_allowed_at_the_top_level_of_a_namespace_or_module: &Message = &CATALOG[185];
-pub static The_return_type_of_a_property_decorator_function_must_be_either_void_or_any: &Message = &CATALOG[186];
-pub static The_return_type_of_a_parameter_decorator_function_must_be_either_void_or_any: &Message = &CATALOG[187];
-pub static Unable_to_resolve_signature_of_class_decorator_when_called_as_an_expression: &Message = &CATALOG[188];
-pub static Unable_to_resolve_signature_of_parameter_decorator_when_called_as_an_expression: &Message = &CATALOG[189];
-pub static Unable_to_resolve_signature_of_property_decorator_when_called_as_an_expression: &Message = &CATALOG[190];
-pub static Unable_to_resolve_signature_of_method_decorator_when_called_as_an_expression: &Message = &CATALOG[191];
-pub static X_abstract_modifier_can_only_appear_on_a_class_method_or_property_declaration: &Message = &CATALOG[192];
+pub static A_type_predicate_cannot_reference_element_0_in_a_binding_pattern: &Message =
+    &CATALOG[180];
+pub static An_export_assignment_must_be_at_the_top_level_of_a_file_or_module_declaration: &Message =
+    &CATALOG[181];
+pub static An_import_declaration_can_only_be_used_at_the_top_level_of_a_namespace_or_module:
+    &Message = &CATALOG[182];
+pub static An_export_declaration_can_only_be_used_at_the_top_level_of_a_namespace_or_module:
+    &Message = &CATALOG[183];
+pub static An_ambient_module_declaration_is_only_allowed_at_the_top_level_in_a_file: &Message =
+    &CATALOG[184];
+pub static A_namespace_declaration_is_only_allowed_at_the_top_level_of_a_namespace_or_module:
+    &Message = &CATALOG[185];
+pub static The_return_type_of_a_property_decorator_function_must_be_either_void_or_any: &Message =
+    &CATALOG[186];
+pub static The_return_type_of_a_parameter_decorator_function_must_be_either_void_or_any: &Message =
+    &CATALOG[187];
+pub static Unable_to_resolve_signature_of_class_decorator_when_called_as_an_expression: &Message =
+    &CATALOG[188];
+pub static Unable_to_resolve_signature_of_parameter_decorator_when_called_as_an_expression:
+    &Message = &CATALOG[189];
+pub static Unable_to_resolve_signature_of_property_decorator_when_called_as_an_expression:
+    &Message = &CATALOG[190];
+pub static Unable_to_resolve_signature_of_method_decorator_when_called_as_an_expression: &Message =
+    &CATALOG[191];
+pub static X_abstract_modifier_can_only_appear_on_a_class_method_or_property_declaration: &Message =
+    &CATALOG[192];
 pub static X_0_modifier_cannot_be_used_with_1_modifier: &Message = &CATALOG[193];
 pub static Abstract_methods_can_only_appear_within_an_abstract_class: &Message = &CATALOG[194];
-pub static Method_0_cannot_have_an_implementation_because_it_is_marked_abstract: &Message = &CATALOG[195];
+pub static Method_0_cannot_have_an_implementation_because_it_is_marked_abstract: &Message =
+    &CATALOG[195];
 pub static An_interface_property_cannot_have_an_initializer: &Message = &CATALOG[196];
 pub static A_type_literal_property_cannot_have_an_initializer: &Message = &CATALOG[197];
 pub static A_class_member_cannot_have_the_0_keyword: &Message = &CATALOG[198];
-pub static A_decorator_can_only_decorate_a_method_implementation_not_an_overload: &Message = &CATALOG[199];
-pub static Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5: &Message = &CATALOG[200];
+pub static A_decorator_can_only_decorate_a_method_implementation_not_an_overload: &Message =
+    &CATALOG[199];
+pub static Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5:
+    &Message = &CATALOG[200];
 pub static Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5_Class_definitions_are_automatically_in_strict_mode: &Message = &CATALOG[201];
 pub static Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5_Modules_are_automatically_in_strict_mode: &Message = &CATALOG[202];
 pub static Abstract_properties_can_only_appear_within_an_abstract_class: &Message = &CATALOG[203];
 pub static A_const_initializer_in_an_ambient_context_must_be_a_string_or_numeric_literal_or_literal_enum_reference: &Message = &CATALOG[204];
-pub static A_definite_assignment_assertion_is_not_permitted_in_this_context: &Message = &CATALOG[205];
+pub static A_definite_assignment_assertion_is_not_permitted_in_this_context: &Message =
+    &CATALOG[205];
 pub static A_required_element_cannot_follow_an_optional_element: &Message = &CATALOG[206];
-pub static A_default_export_must_be_at_the_top_level_of_a_file_or_module_declaration: &Message = &CATALOG[207];
+pub static A_default_export_must_be_at_the_top_level_of_a_file_or_module_declaration: &Message =
+    &CATALOG[207];
 pub static Module_0_can_only_be_default_imported_using_the_1_flag: &Message = &CATALOG[208];
 pub static Keywords_cannot_contain_escape_characters: &Message = &CATALOG[209];
-pub static Already_included_file_name_0_differs_from_file_name_1_only_in_casing: &Message = &CATALOG[210];
-pub static Identifier_expected_0_is_a_reserved_word_at_the_top_level_of_a_module: &Message = &CATALOG[211];
-pub static Declarations_with_initializers_cannot_also_have_definite_assignment_assertions: &Message = &CATALOG[212];
-pub static Declarations_with_definite_assignment_assertions_must_also_have_type_annotations: &Message = &CATALOG[213];
+pub static Already_included_file_name_0_differs_from_file_name_1_only_in_casing: &Message =
+    &CATALOG[210];
+pub static Identifier_expected_0_is_a_reserved_word_at_the_top_level_of_a_module: &Message =
+    &CATALOG[211];
+pub static Declarations_with_initializers_cannot_also_have_definite_assignment_assertions:
+    &Message = &CATALOG[212];
+pub static Declarations_with_definite_assignment_assertions_must_also_have_type_annotations:
+    &Message = &CATALOG[213];
 pub static A_rest_element_cannot_follow_another_rest_element: &Message = &CATALOG[214];
 pub static An_optional_element_cannot_follow_a_rest_element: &Message = &CATALOG[215];
-pub static Property_0_cannot_have_an_initializer_because_it_is_marked_abstract: &Message = &CATALOG[216];
+pub static Property_0_cannot_have_an_initializer_because_it_is_marked_abstract: &Message =
+    &CATALOG[216];
 pub static An_index_signature_parameter_type_must_be_string_number_symbol_or_a_template_literal_type: &Message = &CATALOG[217];
-pub static Cannot_use_export_import_on_a_type_or_type_only_namespace_when_0_is_enabled: &Message = &CATALOG[218];
+pub static Cannot_use_export_import_on_a_type_or_type_only_namespace_when_0_is_enabled: &Message =
+    &CATALOG[218];
 pub static Decorator_function_return_type_0_is_not_assignable_to_type_1: &Message = &CATALOG[219];
-pub static Decorator_function_return_type_is_0_but_is_expected_to_be_void_or_any: &Message = &CATALOG[220];
+pub static Decorator_function_return_type_is_0_but_is_expected_to_be_void_or_any: &Message =
+    &CATALOG[220];
 pub static A_type_referenced_in_a_decorated_signature_must_be_imported_with_import_type_or_a_namespace_import_when_isolatedModules_and_emitDecoratorMetadata_are_enabled: &Message = &CATALOG[221];
 pub static X_0_modifier_cannot_appear_on_a_type_parameter: &Message = &CATALOG[222];
-pub static X_0_modifier_can_only_appear_on_a_type_parameter_of_a_class_interface_or_type_alias: &Message = &CATALOG[223];
+pub static X_0_modifier_can_only_appear_on_a_type_parameter_of_a_class_interface_or_type_alias:
+    &Message = &CATALOG[223];
 pub static X_accessor_modifier_can_only_appear_on_a_property_declaration: &Message = &CATALOG[224];
 pub static An_accessor_property_cannot_be_declared_optional: &Message = &CATALOG[225];
-pub static X_0_modifier_can_only_appear_on_a_type_parameter_of_a_function_method_or_class: &Message = &CATALOG[226];
-pub static The_runtime_will_invoke_the_decorator_with_1_arguments_but_the_decorator_expects_0: &Message = &CATALOG[227];
+pub static X_0_modifier_can_only_appear_on_a_type_parameter_of_a_function_method_or_class:
+    &Message = &CATALOG[226];
+pub static The_runtime_will_invoke_the_decorator_with_1_arguments_but_the_decorator_expects_0:
+    &Message = &CATALOG[227];
 pub static The_runtime_will_invoke_the_decorator_with_1_arguments_but_the_decorator_expects_at_least_0: &Message = &CATALOG[228];
 pub static Namespaces_are_not_allowed_in_global_script_files_when_0_is_enabled_If_this_file_is_not_intended_to_be_a_global_script_set_moduleDetection_to_force_or_add_an_empty_export_statement: &Message = &CATALOG[229];
 pub static Cannot_access_0_from_another_file_without_qualification_when_1_is_enabled_Use_2_instead: &Message = &CATALOG[230];
@@ -251,7 +310,8 @@ pub static This_syntax_is_not_allowed_when_erasableSyntaxOnly_is_enabled: &Messa
 pub static ECMAScript_imports_and_exports_cannot_be_written_in_a_CommonJS_file_under_verbatimModuleSyntax_Adjust_the_type_field_in_the_nearest_package_json_to_make_this_file_an_ECMAScript_module_or_adjust_your_verbatimModuleSyntax_module_and_moduleResolution_settings_in_TypeScript: &Message = &CATALOG[244];
 pub static X_with_statements_are_not_allowed_in_an_async_function_block: &Message = &CATALOG[245];
 pub static X_await_expressions_are_only_allowed_within_async_functions_and_at_the_top_levels_of_modules: &Message = &CATALOG[246];
-pub static The_current_file_is_a_CommonJS_module_and_cannot_use_await_at_the_top_level: &Message = &CATALOG[247];
+pub static The_current_file_is_a_CommonJS_module_and_cannot_use_await_at_the_top_level: &Message =
+    &CATALOG[247];
 pub static Did_you_mean_to_use_a_Colon_An_can_only_follow_a_property_name_when_the_containing_object_literal_is_part_of_a_destructuring_pattern: &Message = &CATALOG[248];
 pub static The_body_of_an_if_statement_cannot_be_the_empty_statement: &Message = &CATALOG[249];
 pub static Global_module_exports_may_only_appear_in_module_files: &Message = &CATALOG[250];
@@ -259,7 +319,8 @@ pub static Global_module_exports_may_only_appear_in_declaration_files: &Message 
 pub static Global_module_exports_may_only_appear_at_top_level: &Message = &CATALOG[252];
 pub static A_parameter_property_cannot_be_declared_using_a_rest_parameter: &Message = &CATALOG[253];
 pub static An_abstract_accessor_cannot_have_an_implementation: &Message = &CATALOG[254];
-pub static A_default_export_can_only_be_used_in_an_ECMAScript_style_module: &Message = &CATALOG[255];
+pub static A_default_export_can_only_be_used_in_an_ECMAScript_style_module: &Message =
+    &CATALOG[255];
 pub static Type_of_await_operand_must_either_be_a_valid_promise_or_must_not_contain_a_callable_then_member: &Message = &CATALOG[256];
 pub static Type_of_yield_operand_in_an_async_generator_must_either_be_a_valid_promise_or_must_not_contain_a_callable_then_member: &Message = &CATALOG[257];
 pub static Type_of_iterated_elements_of_a_yield_Asterisk_operand_must_either_be_a_valid_promise_or_must_not_contain_a_callable_then_member: &Message = &CATALOG[258];
@@ -273,11 +334,14 @@ pub static X_0_accepts_too_few_arguments_to_be_used_as_a_decorator_here_Did_you_
 pub static A_property_of_an_interface_or_type_literal_whose_type_is_a_unique_symbol_type_must_be_readonly: &Message = &CATALOG[266];
 pub static A_property_of_a_class_whose_type_is_a_unique_symbol_type_must_be_both_static_and_readonly: &Message = &CATALOG[267];
 pub static A_variable_whose_type_is_a_unique_symbol_type_must_be_const: &Message = &CATALOG[268];
-pub static X_unique_symbol_types_may_not_be_used_on_a_variable_declaration_with_a_binding_name: &Message = &CATALOG[269];
-pub static X_unique_symbol_types_are_only_allowed_on_variables_in_a_variable_statement: &Message = &CATALOG[270];
+pub static X_unique_symbol_types_may_not_be_used_on_a_variable_declaration_with_a_binding_name:
+    &Message = &CATALOG[269];
+pub static X_unique_symbol_types_are_only_allowed_on_variables_in_a_variable_statement: &Message =
+    &CATALOG[270];
 pub static X_unique_symbol_types_are_not_allowed_here: &Message = &CATALOG[271];
 pub static An_index_signature_parameter_type_cannot_be_a_literal_type_or_generic_type_Consider_using_a_mapped_object_type_instead: &Message = &CATALOG[272];
-pub static X_infer_declarations_are_only_permitted_in_the_extends_clause_of_a_conditional_type: &Message = &CATALOG[273];
+pub static X_infer_declarations_are_only_permitted_in_the_extends_clause_of_a_conditional_type:
+    &Message = &CATALOG[273];
 pub static Module_0_does_not_refer_to_a_value_but_is_used_as_a_value_here: &Message = &CATALOG[274];
 pub static Module_0_does_not_refer_to_a_type_but_is_used_as_a_type_here_Did_you_mean_typeof_import_0: &Message = &CATALOG[275];
 pub static Class_constructor_may_not_be_an_accessor: &Message = &CATALOG[276];
@@ -285,23 +349,31 @@ pub static The_import_meta_meta_property_is_only_allowed_when_the_module_option_
 pub static A_label_is_not_allowed_here: &Message = &CATALOG[278];
 pub static An_expression_of_type_void_cannot_be_tested_for_truthiness: &Message = &CATALOG[279];
 pub static This_parameter_is_not_allowed_with_use_strict_directive: &Message = &CATALOG[280];
-pub static X_use_strict_directive_cannot_be_used_with_non_simple_parameter_list: &Message = &CATALOG[281];
+pub static X_use_strict_directive_cannot_be_used_with_non_simple_parameter_list: &Message =
+    &CATALOG[281];
 pub static Non_simple_parameter_declared_here: &Message = &CATALOG[282];
 pub static X_use_strict_directive_used_here: &Message = &CATALOG[283];
 pub static Print_the_final_configuration_instead_of_building: &Message = &CATALOG[284];
-pub static An_identifier_or_keyword_cannot_immediately_follow_a_numeric_literal: &Message = &CATALOG[285];
+pub static An_identifier_or_keyword_cannot_immediately_follow_a_numeric_literal: &Message =
+    &CATALOG[285];
 pub static A_bigint_literal_cannot_use_exponential_notation: &Message = &CATALOG[286];
 pub static A_bigint_literal_must_be_an_integer: &Message = &CATALOG[287];
-pub static X_readonly_type_modifier_is_only_permitted_on_array_and_tuple_literal_types: &Message = &CATALOG[288];
+pub static X_readonly_type_modifier_is_only_permitted_on_array_and_tuple_literal_types: &Message =
+    &CATALOG[288];
 pub static A_const_assertion_can_only_be_applied_to_references_to_enum_members_or_string_number_boolean_array_or_object_literals: &Message = &CATALOG[289];
 pub static Did_you_mean_to_mark_this_function_as_async: &Message = &CATALOG[290];
 pub static An_enum_member_name_must_be_followed_by_a_or: &Message = &CATALOG[291];
-pub static Tagged_template_expressions_are_not_permitted_in_an_optional_chain: &Message = &CATALOG[292];
-pub static Identifier_expected_0_is_a_reserved_word_that_cannot_be_used_here: &Message = &CATALOG[293];
+pub static Tagged_template_expressions_are_not_permitted_in_an_optional_chain: &Message =
+    &CATALOG[292];
+pub static Identifier_expected_0_is_a_reserved_word_that_cannot_be_used_here: &Message =
+    &CATALOG[293];
 pub static Type_0_does_not_satisfy_the_expected_type_1: &Message = &CATALOG[294];
-pub static X_0_cannot_be_used_as_a_value_because_it_was_imported_using_import_type: &Message = &CATALOG[295];
-pub static X_0_cannot_be_used_as_a_value_because_it_was_exported_using_export_type: &Message = &CATALOG[296];
-pub static A_type_only_import_can_specify_a_default_import_or_named_bindings_but_not_both: &Message = &CATALOG[297];
+pub static X_0_cannot_be_used_as_a_value_because_it_was_imported_using_import_type: &Message =
+    &CATALOG[295];
+pub static X_0_cannot_be_used_as_a_value_because_it_was_exported_using_export_type: &Message =
+    &CATALOG[296];
+pub static A_type_only_import_can_specify_a_default_import_or_named_bindings_but_not_both:
+    &Message = &CATALOG[297];
 pub static Convert_to_type_only_export: &Message = &CATALOG[298];
 pub static Convert_all_re_exported_types_to_type_only_exports: &Message = &CATALOG[299];
 pub static Split_into_two_separate_import_declarations: &Message = &CATALOG[300];
@@ -312,23 +384,32 @@ pub static X_await_expressions_are_only_allowed_at_the_top_level_of_a_file_when_
 pub static X_0_was_imported_here: &Message = &CATALOG[305];
 pub static X_0_was_exported_here: &Message = &CATALOG[306];
 pub static Top_level_await_expressions_are_only_allowed_when_the_module_option_is_set_to_es2022_esnext_system_node16_node18_node20_nodenext_or_preserve_and_the_target_option_is_set_to_es2017_or_higher: &Message = &CATALOG[307];
-pub static An_import_alias_cannot_reference_a_declaration_that_was_exported_using_export_type: &Message = &CATALOG[308];
-pub static An_import_alias_cannot_reference_a_declaration_that_was_imported_using_import_type: &Message = &CATALOG[309];
+pub static An_import_alias_cannot_reference_a_declaration_that_was_exported_using_export_type:
+    &Message = &CATALOG[308];
+pub static An_import_alias_cannot_reference_a_declaration_that_was_imported_using_import_type:
+    &Message = &CATALOG[309];
 pub static Unexpected_token_Did_you_mean_or_rbrace: &Message = &CATALOG[310];
 pub static Unexpected_token_Did_you_mean_or_gt: &Message = &CATALOG[311];
-pub static Function_type_notation_must_be_parenthesized_when_used_in_a_union_type: &Message = &CATALOG[312];
-pub static Constructor_type_notation_must_be_parenthesized_when_used_in_a_union_type: &Message = &CATALOG[313];
-pub static Function_type_notation_must_be_parenthesized_when_used_in_an_intersection_type: &Message = &CATALOG[314];
-pub static Constructor_type_notation_must_be_parenthesized_when_used_in_an_intersection_type: &Message = &CATALOG[315];
+pub static Function_type_notation_must_be_parenthesized_when_used_in_a_union_type: &Message =
+    &CATALOG[312];
+pub static Constructor_type_notation_must_be_parenthesized_when_used_in_a_union_type: &Message =
+    &CATALOG[313];
+pub static Function_type_notation_must_be_parenthesized_when_used_in_an_intersection_type:
+    &Message = &CATALOG[314];
+pub static Constructor_type_notation_must_be_parenthesized_when_used_in_an_intersection_type:
+    &Message = &CATALOG[315];
 pub static X_0_is_not_allowed_as_a_variable_declaration_name: &Message = &CATALOG[316];
 pub static X_0_is_not_allowed_as_a_parameter_name: &Message = &CATALOG[317];
 pub static An_import_alias_cannot_use_import_type: &Message = &CATALOG[318];
 pub static Imported_via_0_from_file_1: &Message = &CATALOG[319];
 pub static Imported_via_0_from_file_1_with_packageId_2: &Message = &CATALOG[320];
-pub static Imported_via_0_from_file_1_to_import_importHelpers_as_specified_in_compilerOptions: &Message = &CATALOG[321];
+pub static Imported_via_0_from_file_1_to_import_importHelpers_as_specified_in_compilerOptions:
+    &Message = &CATALOG[321];
 pub static Imported_via_0_from_file_1_with_packageId_2_to_import_importHelpers_as_specified_in_compilerOptions: &Message = &CATALOG[322];
-pub static Imported_via_0_from_file_1_to_import_jsx_and_jsxs_factory_functions: &Message = &CATALOG[323];
-pub static Imported_via_0_from_file_1_with_packageId_2_to_import_jsx_and_jsxs_factory_functions: &Message = &CATALOG[324];
+pub static Imported_via_0_from_file_1_to_import_jsx_and_jsxs_factory_functions: &Message =
+    &CATALOG[323];
+pub static Imported_via_0_from_file_1_with_packageId_2_to_import_jsx_and_jsxs_factory_functions:
+    &Message = &CATALOG[324];
 pub static File_is_included_via_import_here: &Message = &CATALOG[325];
 pub static Referenced_via_0_from_file_1: &Message = &CATALOG[326];
 pub static File_is_included_via_reference_here: &Message = &CATALOG[327];
@@ -342,13 +423,16 @@ pub static File_is_matched_by_include_pattern_specified_here: &Message = &CATALO
 pub static Part_of_files_list_in_tsconfig_json: &Message = &CATALOG[335];
 pub static File_is_matched_by_files_list_specified_here: &Message = &CATALOG[336];
 pub static Output_from_referenced_project_0_included_because_1_specified: &Message = &CATALOG[337];
-pub static Output_from_referenced_project_0_included_because_module_is_specified_as_none: &Message = &CATALOG[338];
+pub static Output_from_referenced_project_0_included_because_module_is_specified_as_none: &Message =
+    &CATALOG[338];
 pub static File_is_output_from_referenced_project_specified_here: &Message = &CATALOG[339];
 pub static Source_from_referenced_project_0_included_because_1_specified: &Message = &CATALOG[340];
-pub static Source_from_referenced_project_0_included_because_module_is_specified_as_none: &Message = &CATALOG[341];
+pub static Source_from_referenced_project_0_included_because_module_is_specified_as_none: &Message =
+    &CATALOG[341];
 pub static File_is_source_from_referenced_project_specified_here: &Message = &CATALOG[342];
 pub static Entry_point_of_type_library_0_specified_in_compilerOptions: &Message = &CATALOG[343];
-pub static Entry_point_of_type_library_0_specified_in_compilerOptions_with_packageId_1: &Message = &CATALOG[344];
+pub static Entry_point_of_type_library_0_specified_in_compilerOptions_with_packageId_1: &Message =
+    &CATALOG[344];
 pub static File_is_entry_point_of_type_library_specified_here: &Message = &CATALOG[345];
 pub static Entry_point_for_implicit_type_library_0: &Message = &CATALOG[346];
 pub static Entry_point_for_implicit_type_library_0_with_packageId_1: &Message = &CATALOG[347];
@@ -363,10 +447,12 @@ pub static File_redirects_to_file_0: &Message = &CATALOG[355];
 pub static The_file_is_in_the_program_because_Colon: &Message = &CATALOG[356];
 pub static X_for_await_loops_are_only_allowed_at_the_top_level_of_a_file_when_that_file_is_a_module_but_this_file_has_no_imports_or_exports_Consider_adding_an_empty_export_to_make_this_file_a_module: &Message = &CATALOG[357];
 pub static Top_level_for_await_loops_are_only_allowed_when_the_module_option_is_set_to_es2022_esnext_system_node16_node18_node20_nodenext_or_preserve_and_the_target_option_is_set_to_es2017_or_higher: &Message = &CATALOG[358];
-pub static Neither_decorators_nor_modifiers_may_be_applied_to_this_parameters: &Message = &CATALOG[359];
+pub static Neither_decorators_nor_modifiers_may_be_applied_to_this_parameters: &Message =
+    &CATALOG[359];
 pub static Unexpected_keyword_or_identifier: &Message = &CATALOG[360];
 pub static Unknown_keyword_or_identifier_Did_you_mean_0: &Message = &CATALOG[361];
-pub static Decorators_must_precede_the_name_and_all_keywords_of_property_declarations: &Message = &CATALOG[362];
+pub static Decorators_must_precede_the_name_and_all_keywords_of_property_declarations: &Message =
+    &CATALOG[362];
 pub static Namespace_must_be_given_a_name: &Message = &CATALOG[363];
 pub static Interface_must_be_given_a_name: &Message = &CATALOG[364];
 pub static Type_alias_must_be_given_a_name: &Message = &CATALOG[365];
@@ -380,28 +466,37 @@ pub static Dynamic_imports_can_only_accept_a_module_specifier_and_an_optional_se
 pub static Private_identifiers_are_only_allowed_in_class_bodies_and_may_only_be_used_as_part_of_a_class_member_declaration_property_access_or_on_the_left_hand_side_of_an_in_expression: &Message = &CATALOG[373];
 pub static X_resolution_mode_should_be_either_require_or_import: &Message = &CATALOG[374];
 pub static X_resolution_mode_can_only_be_set_for_type_only_imports: &Message = &CATALOG[375];
-pub static X_resolution_mode_is_the_only_valid_key_for_type_import_assertions: &Message = &CATALOG[376];
+pub static X_resolution_mode_is_the_only_valid_key_for_type_import_assertions: &Message =
+    &CATALOG[376];
 pub static Type_import_assertions_should_have_exactly_one_key_resolution_mode_with_value_import_or_require: &Message = &CATALOG[377];
-pub static Matched_by_default_include_pattern_Asterisk_Asterisk_Slash_Asterisk: &Message = &CATALOG[378];
-pub static File_is_ECMAScript_module_because_0_has_field_type_with_value_module: &Message = &CATALOG[379];
-pub static File_is_CommonJS_module_because_0_has_field_type_whose_value_is_not_module: &Message = &CATALOG[380];
+pub static Matched_by_default_include_pattern_Asterisk_Asterisk_Slash_Asterisk: &Message =
+    &CATALOG[378];
+pub static File_is_ECMAScript_module_because_0_has_field_type_with_value_module: &Message =
+    &CATALOG[379];
+pub static File_is_CommonJS_module_because_0_has_field_type_whose_value_is_not_module: &Message =
+    &CATALOG[380];
 pub static File_is_CommonJS_module_because_0_does_not_have_field_type: &Message = &CATALOG[381];
 pub static File_is_CommonJS_module_because_package_json_was_not_found: &Message = &CATALOG[382];
-pub static X_resolution_mode_is_the_only_valid_key_for_type_import_attributes: &Message = &CATALOG[383];
+pub static X_resolution_mode_is_the_only_valid_key_for_type_import_attributes: &Message =
+    &CATALOG[383];
 pub static Type_import_attributes_should_have_exactly_one_key_resolution_mode_with_value_import_or_require: &Message = &CATALOG[384];
 pub static The_import_meta_meta_property_is_not_allowed_in_files_which_will_build_into_CommonJS_output: &Message = &CATALOG[385];
 pub static Module_0_cannot_be_imported_using_this_construct_The_specifier_only_resolves_to_an_ES_module_which_cannot_be_imported_with_require_Use_an_ECMAScript_import_instead: &Message = &CATALOG[386];
 pub static X_catch_or_finally_expected: &Message = &CATALOG[387];
-pub static An_import_declaration_can_only_be_used_at_the_top_level_of_a_module: &Message = &CATALOG[388];
-pub static An_export_declaration_can_only_be_used_at_the_top_level_of_a_module: &Message = &CATALOG[389];
+pub static An_import_declaration_can_only_be_used_at_the_top_level_of_a_module: &Message =
+    &CATALOG[388];
+pub static An_export_declaration_can_only_be_used_at_the_top_level_of_a_module: &Message =
+    &CATALOG[389];
 pub static Control_what_method_is_used_to_detect_module_format_JS_files: &Message = &CATALOG[390];
 pub static X_auto_Colon_Treat_files_with_imports_exports_import_meta_jsx_with_jsx_Colon_react_jsx_or_esm_format_with_module_Colon_node16_as_modules: &Message = &CATALOG[391];
-pub static An_instantiation_expression_cannot_be_followed_by_a_property_access: &Message = &CATALOG[392];
+pub static An_instantiation_expression_cannot_be_followed_by_a_property_access: &Message =
+    &CATALOG[392];
 pub static Identifier_or_string_literal_expected: &Message = &CATALOG[393];
 pub static The_current_file_is_a_CommonJS_module_whose_imports_will_produce_require_calls_however_the_referenced_file_is_an_ECMAScript_module_and_cannot_be_imported_with_require_Consider_writing_a_dynamic_import_0_call_instead: &Message = &CATALOG[394];
 pub static To_convert_this_file_to_an_ECMAScript_module_change_its_file_extension_to_0_or_create_a_local_package_json_file_with_type_Colon_module: &Message = &CATALOG[395];
 pub static To_convert_this_file_to_an_ECMAScript_module_change_its_file_extension_to_0_or_add_the_field_type_Colon_module_to_1: &Message = &CATALOG[396];
-pub static To_convert_this_file_to_an_ECMAScript_module_add_the_field_type_Colon_module_to_0: &Message = &CATALOG[397];
+pub static To_convert_this_file_to_an_ECMAScript_module_add_the_field_type_Colon_module_to_0:
+    &Message = &CATALOG[397];
 pub static To_convert_this_file_to_an_ECMAScript_module_create_a_local_package_json_file_with_type_Colon_module: &Message = &CATALOG[398];
 pub static X_0_is_a_type_and_must_be_imported_using_a_type_only_import_when_verbatimModuleSyntax_is_enabled: &Message = &CATALOG[399];
 pub static X_0_resolves_to_a_type_only_declaration_and_must_be_imported_using_a_type_only_import_when_verbatimModuleSyntax_is_enabled: &Message = &CATALOG[400];
@@ -412,30 +507,40 @@ pub static Decimals_with_leading_zeros_are_not_allowed: &Message = &CATALOG[404]
 pub static File_appears_to_be_binary: &Message = &CATALOG[405];
 pub static X_0_modifier_cannot_appear_on_a_using_declaration: &Message = &CATALOG[406];
 pub static X_0_declarations_may_not_have_binding_patterns: &Message = &CATALOG[407];
-pub static The_left_hand_side_of_a_for_in_statement_cannot_be_a_using_declaration: &Message = &CATALOG[408];
-pub static The_left_hand_side_of_a_for_in_statement_cannot_be_an_await_using_declaration: &Message = &CATALOG[409];
+pub static The_left_hand_side_of_a_for_in_statement_cannot_be_a_using_declaration: &Message =
+    &CATALOG[408];
+pub static The_left_hand_side_of_a_for_in_statement_cannot_be_an_await_using_declaration: &Message =
+    &CATALOG[409];
 pub static X_0_modifier_cannot_appear_on_an_await_using_declaration: &Message = &CATALOG[410];
 pub static Identifier_string_literal_or_number_literal_expected: &Message = &CATALOG[411];
-pub static Expression_must_be_enclosed_in_parentheses_to_be_used_as_a_decorator: &Message = &CATALOG[412];
+pub static Expression_must_be_enclosed_in_parentheses_to_be_used_as_a_decorator: &Message =
+    &CATALOG[412];
 pub static Invalid_syntax_in_decorator: &Message = &CATALOG[413];
 pub static Unknown_regular_expression_flag: &Message = &CATALOG[414];
 pub static Duplicate_regular_expression_flag: &Message = &CATALOG[415];
-pub static This_regular_expression_flag_is_only_available_when_targeting_0_or_later: &Message = &CATALOG[416];
-pub static The_Unicode_u_flag_and_the_Unicode_Sets_v_flag_cannot_be_set_simultaneously: &Message = &CATALOG[417];
-pub static Named_capturing_groups_are_only_available_when_targeting_ES2018_or_later: &Message = &CATALOG[418];
+pub static This_regular_expression_flag_is_only_available_when_targeting_0_or_later: &Message =
+    &CATALOG[416];
+pub static The_Unicode_u_flag_and_the_Unicode_Sets_v_flag_cannot_be_set_simultaneously: &Message =
+    &CATALOG[417];
+pub static Named_capturing_groups_are_only_available_when_targeting_ES2018_or_later: &Message =
+    &CATALOG[418];
 pub static Subpattern_flags_must_be_present_when_there_is_a_minus_sign: &Message = &CATALOG[419];
 pub static Incomplete_quantifier_Digit_expected: &Message = &CATALOG[420];
 pub static Numbers_out_of_order_in_quantifier: &Message = &CATALOG[421];
 pub static There_is_nothing_available_for_repetition: &Message = &CATALOG[422];
 pub static Unexpected_0_Did_you_mean_to_escape_it_with_backslash: &Message = &CATALOG[423];
-pub static This_regular_expression_flag_cannot_be_toggled_within_a_subpattern: &Message = &CATALOG[424];
-pub static X_k_must_be_followed_by_a_capturing_group_name_enclosed_in_angle_brackets: &Message = &CATALOG[425];
+pub static This_regular_expression_flag_cannot_be_toggled_within_a_subpattern: &Message =
+    &CATALOG[424];
+pub static X_k_must_be_followed_by_a_capturing_group_name_enclosed_in_angle_brackets: &Message =
+    &CATALOG[425];
 pub static X_q_is_only_available_inside_character_class: &Message = &CATALOG[426];
 pub static X_c_must_be_followed_by_an_ASCII_letter: &Message = &CATALOG[427];
 pub static Undetermined_character_escape: &Message = &CATALOG[428];
 pub static Expected_a_capturing_group_name: &Message = &CATALOG[429];
-pub static Named_capturing_groups_with_the_same_name_must_be_mutually_exclusive_to_each_other: &Message = &CATALOG[430];
-pub static A_character_class_range_must_not_be_bounded_by_another_character_class: &Message = &CATALOG[431];
+pub static Named_capturing_groups_with_the_same_name_must_be_mutually_exclusive_to_each_other:
+    &Message = &CATALOG[430];
+pub static A_character_class_range_must_not_be_bounded_by_another_character_class: &Message =
+    &CATALOG[431];
 pub static Range_out_of_order_in_character_class: &Message = &CATALOG[432];
 pub static Anything_that_would_possibly_match_more_than_a_single_character_is_invalid_inside_a_negated_character_class: &Message = &CATALOG[433];
 pub static Operators_must_not_be_mixed_within_a_character_class_Wrap_it_in_a_nested_class_instead: &Message = &CATALOG[434];
@@ -450,13 +555,15 @@ pub static Expected_a_Unicode_property_name_or_value: &Message = &CATALOG[442];
 pub static Any_Unicode_property_that_would_possibly_match_more_than_a_single_character_is_only_available_when_the_Unicode_Sets_v_flag_is_set: &Message = &CATALOG[443];
 pub static Unknown_Unicode_property_name_or_value: &Message = &CATALOG[444];
 pub static Unicode_property_value_expressions_are_only_available_when_the_Unicode_u_flag_or_the_Unicode_Sets_v_flag_is_set: &Message = &CATALOG[445];
-pub static X_0_must_be_followed_by_a_Unicode_property_value_expression_enclosed_in_braces: &Message = &CATALOG[446];
+pub static X_0_must_be_followed_by_a_Unicode_property_value_expression_enclosed_in_braces:
+    &Message = &CATALOG[446];
 pub static There_is_no_capturing_group_named_0_in_this_regular_expression: &Message = &CATALOG[447];
 pub static This_backreference_refers_to_a_group_that_does_not_exist_There_are_only_0_capturing_groups_in_this_regular_expression: &Message = &CATALOG[448];
 pub static This_backreference_refers_to_a_group_that_does_not_exist_There_are_no_capturing_groups_in_this_regular_expression: &Message = &CATALOG[449];
 pub static This_character_cannot_be_escaped_in_a_regular_expression: &Message = &CATALOG[450];
 pub static Octal_escape_sequences_and_backreferences_are_not_allowed_in_a_character_class_If_this_was_intended_as_an_escape_sequence_use_the_syntax_0_instead: &Message = &CATALOG[451];
-pub static Decimal_escape_sequences_and_backreferences_are_not_allowed_in_a_character_class: &Message = &CATALOG[452];
+pub static Decimal_escape_sequences_and_backreferences_are_not_allowed_in_a_character_class:
+    &Message = &CATALOG[452];
 pub static Unicode_escape_sequences_are_only_available_when_the_Unicode_u_flag_or_the_Unicode_Sets_v_flag_is_set: &Message = &CATALOG[453];
 pub static A_bigint_literal_cannot_be_used_as_a_property_name: &Message = &CATALOG[454];
 pub static A_namespace_declaration_should_not_be_declared_using_the_module_keyword_Please_use_the_namespace_keyword_instead: &Message = &CATALOG[455];
@@ -468,13 +575,16 @@ pub static X_using_declarations_are_not_allowed_in_ambient_contexts: &Message = 
 pub static X_await_using_declarations_are_not_allowed_in_ambient_contexts: &Message = &CATALOG[461];
 pub static X_using_declarations_are_not_allowed_in_case_or_default_clauses_unless_contained_within_a_block: &Message = &CATALOG[462];
 pub static X_await_using_declarations_are_not_allowed_in_case_or_default_clauses_unless_contained_within_a_block: &Message = &CATALOG[463];
-pub static Ignore_the_tsconfig_found_and_build_with_commandline_options_and_files: &Message = &CATALOG[464];
+pub static Ignore_the_tsconfig_found_and_build_with_commandline_options_and_files: &Message =
+    &CATALOG[464];
 pub static The_types_of_0_are_incompatible_between_these_types: &Message = &CATALOG[465];
 pub static The_types_returned_by_0_are_incompatible_between_these_types: &Message = &CATALOG[466];
 pub static Call_signature_return_types_0_and_1_are_incompatible: &Message = &CATALOG[467];
 pub static Construct_signature_return_types_0_and_1_are_incompatible: &Message = &CATALOG[468];
-pub static Call_signatures_with_no_arguments_have_incompatible_return_types_0_and_1: &Message = &CATALOG[469];
-pub static Construct_signatures_with_no_arguments_have_incompatible_return_types_0_and_1: &Message = &CATALOG[470];
+pub static Call_signatures_with_no_arguments_have_incompatible_return_types_0_and_1: &Message =
+    &CATALOG[469];
+pub static Construct_signatures_with_no_arguments_have_incompatible_return_types_0_and_1: &Message =
+    &CATALOG[470];
 pub static The_type_modifier_cannot_be_used_on_a_named_import_when_import_type_is_used_on_its_import_statement: &Message = &CATALOG[471];
 pub static The_type_modifier_cannot_be_used_on_a_named_export_when_export_type_is_used_on_its_export_statement: &Message = &CATALOG[472];
 pub static This_type_parameter_might_need_an_extends_0_constraint: &Message = &CATALOG[473];
@@ -491,9 +601,11 @@ pub static Module_0_has_no_exported_member_1: &Message = &CATALOG[483];
 pub static File_0_is_not_a_module: &Message = &CATALOG[484];
 pub static Cannot_find_module_0_or_its_corresponding_type_declarations: &Message = &CATALOG[485];
 pub static Module_0_has_already_exported_a_member_named_1_Consider_explicitly_re_exporting_to_resolve_the_ambiguity: &Message = &CATALOG[486];
-pub static An_export_assignment_cannot_be_used_in_a_module_with_other_exported_elements: &Message = &CATALOG[487];
+pub static An_export_assignment_cannot_be_used_in_a_module_with_other_exported_elements: &Message =
+    &CATALOG[487];
 pub static Type_0_recursively_references_itself_as_a_base_type: &Message = &CATALOG[488];
-pub static Cannot_find_name_0_Did_you_mean_to_write_this_in_an_async_function: &Message = &CATALOG[489];
+pub static Cannot_find_name_0_Did_you_mean_to_write_this_in_an_async_function: &Message =
+    &CATALOG[489];
 pub static An_interface_can_only_extend_an_object_type_or_intersection_of_object_types_with_statically_known_members: &Message = &CATALOG[490];
 pub static Type_parameter_0_has_a_circular_constraint: &Message = &CATALOG[491];
 pub static Generic_type_0_requires_1_type_argument_s: &Message = &CATALOG[492];
@@ -533,10 +645,14 @@ pub static This_expression_is_not_callable: &Message = &CATALOG[525];
 pub static Only_a_void_function_can_be_called_with_the_new_keyword: &Message = &CATALOG[526];
 pub static This_expression_is_not_constructable: &Message = &CATALOG[527];
 pub static Conversion_of_type_0_to_type_1_may_be_a_mistake_because_neither_type_sufficiently_overlaps_with_the_other_If_this_was_intentional_convert_the_expression_to_unknown_first: &Message = &CATALOG[528];
-pub static Object_literal_may_only_specify_known_properties_and_0_does_not_exist_in_type_1: &Message = &CATALOG[529];
-pub static This_syntax_requires_an_imported_helper_but_module_0_cannot_be_found: &Message = &CATALOG[530];
-pub static A_function_whose_declared_type_is_neither_undefined_void_nor_any_must_return_a_value: &Message = &CATALOG[531];
-pub static An_arithmetic_operand_must_be_of_type_any_number_bigint_or_an_enum_type: &Message = &CATALOG[532];
+pub static Object_literal_may_only_specify_known_properties_and_0_does_not_exist_in_type_1:
+    &Message = &CATALOG[529];
+pub static This_syntax_requires_an_imported_helper_but_module_0_cannot_be_found: &Message =
+    &CATALOG[530];
+pub static A_function_whose_declared_type_is_neither_undefined_void_nor_any_must_return_a_value:
+    &Message = &CATALOG[531];
+pub static An_arithmetic_operand_must_be_of_type_any_number_bigint_or_an_enum_type: &Message =
+    &CATALOG[532];
 pub static The_operand_of_an_increment_or_decrement_operator_must_be_a_variable_or_a_property_access: &Message = &CATALOG[533];
 pub static The_left_hand_side_of_an_instanceof_expression_must_be_of_type_any_an_object_type_or_a_type_parameter: &Message = &CATALOG[534];
 pub static The_right_hand_side_of_an_instanceof_expression_must_be_either_of_type_any_a_class_function_or_other_type_assignable_to_the_Function_interface_type_or_an_object_type_with_a_Symbol_hasInstance_method: &Message = &CATALOG[535];
@@ -544,12 +660,16 @@ pub static The_left_hand_side_of_an_arithmetic_operation_must_be_of_type_any_num
 pub static The_right_hand_side_of_an_arithmetic_operation_must_be_of_type_any_number_bigint_or_an_enum_type: &Message = &CATALOG[537];
 pub static The_left_hand_side_of_an_assignment_expression_must_be_a_variable_or_a_property_access: &Message = &CATALOG[538];
 pub static Operator_0_cannot_be_applied_to_types_1_and_2: &Message = &CATALOG[539];
-pub static Function_lacks_ending_return_statement_and_return_type_does_not_include_undefined: &Message = &CATALOG[540];
-pub static This_comparison_appears_to_be_unintentional_because_the_types_0_and_1_have_no_overlap: &Message = &CATALOG[541];
+pub static Function_lacks_ending_return_statement_and_return_type_does_not_include_undefined:
+    &Message = &CATALOG[540];
+pub static This_comparison_appears_to_be_unintentional_because_the_types_0_and_1_have_no_overlap:
+    &Message = &CATALOG[541];
 pub static Type_parameter_name_cannot_be_0: &Message = &CATALOG[542];
-pub static A_parameter_property_is_only_allowed_in_a_constructor_implementation: &Message = &CATALOG[543];
+pub static A_parameter_property_is_only_allowed_in_a_constructor_implementation: &Message =
+    &CATALOG[543];
 pub static A_rest_parameter_must_be_of_an_array_type: &Message = &CATALOG[544];
-pub static A_parameter_initializer_is_only_allowed_in_a_function_or_constructor_implementation: &Message = &CATALOG[545];
+pub static A_parameter_initializer_is_only_allowed_in_a_function_or_constructor_implementation:
+    &Message = &CATALOG[545];
 pub static Parameter_0_cannot_reference_itself: &Message = &CATALOG[546];
 pub static Parameter_0_cannot_reference_identifier_1_declared_after_it: &Message = &CATALOG[547];
 pub static Duplicate_index_signature_for_type_0: &Message = &CATALOG[548];
@@ -566,34 +686,46 @@ pub static Function_overload_must_be_static: &Message = &CATALOG[558];
 pub static Function_overload_must_not_be_static: &Message = &CATALOG[559];
 pub static Function_implementation_name_must_be_0: &Message = &CATALOG[560];
 pub static Constructor_implementation_is_missing: &Message = &CATALOG[561];
-pub static Function_implementation_is_missing_or_not_immediately_following_the_declaration: &Message = &CATALOG[562];
+pub static Function_implementation_is_missing_or_not_immediately_following_the_declaration:
+    &Message = &CATALOG[562];
 pub static Multiple_constructor_implementations_are_not_allowed: &Message = &CATALOG[563];
 pub static Duplicate_function_implementation: &Message = &CATALOG[564];
-pub static This_overload_signature_is_not_compatible_with_its_implementation_signature: &Message = &CATALOG[565];
-pub static Individual_declarations_in_merged_declaration_0_must_be_all_exported_or_all_local: &Message = &CATALOG[566];
-pub static Duplicate_identifier_arguments_Compiler_uses_arguments_to_initialize_rest_parameters: &Message = &CATALOG[567];
+pub static This_overload_signature_is_not_compatible_with_its_implementation_signature: &Message =
+    &CATALOG[565];
+pub static Individual_declarations_in_merged_declaration_0_must_be_all_exported_or_all_local:
+    &Message = &CATALOG[566];
+pub static Duplicate_identifier_arguments_Compiler_uses_arguments_to_initialize_rest_parameters:
+    &Message = &CATALOG[567];
 pub static Declaration_name_conflicts_with_built_in_global_identifier_0: &Message = &CATALOG[568];
 pub static X_constructor_cannot_be_used_as_a_parameter_property_name: &Message = &CATALOG[569];
 pub static Duplicate_identifier_this_Compiler_uses_variable_declaration_this_to_capture_this_reference: &Message = &CATALOG[570];
 pub static Expression_resolves_to_variable_declaration_this_that_compiler_uses_to_capture_this_reference: &Message = &CATALOG[571];
 pub static A_super_call_must_be_a_root_level_statement_within_a_constructor_of_a_derived_class_that_contains_initialized_properties_parameter_properties_or_private_identifiers: &Message = &CATALOG[572];
-pub static Expression_resolves_to_super_that_compiler_uses_to_capture_base_class_reference: &Message = &CATALOG[573];
+pub static Expression_resolves_to_super_that_compiler_uses_to_capture_base_class_reference:
+    &Message = &CATALOG[573];
 pub static Subsequent_variable_declarations_must_have_the_same_type_Variable_0_must_be_of_type_1_but_here_has_type_2: &Message = &CATALOG[574];
-pub static The_left_hand_side_of_a_for_in_statement_cannot_use_a_type_annotation: &Message = &CATALOG[575];
-pub static The_left_hand_side_of_a_for_in_statement_must_be_of_type_string_or_any: &Message = &CATALOG[576];
-pub static The_left_hand_side_of_a_for_in_statement_must_be_a_variable_or_a_property_access: &Message = &CATALOG[577];
+pub static The_left_hand_side_of_a_for_in_statement_cannot_use_a_type_annotation: &Message =
+    &CATALOG[575];
+pub static The_left_hand_side_of_a_for_in_statement_must_be_of_type_string_or_any: &Message =
+    &CATALOG[576];
+pub static The_left_hand_side_of_a_for_in_statement_must_be_a_variable_or_a_property_access:
+    &Message = &CATALOG[577];
 pub static The_right_hand_side_of_a_for_in_statement_must_be_of_type_any_an_object_type_or_a_type_parameter_but_here_has_type_0: &Message = &CATALOG[578];
 pub static Setters_cannot_return_a_value: &Message = &CATALOG[579];
 pub static Return_type_of_constructor_signature_must_be_assignable_to_the_instance_type_of_the_class: &Message = &CATALOG[580];
-pub static The_with_statement_is_not_supported_All_symbols_in_a_with_block_will_have_type_any: &Message = &CATALOG[581];
+pub static The_with_statement_is_not_supported_All_symbols_in_a_with_block_will_have_type_any:
+    &Message = &CATALOG[581];
 pub static Property_0_of_type_1_is_not_assignable_to_2_index_type_3: &Message = &CATALOG[582];
 pub static Type_0_is_not_assignable_to_type_1_with_exactOptionalPropertyTypes_Colon_true_Consider_adding_undefined_to_the_type_of_the_target: &Message = &CATALOG[583];
 pub static X_0_index_type_1_is_not_assignable_to_2_index_type_3: &Message = &CATALOG[584];
 pub static Class_name_cannot_be_0: &Message = &CATALOG[585];
 pub static Class_0_incorrectly_extends_base_class_1: &Message = &CATALOG[586];
-pub static Property_0_in_type_1_is_not_assignable_to_the_same_property_in_base_type_2: &Message = &CATALOG[587];
-pub static Class_static_side_0_incorrectly_extends_base_class_static_side_1: &Message = &CATALOG[588];
-pub static Type_of_computed_property_s_value_is_0_which_is_not_assignable_to_type_1: &Message = &CATALOG[589];
+pub static Property_0_in_type_1_is_not_assignable_to_the_same_property_in_base_type_2: &Message =
+    &CATALOG[587];
+pub static Class_static_side_0_incorrectly_extends_base_class_static_side_1: &Message =
+    &CATALOG[588];
+pub static Type_of_computed_property_s_value_is_0_which_is_not_assignable_to_type_1: &Message =
+    &CATALOG[589];
 pub static Types_of_construct_signatures_are_incompatible: &Message = &CATALOG[590];
 pub static Class_0_incorrectly_implements_interface_1: &Message = &CATALOG[591];
 pub static A_class_can_only_implement_an_object_type_or_intersection_of_object_types_with_statically_known_members: &Message = &CATALOG[592];
@@ -607,19 +739,24 @@ pub static Enum_name_cannot_be_0: &Message = &CATALOG[599];
 pub static In_an_enum_with_multiple_declarations_only_one_declaration_can_omit_an_initializer_for_its_first_enum_element: &Message = &CATALOG[600];
 pub static A_namespace_declaration_cannot_be_in_a_different_file_from_a_class_or_function_with_which_it_is_merged: &Message = &CATALOG[601];
 pub static A_namespace_declaration_cannot_be_located_prior_to_a_class_or_function_with_which_it_is_merged: &Message = &CATALOG[602];
-pub static Ambient_modules_cannot_be_nested_in_other_modules_or_namespaces: &Message = &CATALOG[603];
+pub static Ambient_modules_cannot_be_nested_in_other_modules_or_namespaces: &Message =
+    &CATALOG[603];
 pub static Ambient_module_declaration_cannot_specify_relative_module_name: &Message = &CATALOG[604];
 pub static Module_0_is_hidden_by_a_local_declaration_with_the_same_name: &Message = &CATALOG[605];
 pub static Import_name_cannot_be_0: &Message = &CATALOG[606];
 pub static Import_or_export_declaration_in_an_ambient_module_declaration_cannot_reference_module_through_relative_module_name: &Message = &CATALOG[607];
 pub static Import_declaration_conflicts_with_local_declaration_of_0: &Message = &CATALOG[608];
-pub static Duplicate_identifier_0_Compiler_reserves_name_1_in_top_level_scope_of_a_module: &Message = &CATALOG[609];
+pub static Duplicate_identifier_0_Compiler_reserves_name_1_in_top_level_scope_of_a_module:
+    &Message = &CATALOG[609];
 pub static Types_have_separate_declarations_of_a_private_property_0: &Message = &CATALOG[610];
-pub static Property_0_is_protected_but_type_1_is_not_a_class_derived_from_2: &Message = &CATALOG[611];
+pub static Property_0_is_protected_but_type_1_is_not_a_class_derived_from_2: &Message =
+    &CATALOG[611];
 pub static Property_0_is_protected_in_type_1_but_public_in_type_2: &Message = &CATALOG[612];
-pub static Property_0_is_protected_and_only_accessible_within_class_1_and_its_subclasses: &Message = &CATALOG[613];
+pub static Property_0_is_protected_and_only_accessible_within_class_1_and_its_subclasses: &Message =
+    &CATALOG[613];
 pub static Property_0_is_protected_and_only_accessible_through_an_instance_of_class_1_This_is_an_instance_of_class_2: &Message = &CATALOG[614];
-pub static The_0_operator_is_not_allowed_for_boolean_types_Consider_using_1_instead: &Message = &CATALOG[615];
+pub static The_0_operator_is_not_allowed_for_boolean_types_Consider_using_1_instead: &Message =
+    &CATALOG[615];
 pub static Block_scoped_variable_0_used_before_its_declaration: &Message = &CATALOG[616];
 pub static Class_0_used_before_its_declaration: &Message = &CATALOG[617];
 pub static Enum_0_used_before_its_declaration: &Message = &CATALOG[618];
@@ -633,32 +770,45 @@ pub static Module_0_declares_1_locally_but_it_is_not_exported: &Message = &CATAL
 pub static Module_0_declares_1_locally_but_it_is_exported_as_2: &Message = &CATALOG[626];
 pub static Type_0_is_not_an_array_type: &Message = &CATALOG[627];
 pub static A_rest_element_must_be_last_in_a_destructuring_pattern: &Message = &CATALOG[628];
-pub static A_binding_pattern_parameter_cannot_be_optional_in_an_implementation_signature: &Message = &CATALOG[629];
-pub static A_computed_property_name_must_be_of_type_string_number_symbol_or_any: &Message = &CATALOG[630];
+pub static A_binding_pattern_parameter_cannot_be_optional_in_an_implementation_signature: &Message =
+    &CATALOG[629];
+pub static A_computed_property_name_must_be_of_type_string_number_symbol_or_any: &Message =
+    &CATALOG[630];
 pub static X_this_cannot_be_referenced_in_a_computed_property_name: &Message = &CATALOG[631];
 pub static X_super_cannot_be_referenced_in_a_computed_property_name: &Message = &CATALOG[632];
-pub static A_computed_property_name_cannot_reference_a_type_parameter_from_its_containing_type: &Message = &CATALOG[633];
+pub static A_computed_property_name_cannot_reference_a_type_parameter_from_its_containing_type:
+    &Message = &CATALOG[633];
 pub static Cannot_find_global_value_0: &Message = &CATALOG[634];
 pub static The_0_operator_cannot_be_applied_to_type_symbol: &Message = &CATALOG[635];
 pub static Spread_operator_in_new_expressions_is_only_available_when_targeting_ECMAScript_5_and_higher: &Message = &CATALOG[636];
 pub static Enum_declarations_must_all_be_const_or_non_const: &Message = &CATALOG[637];
 pub static X_const_enum_member_initializers_must_be_constant_expressions: &Message = &CATALOG[638];
 pub static X_const_enums_can_only_be_used_in_property_or_index_access_expressions_or_the_right_hand_side_of_an_import_declaration_or_export_assignment_or_type_query: &Message = &CATALOG[639];
-pub static A_const_enum_member_can_only_be_accessed_using_a_string_literal: &Message = &CATALOG[640];
-pub static X_const_enum_member_initializer_was_evaluated_to_a_non_finite_value: &Message = &CATALOG[641];
-pub static X_const_enum_member_initializer_was_evaluated_to_disallowed_value_NaN: &Message = &CATALOG[642];
-pub static X_let_is_not_allowed_to_be_used_as_a_name_in_let_or_const_declarations: &Message = &CATALOG[643];
+pub static A_const_enum_member_can_only_be_accessed_using_a_string_literal: &Message =
+    &CATALOG[640];
+pub static X_const_enum_member_initializer_was_evaluated_to_a_non_finite_value: &Message =
+    &CATALOG[641];
+pub static X_const_enum_member_initializer_was_evaluated_to_disallowed_value_NaN: &Message =
+    &CATALOG[642];
+pub static X_let_is_not_allowed_to_be_used_as_a_name_in_let_or_const_declarations: &Message =
+    &CATALOG[643];
 pub static Cannot_initialize_outer_scoped_variable_0_in_the_same_scope_as_block_scoped_declaration_1: &Message = &CATALOG[644];
-pub static The_left_hand_side_of_a_for_of_statement_cannot_use_a_type_annotation: &Message = &CATALOG[645];
+pub static The_left_hand_side_of_a_for_of_statement_cannot_use_a_type_annotation: &Message =
+    &CATALOG[645];
 pub static Export_declaration_conflicts_with_exported_declaration_of_0: &Message = &CATALOG[646];
-pub static The_left_hand_side_of_a_for_of_statement_must_be_a_variable_or_a_property_access: &Message = &CATALOG[647];
-pub static Type_0_must_have_a_Symbol_iterator_method_that_returns_an_iterator: &Message = &CATALOG[648];
+pub static The_left_hand_side_of_a_for_of_statement_must_be_a_variable_or_a_property_access:
+    &Message = &CATALOG[647];
+pub static Type_0_must_have_a_Symbol_iterator_method_that_returns_an_iterator: &Message =
+    &CATALOG[648];
 pub static An_iterator_must_have_a_next_method: &Message = &CATALOG[649];
-pub static The_type_returned_by_the_0_method_of_an_iterator_must_have_a_value_property: &Message = &CATALOG[650];
-pub static The_left_hand_side_of_a_for_in_statement_cannot_be_a_destructuring_pattern: &Message = &CATALOG[651];
+pub static The_type_returned_by_the_0_method_of_an_iterator_must_have_a_value_property: &Message =
+    &CATALOG[650];
+pub static The_left_hand_side_of_a_for_in_statement_cannot_be_a_destructuring_pattern: &Message =
+    &CATALOG[651];
 pub static Cannot_redeclare_identifier_0_in_catch_clause: &Message = &CATALOG[652];
 pub static Tuple_type_0_of_length_1_has_no_element_at_index_2: &Message = &CATALOG[653];
-pub static Using_a_string_in_a_for_of_statement_is_only_supported_in_ECMAScript_5_and_higher: &Message = &CATALOG[654];
+pub static Using_a_string_in_a_for_of_statement_is_only_supported_in_ECMAScript_5_and_higher:
+    &Message = &CATALOG[654];
 pub static Type_0_is_not_an_array_type_or_a_string_type: &Message = &CATALOG[655];
 pub static The_arguments_object_cannot_be_referenced_in_an_arrow_function_in_ES5_Consider_using_a_standard_function_expression: &Message = &CATALOG[656];
 pub static This_module_can_only_be_referenced_with_ECMAScript_imports_Slashexports_by_turning_on_the_0_flag_and_referencing_its_default_export: &Message = &CATALOG[657];
@@ -666,29 +816,38 @@ pub static Module_0_uses_export_and_cannot_be_used_with_export_Asterisk: &Messag
 pub static An_interface_can_only_extend_an_identifier_Slashqualified_name_with_optional_type_arguments: &Message = &CATALOG[659];
 pub static A_class_can_only_implement_an_identifier_Slashqualified_name_with_optional_type_arguments: &Message = &CATALOG[660];
 pub static A_rest_element_cannot_contain_a_binding_pattern: &Message = &CATALOG[661];
-pub static X_0_is_referenced_directly_or_indirectly_in_its_own_type_annotation: &Message = &CATALOG[662];
+pub static X_0_is_referenced_directly_or_indirectly_in_its_own_type_annotation: &Message =
+    &CATALOG[662];
 pub static Cannot_find_namespace_0: &Message = &CATALOG[663];
-pub static Type_0_must_have_a_Symbol_asyncIterator_method_that_returns_an_async_iterator: &Message = &CATALOG[664];
+pub static Type_0_must_have_a_Symbol_asyncIterator_method_that_returns_an_async_iterator: &Message =
+    &CATALOG[664];
 pub static A_generator_cannot_have_a_void_type_annotation: &Message = &CATALOG[665];
-pub static X_0_is_referenced_directly_or_indirectly_in_its_own_base_expression: &Message = &CATALOG[666];
+pub static X_0_is_referenced_directly_or_indirectly_in_its_own_base_expression: &Message =
+    &CATALOG[666];
 pub static Type_0_is_not_a_constructor_function_type: &Message = &CATALOG[667];
 pub static No_base_constructor_has_the_specified_number_of_type_arguments: &Message = &CATALOG[668];
 pub static Base_constructor_return_type_0_is_not_an_object_type_or_intersection_of_object_types_with_statically_known_members: &Message = &CATALOG[669];
 pub static Base_constructors_must_all_have_the_same_return_type: &Message = &CATALOG[670];
 pub static Cannot_create_an_instance_of_an_abstract_class: &Message = &CATALOG[671];
 pub static Overload_signatures_must_all_be_abstract_or_non_abstract: &Message = &CATALOG[672];
-pub static Abstract_method_0_in_class_1_cannot_be_accessed_via_super_expression: &Message = &CATALOG[673];
+pub static Abstract_method_0_in_class_1_cannot_be_accessed_via_super_expression: &Message =
+    &CATALOG[673];
 pub static A_tuple_type_cannot_be_indexed_with_a_negative_value: &Message = &CATALOG[674];
-pub static Non_abstract_class_0_does_not_implement_inherited_abstract_member_1_from_class_2: &Message = &CATALOG[675];
+pub static Non_abstract_class_0_does_not_implement_inherited_abstract_member_1_from_class_2:
+    &Message = &CATALOG[675];
 pub static All_declarations_of_an_abstract_method_must_be_consecutive: &Message = &CATALOG[676];
-pub static Cannot_assign_an_abstract_constructor_type_to_a_non_abstract_constructor_type: &Message = &CATALOG[677];
-pub static A_this_based_type_guard_is_not_compatible_with_a_parameter_based_type_guard: &Message = &CATALOG[678];
+pub static Cannot_assign_an_abstract_constructor_type_to_a_non_abstract_constructor_type: &Message =
+    &CATALOG[677];
+pub static A_this_based_type_guard_is_not_compatible_with_a_parameter_based_type_guard: &Message =
+    &CATALOG[678];
 pub static An_async_iterator_must_have_a_next_method: &Message = &CATALOG[679];
-pub static Duplicate_identifier_0_Compiler_uses_declaration_1_to_support_async_functions: &Message = &CATALOG[680];
+pub static Duplicate_identifier_0_Compiler_uses_declaration_1_to_support_async_functions: &Message =
+    &CATALOG[680];
 pub static The_arguments_object_cannot_be_referenced_in_an_async_function_or_method_in_ES5_Consider_using_a_standard_function_or_method: &Message = &CATALOG[681];
 pub static X_yield_expressions_cannot_be_used_in_a_parameter_initializer: &Message = &CATALOG[682];
 pub static X_await_expressions_cannot_be_used_in_a_parameter_initializer: &Message = &CATALOG[683];
-pub static A_this_type_is_available_only_in_a_non_static_member_of_a_class_or_interface: &Message = &CATALOG[684];
+pub static A_this_type_is_available_only_in_a_non_static_member_of_a_class_or_interface: &Message =
+    &CATALOG[684];
 pub static The_inferred_type_of_0_references_an_inaccessible_1_type_A_type_annotation_is_necessary: &Message = &CATALOG[685];
 pub static A_module_cannot_have_multiple_default_exports: &Message = &CATALOG[686];
 pub static Duplicate_identifier_0_Compiler_reserves_name_1_in_top_level_scope_of_a_module_containing_async_functions: &Message = &CATALOG[687];
@@ -705,27 +864,34 @@ pub static Cannot_assign_to_0_because_it_is_a_read_only_property: &Message = &CA
 pub static Index_signature_in_type_0_only_permits_reading: &Message = &CATALOG[698];
 pub static Duplicate_identifier_newTarget_Compiler_uses_variable_declaration_newTarget_to_capture_new_target_meta_property_reference: &Message = &CATALOG[699];
 pub static Expression_resolves_to_variable_declaration_newTarget_that_compiler_uses_to_capture_new_target_meta_property_reference: &Message = &CATALOG[700];
-pub static A_mixin_class_must_have_a_constructor_with_a_single_rest_parameter_of_type_any: &Message = &CATALOG[701];
+pub static A_mixin_class_must_have_a_constructor_with_a_single_rest_parameter_of_type_any:
+    &Message = &CATALOG[701];
 pub static The_type_returned_by_the_0_method_of_an_async_iterator_must_be_a_promise_for_a_type_with_a_value_property: &Message = &CATALOG[702];
 pub static Type_0_is_not_an_array_type_or_does_not_have_a_Symbol_iterator_method_that_returns_an_iterator: &Message = &CATALOG[703];
 pub static Type_0_is_not_an_array_type_or_a_string_type_or_does_not_have_a_Symbol_iterator_method_that_returns_an_iterator: &Message = &CATALOG[704];
 pub static Property_0_does_not_exist_on_type_1_Do_you_need_to_change_your_target_library_Try_changing_the_lib_compiler_option_to_2_or_later: &Message = &CATALOG[705];
 pub static Property_0_does_not_exist_on_type_1_Did_you_mean_2: &Message = &CATALOG[706];
 pub static Cannot_find_name_0_Did_you_mean_1: &Message = &CATALOG[707];
-pub static Computed_values_are_not_permitted_in_an_enum_with_string_valued_members: &Message = &CATALOG[708];
+pub static Computed_values_are_not_permitted_in_an_enum_with_string_valued_members: &Message =
+    &CATALOG[708];
 pub static Expected_0_arguments_but_got_1: &Message = &CATALOG[709];
 pub static Expected_at_least_0_arguments_but_got_1: &Message = &CATALOG[710];
-pub static A_spread_argument_must_either_have_a_tuple_type_or_be_passed_to_a_rest_parameter: &Message = &CATALOG[711];
+pub static A_spread_argument_must_either_have_a_tuple_type_or_be_passed_to_a_rest_parameter:
+    &Message = &CATALOG[711];
 pub static Expected_0_type_arguments_but_got_1: &Message = &CATALOG[712];
 pub static Type_0_has_no_properties_in_common_with_type_1: &Message = &CATALOG[713];
-pub static Value_of_type_0_has_no_properties_in_common_with_type_1_Did_you_mean_to_call_it: &Message = &CATALOG[714];
+pub static Value_of_type_0_has_no_properties_in_common_with_type_1_Did_you_mean_to_call_it:
+    &Message = &CATALOG[714];
 pub static Object_literal_may_only_specify_known_properties_but_0_does_not_exist_in_type_1_Did_you_mean_to_write_2: &Message = &CATALOG[715];
 pub static Base_class_expressions_cannot_reference_class_type_parameters: &Message = &CATALOG[716];
-pub static The_containing_function_or_module_body_is_too_large_for_control_flow_analysis: &Message = &CATALOG[717];
-pub static Property_0_has_no_initializer_and_is_not_definitely_assigned_in_the_constructor: &Message = &CATALOG[718];
+pub static The_containing_function_or_module_body_is_too_large_for_control_flow_analysis: &Message =
+    &CATALOG[717];
+pub static Property_0_has_no_initializer_and_is_not_definitely_assigned_in_the_constructor:
+    &Message = &CATALOG[718];
 pub static Property_0_is_used_before_being_assigned: &Message = &CATALOG[719];
 pub static A_rest_element_cannot_have_a_property_name: &Message = &CATALOG[720];
-pub static Enum_declarations_can_only_merge_with_namespace_or_other_enum_declarations: &Message = &CATALOG[721];
+pub static Enum_declarations_can_only_merge_with_namespace_or_other_enum_declarations: &Message =
+    &CATALOG[721];
 pub static Property_0_may_not_exist_on_type_1_Did_you_mean_2: &Message = &CATALOG[722];
 pub static Could_not_find_name_0_Did_you_mean_1: &Message = &CATALOG[723];
 pub static Object_is_of_type_unknown: &Message = &CATALOG[724];
@@ -742,52 +908,69 @@ pub static Cannot_find_name_0_Do_you_need_to_change_your_target_library_Try_chan
 pub static X_0_only_refers_to_a_type_but_is_being_used_as_a_value_here_Do_you_need_to_change_your_target_library_Try_changing_the_lib_compiler_option_to_es2015_or_later: &Message = &CATALOG[735];
 pub static Cannot_assign_to_0_because_it_is_a_constant: &Message = &CATALOG[736];
 pub static Type_instantiation_is_excessively_deep_and_possibly_infinite: &Message = &CATALOG[737];
-pub static Expression_produces_a_union_type_that_is_too_complex_to_represent: &Message = &CATALOG[738];
+pub static Expression_produces_a_union_type_that_is_too_complex_to_represent: &Message =
+    &CATALOG[738];
 pub static Cannot_find_name_0_Do_you_need_to_install_type_definitions_for_node_Try_npm_i_save_dev_types_Slashnode_and_then_add_node_to_the_types_field_in_your_tsconfig: &Message = &CATALOG[739];
 pub static Cannot_find_name_0_Do_you_need_to_install_type_definitions_for_jQuery_Try_npm_i_save_dev_types_Slashjquery_and_then_add_jquery_to_the_types_field_in_your_tsconfig: &Message = &CATALOG[740];
 pub static Cannot_find_name_0_Do_you_need_to_install_type_definitions_for_a_test_runner_Try_npm_i_save_dev_types_Slashjest_or_npm_i_save_dev_types_Slashmocha_and_then_add_jest_or_mocha_to_the_types_field_in_your_tsconfig: &Message = &CATALOG[741];
 pub static This_module_is_declared_with_export_and_can_only_be_used_with_a_default_import_when_using_the_0_flag: &Message = &CATALOG[742];
 pub static X_0_can_only_be_imported_by_using_a_default_import: &Message = &CATALOG[743];
 pub static X_0_can_only_be_imported_by_turning_on_the_esModuleInterop_flag_and_using_a_default_import: &Message = &CATALOG[744];
-pub static X_0_can_only_be_imported_by_using_a_require_call_or_by_using_a_default_import: &Message = &CATALOG[745];
+pub static X_0_can_only_be_imported_by_using_a_require_call_or_by_using_a_default_import: &Message =
+    &CATALOG[745];
 pub static X_0_can_only_be_imported_by_using_a_require_call_or_by_turning_on_the_esModuleInterop_flag_and_using_a_default_import: &Message = &CATALOG[746];
 pub static JSX_element_implicitly_has_type_any_because_the_global_type_JSX_Element_does_not_exist: &Message = &CATALOG[747];
 pub static Property_0_in_type_1_is_not_assignable_to_type_2: &Message = &CATALOG[748];
-pub static JSX_element_type_0_does_not_have_any_construct_or_call_signatures: &Message = &CATALOG[749];
-pub static Property_0_of_JSX_spread_attribute_is_not_assignable_to_target_property: &Message = &CATALOG[750];
-pub static JSX_element_class_does_not_support_attributes_because_it_does_not_have_a_0_property: &Message = &CATALOG[751];
+pub static JSX_element_type_0_does_not_have_any_construct_or_call_signatures: &Message =
+    &CATALOG[749];
+pub static Property_0_of_JSX_spread_attribute_is_not_assignable_to_target_property: &Message =
+    &CATALOG[750];
+pub static JSX_element_class_does_not_support_attributes_because_it_does_not_have_a_0_property:
+    &Message = &CATALOG[751];
 pub static The_global_type_JSX_0_may_not_have_more_than_one_property: &Message = &CATALOG[752];
 pub static JSX_spread_child_must_be_an_array_type: &Message = &CATALOG[753];
 pub static X_0_is_defined_as_an_accessor_in_class_1_but_is_overridden_here_in_2_as_an_instance_property: &Message = &CATALOG[754];
-pub static X_0_is_defined_as_a_property_in_class_1_but_is_overridden_here_in_2_as_an_accessor: &Message = &CATALOG[755];
+pub static X_0_is_defined_as_a_property_in_class_1_but_is_overridden_here_in_2_as_an_accessor:
+    &Message = &CATALOG[755];
 pub static Property_0_will_overwrite_the_base_property_in_1_If_this_is_intentional_add_an_initializer_Otherwise_add_a_declare_modifier_or_remove_the_redundant_declaration: &Message = &CATALOG[756];
-pub static Module_0_has_no_default_export_Did_you_mean_to_use_import_1_from_0_instead: &Message = &CATALOG[757];
-pub static Module_0_has_no_exported_member_1_Did_you_mean_to_use_import_1_from_0_instead: &Message = &CATALOG[758];
-pub static Type_of_property_0_circularly_references_itself_in_mapped_type_1: &Message = &CATALOG[759];
-pub static X_0_can_only_be_imported_by_using_import_1_require_2_or_a_default_import: &Message = &CATALOG[760];
+pub static Module_0_has_no_default_export_Did_you_mean_to_use_import_1_from_0_instead: &Message =
+    &CATALOG[757];
+pub static Module_0_has_no_exported_member_1_Did_you_mean_to_use_import_1_from_0_instead: &Message =
+    &CATALOG[758];
+pub static Type_of_property_0_circularly_references_itself_in_mapped_type_1: &Message =
+    &CATALOG[759];
+pub static X_0_can_only_be_imported_by_using_import_1_require_2_or_a_default_import: &Message =
+    &CATALOG[760];
 pub static X_0_can_only_be_imported_by_using_import_1_require_2_or_by_turning_on_the_esModuleInterop_flag_and_using_a_default_import: &Message = &CATALOG[761];
 pub static Source_has_0_element_s_but_target_requires_1: &Message = &CATALOG[762];
 pub static Source_has_0_element_s_but_target_allows_only_1: &Message = &CATALOG[763];
 pub static Target_requires_0_element_s_but_source_may_have_fewer: &Message = &CATALOG[764];
 pub static Target_allows_only_0_element_s_but_source_may_have_more: &Message = &CATALOG[765];
-pub static Source_provides_no_match_for_required_element_at_position_0_in_target: &Message = &CATALOG[766];
-pub static Source_provides_no_match_for_variadic_element_at_position_0_in_target: &Message = &CATALOG[767];
+pub static Source_provides_no_match_for_required_element_at_position_0_in_target: &Message =
+    &CATALOG[766];
+pub static Source_provides_no_match_for_variadic_element_at_position_0_in_target: &Message =
+    &CATALOG[767];
 pub static Variadic_element_at_position_0_in_source_does_not_match_element_at_position_1_in_target: &Message = &CATALOG[768];
-pub static Type_at_position_0_in_source_is_not_compatible_with_type_at_position_1_in_target: &Message = &CATALOG[769];
+pub static Type_at_position_0_in_source_is_not_compatible_with_type_at_position_1_in_target:
+    &Message = &CATALOG[769];
 pub static Type_at_positions_0_through_1_in_source_is_not_compatible_with_type_at_position_2_in_target: &Message = &CATALOG[770];
 pub static Cannot_assign_to_0_because_it_is_an_enum: &Message = &CATALOG[771];
 pub static Cannot_assign_to_0_because_it_is_a_class: &Message = &CATALOG[772];
 pub static Cannot_assign_to_0_because_it_is_a_function: &Message = &CATALOG[773];
 pub static Cannot_assign_to_0_because_it_is_a_namespace: &Message = &CATALOG[774];
 pub static Cannot_assign_to_0_because_it_is_an_import: &Message = &CATALOG[775];
-pub static JSX_property_access_expressions_cannot_include_JSX_namespace_names: &Message = &CATALOG[776];
+pub static JSX_property_access_expressions_cannot_include_JSX_namespace_names: &Message =
+    &CATALOG[776];
 pub static X_0_index_signatures_are_incompatible: &Message = &CATALOG[777];
-pub static Type_0_has_no_signatures_for_which_the_type_argument_list_is_applicable: &Message = &CATALOG[778];
-pub static Type_0_is_not_assignable_to_type_1_as_implied_by_variance_annotation: &Message = &CATALOG[779];
+pub static Type_0_has_no_signatures_for_which_the_type_argument_list_is_applicable: &Message =
+    &CATALOG[778];
+pub static Type_0_is_not_assignable_to_type_1_as_implied_by_variance_annotation: &Message =
+    &CATALOG[779];
 pub static Variance_annotations_are_only_supported_in_type_aliases_for_object_function_constructor_and_mapped_types: &Message = &CATALOG[780];
 pub static Type_0_may_represent_a_primitive_value_which_is_not_permitted_as_the_right_operand_of_the_in_operator: &Message = &CATALOG[781];
 pub static React_components_cannot_include_JSX_namespace_names: &Message = &CATALOG[782];
-pub static Cannot_augment_module_0_with_value_exports_because_it_resolves_to_a_non_module_entity: &Message = &CATALOG[783];
+pub static Cannot_augment_module_0_with_value_exports_because_it_resolves_to_a_non_module_entity:
+    &Message = &CATALOG[783];
 pub static Non_abstract_class_expression_is_missing_implementations_for_the_following_members_of_0_Colon_1_and_2_more: &Message = &CATALOG[784];
 pub static A_member_initializer_in_a_enum_declaration_cannot_reference_members_declared_after_it_including_members_defined_in_other_enums: &Message = &CATALOG[785];
 pub static Merged_declaration_0_cannot_include_a_default_export_declaration_Consider_adding_a_separate_export_default_0_declaration_instead: &Message = &CATALOG[786];
@@ -799,36 +982,46 @@ pub static JSX_expressions_must_have_one_parent_element: &Message = &CATALOG[791
 pub static Type_0_provides_no_match_for_the_signature_1: &Message = &CATALOG[792];
 pub static X_super_is_only_allowed_in_members_of_object_literal_expressions_when_option_target_is_ES2015_or_higher: &Message = &CATALOG[793];
 pub static X_super_can_only_be_referenced_in_members_of_derived_classes_or_object_literal_expressions: &Message = &CATALOG[794];
-pub static Cannot_export_0_Only_local_declarations_can_be_exported_from_a_module: &Message = &CATALOG[795];
+pub static Cannot_export_0_Only_local_declarations_can_be_exported_from_a_module: &Message =
+    &CATALOG[795];
 pub static Cannot_find_name_0_Did_you_mean_the_static_member_1_0: &Message = &CATALOG[796];
 pub static Cannot_find_name_0_Did_you_mean_the_instance_member_this_0: &Message = &CATALOG[797];
 pub static Invalid_module_name_in_augmentation_module_0_cannot_be_found: &Message = &CATALOG[798];
 pub static Invalid_module_name_in_augmentation_Module_0_resolves_to_an_untyped_module_at_1_which_cannot_be_augmented: &Message = &CATALOG[799];
-pub static Exports_and_export_assignments_are_not_permitted_in_module_augmentations: &Message = &CATALOG[800];
+pub static Exports_and_export_assignments_are_not_permitted_in_module_augmentations: &Message =
+    &CATALOG[800];
 pub static Imports_are_not_permitted_in_module_augmentations_Consider_moving_them_to_the_enclosing_external_module: &Message = &CATALOG[801];
 pub static X_export_modifier_cannot_be_applied_to_ambient_modules_and_module_augmentations_since_they_are_always_visible: &Message = &CATALOG[802];
 pub static Augmentations_for_the_global_scope_can_only_be_directly_nested_in_external_modules_or_ambient_module_declarations: &Message = &CATALOG[803];
 pub static Augmentations_for_the_global_scope_should_have_declare_modifier_unless_they_appear_in_already_ambient_context: &Message = &CATALOG[804];
-pub static Cannot_augment_module_0_because_it_resolves_to_a_non_module_entity: &Message = &CATALOG[805];
+pub static Cannot_augment_module_0_because_it_resolves_to_a_non_module_entity: &Message =
+    &CATALOG[805];
 pub static Cannot_assign_a_0_constructor_type_to_a_1_constructor_type: &Message = &CATALOG[806];
-pub static Constructor_of_class_0_is_private_and_only_accessible_within_the_class_declaration: &Message = &CATALOG[807];
-pub static Constructor_of_class_0_is_protected_and_only_accessible_within_the_class_declaration: &Message = &CATALOG[808];
+pub static Constructor_of_class_0_is_private_and_only_accessible_within_the_class_declaration:
+    &Message = &CATALOG[807];
+pub static Constructor_of_class_0_is_protected_and_only_accessible_within_the_class_declaration:
+    &Message = &CATALOG[808];
 pub static Cannot_extend_a_class_0_Class_constructor_is_marked_as_private: &Message = &CATALOG[809];
 pub static Accessors_must_both_be_abstract_or_non_abstract: &Message = &CATALOG[810];
-pub static A_type_predicate_s_type_must_be_assignable_to_its_parameter_s_type: &Message = &CATALOG[811];
+pub static A_type_predicate_s_type_must_be_assignable_to_its_parameter_s_type: &Message =
+    &CATALOG[811];
 pub static Type_0_is_not_comparable_to_type_1: &Message = &CATALOG[812];
-pub static A_function_that_is_called_with_the_new_keyword_cannot_have_a_this_type_that_is_void: &Message = &CATALOG[813];
+pub static A_function_that_is_called_with_the_new_keyword_cannot_have_a_this_type_that_is_void:
+    &Message = &CATALOG[813];
 pub static A_0_parameter_must_be_the_first_parameter: &Message = &CATALOG[814];
 pub static A_constructor_cannot_have_a_this_parameter: &Message = &CATALOG[815];
-pub static X_this_implicitly_has_type_any_because_it_does_not_have_a_type_annotation: &Message = &CATALOG[816];
-pub static The_this_context_of_type_0_is_not_assignable_to_method_s_this_of_type_1: &Message = &CATALOG[817];
+pub static X_this_implicitly_has_type_any_because_it_does_not_have_a_type_annotation: &Message =
+    &CATALOG[816];
+pub static The_this_context_of_type_0_is_not_assignable_to_method_s_this_of_type_1: &Message =
+    &CATALOG[817];
 pub static The_this_types_of_each_signature_are_incompatible: &Message = &CATALOG[818];
 pub static X_0_refers_to_a_UMD_global_but_the_current_file_is_a_module_Consider_adding_an_import_instead: &Message = &CATALOG[819];
 pub static All_declarations_of_0_must_have_identical_modifiers: &Message = &CATALOG[820];
 pub static Cannot_find_type_definition_file_for_0: &Message = &CATALOG[821];
 pub static Cannot_extend_an_interface_0_Did_you_mean_implements: &Message = &CATALOG[822];
 pub static X_0_only_refers_to_a_type_but_is_being_used_as_a_value_here_Did_you_mean_to_use_1_in_0: &Message = &CATALOG[823];
-pub static X_0_is_a_primitive_but_1_is_a_wrapper_object_Prefer_using_0_when_possible: &Message = &CATALOG[824];
+pub static X_0_is_a_primitive_but_1_is_a_wrapper_object_Prefer_using_0_when_possible: &Message =
+    &CATALOG[824];
 pub static X_0_only_refers_to_a_type_but_is_being_used_as_a_value_here: &Message = &CATALOG[825];
 pub static Namespace_0_has_no_exported_member_1: &Message = &CATALOG[826];
 pub static Left_side_of_comma_operator_is_unused_and_has_no_side_effects: &Message = &CATALOG[827];
@@ -837,21 +1030,27 @@ pub static An_async_function_or_method_must_return_a_Promise_Make_sure_you_have_
 pub static Spread_types_may_only_be_created_from_object_types: &Message = &CATALOG[830];
 pub static Static_property_0_conflicts_with_built_in_property_Function_0_of_constructor_function_1: &Message = &CATALOG[831];
 pub static Rest_types_may_only_be_created_from_object_types: &Message = &CATALOG[832];
-pub static The_target_of_an_object_rest_assignment_must_be_a_variable_or_a_property_access: &Message = &CATALOG[833];
-pub static X_0_only_refers_to_a_type_but_is_being_used_as_a_namespace_here: &Message = &CATALOG[834];
+pub static The_target_of_an_object_rest_assignment_must_be_a_variable_or_a_property_access:
+    &Message = &CATALOG[833];
+pub static X_0_only_refers_to_a_type_but_is_being_used_as_a_namespace_here: &Message =
+    &CATALOG[834];
 pub static The_operand_of_a_delete_operator_must_be_a_property_reference: &Message = &CATALOG[835];
-pub static The_operand_of_a_delete_operator_cannot_be_a_read_only_property: &Message = &CATALOG[836];
+pub static The_operand_of_a_delete_operator_cannot_be_a_read_only_property: &Message =
+    &CATALOG[836];
 pub static An_async_function_or_method_in_ES5_requires_the_Promise_constructor_Make_sure_you_have_a_declaration_for_the_Promise_constructor_or_include_ES2015_in_your_lib_option: &Message = &CATALOG[837];
-pub static Required_type_parameters_may_not_follow_optional_type_parameters: &Message = &CATALOG[838];
+pub static Required_type_parameters_may_not_follow_optional_type_parameters: &Message =
+    &CATALOG[838];
 pub static Generic_type_0_requires_between_1_and_2_type_arguments: &Message = &CATALOG[839];
 pub static Cannot_use_namespace_0_as_a_value: &Message = &CATALOG[840];
 pub static Cannot_use_namespace_0_as_a_type: &Message = &CATALOG[841];
-pub static X_0_are_specified_twice_The_attribute_named_0_will_be_overwritten: &Message = &CATALOG[842];
+pub static X_0_are_specified_twice_The_attribute_named_0_will_be_overwritten: &Message =
+    &CATALOG[842];
 pub static A_dynamic_import_call_returns_a_Promise_Make_sure_you_have_a_declaration_for_Promise_or_include_ES2015_in_your_lib_option: &Message = &CATALOG[843];
 pub static A_dynamic_import_call_in_ES5_requires_the_Promise_constructor_Make_sure_you_have_a_declaration_for_the_Promise_constructor_or_include_ES2015_in_your_lib_option: &Message = &CATALOG[844];
 pub static Cannot_access_0_1_because_0_is_a_type_but_not_a_namespace_Did_you_mean_to_retrieve_the_type_of_the_property_1_in_0_with_0_1: &Message = &CATALOG[845];
 pub static The_expression_of_an_export_assignment_must_be_an_identifier_or_qualified_name_in_an_ambient_context: &Message = &CATALOG[846];
-pub static Abstract_property_0_in_class_1_cannot_be_accessed_in_the_constructor: &Message = &CATALOG[847];
+pub static Abstract_property_0_in_class_1_cannot_be_accessed_in_the_constructor: &Message =
+    &CATALOG[847];
 pub static Type_parameter_0_has_a_circular_default: &Message = &CATALOG[848];
 pub static Subsequent_property_declarations_must_have_the_same_type_Property_0_must_be_of_type_1_but_here_has_type_2: &Message = &CATALOG[849];
 pub static Duplicate_property_0: &Message = &CATALOG[850];
@@ -861,7 +1060,8 @@ pub static Cannot_invoke_an_object_which_is_possibly_null: &Message = &CATALOG[8
 pub static Cannot_invoke_an_object_which_is_possibly_undefined: &Message = &CATALOG[854];
 pub static Cannot_invoke_an_object_which_is_possibly_null_or_undefined: &Message = &CATALOG[855];
 pub static X_0_has_no_exported_member_named_1_Did_you_mean_2: &Message = &CATALOG[856];
-pub static Class_name_cannot_be_Object_when_targeting_ES5_and_above_with_module_0: &Message = &CATALOG[857];
+pub static Class_name_cannot_be_Object_when_targeting_ES5_and_above_with_module_0: &Message =
+    &CATALOG[857];
 pub static Cannot_find_lib_definition_for_0: &Message = &CATALOG[858];
 pub static Cannot_find_lib_definition_for_0_Did_you_mean_1: &Message = &CATALOG[859];
 pub static X_0_is_declared_here: &Message = &CATALOG[860];
@@ -871,21 +1071,26 @@ pub static Implicit_conversion_of_a_symbol_to_a_string_will_fail_at_runtime_Cons
 pub static Cannot_find_module_0_Consider_using_resolveJsonModule_to_import_module_with_json_extension: &Message = &CATALOG[864];
 pub static Property_0_was_also_declared_here: &Message = &CATALOG[865];
 pub static Are_you_missing_a_semicolon: &Message = &CATALOG[866];
-pub static Did_you_mean_for_0_to_be_constrained_to_type_new_args_Colon_any_1: &Message = &CATALOG[867];
+pub static Did_you_mean_for_0_to_be_constrained_to_type_new_args_Colon_any_1: &Message =
+    &CATALOG[867];
 pub static Operator_0_cannot_be_applied_to_type_1: &Message = &CATALOG[868];
-pub static BigInt_literals_are_not_available_when_targeting_lower_than_ES2020: &Message = &CATALOG[869];
+pub static BigInt_literals_are_not_available_when_targeting_lower_than_ES2020: &Message =
+    &CATALOG[869];
 pub static An_outer_value_of_this_is_shadowed_by_this_container: &Message = &CATALOG[870];
 pub static Type_0_is_missing_the_following_properties_from_type_1_Colon_2: &Message = &CATALOG[871];
-pub static Type_0_is_missing_the_following_properties_from_type_1_Colon_2_and_3_more: &Message = &CATALOG[872];
+pub static Type_0_is_missing_the_following_properties_from_type_1_Colon_2_and_3_more: &Message =
+    &CATALOG[872];
 pub static Property_0_is_missing_in_type_1_but_required_in_type_2: &Message = &CATALOG[873];
 pub static The_inferred_type_of_0_cannot_be_named_without_a_reference_to_1_This_is_likely_not_portable_A_type_annotation_is_necessary: &Message = &CATALOG[874];
 pub static No_overload_expects_0_type_arguments_but_overloads_do_exist_that_expect_either_1_or_2_type_arguments: &Message = &CATALOG[875];
-pub static Type_parameter_defaults_can_only_reference_previously_declared_type_parameters: &Message = &CATALOG[876];
+pub static Type_parameter_defaults_can_only_reference_previously_declared_type_parameters:
+    &Message = &CATALOG[876];
 pub static This_JSX_tag_s_0_prop_expects_type_1_which_requires_multiple_children_but_only_a_single_child_was_provided: &Message = &CATALOG[877];
 pub static This_JSX_tag_s_0_prop_expects_a_single_child_of_type_1_but_multiple_children_were_provided: &Message = &CATALOG[878];
 pub static X_0_components_don_t_accept_text_as_child_elements_Text_in_JSX_has_the_type_string_but_the_expected_type_of_1_is_2: &Message = &CATALOG[879];
 pub static Cannot_access_ambient_const_enums_when_0_is_enabled: &Message = &CATALOG[880];
-pub static X_0_refers_to_a_value_but_is_being_used_as_a_type_here_Did_you_mean_typeof_0: &Message = &CATALOG[881];
+pub static X_0_refers_to_a_value_but_is_being_used_as_a_type_here_Did_you_mean_typeof_0: &Message =
+    &CATALOG[881];
 pub static The_implementation_signature_is_declared_here: &Message = &CATALOG[882];
 pub static Circularity_originates_in_type_at_this_location: &Message = &CATALOG[883];
 pub static The_first_export_default_is_here: &Message = &CATALOG[884];
@@ -912,14 +1117,20 @@ pub static Overload_0_of_1_2_gave_the_following_error: &Message = &CATALOG[904];
 pub static Did_you_forget_to_use_await: &Message = &CATALOG[905];
 pub static This_condition_will_always_return_true_since_this_function_is_always_defined_Did_you_mean_to_call_it_instead: &Message = &CATALOG[906];
 pub static Assertions_require_every_name_in_the_call_target_to_be_declared_with_an_explicit_type_annotation: &Message = &CATALOG[907];
-pub static Assertions_require_the_call_target_to_be_an_identifier_or_qualified_name: &Message = &CATALOG[908];
+pub static Assertions_require_the_call_target_to_be_an_identifier_or_qualified_name: &Message =
+    &CATALOG[908];
 pub static The_operand_of_an_increment_or_decrement_operator_may_not_be_an_optional_property_access: &Message = &CATALOG[909];
-pub static The_target_of_an_object_rest_assignment_may_not_be_an_optional_property_access: &Message = &CATALOG[910];
-pub static The_left_hand_side_of_an_assignment_expression_may_not_be_an_optional_property_access: &Message = &CATALOG[911];
-pub static The_left_hand_side_of_a_for_in_statement_may_not_be_an_optional_property_access: &Message = &CATALOG[912];
-pub static The_left_hand_side_of_a_for_of_statement_may_not_be_an_optional_property_access: &Message = &CATALOG[913];
+pub static The_target_of_an_object_rest_assignment_may_not_be_an_optional_property_access:
+    &Message = &CATALOG[910];
+pub static The_left_hand_side_of_an_assignment_expression_may_not_be_an_optional_property_access:
+    &Message = &CATALOG[911];
+pub static The_left_hand_side_of_a_for_in_statement_may_not_be_an_optional_property_access:
+    &Message = &CATALOG[912];
+pub static The_left_hand_side_of_a_for_of_statement_may_not_be_an_optional_property_access:
+    &Message = &CATALOG[913];
 pub static X_0_needs_an_explicit_type_annotation: &Message = &CATALOG[914];
-pub static X_0_is_specified_more_than_once_so_this_usage_will_be_overwritten: &Message = &CATALOG[915];
+pub static X_0_is_specified_more_than_once_so_this_usage_will_be_overwritten: &Message =
+    &CATALOG[915];
 pub static X_get_and_set_accessors_cannot_declare_this_parameters: &Message = &CATALOG[916];
 pub static This_spread_always_overwrites_this_property: &Message = &CATALOG[917];
 pub static X_0_cannot_be_used_as_a_JSX_component: &Message = &CATALOG[918];
@@ -931,15 +1142,19 @@ pub static Exponentiation_cannot_be_performed_on_bigint_values_unless_the_target
 pub static Cannot_find_module_0_Did_you_mean_to_set_the_moduleResolution_option_to_nodenext_or_to_add_aliases_to_the_paths_option: &Message = &CATALOG[924];
 pub static The_call_would_have_succeeded_against_this_implementation_but_implementation_signatures_of_overloads_are_not_externally_visible: &Message = &CATALOG[925];
 pub static Expected_0_arguments_but_got_1_Did_you_forget_to_include_void_in_your_type_argument_to_Promise: &Message = &CATALOG[926];
-pub static The_intrinsic_keyword_can_only_be_used_to_declare_compiler_provided_intrinsic_types: &Message = &CATALOG[927];
+pub static The_intrinsic_keyword_can_only_be_used_to_declare_compiler_provided_intrinsic_types:
+    &Message = &CATALOG[927];
 pub static It_is_likely_that_you_are_missing_a_comma_to_separate_these_two_template_expressions_They_form_a_tagged_template_expression_which_cannot_be_invoked: &Message = &CATALOG[928];
 pub static A_mixin_class_that_extends_from_a_type_variable_containing_an_abstract_construct_signature_must_also_be_declared_abstract: &Message = &CATALOG[929];
 pub static The_declaration_was_marked_as_deprecated_here: &Message = &CATALOG[930];
 pub static Type_produces_a_tuple_type_that_is_too_large_to_represent: &Message = &CATALOG[931];
-pub static Expression_produces_a_tuple_type_that_is_too_large_to_represent: &Message = &CATALOG[932];
-pub static This_condition_will_always_return_true_since_this_0_is_always_defined: &Message = &CATALOG[933];
+pub static Expression_produces_a_tuple_type_that_is_too_large_to_represent: &Message =
+    &CATALOG[932];
+pub static This_condition_will_always_return_true_since_this_0_is_always_defined: &Message =
+    &CATALOG[933];
 pub static Type_0_can_only_be_iterated_through_when_using_the_downlevelIteration_flag_or_with_a_target_of_es2015_or_higher: &Message = &CATALOG[934];
-pub static Cannot_assign_to_private_method_0_Private_methods_are_not_writable: &Message = &CATALOG[935];
+pub static Cannot_assign_to_private_method_0_Private_methods_are_not_writable: &Message =
+    &CATALOG[935];
 pub static Duplicate_identifier_0_Static_and_instance_elements_cannot_share_the_same_private_name: &Message = &CATALOG[936];
 pub static Private_accessor_was_defined_without_a_getter: &Message = &CATALOG[937];
 pub static This_syntax_requires_an_imported_helper_named_1_with_2_parameters_which_is_not_compatible_with_the_one_in_0_Consider_upgrading_your_version_of_0: &Message = &CATALOG[938];
@@ -949,15 +1164,19 @@ pub static Expected_1_argument_but_got_0_new_Promise_needs_a_JSDoc_hint_to_produ
 pub static Initializer_for_property_0: &Message = &CATALOG[942];
 pub static Property_0_does_not_exist_on_type_1_Try_changing_the_lib_compiler_option_to_include_dom: &Message = &CATALOG[943];
 pub static Class_declaration_cannot_implement_overload_list_for_0: &Message = &CATALOG[944];
-pub static Function_with_bodies_can_only_merge_with_classes_that_are_ambient: &Message = &CATALOG[945];
+pub static Function_with_bodies_can_only_merge_with_classes_that_are_ambient: &Message =
+    &CATALOG[945];
 pub static X_arguments_cannot_be_referenced_in_property_initializers_or_class_static_initialization_blocks: &Message = &CATALOG[946];
-pub static Cannot_use_this_in_a_static_property_initializer_of_a_decorated_class: &Message = &CATALOG[947];
-pub static Property_0_has_no_initializer_and_is_not_definitely_assigned_in_a_class_static_block: &Message = &CATALOG[948];
+pub static Cannot_use_this_in_a_static_property_initializer_of_a_decorated_class: &Message =
+    &CATALOG[947];
+pub static Property_0_has_no_initializer_and_is_not_definitely_assigned_in_a_class_static_block:
+    &Message = &CATALOG[948];
 pub static Duplicate_identifier_0_Compiler_reserves_name_1_when_emitting_super_references_in_static_initializers: &Message = &CATALOG[949];
 pub static Namespace_name_cannot_be_0: &Message = &CATALOG[950];
 pub static Type_0_is_not_assignable_to_type_1_Did_you_mean_2: &Message = &CATALOG[951];
 pub static Import_assertions_are_only_supported_when_the_module_option_is_set_to_esnext_node18_node20_nodenext_or_preserve: &Message = &CATALOG[952];
-pub static Import_assertions_cannot_be_used_with_type_only_imports_or_exports: &Message = &CATALOG[953];
+pub static Import_assertions_cannot_be_used_with_type_only_imports_or_exports: &Message =
+    &CATALOG[953];
 pub static Import_attributes_are_only_supported_when_the_module_option_is_set_to_esnext_node18_node20_nodenext_or_preserve: &Message = &CATALOG[954];
 pub static Cannot_find_namespace_0_Did_you_mean_1: &Message = &CATALOG[955];
 pub static Relative_import_paths_need_explicit_file_extensions_in_ECMAScript_imports_when_moduleResolution_is_node16_or_nodenext_Consider_adding_an_extension_to_the_import_path: &Message = &CATALOG[956];
@@ -967,13 +1186,16 @@ pub static Import_assertion_values_must_be_string_literal_expressions: &Message 
 pub static All_declarations_of_0_must_have_identical_constraints: &Message = &CATALOG[960];
 pub static This_condition_will_always_return_0_since_JavaScript_compares_objects_by_reference_not_value: &Message = &CATALOG[961];
 pub static An_interface_cannot_extend_a_primitive_type_like_0_It_can_only_extend_other_named_object_types: &Message = &CATALOG[962];
-pub static X_0_is_an_unused_renaming_of_1_Did_you_intend_to_use_it_as_a_type_annotation: &Message = &CATALOG[963];
-pub static We_can_only_write_a_type_for_0_by_adding_a_type_for_the_entire_parameter_here: &Message = &CATALOG[964];
+pub static X_0_is_an_unused_renaming_of_1_Did_you_intend_to_use_it_as_a_type_annotation: &Message =
+    &CATALOG[963];
+pub static We_can_only_write_a_type_for_0_by_adding_a_type_for_the_entire_parameter_here: &Message =
+    &CATALOG[964];
 pub static Type_of_instance_member_variable_0_cannot_reference_identifier_1_declared_in_the_constructor: &Message = &CATALOG[965];
 pub static This_condition_will_always_return_0: &Message = &CATALOG[966];
 pub static A_declaration_file_cannot_be_imported_without_import_type_Did_you_mean_to_import_an_implementation_file_0_instead: &Message = &CATALOG[967];
 pub static The_right_hand_side_of_an_instanceof_expression_must_not_be_an_instantiation_expression: &Message = &CATALOG[968];
-pub static Target_signature_provides_too_few_arguments_Expected_0_or_more_but_got_1: &Message = &CATALOG[969];
+pub static Target_signature_provides_too_few_arguments_Expected_0_or_more_but_got_1: &Message =
+    &CATALOG[969];
 pub static The_initializer_of_a_using_declaration_must_be_either_an_object_with_a_Symbol_dispose_method_or_be_null_or_undefined: &Message = &CATALOG[970];
 pub static The_initializer_of_an_await_using_declaration_must_be_either_an_object_with_a_Symbol_asyncDispose_or_Symbol_dispose_method_or_be_null_or_undefined: &Message = &CATALOG[971];
 pub static X_await_using_statements_are_only_allowed_within_async_functions_and_at_the_top_levels_of_modules: &Message = &CATALOG[972];
@@ -981,7 +1203,8 @@ pub static X_await_using_statements_are_only_allowed_at_the_top_level_of_a_file_
 pub static Top_level_await_using_statements_are_only_allowed_when_the_module_option_is_set_to_es2022_esnext_system_node16_node18_node20_nodenext_or_preserve_and_the_target_option_is_set_to_es2017_or_higher: &Message = &CATALOG[974];
 pub static Class_field_0_defined_by_the_parent_class_is_not_accessible_in_the_child_class_via_super: &Message = &CATALOG[975];
 pub static Import_attributes_are_not_allowed_on_statements_that_compile_to_CommonJS_require_calls: &Message = &CATALOG[976];
-pub static Import_attributes_cannot_be_used_with_type_only_imports_or_exports: &Message = &CATALOG[977];
+pub static Import_attributes_cannot_be_used_with_type_only_imports_or_exports: &Message =
+    &CATALOG[977];
 pub static Import_attribute_values_must_be_string_literal_expressions: &Message = &CATALOG[978];
 pub static Excessive_complexity_comparing_types_0_and_1: &Message = &CATALOG[979];
 pub static The_left_hand_side_of_an_instanceof_expression_must_be_assignable_to_the_first_argument_of_the_right_hand_side_s_Symbol_hasInstance_method: &Message = &CATALOG[980];
@@ -993,115 +1216,165 @@ pub static Import_0_conflicts_with_local_value_so_must_be_declared_with_a_type_o
 pub static Import_0_conflicts_with_global_value_used_in_this_file_so_must_be_declared_with_a_type_only_import_when_isolatedModules_is_enabled: &Message = &CATALOG[986];
 pub static Cannot_find_name_0_Do_you_need_to_install_type_definitions_for_Bun_Try_npm_i_save_dev_types_Slashbun: &Message = &CATALOG[987];
 pub static Cannot_find_name_0_Do_you_need_to_install_type_definitions_for_Bun_Try_npm_i_save_dev_types_Slashbun_and_then_add_bun_to_the_types_field_in_your_tsconfig: &Message = &CATALOG[988];
-pub static Right_operand_of_is_unreachable_because_the_left_operand_is_never_nullish: &Message = &CATALOG[989];
-pub static This_binary_expression_is_never_nullish_Are_you_missing_parentheses: &Message = &CATALOG[990];
+pub static Right_operand_of_is_unreachable_because_the_left_operand_is_never_nullish: &Message =
+    &CATALOG[989];
+pub static This_binary_expression_is_never_nullish_Are_you_missing_parentheses: &Message =
+    &CATALOG[990];
 pub static This_expression_is_always_nullish: &Message = &CATALOG[991];
 pub static This_kind_of_expression_is_always_truthy: &Message = &CATALOG[992];
 pub static This_kind_of_expression_is_always_falsy: &Message = &CATALOG[993];
-pub static This_JSX_tag_requires_0_to_be_in_scope_but_it_could_not_be_found: &Message = &CATALOG[994];
+pub static This_JSX_tag_requires_0_to_be_in_scope_but_it_could_not_be_found: &Message =
+    &CATALOG[994];
 pub static This_JSX_tag_requires_the_module_path_0_to_exist_but_none_could_be_found_Make_sure_you_have_types_for_the_appropriate_package_installed: &Message = &CATALOG[995];
 pub static This_relative_import_path_is_unsafe_to_rewrite_because_it_looks_like_a_file_name_but_actually_resolves_to_0: &Message = &CATALOG[996];
 pub static This_import_uses_a_0_extension_to_resolve_to_an_input_TypeScript_file_but_will_not_be_rewritten_during_emit_because_it_is_not_a_relative_path: &Message = &CATALOG[997];
 pub static This_import_path_is_unsafe_to_rewrite_because_it_resolves_to_another_project_and_the_relative_path_between_the_projects_output_files_is_not_the_same_as_the_relative_path_between_its_input_files: &Message = &CATALOG[998];
 pub static Using_JSX_fragments_requires_fragment_factory_0_to_be_in_scope_but_it_could_not_be_found: &Message = &CATALOG[999];
-pub static Import_assertions_have_been_replaced_by_import_attributes_Use_with_instead_of_assert: &Message = &CATALOG[1000];
+pub static Import_assertions_have_been_replaced_by_import_attributes_Use_with_instead_of_assert:
+    &Message = &CATALOG[1000];
 pub static This_expression_is_never_nullish: &Message = &CATALOG[1001];
-pub static Cannot_find_module_or_type_declarations_for_side_effect_import_of_0: &Message = &CATALOG[1002];
+pub static Cannot_find_module_or_type_declarations_for_side_effect_import_of_0: &Message =
+    &CATALOG[1002];
 pub static The_inferred_type_of_0_cannot_be_named_without_a_reference_to_2_from_1_This_is_likely_not_portable_A_type_annotation_is_necessary: &Message = &CATALOG[1003];
 pub static Import_declaration_0_is_using_private_name_1: &Message = &CATALOG[1004];
-pub static Type_parameter_0_of_exported_class_has_or_is_using_private_name_1: &Message = &CATALOG[1005];
-pub static Type_parameter_0_of_exported_interface_has_or_is_using_private_name_1: &Message = &CATALOG[1006];
+pub static Type_parameter_0_of_exported_class_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1005];
+pub static Type_parameter_0_of_exported_interface_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1006];
 pub static Type_parameter_0_of_constructor_signature_from_exported_interface_has_or_is_using_private_name_1: &Message = &CATALOG[1007];
 pub static Type_parameter_0_of_call_signature_from_exported_interface_has_or_is_using_private_name_1: &Message = &CATALOG[1008];
 pub static Type_parameter_0_of_public_static_method_from_exported_class_has_or_is_using_private_name_1: &Message = &CATALOG[1009];
-pub static Type_parameter_0_of_public_method_from_exported_class_has_or_is_using_private_name_1: &Message = &CATALOG[1010];
-pub static Type_parameter_0_of_method_from_exported_interface_has_or_is_using_private_name_1: &Message = &CATALOG[1011];
-pub static Type_parameter_0_of_exported_function_has_or_is_using_private_name_1: &Message = &CATALOG[1012];
-pub static Implements_clause_of_exported_class_0_has_or_is_using_private_name_1: &Message = &CATALOG[1013];
-pub static X_extends_clause_of_exported_class_0_has_or_is_using_private_name_1: &Message = &CATALOG[1014];
-pub static X_extends_clause_of_exported_class_has_or_is_using_private_name_0: &Message = &CATALOG[1015];
-pub static X_extends_clause_of_exported_interface_0_has_or_is_using_private_name_1: &Message = &CATALOG[1016];
-pub static Exported_variable_0_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named: &Message = &CATALOG[1017];
-pub static Exported_variable_0_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1018];
+pub static Type_parameter_0_of_public_method_from_exported_class_has_or_is_using_private_name_1:
+    &Message = &CATALOG[1010];
+pub static Type_parameter_0_of_method_from_exported_interface_has_or_is_using_private_name_1:
+    &Message = &CATALOG[1011];
+pub static Type_parameter_0_of_exported_function_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1012];
+pub static Implements_clause_of_exported_class_0_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1013];
+pub static X_extends_clause_of_exported_class_0_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1014];
+pub static X_extends_clause_of_exported_class_has_or_is_using_private_name_0: &Message =
+    &CATALOG[1015];
+pub static X_extends_clause_of_exported_interface_0_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1016];
+pub static Exported_variable_0_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named:
+    &Message = &CATALOG[1017];
+pub static Exported_variable_0_has_or_is_using_name_1_from_private_module_2: &Message =
+    &CATALOG[1018];
 pub static Exported_variable_0_has_or_is_using_private_name_1: &Message = &CATALOG[1019];
 pub static Public_static_property_0_of_exported_class_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named: &Message = &CATALOG[1020];
 pub static Public_static_property_0_of_exported_class_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1021];
-pub static Public_static_property_0_of_exported_class_has_or_is_using_private_name_1: &Message = &CATALOG[1022];
+pub static Public_static_property_0_of_exported_class_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1022];
 pub static Public_property_0_of_exported_class_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named: &Message = &CATALOG[1023];
-pub static Public_property_0_of_exported_class_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1024];
-pub static Public_property_0_of_exported_class_has_or_is_using_private_name_1: &Message = &CATALOG[1025];
-pub static Property_0_of_exported_interface_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1026];
-pub static Property_0_of_exported_interface_has_or_is_using_private_name_1: &Message = &CATALOG[1027];
+pub static Public_property_0_of_exported_class_has_or_is_using_name_1_from_private_module_2:
+    &Message = &CATALOG[1024];
+pub static Public_property_0_of_exported_class_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1025];
+pub static Property_0_of_exported_interface_has_or_is_using_name_1_from_private_module_2: &Message =
+    &CATALOG[1026];
+pub static Property_0_of_exported_interface_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1027];
 pub static Parameter_type_of_public_static_setter_0_from_exported_class_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1028];
 pub static Parameter_type_of_public_static_setter_0_from_exported_class_has_or_is_using_private_name_1: &Message = &CATALOG[1029];
 pub static Parameter_type_of_public_setter_0_from_exported_class_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1030];
-pub static Parameter_type_of_public_setter_0_from_exported_class_has_or_is_using_private_name_1: &Message = &CATALOG[1031];
+pub static Parameter_type_of_public_setter_0_from_exported_class_has_or_is_using_private_name_1:
+    &Message = &CATALOG[1031];
 pub static Return_type_of_public_static_getter_0_from_exported_class_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named: &Message = &CATALOG[1032];
 pub static Return_type_of_public_static_getter_0_from_exported_class_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1033];
 pub static Return_type_of_public_static_getter_0_from_exported_class_has_or_is_using_private_name_1: &Message = &CATALOG[1034];
 pub static Return_type_of_public_getter_0_from_exported_class_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named: &Message = &CATALOG[1035];
 pub static Return_type_of_public_getter_0_from_exported_class_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1036];
-pub static Return_type_of_public_getter_0_from_exported_class_has_or_is_using_private_name_1: &Message = &CATALOG[1037];
+pub static Return_type_of_public_getter_0_from_exported_class_has_or_is_using_private_name_1:
+    &Message = &CATALOG[1037];
 pub static Return_type_of_constructor_signature_from_exported_interface_has_or_is_using_name_0_from_private_module_1: &Message = &CATALOG[1038];
 pub static Return_type_of_constructor_signature_from_exported_interface_has_or_is_using_private_name_0: &Message = &CATALOG[1039];
 pub static Return_type_of_call_signature_from_exported_interface_has_or_is_using_name_0_from_private_module_1: &Message = &CATALOG[1040];
-pub static Return_type_of_call_signature_from_exported_interface_has_or_is_using_private_name_0: &Message = &CATALOG[1041];
+pub static Return_type_of_call_signature_from_exported_interface_has_or_is_using_private_name_0:
+    &Message = &CATALOG[1041];
 pub static Return_type_of_index_signature_from_exported_interface_has_or_is_using_name_0_from_private_module_1: &Message = &CATALOG[1042];
-pub static Return_type_of_index_signature_from_exported_interface_has_or_is_using_private_name_0: &Message = &CATALOG[1043];
+pub static Return_type_of_index_signature_from_exported_interface_has_or_is_using_private_name_0:
+    &Message = &CATALOG[1043];
 pub static Return_type_of_public_static_method_from_exported_class_has_or_is_using_name_0_from_external_module_1_but_cannot_be_named: &Message = &CATALOG[1044];
 pub static Return_type_of_public_static_method_from_exported_class_has_or_is_using_name_0_from_private_module_1: &Message = &CATALOG[1045];
 pub static Return_type_of_public_static_method_from_exported_class_has_or_is_using_private_name_0: &Message = &CATALOG[1046];
 pub static Return_type_of_public_method_from_exported_class_has_or_is_using_name_0_from_external_module_1_but_cannot_be_named: &Message = &CATALOG[1047];
 pub static Return_type_of_public_method_from_exported_class_has_or_is_using_name_0_from_private_module_1: &Message = &CATALOG[1048];
-pub static Return_type_of_public_method_from_exported_class_has_or_is_using_private_name_0: &Message = &CATALOG[1049];
+pub static Return_type_of_public_method_from_exported_class_has_or_is_using_private_name_0:
+    &Message = &CATALOG[1049];
 pub static Return_type_of_method_from_exported_interface_has_or_is_using_name_0_from_private_module_1: &Message = &CATALOG[1050];
-pub static Return_type_of_method_from_exported_interface_has_or_is_using_private_name_0: &Message = &CATALOG[1051];
+pub static Return_type_of_method_from_exported_interface_has_or_is_using_private_name_0: &Message =
+    &CATALOG[1051];
 pub static Return_type_of_exported_function_has_or_is_using_name_0_from_external_module_1_but_cannot_be_named: &Message = &CATALOG[1052];
-pub static Return_type_of_exported_function_has_or_is_using_name_0_from_private_module_1: &Message = &CATALOG[1053];
-pub static Return_type_of_exported_function_has_or_is_using_private_name_0: &Message = &CATALOG[1054];
+pub static Return_type_of_exported_function_has_or_is_using_name_0_from_private_module_1: &Message =
+    &CATALOG[1053];
+pub static Return_type_of_exported_function_has_or_is_using_private_name_0: &Message =
+    &CATALOG[1054];
 pub static Parameter_0_of_constructor_from_exported_class_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named: &Message = &CATALOG[1055];
 pub static Parameter_0_of_constructor_from_exported_class_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1056];
-pub static Parameter_0_of_constructor_from_exported_class_has_or_is_using_private_name_1: &Message = &CATALOG[1057];
+pub static Parameter_0_of_constructor_from_exported_class_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1057];
 pub static Parameter_0_of_constructor_signature_from_exported_interface_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1058];
 pub static Parameter_0_of_constructor_signature_from_exported_interface_has_or_is_using_private_name_1: &Message = &CATALOG[1059];
 pub static Parameter_0_of_call_signature_from_exported_interface_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1060];
-pub static Parameter_0_of_call_signature_from_exported_interface_has_or_is_using_private_name_1: &Message = &CATALOG[1061];
+pub static Parameter_0_of_call_signature_from_exported_interface_has_or_is_using_private_name_1:
+    &Message = &CATALOG[1061];
 pub static Parameter_0_of_public_static_method_from_exported_class_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named: &Message = &CATALOG[1062];
 pub static Parameter_0_of_public_static_method_from_exported_class_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1063];
 pub static Parameter_0_of_public_static_method_from_exported_class_has_or_is_using_private_name_1: &Message = &CATALOG[1064];
 pub static Parameter_0_of_public_method_from_exported_class_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named: &Message = &CATALOG[1065];
 pub static Parameter_0_of_public_method_from_exported_class_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1066];
-pub static Parameter_0_of_public_method_from_exported_class_has_or_is_using_private_name_1: &Message = &CATALOG[1067];
+pub static Parameter_0_of_public_method_from_exported_class_has_or_is_using_private_name_1:
+    &Message = &CATALOG[1067];
 pub static Parameter_0_of_method_from_exported_interface_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1068];
-pub static Parameter_0_of_method_from_exported_interface_has_or_is_using_private_name_1: &Message = &CATALOG[1069];
+pub static Parameter_0_of_method_from_exported_interface_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1069];
 pub static Parameter_0_of_exported_function_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named: &Message = &CATALOG[1070];
-pub static Parameter_0_of_exported_function_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1071];
-pub static Parameter_0_of_exported_function_has_or_is_using_private_name_1: &Message = &CATALOG[1072];
+pub static Parameter_0_of_exported_function_has_or_is_using_name_1_from_private_module_2: &Message =
+    &CATALOG[1071];
+pub static Parameter_0_of_exported_function_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1072];
 pub static Exported_type_alias_0_has_or_is_using_private_name_1: &Message = &CATALOG[1073];
 pub static Default_export_of_the_module_has_or_is_using_private_name_0: &Message = &CATALOG[1074];
-pub static Type_parameter_0_of_exported_type_alias_has_or_is_using_private_name_1: &Message = &CATALOG[1075];
-pub static Exported_type_alias_0_has_or_is_using_private_name_1_from_module_2: &Message = &CATALOG[1076];
-pub static Extends_clause_for_inferred_type_0_has_or_is_using_private_name_1: &Message = &CATALOG[1077];
+pub static Type_parameter_0_of_exported_type_alias_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1075];
+pub static Exported_type_alias_0_has_or_is_using_private_name_1_from_module_2: &Message =
+    &CATALOG[1076];
+pub static Extends_clause_for_inferred_type_0_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1077];
 pub static Parameter_0_of_index_signature_from_exported_interface_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1078];
-pub static Parameter_0_of_index_signature_from_exported_interface_has_or_is_using_private_name_1: &Message = &CATALOG[1079];
-pub static Property_0_of_exported_anonymous_class_type_may_not_be_private_or_protected: &Message = &CATALOG[1080];
+pub static Parameter_0_of_index_signature_from_exported_interface_has_or_is_using_private_name_1:
+    &Message = &CATALOG[1079];
+pub static Property_0_of_exported_anonymous_class_type_may_not_be_private_or_protected: &Message =
+    &CATALOG[1080];
 pub static Public_static_method_0_of_exported_class_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named: &Message = &CATALOG[1081];
-pub static Public_static_method_0_of_exported_class_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1082];
-pub static Public_static_method_0_of_exported_class_has_or_is_using_private_name_1: &Message = &CATALOG[1083];
+pub static Public_static_method_0_of_exported_class_has_or_is_using_name_1_from_private_module_2:
+    &Message = &CATALOG[1082];
+pub static Public_static_method_0_of_exported_class_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1083];
 pub static Public_method_0_of_exported_class_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named: &Message = &CATALOG[1084];
-pub static Public_method_0_of_exported_class_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1085];
-pub static Public_method_0_of_exported_class_has_or_is_using_private_name_1: &Message = &CATALOG[1086];
-pub static Method_0_of_exported_interface_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1087];
+pub static Public_method_0_of_exported_class_has_or_is_using_name_1_from_private_module_2:
+    &Message = &CATALOG[1085];
+pub static Public_method_0_of_exported_class_has_or_is_using_private_name_1: &Message =
+    &CATALOG[1086];
+pub static Method_0_of_exported_interface_has_or_is_using_name_1_from_private_module_2: &Message =
+    &CATALOG[1087];
 pub static Method_0_of_exported_interface_has_or_is_using_private_name_1: &Message = &CATALOG[1088];
-pub static Type_parameter_0_of_exported_mapped_object_type_is_using_private_name_1: &Message = &CATALOG[1089];
-pub static The_type_0_is_readonly_and_cannot_be_assigned_to_the_mutable_type_1: &Message = &CATALOG[1090];
-pub static Private_or_protected_member_0_cannot_be_accessed_on_a_type_parameter: &Message = &CATALOG[1091];
+pub static Type_parameter_0_of_exported_mapped_object_type_is_using_private_name_1: &Message =
+    &CATALOG[1089];
+pub static The_type_0_is_readonly_and_cannot_be_assigned_to_the_mutable_type_1: &Message =
+    &CATALOG[1090];
+pub static Private_or_protected_member_0_cannot_be_accessed_on_a_type_parameter: &Message =
+    &CATALOG[1091];
 pub static Parameter_0_of_accessor_has_or_is_using_private_name_1: &Message = &CATALOG[1092];
-pub static Parameter_0_of_accessor_has_or_is_using_name_1_from_private_module_2: &Message = &CATALOG[1093];
+pub static Parameter_0_of_accessor_has_or_is_using_name_1_from_private_module_2: &Message =
+    &CATALOG[1093];
 pub static Parameter_0_of_accessor_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named: &Message = &CATALOG[1094];
 pub static Type_arguments_for_0_circularly_reference_themselves: &Message = &CATALOG[1095];
 pub static Tuple_type_arguments_circularly_reference_themselves: &Message = &CATALOG[1096];
-pub static Property_0_comes_from_an_index_signature_so_it_must_be_accessed_with_0: &Message = &CATALOG[1097];
+pub static Property_0_comes_from_an_index_signature_so_it_must_be_accessed_with_0: &Message =
+    &CATALOG[1097];
 pub static This_member_cannot_have_an_override_modifier_because_its_containing_class_0_does_not_extend_another_class: &Message = &CATALOG[1098];
 pub static This_member_cannot_have_an_override_modifier_because_it_is_not_declared_in_the_base_class_0: &Message = &CATALOG[1099];
 pub static This_member_must_have_an_override_modifier_because_it_overrides_a_member_in_the_base_class_0: &Message = &CATALOG[1100];
@@ -1115,9 +1388,11 @@ pub static This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_
 pub static This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_it_is_not_declared_in_the_base_class_0: &Message = &CATALOG[1108];
 pub static This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_it_is_not_declared_in_the_base_class_0_Did_you_mean_1: &Message = &CATALOG[1109];
 pub static Compiler_option_0_of_value_1_is_unstable_Use_nightly_TypeScript_to_silence_this_error_Try_updating_with_npm_install_D_typescript_next: &Message = &CATALOG[1110];
-pub static Each_declaration_of_0_1_differs_in_its_value_where_2_was_expected_but_3_was_given: &Message = &CATALOG[1111];
+pub static Each_declaration_of_0_1_differs_in_its_value_where_2_was_expected_but_3_was_given:
+    &Message = &CATALOG[1111];
 pub static One_value_of_0_1_is_the_string_2_and_the_other_is_assumed_to_be_an_unknown_numeric_value: &Message = &CATALOG[1112];
-pub static This_member_cannot_have_an_override_modifier_because_its_name_is_dynamic: &Message = &CATALOG[1113];
+pub static This_member_cannot_have_an_override_modifier_because_its_name_is_dynamic: &Message =
+    &CATALOG[1113];
 pub static This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_its_name_is_dynamic: &Message = &CATALOG[1114];
 pub static The_current_host_does_not_support_the_0_option: &Message = &CATALOG[1115];
 pub static Option_0_requires_value_to_be_greater_than_1: &Message = &CATALOG[1116];
@@ -1129,28 +1404,37 @@ pub static Unknown_compiler_option_0: &Message = &CATALOG[1121];
 pub static Compiler_option_0_requires_a_value_of_type_1: &Message = &CATALOG[1122];
 pub static Unknown_compiler_option_0_Did_you_mean_1: &Message = &CATALOG[1123];
 pub static Could_not_write_file_0_Colon_1: &Message = &CATALOG[1124];
-pub static Option_project_cannot_be_mixed_with_source_files_on_a_command_line: &Message = &CATALOG[1125];
+pub static Option_project_cannot_be_mixed_with_source_files_on_a_command_line: &Message =
+    &CATALOG[1125];
 pub static Option_isolatedModules_can_only_be_used_when_either_option_module_is_provided_or_option_target_is_ES2015_or_higher: &Message = &CATALOG[1126];
 pub static Option_0_can_only_be_used_when_either_option_inlineSourceMap_or_option_sourceMap_is_provided: &Message = &CATALOG[1127];
 pub static Option_0_cannot_be_specified_without_specifying_option_1: &Message = &CATALOG[1128];
 pub static Option_0_cannot_be_specified_with_option_1: &Message = &CATALOG[1129];
 pub static A_tsconfig_json_file_is_already_defined_at_Colon_0: &Message = &CATALOG[1130];
 pub static Cannot_write_file_0_because_it_would_overwrite_input_file: &Message = &CATALOG[1131];
-pub static Cannot_write_file_0_because_it_would_be_overwritten_by_multiple_input_files: &Message = &CATALOG[1132];
-pub static Cannot_find_a_tsconfig_json_file_at_the_specified_directory_Colon_0: &Message = &CATALOG[1133];
+pub static Cannot_write_file_0_because_it_would_be_overwritten_by_multiple_input_files: &Message =
+    &CATALOG[1132];
+pub static Cannot_find_a_tsconfig_json_file_at_the_specified_directory_Colon_0: &Message =
+    &CATALOG[1133];
 pub static The_specified_path_does_not_exist_Colon_0: &Message = &CATALOG[1134];
 pub static Invalid_value_for_reactNamespace_0_is_not_a_valid_identifier: &Message = &CATALOG[1135];
 pub static Pattern_0_can_have_at_most_one_Asterisk_character: &Message = &CATALOG[1136];
-pub static Substitution_0_in_pattern_1_can_have_at_most_one_Asterisk_character: &Message = &CATALOG[1137];
+pub static Substitution_0_in_pattern_1_can_have_at_most_one_Asterisk_character: &Message =
+    &CATALOG[1137];
 pub static Substitutions_for_pattern_0_should_be_an_array: &Message = &CATALOG[1138];
-pub static Substitution_0_for_pattern_1_has_incorrect_type_expected_string_got_2: &Message = &CATALOG[1139];
+pub static Substitution_0_for_pattern_1_has_incorrect_type_expected_string_got_2: &Message =
+    &CATALOG[1139];
 pub static File_specification_cannot_contain_a_parent_directory_that_appears_after_a_recursive_directory_wildcard_Asterisk_Asterisk_Colon_0: &Message = &CATALOG[1140];
 pub static Substitutions_for_pattern_0_shouldn_t_be_an_empty_array: &Message = &CATALOG[1141];
-pub static Invalid_value_for_jsxFactory_0_is_not_a_valid_identifier_or_qualified_name: &Message = &CATALOG[1142];
+pub static Invalid_value_for_jsxFactory_0_is_not_a_valid_identifier_or_qualified_name: &Message =
+    &CATALOG[1142];
 pub static Adding_a_tsconfig_json_file_will_help_organize_projects_that_contain_both_TypeScript_and_JavaScript_files_Learn_more_at_https_Colon_Slash_Slashaka_ms_Slashtsconfig: &Message = &CATALOG[1143];
-pub static Option_0_cannot_be_specified_without_specifying_option_1_or_option_2: &Message = &CATALOG[1144];
-pub static Option_resolveJsonModule_cannot_be_specified_when_moduleResolution_is_set_to_classic: &Message = &CATALOG[1145];
-pub static Option_resolveJsonModule_cannot_be_specified_when_module_is_set_to_none_system_or_umd: &Message = &CATALOG[1146];
+pub static Option_0_cannot_be_specified_without_specifying_option_1_or_option_2: &Message =
+    &CATALOG[1144];
+pub static Option_resolveJsonModule_cannot_be_specified_when_moduleResolution_is_set_to_classic:
+    &Message = &CATALOG[1145];
+pub static Option_resolveJsonModule_cannot_be_specified_when_module_is_set_to_none_system_or_umd:
+    &Message = &CATALOG[1146];
 pub static Unknown_build_option_0: &Message = &CATALOG[1147];
 pub static Build_option_0_requires_a_value_of_type_1: &Message = &CATALOG[1148];
 pub static Option_incremental_is_only_valid_with_a_known_configuration_file_like_tsconfig_json_or_when_tsBuildInfoFile_is_explicitly_provided: &Message = &CATALOG[1149];
@@ -1160,34 +1444,45 @@ pub static Unknown_build_option_0_Did_you_mean_1: &Message = &CATALOG[1152];
 pub static Unknown_watch_option_0: &Message = &CATALOG[1153];
 pub static Unknown_watch_option_0_Did_you_mean_1: &Message = &CATALOG[1154];
 pub static Watch_option_0_requires_a_value_of_type_1: &Message = &CATALOG[1155];
-pub static Cannot_find_a_tsconfig_json_file_at_the_current_directory_Colon_0: &Message = &CATALOG[1156];
-pub static X_0_could_be_instantiated_with_an_arbitrary_type_which_could_be_unrelated_to_1: &Message = &CATALOG[1157];
+pub static Cannot_find_a_tsconfig_json_file_at_the_current_directory_Colon_0: &Message =
+    &CATALOG[1156];
+pub static X_0_could_be_instantiated_with_an_arbitrary_type_which_could_be_unrelated_to_1:
+    &Message = &CATALOG[1157];
 pub static Cannot_read_file_0: &Message = &CATALOG[1158];
 pub static A_tuple_member_cannot_be_both_optional_and_rest: &Message = &CATALOG[1159];
 pub static A_labeled_tuple_element_is_declared_as_optional_with_a_question_mark_after_the_name_and_before_the_colon_rather_than_after_the_type: &Message = &CATALOG[1160];
 pub static A_labeled_tuple_element_is_declared_as_rest_with_a_before_the_name_rather_than_before_the_type: &Message = &CATALOG[1161];
 pub static The_inferred_type_of_0_references_a_type_with_a_cyclic_structure_which_cannot_be_trivially_serialized_A_type_annotation_is_necessary: &Message = &CATALOG[1162];
 pub static Option_0_cannot_be_specified_when_option_jsx_is_1: &Message = &CATALOG[1163];
-pub static Non_relative_paths_are_not_allowed_Did_you_forget_a_leading_Slash: &Message = &CATALOG[1164];
-pub static Option_preserveConstEnums_cannot_be_disabled_when_0_is_enabled: &Message = &CATALOG[1165];
+pub static Non_relative_paths_are_not_allowed_Did_you_forget_a_leading_Slash: &Message =
+    &CATALOG[1164];
+pub static Option_preserveConstEnums_cannot_be_disabled_when_0_is_enabled: &Message =
+    &CATALOG[1165];
 pub static The_root_value_of_a_0_file_must_be_an_object: &Message = &CATALOG[1166];
 pub static Compiler_option_0_may_only_be_used_with_build: &Message = &CATALOG[1167];
 pub static Compiler_option_0_may_not_be_used_with_build: &Message = &CATALOG[1168];
-pub static Option_0_can_only_be_used_when_module_is_set_to_preserve_commonjs_or_es2015_or_later: &Message = &CATALOG[1169];
+pub static Option_0_can_only_be_used_when_module_is_set_to_preserve_commonjs_or_es2015_or_later:
+    &Message = &CATALOG[1169];
 pub static Option_allowImportingTsExtensions_can_only_be_used_when_one_of_noEmit_emitDeclarationOnly_or_rewriteRelativeImportExtensions_is_set: &Message = &CATALOG[1170];
 pub static An_import_path_can_only_end_with_a_0_extension_when_allowImportingTsExtensions_is_enabled: &Message = &CATALOG[1171];
-pub static Option_0_can_only_be_used_when_moduleResolution_is_set_to_node16_nodenext_or_bundler: &Message = &CATALOG[1172];
+pub static Option_0_can_only_be_used_when_moduleResolution_is_set_to_node16_nodenext_or_bundler:
+    &Message = &CATALOG[1172];
 pub static Option_0_is_deprecated_and_will_stop_functioning_in_TypeScript_1_Specify_compilerOption_ignoreDeprecations_Colon_2_to_silence_this_error: &Message = &CATALOG[1173];
-pub static Option_0_has_been_removed_Please_remove_it_from_your_configuration: &Message = &CATALOG[1174];
+pub static Option_0_has_been_removed_Please_remove_it_from_your_configuration: &Message =
+    &CATALOG[1174];
 pub static Invalid_value_for_ignoreDeprecations: &Message = &CATALOG[1175];
 pub static Option_0_is_redundant_and_cannot_be_specified_with_option_1: &Message = &CATALOG[1176];
-pub static Option_verbatimModuleSyntax_cannot_be_used_when_module_is_set_to_UMD_AMD_or_System: &Message = &CATALOG[1177];
+pub static Option_verbatimModuleSyntax_cannot_be_used_when_module_is_set_to_UMD_AMD_or_System:
+    &Message = &CATALOG[1177];
 pub static Use_0_instead: &Message = &CATALOG[1178];
 pub static Option_0_1_is_deprecated_and_will_stop_functioning_in_TypeScript_2_Specify_compilerOption_ignoreDeprecations_Colon_3_to_silence_this_error: &Message = &CATALOG[1179];
-pub static Option_0_1_has_been_removed_Please_remove_it_from_your_configuration: &Message = &CATALOG[1180];
+pub static Option_0_1_has_been_removed_Please_remove_it_from_your_configuration: &Message =
+    &CATALOG[1180];
 pub static Option_moduleResolution_must_be_set_to_0_or_left_unspecified_when_option_module_is_set_to_1: &Message = &CATALOG[1181];
-pub static Option_module_must_be_set_to_0_when_option_moduleResolution_is_set_to_1: &Message = &CATALOG[1182];
-pub static Visit_https_Colon_Slash_Slashaka_ms_Slashts6_for_migration_information: &Message = &CATALOG[1183];
+pub static Option_module_must_be_set_to_0_when_option_moduleResolution_is_set_to_1: &Message =
+    &CATALOG[1182];
+pub static Visit_https_Colon_Slash_Slashaka_ms_Slashts6_for_migration_information: &Message =
+    &CATALOG[1183];
 pub static X_tsconfig_json_is_present_but_will_not_be_loaded_if_files_are_specified_on_commandline_Use_ignoreConfig_to_skip_this_error: &Message = &CATALOG[1184];
 pub static Generates_a_sourcemap_for_each_corresponding_d_ts_file: &Message = &CATALOG[1185];
 pub static Concatenate_and_emit_output_to_single_file: &Message = &CATALOG[1186];
@@ -1232,24 +1527,34 @@ pub static Argument_for_0_option_must_be_Colon_1: &Message = &CATALOG[1224];
 pub static Locale_must_be_an_IETF_BCP_47_language_tag_Examples_Colon_0_1: &Message = &CATALOG[1225];
 pub static Unable_to_open_file_0: &Message = &CATALOG[1226];
 pub static Corrupted_locale_file_0: &Message = &CATALOG[1227];
-pub static Raise_error_on_expressions_and_declarations_with_an_implied_any_type: &Message = &CATALOG[1228];
+pub static Raise_error_on_expressions_and_declarations_with_an_implied_any_type: &Message =
+    &CATALOG[1228];
 pub static File_0_not_found: &Message = &CATALOG[1229];
-pub static File_0_has_an_unsupported_extension_The_only_supported_extensions_are_1: &Message = &CATALOG[1230];
-pub static Suppress_noImplicitAny_errors_for_indexing_objects_lacking_index_signatures: &Message = &CATALOG[1231];
-pub static Do_not_emit_declarations_for_code_that_has_an_internal_annotation: &Message = &CATALOG[1232];
+pub static File_0_has_an_unsupported_extension_The_only_supported_extensions_are_1: &Message =
+    &CATALOG[1230];
+pub static Suppress_noImplicitAny_errors_for_indexing_objects_lacking_index_signatures: &Message =
+    &CATALOG[1231];
+pub static Do_not_emit_declarations_for_code_that_has_an_internal_annotation: &Message =
+    &CATALOG[1232];
 pub static Specify_the_root_directory_of_input_files_Use_to_control_the_output_directory_structure_with_outDir: &Message = &CATALOG[1233];
-pub static File_0_is_not_under_rootDir_1_rootDir_is_expected_to_contain_all_source_files: &Message = &CATALOG[1234];
+pub static File_0_is_not_under_rootDir_1_rootDir_is_expected_to_contain_all_source_files: &Message =
+    &CATALOG[1234];
 pub static Specify_the_end_of_line_sequence_to_be_used_when_emitting_files_Colon_CRLF_dos_or_LF_unix: &Message = &CATALOG[1235];
 pub static NEWLINE: &Message = &CATALOG[1236];
-pub static Option_0_can_only_be_specified_in_tsconfig_json_file_or_set_to_null_on_command_line: &Message = &CATALOG[1237];
+pub static Option_0_can_only_be_specified_in_tsconfig_json_file_or_set_to_null_on_command_line:
+    &Message = &CATALOG[1237];
 pub static Enables_experimental_support_for_ES7_decorators: &Message = &CATALOG[1238];
-pub static Enables_experimental_support_for_emitting_type_metadata_for_decorators: &Message = &CATALOG[1239];
-pub static Initializes_a_TypeScript_project_and_creates_a_tsconfig_json_file: &Message = &CATALOG[1240];
+pub static Enables_experimental_support_for_emitting_type_metadata_for_decorators: &Message =
+    &CATALOG[1239];
+pub static Initializes_a_TypeScript_project_and_creates_a_tsconfig_json_file: &Message =
+    &CATALOG[1240];
 pub static Successfully_created_a_tsconfig_json_file: &Message = &CATALOG[1241];
 pub static Suppress_excess_property_checks_for_object_literals: &Message = &CATALOG[1242];
-pub static Stylize_errors_and_messages_using_color_and_context_experimental: &Message = &CATALOG[1243];
+pub static Stylize_errors_and_messages_using_color_and_context_experimental: &Message =
+    &CATALOG[1243];
 pub static Do_not_report_errors_on_unused_labels: &Message = &CATALOG[1244];
-pub static Report_error_when_not_all_code_paths_in_function_return_a_value: &Message = &CATALOG[1245];
+pub static Report_error_when_not_all_code_paths_in_function_return_a_value: &Message =
+    &CATALOG[1245];
 pub static Report_errors_for_fallthrough_cases_in_switch_statement: &Message = &CATALOG[1246];
 pub static Do_not_report_errors_on_unreachable_code: &Message = &CATALOG[1247];
 pub static Disallow_inconsistently_cased_references_to_the_same_file: &Message = &CATALOG[1248];
@@ -1264,22 +1569,26 @@ pub static Explicitly_specified_module_resolution_kind_Colon_0: &Message = &CATA
 pub static Module_resolution_kind_is_not_specified_using_0: &Message = &CATALOG[1257];
 pub static Module_name_0_was_successfully_resolved_to_1: &Message = &CATALOG[1258];
 pub static Module_name_0_was_not_resolved: &Message = &CATALOG[1259];
-pub static X_paths_option_is_specified_looking_for_a_pattern_to_match_module_name_0: &Message = &CATALOG[1260];
+pub static X_paths_option_is_specified_looking_for_a_pattern_to_match_module_name_0: &Message =
+    &CATALOG[1260];
 pub static Module_name_0_matched_pattern_1: &Message = &CATALOG[1261];
 pub static Trying_substitution_0_candidate_module_location_Colon_1: &Message = &CATALOG[1262];
 pub static Resolving_module_name_0_relative_to_base_url_1_2: &Message = &CATALOG[1263];
 pub static Loading_module_as_file_Slash_folder_candidate_module_location_0_target_file_types_Colon_1: &Message = &CATALOG[1264];
 pub static File_0_does_not_exist: &Message = &CATALOG[1265];
 pub static File_0_exists_use_it_as_a_name_resolution_result: &Message = &CATALOG[1266];
-pub static Loading_module_0_from_node_modules_folder_target_file_types_Colon_1: &Message = &CATALOG[1267];
+pub static Loading_module_0_from_node_modules_folder_target_file_types_Colon_1: &Message =
+    &CATALOG[1267];
 pub static Found_package_json_at_0: &Message = &CATALOG[1268];
 pub static X_package_json_does_not_have_a_0_field: &Message = &CATALOG[1269];
 pub static X_package_json_has_0_field_1_that_references_2: &Message = &CATALOG[1270];
 pub static Allow_javascript_files_to_be_compiled: &Message = &CATALOG[1271];
 pub static Checking_if_0_is_the_longest_matching_prefix_for_1_2: &Message = &CATALOG[1272];
 pub static Expected_type_of_0_field_in_package_json_to_be_1_got_2: &Message = &CATALOG[1273];
-pub static X_baseUrl_option_is_set_to_0_using_this_value_to_resolve_non_relative_module_name_1: &Message = &CATALOG[1274];
-pub static X_rootDirs_option_is_set_using_it_to_resolve_relative_module_name_0: &Message = &CATALOG[1275];
+pub static X_baseUrl_option_is_set_to_0_using_this_value_to_resolve_non_relative_module_name_1:
+    &Message = &CATALOG[1274];
+pub static X_rootDirs_option_is_set_using_it_to_resolve_relative_module_name_0: &Message =
+    &CATALOG[1275];
 pub static Longest_matching_prefix_for_0_is_1: &Message = &CATALOG[1276];
 pub static Loading_0_from_the_root_dir_1_candidate_location_2: &Message = &CATALOG[1277];
 pub static Trying_other_entries_in_rootDirs: &Message = &CATALOG[1278];
@@ -1288,56 +1597,74 @@ pub static Do_not_emit_use_strict_directives_in_module_output: &Message = &CATAL
 pub static Enable_strict_null_checks: &Message = &CATALOG[1281];
 pub static Unknown_option_excludes_Did_you_mean_exclude: &Message = &CATALOG[1282];
 pub static Raise_error_on_this_expressions_with_an_implied_any_type: &Message = &CATALOG[1283];
-pub static Resolving_type_reference_directive_0_containing_file_1_root_directory_2: &Message = &CATALOG[1284];
-pub static Type_reference_directive_0_was_successfully_resolved_to_1_primary_Colon_2: &Message = &CATALOG[1285];
+pub static Resolving_type_reference_directive_0_containing_file_1_root_directory_2: &Message =
+    &CATALOG[1284];
+pub static Type_reference_directive_0_was_successfully_resolved_to_1_primary_Colon_2: &Message =
+    &CATALOG[1285];
 pub static Type_reference_directive_0_was_not_resolved: &Message = &CATALOG[1286];
 pub static Resolving_with_primary_search_path_0: &Message = &CATALOG[1287];
-pub static Root_directory_cannot_be_determined_skipping_primary_search_paths: &Message = &CATALOG[1288];
-pub static Resolving_type_reference_directive_0_containing_file_1_root_directory_not_set: &Message = &CATALOG[1289];
+pub static Root_directory_cannot_be_determined_skipping_primary_search_paths: &Message =
+    &CATALOG[1288];
+pub static Resolving_type_reference_directive_0_containing_file_1_root_directory_not_set: &Message =
+    &CATALOG[1289];
 pub static Type_declaration_files_to_be_included_in_compilation: &Message = &CATALOG[1290];
 pub static Looking_up_in_node_modules_folder_initial_location_0: &Message = &CATALOG[1291];
 pub static Containing_file_is_not_specified_and_root_directory_cannot_be_determined_skipping_lookup_in_node_modules_folder: &Message = &CATALOG[1292];
-pub static Resolving_type_reference_directive_0_containing_file_not_set_root_directory_1: &Message = &CATALOG[1293];
-pub static Resolving_type_reference_directive_0_containing_file_not_set_root_directory_not_set: &Message = &CATALOG[1294];
+pub static Resolving_type_reference_directive_0_containing_file_not_set_root_directory_1: &Message =
+    &CATALOG[1293];
+pub static Resolving_type_reference_directive_0_containing_file_not_set_root_directory_not_set:
+    &Message = &CATALOG[1294];
 pub static Resolving_real_path_for_0_result_1: &Message = &CATALOG[1295];
-pub static Cannot_compile_modules_using_option_0_unless_the_module_flag_is_amd_or_system: &Message = &CATALOG[1296];
+pub static Cannot_compile_modules_using_option_0_unless_the_module_flag_is_amd_or_system: &Message =
+    &CATALOG[1296];
 pub static File_name_0_has_a_1_extension_stripping_it: &Message = &CATALOG[1297];
 pub static X_0_is_declared_but_its_value_is_never_read: &Message = &CATALOG[1298];
 pub static Report_errors_on_unused_locals: &Message = &CATALOG[1299];
 pub static Report_errors_on_unused_parameters: &Message = &CATALOG[1300];
-pub static The_maximum_dependency_depth_to_search_under_node_modules_and_load_JavaScript_files: &Message = &CATALOG[1301];
-pub static Cannot_import_type_declaration_files_Consider_importing_0_instead_of_1: &Message = &CATALOG[1302];
+pub static The_maximum_dependency_depth_to_search_under_node_modules_and_load_JavaScript_files:
+    &Message = &CATALOG[1301];
+pub static Cannot_import_type_declaration_files_Consider_importing_0_instead_of_1: &Message =
+    &CATALOG[1302];
 pub static Property_0_is_declared_but_its_value_is_never_read: &Message = &CATALOG[1303];
 pub static Import_emit_helpers_from_tslib: &Message = &CATALOG[1304];
 pub static Auto_discovery_for_typings_is_enabled_in_project_0_Running_extra_resolution_pass_for_module_1_using_cache_location_2: &Message = &CATALOG[1305];
 pub static Parse_in_strict_mode_and_emit_use_strict_for_each_source_file: &Message = &CATALOG[1306];
 pub static Module_0_was_resolved_to_1_but_jsx_is_not_set: &Message = &CATALOG[1307];
-pub static Module_0_was_resolved_as_locally_declared_ambient_module_in_file_1: &Message = &CATALOG[1308];
+pub static Module_0_was_resolved_as_locally_declared_ambient_module_in_file_1: &Message =
+    &CATALOG[1308];
 pub static Specify_the_JSX_factory_function_to_use_when_targeting_react_JSX_emit_e_g_React_createElement_or_h: &Message = &CATALOG[1309];
 pub static Resolution_for_module_0_was_found_in_cache_from_location_1: &Message = &CATALOG[1310];
 pub static Directory_0_does_not_exist_skipping_all_lookups_in_it: &Message = &CATALOG[1311];
 pub static Show_diagnostic_information: &Message = &CATALOG[1312];
 pub static Show_verbose_diagnostic_information: &Message = &CATALOG[1313];
-pub static Emit_a_single_file_with_source_maps_instead_of_having_a_separate_file: &Message = &CATALOG[1314];
+pub static Emit_a_single_file_with_source_maps_instead_of_having_a_separate_file: &Message =
+    &CATALOG[1314];
 pub static Emit_the_source_alongside_the_sourcemaps_within_a_single_file_requires_inlineSourceMap_or_sourceMap_to_be_set: &Message = &CATALOG[1315];
-pub static Transpile_each_file_as_a_separate_module_similar_to_ts_transpileModule: &Message = &CATALOG[1316];
+pub static Transpile_each_file_as_a_separate_module_similar_to_ts_transpileModule: &Message =
+    &CATALOG[1316];
 pub static Print_names_of_generated_files_part_of_the_compilation: &Message = &CATALOG[1317];
 pub static Print_names_of_files_part_of_the_compilation: &Message = &CATALOG[1318];
-pub static The_locale_used_when_displaying_messages_to_the_user_e_g_en_us: &Message = &CATALOG[1319];
-pub static Do_not_generate_custom_helper_functions_like_extends_in_compiled_output: &Message = &CATALOG[1320];
+pub static The_locale_used_when_displaying_messages_to_the_user_e_g_en_us: &Message =
+    &CATALOG[1319];
+pub static Do_not_generate_custom_helper_functions_like_extends_in_compiled_output: &Message =
+    &CATALOG[1320];
 pub static Do_not_include_the_default_library_file_lib_d_ts: &Message = &CATALOG[1321];
-pub static Do_not_add_triple_slash_references_or_imported_modules_to_the_list_of_compiled_files: &Message = &CATALOG[1322];
+pub static Do_not_add_triple_slash_references_or_imported_modules_to_the_list_of_compiled_files:
+    &Message = &CATALOG[1322];
 pub static Deprecated_Use_skipLibCheck_instead_Skip_type_checking_of_default_library_declaration_files: &Message = &CATALOG[1323];
 pub static List_of_folders_to_include_type_definitions_from: &Message = &CATALOG[1324];
 pub static Disable_size_limitations_on_JavaScript_projects: &Message = &CATALOG[1325];
 pub static The_character_set_of_the_input_files: &Message = &CATALOG[1326];
-pub static Skipping_module_0_that_looks_like_an_absolute_URI_target_file_types_Colon_1: &Message = &CATALOG[1327];
+pub static Skipping_module_0_that_looks_like_an_absolute_URI_target_file_types_Colon_1: &Message =
+    &CATALOG[1327];
 pub static Do_not_truncate_error_messages: &Message = &CATALOG[1328];
 pub static Output_directory_for_generated_declaration_files: &Message = &CATALOG[1329];
-pub static A_series_of_entries_which_re_map_imports_to_lookup_locations_relative_to_the_baseUrl: &Message = &CATALOG[1330];
+pub static A_series_of_entries_which_re_map_imports_to_lookup_locations_relative_to_the_baseUrl:
+    &Message = &CATALOG[1330];
 pub static List_of_root_folders_whose_combined_content_represents_the_structure_of_the_project_at_runtime: &Message = &CATALOG[1331];
 pub static Show_all_compiler_options: &Message = &CATALOG[1332];
-pub static Deprecated_Use_outFile_instead_Concatenate_and_emit_output_to_single_file: &Message = &CATALOG[1333];
+pub static Deprecated_Use_outFile_instead_Concatenate_and_emit_output_to_single_file: &Message =
+    &CATALOG[1333];
 pub static Command_line_Options: &Message = &CATALOG[1334];
 pub static Provide_full_support_for_iterables_in_for_of_spread_and_destructuring_when_targeting_ES5: &Message = &CATALOG[1335];
 pub static Enable_all_strict_type_checking_options: &Message = &CATALOG[1336];
@@ -1348,25 +1675,32 @@ pub static Enable_strict_checking_of_function_types: &Message = &CATALOG[1340];
 pub static Enable_strict_checking_of_property_initialization_in_classes: &Message = &CATALOG[1341];
 pub static Numeric_separators_are_not_allowed_here: &Message = &CATALOG[1342];
 pub static Multiple_consecutive_numeric_separators_are_not_permitted: &Message = &CATALOG[1343];
-pub static Whether_to_keep_outdated_console_output_in_watch_mode_instead_of_clearing_the_screen: &Message = &CATALOG[1344];
+pub static Whether_to_keep_outdated_console_output_in_watch_mode_instead_of_clearing_the_screen:
+    &Message = &CATALOG[1344];
 pub static All_imports_in_import_declaration_are_unused: &Message = &CATALOG[1345];
 pub static Found_1_error_Watching_for_file_changes: &Message = &CATALOG[1346];
 pub static Found_0_errors_Watching_for_file_changes: &Message = &CATALOG[1347];
-pub static Resolve_keyof_to_string_valued_property_names_only_no_numbers_or_symbols: &Message = &CATALOG[1348];
+pub static Resolve_keyof_to_string_valued_property_names_only_no_numbers_or_symbols: &Message =
+    &CATALOG[1348];
 pub static X_0_is_declared_but_never_used: &Message = &CATALOG[1349];
 pub static Include_modules_imported_with_json_extension: &Message = &CATALOG[1350];
 pub static All_destructured_elements_are_unused: &Message = &CATALOG[1351];
 pub static All_variables_are_unused: &Message = &CATALOG[1352];
-pub static Definitions_of_the_following_identifiers_conflict_with_those_in_another_file_Colon_0: &Message = &CATALOG[1353];
+pub static Definitions_of_the_following_identifiers_conflict_with_those_in_another_file_Colon_0:
+    &Message = &CATALOG[1353];
 pub static Conflicts_are_in_this_file: &Message = &CATALOG[1354];
-pub static Project_references_may_not_form_a_circular_graph_Cycle_detected_Colon_0: &Message = &CATALOG[1355];
+pub static Project_references_may_not_form_a_circular_graph_Cycle_detected_Colon_0: &Message =
+    &CATALOG[1355];
 pub static X_0_was_also_declared_here: &Message = &CATALOG[1356];
 pub static X_and_here: &Message = &CATALOG[1357];
 pub static All_type_parameters_are_unused: &Message = &CATALOG[1358];
-pub static X_package_json_has_a_typesVersions_field_with_version_specific_path_mappings: &Message = &CATALOG[1359];
-pub static X_package_json_does_not_have_a_typesVersions_entry_that_matches_version_0: &Message = &CATALOG[1360];
+pub static X_package_json_has_a_typesVersions_field_with_version_specific_path_mappings: &Message =
+    &CATALOG[1359];
+pub static X_package_json_does_not_have_a_typesVersions_entry_that_matches_version_0: &Message =
+    &CATALOG[1360];
 pub static X_package_json_has_a_typesVersions_entry_0_that_matches_compiler_version_1_looking_for_a_pattern_to_match_module_name_2: &Message = &CATALOG[1361];
-pub static X_package_json_has_a_typesVersions_entry_0_that_is_not_a_valid_semver_range: &Message = &CATALOG[1362];
+pub static X_package_json_has_a_typesVersions_entry_0_that_is_not_a_valid_semver_range: &Message =
+    &CATALOG[1362];
 pub static An_argument_for_0_was_not_provided: &Message = &CATALOG[1363];
 pub static An_argument_matching_this_binding_pattern_was_not_provided: &Message = &CATALOG[1364];
 pub static Did_you_mean_to_call_this_expression: &Message = &CATALOG[1365];
@@ -1375,20 +1709,24 @@ pub static Enable_strict_bind_call_and_apply_methods_on_functions: &Message = &C
 pub static Using_compiler_options_of_project_reference_redirect_0: &Message = &CATALOG[1368];
 pub static Found_1_error: &Message = &CATALOG[1369];
 pub static Found_0_errors: &Message = &CATALOG[1370];
-pub static Module_name_0_was_successfully_resolved_to_1_with_Package_ID_2: &Message = &CATALOG[1371];
+pub static Module_name_0_was_successfully_resolved_to_1_with_Package_ID_2: &Message =
+    &CATALOG[1371];
 pub static Type_reference_directive_0_was_successfully_resolved_to_1_with_Package_ID_2_primary_Colon_3: &Message = &CATALOG[1372];
 pub static X_package_json_had_a_falsy_0_field: &Message = &CATALOG[1373];
-pub static Disable_use_of_source_files_instead_of_declaration_files_from_referenced_projects: &Message = &CATALOG[1374];
+pub static Disable_use_of_source_files_instead_of_declaration_files_from_referenced_projects:
+    &Message = &CATALOG[1374];
 pub static Emit_class_fields_with_Define_instead_of_Set: &Message = &CATALOG[1375];
 pub static Generates_a_CPU_profile: &Message = &CATALOG[1376];
 pub static Disable_solution_searching_for_this_project: &Message = &CATALOG[1377];
 pub static Specify_strategy_for_watching_file_Colon_FixedPollingInterval_default_PriorityPollingInterval_DynamicPriorityPolling_FixedChunkSizePolling_UseFsEvents_UseFsEventsOnParentDirectory: &Message = &CATALOG[1378];
 pub static Specify_strategy_for_watching_directory_on_platforms_that_don_t_support_recursive_watching_natively_Colon_UseFsEvents_default_FixedPollingInterval_DynamicPriorityPolling_FixedChunkSizePolling: &Message = &CATALOG[1379];
 pub static Specify_strategy_for_creating_a_polling_watch_when_it_fails_to_create_using_file_system_events_Colon_FixedInterval_default_PriorityInterval_DynamicPriority_FixedChunkSize: &Message = &CATALOG[1380];
-pub static Tag_0_expects_at_least_1_arguments_but_the_JSX_factory_2_provides_at_most_3: &Message = &CATALOG[1381];
+pub static Tag_0_expects_at_least_1_arguments_but_the_JSX_factory_2_provides_at_most_3: &Message =
+    &CATALOG[1381];
 pub static Option_0_can_only_be_specified_in_tsconfig_json_file_or_set_to_false_or_null_on_command_line: &Message = &CATALOG[1382];
 pub static Could_not_resolve_the_path_0_with_the_extensions_Colon_1: &Message = &CATALOG[1383];
-pub static Declaration_augments_declaration_in_another_file_This_cannot_be_serialized: &Message = &CATALOG[1384];
+pub static Declaration_augments_declaration_in_another_file_This_cannot_be_serialized: &Message =
+    &CATALOG[1384];
 pub static This_is_the_declaration_being_augmented_Consider_moving_the_augmenting_declaration_into_the_same_file: &Message = &CATALOG[1385];
 pub static This_expression_is_not_callable_because_it_is_a_get_accessor_Did_you_mean_to_use_it_without: &Message = &CATALOG[1386];
 pub static Disable_loading_referenced_projects: &Message = &CATALOG[1387];
@@ -1397,9 +1735,11 @@ pub static Generates_an_event_trace_and_a_list_of_types: &Message = &CATALOG[138
 pub static Specify_the_module_specifier_to_be_used_to_import_the_jsx_and_jsxs_factory_functions_from_eg_react: &Message = &CATALOG[1390];
 pub static File_0_exists_according_to_earlier_cached_lookups: &Message = &CATALOG[1391];
 pub static File_0_does_not_exist_according_to_earlier_cached_lookups: &Message = &CATALOG[1392];
-pub static Resolution_for_type_reference_directive_0_was_found_in_cache_from_location_1: &Message = &CATALOG[1393];
+pub static Resolution_for_type_reference_directive_0_was_found_in_cache_from_location_1: &Message =
+    &CATALOG[1393];
 pub static Resolving_type_reference_directive_0_containing_file_1: &Message = &CATALOG[1394];
-pub static Interpret_optional_property_types_as_written_rather_than_adding_undefined: &Message = &CATALOG[1395];
+pub static Interpret_optional_property_types_as_written_rather_than_adding_undefined: &Message =
+    &CATALOG[1395];
 pub static Modules: &Message = &CATALOG[1396];
 pub static File_Management: &Message = &CATALOG[1397];
 pub static Emit: &Message = &CATALOG[1398];
@@ -1414,22 +1754,29 @@ pub static Language_and_Environment: &Message = &CATALOG[1406];
 pub static Projects: &Message = &CATALOG[1407];
 pub static Output_Formatting: &Message = &CATALOG[1408];
 pub static Completeness: &Message = &CATALOG[1409];
-pub static X_0_should_be_set_inside_the_compilerOptions_object_of_the_config_json_file: &Message = &CATALOG[1410];
+pub static X_0_should_be_set_inside_the_compilerOptions_object_of_the_config_json_file: &Message =
+    &CATALOG[1410];
 pub static Found_1_error_in_0: &Message = &CATALOG[1411];
 pub static Found_0_errors_in_the_same_file_starting_at_Colon_1: &Message = &CATALOG[1412];
 pub static Found_0_errors_in_1_files: &Message = &CATALOG[1413];
 pub static File_name_0_has_a_1_extension_looking_up_2_instead: &Message = &CATALOG[1414];
-pub static Module_0_was_resolved_to_1_but_allowArbitraryExtensions_is_not_set: &Message = &CATALOG[1415];
-pub static Enable_importing_files_with_any_extension_provided_a_declaration_file_is_present: &Message = &CATALOG[1416];
+pub static Module_0_was_resolved_to_1_but_allowArbitraryExtensions_is_not_set: &Message =
+    &CATALOG[1415];
+pub static Enable_importing_files_with_any_extension_provided_a_declaration_file_is_present:
+    &Message = &CATALOG[1416];
 pub static Resolving_type_reference_directive_for_program_that_specifies_custom_typeRoots_skipping_lookup_in_node_modules_folder: &Message = &CATALOG[1417];
 pub static Option_0_can_only_be_specified_on_command_line: &Message = &CATALOG[1418];
-pub static Directory_0_has_no_containing_package_json_scope_Imports_will_not_resolve: &Message = &CATALOG[1419];
-pub static Import_specifier_0_does_not_exist_in_package_json_scope_at_path_1: &Message = &CATALOG[1420];
+pub static Directory_0_has_no_containing_package_json_scope_Imports_will_not_resolve: &Message =
+    &CATALOG[1419];
+pub static Import_specifier_0_does_not_exist_in_package_json_scope_at_path_1: &Message =
+    &CATALOG[1420];
 pub static Invalid_import_specifier_0_has_no_possible_resolutions: &Message = &CATALOG[1421];
 pub static X_package_json_scope_0_has_no_imports_defined: &Message = &CATALOG[1422];
 pub static X_package_json_scope_0_explicitly_maps_specifier_1_to_null: &Message = &CATALOG[1423];
-pub static X_package_json_scope_0_has_invalid_type_for_target_of_specifier_1: &Message = &CATALOG[1424];
-pub static Export_specifier_0_does_not_exist_in_package_json_scope_at_path_1: &Message = &CATALOG[1425];
+pub static X_package_json_scope_0_has_invalid_type_for_target_of_specifier_1: &Message =
+    &CATALOG[1424];
+pub static Export_specifier_0_does_not_exist_in_package_json_scope_at_path_1: &Message =
+    &CATALOG[1425];
 pub static Resolution_of_non_relative_name_failed_trying_with_modern_Node_resolution_features_disabled_to_see_if_npm_library_needs_configuration_update: &Message = &CATALOG[1426];
 pub static There_are_types_at_0_but_this_result_could_not_be_resolved_when_respecting_package_json_exports_The_1_library_may_need_to_update_its_package_json_or_typings: &Message = &CATALOG[1427];
 pub static Resolution_of_non_relative_name_failed_trying_with_moduleResolution_bundler_to_see_if_project_may_need_configuration_update: &Message = &CATALOG[1428];
@@ -1439,7 +1786,8 @@ pub static Found_peerDependency_0_with_1_version: &Message = &CATALOG[1431];
 pub static Failed_to_find_peerDependency_0: &Message = &CATALOG[1432];
 pub static File_Layout: &Message = &CATALOG[1433];
 pub static Environment_Settings: &Message = &CATALOG[1434];
-pub static See_also_https_Colon_Slash_Slashaka_ms_Slashtsconfig_Slashmodule: &Message = &CATALOG[1435];
+pub static See_also_https_Colon_Slash_Slashaka_ms_Slashtsconfig_Slashmodule: &Message =
+    &CATALOG[1435];
 pub static For_nodejs_Colon: &Message = &CATALOG[1436];
 pub static X_and_npm_install_D_types_Slashnode: &Message = &CATALOG[1437];
 pub static Other_Outputs: &Message = &CATALOG[1438];
@@ -1452,8 +1800,10 @@ pub static Output_file_0_has_not_been_built_from_source_file_1: &Message = &CATA
 pub static Referenced_project_0_must_have_setting_composite_Colon_true: &Message = &CATALOG[1445];
 pub static File_0_is_not_listed_within_the_file_list_of_project_1_Projects_must_list_all_files_or_use_an_include_pattern: &Message = &CATALOG[1446];
 pub static Referenced_project_0_may_not_disable_emit: &Message = &CATALOG[1447];
-pub static Project_0_is_out_of_date_because_output_1_is_older_than_input_2: &Message = &CATALOG[1448];
-pub static Project_0_is_up_to_date_because_newest_input_1_is_older_than_output_2: &Message = &CATALOG[1449];
+pub static Project_0_is_out_of_date_because_output_1_is_older_than_input_2: &Message =
+    &CATALOG[1448];
+pub static Project_0_is_up_to_date_because_newest_input_1_is_older_than_output_2: &Message =
+    &CATALOG[1449];
 pub static Project_0_is_out_of_date_because_output_file_1_does_not_exist: &Message = &CATALOG[1450];
 pub static Failed_to_delete_file_0: &Message = &CATALOG[1451];
 pub static Project_0_is_up_to_date_with_d_ts_files_from_its_dependencies: &Message = &CATALOG[1452];
@@ -1463,27 +1813,33 @@ pub static A_non_dry_build_would_build_project_0: &Message = &CATALOG[1455];
 pub static Building_project_0: &Message = &CATALOG[1456];
 pub static Updating_output_timestamps_of_project_0: &Message = &CATALOG[1457];
 pub static Project_0_is_up_to_date: &Message = &CATALOG[1458];
-pub static Skipping_build_of_project_0_because_its_dependency_1_has_errors: &Message = &CATALOG[1459];
+pub static Skipping_build_of_project_0_because_its_dependency_1_has_errors: &Message =
+    &CATALOG[1459];
 pub static Project_0_can_t_be_built_because_its_dependency_1_has_errors: &Message = &CATALOG[1460];
-pub static Build_one_or_more_projects_and_their_dependencies_if_out_of_date: &Message = &CATALOG[1461];
+pub static Build_one_or_more_projects_and_their_dependencies_if_out_of_date: &Message =
+    &CATALOG[1461];
 pub static Delete_the_outputs_of_all_projects: &Message = &CATALOG[1462];
 pub static Show_what_would_be_built_or_deleted_if_specified_with_clean: &Message = &CATALOG[1463];
 pub static Option_build_must_be_the_first_command_line_argument: &Message = &CATALOG[1464];
 pub static Options_0_and_1_cannot_be_combined: &Message = &CATALOG[1465];
 pub static Updating_unchanged_output_timestamps_of_project_0: &Message = &CATALOG[1466];
-pub static A_non_dry_build_would_update_timestamps_for_output_of_project_0: &Message = &CATALOG[1467];
+pub static A_non_dry_build_would_update_timestamps_for_output_of_project_0: &Message =
+    &CATALOG[1467];
 pub static Cannot_write_file_0_because_it_will_overwrite_tsbuildinfo_file_generated_by_referenced_project_1: &Message = &CATALOG[1468];
 pub static Composite_projects_may_not_disable_incremental_compilation: &Message = &CATALOG[1469];
 pub static Specify_file_to_store_incremental_compilation_information: &Message = &CATALOG[1470];
 pub static Project_0_is_out_of_date_because_output_for_it_was_generated_with_version_1_that_differs_with_current_version_2: &Message = &CATALOG[1471];
-pub static Skipping_build_of_project_0_because_its_dependency_1_was_not_built: &Message = &CATALOG[1472];
-pub static Project_0_can_t_be_built_because_its_dependency_1_was_not_built: &Message = &CATALOG[1473];
+pub static Skipping_build_of_project_0_because_its_dependency_1_was_not_built: &Message =
+    &CATALOG[1472];
+pub static Project_0_can_t_be_built_because_its_dependency_1_was_not_built: &Message =
+    &CATALOG[1473];
 pub static Have_recompiles_in_incremental_and_watch_assume_that_changes_within_a_file_will_only_affect_files_directly_depending_on_it: &Message = &CATALOG[1474];
 pub static X_0_is_deprecated: &Message = &CATALOG[1475];
 pub static Performance_timings_for_diagnostics_or_extendedDiagnostics_are_not_available_in_this_session_A_native_implementation_of_the_Web_Performance_API_could_not_be_found: &Message = &CATALOG[1476];
 pub static The_signature_0_of_1_is_deprecated: &Message = &CATALOG[1477];
 pub static Project_0_is_being_forcibly_rebuilt: &Message = &CATALOG[1478];
-pub static Reusing_resolution_of_module_0_from_1_of_old_program_it_was_not_resolved: &Message = &CATALOG[1479];
+pub static Reusing_resolution_of_module_0_from_1_of_old_program_it_was_not_resolved: &Message =
+    &CATALOG[1479];
 pub static Reusing_resolution_of_type_reference_directive_0_from_1_of_old_program_it_was_successfully_resolved_to_2: &Message = &CATALOG[1480];
 pub static Reusing_resolution_of_type_reference_directive_0_from_1_of_old_program_it_was_successfully_resolved_to_2_with_Package_ID_3: &Message = &CATALOG[1481];
 pub static Reusing_resolution_of_type_reference_directive_0_from_1_of_old_program_it_was_not_resolved: &Message = &CATALOG[1482];
@@ -1502,113 +1858,159 @@ pub static Using_0_subpath_1_with_target_2: &Message = &CATALOG[1494];
 pub static Saw_non_matching_condition_0: &Message = &CATALOG[1495];
 pub static Project_0_is_out_of_date_because_buildinfo_file_1_indicates_there_is_change_in_compilerOptions: &Message = &CATALOG[1496];
 pub static Allow_imports_to_include_TypeScript_file_extensions_Requires_moduleResolution_bundler_and_either_noEmit_or_emitDeclarationOnly_to_be_set: &Message = &CATALOG[1497];
-pub static Use_the_package_json_exports_field_when_resolving_package_imports: &Message = &CATALOG[1498];
+pub static Use_the_package_json_exports_field_when_resolving_package_imports: &Message =
+    &CATALOG[1498];
 pub static Use_the_package_json_imports_field_when_resolving_imports: &Message = &CATALOG[1499];
 pub static Conditions_to_set_in_addition_to_the_resolver_specific_defaults_when_resolving_imports: &Message = &CATALOG[1500];
-pub static X_true_when_moduleResolution_is_node16_nodenext_or_bundler_otherwise_false: &Message = &CATALOG[1501];
+pub static X_true_when_moduleResolution_is_node16_nodenext_or_bundler_otherwise_false: &Message =
+    &CATALOG[1501];
 pub static Project_0_is_out_of_date_because_buildinfo_file_1_indicates_that_file_2_was_root_file_of_compilation_but_not_any_more: &Message = &CATALOG[1502];
 pub static Entering_conditional_exports: &Message = &CATALOG[1503];
 pub static Resolved_under_condition_0: &Message = &CATALOG[1504];
 pub static Failed_to_resolve_under_condition_0: &Message = &CATALOG[1505];
 pub static Exiting_conditional_exports: &Message = &CATALOG[1506];
-pub static Searching_all_ancestor_node_modules_directories_for_preferred_extensions_Colon_0: &Message = &CATALOG[1507];
-pub static Searching_all_ancestor_node_modules_directories_for_fallback_extensions_Colon_0: &Message = &CATALOG[1508];
+pub static Searching_all_ancestor_node_modules_directories_for_preferred_extensions_Colon_0:
+    &Message = &CATALOG[1507];
+pub static Searching_all_ancestor_node_modules_directories_for_fallback_extensions_Colon_0:
+    &Message = &CATALOG[1508];
 pub static Project_0_is_out_of_date_because_buildinfo_file_1_indicates_that_program_needs_to_report_errors: &Message = &CATALOG[1509];
 pub static Project_0_is_out_of_date_because_input_1_does_not_exist: &Message = &CATALOG[1510];
 pub static Rewrite_ts_tsx_mts_and_cts_file_extensions_in_relative_import_paths_to_their_JavaScript_equivalent_in_output_files: &Message = &CATALOG[1511];
 pub static Project_0_is_out_of_date_because_it_has_errors: &Message = &CATALOG[1512];
-pub static Multiple_module_exports_assignments_cannot_be_serialized_for_declaration_emit: &Message = &CATALOG[1513];
-pub static Nested_CommonJS_export_constructs_cannot_be_serialized_for_declaration_emit: &Message = &CATALOG[1514];
-pub static The_expected_type_comes_from_property_0_which_is_declared_here_on_type_1: &Message = &CATALOG[1515];
+pub static Multiple_module_exports_assignments_cannot_be_serialized_for_declaration_emit: &Message =
+    &CATALOG[1513];
+pub static Nested_CommonJS_export_constructs_cannot_be_serialized_for_declaration_emit: &Message =
+    &CATALOG[1514];
+pub static The_expected_type_comes_from_property_0_which_is_declared_here_on_type_1: &Message =
+    &CATALOG[1515];
 pub static The_expected_type_comes_from_this_index_signature: &Message = &CATALOG[1516];
-pub static The_expected_type_comes_from_the_return_type_of_this_signature: &Message = &CATALOG[1517];
-pub static Print_names_of_files_that_are_part_of_the_compilation_and_then_stop_processing: &Message = &CATALOG[1518];
-pub static File_0_is_a_JavaScript_file_Did_you_mean_to_enable_the_allowJs_option: &Message = &CATALOG[1519];
-pub static Print_names_of_files_and_the_reason_they_are_part_of_the_compilation: &Message = &CATALOG[1520];
+pub static The_expected_type_comes_from_the_return_type_of_this_signature: &Message =
+    &CATALOG[1517];
+pub static Print_names_of_files_that_are_part_of_the_compilation_and_then_stop_processing:
+    &Message = &CATALOG[1518];
+pub static File_0_is_a_JavaScript_file_Did_you_mean_to_enable_the_allowJs_option: &Message =
+    &CATALOG[1519];
+pub static Print_names_of_files_and_the_reason_they_are_part_of_the_compilation: &Message =
+    &CATALOG[1520];
 pub static Consider_adding_a_declare_modifier_to_this_class: &Message = &CATALOG[1521];
 pub static Allow_JavaScript_files_to_be_a_part_of_your_program_Use_the_checkJs_option_to_get_errors_from_these_files: &Message = &CATALOG[1522];
-pub static Allow_import_x_from_y_when_a_module_doesn_t_have_a_default_export: &Message = &CATALOG[1523];
+pub static Allow_import_x_from_y_when_a_module_doesn_t_have_a_default_export: &Message =
+    &CATALOG[1523];
 pub static Allow_accessing_UMD_globals_from_modules: &Message = &CATALOG[1524];
 pub static Disable_error_reporting_for_unreachable_code: &Message = &CATALOG[1525];
 pub static Disable_error_reporting_for_unused_labels: &Message = &CATALOG[1526];
 pub static Ensure_use_strict_is_always_emitted: &Message = &CATALOG[1527];
 pub static Have_recompiles_in_projects_that_use_incremental_and_watch_mode_assume_that_changes_within_a_file_will_only_affect_files_directly_depending_on_it: &Message = &CATALOG[1528];
-pub static Specify_the_base_directory_to_resolve_non_relative_module_names: &Message = &CATALOG[1529];
+pub static Specify_the_base_directory_to_resolve_non_relative_module_names: &Message =
+    &CATALOG[1529];
 pub static No_longer_supported_In_early_versions_manually_set_the_text_encoding_for_reading_files: &Message = &CATALOG[1530];
 pub static Enable_error_reporting_in_type_checked_JavaScript_files: &Message = &CATALOG[1531];
-pub static Enable_constraints_that_allow_a_TypeScript_project_to_be_used_with_project_references: &Message = &CATALOG[1532];
-pub static Generate_d_ts_files_from_TypeScript_and_JavaScript_files_in_your_project: &Message = &CATALOG[1533];
+pub static Enable_constraints_that_allow_a_TypeScript_project_to_be_used_with_project_references:
+    &Message = &CATALOG[1532];
+pub static Generate_d_ts_files_from_TypeScript_and_JavaScript_files_in_your_project: &Message =
+    &CATALOG[1533];
 pub static Specify_the_output_directory_for_generated_declaration_files: &Message = &CATALOG[1534];
 pub static Create_sourcemaps_for_d_ts_files: &Message = &CATALOG[1535];
 pub static Output_compiler_performance_information_after_building: &Message = &CATALOG[1536];
-pub static Disables_inference_for_type_acquisition_by_looking_at_filenames_in_a_project: &Message = &CATALOG[1537];
-pub static Reduce_the_number_of_projects_loaded_automatically_by_TypeScript: &Message = &CATALOG[1538];
+pub static Disables_inference_for_type_acquisition_by_looking_at_filenames_in_a_project: &Message =
+    &CATALOG[1537];
+pub static Reduce_the_number_of_projects_loaded_automatically_by_TypeScript: &Message =
+    &CATALOG[1538];
 pub static Remove_the_20mb_cap_on_total_source_code_size_for_JavaScript_files_in_the_TypeScript_language_server: &Message = &CATALOG[1539];
-pub static Opt_a_project_out_of_multi_project_reference_checking_when_editing: &Message = &CATALOG[1540];
+pub static Opt_a_project_out_of_multi_project_reference_checking_when_editing: &Message =
+    &CATALOG[1540];
 pub static Disable_preferring_source_files_instead_of_declaration_files_when_referencing_composite_projects: &Message = &CATALOG[1541];
-pub static Emit_more_compliant_but_verbose_and_less_performant_JavaScript_for_iteration: &Message = &CATALOG[1542];
-pub static Emit_a_UTF_8_Byte_Order_Mark_BOM_in_the_beginning_of_output_files: &Message = &CATALOG[1543];
+pub static Emit_more_compliant_but_verbose_and_less_performant_JavaScript_for_iteration: &Message =
+    &CATALOG[1542];
+pub static Emit_a_UTF_8_Byte_Order_Mark_BOM_in_the_beginning_of_output_files: &Message =
+    &CATALOG[1543];
 pub static Only_output_d_ts_files_and_not_JavaScript_files: &Message = &CATALOG[1544];
-pub static Emit_design_type_metadata_for_decorated_declarations_in_source_files: &Message = &CATALOG[1545];
+pub static Emit_design_type_metadata_for_decorated_declarations_in_source_files: &Message =
+    &CATALOG[1545];
 pub static Disable_the_type_acquisition_for_JavaScript_projects: &Message = &CATALOG[1546];
 pub static Emit_additional_JavaScript_to_ease_support_for_importing_CommonJS_modules_This_enables_allowSyntheticDefaultImports_for_type_compatibility: &Message = &CATALOG[1547];
 pub static Filters_results_from_the_include_option: &Message = &CATALOG[1548];
 pub static Remove_a_list_of_directories_from_the_watch_process: &Message = &CATALOG[1549];
 pub static Remove_a_list_of_files_from_the_watch_mode_s_processing: &Message = &CATALOG[1550];
-pub static Enable_experimental_support_for_legacy_experimental_decorators: &Message = &CATALOG[1551];
-pub static Print_files_read_during_the_compilation_including_why_it_was_included: &Message = &CATALOG[1552];
-pub static Output_more_detailed_compiler_performance_information_after_building: &Message = &CATALOG[1553];
+pub static Enable_experimental_support_for_legacy_experimental_decorators: &Message =
+    &CATALOG[1551];
+pub static Print_files_read_during_the_compilation_including_why_it_was_included: &Message =
+    &CATALOG[1552];
+pub static Output_more_detailed_compiler_performance_information_after_building: &Message =
+    &CATALOG[1553];
 pub static Specify_one_or_more_path_or_node_module_references_to_base_configuration_files_from_which_settings_are_inherited: &Message = &CATALOG[1554];
 pub static Specify_what_approach_the_watcher_should_use_if_the_system_runs_out_of_native_file_watchers: &Message = &CATALOG[1555];
-pub static Include_a_list_of_files_This_does_not_support_glob_patterns_as_opposed_to_include: &Message = &CATALOG[1556];
-pub static Build_all_projects_including_those_that_appear_to_be_up_to_date: &Message = &CATALOG[1557];
+pub static Include_a_list_of_files_This_does_not_support_glob_patterns_as_opposed_to_include:
+    &Message = &CATALOG[1556];
+pub static Build_all_projects_including_those_that_appear_to_be_up_to_date: &Message =
+    &CATALOG[1557];
 pub static Ensure_that_casing_is_correct_in_imports: &Message = &CATALOG[1558];
 pub static Emit_a_v8_CPU_profile_of_the_compiler_run_for_debugging: &Message = &CATALOG[1559];
 pub static Allow_importing_helper_functions_from_tslib_once_per_project_instead_of_including_them_per_file: &Message = &CATALOG[1560];
-pub static Skip_building_downstream_projects_on_error_in_upstream_project: &Message = &CATALOG[1561];
-pub static Specify_a_list_of_glob_patterns_that_match_files_to_be_included_in_compilation: &Message = &CATALOG[1562];
-pub static Save_tsbuildinfo_files_to_allow_for_incremental_compilation_of_projects: &Message = &CATALOG[1563];
+pub static Skip_building_downstream_projects_on_error_in_upstream_project: &Message =
+    &CATALOG[1561];
+pub static Specify_a_list_of_glob_patterns_that_match_files_to_be_included_in_compilation:
+    &Message = &CATALOG[1562];
+pub static Save_tsbuildinfo_files_to_allow_for_incremental_compilation_of_projects: &Message =
+    &CATALOG[1563];
 pub static Include_sourcemap_files_inside_the_emitted_JavaScript: &Message = &CATALOG[1564];
-pub static Include_source_code_in_the_sourcemaps_inside_the_emitted_JavaScript: &Message = &CATALOG[1565];
-pub static Ensure_that_each_file_can_be_safely_transpiled_without_relying_on_other_imports: &Message = &CATALOG[1566];
+pub static Include_source_code_in_the_sourcemaps_inside_the_emitted_JavaScript: &Message =
+    &CATALOG[1565];
+pub static Ensure_that_each_file_can_be_safely_transpiled_without_relying_on_other_imports:
+    &Message = &CATALOG[1566];
 pub static Specify_what_JSX_code_is_generated: &Message = &CATALOG[1567];
 pub static Specify_the_JSX_factory_function_used_when_targeting_React_JSX_emit_e_g_React_createElement_or_h: &Message = &CATALOG[1568];
 pub static Specify_the_JSX_Fragment_reference_used_for_fragments_when_targeting_React_JSX_emit_e_g_React_Fragment_or_Fragment: &Message = &CATALOG[1569];
 pub static Specify_module_specifier_used_to_import_the_JSX_factory_functions_when_using_jsx_Colon_react_jsx_Asterisk: &Message = &CATALOG[1570];
-pub static Make_keyof_only_return_strings_instead_of_string_numbers_or_symbols_Legacy_option: &Message = &CATALOG[1571];
+pub static Make_keyof_only_return_strings_instead_of_string_numbers_or_symbols_Legacy_option:
+    &Message = &CATALOG[1571];
 pub static Specify_a_set_of_bundled_library_declaration_files_that_describe_the_target_runtime_environment: &Message = &CATALOG[1572];
 pub static Print_the_names_of_emitted_files_after_a_compilation: &Message = &CATALOG[1573];
 pub static Print_all_of_the_files_read_during_the_compilation: &Message = &CATALOG[1574];
-pub static Set_the_language_of_the_messaging_from_TypeScript_This_does_not_affect_emit: &Message = &CATALOG[1575];
+pub static Set_the_language_of_the_messaging_from_TypeScript_This_does_not_affect_emit: &Message =
+    &CATALOG[1575];
 pub static Specify_the_location_where_debugger_should_locate_map_files_instead_of_generated_locations: &Message = &CATALOG[1576];
 pub static Specify_the_maximum_folder_depth_used_for_checking_JavaScript_files_from_node_modules_Only_applicable_with_allowJs: &Message = &CATALOG[1577];
 pub static Specify_what_module_code_is_generated: &Message = &CATALOG[1578];
-pub static Specify_how_TypeScript_looks_up_a_file_from_a_given_module_specifier: &Message = &CATALOG[1579];
+pub static Specify_how_TypeScript_looks_up_a_file_from_a_given_module_specifier: &Message =
+    &CATALOG[1579];
 pub static Set_the_newline_character_for_emitting_files: &Message = &CATALOG[1580];
 pub static Disable_emitting_files_from_a_compilation: &Message = &CATALOG[1581];
-pub static Disable_generating_custom_helper_functions_like_extends_in_compiled_output: &Message = &CATALOG[1582];
-pub static Disable_emitting_files_if_any_type_checking_errors_are_reported: &Message = &CATALOG[1583];
+pub static Disable_generating_custom_helper_functions_like_extends_in_compiled_output: &Message =
+    &CATALOG[1582];
+pub static Disable_emitting_files_if_any_type_checking_errors_are_reported: &Message =
+    &CATALOG[1583];
 pub static Disable_truncating_types_in_error_messages: &Message = &CATALOG[1584];
-pub static Enable_error_reporting_for_fallthrough_cases_in_switch_statements: &Message = &CATALOG[1585];
-pub static Enable_error_reporting_for_expressions_and_declarations_with_an_implied_any_type: &Message = &CATALOG[1586];
-pub static Ensure_overriding_members_in_derived_classes_are_marked_with_an_override_modifier: &Message = &CATALOG[1587];
-pub static Enable_error_reporting_for_codepaths_that_do_not_explicitly_return_in_a_function: &Message = &CATALOG[1588];
+pub static Enable_error_reporting_for_fallthrough_cases_in_switch_statements: &Message =
+    &CATALOG[1585];
+pub static Enable_error_reporting_for_expressions_and_declarations_with_an_implied_any_type:
+    &Message = &CATALOG[1586];
+pub static Ensure_overriding_members_in_derived_classes_are_marked_with_an_override_modifier:
+    &Message = &CATALOG[1587];
+pub static Enable_error_reporting_for_codepaths_that_do_not_explicitly_return_in_a_function:
+    &Message = &CATALOG[1588];
 pub static Enable_error_reporting_when_this_is_given_the_type_any: &Message = &CATALOG[1589];
-pub static Disable_adding_use_strict_directives_in_emitted_JavaScript_files: &Message = &CATALOG[1590];
-pub static Disable_including_any_library_files_including_the_default_lib_d_ts: &Message = &CATALOG[1591];
-pub static Enforces_using_indexed_accessors_for_keys_declared_using_an_indexed_type: &Message = &CATALOG[1592];
+pub static Disable_adding_use_strict_directives_in_emitted_JavaScript_files: &Message =
+    &CATALOG[1590];
+pub static Disable_including_any_library_files_including_the_default_lib_d_ts: &Message =
+    &CATALOG[1591];
+pub static Enforces_using_indexed_accessors_for_keys_declared_using_an_indexed_type: &Message =
+    &CATALOG[1592];
 pub static Disallow_import_s_require_s_or_reference_s_from_expanding_the_number_of_files_TypeScript_should_add_to_a_project: &Message = &CATALOG[1593];
-pub static Disable_strict_checking_of_generic_signatures_in_function_types: &Message = &CATALOG[1594];
+pub static Disable_strict_checking_of_generic_signatures_in_function_types: &Message =
+    &CATALOG[1594];
 pub static Add_undefined_to_a_type_when_accessed_using_an_index: &Message = &CATALOG[1595];
 pub static Enable_error_reporting_when_local_variables_aren_t_read: &Message = &CATALOG[1596];
 pub static Raise_an_error_when_a_function_parameter_isn_t_read: &Message = &CATALOG[1597];
 pub static Deprecated_setting_Use_outFile_instead: &Message = &CATALOG[1598];
 pub static Specify_an_output_folder_for_all_emitted_files: &Message = &CATALOG[1599];
 pub static Specify_a_file_that_bundles_all_outputs_into_one_JavaScript_file_If_declaration_is_true_also_designates_a_file_that_bundles_all_d_ts_output: &Message = &CATALOG[1600];
-pub static Specify_a_set_of_entries_that_re_map_imports_to_additional_lookup_locations: &Message = &CATALOG[1601];
+pub static Specify_a_set_of_entries_that_re_map_imports_to_additional_lookup_locations: &Message =
+    &CATALOG[1601];
 pub static Specify_a_list_of_language_service_plugins_to_include: &Message = &CATALOG[1602];
 pub static Disable_erasing_const_enum_declarations_in_generated_code: &Message = &CATALOG[1603];
-pub static Disable_resolving_symlinks_to_their_realpath_This_correlates_to_the_same_flag_in_node: &Message = &CATALOG[1604];
+pub static Disable_resolving_symlinks_to_their_realpath_This_correlates_to_the_same_flag_in_node:
+    &Message = &CATALOG[1604];
 pub static Disable_wiping_the_console_in_watch_mode: &Message = &CATALOG[1605];
 pub static Enable_color_and_formatting_in_TypeScript_s_output_to_make_compiler_errors_easier_to_read: &Message = &CATALOG[1606];
 pub static Specify_the_object_invoked_for_createElement_This_only_applies_when_targeting_react_JSX_emit: &Message = &CATALOG[1607];
@@ -1616,41 +2018,59 @@ pub static Specify_an_array_of_objects_that_specify_paths_for_projects_Used_in_p
 pub static Disable_emitting_comments: &Message = &CATALOG[1609];
 pub static Enable_importing_json_files: &Message = &CATALOG[1610];
 pub static Specify_the_root_folder_within_your_source_files: &Message = &CATALOG[1611];
-pub static Allow_multiple_folders_to_be_treated_as_one_when_resolving_modules: &Message = &CATALOG[1612];
-pub static Skip_type_checking_d_ts_files_that_are_included_with_TypeScript: &Message = &CATALOG[1613];
+pub static Allow_multiple_folders_to_be_treated_as_one_when_resolving_modules: &Message =
+    &CATALOG[1612];
+pub static Skip_type_checking_d_ts_files_that_are_included_with_TypeScript: &Message =
+    &CATALOG[1613];
 pub static Skip_type_checking_all_d_ts_files: &Message = &CATALOG[1614];
 pub static Create_source_map_files_for_emitted_JavaScript_files: &Message = &CATALOG[1615];
-pub static Specify_the_root_path_for_debuggers_to_find_the_reference_source_code: &Message = &CATALOG[1616];
-pub static Check_that_the_arguments_for_bind_call_and_apply_methods_match_the_original_function: &Message = &CATALOG[1617];
+pub static Specify_the_root_path_for_debuggers_to_find_the_reference_source_code: &Message =
+    &CATALOG[1616];
+pub static Check_that_the_arguments_for_bind_call_and_apply_methods_match_the_original_function:
+    &Message = &CATALOG[1617];
 pub static When_assigning_functions_check_to_ensure_parameters_and_the_return_values_are_subtype_compatible: &Message = &CATALOG[1618];
 pub static When_type_checking_take_into_account_null_and_undefined: &Message = &CATALOG[1619];
-pub static Check_for_class_properties_that_are_declared_but_not_set_in_the_constructor: &Message = &CATALOG[1620];
-pub static Disable_emitting_declarations_that_have_internal_in_their_JSDoc_comments: &Message = &CATALOG[1621];
-pub static Disable_reporting_of_excess_property_errors_during_the_creation_of_object_literals: &Message = &CATALOG[1622];
-pub static Suppress_noImplicitAny_errors_when_indexing_objects_that_lack_index_signatures: &Message = &CATALOG[1623];
+pub static Check_for_class_properties_that_are_declared_but_not_set_in_the_constructor: &Message =
+    &CATALOG[1620];
+pub static Disable_emitting_declarations_that_have_internal_in_their_JSDoc_comments: &Message =
+    &CATALOG[1621];
+pub static Disable_reporting_of_excess_property_errors_during_the_creation_of_object_literals:
+    &Message = &CATALOG[1622];
+pub static Suppress_noImplicitAny_errors_when_indexing_objects_that_lack_index_signatures:
+    &Message = &CATALOG[1623];
 pub static Synchronously_call_callbacks_and_update_the_state_of_directory_watchers_on_platforms_that_don_t_support_recursive_watching_natively: &Message = &CATALOG[1624];
 pub static Set_the_JavaScript_language_version_for_emitted_JavaScript_and_include_compatible_library_declarations: &Message = &CATALOG[1625];
 pub static Log_paths_used_during_the_moduleResolution_process: &Message = &CATALOG[1626];
 pub static Specify_the_path_to_tsbuildinfo_incremental_compilation_file: &Message = &CATALOG[1627];
-pub static Specify_options_for_automatic_acquisition_of_declaration_files: &Message = &CATALOG[1628];
-pub static Specify_multiple_folders_that_act_like_Slashnode_modules_Slash_types: &Message = &CATALOG[1629];
-pub static Specify_type_package_names_to_be_included_without_being_referenced_in_a_source_file: &Message = &CATALOG[1630];
+pub static Specify_options_for_automatic_acquisition_of_declaration_files: &Message =
+    &CATALOG[1628];
+pub static Specify_multiple_folders_that_act_like_Slashnode_modules_Slash_types: &Message =
+    &CATALOG[1629];
+pub static Specify_type_package_names_to_be_included_without_being_referenced_in_a_source_file:
+    &Message = &CATALOG[1630];
 pub static Emit_ECMAScript_standard_compliant_class_fields: &Message = &CATALOG[1631];
 pub static Enable_verbose_logging: &Message = &CATALOG[1632];
 pub static Specify_how_directories_are_watched_on_systems_that_lack_recursive_file_watching_functionality: &Message = &CATALOG[1633];
 pub static Specify_how_the_TypeScript_watch_mode_works: &Message = &CATALOG[1634];
-pub static Require_undeclared_properties_from_index_signatures_to_use_element_accesses: &Message = &CATALOG[1635];
-pub static Specify_emit_Slashchecking_behavior_for_imports_that_are_only_used_for_types: &Message = &CATALOG[1636];
+pub static Require_undeclared_properties_from_index_signatures_to_use_element_accesses: &Message =
+    &CATALOG[1635];
+pub static Specify_emit_Slashchecking_behavior_for_imports_that_are_only_used_for_types: &Message =
+    &CATALOG[1636];
 pub static Require_sufficient_annotation_on_exports_so_other_tools_can_trivially_generate_declaration_files: &Message = &CATALOG[1637];
-pub static Built_in_iterators_are_instantiated_with_a_TReturn_type_of_undefined_instead_of_any: &Message = &CATALOG[1638];
-pub static Do_not_allow_runtime_constructs_that_are_not_part_of_ECMAScript: &Message = &CATALOG[1639];
+pub static Built_in_iterators_are_instantiated_with_a_TReturn_type_of_undefined_instead_of_any:
+    &Message = &CATALOG[1638];
+pub static Do_not_allow_runtime_constructs_that_are_not_part_of_ECMAScript: &Message =
+    &CATALOG[1639];
 pub static Default_catch_clause_variables_as_unknown_instead_of_any: &Message = &CATALOG[1640];
 pub static Do_not_transform_or_elide_any_imports_or_exports_not_marked_as_type_only_ensuring_they_are_written_in_the_output_file_s_format_based_on_the_module_setting: &Message = &CATALOG[1641];
-pub static Disable_full_type_checking_only_critical_parse_and_emit_errors_will_be_reported: &Message = &CATALOG[1642];
+pub static Disable_full_type_checking_only_critical_parse_and_emit_errors_will_be_reported:
+    &Message = &CATALOG[1642];
 pub static Check_side_effect_imports: &Message = &CATALOG[1643];
-pub static This_operation_can_be_simplified_This_shift_is_identical_to_0_1_2: &Message = &CATALOG[1644];
+pub static This_operation_can_be_simplified_This_shift_is_identical_to_0_1_2: &Message =
+    &CATALOG[1644];
 pub static Enable_lib_replacement: &Message = &CATALOG[1645];
-pub static Ensure_types_are_ordered_stably_and_deterministically_across_compilations: &Message = &CATALOG[1646];
+pub static Ensure_types_are_ordered_stably_and_deterministically_across_compilations: &Message =
+    &CATALOG[1646];
 pub static X_one_of_Colon: &Message = &CATALOG[1647];
 pub static X_one_or_more_Colon: &Message = &CATALOG[1648];
 pub static X_type_Colon: &Message = &CATALOG[1649];
@@ -1658,7 +2078,8 @@ pub static X_default_Colon: &Message = &CATALOG[1650];
 pub static X_true_unless_strict_is_false: &Message = &CATALOG[1651];
 pub static X_false_unless_composite_is_set: &Message = &CATALOG[1652];
 pub static X_node_modules_bower_components_jspm_packages_plus_the_value_of_outDir_if_one_is_specified: &Message = &CATALOG[1653];
-pub static X_if_files_is_specified_otherwise_Asterisk_Asterisk_Slash_Asterisk: &Message = &CATALOG[1654];
+pub static X_if_files_is_specified_otherwise_Asterisk_Asterisk_Slash_Asterisk: &Message =
+    &CATALOG[1654];
 pub static X_true_if_composite_false_otherwise: &Message = &CATALOG[1655];
 pub static Computed_from_the_list_of_input_files: &Message = &CATALOG[1656];
 pub static Platform_specific: &Message = &CATALOG[1657];
@@ -1672,12 +2093,16 @@ pub static BUILD_OPTIONS: &Message = &CATALOG[1664];
 pub static COMMON_COMPILER_OPTIONS: &Message = &CATALOG[1665];
 pub static COMMAND_LINE_FLAGS: &Message = &CATALOG[1666];
 pub static X_tsc_Colon_The_TypeScript_Compiler: &Message = &CATALOG[1667];
-pub static Compiles_the_current_project_tsconfig_json_in_the_working_directory: &Message = &CATALOG[1668];
-pub static Ignoring_tsconfig_json_compiles_the_specified_files_with_default_compiler_options: &Message = &CATALOG[1669];
+pub static Compiles_the_current_project_tsconfig_json_in_the_working_directory: &Message =
+    &CATALOG[1668];
+pub static Ignoring_tsconfig_json_compiles_the_specified_files_with_default_compiler_options:
+    &Message = &CATALOG[1669];
 pub static Build_a_composite_project_in_the_working_directory: &Message = &CATALOG[1670];
-pub static Creates_a_tsconfig_json_with_the_recommended_settings_in_the_working_directory: &Message = &CATALOG[1671];
+pub static Creates_a_tsconfig_json_with_the_recommended_settings_in_the_working_directory:
+    &Message = &CATALOG[1671];
 pub static Compiles_the_TypeScript_project_located_at_the_specified_path: &Message = &CATALOG[1672];
-pub static An_expanded_version_of_this_information_showing_all_possible_compiler_options: &Message = &CATALOG[1673];
+pub static An_expanded_version_of_this_information_showing_all_possible_compiler_options: &Message =
+    &CATALOG[1673];
 pub static Compiles_the_current_project_with_additional_settings: &Message = &CATALOG[1674];
 pub static X_true_for_ES2022_and_above_including_ESNext: &Message = &CATALOG[1675];
 pub static List_of_file_name_suffixes_to_search_when_resolving_a_module: &Message = &CATALOG[1676];
@@ -1685,23 +2110,33 @@ pub static X_false_unless_checkJs_is_set: &Message = &CATALOG[1677];
 pub static Variable_0_implicitly_has_an_1_type: &Message = &CATALOG[1678];
 pub static Parameter_0_implicitly_has_an_1_type: &Message = &CATALOG[1679];
 pub static Member_0_implicitly_has_an_1_type: &Message = &CATALOG[1680];
-pub static X_new_expression_whose_target_lacks_a_construct_signature_implicitly_has_an_any_type: &Message = &CATALOG[1681];
-pub static X_0_which_lacks_return_type_annotation_implicitly_has_an_1_return_type: &Message = &CATALOG[1682];
+pub static X_new_expression_whose_target_lacks_a_construct_signature_implicitly_has_an_any_type:
+    &Message = &CATALOG[1681];
+pub static X_0_which_lacks_return_type_annotation_implicitly_has_an_1_return_type: &Message =
+    &CATALOG[1682];
 pub static Function_expression_which_lacks_return_type_annotation_implicitly_has_an_0_return_type: &Message = &CATALOG[1683];
-pub static This_overload_implicitly_returns_the_type_0_because_it_lacks_a_return_type_annotation: &Message = &CATALOG[1684];
+pub static This_overload_implicitly_returns_the_type_0_because_it_lacks_a_return_type_annotation:
+    &Message = &CATALOG[1684];
 pub static Construct_signature_which_lacks_return_type_annotation_implicitly_has_an_any_return_type: &Message = &CATALOG[1685];
-pub static Function_type_which_lacks_return_type_annotation_implicitly_has_an_0_return_type: &Message = &CATALOG[1686];
-pub static Element_implicitly_has_an_any_type_because_index_expression_is_not_of_type_number: &Message = &CATALOG[1687];
-pub static Could_not_find_a_declaration_file_for_module_0_1_implicitly_has_an_any_type: &Message = &CATALOG[1688];
-pub static Element_implicitly_has_an_any_type_because_type_0_has_no_index_signature: &Message = &CATALOG[1689];
+pub static Function_type_which_lacks_return_type_annotation_implicitly_has_an_0_return_type:
+    &Message = &CATALOG[1686];
+pub static Element_implicitly_has_an_any_type_because_index_expression_is_not_of_type_number:
+    &Message = &CATALOG[1687];
+pub static Could_not_find_a_declaration_file_for_module_0_1_implicitly_has_an_any_type: &Message =
+    &CATALOG[1688];
+pub static Element_implicitly_has_an_any_type_because_type_0_has_no_index_signature: &Message =
+    &CATALOG[1689];
 pub static Object_literal_s_property_0_implicitly_has_an_1_type: &Message = &CATALOG[1690];
 pub static Rest_parameter_0_implicitly_has_an_any_type: &Message = &CATALOG[1691];
-pub static Call_signature_which_lacks_return_type_annotation_implicitly_has_an_any_return_type: &Message = &CATALOG[1692];
+pub static Call_signature_which_lacks_return_type_annotation_implicitly_has_an_any_return_type:
+    &Message = &CATALOG[1692];
 pub static X_0_implicitly_has_type_any_because_it_does_not_have_a_type_annotation_and_is_referenced_directly_or_indirectly_in_its_own_initializer: &Message = &CATALOG[1693];
 pub static X_0_implicitly_has_return_type_any_because_it_does_not_have_a_return_type_annotation_and_is_referenced_directly_or_indirectly_in_one_of_its_return_expressions: &Message = &CATALOG[1694];
 pub static Function_implicitly_has_return_type_any_because_it_does_not_have_a_return_type_annotation_and_is_referenced_directly_or_indirectly_in_one_of_its_return_expressions: &Message = &CATALOG[1695];
-pub static Generator_implicitly_has_yield_type_0_Consider_supplying_a_return_type_annotation: &Message = &CATALOG[1696];
-pub static JSX_element_implicitly_has_type_any_because_no_interface_JSX_0_exists: &Message = &CATALOG[1697];
+pub static Generator_implicitly_has_yield_type_0_Consider_supplying_a_return_type_annotation:
+    &Message = &CATALOG[1696];
+pub static JSX_element_implicitly_has_type_any_because_no_interface_JSX_0_exists: &Message =
+    &CATALOG[1697];
 pub static Unreachable_code_detected: &Message = &CATALOG[1698];
 pub static Unused_label: &Message = &CATALOG[1699];
 pub static Fallthrough_case_in_switch: &Message = &CATALOG[1700];
@@ -1711,26 +2146,34 @@ pub static Property_0_implicitly_has_type_any_because_its_set_accessor_lacks_a_p
 pub static Property_0_implicitly_has_type_any_because_its_get_accessor_lacks_a_return_type_annotation: &Message = &CATALOG[1704];
 pub static Variable_0_implicitly_has_type_1_in_some_locations_where_its_type_cannot_be_determined: &Message = &CATALOG[1705];
 pub static Try_npm_i_save_dev_types_Slash_1_if_it_exists_or_add_a_new_declaration_d_ts_file_containing_declare_module_0: &Message = &CATALOG[1706];
-pub static Dynamic_import_s_specifier_must_be_of_type_string_but_here_has_type_0: &Message = &CATALOG[1707];
+pub static Dynamic_import_s_specifier_must_be_of_type_string_but_here_has_type_0: &Message =
+    &CATALOG[1707];
 pub static Enables_emit_interoperability_between_CommonJS_and_ES_Modules_via_creation_of_namespace_objects_for_all_imports_Implies_allowSyntheticDefaultImports: &Message = &CATALOG[1708];
 pub static Type_originates_at_this_import_A_namespace_style_import_cannot_be_called_or_constructed_and_will_cause_a_failure_at_runtime_Consider_using_a_default_import_or_import_require_here_instead: &Message = &CATALOG[1709];
 pub static Mapped_object_type_implicitly_has_an_any_template_type: &Message = &CATALOG[1710];
 pub static If_the_0_package_actually_exposes_this_module_consider_sending_a_pull_request_to_amend_https_Colon_Slash_Slashgithub_com_SlashDefinitelyTyped_SlashDefinitelyTyped_Slashtree_Slashmaster_Slashtypes_Slash_1: &Message = &CATALOG[1711];
-pub static The_containing_arrow_function_captures_the_global_value_of_this: &Message = &CATALOG[1712];
+pub static The_containing_arrow_function_captures_the_global_value_of_this: &Message =
+    &CATALOG[1712];
 pub static Module_0_was_resolved_to_1_but_resolveJsonModule_is_not_used: &Message = &CATALOG[1713];
-pub static Variable_0_implicitly_has_an_1_type_but_a_better_type_may_be_inferred_from_usage: &Message = &CATALOG[1714];
-pub static Parameter_0_implicitly_has_an_1_type_but_a_better_type_may_be_inferred_from_usage: &Message = &CATALOG[1715];
-pub static Member_0_implicitly_has_an_1_type_but_a_better_type_may_be_inferred_from_usage: &Message = &CATALOG[1716];
+pub static Variable_0_implicitly_has_an_1_type_but_a_better_type_may_be_inferred_from_usage:
+    &Message = &CATALOG[1714];
+pub static Parameter_0_implicitly_has_an_1_type_but_a_better_type_may_be_inferred_from_usage:
+    &Message = &CATALOG[1715];
+pub static Member_0_implicitly_has_an_1_type_but_a_better_type_may_be_inferred_from_usage:
+    &Message = &CATALOG[1716];
 pub static Variable_0_implicitly_has_type_1_in_some_locations_but_a_better_type_may_be_inferred_from_usage: &Message = &CATALOG[1717];
 pub static Rest_parameter_0_implicitly_has_an_any_type_but_a_better_type_may_be_inferred_from_usage: &Message = &CATALOG[1718];
 pub static Property_0_implicitly_has_type_any_but_a_better_type_for_its_get_accessor_may_be_inferred_from_usage: &Message = &CATALOG[1719];
 pub static Property_0_implicitly_has_type_any_but_a_better_type_for_its_set_accessor_may_be_inferred_from_usage: &Message = &CATALOG[1720];
-pub static X_0_implicitly_has_an_1_return_type_but_a_better_type_may_be_inferred_from_usage: &Message = &CATALOG[1721];
+pub static X_0_implicitly_has_an_1_return_type_but_a_better_type_may_be_inferred_from_usage:
+    &Message = &CATALOG[1721];
 pub static Parameter_has_a_name_but_no_type_Did_you_mean_0_Colon_1: &Message = &CATALOG[1722];
 pub static Element_implicitly_has_an_any_type_because_type_0_has_no_index_signature_Did_you_mean_to_call_1: &Message = &CATALOG[1723];
 pub static Element_implicitly_has_an_any_type_because_expression_of_type_0_can_t_be_used_to_index_type_1: &Message = &CATALOG[1724];
-pub static No_index_signature_with_a_parameter_of_type_0_was_found_on_type_1: &Message = &CATALOG[1725];
-pub static X_0_which_lacks_return_type_annotation_implicitly_has_an_1_yield_type: &Message = &CATALOG[1726];
+pub static No_index_signature_with_a_parameter_of_type_0_was_found_on_type_1: &Message =
+    &CATALOG[1725];
+pub static X_0_which_lacks_return_type_annotation_implicitly_has_an_1_yield_type: &Message =
+    &CATALOG[1726];
 pub static The_inferred_type_of_this_node_exceeds_the_maximum_length_the_compiler_will_serialize_An_explicit_type_annotation_is_needed: &Message = &CATALOG[1727];
 pub static X_yield_expression_implicitly_results_in_an_any_type_because_its_containing_generator_lacks_a_return_type_annotation: &Message = &CATALOG[1728];
 pub static If_the_0_package_actually_exposes_this_module_try_adding_a_new_declaration_d_ts_file_containing_declare_module_1: &Message = &CATALOG[1729];
@@ -1738,10 +2181,12 @@ pub static This_syntax_is_reserved_in_files_with_the_mts_or_cts_extension_Use_an
 pub static This_syntax_is_reserved_in_files_with_the_mts_or_cts_extension_Add_a_trailing_comma_or_explicit_constraint: &Message = &CATALOG[1731];
 pub static A_mapped_type_may_not_declare_properties_or_methods: &Message = &CATALOG[1732];
 pub static You_cannot_rename_this_element: &Message = &CATALOG[1733];
-pub static You_cannot_rename_elements_that_are_defined_in_the_standard_TypeScript_library: &Message = &CATALOG[1734];
+pub static You_cannot_rename_elements_that_are_defined_in_the_standard_TypeScript_library:
+    &Message = &CATALOG[1734];
 pub static X_import_can_only_be_used_in_TypeScript_files: &Message = &CATALOG[1735];
 pub static X_export_can_only_be_used_in_TypeScript_files: &Message = &CATALOG[1736];
-pub static Type_parameter_declarations_can_only_be_used_in_TypeScript_files: &Message = &CATALOG[1737];
+pub static Type_parameter_declarations_can_only_be_used_in_TypeScript_files: &Message =
+    &CATALOG[1737];
 pub static X_implements_clauses_can_only_be_used_in_TypeScript_files: &Message = &CATALOG[1738];
 pub static X_0_declarations_can_only_be_used_in_TypeScript_files: &Message = &CATALOG[1739];
 pub static Type_aliases_can_only_be_used_in_TypeScript_files: &Message = &CATALOG[1740];
@@ -1750,48 +2195,68 @@ pub static Type_annotations_can_only_be_used_in_TypeScript_files: &Message = &CA
 pub static Type_arguments_can_only_be_used_in_TypeScript_files: &Message = &CATALOG[1743];
 pub static Parameter_modifiers_can_only_be_used_in_TypeScript_files: &Message = &CATALOG[1744];
 pub static Non_null_assertions_can_only_be_used_in_TypeScript_files: &Message = &CATALOG[1745];
-pub static Type_assertion_expressions_can_only_be_used_in_TypeScript_files: &Message = &CATALOG[1746];
+pub static Type_assertion_expressions_can_only_be_used_in_TypeScript_files: &Message =
+    &CATALOG[1746];
 pub static Signature_declarations_can_only_be_used_in_TypeScript_files: &Message = &CATALOG[1747];
 pub static Report_errors_in_js_files: &Message = &CATALOG[1748];
 pub static JSDoc_types_can_only_be_used_inside_documentation_comments: &Message = &CATALOG[1749];
 pub static JSDoc_typedef_tag_should_either_have_a_type_annotation_or_be_followed_by_property_or_member_tags: &Message = &CATALOG[1750];
 pub static JSDoc_0_is_not_attached_to_a_class: &Message = &CATALOG[1751];
 pub static JSDoc_0_1_does_not_match_the_extends_2_clause: &Message = &CATALOG[1752];
-pub static JSDoc_param_tag_has_name_0_but_there_is_no_parameter_with_that_name: &Message = &CATALOG[1753];
-pub static Class_declarations_cannot_have_more_than_one_augments_or_extends_tag: &Message = &CATALOG[1754];
+pub static JSDoc_param_tag_has_name_0_but_there_is_no_parameter_with_that_name: &Message =
+    &CATALOG[1753];
+pub static Class_declarations_cannot_have_more_than_one_augments_or_extends_tag: &Message =
+    &CATALOG[1754];
 pub static Expected_0_type_arguments_provide_these_with_an_extends_tag: &Message = &CATALOG[1755];
 pub static Expected_0_1_type_arguments_provide_these_with_an_extends_tag: &Message = &CATALOG[1756];
 pub static JSDoc_may_only_appear_in_the_last_parameter_of_a_signature: &Message = &CATALOG[1757];
 pub static JSDoc_param_tag_has_name_0_but_there_is_no_parameter_with_that_name_It_would_match_arguments_if_it_had_an_array_type: &Message = &CATALOG[1758];
 pub static A_JSDoc_type_tag_on_a_function_must_have_a_signature_with_the_correct_number_of_arguments: &Message = &CATALOG[1759];
 pub static You_cannot_rename_a_module_via_a_global_import: &Message = &CATALOG[1760];
-pub static Qualified_name_0_is_not_allowed_without_a_leading_param_object_1: &Message = &CATALOG[1761];
+pub static Qualified_name_0_is_not_allowed_without_a_leading_param_object_1: &Message =
+    &CATALOG[1761];
 pub static A_JSDoc_typedef_comment_may_not_contain_multiple_type_tags: &Message = &CATALOG[1762];
 pub static The_tag_was_first_specified_here: &Message = &CATALOG[1763];
-pub static You_cannot_rename_elements_that_are_defined_in_a_node_modules_folder: &Message = &CATALOG[1764];
-pub static You_cannot_rename_elements_that_are_defined_in_another_node_modules_folder: &Message = &CATALOG[1765];
-pub static Type_satisfaction_expressions_can_only_be_used_in_TypeScript_files: &Message = &CATALOG[1766];
+pub static You_cannot_rename_elements_that_are_defined_in_a_node_modules_folder: &Message =
+    &CATALOG[1764];
+pub static You_cannot_rename_elements_that_are_defined_in_another_node_modules_folder: &Message =
+    &CATALOG[1765];
+pub static Type_satisfaction_expressions_can_only_be_used_in_TypeScript_files: &Message =
+    &CATALOG[1766];
 pub static Decorators_may_not_appear_after_export_or_export_default_if_they_also_appear_before_export: &Message = &CATALOG[1767];
-pub static A_JSDoc_template_tag_may_not_follow_a_typedef_callback_or_overload_tag: &Message = &CATALOG[1768];
+pub static A_JSDoc_template_tag_may_not_follow_a_typedef_callback_or_overload_tag: &Message =
+    &CATALOG[1768];
 pub static File_rename_is_not_supported_by_the_editor: &Message = &CATALOG[1769];
 pub static Declaration_emit_for_this_file_requires_using_private_name_0_An_explicit_type_annotation_may_unblock_declaration_emit: &Message = &CATALOG[1770];
 pub static Declaration_emit_for_this_file_requires_using_private_name_0_from_module_1_An_explicit_type_annotation_may_unblock_declaration_emit: &Message = &CATALOG[1771];
-pub static Function_must_have_an_explicit_return_type_annotation_with_isolatedDeclarations: &Message = &CATALOG[1772];
-pub static Method_must_have_an_explicit_return_type_annotation_with_isolatedDeclarations: &Message = &CATALOG[1773];
-pub static At_least_one_accessor_must_have_an_explicit_type_annotation_with_isolatedDeclarations: &Message = &CATALOG[1774];
-pub static Variable_must_have_an_explicit_type_annotation_with_isolatedDeclarations: &Message = &CATALOG[1775];
-pub static Parameter_must_have_an_explicit_type_annotation_with_isolatedDeclarations: &Message = &CATALOG[1776];
-pub static Property_must_have_an_explicit_type_annotation_with_isolatedDeclarations: &Message = &CATALOG[1777];
+pub static Function_must_have_an_explicit_return_type_annotation_with_isolatedDeclarations:
+    &Message = &CATALOG[1772];
+pub static Method_must_have_an_explicit_return_type_annotation_with_isolatedDeclarations: &Message =
+    &CATALOG[1773];
+pub static At_least_one_accessor_must_have_an_explicit_type_annotation_with_isolatedDeclarations:
+    &Message = &CATALOG[1774];
+pub static Variable_must_have_an_explicit_type_annotation_with_isolatedDeclarations: &Message =
+    &CATALOG[1775];
+pub static Parameter_must_have_an_explicit_type_annotation_with_isolatedDeclarations: &Message =
+    &CATALOG[1776];
+pub static Property_must_have_an_explicit_type_annotation_with_isolatedDeclarations: &Message =
+    &CATALOG[1777];
 pub static Expression_type_can_t_be_inferred_with_isolatedDeclarations: &Message = &CATALOG[1778];
 pub static Computed_properties_must_be_number_or_string_literals_variables_or_dotted_expressions_with_isolatedDeclarations: &Message = &CATALOG[1779];
-pub static Objects_that_contain_spread_assignments_can_t_be_inferred_with_isolatedDeclarations: &Message = &CATALOG[1780];
-pub static Objects_that_contain_shorthand_properties_can_t_be_inferred_with_isolatedDeclarations: &Message = &CATALOG[1781];
+pub static Objects_that_contain_spread_assignments_can_t_be_inferred_with_isolatedDeclarations:
+    &Message = &CATALOG[1780];
+pub static Objects_that_contain_shorthand_properties_can_t_be_inferred_with_isolatedDeclarations:
+    &Message = &CATALOG[1781];
 pub static Only_const_arrays_can_be_inferred_with_isolatedDeclarations: &Message = &CATALOG[1782];
-pub static Arrays_with_spread_elements_can_t_inferred_with_isolatedDeclarations: &Message = &CATALOG[1783];
-pub static Binding_elements_can_t_be_exported_directly_with_isolatedDeclarations: &Message = &CATALOG[1784];
+pub static Arrays_with_spread_elements_can_t_inferred_with_isolatedDeclarations: &Message =
+    &CATALOG[1783];
+pub static Binding_elements_can_t_be_exported_directly_with_isolatedDeclarations: &Message =
+    &CATALOG[1784];
 pub static Enum_member_initializers_must_be_computable_without_references_to_external_symbols_with_isolatedDeclarations: &Message = &CATALOG[1785];
-pub static Extends_clause_can_t_contain_an_expression_with_isolatedDeclarations: &Message = &CATALOG[1786];
-pub static Inference_from_class_expressions_is_not_supported_with_isolatedDeclarations: &Message = &CATALOG[1787];
+pub static Extends_clause_can_t_contain_an_expression_with_isolatedDeclarations: &Message =
+    &CATALOG[1786];
+pub static Inference_from_class_expressions_is_not_supported_with_isolatedDeclarations: &Message =
+    &CATALOG[1787];
 pub static Assigning_properties_to_functions_without_declaring_them_is_not_supported_with_isolatedDeclarations_Add_an_explicit_declaration_for_the_properties_assigned_to_this_function: &Message = &CATALOG[1788];
 pub static Declaration_emit_for_this_parameter_requires_implicitly_adding_undefined_to_its_type_This_is_not_supported_with_isolatedDeclarations: &Message = &CATALOG[1789];
 pub static Declaration_emit_for_this_file_requires_preserving_this_import_for_augmentations_This_is_not_supported_with_isolatedDeclarations: &Message = &CATALOG[1790];
@@ -1804,19 +2269,24 @@ pub static Add_a_return_type_to_the_get_accessor_declaration: &Message = &CATALO
 pub static Add_a_type_to_parameter_of_the_set_accessor_declaration: &Message = &CATALOG[1797];
 pub static Add_a_return_type_to_the_method: &Message = &CATALOG[1798];
 pub static Add_satisfies_and_a_type_assertion_to_this_expression_satisfies_T_as_T_to_make_the_type_explicit: &Message = &CATALOG[1799];
-pub static Move_the_expression_in_default_export_to_a_variable_and_add_a_type_annotation_to_it: &Message = &CATALOG[1800];
+pub static Move_the_expression_in_default_export_to_a_variable_and_add_a_type_annotation_to_it:
+    &Message = &CATALOG[1800];
 pub static Default_exports_can_t_be_inferred_with_isolatedDeclarations: &Message = &CATALOG[1801];
 pub static Computed_property_names_on_class_or_object_literals_cannot_be_inferred_with_isolatedDeclarations: &Message = &CATALOG[1802];
-pub static Type_containing_private_name_0_can_t_be_used_with_isolatedDeclarations: &Message = &CATALOG[1803];
+pub static Type_containing_private_name_0_can_t_be_used_with_isolatedDeclarations: &Message =
+    &CATALOG[1803];
 pub static JSX_attributes_must_only_be_assigned_a_non_empty_expression: &Message = &CATALOG[1804];
-pub static JSX_elements_cannot_have_multiple_attributes_with_the_same_name: &Message = &CATALOG[1805];
+pub static JSX_elements_cannot_have_multiple_attributes_with_the_same_name: &Message =
+    &CATALOG[1805];
 pub static Expected_corresponding_JSX_closing_tag_for_0: &Message = &CATALOG[1806];
 pub static Cannot_use_JSX_unless_the_jsx_flag_is_provided: &Message = &CATALOG[1807];
-pub static A_constructor_cannot_contain_a_super_call_when_its_class_extends_null: &Message = &CATALOG[1808];
+pub static A_constructor_cannot_contain_a_super_call_when_its_class_extends_null: &Message =
+    &CATALOG[1808];
 pub static An_unary_expression_with_the_0_operator_is_not_allowed_in_the_left_hand_side_of_an_exponentiation_expression_Consider_enclosing_the_expression_in_parentheses: &Message = &CATALOG[1809];
 pub static A_type_assertion_expression_is_not_allowed_in_the_left_hand_side_of_an_exponentiation_expression_Consider_enclosing_the_expression_in_parentheses: &Message = &CATALOG[1810];
 pub static JSX_element_0_has_no_corresponding_closing_tag: &Message = &CATALOG[1811];
-pub static X_super_must_be_called_before_accessing_this_in_the_constructor_of_a_derived_class: &Message = &CATALOG[1812];
+pub static X_super_must_be_called_before_accessing_this_in_the_constructor_of_a_derived_class:
+    &Message = &CATALOG[1812];
 pub static Unknown_type_acquisition_option_0: &Message = &CATALOG[1813];
 pub static X_super_must_be_called_before_accessing_a_property_of_super_in_the_constructor_of_a_derived_class: &Message = &CATALOG[1814];
 pub static X_0_is_not_a_valid_meta_property_for_keyword_1_Did_you_mean_2: &Message = &CATALOG[1815];
@@ -1824,46 +2294,60 @@ pub static Meta_property_0_is_only_allowed_in_the_body_of_a_function_declaration
 pub static JSX_fragment_has_no_corresponding_closing_tag: &Message = &CATALOG[1817];
 pub static Expected_corresponding_closing_tag_for_JSX_fragment: &Message = &CATALOG[1818];
 pub static The_jsxFragmentFactory_compiler_option_must_be_provided_to_use_JSX_fragments_with_the_jsxFactory_compiler_option: &Message = &CATALOG[1819];
-pub static An_jsxFrag_pragma_is_required_when_using_an_jsx_pragma_with_JSX_fragments: &Message = &CATALOG[1820];
+pub static An_jsxFrag_pragma_is_required_when_using_an_jsx_pragma_with_JSX_fragments: &Message =
+    &CATALOG[1820];
 pub static Unknown_type_acquisition_option_0_Did_you_mean_1: &Message = &CATALOG[1821];
-pub static X_0_at_the_end_of_a_type_is_not_valid_TypeScript_syntax_Did_you_mean_to_write_1: &Message = &CATALOG[1822];
-pub static X_0_at_the_start_of_a_type_is_not_valid_TypeScript_syntax_Did_you_mean_to_write_1: &Message = &CATALOG[1823];
+pub static X_0_at_the_end_of_a_type_is_not_valid_TypeScript_syntax_Did_you_mean_to_write_1:
+    &Message = &CATALOG[1822];
+pub static X_0_at_the_start_of_a_type_is_not_valid_TypeScript_syntax_Did_you_mean_to_write_1:
+    &Message = &CATALOG[1823];
 pub static Unicode_escape_sequence_cannot_appear_here: &Message = &CATALOG[1824];
 pub static Circularity_detected_while_resolving_configuration_Colon_0: &Message = &CATALOG[1825];
 pub static The_files_list_in_config_file_0_is_empty: &Message = &CATALOG[1826];
 pub static No_inputs_were_found_in_config_file_0_Specified_include_paths_were_1_and_exclude_paths_were_2: &Message = &CATALOG[1827];
 pub static No_value_exists_in_scope_for_the_shorthand_property_0_Either_declare_one_or_provide_an_initializer: &Message = &CATALOG[1828];
 pub static Classes_may_not_have_a_field_named_constructor: &Message = &CATALOG[1829];
-pub static JSX_expressions_may_not_use_the_comma_operator_Did_you_mean_to_write_an_array: &Message = &CATALOG[1830];
+pub static JSX_expressions_may_not_use_the_comma_operator_Did_you_mean_to_write_an_array: &Message =
+    &CATALOG[1830];
 pub static Private_identifiers_cannot_be_used_as_parameters: &Message = &CATALOG[1831];
-pub static An_accessibility_modifier_cannot_be_used_with_a_private_identifier: &Message = &CATALOG[1832];
-pub static The_operand_of_a_delete_operator_cannot_be_a_private_identifier: &Message = &CATALOG[1833];
+pub static An_accessibility_modifier_cannot_be_used_with_a_private_identifier: &Message =
+    &CATALOG[1832];
+pub static The_operand_of_a_delete_operator_cannot_be_a_private_identifier: &Message =
+    &CATALOG[1833];
 pub static X_constructor_is_a_reserved_word: &Message = &CATALOG[1834];
-pub static Property_0_is_not_accessible_outside_class_1_because_it_has_a_private_identifier: &Message = &CATALOG[1835];
+pub static Property_0_is_not_accessible_outside_class_1_because_it_has_a_private_identifier:
+    &Message = &CATALOG[1835];
 pub static The_property_0_cannot_be_accessed_on_type_1_within_this_class_because_it_is_shadowed_by_another_private_identifier_with_the_same_spelling: &Message = &CATALOG[1836];
 pub static Property_0_in_type_1_refers_to_a_different_member_that_cannot_be_accessed_from_within_type_2: &Message = &CATALOG[1837];
 pub static Private_identifiers_are_not_allowed_outside_class_bodies: &Message = &CATALOG[1838];
 pub static The_shadowing_declaration_of_0_is_defined_here: &Message = &CATALOG[1839];
-pub static The_declaration_of_0_that_you_probably_intended_to_use_is_defined_here: &Message = &CATALOG[1840];
+pub static The_declaration_of_0_that_you_probably_intended_to_use_is_defined_here: &Message =
+    &CATALOG[1840];
 pub static X_0_modifier_cannot_be_used_with_a_private_identifier: &Message = &CATALOG[1841];
 pub static An_enum_member_cannot_be_named_with_a_private_identifier: &Message = &CATALOG[1842];
 pub static X_can_only_be_used_at_the_start_of_a_file: &Message = &CATALOG[1843];
-pub static Compiler_reserves_name_0_when_emitting_private_identifier_downlevel: &Message = &CATALOG[1844];
-pub static Private_identifiers_are_only_available_when_targeting_ECMAScript_2015_and_higher: &Message = &CATALOG[1845];
+pub static Compiler_reserves_name_0_when_emitting_private_identifier_downlevel: &Message =
+    &CATALOG[1844];
+pub static Private_identifiers_are_only_available_when_targeting_ECMAScript_2015_and_higher:
+    &Message = &CATALOG[1845];
 pub static Private_identifiers_are_not_allowed_in_variable_declarations: &Message = &CATALOG[1846];
 pub static An_optional_chain_cannot_contain_private_identifiers: &Message = &CATALOG[1847];
 pub static The_intersection_0_was_reduced_to_never_because_property_1_has_conflicting_types_in_some_constituents: &Message = &CATALOG[1848];
 pub static The_intersection_0_was_reduced_to_never_because_property_1_exists_in_multiple_constituents_and_is_private_in_some: &Message = &CATALOG[1849];
-pub static Type_0_is_not_assignable_to_type_1_as_required_for_computed_enum_member_values: &Message = &CATALOG[1850];
+pub static Type_0_is_not_assignable_to_type_1_as_required_for_computed_enum_member_values:
+    &Message = &CATALOG[1850];
 pub static Specify_the_JSX_fragment_factory_function_to_use_when_targeting_react_JSX_emit_with_jsxFactory_compiler_option_is_specified_e_g_Fragment: &Message = &CATALOG[1851];
-pub static Invalid_value_for_jsxFragmentFactory_0_is_not_a_valid_identifier_or_qualified_name: &Message = &CATALOG[1852];
+pub static Invalid_value_for_jsxFragmentFactory_0_is_not_a_valid_identifier_or_qualified_name:
+    &Message = &CATALOG[1852];
 pub static Class_decorators_can_t_be_used_with_static_private_identifier_Consider_removing_the_experimental_decorator: &Message = &CATALOG[1853];
 pub static X_await_expression_cannot_be_used_inside_a_class_static_block: &Message = &CATALOG[1854];
 pub static X_for_await_loops_cannot_be_used_inside_a_class_static_block: &Message = &CATALOG[1855];
-pub static Invalid_use_of_0_It_cannot_be_used_inside_a_class_static_block: &Message = &CATALOG[1856];
+pub static Invalid_use_of_0_It_cannot_be_used_inside_a_class_static_block: &Message =
+    &CATALOG[1856];
 pub static A_return_statement_cannot_be_used_inside_a_class_static_block: &Message = &CATALOG[1857];
 pub static X_0_is_a_type_and_cannot_be_imported_in_JavaScript_files_Use_1_in_a_JSDoc_type_annotation: &Message = &CATALOG[1858];
-pub static Types_cannot_appear_in_export_declarations_in_JavaScript_files: &Message = &CATALOG[1859];
+pub static Types_cannot_appear_in_export_declarations_in_JavaScript_files: &Message =
+    &CATALOG[1859];
 pub static X_0_is_automatically_exported_here: &Message = &CATALOG[1860];
 pub static Properties_with_the_accessor_modifier_are_only_available_when_targeting_ECMAScript_2015_and_higher: &Message = &CATALOG[1861];
 pub static X_0_is_of_type_unknown: &Message = &CATALOG[1862];
@@ -1873,17 +2357,21 @@ pub static X_0_is_possibly_null_or_undefined: &Message = &CATALOG[1865];
 pub static The_value_0_cannot_be_used_here: &Message = &CATALOG[1866];
 pub static Compiler_option_0_cannot_be_given_an_empty_string: &Message = &CATALOG[1867];
 pub static Its_type_0_is_not_a_valid_JSX_element_type: &Message = &CATALOG[1868];
-pub static X_await_using_statements_cannot_be_used_inside_a_class_static_block: &Message = &CATALOG[1869];
+pub static X_await_using_statements_cannot_be_used_inside_a_class_static_block: &Message =
+    &CATALOG[1869];
 pub static X_0_has_a_string_type_but_must_have_syntactically_recognizable_string_syntax_when_isolatedModules_is_enabled: &Message = &CATALOG[1870];
 pub static Enum_member_following_a_non_literal_numeric_member_must_have_an_initializer_when_isolatedModules_is_enabled: &Message = &CATALOG[1871];
 pub static String_literal_import_and_export_names_are_not_supported_when_the_module_flag_is_set_to_es2015_or_es2020: &Message = &CATALOG[1872];
 pub static Default_imports_are_not_allowed_in_a_deferred_import: &Message = &CATALOG[1873];
 pub static Named_imports_are_not_allowed_in_a_deferred_import: &Message = &CATALOG[1874];
-pub static Deferred_imports_are_only_supported_when_the_module_flag_is_set_to_esnext_or_preserve: &Message = &CATALOG[1875];
-pub static X_0_is_not_a_valid_meta_property_for_keyword_import_Did_you_mean_meta_or_defer: &Message = &CATALOG[1876];
+pub static Deferred_imports_are_only_supported_when_the_module_flag_is_set_to_esnext_or_preserve:
+    &Message = &CATALOG[1875];
+pub static X_0_is_not_a_valid_meta_property_for_keyword_import_Did_you_mean_meta_or_defer:
+    &Message = &CATALOG[1876];
 pub static X_nodenext_if_module_is_nodenext_node16_if_module_is_node16_or_node18_otherwise_bundler: &Message = &CATALOG[1877];
 pub static File_is_a_CommonJS_module_it_may_be_converted_to_an_ES_module: &Message = &CATALOG[1878];
-pub static This_constructor_function_may_be_converted_to_a_class_declaration: &Message = &CATALOG[1879];
+pub static This_constructor_function_may_be_converted_to_a_class_declaration: &Message =
+    &CATALOG[1879];
 pub static Import_may_be_converted_to_a_default_import: &Message = &CATALOG[1880];
 pub static JSDoc_types_may_be_moved_to_TypeScript_types: &Message = &CATALOG[1881];
 pub static X_require_call_may_be_converted_to_an_import: &Message = &CATALOG[1882];
@@ -1972,16 +2460,19 @@ pub static Delete_all_unused_declarations: &Message = &CATALOG[1964];
 pub static Prefix_all_unused_declarations_with_where_possible: &Message = &CATALOG[1965];
 pub static Fix_all_detected_spelling_errors: &Message = &CATALOG[1966];
 pub static Add_initializers_to_all_uninitialized_properties: &Message = &CATALOG[1967];
-pub static Add_definite_assignment_assertions_to_all_uninitialized_properties: &Message = &CATALOG[1968];
+pub static Add_definite_assignment_assertions_to_all_uninitialized_properties: &Message =
+    &CATALOG[1968];
 pub static Add_undefined_type_to_all_uninitialized_properties: &Message = &CATALOG[1969];
 pub static Change_all_jsdoc_style_types_to_TypeScript: &Message = &CATALOG[1970];
-pub static Change_all_jsdoc_style_types_to_TypeScript_and_add_undefined_to_nullable_types: &Message = &CATALOG[1971];
+pub static Change_all_jsdoc_style_types_to_TypeScript_and_add_undefined_to_nullable_types:
+    &Message = &CATALOG[1971];
 pub static Implement_all_unimplemented_interfaces: &Message = &CATALOG[1972];
 pub static Install_all_missing_types_packages: &Message = &CATALOG[1973];
 pub static Rewrite_all_as_indexed_access_types: &Message = &CATALOG[1974];
 pub static Convert_all_to_default_imports: &Message = &CATALOG[1975];
 pub static Make_all_super_calls_the_first_statement_in_their_constructor: &Message = &CATALOG[1976];
-pub static Add_qualifier_to_all_unresolved_variables_matching_a_member_name: &Message = &CATALOG[1977];
+pub static Add_qualifier_to_all_unresolved_variables_matching_a_member_name: &Message =
+    &CATALOG[1977];
 pub static Change_all_extended_interfaces_to_implements: &Message = &CATALOG[1978];
 pub static Add_all_missing_super_calls: &Message = &CATALOG[1979];
 pub static Implement_all_inherited_abstract_classes: &Message = &CATALOG[1980];
@@ -2018,7 +2509,8 @@ pub static Add_unknown_to_all_conversions_of_non_overlapping_types: &Message = &
 pub static Add_missing_new_operator_to_call: &Message = &CATALOG[2011];
 pub static Add_missing_new_operator_to_all_calls: &Message = &CATALOG[2012];
 pub static Add_names_to_all_parameters_without_names: &Message = &CATALOG[2013];
-pub static Enable_the_experimentalDecorators_option_in_your_configuration_file: &Message = &CATALOG[2014];
+pub static Enable_the_experimentalDecorators_option_in_your_configuration_file: &Message =
+    &CATALOG[2014];
 pub static Convert_parameters_to_destructured_object: &Message = &CATALOG[2015];
 pub static Extract_type: &Message = &CATALOG[2016];
 pub static Extract_to_type_alias: &Message = &CATALOG[2017];
@@ -2051,12 +2543,15 @@ pub static Convert_function_declaration_0_to_arrow_function: &Message = &CATALOG
 pub static Fix_all_implicit_this_errors: &Message = &CATALOG[2044];
 pub static Wrap_invalid_character_in_an_expression_container: &Message = &CATALOG[2045];
 pub static Wrap_all_invalid_characters_in_an_expression_container: &Message = &CATALOG[2046];
-pub static Visit_https_Colon_Slash_Slashaka_ms_Slashtsconfig_to_read_more_about_this_file: &Message = &CATALOG[2047];
+pub static Visit_https_Colon_Slash_Slashaka_ms_Slashtsconfig_to_read_more_about_this_file:
+    &Message = &CATALOG[2047];
 pub static Add_a_return_statement: &Message = &CATALOG[2048];
 pub static Remove_braces_from_arrow_function_body: &Message = &CATALOG[2049];
-pub static Wrap_the_following_body_with_parentheses_which_should_be_an_object_literal: &Message = &CATALOG[2050];
+pub static Wrap_the_following_body_with_parentheses_which_should_be_an_object_literal: &Message =
+    &CATALOG[2050];
 pub static Add_all_missing_return_statement: &Message = &CATALOG[2051];
-pub static Remove_braces_from_all_arrow_function_bodies_with_relevant_issues: &Message = &CATALOG[2052];
+pub static Remove_braces_from_all_arrow_function_bodies_with_relevant_issues: &Message =
+    &CATALOG[2052];
 pub static Wrap_all_object_literal_with_parentheses: &Message = &CATALOG[2053];
 pub static Move_labeled_tuple_element_modifiers_to_labels: &Message = &CATALOG[2054];
 pub static Convert_overload_list_to_single_signature: &Message = &CATALOG[2055];
@@ -2138,10 +2633,12 @@ pub static Add_all_optional_parameters: &Message = &CATALOG[2130];
 pub static Wrap_in_parentheses: &Message = &CATALOG[2131];
 pub static Wrap_all_invalid_decorator_expressions_in_parentheses: &Message = &CATALOG[2132];
 pub static Add_resolution_mode_import_attribute: &Message = &CATALOG[2133];
-pub static Add_resolution_mode_import_attribute_to_all_type_only_imports_that_need_it: &Message = &CATALOG[2134];
+pub static Add_resolution_mode_import_attribute_to_all_type_only_imports_that_need_it: &Message =
+    &CATALOG[2134];
 pub static Do_not_print_diagnostics: &Message = &CATALOG[2135];
 pub static Run_in_single_threaded_mode: &Message = &CATALOG[2136];
-pub static Generate_pprof_CPU_Slashmemory_profiles_to_the_given_directory: &Message = &CATALOG[2137];
+pub static Generate_pprof_CPU_Slashmemory_profiles_to_the_given_directory: &Message =
+    &CATALOG[2137];
 pub static Set_the_number_of_checkers_per_project: &Message = &CATALOG[2138];
 pub static X_4_unless_singleThreaded_is_passed: &Message = &CATALOG[2139];
 pub static X_0_references: &Message = &CATALOG[2140];

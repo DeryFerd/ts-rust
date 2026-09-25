@@ -22,7 +22,9 @@ pub fn is_require_variable_statement(node: Node) -> bool {
     if is_variable_statement(node) {
         let declarations = node.declaration_list().declarations().nodes();
         if declarations.len() > 0 {
-            return declarations.iter().all(|d| is_variable_declaration_initialized_to_require(d));
+            return declarations
+                .iter()
+                .all(|d| is_variable_declaration_initialized_to_require(d));
         }
     }
     false
@@ -61,7 +63,11 @@ pub fn get_jsx_runtime_import(base: &str, options: &CompilerOptions) -> String {
     format!(
         "{}/{}",
         base,
-        if options.jsx == JsxEmit::REACT_JSX_DEV { "jsx-dev-runtime" } else { "jsx-runtime" }
+        if options.jsx == JsxEmit::REACT_JSX_DEV {
+            "jsx-dev-runtime"
+        } else {
+            "jsx-runtime"
+        }
     )
 }
 
@@ -100,16 +106,23 @@ pub fn is_variable_declaration_initialized_to_require(node: Node) -> bool {
     if node.kind() == SyntaxKind::BindingElement {
         node = node.parent().parent();
     }
-    is_variable_declaration_initialized_with_require_helper(node, false /*allowAccessedRequire*/)
+    is_variable_declaration_initialized_with_require_helper(
+        node, false, /*allowAccessedRequire*/
+    )
 }
 
 // Go: ast/utilities.go:2813 IsVariableDeclarationInitializedToBareOrAccessedRequire
 pub fn is_variable_declaration_initialized_to_bare_or_accessed_require(node: Node) -> bool {
-    is_variable_declaration_initialized_with_require_helper(node, true /*allowAccessedRequire*/)
+    is_variable_declaration_initialized_with_require_helper(
+        node, true, /*allowAccessedRequire*/
+    )
 }
 
 // Go: ast/utilities.go:2817 isVariableDeclarationInitializedWithRequireHelper
-pub fn is_variable_declaration_initialized_with_require_helper(node: Node, allow_accessed_require: bool) -> bool {
+pub fn is_variable_declaration_initialized_with_require_helper(
+    node: Node,
+    allow_accessed_require: bool,
+) -> bool {
     if !is_in_js_file(node) {
         return false;
     }
@@ -124,17 +137,25 @@ pub fn is_variable_declaration_initialized_with_require_helper(node: Node, allow
         initializer = get_leftmost_access_expression(initializer);
     }
 
-    !node.parent().parent().modifier_flags().intersects(ModifierFlags::EXPORT)
+    !node
+        .parent()
+        .parent()
+        .modifier_flags()
+        .intersects(ModifierFlags::EXPORT)
         && node.type_().is_nil()
         && is_require_call(initializer, true /*requireStringLiteralLikeArgument*/)
 }
 
 // Go: ast/utilities.go:2837 GetModuleSpecifierOfBareOrAccessedRequire
 pub fn get_module_specifier_of_bare_or_accessed_require(node: Node) -> Node {
-    if is_variable_declaration_initialized_with_require_helper(node, false /*allowAccessedRequire*/) {
+    if is_variable_declaration_initialized_with_require_helper(
+        node, false, /*allowAccessedRequire*/
+    ) {
         return node.initializer().arguments().get(0);
     }
-    if is_variable_declaration_initialized_with_require_helper(node, true /*allowAccessedRequire*/) {
+    if is_variable_declaration_initialized_with_require_helper(
+        node, true, /*allowAccessedRequire*/
+    ) {
         let leftmost = get_leftmost_access_expression(node.initializer());
         if is_require_call(leftmost, true /*requireStringLiteralLikeArgument*/) {
             return leftmost.arguments().get(0);
@@ -170,7 +191,8 @@ pub fn is_check_js_enabled_for_file(source_file: Node, compiler_options: &Compil
 // Go: ast/utilities.go:2870 IsPlainJSFile
 pub fn is_plain_js_file(file: Node, check_js: Tristate) -> bool {
     file.is_some()
-        && (source_file_info(file).script_kind == ScriptKind::JS || source_file_info(file).script_kind == ScriptKind::JSX)
+        && (source_file_info(file).script_kind == ScriptKind::JS
+            || source_file_info(file).script_kind == ScriptKind::JSX)
         && source_file_info(file).check_js_directive.is_none()
         && check_js == Tristate::Unknown
 }
@@ -237,7 +259,13 @@ pub fn is_exclusively_type_only_import_or_export(node: Node) -> bool {
 
 // Go: ast/utilities.go:2926 GetClassLikeDeclarationOfSymbol
 pub fn get_class_like_declaration_of_symbol(symbols: &SymbolArena, symbol: SymbolId) -> Node {
-    symbols.sym(symbol).declarations.iter().copied().find(|&d| is_class_like(d)).unwrap_or(Node::NIL)
+    symbols
+        .sym(symbol)
+        .declarations
+        .iter()
+        .copied()
+        .find(|&d| is_class_like(d))
+        .unwrap_or(Node::NIL)
 }
 
 // Go: ast/utilities.go:2930 IsCallLikeExpression
@@ -250,7 +278,9 @@ pub fn is_call_like_expression(node: Node) -> bool {
         | SyntaxKind::NewExpression
         | SyntaxKind::TaggedTemplateExpression
         | SyntaxKind::Decorator => true,
-        SyntaxKind::BinaryExpression => node.operator_token().kind() == SyntaxKind::InstanceOfKeyword,
+        SyntaxKind::BinaryExpression => {
+            node.operator_token().kind() == SyntaxKind::InstanceOfKeyword
+        }
         _ => false,
     }
 }
@@ -259,7 +289,9 @@ pub fn is_call_like_expression(node: Node) -> bool {
 pub fn is_jsx_call_like(node: Node) -> bool {
     matches!(
         node.kind(),
-        SyntaxKind::JsxOpeningElement | SyntaxKind::JsxSelfClosingElement | SyntaxKind::JsxOpeningFragment
+        SyntaxKind::JsxOpeningElement
+            | SyntaxKind::JsxSelfClosingElement
+            | SyntaxKind::JsxOpeningFragment
     )
 }
 
@@ -279,7 +311,8 @@ pub fn node_has_kind(node: Node, kind: SyntaxKind) -> bool {
 // Go: ast/utilities.go:2960 IsContextualKeyword
 pub fn is_contextual_keyword(token: SyntaxKind) -> bool {
     // PORT: compare discriminants; ts_ast::SyntaxKind does not derive Ord.
-    SyntaxKind::FIRST_CONTEXTUAL_KEYWORD as u16 <= token as u16 && token as u16 <= SyntaxKind::LAST_CONTEXTUAL_KEYWORD as u16
+    SyntaxKind::FIRST_CONTEXTUAL_KEYWORD as u16 <= token as u16
+        && token as u16 <= SyntaxKind::LAST_CONTEXTUAL_KEYWORD as u16
 }
 
 // Go: ast/utilities.go:2964 IsThisInTypeQuery
@@ -316,7 +349,11 @@ pub fn is_parameter_property_modifier(kind: SyntaxKind) -> bool {
 // Go: ast/utilities.go:2988 ForEachChildAndJSDoc
 // PORT: Go `Visitor` (`func(*Node) bool`) -> `&mut dyn FnMut(Node) -> bool`.
 // `visitNodes` is inlined as a loop over `node.js_doc(file)`.
-pub fn for_each_child_and_js_doc(node: Node, source_file: Node, v: &mut dyn FnMut(Node) -> bool) -> bool {
+pub fn for_each_child_and_js_doc(
+    node: Node,
+    source_file: Node,
+    v: &mut dyn FnMut(Node) -> bool,
+) -> bool {
     for js_doc in node.js_doc(source_file).iter() {
         if v(js_doc) {
             return true;
@@ -343,7 +380,8 @@ pub fn has_type_arguments(node: Node) -> bool {
 
 // Go: ast/utilities.go:3005 IsTypeReferenceType
 pub fn is_type_reference_type(node: Node) -> bool {
-    node.kind() == SyntaxKind::TypeReference || node.kind() == SyntaxKind::ExpressionWithTypeArguments
+    node.kind() == SyntaxKind::TypeReference
+        || node.kind() == SyntaxKind::ExpressionWithTypeArguments
 }
 
 // Go: ast/utilities.go:3009 IsVariableLike
@@ -503,19 +541,24 @@ pub fn is_js_doc_single_comment_node_comment(node: Node) -> bool {
     if node.is_nil() || node.parent().is_nil() {
         return false;
     }
-    is_js_doc_single_comment_node(node.parent()) && node == node.parent().comment_list().nodes().get(0)
+    is_js_doc_single_comment_node(node.parent())
+        && node == node.parent().comment_list().nodes().get(0)
 }
 
 // Go: ast/utilities.go:3101 IsJSDocSingleCommentNode
 // In Strada, if a JSDoc node has a single comment, that comment is represented as a string property
 // as a simplification, and therefore that comment is not visited by `forEachChild`.
 pub fn is_js_doc_single_comment_node(node: Node) -> bool {
-    has_comment(node.kind()) && !node.comment_list().is_nil() && node.comment_list().nodes().len() == 1
+    has_comment(node.kind())
+        && !node.comment_list().is_nil()
+        && node.comment_list().nodes().len() == 1
 }
 
 // Go: ast/utilities.go:3105 IsValidTypeOnlyAliasUseSite
 pub fn is_valid_type_only_alias_use_site(use_site: Node) -> bool {
-    use_site.flags().intersects(NodeFlags::AMBIENT | NodeFlags::JS_DOC)
+    use_site
+        .flags()
+        .intersects(NodeFlags::AMBIENT | NodeFlags::JS_DOC)
         || is_part_of_type_query(use_site)
         || is_identifier_in_non_emitting_heritage_clause(use_site)
         || is_part_of_possibly_valid_type_or_abstract_computed_property_name(use_site)
@@ -532,13 +575,17 @@ pub fn is_identifier_in_non_emitting_heritage_clause(node: Node) -> bool {
         parent = parent.parent();
     }
     is_heritage_clause(parent)
-        && (parent.token() == SyntaxKind::ImplementsKeyword || is_interface_declaration(parent.parent()))
+        && (parent.token() == SyntaxKind::ImplementsKeyword
+            || is_interface_declaration(parent.parent()))
 }
 
 // Go: ast/utilities.go:3124 isPartOfPossiblyValidTypeOrAbstractComputedPropertyName
 pub fn is_part_of_possibly_valid_type_or_abstract_computed_property_name(node: Node) -> bool {
     let mut node = node;
-    while node_kind_is(node, &[SyntaxKind::Identifier, SyntaxKind::PropertyAccessExpression]) {
+    while node_kind_is(
+        node,
+        &[SyntaxKind::Identifier, SyntaxKind::PropertyAccessExpression],
+    ) {
         node = node.parent();
     }
     if node.kind() != SyntaxKind::ComputedPropertyName {
@@ -547,12 +594,17 @@ pub fn is_part_of_possibly_valid_type_or_abstract_computed_property_name(node: N
     if has_syntactic_modifier(node.parent(), ModifierFlags::ABSTRACT) {
         return true;
     }
-    node_kind_is(node.parent().parent(), &[SyntaxKind::InterfaceDeclaration, SyntaxKind::TypeLiteral])
+    node_kind_is(
+        node.parent().parent(),
+        &[SyntaxKind::InterfaceDeclaration, SyntaxKind::TypeLiteral],
+    )
 }
 
 // Go: ast/utilities.go:3137 isShorthandPropertyNameUseSite
 pub fn is_shorthand_property_name_use_site(use_site: Node) -> bool {
-    is_identifier(use_site) && is_shorthand_property_assignment(use_site.parent()) && use_site.parent().name() == use_site
+    is_identifier(use_site)
+        && is_shorthand_property_assignment(use_site.parent())
+        && use_site.parent().name() == use_site
 }
 
 // Go: ast/utilities.go:3141 GetPropertyNameForPropertyNameNode
@@ -599,7 +651,9 @@ pub fn is_part_of_exclusively_type_only_import_or_export_declaration(node: Node)
 // Go: ast/utilities.go:3171 IsEmittableImport
 pub fn is_emittable_import(node: Node) -> bool {
     match node.kind() {
-        SyntaxKind::ImportDeclaration => node.import_clause().is_some() && !node.import_clause().is_type_only(),
+        SyntaxKind::ImportDeclaration => {
+            node.import_clause().is_some() && !node.import_clause().is_type_only()
+        }
         SyntaxKind::ExportDeclaration | SyntaxKind::ImportEqualsDeclaration => !node.is_type_only(),
         SyntaxKind::CallExpression => is_import_call(node),
         _ => false,
@@ -670,7 +724,8 @@ pub fn is_string_text_containing_node(node: Node) -> bool {
 // Go: ast/utilities.go:3218 IsTemplateLiteralKind
 pub fn is_template_literal_kind(kind: SyntaxKind) -> bool {
     // PORT: compare discriminants; ts_ast::SyntaxKind does not derive Ord.
-    SyntaxKind::FIRST_TEMPLATE_TOKEN as u16 <= kind as u16 && kind as u16 <= SyntaxKind::LAST_TEMPLATE_TOKEN as u16
+    SyntaxKind::FIRST_TEMPLATE_TOKEN as u16 <= kind as u16
+        && kind as u16 <= SyntaxKind::LAST_TEMPLATE_TOKEN as u16
 }
 
 // Go: ast/utilities.go:3222 IsTemplateLiteralToken
@@ -754,22 +809,65 @@ pub fn get_this_parameter(signature: Node) -> Node {
 pub fn replace_modifiers(factory: &NodeFactory, node: Node, modifier_array: ModifierList) -> Node {
     match node.kind() {
         SyntaxKind::TypeParameter => {
-            return factory.update_type_parameter_declaration(node, modifier_array, node.name(), node.constraint(), node.expression(), node.default_type());
+            return factory.update_type_parameter_declaration(
+                node,
+                modifier_array,
+                node.name(),
+                node.constraint(),
+                node.expression(),
+                node.default_type(),
+            );
         }
         SyntaxKind::Parameter => {
-            return factory.update_parameter_declaration(node, modifier_array, node.dot_dot_dot_token(), node.name(), node.question_token(), node.type_(), node.initializer());
+            return factory.update_parameter_declaration(
+                node,
+                modifier_array,
+                node.dot_dot_dot_token(),
+                node.name(),
+                node.question_token(),
+                node.type_(),
+                node.initializer(),
+            );
         }
         SyntaxKind::ConstructorType => {
-            return factory.update_constructor_type_node(node, modifier_array, node.type_parameter_list(), node.parameter_list(), node.type_());
+            return factory.update_constructor_type_node(
+                node,
+                modifier_array,
+                node.type_parameter_list(),
+                node.parameter_list(),
+                node.type_(),
+            );
         }
         SyntaxKind::PropertySignature => {
-            return factory.update_property_signature_declaration(node, modifier_array, node.name(), node.postfix_token(), node.type_(), node.initializer());
+            return factory.update_property_signature_declaration(
+                node,
+                modifier_array,
+                node.name(),
+                node.postfix_token(),
+                node.type_(),
+                node.initializer(),
+            );
         }
         SyntaxKind::PropertyDeclaration => {
-            return factory.update_property_declaration(node, modifier_array, node.name(), node.postfix_token(), node.type_(), node.initializer());
+            return factory.update_property_declaration(
+                node,
+                modifier_array,
+                node.name(),
+                node.postfix_token(),
+                node.type_(),
+                node.initializer(),
+            );
         }
         SyntaxKind::MethodSignature => {
-            return factory.update_method_signature_declaration(node, modifier_array, node.name(), node.postfix_token(), node.type_parameter_list(), node.parameter_list(), node.type_());
+            return factory.update_method_signature_declaration(
+                node,
+                modifier_array,
+                node.name(),
+                node.postfix_token(),
+                node.type_parameter_list(),
+                node.parameter_list(),
+                node.type_(),
+            );
         }
         SyntaxKind::MethodDeclaration => {
             return factory.update_method_declaration(
@@ -786,16 +884,47 @@ pub fn replace_modifiers(factory: &NodeFactory, node: Node, modifier_array: Modi
             );
         }
         SyntaxKind::Constructor => {
-            return factory.update_constructor_declaration(node, modifier_array, node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body());
+            return factory.update_constructor_declaration(
+                node,
+                modifier_array,
+                node.type_parameter_list(),
+                node.parameter_list(),
+                node.type_(),
+                node.full_signature(),
+                node.body(),
+            );
         }
         SyntaxKind::GetAccessor => {
-            return factory.update_get_accessor_declaration(node, modifier_array, node.name(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body());
+            return factory.update_get_accessor_declaration(
+                node,
+                modifier_array,
+                node.name(),
+                node.type_parameter_list(),
+                node.parameter_list(),
+                node.type_(),
+                node.full_signature(),
+                node.body(),
+            );
         }
         SyntaxKind::SetAccessor => {
-            return factory.update_set_accessor_declaration(node, modifier_array, node.name(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body());
+            return factory.update_set_accessor_declaration(
+                node,
+                modifier_array,
+                node.name(),
+                node.type_parameter_list(),
+                node.parameter_list(),
+                node.type_(),
+                node.full_signature(),
+                node.body(),
+            );
         }
         SyntaxKind::IndexSignature => {
-            return factory.update_index_signature_declaration(node, modifier_array, node.parameter_list(), node.type_());
+            return factory.update_index_signature_declaration(
+                node,
+                modifier_array,
+                node.parameter_list(),
+                node.type_(),
+            );
         }
         SyntaxKind::FunctionExpression => {
             return factory.update_function_expression(
@@ -823,10 +952,21 @@ pub fn replace_modifiers(factory: &NodeFactory, node: Node, modifier_array: Modi
             );
         }
         SyntaxKind::ClassExpression => {
-            return factory.update_class_expression(node, modifier_array, node.name(), node.type_parameter_list(), node.heritage_clauses(), node.member_list());
+            return factory.update_class_expression(
+                node,
+                modifier_array,
+                node.name(),
+                node.type_parameter_list(),
+                node.heritage_clauses(),
+                node.member_list(),
+            );
         }
         SyntaxKind::VariableStatement => {
-            return factory.update_variable_statement(node, modifier_array, node.declaration_list());
+            return factory.update_variable_statement(
+                node,
+                modifier_array,
+                node.declaration_list(),
+            );
         }
         SyntaxKind::FunctionDeclaration => {
             return factory.update_function_declaration(
@@ -842,31 +982,87 @@ pub fn replace_modifiers(factory: &NodeFactory, node: Node, modifier_array: Modi
             );
         }
         SyntaxKind::ClassDeclaration => {
-            return factory.update_class_declaration(node, modifier_array, node.name(), node.type_parameter_list(), node.heritage_clauses(), node.member_list());
+            return factory.update_class_declaration(
+                node,
+                modifier_array,
+                node.name(),
+                node.type_parameter_list(),
+                node.heritage_clauses(),
+                node.member_list(),
+            );
         }
         SyntaxKind::InterfaceDeclaration => {
-            return factory.update_interface_declaration(node, modifier_array, node.name(), node.type_parameter_list(), node.heritage_clauses(), node.member_list());
+            return factory.update_interface_declaration(
+                node,
+                modifier_array,
+                node.name(),
+                node.type_parameter_list(),
+                node.heritage_clauses(),
+                node.member_list(),
+            );
         }
         SyntaxKind::TypeAliasDeclaration => {
-            return factory.update_type_alias_declaration(node, modifier_array, node.name(), node.type_parameter_list(), node.type_());
+            return factory.update_type_alias_declaration(
+                node,
+                modifier_array,
+                node.name(),
+                node.type_parameter_list(),
+                node.type_(),
+            );
         }
         SyntaxKind::EnumDeclaration => {
-            return factory.update_enum_declaration(node, modifier_array, node.name(), node.member_list());
+            return factory.update_enum_declaration(
+                node,
+                modifier_array,
+                node.name(),
+                node.member_list(),
+            );
         }
         SyntaxKind::ModuleDeclaration => {
-            return factory.update_module_declaration(node, modifier_array, node.keyword(), node.name(), node.body());
+            return factory.update_module_declaration(
+                node,
+                modifier_array,
+                node.keyword(),
+                node.name(),
+                node.body(),
+            );
         }
         SyntaxKind::ImportEqualsDeclaration => {
-            return factory.update_import_equals_declaration(node, modifier_array, node.is_type_only(), node.name(), node.module_reference());
+            return factory.update_import_equals_declaration(
+                node,
+                modifier_array,
+                node.is_type_only(),
+                node.name(),
+                node.module_reference(),
+            );
         }
         SyntaxKind::ImportDeclaration => {
-            return factory.update_import_declaration(node, modifier_array, node.import_clause(), node.module_specifier(), node.attributes());
+            return factory.update_import_declaration(
+                node,
+                modifier_array,
+                node.import_clause(),
+                node.module_specifier(),
+                node.attributes(),
+            );
         }
         SyntaxKind::ExportAssignment => {
-            return factory.update_export_assignment(node, modifier_array, node.is_export_equals(), node.type_(), node.expression());
+            return factory.update_export_assignment(
+                node,
+                modifier_array,
+                node.is_export_equals(),
+                node.type_(),
+                node.expression(),
+            );
         }
         SyntaxKind::ExportDeclaration => {
-            return factory.update_export_declaration(node, modifier_array, node.is_type_only(), node.export_clause(), node.module_specifier(), node.attributes());
+            return factory.update_export_declaration(
+                node,
+                modifier_array,
+                node.is_type_only(),
+                node.export_clause(),
+                node.module_specifier(),
+                node.attributes(),
+            );
         }
         _ => {}
     }
@@ -929,14 +1125,18 @@ pub fn is_type_declaration(node: Node) -> bool {
         | SyntaxKind::JsTypeAliasDeclaration
         | SyntaxKind::EnumDeclaration => true,
         SyntaxKind::ImportClause => node.is_type_only(),
-        SyntaxKind::ImportSpecifier | SyntaxKind::ExportSpecifier => node.parent().parent().is_type_only(),
+        SyntaxKind::ImportSpecifier | SyntaxKind::ExportSpecifier => {
+            node.parent().parent().is_type_only()
+        }
         _ => false,
     }
 }
 
 // Go: ast/utilities.go:3579 IsTypeDeclarationName
 pub fn is_type_declaration_name(name: Node) -> bool {
-    name.kind() == SyntaxKind::Identifier && is_type_declaration(name.parent()) && get_name_of_declaration(name.parent()) == name
+    name.kind() == SyntaxKind::Identifier
+        && is_type_declaration(name.parent())
+        && get_name_of_declaration(name.parent()) == name
 }
 
 // Go: ast/utilities.go:3585 IsRightSideOfPropertyAccess
@@ -992,7 +1192,11 @@ pub fn select_tag_name_of_jsx_opening_like_element(node: Node) -> Node {
 }
 
 // Go: ast/utilities.go:3628 IsCallExpressionTarget
-pub fn is_call_expression_target(node: Node, include_element_access: bool, skip_past_outer_expressions: bool) -> bool {
+pub fn is_call_expression_target(
+    node: Node,
+    include_element_access: bool,
+    skip_past_outer_expressions: bool,
+) -> bool {
     is_callee_worker(
         node,
         is_call_expression,

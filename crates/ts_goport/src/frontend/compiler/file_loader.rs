@@ -104,7 +104,8 @@ pub struct ProcessedFiles {
     pub project_reference_file_mapper: Option<Rc<RefCell<ProjectReferenceFileMapper>>>,
     pub missing_files: Vec<String>,
     pub resolved_modules: FxHashMap<Path, ModeAwareCache<Rc<ResolvedModule>>>,
-    pub type_resolutions_in_file: FxHashMap<Path, ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>>,
+    pub type_resolutions_in_file:
+        FxHashMap<Path, ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>>,
     pub source_file_meta_datas: FxHashMap<Path, SourceFileMetaData>,
     pub jsx_runtime_import_specifiers: Option<FxHashMap<Path, Rc<JsxRuntimeImportSpecifier>>>,
     pub import_helpers_import_specifiers: Option<FxHashMap<Path, Node>>,
@@ -133,21 +134,31 @@ pub struct JsxRuntimeImportSpecifier {
 pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) -> ProcessedFiles {
     let compiler_options = opts.config.compiler_options().clone();
     let root_files: Vec<String> = opts.config.file_names().to_vec();
-    let supported_extensions = get_supported_extensions(&compiler_options, &[] /*extraFileExtensions*/);
+    let supported_extensions =
+        get_supported_extensions(&compiler_options, &[] /*extraFileExtensions*/);
     let supported_extensions_with_json_if_resolve_json_module =
-        get_supported_extensions_with_json_if_resolve_json_module(Some(&compiler_options), supported_extensions.clone());
+        get_supported_extensions_with_json_if_resolve_json_module(
+            Some(&compiler_options),
+            supported_extensions.clone(),
+        );
     let mut max_node_module_js_depth = 0;
     if let Some(p) = opts.config.compiler_options().max_node_module_js_depth {
         max_node_module_js_depth = p;
     }
     let current_directory = opts.host.get_current_directory().to_string();
     let mut loader = FileLoader {
-        default_library_path: get_normalized_absolute_path(&opts.host.default_library_path(), &current_directory),
+        default_library_path: get_normalized_absolute_path(
+            &opts.host.default_library_path(),
+            &current_directory,
+        ),
         compare_paths_options: ComparePathsOptions {
             use_case_sensitive_file_names: opts.host.fs().use_case_sensitive_file_names(),
             current_directory: current_directory.clone(),
         },
-        files_parser: RefCell::new(FilesParser { max_depth: max_node_module_js_depth, ..Default::default() }),
+        files_parser: RefCell::new(FilesParser {
+            max_depth: max_node_module_js_depth,
+            ..Default::default()
+        }),
         root_tasks: Vec::with_capacity(root_files.len() + compiler_options.lib.len()),
         supported_extensions,
         supported_extensions_with_json_if_resolve_json_module,
@@ -182,7 +193,10 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         loader.add_root_file_task(
             root_file,
             None,
-            new_file_include_reason(FileIncludeKind::ROOT_FILE, FileIncludeData::Index(index as i32)),
+            new_file_include_reason(
+                FileIncludeKind::ROOT_FILE,
+                FileIncludeData::Index(index as i32),
+            ),
         );
     }
     if !root_files.is_empty() && compiler_options.no_lib.is_false_or_unknown() {
@@ -205,7 +219,10 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
                     loader.add_root_task(
                         &lib_file.path,
                         Some(lib_file.clone()),
-                        new_file_include_reason(FileIncludeKind::LIB_FILE, FileIncludeData::Index(index as i32)),
+                        new_file_include_reason(
+                            FileIncludeKind::LIB_FILE,
+                            FileIncludeData::Index(index as i32),
+                        ),
                     );
                 }
                 // !!! error on unknown name
@@ -234,7 +251,11 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
 impl FileLoader {
     // Go: fileloader.go:187 (*fileLoader).toPath
     pub fn to_path(&self, file: &str) -> Path {
-        to_path(file, &self.opts.host.get_current_directory(), self.opts.host.fs().use_case_sensitive_file_names())
+        to_path(
+            file,
+            &self.opts.host.get_current_directory(),
+            self.opts.host.fs().use_case_sensitive_file_names(),
+        )
     }
 
     // Go: fileloader.go:191 (*fileLoader).addRootTask
@@ -244,8 +265,16 @@ impl FileLoader {
         lib_file: Option<Rc<LibFile>>,
         include_reason: Rc<FileIncludeReason>,
     ) {
-        let abs_path = get_normalized_absolute_path(file_name, &self.opts.host.get_current_directory());
-        if self.opts.config.compiler_options().allow_non_ts_extensions.is_true() || has_extension(&abs_path) {
+        let abs_path =
+            get_normalized_absolute_path(file_name, &self.opts.host.get_current_directory());
+        if self
+            .opts
+            .config
+            .compiler_options()
+            .allow_non_ts_extensions
+            .is_true()
+            || has_extension(&abs_path)
+        {
             self.root_tasks.push(Rc::new(RefCell::new(ParseTask {
                 normalized_file_path: abs_path,
                 lib_file,
@@ -268,8 +297,12 @@ impl FileLoader {
         if let Some(config_file) = &self.opts.config.config_file {
             containing_file = get_normalized_absolute_path(&config_file.file_name, &curr_dir);
         }
-        let (resolved_file, diagnostic) =
-            self.get_source_file_from_reference(&abs_path, file_name, &containing_file, &include_reason);
+        let (resolved_file, diagnostic) = self.get_source_file_from_reference(
+            &abs_path,
+            file_name,
+            &containing_file,
+            &include_reason,
+        );
         let mut root_task = ParseTask {
             normalized_file_path: resolved_file,
             lib_file,
@@ -278,8 +311,11 @@ impl FileLoader {
         };
         if let Some(diagnostic) = diagnostic {
             root_task.normalized_file_path = abs_path;
-            root_task.processing_diagnostics =
-                vec![new_explaining_processing_diagnostic(Some(include_reason), diagnostic.message, diagnostic.args)];
+            root_task.processing_diagnostics = vec![new_explaining_processing_diagnostic(
+                Some(include_reason),
+                diagnostic.message,
+                diagnostic.args,
+            )];
         }
         self.root_tasks.push(Rc::new(RefCell::new(root_task)));
     }
@@ -293,7 +329,8 @@ impl FileLoader {
         } else {
             containing_directory = self.opts.host.get_current_directory().to_string();
         }
-        let containing_file_name = combine_paths(&containing_directory, &[INFERRED_TYPES_CONTAINING_FILE]);
+        let containing_file_name =
+            combine_paths(&containing_directory, &[INFERRED_TYPES_CONTAINING_FILE]);
         self.root_tasks.push(Rc::new(RefCell::new(ParseTask {
             normalized_file_path: containing_file_name,
             is_for_automatic_type_directive: true,
@@ -313,7 +350,8 @@ impl FileLoader {
         Vec<Rc<ProcessingDiagnostic>>,
     ) {
         let mut to_parse: Vec<ResolvedRef> = Vec::new();
-        let mut type_resolutions_in_file: ModeAwareCache<Rc<ResolvedTypeReferenceDirective>> = ModeAwareCache::default();
+        let mut type_resolutions_in_file: ModeAwareCache<Rc<ResolvedTypeReferenceDirective>> =
+            ModeAwareCache::default();
         let mut type_resolutions_trace: Vec<DiagAndArgs> = Vec::new();
         let mut p_diagnostics: Vec<Rc<ProcessingDiagnostic>> = Vec::new();
         // PORT: Go passes the compiler host as a `module.ResolutionHost`.
@@ -327,10 +365,19 @@ impl FileLoader {
                 // Under node16/nodenext module resolution, load `types`/ata include names as cjs resolution results by passing an `undefined` mode.
                 // Under bundler module resolution, this also triggers the "import" condition to be used.
                 let resolution_mode = RESOLUTION_MODE_NONE;
-                let (resolved, trace) =
-                    self.resolver().resolve_type_reference_directive(name, containing_file_name, resolution_mode, None);
-                type_resolutions_in_file
-                    .insert(ModeAwareCacheKey { name: name.clone(), mode: resolution_mode }, resolved.clone());
+                let (resolved, trace) = self.resolver().resolve_type_reference_directive(
+                    name,
+                    containing_file_name,
+                    resolution_mode,
+                    None,
+                );
+                type_resolutions_in_file.insert(
+                    ModeAwareCacheKey {
+                        name: name.clone(),
+                        mode: resolution_mode,
+                    },
+                    resolved.clone(),
+                );
                 type_resolutions_trace.extend(trace);
                 if resolved.is_resolved() {
                     to_parse.push(ResolvedRef {
@@ -339,10 +386,12 @@ impl FileLoader {
                         elide_on_depth: false,
                         include_reason: Some(new_file_include_reason(
                             FileIncludeKind::AUTOMATIC_TYPE_DIRECTIVE_FILE,
-                            FileIncludeData::AutomaticTypeDirectiveFile(AutomaticTypeDirectiveFileData {
-                                type_reference: name.clone(),
-                                package_id: resolved.package_id.clone(),
-                            }),
+                            FileIncludeData::AutomaticTypeDirectiveFile(
+                                AutomaticTypeDirectiveFileData {
+                                    type_reference: name.clone(),
+                                    package_id: resolved.package_id.clone(),
+                                },
+                            ),
                         )),
                         package_id: resolved.package_id.clone(),
                     });
@@ -350,10 +399,12 @@ impl FileLoader {
                     p_diagnostics.push(new_explaining_processing_diagnostic(
                         Some(new_file_include_reason(
                             FileIncludeKind::AUTOMATIC_TYPE_DIRECTIVE_FILE,
-                            FileIncludeData::AutomaticTypeDirectiveFile(AutomaticTypeDirectiveFileData {
-                                type_reference: name.clone(),
-                                package_id: PackageId::default(),
-                            }),
+                            FileIncludeData::AutomaticTypeDirectiveFile(
+                                AutomaticTypeDirectiveFileData {
+                                    type_reference: name.clone(),
+                                    package_id: PackageId::default(),
+                                },
+                            ),
                         )),
                         diag::Cannot_find_type_definition_file_for_0,
                         args![name],
@@ -361,7 +412,12 @@ impl FileLoader {
                 }
             }
         }
-        (to_parse, type_resolutions_in_file, type_resolutions_trace, p_diagnostics)
+        (
+            to_parse,
+            type_resolutions_in_file,
+            type_resolutions_trace,
+            p_diagnostics,
+        )
     }
 
     // Go: fileloader.go:297 (*fileLoader).addProjectReferenceTasks
@@ -399,12 +455,16 @@ impl FileLoader {
             && a_file_name.as_bytes()[default_library_path.len()] == DIRECTORY_SEPARATOR
         {
             // avoid tspath.GetBaseFileName; we know these paths are already absolute and normalized.
-            let basename = &a_file_name[a_file_name.rfind(DIRECTORY_SEPARATOR as char).map_or(0, |i| i + 1)..];
+            let basename = &a_file_name[a_file_name
+                .rfind(DIRECTORY_SEPARATOR as char)
+                .map_or(0, |i| i + 1)..];
             if basename == "lib.d.ts" || basename == "lib.es6.d.ts" {
                 return 0;
             }
             let without_prefix = basename.strip_prefix("lib.").unwrap_or(basename);
-            let name = without_prefix.strip_suffix(".d.ts").unwrap_or(without_prefix);
+            let name = without_prefix
+                .strip_suffix(".d.ts")
+                .unwrap_or(without_prefix);
             if let Some(index) = LIBS.iter().position(|lib| lib == name) {
                 return index + 1;
             }
@@ -414,18 +474,29 @@ impl FileLoader {
 
     // Go: fileloader.go:341 (*fileLoader).loadSourceFileMetaData
     pub fn load_source_file_meta_data(&self, file_name: &str) -> SourceFileMetaData {
-        let package_json_scope = self.resolver().get_package_scope_for_path(&get_directory_path(file_name));
-        let module_resolution_kind = self.opts.config.compiler_options().get_module_resolution_kind();
+        let package_json_scope = self
+            .resolver()
+            .get_package_scope_for_path(&get_directory_path(file_name));
+        let module_resolution_kind = self
+            .opts
+            .config
+            .compiler_options()
+            .get_module_resolution_kind();
 
         let mut package_json_type = String::new();
         let mut package_json_directory = String::new();
         if let Some(scope) = package_json_scope.as_ref().filter(|scope| scope.exists()) {
             package_json_directory = scope.package_directory.clone();
-            let contents = scope.contents.as_ref().expect("an existing package.json scope has contents");
+            let contents = scope
+                .contents
+                .as_ref()
+                .expect("an existing package.json scope has contents");
             let (value, ok) = contents.fields.header_fields.type_.get_value();
             if ok
-                && (!file_extension_is_one_of(file_name, &[EXTENSION_MTS, EXTENSION_CTS, EXTENSION_MJS, EXTENSION_CJS])
-                    && ModuleResolutionKind::NODE16 <= module_resolution_kind
+                && (!file_extension_is_one_of(
+                    file_name,
+                    &[EXTENSION_MTS, EXTENSION_CTS, EXTENSION_MJS, EXTENSION_CJS],
+                ) && ModuleResolutionKind::NODE16 <= module_resolution_kind
                     && module_resolution_kind <= ModuleResolutionKind::NODE_NEXT
                     || file_name.contains("/node_modules/"))
             {
@@ -434,7 +505,11 @@ impl FileLoader {
         }
 
         let implied_node_format = get_implied_node_format_for_file(file_name, &package_json_type);
-        SourceFileMetaData { package_json_type, package_json_directory, implied_node_format }
+        SourceFileMetaData {
+            package_json_type,
+            package_json_directory,
+            implied_node_format,
+        }
     }
 
     // Go: fileloader.go:364 (*fileLoader).parseSourceFile
@@ -480,7 +555,8 @@ impl FileLoader {
         let fs = self.opts.host.fs();
 
         if has_extension(file_name) {
-            let canonical_file_name = get_canonical_file_name(file_name, fs.use_case_sensitive_file_names());
+            let canonical_file_name =
+                get_canonical_file_name(file_name, fs.use_case_sensitive_file_names());
             if !allow_non_ts_extensions && !self.is_supported_extension(&canonical_file_name) {
                 if has_js_file_extension(&canonical_file_name) {
                     return (
@@ -514,7 +590,8 @@ impl FileLoader {
             }
 
             if include_reason.is_referenced_file()
-                && get_canonical_file_name(containing_file, fs.use_case_sensitive_file_names()) == canonical_file_name
+                && get_canonical_file_name(containing_file, fs.use_case_sensitive_file_names())
+                    == canonical_file_name
             {
                 return (
                     String::new(),
@@ -554,7 +631,10 @@ impl FileLoader {
                 message: diag::Could_not_resolve_the_path_0_with_the_extensions_Colon_1,
                 args: args![
                     diagnostic_file_name,
-                    format!("'{}'", join_flattened_extensions(&self.supported_extensions))
+                    format!(
+                        "'{}'",
+                        join_flattened_extensions(&self.supported_extensions)
+                    )
                 ],
             }),
         )
@@ -583,12 +663,20 @@ impl FileLoader {
             }),
         );
 
-        let (resolved_file_name, diagnostic) =
-            self.get_source_file_from_reference(&normalized_file_name, module_name, containing_file, &include_reason);
+        let (resolved_file_name, diagnostic) = self.get_source_file_from_reference(
+            &normalized_file_name,
+            module_name,
+            containing_file,
+            &include_reason,
+        );
         if let Some(diagnostic) = diagnostic {
             return (
                 None,
-                Some(new_explaining_processing_diagnostic(Some(include_reason), diagnostic.message, diagnostic.args)),
+                Some(new_explaining_processing_diagnostic(
+                    Some(include_reason),
+                    diagnostic.message,
+                    diagnostic.args,
+                )),
             );
         }
 
@@ -604,7 +692,10 @@ impl FileLoader {
 
     // Go: fileloader.go:473 (*fileLoader).resolveTypeReferenceDirectives
     pub fn resolve_type_reference_directives(&self, t: &mut ParseTask) {
-        let file = t.file.clone().expect("resolveTypeReferenceDirectives runs on a parsed file");
+        let file = t
+            .file
+            .clone()
+            .expect("resolveTypeReferenceDirectives runs on a parsed file");
         if file.type_reference_directives.is_empty() {
             return;
         }
@@ -619,12 +710,17 @@ impl FileLoader {
                 .project_reference_file_mapper
                 .borrow()
                 .get_redirect_for_resolution(&new_has_file_name(file.file_name(), file.path()));
-            let redirect_ref = redirect.as_deref().map(|r| r as &dyn ModuleResolvedProjectReference);
+            let redirect_ref = redirect
+                .as_deref()
+                .map(|r| r as &dyn ModuleResolvedProjectReference);
             let resolution_mode = get_mode_for_type_reference_directive_in_file(
                 ref_,
                 &file,
                 &meta,
-                &get_compiler_options_with_redirect(self.opts.config.compiler_options(), redirect_ref),
+                &get_compiler_options_with_redirect(
+                    self.opts.config.compiler_options(),
+                    redirect_ref,
+                ),
             );
             let (resolved, trace) = self.resolver().resolve_type_reference_directive(
                 &ref_.file_name,
@@ -632,8 +728,13 @@ impl FileLoader {
                 resolution_mode,
                 redirect_ref,
             );
-            type_resolutions_in_file
-                .insert(ModeAwareCacheKey { name: ref_.file_name.clone(), mode: resolution_mode }, resolved.clone());
+            type_resolutions_in_file.insert(
+                ModeAwareCacheKey {
+                    name: ref_.file_name.clone(),
+                    mode: resolution_mode,
+                },
+                resolved.clone(),
+            );
             let include_reason = new_file_include_reason(
                 FileIncludeKind::TYPE_REFERENCE_DIRECTIVE,
                 FileIncludeData::ReferencedFile(ReferencedFileData {
@@ -656,7 +757,8 @@ impl FileLoader {
                     None,
                 );
             } else {
-                t.processing_diagnostics.push(new_unknown_reference_processing_diagnostic(include_reason));
+                t.processing_diagnostics
+                    .push(new_unknown_reference_processing_diagnostic(include_reason));
             }
         }
 
@@ -670,10 +772,14 @@ impl FileLoader {
 
     // Go: fileloader.go:528 (*fileLoader).resolveImportsAndModuleAugmentations
     pub fn resolve_imports_and_module_augmentations(&self, t: &mut ParseTask) {
-        let file = t.file.clone().expect("resolveImportsAndModuleAugmentations runs on a parsed file");
+        let file = t
+            .file
+            .clone()
+            .expect("resolveImportsAndModuleAugmentations runs on a parsed file");
         let meta = t.metadata.clone();
 
-        let mut module_names: Vec<Node> = Vec::with_capacity(file.imports.len() + file.module_augmentations.len() + 2);
+        let mut module_names: Vec<Node> =
+            Vec::with_capacity(file.imports.len() + file.module_augmentations.len() + 2);
 
         // PORT: Go `ast.IsSourceFileJS(file)` and `ast.IsExternalModule(file)`
         // read the `ast.SourceFile` fields. The crate versions read
@@ -686,26 +792,35 @@ impl FileLoader {
             .project_reference_file_mapper
             .borrow()
             .get_redirect_for_resolution(&new_has_file_name(file.file_name(), file.path()));
-        let redirect_ref = redirect.as_deref().map(|r| r as &dyn ModuleResolvedProjectReference);
-        let options_for_file = get_compiler_options_with_redirect(self.opts.config.compiler_options(), redirect_ref);
+        let redirect_ref = redirect
+            .as_deref()
+            .map(|r| r as &dyn ModuleResolvedProjectReference);
+        let options_for_file =
+            get_compiler_options_with_redirect(self.opts.config.compiler_options(), redirect_ref);
         if is_java_script_file
-            || (!file.is_declaration_file && (options_for_file.get_isolated_modules() || is_external_module_file))
+            || (!file.is_declaration_file
+                && (options_for_file.get_isolated_modules() || is_external_module_file))
         {
             if options_for_file.import_helpers.is_true() {
-                let specifier = self.create_synthetic_import(EXTERNAL_HELPERS_MODULE_NAME_TEXT, &file);
+                let specifier =
+                    self.create_synthetic_import(EXTERNAL_HELPERS_MODULE_NAME_TEXT, &file);
                 module_names.push(specifier);
                 t.import_helpers_import_specifier = specifier;
             }
         }
 
         if file.script_kind == ScriptKind::JSX || file.script_kind == ScriptKind::TSX {
-            let jsx_import =
-                get_jsx_runtime_import(&get_jsx_implicit_import_base_of_file(&options_for_file, &file), &options_for_file);
+            let jsx_import = get_jsx_runtime_import(
+                &get_jsx_implicit_import_base_of_file(&options_for_file, &file),
+                &options_for_file,
+            );
             if !jsx_import.is_empty() {
                 let specifier = self.create_synthetic_import(&jsx_import, &file);
                 module_names.push(specifier);
-                t.jsx_runtime_import_specifier =
-                    Some(Rc::new(JsxRuntimeImportSpecifier { module_reference: jsx_import, specifier }));
+                t.jsx_runtime_import_specifier = Some(Rc::new(JsxRuntimeImportSpecifier {
+                    module_reference: jsx_import,
+                    specifier,
+                }));
             }
         }
 
@@ -720,7 +835,8 @@ impl FileLoader {
         }
 
         if !module_names.is_empty() {
-            let mut resolutions_in_file: ModeAwareCache<Rc<ResolvedModule>> = ModeAwareCache::default();
+            let mut resolutions_in_file: ModeAwareCache<Rc<ResolvedModule>> =
+                ModeAwareCache::default();
             resolutions_in_file.reserve(module_names.len());
             let mut resolutions_trace: Vec<DiagAndArgs> = Vec::new();
 
@@ -730,11 +846,25 @@ impl FileLoader {
                     continue;
                 }
 
-                let mode = get_mode_for_usage_location(file.file_name(), &meta, entry, Some(&options_for_file));
-                let (resolved_module, trace) =
-                    self.resolver().resolve_module_name(module_name, &file_name, mode, redirect_ref);
-                resolutions_in_file
-                    .insert(ModeAwareCacheKey { name: module_name.to_string(), mode }, resolved_module.clone());
+                let mode = get_mode_for_usage_location(
+                    file.file_name(),
+                    &meta,
+                    entry,
+                    Some(&options_for_file),
+                );
+                let (resolved_module, trace) = self.resolver().resolve_module_name(
+                    module_name,
+                    &file_name,
+                    mode,
+                    redirect_ref,
+                );
+                resolutions_in_file.insert(
+                    ModeAwareCacheKey {
+                        name: module_name.to_string(),
+                        mode,
+                    },
+                    resolved_module.clone(),
+                );
                 resolutions_trace.extend(trace);
 
                 if !resolved_module.is_resolved() {
@@ -744,17 +874,20 @@ impl FileLoader {
                 let resolved_file_name = &resolved_module.resolved_file_name;
                 let is_from_node_modules_search = resolved_module.is_external_library_import;
                 // Don't treat redirected files as JS files.
-                let is_js_file = !file_extension_is_one_of(resolved_file_name, SUPPORTED_TS_EXTENSIONS_WITH_JSON_FLAT)
-                    && self
-                        .project_reference_file_mapper
-                        .borrow()
-                        .get_redirect_parsed_command_line_for_resolution(&new_has_file_name(
-                            resolved_file_name,
-                            &self.to_path(resolved_file_name),
-                        ))
-                        .is_none();
-                let is_js_file_from_node_modules =
-                    is_from_node_modules_search && is_js_file && resolved_file_name.contains("/node_modules/");
+                let is_js_file = !file_extension_is_one_of(
+                    resolved_file_name,
+                    SUPPORTED_TS_EXTENSIONS_WITH_JSON_FLAT,
+                ) && self
+                    .project_reference_file_mapper
+                    .borrow()
+                    .get_redirect_parsed_command_line_for_resolution(&new_has_file_name(
+                        resolved_file_name,
+                        &self.to_path(resolved_file_name),
+                    ))
+                    .is_none();
+                let is_js_file_from_node_modules = is_from_node_modules_search
+                    && is_js_file
+                    && resolved_file_name.contains("/node_modules/");
 
                 // add file to program only if:
                 // - resolution was successful
@@ -767,7 +900,8 @@ impl FileLoader {
                 // PORT: Go passes the `*ast.SourceFile`. The crate
                 // `get_resolution_diagnostic` takes the root node.
                 let should_add_file = !module_name.is_empty()
-                    && get_resolution_diagnostic(&options_for_file, &resolved_module, file.root).is_none()
+                    && get_resolution_diagnostic(&options_for_file, &resolved_module, file.root)
+                        .is_none()
                     && !options_for_file.no_resolve.is_true()
                     && !(is_js_file && !options_for_file.get_allow_js())
                     && (import_index < 0
@@ -804,9 +938,14 @@ impl FileLoader {
 
     // Go: fileloader.go:634 (*fileLoader).createSyntheticImport
     pub fn create_synthetic_import(&self, text: &str, file: &ParsedSourceFile) -> Node {
-        let external_helpers_module_reference = self.factory.new_string_literal(text, TokenFlags::NONE);
-        let import_decl =
-            self.factory.new_import_declaration(ModifierList::NIL, Node::NIL, external_helpers_module_reference, Node::NIL);
+        let external_helpers_module_reference =
+            self.factory.new_string_literal(text, TokenFlags::NONE);
+        let import_decl = self.factory.new_import_declaration(
+            ModifierList::NIL,
+            Node::NIL,
+            external_helpers_module_reference,
+            Node::NIL,
+        );
         set_node_parent(external_helpers_module_reference, import_decl);
         set_node_parent(import_decl, file.root);
         external_helpers_module_reference
@@ -820,7 +959,14 @@ impl FileLoader {
 
         let mut path = combine_paths(&self.default_library_path, &[name]);
         let mut replaced = false;
-        if self.opts.config.compiler_options().lib_replacement.is_true() && name != "lib.d.ts" {
+        if self
+            .opts
+            .config
+            .compiler_options()
+            .lib_replacement
+            .is_true()
+            && name != "lib.d.ts"
+        {
             let library_name = get_library_name_from_lib_file_name(name);
             let resolve_from = get_inferred_library_name_resolve_from(
                 self.opts.config.compiler_options(),
@@ -835,24 +981,43 @@ impl FileLoader {
             self.path_for_lib_file_resolutions
                 .borrow_mut()
                 .entry(self.to_path(&resolve_from))
-                .or_insert_with(|| Rc::new(LibResolution { library_name, resolution, trace }));
+                .or_insert_with(|| {
+                    Rc::new(LibResolution {
+                        library_name,
+                        resolution,
+                        trace,
+                    })
+                });
         }
 
         self.path_for_lib_file_cache
             .borrow_mut()
             .entry(name.to_string())
-            .or_insert_with(|| Rc::new(LibFile { name: name.to_string(), path, replaced }))
+            .or_insert_with(|| {
+                Rc::new(LibFile {
+                    name: name.to_string(),
+                    path,
+                    replaced,
+                })
+            })
             .clone()
     }
 
     // Go: fileloader.go:670 (*fileLoader).resolveLibrary
-    pub fn resolve_library(&self, library_name: &str, resolve_from: &str) -> (Rc<ResolvedModule>, Vec<DiagAndArgs>) {
-        self.resolver().resolve_module_name(library_name, resolve_from, ModuleKind::COMMON_JS, None)
+    pub fn resolve_library(
+        &self,
+        library_name: &str,
+        resolve_from: &str,
+    ) -> (Rc<ResolvedModule>, Vec<DiagAndArgs>) {
+        self.resolver()
+            .resolve_module_name(library_name, resolve_from, ModuleKind::COMMON_JS, None)
     }
 
     /// Go `p.resolver`. It is set before any file is loaded.
     fn resolver(&self) -> &Resolver {
-        self.resolver.as_ref().expect("fileLoader.resolver is set before loading")
+        self.resolver
+            .as_ref()
+            .expect("fileLoader.resolver is set before loading")
     }
 }
 
@@ -890,7 +1055,10 @@ pub fn get_inferred_library_name_resolve_from(
     } else {
         current_directory.to_string()
     };
-    combine_paths(&containing_directory, &[&format!("__lib_node_modules_lookup_{lib_file_name}__.ts")])
+    combine_paths(
+        &containing_directory,
+        &[&format!("__lib_node_modules_lookup_{lib_file_name}__.ts")],
+    )
 }
 
 // Go: fileloader.go:710 getModeForTypeReferenceDirectiveInFile
@@ -973,7 +1141,8 @@ pub(crate) fn get_mode_for_usage_location(
 // Go: fileloader.go:758 importSyntaxAffectsModuleResolution
 fn import_syntax_affects_module_resolution(options: &CompilerOptions) -> bool {
     let module_resolution = options.get_module_resolution_kind();
-    ModuleResolutionKind::NODE16 <= module_resolution && module_resolution <= ModuleResolutionKind::NODE_NEXT
+    ModuleResolutionKind::NODE16 <= module_resolution
+        && module_resolution <= ModuleResolutionKind::NODE_NEXT
         || options.get_resolve_package_json_exports()
         || options.get_resolve_package_json_imports()
 }
@@ -1020,7 +1189,10 @@ pub(crate) fn get_emit_syntax_for_usage_location_worker(
 // `source_file_info`, which does not exist during load. This is the same Go
 // logic (ast/utilities.go GetJSXImplicitImportBase and
 // GetPragmaFromSourceFile) on the `ParsedSourceFile` pragmas.
-fn get_jsx_implicit_import_base_of_file(compiler_options: &CompilerOptions, file: &ParsedSourceFile) -> String {
+fn get_jsx_implicit_import_base_of_file(
+    compiler_options: &CompilerOptions,
+    file: &ParsedSourceFile,
+) -> String {
     // Go: GetPragmaFromSourceFile, the last one wins.
     let pragma = |name: &str| file.pragmas.iter().rev().find(|pragma| pragma.name == name);
     let jsx_import_source_pragma = pragma("jsximportsource");

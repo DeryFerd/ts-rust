@@ -97,7 +97,11 @@ impl EmitResolver {
 
         let is_visible = self.declaration_links.borrow_mut().get(node).is_visible;
         if is_visible == Tristate::Unknown {
-            let value = if self.determine_if_declaration_is_visible(c, node) { Tristate::True } else { Tristate::False };
+            let value = if self.determine_if_declaration_is_visible(c, node) {
+                Tristate::True
+            } else {
+                Tristate::False
+            };
             self.declaration_links.borrow_mut().get(node).is_visible = value;
         }
         self.declaration_links.borrow_mut().get(node).is_visible == Tristate::True
@@ -243,7 +247,10 @@ impl EmitResolver {
             export_symbol = c.resolve_name(
                 node,
                 node.text(),
-                SymbolFlags::VALUE | SymbolFlags::TYPE | SymbolFlags::NAMESPACE | SymbolFlags::ALIAS,
+                SymbolFlags::VALUE
+                    | SymbolFlags::TYPE
+                    | SymbolFlags::NAMESPACE
+                    | SymbolFlags::ALIAS,
                 None,  /*nameNotFoundMessage*/
                 false, /*isUse*/
                 false,
@@ -251,7 +258,10 @@ impl EmitResolver {
         } else if node.parent().kind() == SyntaxKind::ExportSpecifier {
             export_symbol = c.get_target_of_export_specifier(
                 node.parent(),
-                SymbolFlags::VALUE | SymbolFlags::TYPE | SymbolFlags::NAMESPACE | SymbolFlags::ALIAS,
+                SymbolFlags::VALUE
+                    | SymbolFlags::TYPE
+                    | SymbolFlags::NAMESPACE
+                    | SymbolFlags::ALIAS,
                 false,
             );
         }
@@ -266,7 +276,10 @@ impl EmitResolver {
             let mut next_symbol = SymbolId::NIL;
             let declarations = c.sym(export_symbol).declarations.clone();
             for declaration in declarations {
-                self.declaration_links.borrow_mut().get(declaration).is_visible = Tristate::True;
+                self.declaration_links
+                    .borrow_mut()
+                    .get(declaration)
+                    .is_visible = Tristate::True;
 
                 if is_internal_module_import_equals_declaration(declaration) {
                     // Add the referenced top container visible
@@ -275,7 +288,10 @@ impl EmitResolver {
                     let import_symbol = c.resolve_name(
                         declaration,
                         first_identifier.text(),
-                        SymbolFlags::VALUE | SymbolFlags::TYPE | SymbolFlags::NAMESPACE | SymbolFlags::ALIAS,
+                        SymbolFlags::VALUE
+                            | SymbolFlags::TYPE
+                            | SymbolFlags::NAMESPACE
+                            | SymbolFlags::ALIAS,
                         None,  /*nameNotFoundMessage*/
                         false, /*isUse*/
                         false,
@@ -307,19 +323,31 @@ impl EmitResolver {
         let meaning = get_meaning_of_entity_name_reference(entity_name);
         let first_identifier = get_first_identifier(entity_name);
 
-        let symbol = c.resolve_name(enclosing_declaration, first_identifier.text(), meaning, None, false, false);
+        let symbol = c.resolve_name(
+            enclosing_declaration,
+            first_identifier.text(),
+            meaning,
+            None,
+            false,
+            false,
+        );
 
         if symbol.is_some()
             && c.sym(symbol).flags.intersects(SymbolFlags::TYPE_PARAMETER)
             && meaning.intersects(SymbolFlags::TYPE)
         {
-            return SymbolAccessibilityResult { accessibility: SymbolAccessibility::ACCESSIBLE, ..Default::default() };
+            return SymbolAccessibilityResult {
+                accessibility: SymbolAccessibility::ACCESSIBLE,
+                ..Default::default()
+            };
         }
 
         if symbol.is_nil() && is_this_identifier(first_identifier) {
             let this_container = c.get_this_container(first_identifier, false, false);
             let sym = c.get_symbol_of_declaration(this_container);
-            if self.is_symbol_accessible(c, sym, enclosing_declaration, meaning, false).accessibility
+            if self
+                .is_symbol_accessible(c, sym, enclosing_declaration, meaning, false)
+                .accessibility
                 == SymbolAccessibility::ACCESSIBLE
             {
                 return SymbolAccessibilityResult {
@@ -338,7 +366,8 @@ impl EmitResolver {
             };
         }
 
-        let visible = self.has_visible_declarations(c, symbol, should_compute_alias_to_make_visible);
+        let visible =
+            self.has_visible_declarations(c, symbol, should_compute_alias_to_make_visible);
         if let Some(visible) = visible {
             return visible;
         }
@@ -418,7 +447,10 @@ impl EmitResolver {
                         && declaration.parent().parent().parent().parent().parent().is_some() // check if the thing containing the variable statement is visible (ie, the file)
                         && self.is_declaration_visible(c, declaration.parent().parent().parent().parent().parent())
                     {
-                        add_visible_alias(declaration, declaration.parent().parent().parent().parent());
+                        add_visible_alias(
+                            declaration,
+                            declaration.parent().parent().parent().parent(),
+                        );
                         continue;
                     }
                     if symbol_flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE) {
@@ -466,7 +498,9 @@ impl EmitResolver {
             return false;
         }
         match declaration.kind() {
-            SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature | SyntaxKind::JsDocPropertyTag => {
+            SyntaxKind::PropertyDeclaration
+            | SyntaxKind::PropertySignature
+            | SyntaxKind::JsDocPropertyTag => {
                 let mut symbol = symbol;
                 if symbol.is_nil() {
                     symbol = c.get_symbol_of_declaration(declaration);
@@ -478,12 +512,14 @@ impl EmitResolver {
                     && flags.intersects(SymbolFlags::OPTIONAL)
                     && is_optional_declaration(declaration)
                     && c.reverse_mapped_symbol_links.has(symbol)
-                    && c.reverse_mapped_symbol_links.get(symbol).mapped_type.is_some()
+                    && c.reverse_mapped_symbol_links
+                        .get(symbol)
+                        .mapped_type
+                        .is_some()
                     && c.contains_non_missing_undefined_type(t)
             }
-            SyntaxKind::Parameter | SyntaxKind::JsDocParameterTag => {
-                self.requires_adding_implicit_undefined_worker(c, declaration, enclosing_declaration)
-            }
+            SyntaxKind::Parameter | SyntaxKind::JsDocParameterTag => self
+                .requires_adding_implicit_undefined_worker(c, declaration, enclosing_declaration),
             _ => panic!("Node cannot possibly require adding undefined"),
         }
     }
@@ -494,10 +530,13 @@ pub(super) fn is_common_js_module_exports(node: Node) -> bool {
     if is_binary_expression(node)
         && is_expression_statement(node.parent())
         && is_source_file(node.parent().parent())
-        && source_file_info(node.parent().parent()).common_js_module_indicator.is_some()
+        && source_file_info(node.parent().parent())
+            .common_js_module_indicator
+            .is_some()
     {
         let kind = get_assignment_declaration_kind(node);
-        if kind == JSDeclarationKind::MODULE_EXPORTS || kind == JSDeclarationKind::EXPORTS_PROPERTY {
+        if kind == JSDeclarationKind::MODULE_EXPORTS || kind == JSDeclarationKind::EXPORTS_PROPERTY
+        {
             return true;
         }
     }
@@ -521,8 +560,10 @@ fn get_meaning_of_entity_name_reference(entity_name: Node) -> SymbolFlags {
         || entity_name.kind() == SyntaxKind::PropertyAccessExpression
         || parent.kind() == SyntaxKind::ImportEqualsDeclaration
         || (parent.kind() == SyntaxKind::QualifiedName && parent.left() == entity_name)
-        || (parent.kind() == SyntaxKind::PropertyAccessExpression && parent.expression() == entity_name)
-        || (parent.kind() == SyntaxKind::ElementAccessExpression && parent.expression() == entity_name)
+        || (parent.kind() == SyntaxKind::PropertyAccessExpression
+            && parent.expression() == entity_name)
+        || (parent.kind() == SyntaxKind::ElementAccessExpression
+            && parent.expression() == entity_name)
     {
         // Left identifier from type reference or TypeAlias
         // Entity name of the import declaration
@@ -603,7 +644,11 @@ impl crate::printer::EmitResolver for EmitResolver {
     }
 
     // Go: checker/emitresolver.go:1157 EmitResolver.GetTypeReferenceSerializationKind
-    fn get_type_reference_serialization_kind(&self, name: Node, serial_scope: Node) -> TypeReferenceSerializationKind {
+    fn get_type_reference_serialization_kind(
+        &self,
+        name: Node,
+        serial_scope: Node,
+    ) -> TypeReferenceSerializationKind {
         EmitResolver::get_type_reference_serialization_kind(self, name, serial_scope)
     }
 
@@ -630,10 +675,18 @@ impl crate::printer::EmitResolver for EmitResolver {
     // Go: checker/emitresolver.go:236 EmitResolver.PrecalculateDeclarationEmitVisibility
     fn precalculate_declaration_emit_visibility(&self, file: Node) {
         self.with_checker(|c| {
-            if self.declaration_file_links.borrow_mut().get(file).aliases_marked {
+            if self
+                .declaration_file_links
+                .borrow_mut()
+                .get(file)
+                .aliases_marked
+            {
                 return;
             }
-            self.declaration_file_links.borrow_mut().get(file).aliases_marked = true;
+            self.declaration_file_links
+                .borrow_mut()
+                .get(file)
+                .aliases_marked = true;
             // TODO: Does this even *have* to be an upfront walk? If it's not possible for a
             // import a = a.b.c statement to chain into exposing a statement in a sibling scope,
             // it could at least be pushed into scope entry -  then it wouldn't need to be recursive.
@@ -659,8 +712,14 @@ impl crate::printer::EmitResolver for EmitResolver {
     }
 
     // Go: checker/emitresolver.go:334 EmitResolver.IsEntityNameVisible
-    fn is_entity_name_visible(&self, entity_name: Node, enclosing_declaration: Node) -> SymbolAccessibilityResult {
-        self.with_checker(|c| self.is_entity_name_visible(c, entity_name, enclosing_declaration, true))
+    fn is_entity_name_visible(
+        &self,
+        entity_name: Node,
+        enclosing_declaration: Node,
+    ) -> SymbolAccessibilityResult {
+        self.with_checker(|c| {
+            self.is_entity_name_visible(c, entity_name, enclosing_declaration, true)
+        })
     }
 
     // Go: checker/emitresolver.go:667 EmitResolver.IsExpandoFunctionDeclaration
@@ -679,11 +738,18 @@ impl crate::printer::EmitResolver for EmitResolver {
     }
 
     // Go: checker/emitresolver.go:564 EmitResolver.RequiresAddingImplicitUndefined
-    fn requires_adding_implicit_undefined(&self, node: Node, symbol: SymbolId, enclosing_declaration: Node) -> bool {
+    fn requires_adding_implicit_undefined(
+        &self,
+        node: Node,
+        symbol: SymbolId,
+        enclosing_declaration: Node,
+    ) -> bool {
         if !is_parse_tree_node(node) {
             return false;
         }
-        self.with_checker(|c| self.requires_adding_implicit_undefined(c, node, symbol, enclosing_declaration))
+        self.with_checker(|c| {
+            self.requires_adding_implicit_undefined(c, node, symbol, enclosing_declaration)
+        })
     }
 
     // Go: checker/emitresolver.go:104 EmitResolver.IsDeclarationVisible
@@ -709,7 +775,8 @@ impl crate::printer::EmitResolver for EmitResolver {
             // script file
             return false;
         }
-        let import_target = crate::printer::EmitResolver::get_external_module_file_from_declaration(self, decl);
+        let import_target =
+            crate::printer::EmitResolver::get_external_module_file_from_declaration(self, decl);
         if import_target.is_nil() {
             return false;
         }
@@ -740,7 +807,8 @@ impl crate::printer::EmitResolver for EmitResolver {
     fn is_definitely_reference_to_global_symbol_object(&self, node: Node) -> bool {
         if !is_property_access_expression(node)
             || !is_identifier(node.name())
-            || !is_property_access_expression(node.expression()) && !is_identifier(node.expression())
+            || !is_property_access_expression(node.expression())
+                && !is_identifier(node.expression())
         {
             return false;
         }
@@ -766,7 +834,9 @@ impl crate::printer::EmitResolver for EmitResolver {
             return false;
         }
         // Exactly `globalThis.Symbol.something` and `globalThis` resolves to the global `globalThis`
-        self.with_checker(|c| c.get_resolved_symbol(node.expression().expression()) == c.global_this_symbol)
+        self.with_checker(|c| {
+            c.get_resolved_symbol(node.expression().expression()) == c.global_this_symbol
+        })
     }
 
     // Go: checker/emitresolver.go:467 EmitResolver.IsImplementationOfOverload
@@ -860,12 +930,19 @@ impl crate::printer::EmitResolver for EmitResolver {
     // Go: checker/emitresolver.go:573 EmitResolver.RequiresAddingImplicitUndefinedUnsafe
     // PORT: Go takes no lock because its callers already hold it. The trait
     // method has no checker argument, so it borrows the checker from the pool.
-    fn requires_adding_implicit_undefined_unsafe(&self, node: Node, symbol: SymbolId, enclosing_declaration: Node) -> bool {
+    fn requires_adding_implicit_undefined_unsafe(
+        &self,
+        node: Node,
+        symbol: SymbolId,
+        enclosing_declaration: Node,
+    ) -> bool {
         if !is_parse_tree_node(node) {
             return false;
         }
         // NO LOCKING - only should be called in contexts that already have a checker lock
-        self.with_checker(|c| self.requires_adding_implicit_undefined(c, node, symbol, enclosing_declaration))
+        self.with_checker(|c| {
+            self.requires_adding_implicit_undefined(c, node, symbol, enclosing_declaration)
+        })
     }
 
     // Go: checker/emitresolver.go:959 EmitResolver.CreateTypeOfDeclaration
@@ -932,7 +1009,12 @@ impl crate::printer::EmitResolver for EmitResolver {
     }
 
     // Go: checker/emitresolver.go:973 EmitResolver.CreateLiteralConstValue
-    fn create_literal_const_value(&self, emit_context: &EmitContext, node: Node, tracker: EmitSymbolTracker) -> Node {
+    fn create_literal_const_value(
+        &self,
+        emit_context: &EmitContext,
+        node: Node,
+        tracker: EmitSymbolTracker,
+    ) -> Node {
         EmitResolver::create_literal_const_value(self, emit_context, node, tracker)
     }
 

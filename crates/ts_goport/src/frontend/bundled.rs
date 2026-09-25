@@ -230,7 +230,11 @@ impl WrappedFs {
 // Go: embed.go:84 rootEntries
 // PORT: Go builds this slice once at package init; the port builds it per call.
 fn root_entries() -> Vec<DirEntry> {
-    vec![file_info_to_dir_entry(new_file_info("libs", FileMode::DIR, 0))]
+    vec![file_info_to_dir_entry(new_file_info(
+        "libs",
+        FileMode::DIR,
+        0,
+    ))]
 }
 
 // Go: embed.go:183 fileInfo
@@ -271,7 +275,11 @@ macro_rules! bundled_lib {
     ($name:literal) => {
         (
             concat!("libs/", $name),
-            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../ts_bundled/libs/", $name)),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../ts_bundled/libs/",
+                $name
+            )),
         )
     };
 }

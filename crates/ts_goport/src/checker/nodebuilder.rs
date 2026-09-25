@@ -7,7 +7,7 @@
 //! checker stay on `NodeBuilder`.
 
 use crate::prelude::*;
-use crate::printer::{new_emit_context, EmitContext};
+use crate::printer::{EmitContext, new_emit_context};
 
 // Go: checker/nodebuilder.go:10 NodeBuilder
 // PORT: Go `VerbosityContext` (line 21) is defined in printer_impl.rs, with
@@ -50,7 +50,11 @@ impl NodeBuilder {
         ctx.enclosing_declaration = enclosing_declaration;
         // PORT: Go `ast.GetSourceFileOfNode(nil)` returns nil. The Rust
         // function panics on nil, so the nil case is checked here.
-        ctx.enclosing_file = if enclosing_declaration.is_some() { get_source_file_of_node(enclosing_declaration) } else { Node::NIL };
+        ctx.enclosing_file = if enclosing_declaration.is_some() {
+            get_source_file_of_node(enclosing_declaration)
+        } else {
+            Node::NIL
+        };
         let ctx = Rc::new(RefCell::new(ctx));
         self.impl_.borrow_mut().ctx = ctx.clone();
         let tracker: Rc<dyn SymbolTracker> = new_symbol_tracker_impl(ctx.clone(), tracker);
@@ -85,9 +89,21 @@ impl NodeBuilder {
 }
 
 // Go: checker/nodebuilder.go:188 simplifyClassDeclaration
-fn simplify_class_declaration(c: &Checker, f: &crate::ast::NodeFactory, mut class_decl: Node, symbol: SymbolId) -> Node {
-    let original_class_decl = c.sym(symbol).declarations.iter().copied().find(|&d| is_class_like(d)).unwrap_or(class_decl);
-    let modifiers = original_class_decl.modifier_flags() & !(ModifierFlags::EXPORT | ModifierFlags::AMBIENT);
+fn simplify_class_declaration(
+    c: &Checker,
+    f: &crate::ast::NodeFactory,
+    mut class_decl: Node,
+    symbol: SymbolId,
+) -> Node {
+    let original_class_decl = c
+        .sym(symbol)
+        .declarations
+        .iter()
+        .copied()
+        .find(|&d| is_class_like(d))
+        .unwrap_or(class_decl);
+    let modifiers =
+        original_class_decl.modifier_flags() & !(ModifierFlags::EXPORT | ModifierFlags::AMBIENT);
     let is_anonymous = is_class_expression(original_class_decl);
     if is_anonymous {
         class_decl = f.update_class_declaration(
@@ -99,14 +115,39 @@ fn simplify_class_declaration(c: &Checker, f: &crate::ast::NodeFactory, mut clas
             class_decl.member_list(),
         );
     }
-    replace_modifiers(f, class_decl, f.new_modifier_list(&create_modifiers_from_modifier_flags(modifiers, &mut |k| f.new_modifier(k))))
+    replace_modifiers(
+        f,
+        class_decl,
+        f.new_modifier_list(&create_modifiers_from_modifier_flags(modifiers, &mut |k| {
+            f.new_modifier(k)
+        })),
+    )
 }
 
 // Go: checker/nodebuilder.go:212 simplifyModifiers
-fn simplify_modifiers(c: &Checker, f: &crate::ast::NodeFactory, new_decl: Node, is_decl_kind: fn(Node) -> bool, symbol: SymbolId) -> Node {
-    let decl_with_modifiers = c.sym(symbol).declarations.iter().copied().find(|&d| is_decl_kind(d)).unwrap_or(new_decl);
-    let modifiers = decl_with_modifiers.modifier_flags() & !(ModifierFlags::EXPORT | ModifierFlags::AMBIENT);
-    replace_modifiers(f, new_decl, f.new_modifier_list(&create_modifiers_from_modifier_flags(modifiers, &mut |k| f.new_modifier(k))))
+fn simplify_modifiers(
+    c: &Checker,
+    f: &crate::ast::NodeFactory,
+    new_decl: Node,
+    is_decl_kind: fn(Node) -> bool,
+    symbol: SymbolId,
+) -> Node {
+    let decl_with_modifiers = c
+        .sym(symbol)
+        .declarations
+        .iter()
+        .copied()
+        .find(|&d| is_decl_kind(d))
+        .unwrap_or(new_decl);
+    let modifiers =
+        decl_with_modifiers.modifier_flags() & !(ModifierFlags::EXPORT | ModifierFlags::AMBIENT);
+    replace_modifiers(
+        f,
+        new_decl,
+        f.new_modifier_list(&create_modifiers_from_modifier_flags(modifiers, &mut |k| {
+            f.new_modifier(k)
+        })),
+    )
 }
 
 /// Go `b.impl`.
@@ -130,7 +171,11 @@ impl Checker {
 
     // Go: checker/nodebuilder.go:94 NodeBuilder.exitContextSlice
     // PORT: Go returns a nil slice on error. Here it is an empty `Vec`.
-    fn nb_exit_context_slice(&mut self, nb: &Rc<RefCell<NodeBuilder>>, result: Vec<Node>) -> Vec<Node> {
+    fn nb_exit_context_slice(
+        &mut self,
+        nb: &Rc<RefCell<NodeBuilder>>,
+        result: Vec<Node>,
+    ) -> Vec<Node> {
         nb.borrow().propagate_verbosity_out();
         self.nb_exit_context_check(nb);
         let encountered_error = nb_impl(nb).borrow().ctx.borrow().encountered_error;
@@ -146,7 +191,11 @@ impl Checker {
         let ctx = nb_impl(nb).borrow().ctx.clone();
         let tracker = {
             let c = ctx.borrow();
-            if c.truncating && c.flags.intersects(NodeBuilderFlags::NO_TRUNCATION) { Some(c.tracker.clone()) } else { None }
+            if c.truncating && c.flags.intersects(NodeBuilderFlags::NO_TRUNCATION) {
+                Some(c.tracker.clone())
+            } else {
+                None
+            }
         };
         if let Some(tracker) = tracker {
             tracker.report_truncation_error(self);
@@ -164,7 +213,8 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Node {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker);
+        nb.borrow_mut()
+            .enter_context(enclosing_declaration, flags, internal_flags, tracker);
         let b = nb_impl(nb);
         let result = self.index_info_to_index_signature_declaration_helper(&b, info, Node::NIL);
         self.nb_exit_context(nb, result)
@@ -181,7 +231,8 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Node {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker);
+        nb.borrow_mut()
+            .enter_context(enclosing_declaration, flags, internal_flags, tracker);
         let b = nb_impl(nb);
         let signature = self.get_signature_from_declaration(signature_declaration);
         let (_, cleanup) = self.enter_signature_scope(&b, signature);
@@ -200,10 +251,21 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Vec<Node> {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker.clone());
+        nb.borrow_mut().enter_context(
+            enclosing_declaration,
+            flags,
+            internal_flags,
+            tracker.clone(),
+        );
         let symbol = self.get_symbol_of_declaration(signature_declaration);
-        let type_params =
-            self.node_builder_symbol_to_type_parameter_declarations(nb, symbol, enclosing_declaration, flags, internal_flags, tracker);
+        let type_params = self.node_builder_symbol_to_type_parameter_declarations(
+            nb,
+            symbol,
+            enclosing_declaration,
+            flags,
+            internal_flags,
+            tracker,
+        );
         self.nb_exit_context_slice(nb, type_params)
     }
 
@@ -219,9 +281,11 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Node {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker);
+        nb.borrow_mut()
+            .enter_context(enclosing_declaration, flags, internal_flags, tracker);
         let b = nb_impl(nb);
-        let result = self.serialize_type_for_declaration(&b, declaration, TypeId::NIL, symbol, true);
+        let result =
+            self.serialize_type_for_declaration(&b, declaration, TypeId::NIL, symbol, true);
         self.nb_exit_context(nb, result)
     }
 
@@ -236,7 +300,8 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Node {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker);
+        nb.borrow_mut()
+            .enter_context(enclosing_declaration, flags, internal_flags, tracker);
         let b = nb_impl(nb);
         let result = self.serialize_type_for_expression(&b, expr);
         self.nb_exit_context(nb, result)
@@ -254,7 +319,8 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Node {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker);
+        nb.borrow_mut()
+            .enter_context(enclosing_declaration, flags, internal_flags, tracker);
         let b = nb_impl(nb);
         let result = self.signature_to_signature_declaration_helper(&b, signature, kind, None);
         self.nb_exit_context(nb, result)
@@ -302,14 +368,34 @@ impl Checker {
         let mut result: Vec<Node> = Vec::with_capacity(nodes.len());
         for node in nodes {
             match node.kind() {
-                SyntaxKind::ClassDeclaration => result.push(simplify_class_declaration(self, f, node, symbol)),
-                SyntaxKind::EnumDeclaration => result.push(simplify_modifiers(self, f, node, is_enum_declaration, symbol)),
+                SyntaxKind::ClassDeclaration => {
+                    result.push(simplify_class_declaration(self, f, node, symbol))
+                }
+                SyntaxKind::EnumDeclaration => result.push(simplify_modifiers(
+                    self,
+                    f,
+                    node,
+                    is_enum_declaration,
+                    symbol,
+                )),
                 SyntaxKind::InterfaceDeclaration => {
                     if meaning.intersects(SymbolFlags::INTERFACE) {
-                        result.push(simplify_modifiers(self, f, node, is_interface_declaration, symbol));
+                        result.push(simplify_modifiers(
+                            self,
+                            f,
+                            node,
+                            is_interface_declaration,
+                            symbol,
+                        ));
                     }
                 }
-                SyntaxKind::ModuleDeclaration => result.push(simplify_modifiers(self, f, node, is_module_declaration, symbol)),
+                SyntaxKind::ModuleDeclaration => result.push(simplify_modifiers(
+                    self,
+                    f,
+                    node,
+                    is_module_declaration,
+                    symbol,
+                )),
                 _ => {}
             }
         }
@@ -329,7 +415,8 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Node {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker);
+        nb.borrow_mut()
+            .enter_context(enclosing_declaration, flags, internal_flags, tracker);
         let b = nb_impl(nb);
         let result = self.symbol_to_name(&b, symbol, meaning, false);
         self.nb_exit_context(nb, result)
@@ -347,7 +434,8 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Node {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker);
+        nb.borrow_mut()
+            .enter_context(enclosing_declaration, flags, internal_flags, tracker);
         let b = nb_impl(nb);
         let result = self.symbol_to_expression(&b, symbol, meaning);
         self.nb_exit_context(nb, result)
@@ -365,7 +453,8 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Node {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker);
+        nb.borrow_mut()
+            .enter_context(enclosing_declaration, flags, internal_flags, tracker);
         let b = nb_impl(nb);
         let result = self.symbol_to_node(&b, symbol, meaning);
         self.nb_exit_context(nb, result)
@@ -385,7 +474,8 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Node {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker);
+        nb.borrow_mut()
+            .enter_context(enclosing_declaration, flags, internal_flags, tracker);
         let b = nb_impl(nb);
         let result = self.symbol_to_parameter_declaration(&b, symbol, false);
         self.nb_exit_context(nb, result)
@@ -402,7 +492,8 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Vec<Node> {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker);
+        nb.borrow_mut()
+            .enter_context(enclosing_declaration, flags, internal_flags, tracker);
         let b = nb_impl(nb);
         let result = self.symbol_to_type_parameter_declarations(&b, symbol);
         self.nb_exit_context_slice(nb, result)
@@ -419,7 +510,8 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Node {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker);
+        nb.borrow_mut()
+            .enter_context(enclosing_declaration, flags, internal_flags, tracker);
         let b = nb_impl(nb);
         let result = self.type_parameter_to_declaration(&b, parameter);
         self.nb_exit_context(nb, result)
@@ -436,7 +528,8 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Node {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker);
+        nb.borrow_mut()
+            .enter_context(enclosing_declaration, flags, internal_flags, tracker);
         let b = nb_impl(nb);
         let result = self.type_predicate_to_type_predicate_node(&b, predicate);
         self.nb_exit_context(nb, result)
@@ -453,7 +546,8 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Node {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker);
+        nb.borrow_mut()
+            .enter_context(enclosing_declaration, flags, internal_flags, tracker);
         let b = nb_impl(nb);
         let result = self.type_to_type_node(&b, typ);
         self.nb_exit_context(nb, result)
@@ -469,7 +563,8 @@ impl Checker {
         internal_flags: InternalNodeBuilderFlags,
         tracker: Option<Rc<dyn SymbolTracker>>,
     ) -> Node {
-        nb.borrow_mut().enter_context(enclosing_declaration, flags, internal_flags, tracker);
+        nb.borrow_mut()
+            .enter_context(enclosing_declaration, flags, internal_flags, tracker);
         let b = nb_impl(nb);
         let result = self.try_js_type_node_to_type_node(&b, node);
         self.nb_exit_context(nb, result)
@@ -488,8 +583,15 @@ impl Checker {
     }
 
     // Go: checker/nodebuilder.go:299 Checker.getNodeBuilderEx
-    pub fn get_node_builder_ex(&mut self, id_to_symbol: Option<FxHashMap<Node, SymbolId>>) -> Rc<RefCell<NodeBuilder>> {
-        Rc::new(RefCell::new(new_node_builder_ex(self, new_emit_context(), id_to_symbol)))
+    pub fn get_node_builder_ex(
+        &mut self,
+        id_to_symbol: Option<FxHashMap<Node, SymbolId>>,
+    ) -> Rc<RefCell<NodeBuilder>> {
+        Rc::new(RefCell::new(new_node_builder_ex(
+            self,
+            new_emit_context(),
+            id_to_symbol,
+        )))
     }
 }
 
@@ -499,7 +601,16 @@ pub fn new_node_builder(ch: &Checker, e: Rc<EmitContext>) -> NodeBuilder {
 }
 
 // Go: checker/nodebuilder.go:283 NewNodeBuilderEx
-pub fn new_node_builder_ex(ch: &Checker, e: Rc<EmitContext>, id_to_symbol: Option<FxHashMap<Node, SymbolId>>) -> NodeBuilder {
+pub fn new_node_builder_ex(
+    ch: &Checker,
+    e: Rc<EmitContext>,
+    id_to_symbol: Option<FxHashMap<Node, SymbolId>>,
+) -> NodeBuilder {
     let impl_ = new_node_builder_impl(ch, e, id_to_symbol);
-    NodeBuilder { impl_: Rc::new(RefCell::new(impl_)), ctx_stack: Vec::with_capacity(1), host: ch.program, verbosity: None }
+    NodeBuilder {
+        impl_: Rc::new(RefCell::new(impl_)),
+        ctx_stack: Vec::with_capacity(1),
+        host: ch.program,
+        verbosity: None,
+    }
 }

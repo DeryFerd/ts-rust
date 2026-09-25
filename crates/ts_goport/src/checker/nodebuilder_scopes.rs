@@ -19,7 +19,12 @@ pub fn clone_node_builder_context(context: &Rc<RefCell<NodeBuilderContext>>) -> 
     // we write it out like that, rather than as
     // export const x: <T>(x: T) => T
     // export const y: <T_1>(x: T_1) => T_1
-    let (restore_names, restore_names_by_text, restore_names_by_text_next_name_count, restore_symbol_list) = {
+    let (
+        restore_names,
+        restore_names_by_text,
+        restore_names_by_text_next_name_count,
+        restore_symbol_list,
+    ) = {
         let c = context.borrow();
         (
             c.type_parameter_names.enter_scope(),
@@ -32,9 +37,12 @@ pub fn clone_node_builder_context(context: &Rc<RefCell<NodeBuilderContext>>) -> 
     Box::new(move || {
         let mut c = context.borrow_mut();
         c.type_parameter_names.restore_scope(restore_names);
-        c.type_parameter_names_by_text.restore_scope(restore_names_by_text);
-        c.type_parameter_names_by_text_next_name_count.restore_scope(restore_names_by_text_next_name_count);
-        c.type_parameter_symbol_list.restore_scope(restore_symbol_list);
+        c.type_parameter_names_by_text
+            .restore_scope(restore_names_by_text);
+        c.type_parameter_names_by_text_next_name_count
+            .restore_scope(restore_names_by_text_next_name_count);
+        c.type_parameter_symbol_list
+            .restore_scope(restore_symbol_list);
     })
 }
 
@@ -56,12 +64,19 @@ fn is_fake_scope_of_kind(b: &Rc<RefCell<NodeBuilderImpl>>, node: Node, kind: &st
     if !bi.links.has(node) {
         return false;
     }
-    bi.links.try_get(node).is_some_and(|links| links.fake_scope_for_signature_declaration.as_deref() == Some(kind))
+    bi.links
+        .try_get(node)
+        .is_some_and(|links| links.fake_scope_for_signature_declaration.as_deref() == Some(kind))
 }
 
 impl Checker {
     // Go: checker/nodebuilderscopes.go:40 addSymbolTypeToContext
-    pub fn add_symbol_type_to_context(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, symbol: SymbolId, t: TypeId) -> Box<dyn FnOnce()> {
+    pub fn add_symbol_type_to_context(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        symbol: SymbolId,
+        t: TypeId,
+    ) -> Box<dyn FnOnce()> {
         let ctx = scopes_ctx(b);
         // PORT: the map is keyed by `SymbolId`, which stands for Go `ast.GetSymbolId(symbol)`.
         let id = symbol;
@@ -82,12 +97,26 @@ impl Checker {
         b: &Rc<RefCell<NodeBuilderImpl>>,
         signature: SignatureId,
     ) -> (Vec<SymbolId>, Box<dyn FnOnce(&mut Checker)>) {
-        let expanded_params = self.get_expanded_parameters(signature, true /*skipUnionExpanding*/).swap_remove(0);
+        let expanded_params = self
+            .get_expanded_parameters(signature, true /*skipUnionExpanding*/)
+            .swap_remove(0);
         let (declaration, type_parameters, parameters, mapper) = {
             let sig = self.sig(signature);
-            (sig.declaration, sig.type_parameters.clone(), sig.parameters.clone(), sig.mapper)
+            (
+                sig.declaration,
+                sig.type_parameters.clone(),
+                sig.parameters.clone(),
+                sig.mapper,
+            )
         };
-        let cleanup = self.enter_new_scope(b, declaration, &expanded_params, &type_parameters, &parameters, mapper);
+        let cleanup = self.enter_new_scope(
+            b,
+            declaration,
+            &expanded_params,
+            &type_parameters,
+            &parameters,
+            mapper,
+        );
         (expanded_params, cleanup)
     }
 
@@ -138,7 +167,10 @@ impl Checker {
             } else {
                 let mut adds: Vec<(String, SymbolId)> = Vec::new();
                 for (p_index, &param) in expanded_params.iter().enumerate() {
-                    let original_param = original_parameters.get(p_index).copied().unwrap_or(SymbolId::NIL);
+                    let original_param = original_parameters
+                        .get(p_index)
+                        .copied()
+                        .unwrap_or(SymbolId::NIL);
                     // PORT: Go `originalParameters != nil`. A nil and an empty slice
                     // are the same here.
                     if !original_parameters.is_empty() && original_param != param {
@@ -152,7 +184,10 @@ impl Checker {
                         let declarations = self.sym(param).declarations.clone();
                         let mut some = false;
                         for d in declarations {
-                            if is_parameter_declaration(d) && d.name().is_some() && is_binding_pattern(d.name()) {
+                            if is_parameter_declaration(d)
+                                && d.name().is_some()
+                                && is_binding_pattern(d.name())
+                            {
                                 self.enter_new_scope_bind_pattern(d.name(), &mut adds);
                                 some = true;
                                 break;
@@ -166,7 +201,10 @@ impl Checker {
                 cleanup_params = self.push_fake_scope(b, "params", adds);
             }
 
-            if ctx.borrow().flags.intersects(NodeBuilderFlags::GENERATE_NAMES_FOR_SHADOWED_TYPE_PARAMS)
+            if ctx
+                .borrow()
+                .flags
+                .intersects(NodeBuilderFlags::GENERATE_NAMES_FOR_SHADOWED_TYPE_PARAMS)
                 && type_parameters.iter().any(|p| p.is_some())
             {
                 let mut adds: Vec<(String, SymbolId)> = Vec::new();
@@ -174,7 +212,10 @@ impl Checker {
                     if type_param.is_nil() {
                         continue;
                     }
-                    let type_param_name = self.type_parameter_to_name(b, type_param).text().to_string();
+                    let type_param_name = self
+                        .type_parameter_to_name(b, type_param)
+                        .text()
+                        .to_string();
                     adds.push((type_param_name, self.ty(type_param).symbol));
                 }
                 cleanup_type_params = self.push_fake_scope(b, "typeParams", adds);
@@ -260,7 +301,10 @@ impl Checker {
                 if old_symbol.is_nil() {
                     new_locals.push(name.clone());
                 } else {
-                    old_locals.push(LocalsRecord { name: name.clone(), old_symbol });
+                    old_locals.push(LocalsRecord {
+                        name: name.clone(),
+                        old_symbol,
+                    });
                 }
             }
             self.symbols.set(locals, name, symbol);
@@ -274,7 +318,10 @@ impl Checker {
                 let f = bi.f();
                 f.new_block(f.new_node_list(&[]), false)
             };
-            b.borrow_mut().links.get(fake_scope).fake_scope_for_signature_declaration = Some(kind.to_string());
+            b.borrow_mut()
+                .links
+                .get(fake_scope)
+                .fake_scope_for_signature_declaration = Some(kind.to_string());
             set_node_locals(fake_scope, locals);
             set_node_parent(fake_scope, enclosing_declaration);
             ctx.borrow_mut().enclosing_declaration = fake_scope;

@@ -31,7 +31,9 @@ pub struct JsonError {
 
 impl JsonError {
     fn new(message: impl Into<String>) -> JsonError {
-        JsonError { message: message.into() }
+        JsonError {
+            message: message.into(),
+        }
     }
 }
 
@@ -162,7 +164,13 @@ fn decode_utf8(b: &[u8]) -> Option<(char, usize)> {
 impl<'a> JsonDecoder<'a> {
     #[must_use]
     pub fn new(buf: &'a [u8], options: JsonOptions) -> JsonDecoder<'a> {
-        JsonDecoder { buf, pos: 0, stack: Vec::new(), top_len: 0, options }
+        JsonDecoder {
+            buf,
+            pos: 0,
+            stack: Vec::new(),
+            top_len: 0,
+            options,
+        }
     }
 
     fn skip_ws(&self, mut p: usize) -> usize {
@@ -224,7 +232,10 @@ impl<'a> JsonDecoder<'a> {
         }
         let next = normalize_kind(self.buf[p]);
         if self.need_delim(next) != delim {
-            return Err(JsonError::new(format!("invalid character {:?} at offset {p}", char::from(self.buf[p]))));
+            return Err(JsonError::new(format!(
+                "invalid character {:?} at offset {p}",
+                char::from(self.buf[p])
+            )));
         }
         Ok((p, next))
     }
@@ -284,7 +295,9 @@ impl<'a> JsonDecoder<'a> {
                         None => false,
                     };
                     if dup {
-                        return Err(JsonError::new(format!("duplicate object member name {s:?}")));
+                        return Err(JsonError::new(format!(
+                            "duplicate object member name {s:?}"
+                        )));
                     }
                 }
                 self.increment();
@@ -307,10 +320,22 @@ impl<'a> JsonDecoder<'a> {
                 }
                 self.increment();
                 let is_object = c == b'{';
-                let names = if is_object && !self.options.allow_duplicate_names { Some(FxHashSet::default()) } else { None };
-                self.stack.push(Frame { is_object, len: 0, names });
+                let names = if is_object && !self.options.allow_duplicate_names {
+                    Some(FxHashSet::default())
+                } else {
+                    None
+                };
+                self.stack.push(Frame {
+                    is_object,
+                    len: 0,
+                    names,
+                });
                 self.pos = p + 1;
-                Ok(if is_object { JsonToken::BeginObject } else { JsonToken::BeginArray })
+                Ok(if is_object {
+                    JsonToken::BeginObject
+                } else {
+                    JsonToken::BeginArray
+                })
             }
             b'}' => {
                 if !self.last_is_object() {
@@ -331,7 +356,10 @@ impl<'a> JsonDecoder<'a> {
                 self.pos = p + 1;
                 Ok(JsonToken::EndArray)
             }
-            _ => Err(JsonError::new(format!("invalid character {:?} at offset {p}", char::from(c)))),
+            _ => Err(JsonError::new(format!(
+                "invalid character {:?} at offset {p}",
+                char::from(c)
+            ))),
         }
     }
 
@@ -400,10 +428,15 @@ impl<'a> JsonDecoder<'a> {
                                 // A surrogate must be a high surrogate followed by
                                 // an escaped low surrogate.
                                 let mut decoded = None;
-                                if v1 < 0xDC00 && b.get(i) == Some(&b'\\') && b.get(i + 1) == Some(&b'u') {
+                                if v1 < 0xDC00
+                                    && b.get(i) == Some(&b'\\')
+                                    && b.get(i + 1) == Some(&b'u')
+                                {
                                     let v2 = self.parse_hex4(i + 2)?;
                                     if (0xDC00..0xE000).contains(&v2) {
-                                        decoded = char::from_u32(0x10000 + ((v1 - 0xD800) << 10) + (v2 - 0xDC00));
+                                        decoded = char::from_u32(
+                                            0x10000 + ((v1 - 0xD800) << 10) + (v2 - 0xDC00),
+                                        );
                                         if decoded.is_some() {
                                             i += 6;
                                         }
@@ -412,7 +445,11 @@ impl<'a> JsonDecoder<'a> {
                                 match decoded {
                                     Some(ch) => out.push(ch),
                                     None if self.options.allow_invalid_utf8 => out.push('\u{FFFD}'),
-                                    None => return Err(JsonError::new("invalid surrogate in string escape")),
+                                    None => {
+                                        return Err(JsonError::new(
+                                            "invalid surrogate in string escape",
+                                        ));
+                                    }
                                 }
                             } else {
                                 out.push(char::from_u32(v1).expect("non-surrogate BMP code point"));
@@ -565,13 +602,17 @@ impl UnmarshalerFrom for f64 {
                 let v: f64 = raw.parse().map_err(|_| JsonError::new("invalid number"))?;
                 *self = v;
                 if v.is_infinite() {
-                    return Err(JsonError::new(format!("cannot unmarshal JSON number {raw} into Go float64: value out of range")));
+                    return Err(JsonError::new(format!(
+                        "cannot unmarshal JSON number {raw} into Go float64: value out of range"
+                    )));
                 }
                 Ok(())
             }
             _ => {
                 dec.skip_value()?;
-                Err(JsonError::new("cannot unmarshal JSON value into Go float64"))
+                Err(JsonError::new(
+                    "cannot unmarshal JSON value into Go float64",
+                ))
             }
         }
     }
@@ -596,15 +637,20 @@ impl<V: UnmarshalerFrom + Default + Clone> UnmarshalerFrom for FxHashMap<String,
                     dec.disable_namespace();
                 }
                 let allow_dup = dec.options.allow_duplicate_names;
-                let mut seen: Option<FxHashSet<String>> =
-                    if !allow_dup && !self.is_empty() { Some(FxHashSet::default()) } else { None };
+                let mut seen: Option<FxHashSet<String>> = if !allow_dup && !self.is_empty() {
+                    Some(FxHashSet::default())
+                } else {
+                    None
+                };
                 while dec.peek_kind() != b'}' {
                     let mut k = String::new();
                     json_unmarshal_decode(dec, &mut k)?;
                     let mut v = V::default();
                     if let Some(existing) = self.get(&k) {
                         if !allow_dup && seen.as_ref().is_none_or(|s| s.contains(&k)) {
-                            return Err(JsonError::new(format!("duplicate object member name {k:?}")));
+                            return Err(JsonError::new(format!(
+                                "duplicate object member name {k:?}"
+                            )));
                         }
                         v = existing.clone();
                     }
@@ -726,7 +772,10 @@ const ALLOW_INVALID: &[JsonOption] = &[JsonOption::AllowInvalidUtf8(true)];
 // PORT: named `json_marshal` so the glob export stays unambiguous. Go returns
 // bytes; the output here is always UTF-8 text. Rust strings are always valid
 // UTF-8, so `AllowInvalidUTF8` has no effect on output.
-pub fn json_marshal<T: MarshalerTo + ?Sized>(input: &T, opts: &[JsonOption]) -> Result<String, JsonError> {
+pub fn json_marshal<T: MarshalerTo + ?Sized>(
+    input: &T,
+    opts: &[JsonOption],
+) -> Result<String, JsonError> {
     let mut all: Vec<JsonOption> = ALLOW_INVALID.to_vec();
     all.extend_from_slice(opts);
     let _ = JsonOptions::from_options(&all);
@@ -740,7 +789,11 @@ pub fn json_marshal<T: MarshalerTo + ?Sized>(input: &T, opts: &[JsonOption]) -> 
 // PORT: not ported. Only the LSP, API and build-info writers use them.
 
 // Go: json/json.go:41 MarshalIndent
-pub fn json_marshal_indent<T: MarshalerTo + ?Sized>(input: &T, prefix: &str, indent: &str) -> Result<String, JsonError> {
+pub fn json_marshal_indent<T: MarshalerTo + ?Sized>(
+    input: &T,
+    prefix: &str,
+    indent: &str,
+) -> Result<String, JsonError> {
     if prefix.is_empty() && indent.is_empty() {
         // WithIndentPrefix and WithIndent imply multiline output, so skip them.
         return json_marshal(input, &[]);
@@ -754,7 +807,11 @@ pub fn json_marshal_indent<T: MarshalerTo + ?Sized>(input: &T, prefix: &str, ind
 // Go: json/json.go:57 Unmarshal
 // PORT: `out` implements `UnmarshalerFrom` in place of Go reflection. Like
 // Go, `out` is not reset on error, and the input must hold exactly one value.
-pub fn json_unmarshal<T: UnmarshalerFrom + ?Sized>(input: &[u8], out: &mut T, opts: &[JsonOption]) -> Result<(), JsonError> {
+pub fn json_unmarshal<T: UnmarshalerFrom + ?Sized>(
+    input: &[u8],
+    out: &mut T,
+    opts: &[JsonOption],
+) -> Result<(), JsonError> {
     let mut dec = JsonDecoder::new(input, JsonOptions::from_options(opts));
     json_unmarshal_decode(&mut dec, out)?;
     dec.check_eof()
@@ -764,7 +821,10 @@ pub fn json_unmarshal<T: UnmarshalerFrom + ?Sized>(input: &[u8], out: &mut T, op
 // PORT: Go merges `opts` into the decoder options; callers here pass none,
 // so the decoder options apply. The v2 check that an `UnmarshalerFrom`
 // reads exactly one value is kept.
-pub fn json_unmarshal_decode<T: UnmarshalerFrom + ?Sized>(dec: &mut JsonDecoder<'_>, out: &mut T) -> Result<(), JsonError> {
+pub fn json_unmarshal_decode<T: UnmarshalerFrom + ?Sized>(
+    dec: &mut JsonDecoder<'_>,
+    out: &mut T,
+) -> Result<(), JsonError> {
     let (prev_depth, prev_len) = dec.depth_length();
     out.unmarshal_json_from(dec)?;
     let (curr_depth, curr_len) = dec.depth_length();

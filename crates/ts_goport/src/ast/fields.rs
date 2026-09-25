@@ -42,13 +42,19 @@ fn opt_node(file: usize, id: Option<ts_ast::NodeId>) -> Node {
 // (`{ file: u32, list: Option<&'static ts_ast::NodeList> }`). This is the one
 // place that depends on that shape.
 fn make_node_list(file: usize, list: Option<&'static ts_ast::NodeList>) -> NodeList {
-    NodeList { file: file as u32, list }
+    NodeList {
+        file: file as u32,
+        list,
+    }
 }
 
 /// Go panics with a failed type assertion when `AsX()` gets the wrong kind.
 #[cold]
 fn field_panic(n: Node, field: &str) -> ! {
-    panic!("ast field {field} does not exist on node kind {:?}", n.kind())
+    panic!(
+        "ast field {field} does not exist on node kind {:?}",
+        n.kind()
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -414,7 +420,9 @@ impl Node {
             NodeData::ParameterDeclaration(d) => opt_node(file, d.dot_dot_dot_token),
             NodeData::BindingElement(d) => opt_node(file, d.dot_dot_dot_token),
             // PORT: an array binding hole, Go `BindingElement` with nil fields.
-            NodeData::OmittedExpression(_) if self.kind() == SyntaxKind::BindingElement => Node::NIL,
+            NodeData::OmittedExpression(_) if self.kind() == SyntaxKind::BindingElement => {
+                Node::NIL
+            }
             NodeData::NamedTupleMember(d) => opt_node(file, d.dot_dot_dot_token),
             NodeData::JsxExpression(d) => opt_node(file, d.dot_dot_dot_token),
             _ => field_panic(self, "DotDotDotToken"),
@@ -618,7 +626,9 @@ impl Node {
     pub fn object_assignment_initializer(self) -> Node {
         let file = self.file_index();
         match node_data(self) {
-            NodeData::ShorthandPropertyAssignment(d) => opt_node(file, d.object_assignment_initializer),
+            NodeData::ShorthandPropertyAssignment(d) => {
+                opt_node(file, d.object_assignment_initializer)
+            }
             _ => field_panic(self, "ObjectAssignmentInitializer"),
         }
     }
@@ -1022,7 +1032,12 @@ impl Node {
     pub fn js_doc_property_tags(self) -> Vec<Node> {
         let file = self.file_index();
         match node_data(self) {
-            NodeData::JsDocTypeLiteral(d) => d.js_doc_property_tags.as_ref().map_or_else(Vec::new, |ids| ids.iter().map(|&id| Node::new(file, id)).collect()),
+            NodeData::JsDocTypeLiteral(d) => d
+                .js_doc_property_tags
+                .as_ref()
+                .map_or_else(Vec::new, |ids| {
+                    ids.iter().map(|&id| Node::new(file, id)).collect()
+                }),
             _ => field_panic(self, "JSDocPropertyTags"),
         }
     }
@@ -2326,16 +2341,15 @@ pub fn is_trivia_kind(kind: SyntaxKind) -> bool {
 // Go: ast/ast_generated.go:9642 IsLiteralKind
 #[must_use]
 pub fn is_literal_kind(kind: SyntaxKind) -> bool {
-    (kind as u16) >= (SyntaxKind::FIRST_LITERAL_TOKEN as u16) && (kind as u16) <= (SyntaxKind::LAST_LITERAL_TOKEN as u16)
+    (kind as u16) >= (SyntaxKind::FIRST_LITERAL_TOKEN as u16)
+        && (kind as u16) <= (SyntaxKind::LAST_LITERAL_TOKEN as u16)
 }
 
 // Go: ast/ast_generated.go:9646 IsPseudoLiteralKind
 #[must_use]
 pub fn is_pseudo_literal_kind(kind: SyntaxKind) -> bool {
     match kind {
-        SyntaxKind::TemplateHead
-        | SyntaxKind::TemplateMiddle
-        | SyntaxKind::TemplateTail => true,
+        SyntaxKind::TemplateHead | SyntaxKind::TemplateMiddle | SyntaxKind::TemplateTail => true,
         _ => false,
     }
 }
@@ -2343,13 +2357,15 @@ pub fn is_pseudo_literal_kind(kind: SyntaxKind) -> bool {
 // Go: ast/ast_generated.go:9654 IsPunctuationKind
 #[must_use]
 pub fn is_punctuation_kind(kind: SyntaxKind) -> bool {
-    (kind as u16) >= (SyntaxKind::FIRST_PUNCTUATION as u16) && (kind as u16) <= (SyntaxKind::LAST_PUNCTUATION as u16)
+    (kind as u16) >= (SyntaxKind::FIRST_PUNCTUATION as u16)
+        && (kind as u16) <= (SyntaxKind::LAST_PUNCTUATION as u16)
 }
 
 // Go: ast/ast_generated.go:9658 IsKeywordKind
 #[must_use]
 pub fn is_keyword_kind(kind: SyntaxKind) -> bool {
-    (kind as u16) >= (SyntaxKind::FIRST_KEYWORD as u16) && (kind as u16) <= (SyntaxKind::LAST_KEYWORD as u16)
+    (kind as u16) >= (SyntaxKind::FIRST_KEYWORD as u16)
+        && (kind as u16) <= (SyntaxKind::LAST_KEYWORD as u16)
 }
 
 // Go: ast/ast_generated.go:9662 IsModifierKind
@@ -2412,7 +2428,8 @@ pub fn is_keyword_expression_kind(kind: SyntaxKind) -> bool {
 // Go: ast/ast_generated.go:9686 IsTokenKind
 #[must_use]
 pub fn is_token_kind(kind: SyntaxKind) -> bool {
-    (kind as u16) >= (SyntaxKind::FIRST_TOKEN as u16) && (kind as u16) <= (SyntaxKind::LAST_TOKEN as u16)
+    (kind as u16) >= (SyntaxKind::FIRST_TOKEN as u16)
+        && (kind as u16) <= (SyntaxKind::LAST_TOKEN as u16)
 }
 
 // Go: ast/ast_generated.go:9690 IsJsxTokenKind
@@ -2433,15 +2450,15 @@ pub fn is_jsx_token_kind(kind: SyntaxKind) -> bool {
 // Go: ast/ast_generated.go:9698 IsJSDocNodeKind
 #[must_use]
 pub fn is_js_doc_node_kind(kind: SyntaxKind) -> bool {
-    (kind as u16) >= (SyntaxKind::FIRST_JS_DOC_NODE as u16) && (kind as u16) <= (SyntaxKind::LAST_JS_DOC_NODE as u16)
+    (kind as u16) >= (SyntaxKind::FIRST_JS_DOC_NODE as u16)
+        && (kind as u16) <= (SyntaxKind::LAST_JS_DOC_NODE as u16)
 }
 
 // Go: ast/ast_generated.go:9702 IsImportPhaseModifierKind
 #[must_use]
 pub fn is_import_phase_modifier_kind(kind: SyntaxKind) -> bool {
     match kind {
-        SyntaxKind::TypeKeyword
-        | SyntaxKind::DeferKeyword => true,
+        SyntaxKind::TypeKeyword | SyntaxKind::DeferKeyword => true,
         _ => false,
     }
 }
@@ -2450,8 +2467,7 @@ pub fn is_import_phase_modifier_kind(kind: SyntaxKind) -> bool {
 #[must_use]
 pub fn is_postfix_unary_operator(kind: SyntaxKind) -> bool {
     match kind {
-        SyntaxKind::PlusPlusToken
-        | SyntaxKind::MinusMinusToken => true,
+        SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken => true,
         _ => false,
     }
 }
@@ -2557,9 +2573,7 @@ pub fn is_exponentiation_operator(kind: SyntaxKind) -> bool {
 #[must_use]
 pub fn is_multiplicative_operator(kind: SyntaxKind) -> bool {
     match kind {
-        SyntaxKind::AsteriskToken
-        | SyntaxKind::SlashToken
-        | SyntaxKind::PercentToken => true,
+        SyntaxKind::AsteriskToken | SyntaxKind::SlashToken | SyntaxKind::PercentToken => true,
         _ => false,
     }
 }
@@ -2580,8 +2594,7 @@ pub fn is_multiplicative_operator_or_higher(kind: SyntaxKind) -> bool {
 #[must_use]
 pub fn is_additive_operator(kind: SyntaxKind) -> bool {
     match kind {
-        SyntaxKind::PlusToken
-        | SyntaxKind::MinusToken => true,
+        SyntaxKind::PlusToken | SyntaxKind::MinusToken => true,
         _ => false,
     }
 }
@@ -2708,9 +2721,7 @@ pub fn is_equality_operator_or_higher(kind: SyntaxKind) -> bool {
 #[must_use]
 pub fn is_bitwise_operator(kind: SyntaxKind) -> bool {
     match kind {
-        SyntaxKind::AmpersandToken
-        | SyntaxKind::BarToken
-        | SyntaxKind::CaretToken => true,
+        SyntaxKind::AmpersandToken | SyntaxKind::BarToken | SyntaxKind::CaretToken => true,
         _ => false,
     }
 }
@@ -2749,8 +2760,7 @@ pub fn is_bitwise_operator_or_higher(kind: SyntaxKind) -> bool {
 #[must_use]
 pub fn is_logical_operator(kind: SyntaxKind) -> bool {
     match kind {
-        SyntaxKind::AmpersandAmpersandToken
-        | SyntaxKind::BarBarToken => true,
+        SyntaxKind::AmpersandAmpersandToken | SyntaxKind::BarBarToken => true,
         _ => false,
     }
 }

@@ -5,7 +5,7 @@ use crate::prelude::*;
 use super::compare::count_path_components;
 use super::deps;
 use super::packagejson::{ExportsOrImports, JSONValue, VersionPaths};
-use super::preferences::{get_module_specifier_preferences, ModuleSpecifierPreferences};
+use super::preferences::{ModuleSpecifierPreferences, get_module_specifier_preferences};
 use super::tspath;
 use super::types::*;
 use super::util::*;
@@ -50,7 +50,12 @@ pub fn get_module_specifiers_with_info(
 ) -> (Vec<String>, ResultKind) {
     let ambient = try_get_module_name_from_ambient_module(module_symbol, checker);
     if !ambient.is_empty() {
-        if for_auto_imports && is_excluded_by_regex(&ambient, &user_preferences.auto_import_specifier_exclude_regexes) {
+        if for_auto_imports
+            && is_excluded_by_regex(
+                &ambient,
+                &user_preferences.auto_import_specifier_exclude_regexes,
+            )
+        {
             return (Vec::new(), ResultKind::Ambient);
         }
         return (vec![ambient], ResultKind::Ambient);
@@ -62,7 +67,8 @@ pub fn get_module_specifiers_with_info(
     }
 
     // Use original source file name when file is from project reference output
-    let module_file_name = host.get_source_of_project_reference_if_output_included(module_source_file);
+    let module_file_name =
+        host.get_source_of_project_reference_if_output_included(module_source_file);
 
     get_module_specifiers_for_file_with_info(
         importing_source_file,
@@ -86,7 +92,10 @@ pub fn get_module_specifiers_for_file_with_info(
     for_auto_imports: bool,
 ) -> (Vec<String>, ResultKind) {
     let module_paths = get_all_module_paths_worker(
-        &get_info(&host.get_source_of_project_reference_if_output_included(importing_source_file.node()), host),
+        &get_info(
+            &host.get_source_of_project_reference_if_output_included(importing_source_file.node()),
+            host,
+        ),
         module_file_name,
         host,
         compiler_options,
@@ -105,11 +114,15 @@ pub fn get_module_specifiers_for_file_with_info(
 }
 
 // Go: modulespecifiers/specifiers.go:106 tryGetModuleNameFromAmbientModule
-fn try_get_module_name_from_ambient_module(module_symbol: SymbolId, checker: &mut dyn CheckerShape) -> String {
+fn try_get_module_name_from_ambient_module(
+    module_symbol: SymbolId,
+    checker: &mut dyn CheckerShape,
+) -> String {
     let declarations = checker.symbols().sym(module_symbol).declarations.clone();
     for decl in &declarations {
         if is_module_with_string_literal_name(*decl)
-            && (!is_module_augmentation_external(*decl) || !tspath::is_external_module_name_relative(decl.name().text()))
+            && (!is_module_augmentation_external(*decl)
+                || !tspath::is_external_module_name_relative(decl.name().text()))
         {
             return decl.name().text().to_string();
         }
@@ -131,24 +144,37 @@ fn try_get_module_name_from_ambient_module(module_symbol: SymbolId, checker: &mu
         }
 
         let possible_container = find_ancestor(d, is_module_with_string_literal_name);
-        if possible_container.is_nil() || possible_container.parent().is_nil() || !is_source_file(possible_container.parent()) {
+        if possible_container.is_nil()
+            || possible_container.parent().is_nil()
+            || !is_source_file(possible_container.parent())
+        {
             continue;
         }
 
         let symbols = checker.symbols();
-        let sym = symbols.get(symbols.sym(possible_container.symbol()).exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS);
+        let sym = symbols.get(
+            symbols.sym(possible_container.symbol()).exports,
+            INTERNAL_SYMBOL_NAME_EXPORT_EQUALS,
+        );
         if sym.is_nil() {
             continue;
         }
         let export_assignment_decl = symbols.sym(sym).value_declaration;
-        if export_assignment_decl.is_nil() || export_assignment_decl.kind() != SyntaxKind::ExportAssignment {
+        if export_assignment_decl.is_nil()
+            || export_assignment_decl.kind() != SyntaxKind::ExportAssignment
+        {
             continue;
         }
         let mut export_symbol = checker.get_symbol_at_location(export_assignment_decl.expression());
         if export_symbol.is_nil() {
             continue;
         }
-        if checker.symbols().sym(export_symbol).flags.intersects(SymbolFlags::ALIAS) {
+        if checker
+            .symbols()
+            .sym(export_symbol)
+            .flags
+            .intersects(SymbolFlags::ALIAS)
+        {
             export_symbol = checker.get_aliased_symbol(export_symbol);
         }
         // TODO: Possible strada bug - isn't this insufficient in the presence of merge symbols?
@@ -168,7 +194,10 @@ pub struct Info {
 }
 
 // Go: modulespecifiers/specifiers.go:162 getInfo
-pub(crate) fn get_info(importing_source_file_name: &str, host: &dyn ModuleSpecifierGenerationHost) -> Info {
+pub(crate) fn get_info(
+    importing_source_file_name: &str,
+    host: &dyn ModuleSpecifierGenerationHost,
+) -> Info {
     let source_directory = tspath::get_directory_path(importing_source_file_name);
     Info {
         importing_source_file_name: importing_source_file_name.to_string(),
@@ -204,14 +233,20 @@ fn get_all_module_paths_worker(
 ) -> Vec<ModulePath> {
     let _ = (compiler_options, options);
     let mut all_file_names: IndexMap<String, ModulePath> = IndexMap::default();
-    let paths = get_each_file_name_of_module(&info.importing_source_file_name, imported_file_name, host, true);
+    let paths = get_each_file_name_of_module(
+        &info.importing_source_file_name,
+        imported_file_name,
+        host,
+        true,
+    );
     for p in &paths {
         all_file_names.insert(p.file_name.clone(), p.clone());
     }
 
     let use_case_sensitive_file_names = info.use_case_sensitive_file_names;
-    let compare_paths =
-        |a: &ModulePath, b: &ModulePath| compare_paths_by_redirect(a, b, use_case_sensitive_file_names).cmp(&0);
+    let compare_paths = |a: &ModulePath, b: &ModulePath| {
+        compare_paths_by_redirect(a, b, use_case_sensitive_file_names).cmp(&0)
+    };
 
     // Sort by paths closest to importing file Name directory
     let mut sorted_paths: Vec<ModulePath> = Vec::with_capacity(paths.len());
@@ -266,7 +301,11 @@ pub fn get_each_file_name_of_module(
     prefer_symlinks: bool,
 ) -> Vec<ModulePath> {
     let cwd = host.get_current_directory();
-    let imported_path = tspath::to_path(imported_file_name, &cwd, host.use_case_sensitive_file_names());
+    let imported_path = tspath::to_path(
+        imported_file_name,
+        &cwd,
+        host.use_case_sensitive_file_names(),
+    );
     let mut reference_redirect = String::new();
     let output_and_reference = host.get_project_reference_from_source(&imported_path);
     if let Some(output_and_reference) = output_and_reference {
@@ -282,8 +321,10 @@ pub fn get_each_file_name_of_module(
     }
     imported_file_names.push(imported_file_name.to_string());
     imported_file_names.extend(redirects);
-    let targets: Vec<String> =
-        imported_file_names.iter().map(|f| tspath::get_normalized_absolute_path(f, &cwd)).collect();
+    let targets: Vec<String> = imported_file_names
+        .iter()
+        .map(|f| tspath::get_normalized_absolute_path(f, &cwd))
+        .collect();
     let mut should_filter_ignored_paths = !targets.iter().all(|t| contains_ignored_path(t));
 
     let mut results: Vec<ModulePath> = Vec::with_capacity(2);
@@ -306,8 +347,12 @@ pub fn get_each_file_name_of_module(
             &host.get_global_typings_cache_location(),
             &tspath::get_directory_path(&full_imported_file_name),
             |real_path_directory| -> (bool, bool) {
-                let key = tspath::to_path(real_path_directory, &cwd, host.use_case_sensitive_file_names())
-                    .ensure_trailing_directory_separator();
+                let key = tspath::to_path(
+                    real_path_directory,
+                    &cwd,
+                    host.use_case_sensitive_file_names(),
+                )
+                .ensure_trailing_directory_separator();
                 let Some(symlink_set) = symlink_cache.directories_by_realpath().get(&key) else {
                     return (false, false);
                 }; // Continue to ancestor directory
@@ -322,7 +367,11 @@ pub fn get_each_file_name_of_module(
                 }
 
                 for target in &targets {
-                    if !tspath::starts_with_directory(target, real_path_directory, host.use_case_sensitive_file_names()) {
+                    if !tspath::starts_with_directory(
+                        target,
+                        real_path_directory,
+                        host.use_case_sensitive_file_names(),
+                    ) {
                         continue;
                     }
 
@@ -376,17 +425,28 @@ fn compute_module_specifiers(
     for_auto_import: bool,
 ) -> (Vec<String>, ResultKind) {
     let info = get_info(&importing_source_file.file_name(), host);
-    let preferences = get_module_specifier_preferences(user_preferences, host, compiler_options, importing_source_file, "");
+    let preferences = get_module_specifier_preferences(
+        user_preferences,
+        host,
+        compiler_options,
+        importing_source_file,
+        "",
+    );
 
     let mut existing_specifier = String::new();
     let imports = importing_source_file.imports();
     for module_path in module_paths {
-        let target_path =
-            tspath::to_path(&module_path.file_name, &host.get_current_directory(), info.use_case_sensitive_file_names);
+        let target_path = tspath::to_path(
+            &module_path.file_name,
+            &host.get_current_directory(),
+            info.use_case_sensitive_file_names,
+        );
         let mut existing_import = Node::NIL;
         for import_specifier in &imports {
-            let resolved_module =
-                host.get_resolved_module_from_module_specifier(importing_source_file.node(), *import_specifier);
+            let resolved_module = host.get_resolved_module_from_module_specifier(
+                importing_source_file.node(),
+                *import_specifier,
+            );
             if let Some(resolved_module) = resolved_module.filter(|r| r.is_resolved()) {
                 if tspath::to_path(
                     &resolved_module.resolved_file_name,
@@ -406,12 +466,17 @@ fn compute_module_specifiers(
                 // If the preference is for non-relative and the module specifier is relative, ignore it
                 continue;
             }
-            let existing_mode = host.get_mode_for_usage_location(importing_source_file.node(), existing_import);
+            let existing_mode =
+                host.get_mode_for_usage_location(importing_source_file.node(), existing_import);
             let mut target_mode = options.override_import_mode;
             if target_mode == RESOLUTION_MODE_NONE {
-                target_mode = host.get_default_resolution_mode_for_file(importing_source_file.node());
+                target_mode =
+                    host.get_default_resolution_mode_for_file(importing_source_file.node());
             }
-            if existing_mode != target_mode && existing_mode != RESOLUTION_MODE_NONE && target_mode != RESOLUTION_MODE_NONE {
+            if existing_mode != target_mode
+                && existing_mode != RESOLUTION_MODE_NONE
+                && target_mode != RESOLUTION_MODE_NONE
+            {
                 // If the candidate import mode doesn't match the mode we're generating for, don't consider it
                 continue;
             }
@@ -450,7 +515,9 @@ fn compute_module_specifiers(
                 options.override_import_mode,
             );
         }
-        if !specifier.is_empty() && !(for_auto_import && is_excluded_by_regex(&specifier, &preferences.exclude_regexes)) {
+        if !specifier.is_empty()
+            && !(for_auto_import && is_excluded_by_regex(&specifier, &preferences.exclude_regexes))
+        {
             node_modules_specifiers.push(specifier.clone());
             if module_path.is_redirect {
                 // If we got a specifier for a redirect, it was a bare package specifier (e.g. "@foo/bar",
@@ -472,7 +539,9 @@ fn compute_module_specifiers(
             &preferences,
             /*pathsOnly*/ module_path.is_redirect || !specifier.is_empty(),
         );
-        if local.is_empty() || for_auto_import && is_excluded_by_regex(&local, &preferences.exclude_regexes) {
+        if local.is_empty()
+            || for_auto_import && is_excluded_by_regex(&local, &preferences.exclude_regexes)
+        {
             continue;
         }
         if module_path.is_redirect {
@@ -487,7 +556,10 @@ fn compute_module_specifiers(
             } else {
                 paths_specifiers.push(local);
             }
-        } else if for_auto_import || !imported_file_is_in_node_modules || module_path.is_in_node_modules {
+        } else if for_auto_import
+            || !imported_file_is_in_node_modules
+            || module_path.is_in_node_modules
+        {
             // Why this extra conditional, not just an `else`? If some path to the file contained
             // 'node_modules', but we can't create a non-relative specifier (e.g. "@foo/bar/path/to/file"),
             // that means we had to go through a *sibling's* node_modules, not one we can access directly.
@@ -571,8 +643,11 @@ fn get_local_module_specifier(
 
     let root = compiler_options.get_paths_base_path(&host.get_current_directory());
     let base_directory = tspath::get_normalized_absolute_path(&root, &host.get_current_directory());
-    let relative_to_base_url =
-        get_relative_path_if_in_same_volume(module_file_name, &base_directory, host.use_case_sensitive_file_names());
+    let relative_to_base_url = get_relative_path_if_in_same_volume(
+        module_file_name,
+        &base_directory,
+        host.use_case_sensitive_file_names(),
+    );
     if relative_to_base_url.is_empty() {
         if paths_only {
             return String::new();
@@ -610,13 +685,18 @@ fn get_local_module_specifier(
         return from_paths;
     }
 
-    let maybe_non_relative = if !from_package_json_imports.is_empty() { from_package_json_imports } else { from_paths };
+    let maybe_non_relative = if !from_package_json_imports.is_empty() {
+        from_package_json_imports
+    } else {
+        from_paths
+    };
     if maybe_non_relative.is_empty() {
         return relative_path;
     }
 
     let relative_is_excluded = is_excluded_by_regex(&relative_path, &preferences.exclude_regexes);
-    let non_relative_is_excluded = is_excluded_by_regex(&maybe_non_relative, &preferences.exclude_regexes);
+    let non_relative_is_excluded =
+        is_excluded_by_regex(&maybe_non_relative, &preferences.exclude_regexes);
     if !relative_is_excluded && non_relative_is_excluded {
         return relative_path;
     }
@@ -636,7 +716,11 @@ fn get_local_module_specifier(
         let cwd = host.get_current_directory();
         let case = host.use_case_sensitive_file_names();
         let project_directory = if !compiler_options.config_file_path.is_empty() {
-            tspath::to_path(&tspath::get_directory_path(&compiler_options.config_file_path), &cwd, case)
+            tspath::to_path(
+                &tspath::get_directory_path(&compiler_options.config_file_path),
+                &cwd,
+                case,
+            )
         } else {
             tspath::to_path(&cwd, &cwd, case)
         };
@@ -657,14 +741,19 @@ fn get_local_module_specifier(
             return maybe_non_relative;
         }
 
-        let nearest_target_package_json =
-            host.get_nearest_ancestor_directory_with_package_json(&tspath::get_directory_path(&module_path));
-        let nearest_source_package_json = host.get_nearest_ancestor_directory_with_package_json(source_directory);
+        let nearest_target_package_json = host.get_nearest_ancestor_directory_with_package_json(
+            &tspath::get_directory_path(&module_path),
+        );
+        let nearest_source_package_json =
+            host.get_nearest_ancestor_directory_with_package_json(source_directory);
 
         if !package_json_paths_are_equal(
             &nearest_target_package_json,
             &nearest_source_package_json,
-            &tspath::ComparePathsOptions { use_case_sensitive_file_names: case, current_directory: cwd.clone() },
+            &tspath::ComparePathsOptions {
+                use_case_sensitive_file_names: case,
+                current_directory: cwd.clone(),
+            },
         ) {
             // 2. The importing and imported files are part of different packages.
             //
@@ -701,7 +790,11 @@ fn process_ending(
 ) -> String {
     if tspath::file_extension_is_one_of(
         file_name,
-        &[tspath::EXTENSION_JSON, tspath::EXTENSION_MJS, tspath::EXTENSION_CJS],
+        &[
+            tspath::EXTENSION_JSON,
+            tspath::EXTENSION_MJS,
+            tspath::EXTENSION_CJS,
+        ],
     ) {
         return file_name.to_string();
     }
@@ -719,13 +812,21 @@ fn process_ending(
     {
         return file_name.to_string();
     }
-    if tspath::file_extension_is_one_of(file_name, &[tspath::EXTENSION_DMTS, tspath::EXTENSION_DCTS]) {
+    if tspath::file_extension_is_one_of(
+        file_name,
+        &[tspath::EXTENSION_DMTS, tspath::EXTENSION_DCTS],
+    ) {
         let input_ext = tspath::get_declaration_file_extension(file_name);
         let ext = get_js_extension_for_declaration_file_extension(&input_ext);
         return format!("{}{}", tspath::remove_extension(file_name, &input_ext), ext);
     }
-    if tspath::file_extension_is_one_of(file_name, &[tspath::EXTENSION_MTS, tspath::EXTENSION_CTS]) {
-        return format!("{}{}", no_extension, get_js_extension_for_file(file_name, options));
+    if tspath::file_extension_is_one_of(file_name, &[tspath::EXTENSION_MTS, tspath::EXTENSION_CTS])
+    {
+        return format!(
+            "{}{}",
+            no_extension,
+            get_js_extension_for_file(file_name, options)
+        );
     }
     if !tspath::file_extension_is_one_of(file_name, &[tspath::EXTENSION_DTS])
         && tspath::file_extension_is_one_of(file_name, &[tspath::EXTENSION_TS])
@@ -750,7 +851,11 @@ fn process_ending(
         }
         ModuleSpecifierEnding::Index => no_extension.to_string(),
         ModuleSpecifierEnding::JsExtension => {
-            format!("{}{}", no_extension, get_js_extension_for_file(file_name, options))
+            format!(
+                "{}{}",
+                no_extension,
+                get_js_extension_for_file(file_name, options)
+            )
         }
         ModuleSpecifierEnding::TsExtension => {
             // For now, we don't know if this import is going to be type-only, which means we don't
@@ -766,7 +871,11 @@ fn process_ending(
                 if extensionless_priority != -1 && extensionless_priority < js_priority {
                     return no_extension.to_string();
                 }
-                return format!("{}{}", no_extension, get_js_extension_for_file(file_name, options));
+                return format!(
+                    "{}{}",
+                    no_extension,
+                    get_js_extension_for_file(file_name, options)
+                );
             }
             file_name.to_string()
         }
@@ -782,26 +891,33 @@ fn try_get_module_name_from_root_dirs(
     compiler_options: &CompilerOptions,
     host: &dyn ModuleSpecifierGenerationHost,
 ) -> String {
-    let normalized_target_paths =
-        get_paths_relative_to_root_dirs(module_file_name, root_dirs, host.use_case_sensitive_file_names());
+    let normalized_target_paths = get_paths_relative_to_root_dirs(
+        module_file_name,
+        root_dirs,
+        host.use_case_sensitive_file_names(),
+    );
     if normalized_target_paths.is_empty() {
         return String::new();
     }
 
-    let normalized_source_paths =
-        get_paths_relative_to_root_dirs(source_directory, root_dirs, host.use_case_sensitive_file_names());
+    let normalized_source_paths = get_paths_relative_to_root_dirs(
+        source_directory,
+        root_dirs,
+        host.use_case_sensitive_file_names(),
+    );
     let mut shortest = String::new();
     let mut shortest_sep_count = 0usize;
     for source_path in &normalized_source_paths {
         for target_path in &normalized_target_paths {
-            let candidate = ensure_path_is_non_module_name(&tspath::get_relative_path_from_directory(
-                source_path,
-                target_path,
-                &tspath::ComparePathsOptions {
-                    use_case_sensitive_file_names: host.use_case_sensitive_file_names(),
-                    current_directory: host.get_current_directory(),
-                },
-            ));
+            let candidate =
+                ensure_path_is_non_module_name(&tspath::get_relative_path_from_directory(
+                    source_path,
+                    target_path,
+                    &tspath::ComparePathsOptions {
+                        use_case_sensitive_file_names: host.use_case_sensitive_file_names(),
+                        current_directory: host.get_current_directory(),
+                    },
+                ));
             let candidate_sep_count = candidate.matches('/').count();
             if shortest.is_empty() || candidate_sep_count < shortest_sep_count {
                 shortest = candidate;
@@ -833,8 +949,15 @@ pub(crate) fn try_get_module_name_as_node_module(
     };
 
     // Simplify the full file path to something that can be resolved by Node.
-    let preferences = get_module_specifier_preferences(user_preferences, host, options, importing_source_file, "");
-    let allowed_endings = (preferences.get_allowed_endings_in_preferred_order)(RESOLUTION_MODE_NONE);
+    let preferences = get_module_specifier_preferences(
+        user_preferences,
+        host,
+        options,
+        importing_source_file,
+        "",
+    );
+    let allowed_endings =
+        (preferences.get_allowed_endings_in_preferred_order)(RESOLUTION_MODE_NONE);
 
     let case_sensitive = host.use_case_sensitive_file_names();
     let mut module_specifier = path_obj.file_name.clone();
@@ -874,9 +997,11 @@ pub(crate) fn try_get_module_name_as_node_module(
                 module_file_name = module_file_to_try;
             }
             // try with next level of directory
-            package_root_index = deps::index_after(&path_obj.file_name, "/", (package_root_index + 1) as usize);
+            package_root_index =
+                deps::index_after(&path_obj.file_name, "/", (package_root_index + 1) as usize);
             if package_root_index == -1 {
-                module_specifier = process_ending(&module_file_name, &allowed_endings, options, host);
+                module_specifier =
+                    process_ending(&module_file_name, &allowed_endings, options, host);
                 break;
             }
         }
@@ -889,17 +1014,26 @@ pub(crate) fn try_get_module_name_as_node_module(
     let global_typings_cache_location = host.get_global_typings_cache_location();
     // Get a path that's relative to node_modules or the importing file's path
     // if node_modules folder is in this folder or any of its parent folders, no need to keep it.
-    let path_to_top_level_node_modules = &module_specifier[0..parts.top_level_node_modules_index as usize];
+    let path_to_top_level_node_modules =
+        &module_specifier[0..parts.top_level_node_modules_index as usize];
 
-    if !deps::has_prefix(&info.source_directory, path_to_top_level_node_modules, case_sensitive)
-        || !global_typings_cache_location.is_empty()
-            && deps::has_prefix(&global_typings_cache_location, path_to_top_level_node_modules, case_sensitive)
+    if !deps::has_prefix(
+        &info.source_directory,
+        path_to_top_level_node_modules,
+        case_sensitive,
+    ) || !global_typings_cache_location.is_empty()
+        && deps::has_prefix(
+            &global_typings_cache_location,
+            path_to_top_level_node_modules,
+            case_sensitive,
+        )
     {
         return String::new();
     }
 
     // If the module was found in @types, get the actual Node package name
-    let node_modules_directory_name = &module_specifier[(parts.top_level_package_name_index + 1) as usize..];
+    let node_modules_directory_name =
+        &module_specifier[(parts.top_level_package_name_index + 1) as usize..];
     deps::get_package_name_from_types_package_name(node_modules_directory_name)
 }
 
@@ -933,10 +1067,21 @@ fn try_directory_with_package_json(
     let Some(package_json) = host.get_package_json_info(&package_json_path) else {
         // No package.json exists; an index.js will still resolve as the package name
         let file_name = &module_file_to_try[(parts.package_root_index + 1) as usize..];
-        if file_name == "index.d.ts" || file_name == "index.js" || file_name == "index.ts" || file_name == "index.tsx" {
-            return PkgJsonDirAttemptResult { module_file_to_try, package_root_path, ..Default::default() };
+        if file_name == "index.d.ts"
+            || file_name == "index.js"
+            || file_name == "index.ts"
+            || file_name == "index.tsx"
+        {
+            return PkgJsonDirAttemptResult {
+                module_file_to_try,
+                package_root_path,
+                ..Default::default()
+            };
         }
-        return PkgJsonDirAttemptResult { module_file_to_try, ..Default::default() };
+        return PkgJsonDirAttemptResult {
+            module_file_to_try,
+            ..Default::default()
+        };
     };
 
     let mut import_mode = override_mode;
@@ -949,8 +1094,10 @@ fn try_directory_with_package_json(
         // The package name that we found in node_modules could be different from the package
         // name in the package.json content via url/filepath dependency specifiers. We need to
         // use the actual directory name, so don't look at `packageJsonContent.name` here.
-        let node_modules_directory_name = &package_root_path[(parts.top_level_package_name_index + 1) as usize..];
-        let package_name = deps::get_package_name_from_types_package_name(node_modules_directory_name);
+        let node_modules_directory_name =
+            &package_root_path[(parts.top_level_package_name_index + 1) as usize..];
+        let package_name =
+            deps::get_package_name_from_types_package_name(node_modules_directory_name);
 
         // Determine resolution mode for package.json exports condition matching.
         // TypeScript's tryDirectoryWithPackageJson uses the importing file's mode (moduleSpecifiers.ts:1257),
@@ -960,12 +1107,20 @@ fn try_directory_with_package_json(
         // .mjs/.mts/.d.mts → ESM → "import" condition
         if tspath::file_extension_is_one_of(
             &path_obj.file_name,
-            &[tspath::EXTENSION_CJS, tspath::EXTENSION_CTS, tspath::EXTENSION_DCTS],
+            &[
+                tspath::EXTENSION_CJS,
+                tspath::EXTENSION_CTS,
+                tspath::EXTENSION_DCTS,
+            ],
         ) {
             import_mode = RESOLUTION_MODE_COMMON_JS;
         } else if tspath::file_extension_is_one_of(
             &path_obj.file_name,
-            &[tspath::EXTENSION_MJS, tspath::EXTENSION_MTS, tspath::EXTENSION_DMTS],
+            &[
+                tspath::EXTENSION_MJS,
+                tspath::EXTENSION_MTS,
+                tspath::EXTENSION_DMTS,
+            ],
         ) {
             import_mode = RESOLUTION_MODE_ESM;
         }
@@ -1009,8 +1164,14 @@ fn try_directory_with_package_json(
     let version_paths_paths = version_paths.get_paths();
     if let Some(paths) = &version_paths_paths {
         let sub_module_name = &path_obj.file_name[package_root_path.len() + 1..];
-        let from_paths =
-            try_get_module_name_from_paths(sub_module_name, paths, allowed_endings, &package_root_path, host, options);
+        let from_paths = try_get_module_name_from_paths(
+            sub_module_name,
+            paths,
+            allowed_endings,
+            &package_root_path,
+            host,
+            options,
+        );
         if from_paths.is_empty() {
             maybe_blocked_by_types_versions = true;
         } else {
@@ -1042,8 +1203,11 @@ fn try_directory_with_package_json(
         // package got pulled into the program anyway, e.g. transitively through a file that *is* reachable. It
         // happens very easily in fourslash tests though, since every test file listed gets included. See
         // importNameCodeFix_typesVersions.ts for an example.)
-        let main_export_file =
-            tspath::to_path(&main_file_relative, &package_root_path, host.use_case_sensitive_file_names());
+        let main_export_file = tspath::to_path(
+            &main_file_relative,
+            &package_root_path,
+            host.use_case_sensitive_file_names(),
+        );
         let compare_opt = tspath::ComparePathsOptions {
             use_case_sensitive_file_names: host.use_case_sensitive_file_names(),
             current_directory: host.get_current_directory(),
@@ -1055,30 +1219,46 @@ fn try_directory_with_package_json(
         ) == 0
         {
             // ^ An arbitrary removal of file extension for this comparison is almost certainly wrong
-            return PkgJsonDirAttemptResult { package_root_path, module_file_to_try, ..Default::default() };
+            return PkgJsonDirAttemptResult {
+                package_root_path,
+                module_file_to_try,
+                ..Default::default()
+            };
         } else if package_json_content.is_none_or(|c| {
             c.fields.type_.value != "module"
                 && !tspath::file_extension_is_one_of(
                     &module_file_to_try,
                     tspath::EXTENSIONS_NOT_SUPPORTING_EXTENSIONLESS_RESOLUTION,
                 )
-                && deps::has_prefix(&module_file_to_try, &main_export_file, host.use_case_sensitive_file_names())
+                && deps::has_prefix(
+                    &module_file_to_try,
+                    &main_export_file,
+                    host.use_case_sensitive_file_names(),
+                )
                 && tspath::compare_paths(
                     &tspath::get_directory_path(&module_file_to_try),
                     tspath::remove_trailing_directory_separator(&main_export_file),
                     &compare_opt,
                 ) == 0
-                && tspath::remove_file_extension(&tspath::get_base_file_name(&module_file_to_try)) == "index"
+                && tspath::remove_file_extension(&tspath::get_base_file_name(&module_file_to_try))
+                    == "index"
         }) {
             // if mainExportFile is a directory, which contains moduleFileToTry, we just try index file
             // example mainExportFile: `pkg/lib` and moduleFileToTry: `pkg/lib/index`, we can use packageRootPath
             // but this behavior is deprecated for packages with "type": "module", so we only do this for packages without "type": "module"
             // and make sure that the extension on index.{???} is something that supports omitting the extension
-            return PkgJsonDirAttemptResult { package_root_path, module_file_to_try, ..Default::default() };
+            return PkgJsonDirAttemptResult {
+                package_root_path,
+                module_file_to_try,
+                ..Default::default()
+            };
         }
     }
 
-    PkgJsonDirAttemptResult { module_file_to_try, ..Default::default() }
+    PkgJsonDirAttemptResult {
+        module_file_to_try,
+        ..Default::default()
+    }
 }
 
 // Go: modulespecifiers/specifiers.go:986 tryGetModuleNameFromExports
@@ -1098,8 +1278,10 @@ fn try_get_module_name_from_exports(
         // * pattern mappings (contains a *)
         // * exact mappings (no *, does not end with /)
         for (k, subk) in exports.as_object() {
-            let sub_package_name =
-                tspath::get_normalized_absolute_path(&tspath::combine_paths(package_name, &[k]), "");
+            let sub_package_name = tspath::get_normalized_absolute_path(
+                &tspath::combine_paths(package_name, &[k]),
+                "",
+            );
             let mut mode = MatchingMode::Exact;
             if k.ends_with('/') {
                 mode = MatchingMode::Directory;
@@ -1150,11 +1332,13 @@ fn try_get_module_name_from_package_json_imports(
         return String::new();
     }
 
-    let ancestor_directory_with_package_json = host.get_nearest_ancestor_directory_with_package_json(source_directory);
+    let ancestor_directory_with_package_json =
+        host.get_nearest_ancestor_directory_with_package_json(source_directory);
     if ancestor_directory_with_package_json.is_empty() {
         return String::new();
     }
-    let package_json_path = tspath::combine_paths(&ancestor_directory_with_package_json, &["package.json"]);
+    let package_json_path =
+        tspath::combine_paths(&ancestor_directory_with_package_json, &["package.json"]);
 
     let Some(info) = host.get_package_json_info(&package_json_path) else {
         return String::new();
@@ -1162,7 +1346,11 @@ fn try_get_module_name_from_package_json_imports(
 
     // PORT: Go dereferences `GetContents()` without a nil check. The host
     // only returns entries whose package.json was read.
-    let imports = &info.get_contents().expect("package.json contents").fields.imports;
+    let imports = &info
+        .get_contents()
+        .expect("package.json contents")
+        .fields
+        .imports;
     match imports {
         JSONValue::NotPresent | JSONValue::Array(_) | JSONValue::String(_) => {
             return String::new(); // not present or invalid for imports
@@ -1228,7 +1416,8 @@ fn try_get_module_name_from_paths(
     for (key, values) in paths {
         for pattern_text in values {
             let normalized = tspath::normalize_path(pattern_text);
-            let mut pattern = get_relative_path_if_in_same_volume(&normalized, base_directory, case_sensitive);
+            let mut pattern =
+                get_relative_path_if_in_same_volume(&normalized, base_directory, case_sensitive);
             if pattern.is_empty() {
                 pattern = normalized;
             }
@@ -1241,8 +1430,12 @@ fn try_get_module_name_from_paths(
 
             let mut candidates: Vec<SpecPair> = Vec::new();
             for ending in allowed_endings {
-                let result = process_ending(relative_to_base_url, &[*ending], compiler_options, host);
-                candidates.push(SpecPair { ending: *ending, value: result });
+                let result =
+                    process_ending(relative_to_base_url, &[*ending], compiler_options, host);
+                candidates.push(SpecPair {
+                    ending: *ending,
+                    value: result,
+                });
             }
             if !tspath::try_get_extension_from_path(&pattern).is_empty() {
                 candidates.push(SpecPair {
@@ -1265,7 +1458,9 @@ fn try_get_module_name_from_paths(
                         }
                     }
                 }
-            } else if candidates.iter().any(|c| c.ending != ModuleSpecifierEnding::Minimal && pattern == c.value)
+            } else if candidates
+                .iter()
+                .any(|c| c.ending != ModuleSpecifierEnding::Minimal && pattern == c.value)
                 || candidates.iter().any(|c| {
                     c.ending == ModuleSpecifierEnding::Minimal
                         && pattern == c.value
@@ -1318,13 +1513,22 @@ fn try_get_module_name_from_exports_or_imports(
             let mut output_file = String::new();
             let mut declaration_file = String::new();
             if is_imports {
-                output_file = deps::get_output_js_file_name_worker(target_file_path, options, host.as_output_paths_host());
-                declaration_file =
-                    deps::get_output_declaration_file_name_worker(target_file_path, options, host.as_output_paths_host());
+                output_file = deps::get_output_js_file_name_worker(
+                    target_file_path,
+                    options,
+                    host.as_output_paths_host(),
+                );
+                declaration_file = deps::get_output_declaration_file_name_worker(
+                    target_file_path,
+                    options,
+                    host.as_output_paths_host(),
+                );
             }
 
-            let path_or_pattern =
-                tspath::get_normalized_absolute_path(&tspath::combine_paths(package_directory, &[str_value]), "");
+            let path_or_pattern = tspath::get_normalized_absolute_path(
+                &tspath::combine_paths(package_directory, &[str_value]),
+                "",
+            );
             let mut extension_swapped_target = String::new();
             if tspath::has_ts_file_extension(target_file_path) {
                 extension_swapped_target = format!(
@@ -1333,8 +1537,8 @@ fn try_get_module_name_from_exports_or_imports(
                     deps::try_get_js_extension_for_file(target_file_path, options)
                 );
             }
-            let can_try_ts_extension =
-                prefer_ts_extension && tspath::has_implementation_ts_file_extension(target_file_path);
+            let can_try_ts_extension = prefer_ts_extension
+                && tspath::has_implementation_ts_file_extension(target_file_path);
 
             let compare_opts = tspath::ComparePathsOptions {
                 use_case_sensitive_file_names: host.use_case_sensitive_file_names(),
@@ -1344,11 +1548,22 @@ fn try_get_module_name_from_exports_or_imports(
             match mode {
                 MatchingMode::Exact => {
                     if !extension_swapped_target.is_empty()
-                        && tspath::compare_paths(&extension_swapped_target, &path_or_pattern, &compare_opts) == 0
-                        || tspath::compare_paths(target_file_path, &path_or_pattern, &compare_opts) == 0
-                        || !output_file.is_empty() && tspath::compare_paths(&output_file, &path_or_pattern, &compare_opts) == 0
+                        && tspath::compare_paths(
+                            &extension_swapped_target,
+                            &path_or_pattern,
+                            &compare_opts,
+                        ) == 0
+                        || tspath::compare_paths(target_file_path, &path_or_pattern, &compare_opts)
+                            == 0
+                        || !output_file.is_empty()
+                            && tspath::compare_paths(&output_file, &path_or_pattern, &compare_opts)
+                                == 0
                         || !declaration_file.is_empty()
-                            && tspath::compare_paths(&declaration_file, &path_or_pattern, &compare_opts) == 0
+                            && tspath::compare_paths(
+                                &declaration_file,
+                                &path_or_pattern,
+                                &compare_opts,
+                            ) == 0
                     {
                         return package_name.to_string();
                     }
@@ -1356,19 +1571,31 @@ fn try_get_module_name_from_exports_or_imports(
                 MatchingMode::Directory => {
                     let from_fragment = |fragment: &str| {
                         tspath::get_normalized_absolute_path(
-                            &tspath::combine_paths(&tspath::combine_paths(package_name, &[str_value]), &[fragment]),
+                            &tspath::combine_paths(
+                                &tspath::combine_paths(package_name, &[str_value]),
+                                &[fragment],
+                            ),
                             "",
                         )
                     };
                     // PORT: Go passes the arguments in this order
                     // (`targetFilePath` as the parent).
-                    if can_try_ts_extension && tspath::contains_path(target_file_path, &path_or_pattern, &compare_opts) {
-                        let fragment =
-                            tspath::get_relative_path_from_directory(&path_or_pattern, target_file_path, &compare_opts);
+                    if can_try_ts_extension
+                        && tspath::contains_path(target_file_path, &path_or_pattern, &compare_opts)
+                    {
+                        let fragment = tspath::get_relative_path_from_directory(
+                            &path_or_pattern,
+                            target_file_path,
+                            &compare_opts,
+                        );
                         return from_fragment(&fragment);
                     }
                     if !extension_swapped_target.is_empty()
-                        && tspath::contains_path(&path_or_pattern, &extension_swapped_target, &compare_opts)
+                        && tspath::contains_path(
+                            &path_or_pattern,
+                            &extension_swapped_target,
+                            &compare_opts,
+                        )
                     {
                         let fragment = tspath::get_relative_path_from_directory(
                             &path_or_pattern,
@@ -1377,29 +1604,44 @@ fn try_get_module_name_from_exports_or_imports(
                         );
                         return from_fragment(&fragment);
                     }
-                    if !can_try_ts_extension && tspath::contains_path(&path_or_pattern, target_file_path, &compare_opts) {
-                        let fragment =
-                            tspath::get_relative_path_from_directory(&path_or_pattern, target_file_path, &compare_opts);
+                    if !can_try_ts_extension
+                        && tspath::contains_path(&path_or_pattern, target_file_path, &compare_opts)
+                    {
+                        let fragment = tspath::get_relative_path_from_directory(
+                            &path_or_pattern,
+                            target_file_path,
+                            &compare_opts,
+                        );
                         return from_fragment(&fragment);
                     }
-                    if !output_file.is_empty() && tspath::contains_path(&path_or_pattern, &output_file, &compare_opts) {
-                        let fragment =
-                            tspath::get_relative_path_from_directory(&path_or_pattern, &output_file, &compare_opts);
+                    if !output_file.is_empty()
+                        && tspath::contains_path(&path_or_pattern, &output_file, &compare_opts)
+                    {
+                        let fragment = tspath::get_relative_path_from_directory(
+                            &path_or_pattern,
+                            &output_file,
+                            &compare_opts,
+                        );
                         return tspath::combine_paths(package_name, &[&fragment]);
                     }
                     if !declaration_file.is_empty()
                         && tspath::contains_path(&path_or_pattern, &declaration_file, &compare_opts)
                     {
-                        let fragment =
-                            tspath::get_relative_path_from_directory(&path_or_pattern, &declaration_file, &compare_opts);
+                        let fragment = tspath::get_relative_path_from_directory(
+                            &path_or_pattern,
+                            &declaration_file,
+                            &compare_opts,
+                        );
                         let js_extension = get_js_extension_for_file(&declaration_file, options);
-                        let fragment_with_js_extension = tspath::change_extension(&fragment, js_extension);
+                        let fragment_with_js_extension =
+                            tspath::change_extension(&fragment, js_extension);
                         return tspath::combine_paths(package_name, &[&fragment_with_js_extension]);
                     }
                 }
                 MatchingMode::Pattern => {
-                    let (leading_slice, trailing_slice) =
-                        path_or_pattern.split_once('*').unwrap_or((path_or_pattern.as_str(), ""));
+                    let (leading_slice, trailing_slice) = path_or_pattern
+                        .split_once('*')
+                        .unwrap_or((path_or_pattern.as_str(), ""));
                     let case_sensitive = host.use_case_sensitive_file_names();
                     fn star_replacement<'s>(s: &'s str, leading: &str, trailing: &str) -> &'s str {
                         &s[leading.len()..s.len() - trailing.len()]
@@ -1412,7 +1654,10 @@ fn try_get_module_name_from_exports_or_imports(
                             case_sensitive,
                         )
                     {
-                        return replace_first_star(package_name, star_replacement(target_file_path, leading_slice, trailing_slice));
+                        return replace_first_star(
+                            package_name,
+                            star_replacement(target_file_path, leading_slice, trailing_slice),
+                        );
                     }
                     if !extension_swapped_target.is_empty()
                         && deps::has_prefix_and_suffix_without_overlap(
@@ -1422,7 +1667,14 @@ fn try_get_module_name_from_exports_or_imports(
                             case_sensitive,
                         )
                     {
-                        return replace_first_star(package_name, star_replacement(&extension_swapped_target, leading_slice, trailing_slice));
+                        return replace_first_star(
+                            package_name,
+                            star_replacement(
+                                &extension_swapped_target,
+                                leading_slice,
+                                trailing_slice,
+                            ),
+                        );
                     }
                     if !can_try_ts_extension
                         && deps::has_prefix_and_suffix_without_overlap(
@@ -1432,7 +1684,10 @@ fn try_get_module_name_from_exports_or_imports(
                             case_sensitive,
                         )
                     {
-                        return replace_first_star(package_name, star_replacement(target_file_path, leading_slice, trailing_slice));
+                        return replace_first_star(
+                            package_name,
+                            star_replacement(target_file_path, leading_slice, trailing_slice),
+                        );
                     }
                     if !output_file.is_empty()
                         && deps::has_prefix_and_suffix_without_overlap(
@@ -1442,7 +1697,10 @@ fn try_get_module_name_from_exports_or_imports(
                             case_sensitive,
                         )
                     {
-                        return replace_first_star(package_name, star_replacement(&output_file, leading_slice, trailing_slice));
+                        return replace_first_star(
+                            package_name,
+                            star_replacement(&output_file, leading_slice, trailing_slice),
+                        );
                     }
                     if !declaration_file.is_empty()
                         && deps::has_prefix_and_suffix_without_overlap(
@@ -1452,8 +1710,12 @@ fn try_get_module_name_from_exports_or_imports(
                             case_sensitive,
                         )
                     {
-                        let substituted = replace_first_star(package_name, star_replacement(&declaration_file, leading_slice, trailing_slice));
-                        let js_extension = deps::try_get_js_extension_for_file(&declaration_file, options);
+                        let substituted = replace_first_star(
+                            package_name,
+                            star_replacement(&declaration_file, leading_slice, trailing_slice),
+                        );
+                        let js_extension =
+                            deps::try_get_js_extension_for_file(&declaration_file, options);
                         if !js_extension.is_empty() {
                             return tspath::change_full_extension(&substituted, js_extension);
                         }
@@ -1487,7 +1749,8 @@ fn try_get_module_name_from_exports_or_imports(
             for (key, value) in obj {
                 if key == "default"
                     || conditions.iter().any(|c| c == key)
-                    || conditions.iter().any(|c| c == "types") && deps::is_applicable_versioned_types_key(key)
+                    || conditions.iter().any(|c| c == "types")
+                        && deps::is_applicable_versioned_types_key(key)
                 {
                     let result = try_get_module_name_from_exports_or_imports(
                         options,
@@ -1578,7 +1841,14 @@ fn get_module_specifier_with_preferences(
     options: ModuleSpecifierOptions,
 ) -> String {
     let info = get_info(importing_source_file_name, host);
-    let module_paths = get_all_module_paths(&info, to_file_name, host, compiler_options, user_preferences, options);
+    let module_paths = get_all_module_paths(
+        &info,
+        to_file_name,
+        host,
+        compiler_options,
+        user_preferences,
+        options,
+    );
     let preferences = get_module_specifier_preferences(
         user_preferences,
         host,
@@ -1608,5 +1878,13 @@ fn get_module_specifier_with_preferences(
         }
     }
 
-    get_local_module_specifier(to_file_name, &info, compiler_options, host, resolution_mode, &preferences, false)
+    get_local_module_specifier(
+        to_file_name,
+        &info,
+        compiler_options,
+        host,
+        resolution_mode,
+        &preferences,
+        false,
+    )
 }

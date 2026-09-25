@@ -13,7 +13,10 @@ fn opt(o: CommandLineOption) -> &'static CommandLineOption {
 }
 
 /// Go `slices.Concat` for declaration lists.
-fn concat_options(a: &[&'static CommandLineOption], b: &[&'static CommandLineOption]) -> Vec<&'static CommandLineOption> {
+fn concat_options(
+    a: &[&'static CommandLineOption],
+    b: &[&'static CommandLineOption],
+) -> Vec<&'static CommandLineOption> {
     a.iter().chain(b.iter()).copied().collect()
 }
 
@@ -26,8 +29,9 @@ pub static OPTIONS_DECLARATIONS: LazyLock<Vec<&'static CommandLineOption>> =
     LazyLock::new(|| concat_options(&COMMON_OPTIONS_WITH_BUILD, &OPTIONS_FOR_COMPILER));
 
 // Go: tsoptions/declscompiler.go:13 commonOptionsWithBuild
-pub static COMMON_OPTIONS_WITH_BUILD: LazyLock<Vec<&'static CommandLineOption>> = LazyLock::new(|| {
-    vec![
+pub static COMMON_OPTIONS_WITH_BUILD: LazyLock<Vec<&'static CommandLineOption>> = LazyLock::new(
+    || {
+        vec![
     //******* commonOptionsWithBuild *******
     opt(CommandLineOption {
         name: "help",
@@ -296,7 +300,8 @@ pub static COMMON_OPTIONS_WITH_BUILD: LazyLock<Vec<&'static CommandLineOption>> 
         ..Default::default()
     }),
     ]
-});
+    },
+);
 
 // Go: tsoptions/declscompiler.go:255 optionsForCompiler
 pub static OPTIONS_FOR_COMPILER: LazyLock<Vec<&'static CommandLineOption>> = LazyLock::new(|| {
@@ -1352,42 +1357,89 @@ pub static OPTIONS_FOR_COMPILER: LazyLock<Vec<&'static CommandLineOption>> = Laz
 // The Go field index `i` is the index in this list (the unexported
 // `noCopy` field is not in it).
 #[must_use]
-pub fn compiler_options_field_values(o: &CompilerOptions) -> Vec<(&'static str, CompilerOptionsValue)> {
+pub fn compiler_options_field_values(
+    o: &CompilerOptions,
+) -> Vec<(&'static str, CompilerOptionsValue)> {
     use CompilerOptionsValue as V;
     // PORT: Go `TypeRoots` is `[]string`; Rust keeps `Option<Vec<String>>`.
     // Go nil and empty slices differ under `reflect.DeepEqual`; the Rust
     // `Vec<String>` fields cannot keep that difference.
     vec![
         ("AllowJs", V::Tristate(o.allow_js)),
-        ("AllowArbitraryExtensions", V::Tristate(o.allow_arbitrary_extensions)),
-        ("AllowImportingTsExtensions", V::Tristate(o.allow_importing_ts_extensions)),
-        ("AllowNonTsExtensions", V::Tristate(o.allow_non_ts_extensions)),
-        ("AllowUmdGlobalAccess", V::Tristate(o.allow_umd_global_access)),
-        ("AllowUnreachableCode", V::Tristate(o.allow_unreachable_code)),
+        (
+            "AllowArbitraryExtensions",
+            V::Tristate(o.allow_arbitrary_extensions),
+        ),
+        (
+            "AllowImportingTsExtensions",
+            V::Tristate(o.allow_importing_ts_extensions),
+        ),
+        (
+            "AllowNonTsExtensions",
+            V::Tristate(o.allow_non_ts_extensions),
+        ),
+        (
+            "AllowUmdGlobalAccess",
+            V::Tristate(o.allow_umd_global_access),
+        ),
+        (
+            "AllowUnreachableCode",
+            V::Tristate(o.allow_unreachable_code),
+        ),
         ("AllowUnusedLabels", V::Tristate(o.allow_unused_labels)),
-        ("AssumeChangesOnlyAffectDirectDependencies", V::Tristate(o.assume_changes_only_affect_direct_dependencies)),
+        (
+            "AssumeChangesOnlyAffectDirectDependencies",
+            V::Tristate(o.assume_changes_only_affect_direct_dependencies),
+        ),
         ("CheckJs", V::Tristate(o.check_js)),
-        ("CustomConditions", V::StringList(o.custom_conditions.clone())),
+        (
+            "CustomConditions",
+            V::StringList(o.custom_conditions.clone()),
+        ),
         ("Composite", V::Tristate(o.composite)),
         ("EmitDeclarationOnly", V::Tristate(o.emit_declaration_only)),
         ("EmitBOM", V::Tristate(o.emit_bom)),
-        ("EmitDecoratorMetadata", V::Tristate(o.emit_decorator_metadata)),
+        (
+            "EmitDecoratorMetadata",
+            V::Tristate(o.emit_decorator_metadata),
+        ),
         ("Declaration", V::Tristate(o.declaration)),
         ("DeclarationDir", V::String(o.declaration_dir.clone())),
         ("DeclarationMap", V::Tristate(o.declaration_map)),
         ("DeduplicatePackages", V::Tristate(o.deduplicate_packages)),
         ("DisableSizeLimit", V::Tristate(o.disable_size_limit)),
-        ("DisableSourceOfProjectReferenceRedirect", V::Tristate(o.disable_source_of_project_reference_redirect)),
-        ("DisableSolutionSearching", V::Tristate(o.disable_solution_searching)),
-        ("DisableReferencedProjectLoad", V::Tristate(o.disable_referenced_project_load)),
+        (
+            "DisableSourceOfProjectReferenceRedirect",
+            V::Tristate(o.disable_source_of_project_reference_redirect),
+        ),
+        (
+            "DisableSolutionSearching",
+            V::Tristate(o.disable_solution_searching),
+        ),
+        (
+            "DisableReferencedProjectLoad",
+            V::Tristate(o.disable_referenced_project_load),
+        ),
         ("ErasableSyntaxOnly", V::Tristate(o.erasable_syntax_only)),
-        ("ExactOptionalPropertyTypes", V::Tristate(o.exact_optional_property_types)),
-        ("ExperimentalDecorators", V::Tristate(o.experimental_decorators)),
-        ("ForceConsistentCasingInFileNames", V::Tristate(o.force_consistent_casing_in_file_names)),
+        (
+            "ExactOptionalPropertyTypes",
+            V::Tristate(o.exact_optional_property_types),
+        ),
+        (
+            "ExperimentalDecorators",
+            V::Tristate(o.experimental_decorators),
+        ),
+        (
+            "ForceConsistentCasingInFileNames",
+            V::Tristate(o.force_consistent_casing_in_file_names),
+        ),
         ("IsolatedModules", V::Tristate(o.isolated_modules)),
         ("IsolatedDeclarations", V::Tristate(o.isolated_declarations)),
         ("IgnoreConfig", V::Tristate(o.ignore_config)),
-        ("IgnoreDeprecations", V::String(o.ignore_deprecations.clone())),
+        (
+            "IgnoreDeprecations",
+            V::String(o.ignore_deprecations.clone()),
+        ),
         ("ImportHelpers", V::Tristate(o.import_helpers)),
         ("InlineSourceMap", V::Tristate(o.inline_source_map)),
         ("InlineSources", V::Tristate(o.inline_sources)),
@@ -1395,44 +1447,74 @@ pub fn compiler_options_field_values(o: &CompilerOptions) -> Vec<(&'static str, 
         ("Incremental", V::Tristate(o.incremental)),
         ("Jsx", V::JsxEmit(o.jsx)),
         ("JsxFactory", V::String(o.jsx_factory.clone())),
-        ("JsxFragmentFactory", V::String(o.jsx_fragment_factory.clone())),
+        (
+            "JsxFragmentFactory",
+            V::String(o.jsx_fragment_factory.clone()),
+        ),
         ("JsxImportSource", V::String(o.jsx_import_source.clone())),
         ("Lib", V::StringList(o.lib.clone())),
         ("LibReplacement", V::Tristate(o.lib_replacement)),
         ("Locale", V::String(o.locale.clone())),
         ("MapRoot", V::String(o.map_root.clone())),
         ("Module", V::ModuleKind(o.module)),
-        ("ModuleResolution", V::ModuleResolutionKind(o.module_resolution)),
+        (
+            "ModuleResolution",
+            V::ModuleResolutionKind(o.module_resolution),
+        ),
         ("ModuleSuffixes", V::StringList(o.module_suffixes.clone())),
-        ("ModuleDetection", V::ModuleDetectionKind(o.module_detection)),
+        (
+            "ModuleDetection",
+            V::ModuleDetectionKind(o.module_detection),
+        ),
         ("NewLine", V::NewLineKind(o.new_line)),
         ("NoEmit", V::Tristate(o.no_emit)),
         ("NoCheck", V::Tristate(o.no_check)),
         ("NoErrorTruncation", V::Tristate(o.no_error_truncation)),
-        ("NoFallthroughCasesInSwitch", V::Tristate(o.no_fallthrough_cases_in_switch)),
+        (
+            "NoFallthroughCasesInSwitch",
+            V::Tristate(o.no_fallthrough_cases_in_switch),
+        ),
         ("NoImplicitAny", V::Tristate(o.no_implicit_any)),
         ("NoImplicitThis", V::Tristate(o.no_implicit_this)),
         ("NoImplicitReturns", V::Tristate(o.no_implicit_returns)),
         ("NoEmitHelpers", V::Tristate(o.no_emit_helpers)),
         ("NoLib", V::Tristate(o.no_lib)),
-        ("NoPropertyAccessFromIndexSignature", V::Tristate(o.no_property_access_from_index_signature)),
-        ("NoUncheckedIndexedAccess", V::Tristate(o.no_unchecked_indexed_access)),
+        (
+            "NoPropertyAccessFromIndexSignature",
+            V::Tristate(o.no_property_access_from_index_signature),
+        ),
+        (
+            "NoUncheckedIndexedAccess",
+            V::Tristate(o.no_unchecked_indexed_access),
+        ),
         ("NoEmitOnError", V::Tristate(o.no_emit_on_error)),
         ("NoUnusedLocals", V::Tristate(o.no_unused_locals)),
         ("NoUnusedParameters", V::Tristate(o.no_unused_parameters)),
         ("NoResolve", V::Tristate(o.no_resolve)),
         ("NoImplicitOverride", V::Tristate(o.no_implicit_override)),
-        ("NoUncheckedSideEffectImports", V::Tristate(o.no_unchecked_side_effect_imports)),
+        (
+            "NoUncheckedSideEffectImports",
+            V::Tristate(o.no_unchecked_side_effect_imports),
+        ),
         ("OutDir", V::String(o.out_dir.clone())),
         ("Paths", V::Paths(o.paths.clone())),
         ("PreserveConstEnums", V::Tristate(o.preserve_const_enums)),
         ("PreserveSymlinks", V::Tristate(o.preserve_symlinks)),
         ("Project", V::String(o.project.clone())),
         ("ResolveJsonModule", V::Tristate(o.resolve_json_module)),
-        ("ResolvePackageJsonExports", V::Tristate(o.resolve_package_json_exports)),
-        ("ResolvePackageJsonImports", V::Tristate(o.resolve_package_json_imports)),
+        (
+            "ResolvePackageJsonExports",
+            V::Tristate(o.resolve_package_json_exports),
+        ),
+        (
+            "ResolvePackageJsonImports",
+            V::Tristate(o.resolve_package_json_imports),
+        ),
         ("RemoveComments", V::Tristate(o.remove_comments)),
-        ("RewriteRelativeImportExtensions", V::Tristate(o.rewrite_relative_import_extensions)),
+        (
+            "RewriteRelativeImportExtensions",
+            V::Tristate(o.rewrite_relative_import_extensions),
+        ),
         ("ReactNamespace", V::String(o.react_namespace.clone())),
         ("RootDir", V::String(o.root_dir.clone())),
         ("RootDirs", V::StringList(o.root_dirs.clone())),
@@ -1440,25 +1522,52 @@ pub fn compiler_options_field_values(o: &CompilerOptions) -> Vec<(&'static str, 
         ("StableTypeOrdering", V::Tristate(o.stable_type_ordering)),
         ("Strict", V::Tristate(o.strict)),
         ("StrictBindCallApply", V::Tristate(o.strict_bind_call_apply)),
-        ("StrictBuiltinIteratorReturn", V::Tristate(o.strict_builtin_iterator_return)),
+        (
+            "StrictBuiltinIteratorReturn",
+            V::Tristate(o.strict_builtin_iterator_return),
+        ),
         ("StrictFunctionTypes", V::Tristate(o.strict_function_types)),
         ("StrictNullChecks", V::Tristate(o.strict_null_checks)),
-        ("StrictPropertyInitialization", V::Tristate(o.strict_property_initialization)),
+        (
+            "StrictPropertyInitialization",
+            V::Tristate(o.strict_property_initialization),
+        ),
         ("StripInternal", V::Tristate(o.strip_internal)),
         ("SkipDefaultLibCheck", V::Tristate(o.skip_default_lib_check)),
         ("SourceMap", V::Tristate(o.source_map)),
         ("SourceRoot", V::String(o.source_root.clone())),
-        ("SuppressOutputPathCheck", V::Tristate(o.suppress_output_path_check)),
+        (
+            "SuppressOutputPathCheck",
+            V::Tristate(o.suppress_output_path_check),
+        ),
         ("Target", V::ScriptTarget(o.target)),
         ("TraceResolution", V::Tristate(o.trace_resolution)),
         ("TsBuildInfoFile", V::String(o.ts_build_info_file.clone())),
-        ("TypeRoots", V::StringList(o.type_roots.clone().unwrap_or_default())),
+        (
+            "TypeRoots",
+            V::StringList(o.type_roots.clone().unwrap_or_default()),
+        ),
         ("Types", V::StringList(o.types.clone())),
-        ("UseDefineForClassFields", V::Tristate(o.use_define_for_class_fields)),
-        ("UseUnknownInCatchVariables", V::Tristate(o.use_unknown_in_catch_variables)),
-        ("VerbatimModuleSyntax", V::Tristate(o.verbatim_module_syntax)),
-        ("MaxNodeModuleJsDepth", V::IntPtr(o.max_node_module_js_depth.clone())),
-        ("AllowSyntheticDefaultImports", V::Tristate(o.allow_synthetic_default_imports)),
+        (
+            "UseDefineForClassFields",
+            V::Tristate(o.use_define_for_class_fields),
+        ),
+        (
+            "UseUnknownInCatchVariables",
+            V::Tristate(o.use_unknown_in_catch_variables),
+        ),
+        (
+            "VerbatimModuleSyntax",
+            V::Tristate(o.verbatim_module_syntax),
+        ),
+        (
+            "MaxNodeModuleJsDepth",
+            V::IntPtr(o.max_node_module_js_depth.clone()),
+        ),
+        (
+            "AllowSyntheticDefaultImports",
+            V::Tristate(o.allow_synthetic_default_imports),
+        ),
         ("AlwaysStrict", V::Tristate(o.always_strict)),
         ("BaseUrl", V::String(o.base_url.clone())),
         ("DownlevelIteration", V::Tristate(o.downlevel_iteration)),
@@ -1469,7 +1578,10 @@ pub fn compiler_options_field_values(o: &CompilerOptions) -> Vec<(&'static str, 
         ("PathsBasePath", V::String(o.paths_base_path.clone())),
         ("Diagnostics", V::Tristate(o.diagnostics)),
         ("ExtendedDiagnostics", V::Tristate(o.extended_diagnostics)),
-        ("GenerateCpuProfile", V::String(o.generate_cpu_profile.clone())),
+        (
+            "GenerateCpuProfile",
+            V::String(o.generate_cpu_profile.clone()),
+        ),
         ("GenerateTrace", V::String(o.generate_trace.clone())),
         ("ListEmittedFiles", V::Tristate(o.list_emitted_files)),
         ("ListFiles", V::Tristate(o.list_files)),
@@ -1511,10 +1623,15 @@ pub fn options_have_changes(
     for_each_compiler_option_value(new_options, decl_filter, &mut |option, new_value, i| {
         let old_value = &old_options_value[i].1;
         if option.strict_flag {
-            let (CompilerOptionsValue::Tristate(old_value), CompilerOptionsValue::Tristate(new_value)) = (old_value, &new_value) else {
+            let (
+                CompilerOptionsValue::Tristate(old_value),
+                CompilerOptionsValue::Tristate(new_value),
+            ) = (old_value, &new_value)
+            else {
                 panic!("strict option is not a Tristate");
             };
-            return old_options.get_strict_option_value(*old_value) != new_options.get_strict_option_value(*new_value);
+            return old_options.get_strict_option_value(*old_value)
+                != new_options.get_strict_option_value(*new_value);
         }
         if option.allow_js_flag {
             return old_options.get_allow_js() != new_options.get_allow_js();
@@ -1529,7 +1646,10 @@ pub fn for_each_compiler_option_value(
     decl_filter: &dyn Fn(&CommandLineOption) -> bool,
     f: &mut dyn FnMut(&'static CommandLineOption, CompilerOptionsValue, usize) -> bool,
 ) -> bool {
-    for (i, (field_name, value)) in compiler_options_field_values(options).into_iter().enumerate() {
+    for (i, (field_name, value)) in compiler_options_field_values(options)
+        .into_iter()
+        .enumerate()
+    {
         if let Some(option_declaration) = COMMAND_LINE_COMPILER_OPTIONS_MAP.get(field_name) {
             if decl_filter(option_declaration) && f(option_declaration, value, i) {
                 return true;
@@ -1545,7 +1665,9 @@ pub fn compiler_options_affect_semantic_diagnostics(
     old_options: Option<&CompilerOptions>,
     new_options: Option<&CompilerOptions>,
 ) -> bool {
-    options_have_changes(old_options, new_options, &|option| option.affects_semantic_diagnostics)
+    options_have_changes(old_options, new_options, &|option| {
+        option.affects_semantic_diagnostics
+    })
 }
 
 // Go: tsoptions/declscompiler.go:1251 CompilerOptionsAffectDeclarationPath
@@ -1554,12 +1676,17 @@ pub fn compiler_options_affect_declaration_path(
     old_options: Option<&CompilerOptions>,
     new_options: Option<&CompilerOptions>,
 ) -> bool {
-    options_have_changes(old_options, new_options, &|option| option.affects_declaration_path)
+    options_have_changes(old_options, new_options, &|option| {
+        option.affects_declaration_path
+    })
 }
 
 // Go: tsoptions/declscompiler.go:1260 CompilerOptionsAffectEmit
 #[must_use]
-pub fn compiler_options_affect_emit(old_options: Option<&CompilerOptions>, new_options: Option<&CompilerOptions>) -> bool {
+pub fn compiler_options_affect_emit(
+    old_options: Option<&CompilerOptions>,
+    new_options: Option<&CompilerOptions>,
+) -> bool {
     options_have_changes(old_options, new_options, &|option| option.affects_emit)
 }
 
@@ -1568,16 +1695,20 @@ pub fn compiler_options_affect_emit(old_options: Option<&CompilerOptions>, new_o
 // ---------------------------------------------------------------------------
 
 // Go: tsoptions/namemap.go:9 CompilerNameMap
-pub static COMPILER_NAME_MAP: LazyLock<NameMap> = LazyLock::new(|| get_name_map_from_list(&OPTIONS_DECLARATIONS));
+pub static COMPILER_NAME_MAP: LazyLock<NameMap> =
+    LazyLock::new(|| get_name_map_from_list(&OPTIONS_DECLARATIONS));
 // Go: tsoptions/namemap.go:10 BuildNameMap
-pub static BUILD_NAME_MAP: LazyLock<NameMap> = LazyLock::new(|| get_name_map_from_list(&BUILD_OPTS));
+pub static BUILD_NAME_MAP: LazyLock<NameMap> =
+    LazyLock::new(|| get_name_map_from_list(&BUILD_OPTS));
 // Go: tsoptions/namemap.go:11 WatchNameMap
-pub static WATCH_NAME_MAP: LazyLock<NameMap> = LazyLock::new(|| get_name_map_from_list(&OPTIONS_FOR_WATCH));
+pub static WATCH_NAME_MAP: LazyLock<NameMap> =
+    LazyLock::new(|| get_name_map_from_list(&OPTIONS_FOR_WATCH));
 
 // Go: tsoptions/namemap.go:14 GetNameMapFromList
 #[must_use]
 pub fn get_name_map_from_list(opt_decls: &[&'static CommandLineOption]) -> NameMap {
-    let mut options_names: IndexMap<String, &'static CommandLineOption> = IndexMap::with_capacity(opt_decls.len());
+    let mut options_names: IndexMap<String, &'static CommandLineOption> =
+        IndexMap::with_capacity(opt_decls.len());
     let mut short_option_names: FxHashMap<String, String> = FxHashMap::default();
     for &option in opt_decls {
         options_names.insert(option.name.to_lowercase(), option);
@@ -1585,7 +1716,10 @@ pub fn get_name_map_from_list(opt_decls: &[&'static CommandLineOption]) -> NameM
             short_option_names.insert(option.short_name.to_string(), option.name.to_string());
         }
     }
-    NameMap { options_names, short_option_names }
+    NameMap {
+        options_names,
+        short_option_names,
+    }
 }
 
 // Go: tsoptions/namemap.go:29 NameMap
@@ -1616,7 +1750,11 @@ impl NameMap {
 
     // Go: tsoptions/namemap.go:47 GetOptionDeclarationFromName
     #[must_use]
-    pub fn get_option_declaration_from_name(&self, option_name: &str, allow_short: bool) -> Option<&'static CommandLineOption> {
+    pub fn get_option_declaration_from_name(
+        &self,
+        option_name: &str,
+        allow_short: bool,
+    ) -> Option<&'static CommandLineOption> {
         let mut option_name = option_name.to_lowercase();
         // Try to translate short option names to their full equivalents.
         if allow_short {
@@ -1650,58 +1788,62 @@ pub static TSC_BUILD_OPTION: LazyLock<CommandLineOption> = LazyLock::new(|| Comm
 pub static OPTIONS_FOR_BUILD: LazyLock<Vec<&'static CommandLineOption>> = LazyLock::new(|| {
     vec![
         &*TSC_BUILD_OPTION,
-    opt(CommandLineOption {
-        name: "verbose",
-        short_name: "v",
-        category: Some(diag::Command_line_Options),
-        description: Some(diag::Enable_verbose_logging),
-        kind: CommandLineOptionKind::BOOLEAN,
-        default_value_description: CompilerOptionsValue::Bool(false),
-        ..Default::default()
-    }),
-    opt(CommandLineOption {
-        name: "dry",
-        short_name: "d",
-        category: Some(diag::Command_line_Options),
-        description: Some(diag::Show_what_would_be_built_or_deleted_if_specified_with_clean),
-        kind: CommandLineOptionKind::BOOLEAN,
-        default_value_description: CompilerOptionsValue::Bool(false),
-        ..Default::default()
-    }),
-    opt(CommandLineOption {
-        name: "force",
-        short_name: "f",
-        category: Some(diag::Command_line_Options),
-        description: Some(diag::Build_all_projects_including_those_that_appear_to_be_up_to_date),
-        kind: CommandLineOptionKind::BOOLEAN,
-        default_value_description: CompilerOptionsValue::Bool(false),
-        ..Default::default()
-    }),
-    opt(CommandLineOption {
-        name: "clean",
-        category: Some(diag::Command_line_Options),
-        description: Some(diag::Delete_the_outputs_of_all_projects),
-        kind: CommandLineOptionKind::BOOLEAN,
-        default_value_description: CompilerOptionsValue::Bool(false),
-        ..Default::default()
-    }),
-    opt(CommandLineOption {
-        name: "builders",
-        kind: CommandLineOptionKind::NUMBER,
-        category: Some(diag::Command_line_Options),
-        description: Some(diag::Set_the_number_of_projects_to_build_concurrently),
-        default_value_description: CompilerOptionsValue::Message(diag::X_4_unless_singleThreaded_is_passed),
-        min_value: 1,
-        ..Default::default()
-    }),
-    opt(CommandLineOption {
-        name: "stopBuildOnErrors",
-        category: Some(diag::Command_line_Options),
-        description: Some(diag::Skip_building_downstream_projects_on_error_in_upstream_project),
-        kind: CommandLineOptionKind::BOOLEAN,
-        default_value_description: CompilerOptionsValue::Bool(false),
-        ..Default::default()
-    }),
+        opt(CommandLineOption {
+            name: "verbose",
+            short_name: "v",
+            category: Some(diag::Command_line_Options),
+            description: Some(diag::Enable_verbose_logging),
+            kind: CommandLineOptionKind::BOOLEAN,
+            default_value_description: CompilerOptionsValue::Bool(false),
+            ..Default::default()
+        }),
+        opt(CommandLineOption {
+            name: "dry",
+            short_name: "d",
+            category: Some(diag::Command_line_Options),
+            description: Some(diag::Show_what_would_be_built_or_deleted_if_specified_with_clean),
+            kind: CommandLineOptionKind::BOOLEAN,
+            default_value_description: CompilerOptionsValue::Bool(false),
+            ..Default::default()
+        }),
+        opt(CommandLineOption {
+            name: "force",
+            short_name: "f",
+            category: Some(diag::Command_line_Options),
+            description: Some(
+                diag::Build_all_projects_including_those_that_appear_to_be_up_to_date,
+            ),
+            kind: CommandLineOptionKind::BOOLEAN,
+            default_value_description: CompilerOptionsValue::Bool(false),
+            ..Default::default()
+        }),
+        opt(CommandLineOption {
+            name: "clean",
+            category: Some(diag::Command_line_Options),
+            description: Some(diag::Delete_the_outputs_of_all_projects),
+            kind: CommandLineOptionKind::BOOLEAN,
+            default_value_description: CompilerOptionsValue::Bool(false),
+            ..Default::default()
+        }),
+        opt(CommandLineOption {
+            name: "builders",
+            kind: CommandLineOptionKind::NUMBER,
+            category: Some(diag::Command_line_Options),
+            description: Some(diag::Set_the_number_of_projects_to_build_concurrently),
+            default_value_description: CompilerOptionsValue::Message(
+                diag::X_4_unless_singleThreaded_is_passed,
+            ),
+            min_value: 1,
+            ..Default::default()
+        }),
+        opt(CommandLineOption {
+            name: "stopBuildOnErrors",
+            category: Some(diag::Command_line_Options),
+            description: Some(diag::Skip_building_downstream_projects_on_error_in_upstream_project),
+            kind: CommandLineOptionKind::BOOLEAN,
+            default_value_description: CompilerOptionsValue::Bool(false),
+            ..Default::default()
+        }),
     ]
 });
 
@@ -1810,40 +1952,42 @@ pub static OPTIONS_FOR_WATCH: LazyLock<Vec<&'static CommandLineOption>> = LazyLo
 // ---------------------------------------------------------------------------
 
 // Go: tsoptions/declstypeacquisition.go:3 typeAcquisitionDeclaration
-pub static TYPE_ACQUISITION_DECLARATION: LazyLock<&'static CommandLineOption> = LazyLock::new(|| {
-    opt(CommandLineOption {
-        name: "typeAcquisition",
-        kind: CommandLineOptionKind::OBJECT,
-        element_options: command_line_options_to_map(&TYPE_ACQUISITION_DECLS),
-        ..Default::default()
-    })
-});
+pub static TYPE_ACQUISITION_DECLARATION: LazyLock<&'static CommandLineOption> =
+    LazyLock::new(|| {
+        opt(CommandLineOption {
+            name: "typeAcquisition",
+            kind: CommandLineOptionKind::OBJECT,
+            element_options: command_line_options_to_map(&TYPE_ACQUISITION_DECLS),
+            ..Default::default()
+        })
+    });
 
 // Do not delete this without updating the website's tsconfig generation.
 // Go: tsoptions/declstypeacquisition.go:10 typeAcquisitionDecls
-pub static TYPE_ACQUISITION_DECLS: LazyLock<Vec<&'static CommandLineOption>> = LazyLock::new(|| {
-    vec![
-    opt(CommandLineOption {
-        name: "enable",
-        kind: CommandLineOptionKind::BOOLEAN,
-        default_value_description: CompilerOptionsValue::Bool(false),
-        ..Default::default()
-    }),
-    opt(CommandLineOption {
-        name: "include",
-        kind: CommandLineOptionKind::LIST,
-        ..Default::default()
-    }),
-    opt(CommandLineOption {
-        name: "exclude",
-        kind: CommandLineOptionKind::LIST,
-        ..Default::default()
-    }),
-    opt(CommandLineOption {
-        name: "disableFilenameBasedTypeAcquisition",
-        kind: CommandLineOptionKind::BOOLEAN,
-        default_value_description: CompilerOptionsValue::Bool(false),
-        ..Default::default()
-    }),
-    ]
-});
+pub static TYPE_ACQUISITION_DECLS: LazyLock<Vec<&'static CommandLineOption>> =
+    LazyLock::new(|| {
+        vec![
+            opt(CommandLineOption {
+                name: "enable",
+                kind: CommandLineOptionKind::BOOLEAN,
+                default_value_description: CompilerOptionsValue::Bool(false),
+                ..Default::default()
+            }),
+            opt(CommandLineOption {
+                name: "include",
+                kind: CommandLineOptionKind::LIST,
+                ..Default::default()
+            }),
+            opt(CommandLineOption {
+                name: "exclude",
+                kind: CommandLineOptionKind::LIST,
+                ..Default::default()
+            }),
+            opt(CommandLineOption {
+                name: "disableFilenameBasedTypeAcquisition",
+                kind: CommandLineOptionKind::BOOLEAN,
+                default_value_description: CompilerOptionsValue::Bool(false),
+                ..Default::default()
+            }),
+        ]
+    });

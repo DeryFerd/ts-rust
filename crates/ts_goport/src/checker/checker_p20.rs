@@ -41,8 +41,14 @@ impl Checker {
             SyntaxKind::ObjectBindingPattern => {
                 if has_dot_dot_dot_token(declaration) {
                     parent_type = self.get_reduced_type(parent_type);
-                    if self.ty(parent_type).flags.intersects(TypeFlags::UNKNOWN) || !self.is_valid_spread_type(parent_type) {
-                        self.error(declaration, diag::Rest_types_may_only_be_created_from_object_types, args![]);
+                    if self.ty(parent_type).flags.intersects(TypeFlags::UNKNOWN)
+                        || !self.is_valid_spread_type(parent_type)
+                    {
+                        self.error(
+                            declaration,
+                            diag::Rest_types_may_only_be_created_from_object_types,
+                            args![],
+                        );
                         return self.error_type;
                     }
                     let elements = pattern.elements();
@@ -58,7 +64,13 @@ impl Checker {
                     // Use explicitly specified property name ({ p: xxx } form), or otherwise the implied name ({ p } form)
                     let name = declaration.property_name_or_name();
                     let index_type = self.get_literal_type_from_property_name(name);
-                    let declared_type = self.get_indexed_access_type_ex(parent_type, index_type, access_flags, name, None);
+                    let declared_type = self.get_indexed_access_type_ex(
+                        parent_type,
+                        index_type,
+                        access_flags,
+                        name,
+                        None,
+                    );
                     t = self.get_flow_type_of_destructuring(declaration, declared_type);
                 }
             }
@@ -67,9 +79,18 @@ impl Checker {
                 // present (aka the tuple element property). This call also checks that the parentType is in
                 // fact an iterable or array (depending on target language).
                 let use_ = IterationUse::DESTRUCTURING
-                    | if has_dot_dot_dot_token(declaration) { IterationUse(0) } else { IterationUse::POSSIBLY_OUT_OF_BOUNDS };
+                    | if has_dot_dot_dot_token(declaration) {
+                        IterationUse(0)
+                    } else {
+                        IterationUse::POSSIBLY_OUT_OF_BOUNDS
+                    };
                 let undefined_type = self.undefined_type;
-                let element_type = self.check_iterated_type_or_element_type(use_, parent_type, undefined_type, pattern);
+                let element_type = self.check_iterated_type_or_element_type(
+                    use_,
+                    parent_type,
+                    undefined_type,
+                    pattern,
+                );
                 let index: i32 = pattern
                     .elements()
                     .to_vec()
@@ -80,19 +101,28 @@ impl Checker {
                     // If the parent is a tuple type, the rest element has a tuple type of the
                     // remaining tuple element types. Otherwise, the rest element has an array type with same
                     // element type as the parent type.
-                    let base_constraint = self.map_type(parent_type, &mut |c: &mut Checker, t: TypeId| {
-                        if c.ty(t).flags.intersects(TypeFlags::INSTANTIABLE_NON_PRIMITIVE) {
-                            return c.get_base_constraint_or_type(t);
-                        }
-                        t
-                    });
-                    if self.every_type(base_constraint, &mut |c: &mut Checker, t: TypeId| c.is_tuple_type(t)) {
-                        t = self.map_type(base_constraint, &mut |c: &mut Checker, t: TypeId| c.slice_tuple_type(t, index, 0));
+                    let base_constraint =
+                        self.map_type(parent_type, &mut |c: &mut Checker, t: TypeId| {
+                            if c.ty(t)
+                                .flags
+                                .intersects(TypeFlags::INSTANTIABLE_NON_PRIMITIVE)
+                            {
+                                return c.get_base_constraint_or_type(t);
+                            }
+                            t
+                        });
+                    if self.every_type(base_constraint, &mut |c: &mut Checker, t: TypeId| {
+                        c.is_tuple_type(t)
+                    }) {
+                        t = self.map_type(base_constraint, &mut |c: &mut Checker, t: TypeId| {
+                            c.slice_tuple_type(t, index, 0)
+                        });
                     } else {
                         t = self.create_array_type(element_type);
                     }
                 } else if self.is_array_like_type(parent_type) {
-                    let index_type = self.get_number_literal_type(ts_jsnum::Number(f64::from(index)));
+                    let index_type =
+                        self.get_number_literal_type(ts_jsnum::Number(f64::from(index)));
                     let mut declared_type = self.get_indexed_access_type_or_undefined(
                         parent_type,
                         index_type,
@@ -113,11 +143,15 @@ impl Checker {
         if declaration.initializer().is_nil() {
             return t;
         }
-        if walk_up_binding_elements_and_patterns(declaration).type_().is_some() {
+        if walk_up_binding_elements_and_patterns(declaration)
+            .type_()
+            .is_some()
+        {
             // In strict null checking mode, if a default value of a non-undefined type is specified, remove
             // undefined from the final type.
             if self.strict_null_checks {
-                let init_type = self.check_declaration_initializer(declaration, CheckMode::NORMAL, TypeId::NIL);
+                let init_type =
+                    self.check_declaration_initializer(declaration, CheckMode::NORMAL, TypeId::NIL);
                 if !self.has_type_facts(init_type, TypeFacts::IS_UNDEFINED) {
                     return self.get_non_undefined_type(t);
                 }
@@ -125,20 +159,34 @@ impl Checker {
             return t;
         }
         let non_undefined = self.get_non_undefined_type(t);
-        let init_type = self.check_declaration_initializer(declaration, CheckMode::NORMAL, TypeId::NIL);
-        let union = self.get_union_type_ex(&[non_undefined, init_type], UnionReduction::SUBTYPE, None, TypeId::NIL);
+        let init_type =
+            self.check_declaration_initializer(declaration, CheckMode::NORMAL, TypeId::NIL);
+        let union = self.get_union_type_ex(
+            &[non_undefined, init_type],
+            UnionReduction::SUBTYPE,
+            None,
+            TypeId::NIL,
+        );
         self.widen_type_inferred_from_initializer(declaration, union)
     }
 
     // Go: checker/checker.go:17699 getRestType
-    pub fn get_rest_type(&mut self, source: TypeId, properties: &[Node], symbol: SymbolId) -> TypeId {
-        let source =
-            self.filter_type(source, &mut |c: &mut Checker, t: TypeId| !c.ty(t).flags.intersects(TypeFlags::NULLABLE));
+    pub fn get_rest_type(
+        &mut self,
+        source: TypeId,
+        properties: &[Node],
+        symbol: SymbolId,
+    ) -> TypeId {
+        let source = self.filter_type(source, &mut |c: &mut Checker, t: TypeId| {
+            !c.ty(t).flags.intersects(TypeFlags::NULLABLE)
+        });
         if self.ty(source).flags.intersects(TypeFlags::NEVER) {
             return self.empty_object_type;
         }
         if self.ty(source).flags.intersects(TypeFlags::UNION) {
-            return self.map_type(source, &mut |c: &mut Checker, t: TypeId| c.get_rest_type(t, properties, symbol));
+            return self.map_type(source, &mut |c: &mut Checker, t: TypeId| {
+                c.get_rest_type(t, properties, symbol)
+            });
         }
         let mut literal_types: Vec<TypeId> = Vec::with_capacity(properties.len());
         for &p in properties {
@@ -148,8 +196,11 @@ impl Checker {
         let mut spreadable_properties: Vec<SymbolId> = Vec::new();
         let mut unspreadable_to_rest_keys: Vec<TypeId> = Vec::new();
         for prop in self.get_properties_of_type(source) {
-            let literal_type_from_property =
-                self.get_literal_type_from_property(prop, TypeFlags::STRING_OR_NUMBER_LITERAL_OR_UNIQUE, false);
+            let literal_type_from_property = self.get_literal_type_from_property(
+                prop,
+                TypeFlags::STRING_OR_NUMBER_LITERAL_OR_UNIQUE,
+                false,
+            );
             if !self.is_type_assignable_to(literal_type_from_property, omit_key_type)
                 && !self
                     .get_declaration_modifier_flags_from_symbol(prop)
@@ -177,7 +228,11 @@ impl Checker {
             if omit_type_alias.is_nil() {
                 return self.error_type;
             }
-            return self.get_type_alias_instantiation(omit_type_alias, &[source, omit_key_type], None);
+            return self.get_type_alias_instantiation(
+                omit_type_alias,
+                &[source, omit_key_type],
+                None,
+            );
         }
         let members = self.symbols.new_table();
         for prop in spreadable_properties {
@@ -224,7 +279,12 @@ impl Checker {
                     lhs_expr = self.factory.new_parenthesized_expression(parent_access);
                     set_node_loc(lhs_expr, node.loc());
                 }
-                let result = self.factory.new_element_access_expression(lhs_expr, Node::NIL, literal, NodeFlags::NONE);
+                let result = self.factory.new_element_access_expression(
+                    lhs_expr,
+                    Node::NIL,
+                    literal,
+                    NodeFlags::NONE,
+                );
                 set_node_loc(result, node.loc());
                 set_node_parent(literal, result);
                 set_node_parent(result, node);
@@ -242,7 +302,9 @@ impl Checker {
     pub fn get_parent_element_access(&mut self, node: Node) -> Node {
         let ancestor = node.parent().parent();
         match ancestor.kind() {
-            SyntaxKind::BindingElement | SyntaxKind::PropertyAssignment => self.get_synthetic_element_access(ancestor),
+            SyntaxKind::BindingElement | SyntaxKind::PropertyAssignment => {
+                self.get_synthetic_element_access(ancestor)
+            }
             SyntaxKind::ArrayLiteralExpression => self.get_synthetic_element_access(node.parent()),
             SyntaxKind::VariableDeclaration => ancestor.initializer(),
             SyntaxKind::BinaryExpression => ancestor.right(),
@@ -268,9 +330,17 @@ impl Checker {
             self.contextual_binding_patterns.push(pattern);
         }
         let result = if is_object_binding_pattern(pattern) {
-            self.get_type_from_object_binding_pattern(pattern, include_pattern_in_type, report_errors)
+            self.get_type_from_object_binding_pattern(
+                pattern,
+                include_pattern_in_type,
+                report_errors,
+            )
         } else {
-            self.get_type_from_array_binding_pattern(pattern, include_pattern_in_type, report_errors)
+            self.get_type_from_array_binding_pattern(
+                pattern,
+                include_pattern_in_type,
+                report_errors,
+            )
         };
         if include_pattern_in_type {
             self.contextual_binding_patterns.pop();
@@ -288,12 +358,19 @@ impl Checker {
     ) -> TypeId {
         let members = self.symbols.new_table();
         let mut string_index_info = IndexInfoId::NIL;
-        let mut object_flags = ObjectFlags::OBJECT_LITERAL | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL;
+        let mut object_flags =
+            ObjectFlags::OBJECT_LITERAL | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL;
         for e in pattern.elements().to_vec() {
             let name = e.property_name_or_name();
             if has_dot_dot_dot_token(e) {
                 let (string_type, any_type) = (self.string_type, self.any_type);
-                string_index_info = self.new_index_info(string_type, any_type, false /*isReadonly*/, Node::NIL, &[]);
+                string_index_info = self.new_index_info(
+                    string_type,
+                    any_type,
+                    false, /*isReadonly*/
+                    Node::NIL,
+                    &[],
+                );
                 continue;
             }
             let expr_type = self.get_literal_type_from_property_name(name);
@@ -304,15 +381,23 @@ impl Checker {
             }
             let text = self.get_property_name_from_type(expr_type);
             let flags = SymbolFlags::PROPERTY
-                | if e.initializer().is_some() { SymbolFlags::OPTIONAL } else { SymbolFlags::NONE };
+                | if e.initializer().is_some() {
+                    SymbolFlags::OPTIONAL
+                } else {
+                    SymbolFlags::NONE
+                };
             let symbol = self.new_symbol(flags, &text);
-            let resolved_type = self.get_type_from_binding_element(e, include_pattern_in_type, report_errors);
+            let resolved_type =
+                self.get_type_from_binding_element(e, include_pattern_in_type, report_errors);
             self.value_symbol_links.get(symbol).resolved_type = resolved_type;
             let symbol_name = self.sym(symbol).name.clone();
             self.symbols.set(members, symbol_name, symbol);
         }
-        let index_infos: Vec<IndexInfoId> =
-            if string_index_info.is_some() { vec![string_index_info] } else { Vec::new() };
+        let index_infos: Vec<IndexInfoId> = if string_index_info.is_some() {
+            vec![string_index_info]
+        } else {
+            Vec::new()
+        };
         let result = self.new_anonymous_type(SymbolId::NIL, members, &[], &[], &index_infos);
         self.ty_mut(result).object_flags |= object_flags;
         if include_pattern_in_type {
@@ -333,7 +418,10 @@ impl Checker {
         let elements = pattern.elements().to_vec();
         let last_element = elements.last().copied().unwrap_or(Node::NIL);
         let mut rest_element = Node::NIL;
-        if last_element.is_some() && is_binding_element(last_element) && has_dot_dot_dot_token(last_element) {
+        if last_element.is_some()
+            && is_binding_element(last_element)
+            && has_dot_dot_dot_token(last_element)
+        {
             rest_element = last_element;
         }
         if elements.is_empty() || elements.len() == 1 && rest_element.is_some() {
@@ -354,7 +442,8 @@ impl Checker {
             }
         }
         let mut element_types: Vec<TypeId> = vec![TypeId::NIL; elements.len()];
-        let mut element_infos: Vec<TupleElementInfo> = vec![TupleElementInfo::default(); elements.len()];
+        let mut element_infos: Vec<TupleElementInfo> =
+            vec![TupleElementInfo::default(); elements.len()];
         for (i, &e) in elements.iter().enumerate() {
             let t = if e.name().is_nil() {
                 self.any_type
@@ -369,7 +458,10 @@ impl Checker {
                 ElementFlags::REQUIRED
             };
             element_types[i] = t;
-            element_infos[i] = TupleElementInfo { flags, ..Default::default() };
+            element_infos[i] = TupleElementInfo {
+                flags,
+                ..Default::default()
+            };
         }
         let mut result = self.create_tuple_type_ex(&element_types, &element_infos, false);
         if include_pattern_in_type {
@@ -398,16 +490,21 @@ impl Checker {
             if is_binding_pattern(element.name()) {
                 contextual_type = self.get_type_from_binding_pattern(
                     element.name(),
-                    true, /*includePatternInType*/
+                    true,  /*includePatternInType*/
                     false, /*reportErrors*/
                 );
             }
-            let init_type = self.check_declaration_initializer(element, CheckMode::NORMAL, contextual_type);
+            let init_type =
+                self.check_declaration_initializer(element, CheckMode::NORMAL, contextual_type);
             let widened = self.get_widened_literal_type_for_initializer(element, init_type);
             return self.add_optionality(widened);
         }
         if is_binding_pattern(element.name()) {
-            return self.get_type_from_binding_pattern(element.name(), include_pattern_in_type, report_errors);
+            return self.get_type_from_binding_pattern(
+                element.name(),
+                include_pattern_in_type,
+                report_errors,
+            );
         }
         if report_errors && !self.declaration_belongs_to_private_ambient_member(element) {
             let any_type = self.any_type;
@@ -440,7 +537,11 @@ impl Checker {
         // It is an error to explicitly declare a static property member with the name 'prototype'.
         let parent = self.get_parent_of_symbol(prototype);
         let class_type = self.get_declared_type_of_symbol(parent);
-        let type_parameters = self.ty(class_type).as_interface_type().type_parameters().to_vec();
+        let type_parameters = self
+            .ty(class_type)
+            .as_interface_type()
+            .type_parameters()
+            .to_vec();
         if !type_parameters.is_empty() {
             let any_type = self.any_type;
             let type_arguments: Vec<TypeId> = type_parameters.iter().map(|_| any_type).collect();
@@ -465,7 +566,9 @@ impl Checker {
             }
             ThisAssignmentDeclarationKind::THIS_ASSIGNMENT_DECLARATION_CONSTRUCTOR => {
                 if location.is_nil() {
-                    panic!("constructor should not be nil when this assignment is in a constructor.");
+                    panic!(
+                        "constructor should not be nil when this assignment is in a constructor."
+                    );
                 }
                 t = self.get_flow_type_in_constructor(symbol, location);
             }
@@ -485,10 +588,14 @@ impl Checker {
                 let assigned_type = self.get_assignment_declaration_initializer_type(declaration);
                 if assigned_type.is_some() {
                     // We ignore initial assignments of undefined to CommonJS exports when there are multiple assignment declarations
-                    if get_assignment_declaration_kind(declaration) != JSDeclarationKind::EXPORTS_PROPERTY
+                    if get_assignment_declaration_kind(declaration)
+                        != JSDeclarationKind::EXPORTS_PROPERTY
                         || i != 0
                         || declarations.len() == 1
-                        || !self.ty(assigned_type).flags.intersects(TypeFlags::UNDEFINED)
+                        || !self
+                            .ty(assigned_type)
+                            .flags
+                            .intersects(TypeFlags::UNDEFINED)
                     {
                         if !types.contains(&assigned_type) {
                             types.push(assigned_type);
@@ -496,7 +603,9 @@ impl Checker {
                     }
                 }
             }
-            if kind == ThisAssignmentDeclarationKind::THIS_ASSIGNMENT_DECLARATION_METHOD && !types.is_empty() {
+            if kind == ThisAssignmentDeclarationKind::THIS_ASSIGNMENT_DECLARATION_METHOD
+                && !types.is_empty()
+            {
                 if self.strict_null_checks {
                     let undefined_or_missing_type = self.undefined_or_missing_type;
                     if !types.contains(&undefined_or_missing_type) {
@@ -533,7 +642,8 @@ impl Checker {
             let t: TypeId;
             match get_assignment_declaration_kind(node) {
                 JSDeclarationKind::MODULE_EXPORTS | JSDeclarationKind::EXPORTS_PROPERTY => {
-                    let expr_type = self.check_expression_cached(get_right_most_assigned_expression(node));
+                    let expr_type =
+                        self.check_expression_cached(get_right_most_assigned_expression(node));
                     t = self.get_regular_type_of_literal_type(expr_type);
                 }
                 kind => {
@@ -546,7 +656,9 @@ impl Checker {
                     t = self.check_expression_for_mutable_location(node.right(), CheckMode::NORMAL);
                 }
             }
-            if self.is_empty_array_literal_type(t) && !self.has_parent_with_type_annotation(node.symbol()) {
+            if self.is_empty_array_literal_type(t)
+                && !self.has_parent_with_type_annotation(node.symbol())
+            {
                 let any_array_type = self.any_array_type;
                 self.report_implicit_any(node, any_array_type, WideningKind::NORMAL);
                 return self.any_array_type;
@@ -569,8 +681,11 @@ impl Checker {
         let parent = self.sym(symbol).parent;
         if parent.is_some() {
             let parent_value_declaration = self.sym(parent).value_declaration;
-            if parent_value_declaration.is_some() && is_function_expression_or_arrow_function(parent_value_declaration) {
-                let possibly_annotated_symbol = self.get_symbol_of_node(parent_value_declaration.parent());
+            if parent_value_declaration.is_some()
+                && is_function_expression_or_arrow_function(parent_value_declaration)
+            {
+                let possibly_annotated_symbol =
+                    self.get_symbol_of_node(parent_value_declaration.parent());
                 if possibly_annotated_symbol.is_some() {
                     let value_declaration = self.sym(possibly_annotated_symbol).value_declaration;
                     if value_declaration.is_some() {
@@ -583,7 +698,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:18063 containsSameNamedThisProperty
-    pub fn contains_same_named_this_property(&mut self, this_property: Node, expression: Node) -> bool {
+    pub fn contains_same_named_this_property(
+        &mut self,
+        this_property: Node,
+        expression: Node,
+    ) -> bool {
         fn visit(c: &mut Checker, this_property: Node, node: Node) -> bool {
             if c.is_matching_reference(this_property, node) {
                 return true;
@@ -624,10 +743,16 @@ impl Checker {
     // when no declaration sites have JSDoc type annotations, and when at least one declaration site is in the body of
     // a class constructor.
     // Go: checker/checker.go:18098 isConstructorDeclaredThisProperty
-    pub fn is_constructor_declared_this_property(&mut self, symbol: SymbolId) -> (ThisAssignmentDeclarationKind, Node) {
+    pub fn is_constructor_declared_this_property(
+        &mut self,
+        symbol: SymbolId,
+    ) -> (ThisAssignmentDeclarationKind, Node) {
         let value_declaration = self.sym(symbol).value_declaration;
         if value_declaration.is_nil() || !is_binary_expression(value_declaration) {
-            return (ThisAssignmentDeclarationKind::THIS_ASSIGNMENT_DECLARATION_NONE, Node::NIL);
+            return (
+                ThisAssignmentDeclarationKind::THIS_ASSIGNMENT_DECLARATION_NONE,
+                Node::NIL,
+            );
         }
         if let Some(&kind) = self.this_expando_kinds.get(&symbol) {
             let Some(&location) = self.this_expando_locations.get(&symbol) else {
@@ -679,7 +804,9 @@ impl Checker {
     // Go: checker/checker.go:18143 isGlobalSymbolConstructor
     pub fn is_global_symbol_constructor(&mut self, node: Node) -> bool {
         let symbol = self.get_symbol_of_node(node);
-        let global_symbol = (self.get_global_es_symbol_constructor_type_symbol_or_nil.clone())(self);
+        let global_symbol = (self
+            .get_global_es_symbol_constructor_type_symbol_or_nil
+            .clone())(self);
         global_symbol.is_some() && symbol == global_symbol
     }
 
@@ -694,7 +821,9 @@ impl Checker {
         if t.is_some() {
             // This special case is required for backwards compatibility with libraries that merge a `symbol` property into `SymbolConstructor`.
             // See https://github.com/microsoft/typescript-go/issues/1212
-            if self.ty(t).flags.intersects(TypeFlags::ES_SYMBOL) && self.is_global_symbol_constructor(declaration.parent()) {
+            if self.ty(t).flags.intersects(TypeFlags::ES_SYMBOL)
+                && self.is_global_symbol_constructor(declaration.parent())
+            {
                 t = self.get_es_symbol_like_type_for_node(declaration);
             }
 
@@ -730,9 +859,17 @@ impl Checker {
     }
 
     // Go: checker/checker.go:18182 reportImplicitAny
-    pub fn report_implicit_any(&mut self, declaration: Node, t: TypeId, widening_kind: WideningKind) {
+    pub fn report_implicit_any(
+        &mut self,
+        declaration: Node,
+        t: TypeId,
+        widening_kind: WideningKind,
+    ) {
         if is_in_js_file(declaration)
-            && !is_check_js_enabled_for_file(get_source_file_of_node(declaration), self.compiler_options)
+            && !is_check_js_enabled_for_file(
+                get_source_file_of_node(declaration),
+                self.compiler_options,
+            )
         {
             // Only report implicit any errors/suggestions in TS and ts-check JS files
             return;
@@ -741,7 +878,9 @@ impl Checker {
         let type_as_string = self.type_to_string_exported(widened);
         let diagnostic: &'static ts_diagnostics::Message;
         match declaration.kind() {
-            SyntaxKind::BinaryExpression | SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature => {
+            SyntaxKind::BinaryExpression
+            | SyntaxKind::PropertyDeclaration
+            | SyntaxKind::PropertySignature => {
                 diagnostic = if self.no_implicit_any {
                     diag::Member_0_implicitly_has_an_1_type
                 } else {
@@ -764,8 +903,8 @@ impl Checker {
                                     declaration,
                                     name.text(),
                                     SymbolFlags::TYPE,
-                                    None, /*nameNotFoundMessage*/
-                                    true, /*isUse*/
+                                    None,  /*nameNotFoundMessage*/
+                                    true,  /*isUse*/
                                     false, /*excludeGlobals*/
                                 )
                                 .is_some())
@@ -778,7 +917,11 @@ impl Checker {
                             .map_or(-1, |i| i as i32);
                         let new_name = format!("arg{index}");
                         let type_name = declaration_name_to_string(param.name())
-                            + if param.dot_dot_dot_token().is_some() { "[]" } else { "" };
+                            + if param.dot_dot_dot_token().is_some() {
+                                "[]"
+                            } else {
+                                ""
+                            };
                         let no_implicit_any = self.no_implicit_any;
                         self.error_or_suggestion(
                             no_implicit_any,
@@ -842,14 +985,19 @@ impl Checker {
                     );
                     return;
                 } else if widening_kind == WideningKind::GENERATOR_YIELD {
-                    diagnostic = diag::X_0_which_lacks_return_type_annotation_implicitly_has_an_1_yield_type;
+                    diagnostic =
+                        diag::X_0_which_lacks_return_type_annotation_implicitly_has_an_1_yield_type;
                 } else {
                     diagnostic = diag::X_0_which_lacks_return_type_annotation_implicitly_has_an_1_return_type;
                 }
             }
             SyntaxKind::MappedType => {
                 if self.no_implicit_any {
-                    self.error(declaration, diag::Mapped_object_type_implicitly_has_an_any_template_type, args![]);
+                    self.error(
+                        declaration,
+                        diag::Mapped_object_type_implicitly_has_an_any_template_type,
+                        args![],
+                    );
                 }
                 return;
             }
@@ -863,7 +1011,12 @@ impl Checker {
         }
         let no_implicit_any = self.no_implicit_any;
         let name_string = declaration_name_to_string(get_name_of_declaration(declaration));
-        self.error_or_suggestion(no_implicit_any, declaration, diagnostic, args![name_string, type_as_string]);
+        self.error_or_suggestion(
+            no_implicit_any,
+            declaration,
+            diagnostic,
+            args![name_string, type_as_string],
+        );
     }
 
     // Go: checker/checker.go:18262 getWidenedType
@@ -879,8 +1032,15 @@ impl Checker {
         t: TypeId,
         context: Option<Rc<RefCell<WideningContext>>>,
     ) -> TypeId {
-        if self.ty(t).object_flags.intersects(ObjectFlags::REQUIRES_WIDENING) {
-            let key = CachedTypeKey { kind: CachedTypeKind::WIDENED, type_id: self.ty(t).id };
+        if self
+            .ty(t)
+            .object_flags
+            .intersects(ObjectFlags::REQUIRES_WIDENING)
+        {
+            let key = CachedTypeKey {
+                kind: CachedTypeKind::WIDENED,
+                type_id: self.ty(t).id,
+            };
             if context.is_none() {
                 if let Some(&cached) = self.cached_types.get(&key) {
                     if cached.is_some() {
@@ -898,14 +1058,19 @@ impl Checker {
                 let types = self.ty(t).types().to_vec();
                 let union_context = match &context {
                     Some(ctx) => ctx.clone(),
-                    None => Rc::new(RefCell::new(WideningContext { siblings: types.clone(), ..Default::default() })),
+                    None => Rc::new(RefCell::new(WideningContext {
+                        siblings: types.clone(),
+                        ..Default::default()
+                    })),
                 };
                 let mut widened_types: Vec<TypeId> = Vec::with_capacity(types.len());
                 for &member in &types {
                     if self.ty(member).flags.intersects(TypeFlags::NULLABLE) {
                         widened_types.push(member);
                     } else {
-                        widened_types.push(self.get_widened_type_with_context(member, Some(union_context.clone())));
+                        widened_types.push(
+                            self.get_widened_type_with_context(member, Some(union_context.clone())),
+                        );
                     }
                 }
                 // Widening an empty object literal transitions from a highly restrictive type to
@@ -918,7 +1083,11 @@ impl Checker {
                         break;
                     }
                 }
-                let reduction = if some_empty { UnionReduction::SUBTYPE } else { UnionReduction::LITERAL };
+                let reduction = if some_empty {
+                    UnionReduction::SUBTYPE
+                } else {
+                    UnionReduction::LITERAL
+                };
                 result = self.get_union_type_ex(&widened_types, reduction, None, TypeId::NIL);
             } else if flags.intersects(TypeFlags::INTERSECTION) {
                 let types = self.ty(t).types().to_vec();
@@ -978,14 +1147,27 @@ impl Checker {
         for info in infos {
             let (key_type, value_type, is_readonly, declaration, components) = {
                 let i = self.index_info(info);
-                (i.key_type, i.value_type, i.is_readonly, i.declaration, i.components.clone())
+                (
+                    i.key_type,
+                    i.value_type,
+                    i.is_readonly,
+                    i.declaration,
+                    i.components.clone(),
+                )
             };
             let widened_value_type = self.get_widened_type(value_type);
-            widened_infos.push(self.new_index_info(key_type, widened_value_type, is_readonly, declaration, &components));
+            widened_infos.push(self.new_index_info(
+                key_type,
+                widened_value_type,
+                is_readonly,
+                declaration,
+                &components,
+            ));
         }
         let result = self.new_anonymous_type(symbol, members, &[], &[], &widened_infos);
         // Retain js literal flag through widening
-        let retained = self.ty(t).object_flags & (ObjectFlags::JS_LITERAL | ObjectFlags::NON_INFERRABLE_TYPE);
+        let retained =
+            self.ty(t).object_flags & (ObjectFlags::JS_LITERAL | ObjectFlags::NON_INFERRABLE_TYPE);
         self.ty_mut(result).object_flags |= retained;
         // Only cache in child contexts since the root context never widens a particular object literal type more than once
         if let Some(ctx) = &context {
@@ -997,7 +1179,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:18339 getWidenedProperty
-    pub fn get_widened_property(&mut self, prop: SymbolId, context: Option<Rc<RefCell<WideningContext>>>) -> SymbolId {
+    pub fn get_widened_property(
+        &mut self,
+        prop: SymbolId,
+        context: Option<Rc<RefCell<WideningContext>>>,
+    ) -> SymbolId {
         if !self.sym(prop).flags.intersects(SymbolFlags::PROPERTY) {
             // Since get accessors already widen their return value there is no need to
             // widen accessor based properties here.
@@ -1021,7 +1207,10 @@ impl WideningContext {
     // Go: checker/checker.go:18357 WideningContext.getChildContext
     // PORT: the child keeps an `Rc` to its parent, so this takes the parent's
     // `Rc` instead of `&self`. Call as `WideningContext::get_child_context(&ctx, name)`.
-    pub fn get_child_context(this: &Rc<RefCell<WideningContext>>, property_name: &str) -> Rc<RefCell<WideningContext>> {
+    pub fn get_child_context(
+        this: &Rc<RefCell<WideningContext>>,
+        property_name: &str,
+    ) -> Rc<RefCell<WideningContext>> {
         if let Some(cached) = this.borrow().child_contexts.get(property_name) {
             return cached.clone();
         }
@@ -1030,7 +1219,9 @@ impl WideningContext {
             property_name: property_name.to_string(),
             ..Default::default()
         }));
-        this.borrow_mut().child_contexts.insert(property_name.to_string(), result.clone());
+        this.borrow_mut()
+            .child_contexts
+            .insert(property_name.to_string(), result.clone());
         result
     }
 }
@@ -1040,11 +1231,19 @@ impl Checker {
     // PORT: Go tests `resolvedProperties == nil`. The Rust field is a `Vec`,
     // so an empty result is computed again on the next call. The inputs are
     // cached, so the result is the same.
-    pub fn get_properties_of_context(&mut self, context: &Rc<RefCell<WideningContext>>) -> Vec<SymbolId> {
+    pub fn get_properties_of_context(
+        &mut self,
+        context: &Rc<RefCell<WideningContext>>,
+    ) -> Vec<SymbolId> {
         if context.borrow().resolved_properties.is_empty() {
             let mut names: IndexMap<String, SymbolId> = IndexMap::new();
             for t in self.get_siblings_of_context(context) {
-                if self.is_object_literal_type(t) && !self.ty(t).object_flags.intersects(ObjectFlags::CONTAINS_SPREAD) {
+                if self.is_object_literal_type(t)
+                    && !self
+                        .ty(t)
+                        .object_flags
+                        .intersects(ObjectFlags::CONTAINS_SPREAD)
+                {
                     for prop in self.get_properties_of_type(t) {
                         let name = self.sym(prop).name.clone();
                         names.insert(name, prop);
@@ -1060,12 +1259,20 @@ impl Checker {
     // PORT: Go tests `siblings == nil`. The Rust field is a `Vec`, so an
     // empty result is computed again on the next call. The inputs are
     // cached, so the result is the same.
-    pub fn get_siblings_of_context(&mut self, context: &Rc<RefCell<WideningContext>>) -> Vec<TypeId> {
+    pub fn get_siblings_of_context(
+        &mut self,
+        context: &Rc<RefCell<WideningContext>>,
+    ) -> Vec<TypeId> {
         if context.borrow().siblings.is_empty() {
             let mut siblings: Vec<TypeId> = Vec::new();
             let (parent, property_name) = {
                 let ctx = context.borrow();
-                (ctx.parent.clone().expect("child widening context has a parent"), ctx.property_name.clone())
+                (
+                    ctx.parent
+                        .clone()
+                        .expect("child widening context has a parent"),
+                    ctx.property_name.clone(),
+                )
             };
             for t in self.get_siblings_of_context(&parent) {
                 if self.is_object_literal_type(t) {
@@ -1108,7 +1315,10 @@ impl Checker {
     // Go: checker/checker.go:18418 getTypeOfAccessors
     pub fn get_type_of_accessors(&mut self, symbol: SymbolId) -> TypeId {
         if self.value_symbol_links.get(symbol).resolved_type.is_nil() {
-            if !self.push_type_resolution(TypeSystemEntity::Symbol(symbol), TypeSystemPropertyName::TYPE) {
+            if !self.push_type_resolution(
+                TypeSystemEntity::Symbol(symbol),
+                TypeSystemPropertyName::TYPE,
+            ) {
                 return self.error_type;
             }
             let getter = get_declaration_of_kind(&self.symbols, symbol, SyntaxKind::GetAccessor);
@@ -1136,7 +1346,9 @@ impl Checker {
                 }
             }
             if t.is_nil() && accessor.is_some() {
-                t = self.get_widened_type_for_variable_like_declaration(accessor, true /*reportErrors*/);
+                t = self.get_widened_type_for_variable_like_declaration(
+                    accessor, true, /*reportErrors*/
+                );
             }
             if t.is_nil() {
                 let no_implicit_any = self.no_implicit_any;
@@ -1211,13 +1423,20 @@ impl Checker {
     // Go: checker/checker.go:18473 getWriteTypeOfAccessors
     pub fn get_write_type_of_accessors(&mut self, symbol: SymbolId) -> TypeId {
         if self.value_symbol_links.get(symbol).write_type.is_nil() {
-            if !self.push_type_resolution(TypeSystemEntity::Symbol(symbol), TypeSystemPropertyName::WRITE_TYPE) {
+            if !self.push_type_resolution(
+                TypeSystemEntity::Symbol(symbol),
+                TypeSystemPropertyName::WRITE_TYPE,
+            ) {
                 return self.error_type;
             }
-            let mut setter = get_declaration_of_kind(&self.symbols, symbol, SyntaxKind::SetAccessor);
+            let mut setter =
+                get_declaration_of_kind(&self.symbols, symbol, SyntaxKind::SetAccessor);
             if setter.is_nil() {
-                let prop_declaration = get_declaration_of_kind(&self.symbols, symbol, SyntaxKind::PropertyDeclaration);
-                if prop_declaration.is_some() && is_auto_accessor_property_declaration(prop_declaration) {
+                let prop_declaration =
+                    get_declaration_of_kind(&self.symbols, symbol, SyntaxKind::PropertyDeclaration);
+                if prop_declaration.is_some()
+                    && is_auto_accessor_property_declaration(prop_declaration)
+                {
                     setter = prop_declaration;
                 }
             }
@@ -1249,7 +1468,10 @@ impl Checker {
     // Go: checker/checker.go:18505 getTypeOfAlias
     pub fn get_type_of_alias(&mut self, symbol: SymbolId) -> TypeId {
         if self.value_symbol_links.get(symbol).resolved_type.is_nil() {
-            if !self.push_type_resolution(TypeSystemEntity::Symbol(symbol), TypeSystemPropertyName::TYPE) {
+            if !self.push_type_resolution(
+                TypeSystemEntity::Symbol(symbol),
+                TypeSystemPropertyName::TYPE,
+            ) {
                 return self.error_type;
             }
             let target_symbol = self.resolve_alias(symbol);
@@ -1261,7 +1483,10 @@ impl Checker {
             // This check is important because without it, a call to getTypeOfSymbol could end
             // up recursively calling getTypeOfAlias, causing a stack overflow.
             if self.value_symbol_links.get(symbol).resolved_type.is_nil() {
-                if self.get_symbol_flags(target_symbol).intersects(SymbolFlags::VALUE) {
+                if self
+                    .get_symbol_flags(target_symbol)
+                    .intersects(SymbolFlags::VALUE)
+                {
                     let t = self.get_type_of_symbol(target_symbol);
                     self.value_symbol_links.get(symbol).resolved_type = t;
                 } else {
@@ -1270,7 +1495,11 @@ impl Checker {
                 }
             }
             if !self.pop_type_resolution() {
-                self.report_circularity_error(if export_symbol.is_some() { export_symbol } else { symbol });
+                self.report_circularity_error(if export_symbol.is_some() {
+                    export_symbol
+                } else {
+                    symbol
+                });
                 if self.value_symbol_links.get(symbol).resolved_type.is_nil() {
                     let error_type = self.error_type;
                     self.value_symbol_links.get(symbol).resolved_type = error_type;

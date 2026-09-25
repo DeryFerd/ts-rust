@@ -8,7 +8,7 @@
 
 use crate::prelude::*;
 use crate::printer::{EmitContext, EmitFlags, SymbolAccessibility};
-use crate::pseudochecker::{new_pseudo_checker, PseudoChecker};
+use crate::pseudochecker::{PseudoChecker, new_pseudo_checker};
 use std::cell::Cell;
 use std::rc::Weak;
 
@@ -149,7 +149,11 @@ impl NodeBuilderContext {
 /// A `SymbolTrackerImpl` with no context and no inner tracker. It fills the
 /// tracker slot until the real tracker exists.
 fn placeholder_tracker() -> Rc<dyn SymbolTracker> {
-    Rc::new(SymbolTrackerImpl { context: Weak::new(), inner: None, disable_track_symbol: Cell::new(false) })
+    Rc::new(SymbolTrackerImpl {
+        context: Weak::new(),
+        inner: None,
+        disable_track_symbol: Cell::new(false),
+    })
 }
 
 /// Go `b.ctx = nil`: the context a `NodeBuilderImpl` holds when no
@@ -199,7 +203,11 @@ pub const NO_TRUNCATION_MAXIMUM_TRUNCATION_LENGTH: i32 = 1_000_000;
 
 // Go: checker/nodebuilderimpl.go:119 newNodeBuilderImpl
 #[must_use]
-pub fn new_node_builder_impl(ch: &Checker, e: Rc<EmitContext>, id_to_symbol: Option<FxHashMap<Node, SymbolId>>) -> NodeBuilderImpl {
+pub fn new_node_builder_impl(
+    ch: &Checker,
+    e: Rc<EmitContext>,
+    id_to_symbol: Option<FxHashMap<Node, SymbolId>>,
+) -> NodeBuilderImpl {
     let id_to_symbol = id_to_symbol.unwrap_or_default();
     NodeBuilderImpl {
         e,
@@ -338,7 +346,10 @@ impl Checker {
     // Go: checker/nodebuilderimpl.go:158 checkTruncationLengthIfExpanding
     // checkTruncationLengthIfExpanding returns true if maxExpansionDepth >= 0 and truncation length exceeded.
     // When expanding, we need to mark the output as truncated so we know not to offer further expansion.
-    pub fn check_truncation_length_if_expanding(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>) -> bool {
+    pub fn check_truncation_length_if_expanding(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+    ) -> bool {
         let ctx = p1_ctx(b);
         let max_expansion_depth = ctx.borrow().max_expansion_depth;
         if max_expansion_depth >= 0 && self.check_truncation_length(b) {
@@ -352,34 +363,19 @@ impl Checker {
     // isExpandableType reports whether t has a named representation that could be inlined
     // as its structural form during hover expansion. Filters out lib types.
     // When isAlias is true, checks whether t's alias symbol is from user code (not lib).
-    pub fn is_expandable_type(&mut self, _b: &Rc<RefCell<NodeBuilderImpl>>, t: TypeId, is_alias: bool) -> bool {
+    // PORT: both Go branches first call a lib check that is not ported. The
+    // rest of Go (enum-like, reference, class/interface and anonymous
+    // class/enum/module/function/method checks) is ported when those land.
+    pub fn is_expandable_type(
+        &mut self,
+        _b: &Rc<RefCell<NodeBuilderImpl>>,
+        _t: TypeId,
+        is_alias: bool,
+    ) -> bool {
         if is_alias {
-            let is_lib: bool = unported!("IsLibSymbolForHoverVerbosity");
-            return !is_lib;
+            unported!("IsLibSymbolForHoverVerbosity")
         }
-        let is_lib_type: bool = unported!("IsLibTypeForHoverVerbosity");
-        if is_lib_type {
-            return false;
-        }
-        let (flags, object_flags, symbol) = {
-            let ty = self.ty(t);
-            (ty.flags, ty.object_flags, ty.symbol)
-        };
-        if flags.intersects(TypeFlags::ENUM_LIKE)
-            || object_flags.intersects(ObjectFlags::REFERENCE)
-            || object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE)
-        {
-            return true;
-        }
-        if object_flags.intersects(ObjectFlags::ANONYMOUS)
-            && symbol.is_some()
-            && self.sym(symbol).flags.intersects(
-                SymbolFlags::CLASS | SymbolFlags::ENUM | SymbolFlags::VALUE_MODULE | SymbolFlags::FUNCTION | SymbolFlags::METHOD,
-            )
-        {
-            return true;
-        }
-        false
+        unported!("IsLibTypeForHoverVerbosity")
     }
 
     // Go: checker/nodebuilderimpl.go:191 isTypeOnStack
@@ -399,7 +395,12 @@ impl Checker {
     // to signal that a higher verbosity level would reveal more detail.
     // Returns false when expansion is disabled (maxExpansionDepth < 0), the type
     // is not expandable, or the type is cyclic.
-    pub fn should_expand_type(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, t: TypeId, is_alias: bool) -> bool {
+    pub fn should_expand_type(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        t: TypeId,
+        is_alias: bool,
+    ) -> bool {
         let ctx = p1_ctx(b);
         if ctx.borrow().max_expansion_depth < 0 {
             return false;
@@ -464,7 +465,12 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:260 appendReferenceToType
-    pub fn append_reference_to_type(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, root: Node, ref_: Node) -> Node {
+    pub fn append_reference_to_type(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        root: Node,
+        ref_: Node,
+    ) -> Node {
         let e = p1_e(b);
         let f = e.factory();
         if is_import_type_node(root) {
@@ -483,7 +489,14 @@ impl Checker {
                     qualifier = id;
                 }
             }
-            return f.update_import_type_node(root, root.is_type_of(), root.argument(), root.attributes(), qualifier, ref_.type_argument_list());
+            return f.update_import_type_node(
+                root,
+                root.is_type_of(),
+                root.argument(),
+                root.attributes(),
+                qualifier,
+                ref_.type_argument_list(),
+            );
         } else if is_type_reference_node(root) {
             let type_arguments = root.type_argument_list();
             if p1_flags(b).intersects(NodeBuilderFlags::USE_INSTANTIATION_EXPRESSIONS)
@@ -491,7 +504,8 @@ impl Checker {
                 && !type_arguments.nodes().is_empty()
             {
                 let access = self.create_access_expression(b, root.type_name());
-                let mut expr = self.create_expression_with_type_arguments(b, access, type_arguments);
+                let mut expr =
+                    self.create_expression_with_type_arguments(b, access, type_arguments);
                 for id in get_access_stack(ref_) {
                     expr = f.new_property_access_expression(expr, Node::NIL, id, NodeFlags::NONE);
                 }
@@ -520,16 +534,23 @@ impl Checker {
         symbol.is_some()
             && self.sym(symbol).flags.intersects(SymbolFlags::CLASS)
             && (t == self.get_declared_type_of_class_or_interface(symbol)
-                || (flags.intersects(TypeFlags::OBJECT) && object_flags.intersects(ObjectFlags::IS_CLASS_INSTANCE_CLONE)))
+                || (flags.intersects(TypeFlags::OBJECT)
+                    && object_flags.intersects(ObjectFlags::IS_CLASS_INSTANCE_CLONE)))
     }
 
     // Go: checker/nodebuilderimpl.go:329 createElidedInformationPlaceholder
-    pub fn create_elided_information_placeholder(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>) -> Node {
+    pub fn create_elided_information_placeholder(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+    ) -> Node {
         p1_add_length(b, 3);
         let e = p1_e(b);
         let f = e.factory();
         if !p1_flags(b).intersects(NodeBuilderFlags::NO_TRUNCATION) {
-            return f.new_type_reference_node(f.new_identifier("..."), NodeList::NIL /*typeArguments*/);
+            return f.new_type_reference_node(
+                f.new_identifier("..."),
+                NodeList::NIL, /*typeArguments*/
+            );
         }
         e.add_synthetic_leading_comment(
             f.new_keyword_type_node(SyntaxKind::AnyKeyword),
@@ -540,7 +561,12 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:337 mapToTypeNodes
-    pub fn map_to_type_nodes(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, list: &[TypeId], is_bare_list: bool) -> NodeList {
+    pub fn map_to_type_nodes(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        list: &[TypeId],
+        is_bare_list: bool,
+    ) -> NodeList {
         if list.is_empty() {
             return NodeList::NIL;
         }
@@ -557,7 +583,10 @@ impl Checker {
                         false, /*hasTrailingNewLine*/
                     )
                 } else {
-                    f.new_type_reference_node(f.new_identifier("..."), NodeList::NIL /*typeArguments*/)
+                    f.new_type_reference_node(
+                        f.new_identifier("..."),
+                        NodeList::NIL, /*typeArguments*/
+                    )
                 };
                 return f.new_node_list(&[node]);
             } else if list.len() > 2 {
@@ -572,16 +601,24 @@ impl Checker {
                     )
                 } else {
                     let text = format!("... {} more ...", list.len() - 2);
-                    f.new_type_reference_node(f.new_identifier(text), NodeList::NIL /*typeArguments*/)
+                    f.new_type_reference_node(
+                        f.new_identifier(text),
+                        NodeList::NIL, /*typeArguments*/
+                    )
                 };
                 return f.new_node_list(&[first, middle, last]);
             }
         }
 
-        let may_have_name_collisions = !p1_flags(b).intersects(NodeBuilderFlags::USE_FULLY_QUALIFIED_TYPE);
+        let may_have_name_collisions =
+            !p1_flags(b).intersects(NodeBuilderFlags::USE_FULLY_QUALIFIED_TYPE);
         // PORT: Go `collections.MultiMap[string, seenName]`; a seenName is `(t, i)`.
         let mut seen_names: Option<IndexMap<String, Vec<(TypeId, usize)>>> =
-            if may_have_name_collisions { Some(IndexMap::new()) } else { None };
+            if may_have_name_collisions {
+                Some(IndexMap::new())
+            } else {
+                None
+            };
 
         let mut result: Vec<Node> = Vec::with_capacity(list.len());
 
@@ -597,7 +634,10 @@ impl Checker {
                     ));
                 } else {
                     let text = format!("... {} more ...", list.len() - display_index);
-                    result.push(f.new_type_reference_node(f.new_identifier(text), NodeList::NIL /*typeArguments*/));
+                    result.push(f.new_type_reference_node(
+                        f.new_identifier(text),
+                        NodeList::NIL, /*typeArguments*/
+                    ));
                 }
                 let type_node = self.type_to_type_node(b, list[list.len() - 1]);
                 if type_node.is_some() {
@@ -611,7 +651,10 @@ impl Checker {
                 result.push(type_node);
                 if let Some(seen_names) = seen_names.as_mut() {
                     if is_identifier_type_reference(type_node) {
-                        seen_names.entry(type_node.type_name().text().to_string()).or_default().push((t, result.len() - 1));
+                        seen_names
+                            .entry(type_node.type_name().text().to_string())
+                            .or_default()
+                            .push((t, result.len() - 1));
                     }
                 }
             }
@@ -645,8 +688,18 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:430 serializeTypeName
-    pub fn serialize_type_name(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, node: Node, is_type_of: bool, type_arguments: NodeList) -> Node {
-        let meaning = if is_type_of { SymbolFlags::VALUE } else { SymbolFlags::TYPE };
+    pub fn serialize_type_name(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        node: Node,
+        is_type_of: bool,
+        type_arguments: NodeList,
+    ) -> Node {
+        let meaning = if is_type_of {
+            SymbolFlags::VALUE
+        } else {
+            SymbolFlags::TYPE
+        };
         let symbol = self.resolve_entity_name(node, meaning, true, false, node);
         if symbol.is_nil() {
             return Node::NIL;
@@ -658,7 +711,11 @@ impl Checker {
         }
 
         let enclosing_declaration = p1_ctx(b).borrow().enclosing_declaration;
-        if self.is_symbol_accessible(symbol, enclosing_declaration, meaning, false).accessibility != SymbolAccessibility::ACCESSIBLE {
+        if self
+            .is_symbol_accessible(symbol, enclosing_declaration, meaning, false)
+            .accessibility
+            != SymbolAccessibility::ACCESSIBLE
+        {
             return Node::NIL;
         }
         self.symbol_to_type_node(b, resolved_symbol, meaning, type_arguments)
@@ -678,9 +735,17 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:473 setCommentRange
-    pub fn set_comment_range(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, node: Node, range_: Node) {
+    pub fn set_comment_range(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        node: Node,
+        range_: Node,
+    ) {
         let enclosing_file = p1_ctx(b).borrow().enclosing_file;
-        if range_.is_some() && enclosing_file.is_some() && enclosing_file == get_source_file_of_node(range_) {
+        if range_.is_some()
+            && enclosing_file.is_some()
+            && enclosing_file == get_source_file_of_node(range_)
+        {
             // Copy comments to node for declaration emit
             p1_e(b).assign_comment_range(node, range_);
         }
@@ -738,7 +803,11 @@ impl Checker {
         if existing_target.is_nil() || existing_target != target {
             return true;
         }
-        let type_parameters = self.ty(target).as_interface_type().type_parameters().to_vec();
+        let type_parameters = self
+            .ty(target)
+            .as_interface_type()
+            .type_parameters()
+            .to_vec();
         let min = self.get_min_type_argument_count(&type_parameters);
         existing.type_arguments().len() as i64 >= i64::from(min)
     }
@@ -772,7 +841,11 @@ impl Checker {
 
     // Go: checker/nodebuilderimpl.go:538 getResolvedTypeWithoutAbstractConstructSignatures
     // PORT: Go takes the `*StructuredType`; here it is the type id.
-    pub fn get_resolved_type_without_abstract_construct_signatures(&mut self, _b: &Rc<RefCell<NodeBuilderImpl>>, t: TypeId) -> TypeId {
+    pub fn get_resolved_type_without_abstract_construct_signatures(
+        &mut self,
+        _b: &Rc<RefCell<NodeBuilderImpl>>,
+        t: TypeId,
+    ) -> TypeId {
         let (symbol, members, call_signatures, construct_signatures, index_infos, cached) = {
             let ty = self.ty(t);
             let st = ty.as_structured_type();
@@ -794,22 +867,43 @@ impl Checker {
         let filtered: Vec<SignatureId> = construct_signatures
             .iter()
             .copied()
-            .filter(|&signature| !self.sig(signature).flags.intersects(SignatureFlags::ABSTRACT))
+            .filter(|&signature| {
+                !self
+                    .sig(signature)
+                    .flags
+                    .intersects(SignatureFlags::ABSTRACT)
+            })
             .collect();
         if filtered.len() == construct_signatures.len() {
-            self.ty_mut(t).as_structured_type_mut().object_type_without_abstract_construct_signatures = t;
+            self.ty_mut(t)
+                .as_structured_type_mut()
+                .object_type_without_abstract_construct_signatures = t;
             return t;
         }
-        let type_copy = self.new_anonymous_type(symbol, members, &call_signatures, &filtered, &index_infos);
-        self.ty_mut(t).as_structured_type_mut().object_type_without_abstract_construct_signatures = type_copy;
-        self.ty_mut(type_copy).as_structured_type_mut().object_type_without_abstract_construct_signatures = type_copy;
+        let type_copy =
+            self.new_anonymous_type(symbol, members, &call_signatures, &filtered, &index_infos);
+        self.ty_mut(t)
+            .as_structured_type_mut()
+            .object_type_without_abstract_construct_signatures = type_copy;
+        self.ty_mut(type_copy)
+            .as_structured_type_mut()
+            .object_type_without_abstract_construct_signatures = type_copy;
         type_copy
     }
 
     // Go: checker/nodebuilderimpl.go:558 symbolToNode
-    pub fn symbol_to_node(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, symbol: SymbolId, meaning: SymbolFlags) -> Node {
+    pub fn symbol_to_node(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        symbol: SymbolId,
+        meaning: SymbolFlags,
+    ) -> Node {
         let ctx = p1_ctx(b);
-        if ctx.borrow().internal_flags.intersects(InternalNodeBuilderFlags::WRITE_COMPUTED_PROPS) {
+        if ctx
+            .borrow()
+            .internal_flags
+            .intersects(InternalNodeBuilderFlags::WRITE_COMPUTED_PROPS)
+        {
             let value_declaration = self.sym(symbol).value_declaration;
             if value_declaration.is_some() {
                 let name = get_name_of_declaration(value_declaration);
@@ -819,10 +913,16 @@ impl Checker {
             }
             if self.value_symbol_links.has(symbol) {
                 let name_type = self.value_symbol_links.get(symbol).name_type;
-                if name_type.is_some() && self.ty(name_type).flags.intersects(TypeFlags::ENUM_LITERAL | TypeFlags::UNIQUE_ES_SYMBOL) {
+                if name_type.is_some()
+                    && self
+                        .ty(name_type)
+                        .flags
+                        .intersects(TypeFlags::ENUM_LITERAL | TypeFlags::UNIQUE_ES_SYMBOL)
+                {
                     let name_type_symbol = self.ty(name_type).symbol;
                     let old_enclosing = ctx.borrow().enclosing_declaration;
-                    ctx.borrow_mut().enclosing_declaration = self.sym(name_type_symbol).value_declaration;
+                    ctx.borrow_mut().enclosing_declaration =
+                        self.sym(name_type_symbol).value_declaration;
                     let expression = self.symbol_to_expression(b, name_type_symbol, meaning);
                     let result = p1_e(b).factory().new_computed_property_name(expression);
                     ctx.borrow_mut().enclosing_declaration = old_enclosing;
@@ -834,7 +934,13 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:580 symbolToName
-    pub fn symbol_to_name(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, symbol: SymbolId, meaning: SymbolFlags, expects_identifier: bool) -> Node {
+    pub fn symbol_to_name(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        symbol: SymbolId,
+        meaning: SymbolFlags,
+        expects_identifier: bool,
+    ) -> Node {
         let chain = self.lookup_symbol_chain(b, symbol, meaning, false);
         {
             let ctx = p1_ctx(b);
@@ -842,7 +948,8 @@ impl Checker {
             if expects_identifier
                 && chain.len() != 1
                 && !c.encountered_error
-                && c.flags.intersects(NodeBuilderFlags::ALLOW_QUALIFIED_NAME_IN_PLACE_OF_IDENTIFIER)
+                && c.flags
+                    .intersects(NodeBuilderFlags::ALLOW_QUALIFIED_NAME_IN_PLACE_OF_IDENTIFIER)
             {
                 c.encountered_error = true;
             }
@@ -853,7 +960,12 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:588 createEntityNameFromSymbolChain
-    pub fn create_entity_name_from_symbol_chain(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, chain: &[SymbolId], index: usize) -> Node {
+    pub fn create_entity_name_from_symbol_chain(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        chain: &[SymbolId],
+        index: usize,
+    ) -> Node {
         // typeParameterNodes := b.lookupTypeParameterNodes(chain, index)
         let symbol = chain[index];
         let ctx = p1_ctx(b);
@@ -883,7 +995,11 @@ impl Checker {
 
     // Go: checker/nodebuilderimpl.go:616 symbolToEntityNameNode
     // TODO: Audit usages of symbolToEntityNameNode - they should probably all be symbolToName
-    pub fn symbol_to_entity_name_node(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, symbol: SymbolId) -> Node {
+    pub fn symbol_to_entity_name_node(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        symbol: SymbolId,
+    ) -> Node {
         let name = self.sym(symbol).name.clone();
         let identifier = self.nb_new_identifier(b, &name, symbol);
         let parent = self.sym(symbol).parent;
@@ -895,21 +1011,39 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:624 symbolToTypeNode
-    pub fn symbol_to_type_node(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, symbol: SymbolId, mask: SymbolFlags, type_arguments: NodeList) -> Node {
+    pub fn symbol_to_type_node(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        symbol: SymbolId,
+        mask: SymbolFlags,
+        type_arguments: NodeList,
+    ) -> Node {
         let ctx = p1_ctx(b);
         let e = p1_e(b);
         let f = e.factory();
-        let use_alias_outside = p1_flags(b).intersects(NodeBuilderFlags::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE);
+        let use_alias_outside =
+            p1_flags(b).intersects(NodeBuilderFlags::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE);
         let chain = self.lookup_symbol_chain(b, symbol, mask, !use_alias_outside); // If we're using aliases outside the current scope, dont bother with the module
         if chain.is_empty() {
             return Node::NIL; // TODO: shouldn't be possible, `lookupSymbolChain` should always at least return the input symbol and issue an error
         }
         let is_type_of = mask == SymbolFlags::VALUE;
-        if self.sym(chain[0]).declarations.iter().any(|&d| has_non_global_augmentation_external_module_symbol(d)) {
+        if self
+            .sym(chain[0])
+            .declarations
+            .iter()
+            .any(|&d| has_non_global_augmentation_external_module_symbol(d))
+        {
             // module is root, must use `ImportTypeNode`
             let mut non_root_parts = Node::NIL;
             if chain.len() > 1 {
-                non_root_parts = self.create_access_from_symbol_chain(b, &chain, chain.len() - 1, 1, type_arguments);
+                non_root_parts = self.create_access_from_symbol_chain(
+                    b,
+                    &chain,
+                    chain.len() - 1,
+                    1,
+                    type_arguments,
+                );
             }
             let mut type_parameter_nodes = type_arguments;
             if type_parameter_nodes.is_nil() {
@@ -921,14 +1055,18 @@ impl Checker {
             let mut specifier = String::new();
             let mut attributes = Node::NIL;
             let resolution_kind = self.compiler_options.get_module_resolution_kind();
-            if resolution_kind == ModuleResolutionKind::NODE16 || resolution_kind == ModuleResolutionKind::NODE_NEXT {
+            if resolution_kind == ModuleResolutionKind::NODE16
+                || resolution_kind == ModuleResolutionKind::NODE_NEXT
+            {
                 // An `import` type directed at an esm format file is only going to resolve in esm mode - set the esm mode assertion
                 if target_file.is_some()
                     && context_file.is_some()
                     && get_emit_module_format_of_file(target_file) == ModuleKind::ES_NEXT
-                    && get_emit_module_format_of_file(target_file) != get_emit_module_format_of_file(context_file)
+                    && get_emit_module_format_of_file(target_file)
+                        != get_emit_module_format_of_file(context_file)
                 {
-                    specifier = self.get_specifier_for_module_symbol(b, chain[0], ModuleKind::ES_NEXT);
+                    specifier =
+                        self.get_specifier_for_module_symbol(b, chain[0], ModuleKind::ES_NEXT);
                     let name = self.nb_new_string_literal(b, "resolution-mode");
                     let value = self.nb_new_string_literal(b, "import");
                     attributes = f.new_import_attributes(
@@ -946,7 +1084,9 @@ impl Checker {
             {
                 let old_specifier = specifier.clone();
 
-                if resolution_kind == ModuleResolutionKind::NODE16 || resolution_kind == ModuleResolutionKind::NODE_NEXT {
+                if resolution_kind == ModuleResolutionKind::NODE16
+                    || resolution_kind == ModuleResolutionKind::NODE_NEXT
+                {
                     // We might be able to write a portable import type using a mode override; try specifier generation again, but with a different mode set
                     let mut swapped_mode = ModuleKind::ES_NEXT;
                     if get_emit_module_format_of_file(context_file) == ModuleKind::ES_NEXT {
@@ -958,7 +1098,11 @@ impl Checker {
                         // Still unreachable :(
                         specifier = old_specifier.clone();
                     } else {
-                        let mode_str = if swapped_mode == ModuleKind::ES_NEXT { "import" } else { "require" };
+                        let mode_str = if swapped_mode == ModuleKind::ES_NEXT {
+                            "import"
+                        } else {
+                            "require"
+                        };
                         let name = self.nb_new_string_literal(b, "resolution-mode");
                         let value = self.nb_new_string_literal(b, mode_str);
                         attributes = f.new_import_attributes(
@@ -975,7 +1119,11 @@ impl Checker {
                     ctx.borrow_mut().encountered_error = true;
                     let tracker = ctx.borrow().tracker.clone();
                     let symbol_name = self.sym(symbol).name.clone();
-                    tracker.report_likely_unsafe_import_required_error(self, &old_specifier, &symbol_name);
+                    tracker.report_likely_unsafe_import_required_error(
+                        self,
+                        &old_specifier,
+                        &symbol_name,
+                    );
                 }
             }
 
@@ -985,18 +1133,31 @@ impl Checker {
                 // !!! TODO: smuggle type arguments out
                 // const lastId = isIdentifier(nonRootParts) ? nonRootParts : nonRootParts.right;
                 // setIdentifierTypeArguments(lastId, /*typeArguments*/ undefined);
-                return f.new_import_type_node(is_type_of, lit, attributes, non_root_parts, type_parameter_nodes);
+                return f.new_import_type_node(
+                    is_type_of,
+                    lit,
+                    attributes,
+                    non_root_parts,
+                    type_parameter_nodes,
+                );
             }
 
             let split_node = get_topmost_indexed_access_type(non_root_parts);
             let qualifier = split_node.object_type().type_name();
             return f.new_indexed_access_type_node(
-                f.new_import_type_node(is_type_of, lit, attributes, qualifier, type_parameter_nodes),
+                f.new_import_type_node(
+                    is_type_of,
+                    lit,
+                    attributes,
+                    qualifier,
+                    type_parameter_nodes,
+                ),
                 split_node.index_type(),
             );
         }
 
-        let entity_name = self.create_access_from_symbol_chain(b, &chain, chain.len() - 1, 0, type_arguments);
+        let entity_name =
+            self.create_access_from_symbol_chain(b, &chain, chain.len() - 1, 0, type_arguments);
         if is_indexed_access_type_node(entity_name) {
             return entity_name; // Indexed accesses can never be `typeof`
         }
@@ -1007,7 +1168,10 @@ impl Checker {
             return f.new_type_reference_node(entity_name, type_arguments);
         }
         if is_type_of && is_expression_with_type_arguments(entity_name) {
-            return f.new_type_query_node(f.deep_clone_node(entity_name.expression()), entity_name.type_argument_list());
+            return f.new_type_query_node(
+                f.deep_clone_node(entity_name.expression()),
+                entity_name.type_argument_list(),
+            );
         }
         entity_name
     }
@@ -1029,7 +1193,11 @@ impl Checker {
             type_parameter_nodes = self.lookup_type_parameter_nodes(b, chain, index as i32);
         }
         let symbol = chain[index];
-        let parent = if index > 0 { chain[index - 1] } else { SymbolId::NIL };
+        let parent = if index > 0 {
+            chain[index - 1]
+        } else {
+            SymbolId::NIL
+        };
 
         let mut symbol_name = String::new();
         if index == 0 {
@@ -1087,10 +1255,19 @@ impl Checker {
                     break;
                 }
             }
-            if name.is_some() && is_computed_property_name(name) && is_entity_name(name.expression()) {
+            if name.is_some()
+                && is_computed_property_name(name)
+                && is_entity_name(name.expression())
+            {
                 // PORT: Go passes `index-1`, which is -1 when index is 0 and
                 // then panics on the index. The `usize` subtraction panics too.
-                let lhs = self.create_access_from_symbol_chain(b, chain, index - 1, stopper, override_type_arguments);
+                let lhs = self.create_access_from_symbol_chain(
+                    b,
+                    chain,
+                    index - 1,
+                    stopper,
+                    override_type_arguments,
+                );
                 if is_entity_name(lhs) {
                     return f.new_indexed_access_type_node(
                         f.new_parenthesized_type_node(f.new_type_query_node(lhs, NodeList::NIL)),
@@ -1103,19 +1280,33 @@ impl Checker {
         }
         p1_add_length(b, symbol_name.len() + 1);
 
-        if !p1_flags(b).intersects(NodeBuilderFlags::FORBID_INDEXED_ACCESS_SYMBOL_REFERENCES) && parent.is_some() {
+        if !p1_flags(b).intersects(NodeBuilderFlags::FORBID_INDEXED_ACCESS_SYMBOL_REFERENCES)
+            && parent.is_some()
+        {
             let members = self.get_members_of_symbol(parent);
             let name = self.sym(symbol).name.clone();
             let member = self.symbols.get(members, &name);
-            if members.is_some() && member.is_some() && self.get_symbol_if_same_reference(member, symbol).is_some() {
+            if members.is_some()
+                && member.is_some()
+                && self.get_symbol_if_same_reference(member, symbol).is_some()
+            {
                 // Should use an indexed access
-                let lhs = self.create_access_from_symbol_chain(b, chain, index - 1, stopper, override_type_arguments);
+                let lhs = self.create_access_from_symbol_chain(
+                    b,
+                    chain,
+                    index - 1,
+                    stopper,
+                    override_type_arguments,
+                );
                 if is_indexed_access_type_node(lhs) {
                     let lit = self.nb_new_string_literal(b, &symbol_name);
                     return f.new_indexed_access_type_node(lhs, f.new_literal_type_node(lit));
                 }
                 let lit = self.nb_new_string_literal(b, &symbol_name);
-                return f.new_indexed_access_type_node(f.new_type_reference_node(lhs, type_parameter_nodes), f.new_literal_type_node(lit));
+                return f.new_indexed_access_type_node(
+                    f.new_type_reference_node(lhs, type_parameter_nodes),
+                    f.new_literal_type_node(lit),
+                );
             }
         }
 
@@ -1123,29 +1314,48 @@ impl Checker {
         e.add_emit_flags(identifier, EmitFlags::NO_ASCII_ESCAPING);
 
         if index > stopper {
-            let lhs = self.create_access_from_symbol_chain(b, chain, index - 1, stopper, override_type_arguments);
+            let lhs = self.create_access_from_symbol_chain(
+                b,
+                chain,
+                index - 1,
+                stopper,
+                override_type_arguments,
+            );
             if !p1_flags(b).intersects(NodeBuilderFlags::USE_INSTANTIATION_EXPRESSIONS)
-                || is_entity_name(lhs) && (type_parameter_nodes.is_nil() || type_parameter_nodes.nodes().is_empty())
+                || is_entity_name(lhs)
+                    && (type_parameter_nodes.is_nil() || type_parameter_nodes.nodes().is_empty())
             {
                 return f.new_qualified_name(lhs, identifier);
             }
             let access = self.create_access_expression(b, lhs);
-            let expr = f.new_property_access_expression(access, Node::NIL, identifier, NodeFlags::NONE);
+            let expr =
+                f.new_property_access_expression(access, Node::NIL, identifier, NodeFlags::NONE);
             return self.create_expression_with_type_arguments(b, expr, type_parameter_nodes);
         }
         identifier
     }
 
     // Go: checker/nodebuilderimpl.go:833 symbolToExpression
-    pub fn symbol_to_expression(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, symbol: SymbolId, mask: SymbolFlags) -> Node {
+    pub fn symbol_to_expression(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        symbol: SymbolId,
+        mask: SymbolFlags,
+    ) -> Node {
         let chain = self.lookup_symbol_chain(b, symbol, mask, false);
         // PORT: see `symbol_to_name` for the empty chain case.
         self.create_expression_from_symbol_chain(b, &chain, chain.len() - 1)
     }
 
     // Go: checker/nodebuilderimpl.go:838 createExpressionFromSymbolChain
-    pub fn create_expression_from_symbol_chain(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, chain: &[SymbolId], index: usize) -> Node {
-        let type_parameter_nodes = self.lookup_expression_chain_type_argument_nodes(b, chain, index);
+    pub fn create_expression_from_symbol_chain(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        chain: &[SymbolId],
+        index: usize,
+    ) -> Node {
+        let type_parameter_nodes =
+            self.lookup_expression_chain_type_argument_nodes(b, chain, index);
         let symbol = chain[index];
         let ctx = p1_ctx(b);
         let e = p1_e(b);
@@ -1162,7 +1372,11 @@ impl Checker {
         }
 
         if starts_with_single_or_double_quote(&symbol_name)
-            && self.sym(symbol).declarations.iter().any(|&d| has_non_global_augmentation_external_module_symbol(d))
+            && self
+                .sym(symbol)
+                .declarations
+                .iter()
+                .any(|&d| has_non_global_augmentation_external_module_symbol(d))
         {
             let specifier = self.get_specifier_for_module_symbol(b, symbol, ResolutionMode::NONE);
             p1_add_length(b, 2 + specifier.len());
@@ -1175,7 +1389,8 @@ impl Checker {
             p1_add_length(b, 1 + symbol_name.len());
             if index > 0 {
                 let left = self.create_expression_from_symbol_chain(b, chain, index - 1);
-                let result = f.new_property_access_expression(left, Node::NIL, identifier, NodeFlags::NONE);
+                let result =
+                    f.new_property_access_expression(left, Node::NIL, identifier, NodeFlags::NONE);
                 e.add_emit_flags(result, EmitFlags::NO_INDENTATION);
                 return self.create_expression_with_type_arguments(b, result, type_parameter_nodes);
             }
@@ -1187,10 +1402,13 @@ impl Checker {
         }
 
         let mut expression = Node::NIL;
-        if starts_with_single_or_double_quote(&symbol_name) && !self.sym(symbol).flags.intersects(SymbolFlags::ENUM_MEMBER) {
+        if starts_with_single_or_double_quote(&symbol_name)
+            && !self.sym(symbol).flags.intersects(SymbolFlags::ENUM_MEMBER)
+        {
             let literal_text = unquote_string(&symbol_name);
             p1_add_length(b, literal_text.len() + 2);
-            expression = self.nb_new_string_literal_ex(b, &literal_text, symbol_name.starts_with('\''));
+            expression =
+                self.nb_new_string_literal_ex(b, &literal_text, symbol_name.starts_with('\''));
         } else if ts_jsnum::from_string(&symbol_name).to_string() == symbol_name {
             // TODO: the follwing in strada would assert if the number is negative, but no such assertion exists here
             // Moreover, what's even guaranteeing the name *isn't* -1 here anyway? Needs double-checking.
@@ -1209,7 +1427,11 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:916 getNameOfSymbolFromNameType
-    pub fn get_name_of_symbol_from_name_type(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, symbol: SymbolId) -> String {
+    pub fn get_name_of_symbol_from_name_type(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        symbol: SymbolId,
+    ) -> String {
         if self.value_symbol_links.has(symbol) {
             let name_type = self.value_symbol_links.get(symbol).name_type;
             if name_type.is_nil() {
@@ -1223,7 +1445,9 @@ impl Checker {
                     Some(LiteralValue::Number(v)) => v.to_string(),
                     _ => String::new(),
                 };
-                if !is_identifier_text(&name, LanguageVariant::STANDARD) && !is_numeric_literal_name(&name) {
+                if !is_identifier_text(&name, LanguageVariant::STANDARD)
+                    && !is_numeric_literal_name(&name)
+                {
                     // PORT: Go `valueToString(nil)` panics; `expect` does the same.
                     return value_to_string(value.as_ref().expect("literal type has no value"));
                 }
@@ -1251,7 +1475,11 @@ impl Checker {
      * Unlike `symbolName(symbol)`, this will include quotes if the name is from a string literal.
      * It will also use a representation of a number as written instead of a decimal form, e.g. `0o11` instead of `9`.
      */
-    pub fn get_name_of_symbol_as_written(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, mut symbol: SymbolId) -> String {
+    pub fn get_name_of_symbol_as_written(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        mut symbol: SymbolId,
+    ) -> String {
         let ctx = p1_ctx(b);
         if let Some(&result) = ctx.borrow().remapped_symbol_references.get(&symbol) {
             symbol = result;
@@ -1275,16 +1503,27 @@ impl Checker {
             return "default".to_string();
         }
         if !declarations.is_empty() {
-            let name = declarations.iter().map(|&d| get_name_of_declaration(d)).find(|n| n.is_some()).unwrap_or(Node::NIL); // Try using a declaration with a name, first
+            let name = declarations
+                .iter()
+                .map(|&d| get_name_of_declaration(d))
+                .find(|n| n.is_some())
+                .unwrap_or(Node::NIL); // Try using a declaration with a name, first
             if name.is_some() {
                 // !!! TODO: JS Object.defineProperty declarations
                 // if ast.IsCallExpression(declaration) && ast.IsBindableObjectDefinePropertyCall(declaration) {
                 // 	return symbol.Name
                 // }
-                if is_computed_property_name(name) && !self.sym(symbol).check_flags.intersects(CheckFlags::LATE) {
+                if is_computed_property_name(name)
+                    && !self.sym(symbol).check_flags.intersects(CheckFlags::LATE)
+                {
                     if self.value_symbol_links.has(symbol) {
                         let name_type = self.value_symbol_links.get(symbol).name_type;
-                        if name_type.is_some() && self.ty(name_type).flags.intersects(TypeFlags::STRING_OR_NUMBER_LITERAL) {
+                        if name_type.is_some()
+                            && self
+                                .ty(name_type)
+                                .flags
+                                .intersects(TypeFlags::STRING_OR_NUMBER_LITERAL)
+                        {
                             let result = self.get_name_of_symbol_from_name_type(b, symbol);
                             if !result.is_empty() {
                                 return result;
@@ -1295,20 +1534,31 @@ impl Checker {
                 return declaration_name_to_string(name);
             }
             let declaration = declarations[0]; // Declaration may be nameless, but we'll try anyway
-            if declaration.parent().is_some() && declaration.parent().kind() == SyntaxKind::VariableDeclaration {
+            if declaration.parent().is_some()
+                && declaration.parent().kind() == SyntaxKind::VariableDeclaration
+            {
                 return declaration_name_to_string(declaration.parent().name());
             }
-            if is_class_expression(declaration) || is_function_expression(declaration) || is_arrow_function(declaration) {
+            if is_class_expression(declaration)
+                || is_function_expression(declaration)
+                || is_arrow_function(declaration)
+            {
                 // PORT: Go checks `b.ctx != nil`. The Rust context always exists.
                 {
                     let mut c = ctx.borrow_mut();
-                    if !c.encountered_error && !c.flags.intersects(NodeBuilderFlags::ALLOW_ANONYMOUS_IDENTIFIER) {
+                    if !c.encountered_error
+                        && !c
+                            .flags
+                            .intersects(NodeBuilderFlags::ALLOW_ANONYMOUS_IDENTIFIER)
+                    {
                         c.encountered_error = true;
                     }
                 }
                 match declaration.kind() {
                     SyntaxKind::ClassExpression => return "(Anonymous class)".to_string(),
-                    SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction => return "(Anonymous function)".to_string(),
+                    SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction => {
+                        return "(Anonymous function)".to_string();
+                    }
                     _ => {}
                 }
             }
@@ -1326,7 +1576,11 @@ impl Checker {
     // Go: checker/nodebuilderimpl.go:1012 getTypeParametersOfClassOrInterface
     // The full set of type parameters for a generic class or interface type consists of its outer type parameters plus
     // its locally declared type parameters.
-    pub fn get_type_parameters_of_class_or_interface(&mut self, _b: &Rc<RefCell<NodeBuilderImpl>>, symbol: SymbolId) -> Vec<TypeId> {
+    pub fn get_type_parameters_of_class_or_interface(
+        &mut self,
+        _b: &Rc<RefCell<NodeBuilderImpl>>,
+        symbol: SymbolId,
+    ) -> Vec<TypeId> {
         let mut result: Vec<TypeId> = Vec::new();
         result.extend(self.get_outer_type_parameters_of_class_or_interface(symbol));
         result.extend(self.get_local_type_parameters_of_class_or_interface_or_type_alias(symbol));

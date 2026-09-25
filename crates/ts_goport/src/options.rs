@@ -427,7 +427,9 @@ impl CompilerOptions {
             if base_dir.is_empty() {
                 // This was accounted for in the TS codebase, but only for third-party API usage
                 // where the module resolution host does not provide a getCurrentDirectory().
-                panic!("cannot get effective type roots without a config file path or current directory");
+                panic!(
+                    "cannot get effective type roots without a config file path or current directory"
+                );
             }
         }
 
@@ -814,7 +816,10 @@ fn tspath_is_declaration_file_name(file_name: &str) -> bool {
 
 // Go: tspath/path.go:1066 ForEachAncestorDirectory
 // PORT: the callback returns only `stop`; the only caller here has no result.
-fn tspath_for_each_ancestor_directory(directory: &str, callback: &mut dyn FnMut(&str) -> bool) -> bool {
+fn tspath_for_each_ancestor_directory(
+    directory: &str,
+    callback: &mut dyn FnMut(&str) -> bool,
+) -> bool {
     let mut directory = directory.to_string();
     loop {
         if callback(&directory) {
@@ -981,7 +986,12 @@ pub fn from_ts_options(opts: &ts_options::CompilerOptions) -> CompilerOptions {
     let paths = if opts.paths.is_empty() {
         None
     } else {
-        Some(opts.paths.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<IndexMap<_, _>>())
+        Some(
+            opts.paths
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<IndexMap<_, _>>(),
+        )
     };
 
     CompilerOptions {
@@ -1066,7 +1076,11 @@ pub fn from_ts_options(opts: &ts_options::CompilerOptions) -> CompilerOptions {
         lib_replacement: ts_default_tristate(opts.lib_replacement, d.lib_replacement),
         locale: String::new(),
         map_root: opts.map_root.clone().unwrap_or_default(),
-        module: if opts.module_specified { ts_module_kind(opts.module) } else { ModuleKind::NONE },
+        module: if opts.module_specified {
+            ts_module_kind(opts.module)
+        } else {
+            ModuleKind::NONE
+        },
         module_resolution: opts
             .module_resolution_configured
             .map_or(ModuleResolutionKind::UNKNOWN, ts_module_resolution_kind),
@@ -1084,7 +1098,10 @@ pub fn from_ts_options(opts: &ts_options::CompilerOptions) -> CompilerOptions {
             opts.no_fallthrough_cases_in_switch,
             d.no_fallthrough_cases_in_switch,
         ),
-        no_implicit_any: ts_specified_tristate(opts.no_implicit_any, opts.no_implicit_any_specified),
+        no_implicit_any: ts_specified_tristate(
+            opts.no_implicit_any,
+            opts.no_implicit_any_specified,
+        ),
         no_implicit_this: ts_specified_tristate(
             opts.no_implicit_this,
             opts.no_implicit_this_specified,

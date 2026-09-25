@@ -4,7 +4,10 @@ use crate::prelude::*;
 
 use super::emit_context::{AutoGenerateId, EmitContext};
 use super::types::GeneratedIdentifierFlags;
-use super::utilities::{ensure_leading_hash, format_generated_name, make_identifier_from_module_name, remove_leading_hash};
+use super::utilities::{
+    ensure_leading_hash, format_generated_name, make_identifier_from_module_name,
+    remove_leading_hash,
+};
 
 /// Go `tempFlags`. Flags enum to track count of temp variables and a few dedicated names
 pub(crate) type TempFlags = i32;
@@ -29,7 +32,7 @@ pub type GetTextOfNodeFn = Rc<dyn Fn(&mut NameGenerator, Node) -> String>;
 pub struct NameGenerator {
     pub context: Option<Rc<EmitContext>>,
     pub is_file_level_unique_name_in_current_file: Option<IsFileLevelUniqueNameFn>, // callback for Printer.isFileLevelUniqueNameInCurrentFile
-    pub get_text_of_node: Option<GetTextOfNodeFn>,                                  // callback for Printer.getTextOfNode
+    pub get_text_of_node: Option<GetTextOfNodeFn>, // callback for Printer.getTextOfNode
     node_id_to_generated_name: FxHashMap<u64, String>, // Map of generated names for specific nodes
     node_id_to_generated_private_name: FxHashMap<u64, String>, // Map of generated private names for specific nodes
     auto_generated_id_to_generated_name: FxHashMap<AutoGenerateId, String>, // Map of generated names for temp and loop variables
@@ -44,18 +47,22 @@ struct NameGenerationScope {
     next: Option<Box<NameGenerationScope>>, // The next nameGenerationScope in the stack
     temp_flags: TempFlags,                  // TempFlags for the current name generation scope.
     formatted_name_temp_flags: FxHashMap<String, TempFlags>, // TempFlags for the current name generation scope.
-    reserved_names: FxHashSet<String>,      // Names reserved in nested name generation scopes.
-                                            // generatedNames         collections.Set[string] // NOTE: generated names should be scoped after Strada port is complete.
+    reserved_names: FxHashSet<String>, // Names reserved in nested name generation scopes.
+                                       // generatedNames         collections.Set[string] // NOTE: generated names should be scoped after Strada port is complete.
 }
 
 impl NameGenerator {
     // Go: printer/namegenerator.go:41 PushScope
     pub fn push_scope(&mut self, reuse_temp_variable_scope: bool) {
-        self.private_name_generation_scope =
-            Some(Box::new(NameGenerationScope { next: self.private_name_generation_scope.take(), ..Default::default() }));
+        self.private_name_generation_scope = Some(Box::new(NameGenerationScope {
+            next: self.private_name_generation_scope.take(),
+            ..Default::default()
+        }));
         if !reuse_temp_variable_scope {
-            self.name_generation_scope =
-                Some(Box::new(NameGenerationScope { next: self.name_generation_scope.take(), ..Default::default() }));
+            self.name_generation_scope = Some(Box::new(NameGenerationScope {
+                next: self.name_generation_scope.take(),
+                ..Default::default()
+            }));
         }
     }
 
@@ -73,12 +80,20 @@ impl NameGenerator {
 
     // Go: printer/namegenerator.go:57 getScope
     fn get_scope(&mut self, private_name: bool) -> &mut Option<Box<NameGenerationScope>> {
-        if private_name { &mut self.private_name_generation_scope } else { &mut self.name_generation_scope }
+        if private_name {
+            &mut self.private_name_generation_scope
+        } else {
+            &mut self.name_generation_scope
+        }
     }
 
     /// Read-only `getScope`.
     fn get_scope_ref(&self, private_name: bool) -> &Option<Box<NameGenerationScope>> {
-        if private_name { &self.private_name_generation_scope } else { &self.name_generation_scope }
+        if private_name {
+            &self.private_name_generation_scope
+        } else {
+            &self.name_generation_scope
+        }
     }
 
     // Go: printer/namegenerator.go:61 getTempFlags
@@ -91,13 +106,19 @@ impl NameGenerator {
 
     // Go: printer/namegenerator.go:69 setTempFlags
     fn set_temp_flags(&mut self, private_name: bool, flags: TempFlags) {
-        let scope = self.get_scope(private_name).get_or_insert_with(Box::default);
+        let scope = self
+            .get_scope(private_name)
+            .get_or_insert_with(Box::default);
         scope.temp_flags = flags;
     }
 
     // Go: printer/namegenerator.go:78 getTempFlagsForFormattedName
     // Gets the TempFlags to use in the current nameGenerationScope for the given key
-    fn get_temp_flags_for_formatted_name(&self, private_name: bool, formatted_name_key: &str) -> TempFlags {
+    fn get_temp_flags_for_formatted_name(
+        &self,
+        private_name: bool,
+        formatted_name_key: &str,
+    ) -> TempFlags {
         if let Some(scope) = self.get_scope_ref(private_name) {
             if let Some(flags) = scope.formatted_name_temp_flags.get(formatted_name_key) {
                 return *flags;
@@ -108,14 +129,25 @@ impl NameGenerator {
 
     // Go: printer/namegenerator.go:89 setTempFlagsForFormattedName
     // Sets the TempFlags to use in the current nameGenerationScope for the given key
-    fn set_temp_flags_for_formatted_name(&mut self, private_name: bool, formatted_name_key: &str, flags: TempFlags) {
-        let scope = self.get_scope(private_name).get_or_insert_with(Box::default);
-        scope.formatted_name_temp_flags.insert(formatted_name_key.to_string(), flags);
+    fn set_temp_flags_for_formatted_name(
+        &mut self,
+        private_name: bool,
+        formatted_name_key: &str,
+        flags: TempFlags,
+    ) {
+        let scope = self
+            .get_scope(private_name)
+            .get_or_insert_with(Box::default);
+        scope
+            .formatted_name_temp_flags
+            .insert(formatted_name_key.to_string(), flags);
     }
 
     // Go: printer/namegenerator.go:100 reserveName
     fn reserve_name(&mut self, name: &str, private_name: bool, scoped: bool, temp: bool) {
-        let scope = self.get_scope(private_name).get_or_insert_with(Box::default);
+        let scope = self
+            .get_scope(private_name)
+            .get_or_insert_with(Box::default);
         if private_name || scoped {
             scope.reserved_names.insert(name.to_string());
         } else if !temp {
@@ -126,7 +158,10 @@ impl NameGenerator {
 
     /// Go `g.GetTextOfNode(node)`. Panics when the callback is nil, as Go does.
     fn text_of_node(&mut self, node: Node) -> String {
-        let get_text_of_node = self.get_text_of_node.clone().expect("nil GetTextOfNode callback");
+        let get_text_of_node = self
+            .get_text_of_node
+            .clone()
+            .expect("nil GetTextOfNode callback");
         get_text_of_node(self, node)
     }
 
@@ -148,11 +183,15 @@ impl NameGenerator {
                     );
                 } else {
                     // Auto, Loop, and Unique names are cached based on their unique autoGenerateId.
-                    if let Some(auto_generated_name) = self.auto_generated_id_to_generated_name.get(&auto_generate.id) {
+                    if let Some(auto_generated_name) = self
+                        .auto_generated_id_to_generated_name
+                        .get(&auto_generate.id)
+                    {
                         return auto_generated_name.clone();
                     }
                     let auto_generated_name = self.make_name(name);
-                    self.auto_generated_id_to_generated_name.insert(auto_generate.id, auto_generated_name.clone());
+                    self.auto_generated_id_to_generated_name
+                        .insert(auto_generate.id, auto_generated_name.clone());
                     return auto_generated_name;
                 }
             }
@@ -170,14 +209,22 @@ impl NameGenerator {
         suffix: &str,
     ) -> String {
         let node_id = get_node_id(node);
-        let cache = if private_name { &self.node_id_to_generated_private_name } else { &self.node_id_to_generated_name };
+        let cache = if private_name {
+            &self.node_id_to_generated_private_name
+        } else {
+            &self.node_id_to_generated_name
+        };
 
         if let Some(name) = cache.get(&node_id) {
             return name.clone();
         }
 
         let name = self.generate_name_for_node(node, private_name, flags, prefix, suffix);
-        let cache = if private_name { &mut self.node_id_to_generated_private_name } else { &mut self.node_id_to_generated_name };
+        let cache = if private_name {
+            &mut self.node_id_to_generated_private_name
+        } else {
+            &mut self.node_id_to_generated_name
+        };
         cache.insert(node_id, name.clone());
         name
     }
@@ -206,13 +253,19 @@ impl NameGenerator {
             }
             SyntaxKind::ModuleDeclaration | SyntaxKind::EnumDeclaration => {
                 if private_name || !prefix.is_empty() || !suffix.is_empty() {
-                    panic!("Generated name for a module or enum cannot be private and may have neither a prefix nor suffix");
+                    panic!(
+                        "Generated name for a module or enum cannot be private and may have neither a prefix nor suffix"
+                    );
                 }
                 self.generate_name_for_module_or_enum(node)
             }
-            SyntaxKind::ImportDeclaration | SyntaxKind::JsImportDeclaration | SyntaxKind::ExportDeclaration => {
+            SyntaxKind::ImportDeclaration
+            | SyntaxKind::JsImportDeclaration
+            | SyntaxKind::ExportDeclaration => {
                 if private_name || !prefix.is_empty() || !suffix.is_empty() {
-                    panic!("Generated name for an import or export cannot be private and may have neither a prefix nor suffix");
+                    panic!(
+                        "Generated name for an import or export cannot be private and may have neither a prefix nor suffix"
+                    );
                 }
                 self.generate_name_for_import_or_export_declaration(node)
             }
@@ -231,19 +284,27 @@ impl NameGenerator {
                     None => panic!("nil EmitContext dereference in HasAutoGenerateInfo"),
                 };
                 if name.is_some() && !context_nil_and_has_info {
-                    return self.generate_name_for_node(name, false /*privateName*/, flags, "" /*prefix*/, "" /*suffix*/);
+                    return self.generate_name_for_node(
+                        name, false, /*privateName*/
+                        flags, "", /*prefix*/
+                        "", /*suffix*/
+                    );
                 }
                 self.generate_name_for_export_default()
             }
             SyntaxKind::ExportAssignment => {
                 if private_name || !prefix.is_empty() || !suffix.is_empty() {
-                    panic!("Generated name for an export assignment cannot be private and may have neither a prefix nor suffix");
+                    panic!(
+                        "Generated name for an export assignment cannot be private and may have neither a prefix nor suffix"
+                    );
                 }
                 self.generate_name_for_export_default()
             }
             SyntaxKind::ClassExpression => {
                 if private_name || !prefix.is_empty() || !suffix.is_empty() {
-                    panic!("Generated name for a class expression cannot be private and may have neither a prefix nor suffix");
+                    panic!(
+                        "Generated name for a class expression cannot be private and may have neither a prefix nor suffix"
+                    );
                 }
                 self.generate_name_for_class_expression()
             }
@@ -251,14 +312,29 @@ impl NameGenerator {
                 self.generate_name_for_method_or_accessor(node, private_name, prefix, suffix)
             }
             SyntaxKind::ComputedPropertyName => {
-                self.make_temp_variable_name(TEMP_FLAGS_AUTO, true /*reservedInNestedScopes*/, private_name, prefix, suffix)
+                self.make_temp_variable_name(
+                    TEMP_FLAGS_AUTO,
+                    true, /*reservedInNestedScopes*/
+                    private_name,
+                    prefix,
+                    suffix,
+                )
             }
-            _ => self.make_temp_variable_name(TEMP_FLAGS_AUTO, false /*reservedInNestedScopes*/, private_name, prefix, suffix),
+            _ => self.make_temp_variable_name(
+                TEMP_FLAGS_AUTO,
+                false, /*reservedInNestedScopes*/
+                private_name,
+                prefix,
+                suffix,
+            ),
         }
     }
 
     // Go: printer/namegenerator.go:196 generateNameForModuleOrEnum
-    fn generate_name_for_module_or_enum(&mut self, node: Node /* ModuleDeclaration | EnumDeclaration */) -> String {
+    fn generate_name_for_module_or_enum(
+        &mut self,
+        node: Node, /* ModuleDeclaration | EnumDeclaration */
+    ) -> String {
         let name = self.text_of_node(node.name());
         // Use module/enum name itself if it is unique, otherwise make a unique variation
         if is_unique_local_name(&name, node) {
@@ -276,7 +352,10 @@ impl NameGenerator {
     }
 
     // Go: printer/namegenerator.go:206 generateNameForImportOrExportDeclaration
-    fn generate_name_for_import_or_export_declaration(&mut self, node: Node /* ImportDeclaration | ExportDeclaration */) -> String {
+    fn generate_name_for_import_or_export_declaration(
+        &mut self,
+        node: Node, /* ImportDeclaration | ExportDeclaration */
+    ) -> String {
         let expr = get_external_module_name(node);
         let mut base_name = "module".to_string();
         if is_string_literal(expr) {
@@ -325,9 +404,21 @@ impl NameGenerator {
         suffix: &str,
     ) -> String {
         if is_identifier(node.name()) {
-            return self.generate_name_for_node_cached(node.name(), private_name, GeneratedIdentifierFlags::NONE, prefix, suffix);
+            return self.generate_name_for_node_cached(
+                node.name(),
+                private_name,
+                GeneratedIdentifierFlags::NONE,
+                prefix,
+                suffix,
+            );
         }
-        self.make_temp_variable_name(TEMP_FLAGS_AUTO, false /*reservedInNestedScopes*/, private_name, prefix, suffix)
+        self.make_temp_variable_name(
+            TEMP_FLAGS_AUTO,
+            false, /*reservedInNestedScopes*/
+            private_name,
+            prefix,
+            suffix,
+        )
     }
 
     // Go: printer/namegenerator.go:230 makeName
@@ -354,8 +445,11 @@ impl NameGenerator {
                         &auto_generate.suffix,
                     );
                 } else if kind == GeneratedIdentifierFlags::UNIQUE {
-                    let check_fn =
-                        if auto_generate.flags.is_file_level() { self.is_file_level_unique_name_in_current_file.clone() } else { None };
+                    let check_fn = if auto_generate.flags.is_file_level() {
+                        self.is_file_level_unique_name_in_current_file.clone()
+                    } else {
+                        None
+                    };
                     return self.make_unique_name(
                         name.text(),
                         check_fn.as_deref(),
@@ -401,7 +495,12 @@ impl NameGenerator {
             let full_name = format_generated_name(private_name, prefix, "_i", suffix);
             if self.is_unique_name(&full_name, private_name) {
                 temp_flags |= flags;
-                self.reserve_name(&full_name, private_name, reserved_in_nested_scopes, true /*temp*/);
+                self.reserve_name(
+                    &full_name,
+                    private_name,
+                    reserved_in_nested_scopes,
+                    true, /*temp*/
+                );
                 if simple {
                     self.set_temp_flags(private_name, temp_flags);
                 } else {
@@ -423,7 +522,12 @@ impl NameGenerator {
                 };
                 let full_name = format_generated_name(private_name, prefix, &name, suffix);
                 if self.is_unique_name(&full_name, private_name) {
-                    self.reserve_name(&full_name, private_name, reserved_in_nested_scopes, true /*temp*/);
+                    self.reserve_name(
+                        &full_name,
+                        private_name,
+                        reserved_in_nested_scopes,
+                        true, /*temp*/
+                    );
                     if simple {
                         self.set_temp_flags(private_name, temp_flags);
                     } else {
@@ -468,7 +572,8 @@ impl NameGenerator {
 
         let mut i = 1;
         loop {
-            let full_name = format_generated_name(private_name, prefix, &format!("{base_name}{i}"), suffix);
+            let full_name =
+                format_generated_name(private_name, prefix, &format!("{base_name}{i}"), suffix);
             if self.check_unique_name(&full_name, private_name, check_fn) {
                 self.reserve_name(&full_name, private_name, scoped, false /*temp*/);
                 return full_name;
@@ -492,7 +597,12 @@ impl NameGenerator {
     }
 
     // Go: printer/namegenerator.go:347 checkUniqueName
-    fn check_unique_name(&self, name: &str, private_name: bool, check_fn: Option<&dyn Fn(&str, bool) -> bool>) -> bool {
+    fn check_unique_name(
+        &self,
+        name: &str,
+        private_name: bool,
+        check_fn: Option<&dyn Fn(&str, bool) -> bool>,
+    ) -> bool {
         if let Some(check_fn) = check_fn {
             check_fn(name, private_name)
         } else {
@@ -502,7 +612,10 @@ impl NameGenerator {
 
     // Go: printer/namegenerator.go:378 isUniqueName
     fn is_unique_name(&self, name: &str, private_name: bool) -> bool {
-        (self.is_file_level_unique_name_in_current_file.as_ref().is_none_or(|f| f(name, private_name)))
+        (self
+            .is_file_level_unique_name_in_current_file
+            .as_ref()
+            .is_none_or(|f| f(name, private_name)))
             && !self.is_reserved_name(name, private_name)
     }
 
@@ -552,7 +665,10 @@ fn is_unique_local_name(name: &str, container: Node) -> bool {
             // We conservatively include alias symbols to cover cases where they're emitted as locals
             let local = symbols.get(locals, name);
             if local.is_some()
-                && symbols.sym(local).flags.intersects(SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE | SymbolFlags::ALIAS)
+                && symbols
+                    .sym(local)
+                    .flags
+                    .intersects(SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE | SymbolFlags::ALIAS)
             {
                 return false;
             }

@@ -51,7 +51,12 @@ impl PackageId {
     // Go: module/types.go:54 PackageId.String
     #[must_use]
     pub fn string(&self) -> String {
-        format!("{}@{}{}", self.package_name(), self.version, self.peer_dependencies)
+        format!(
+            "{}@{}{}",
+            self.package_name(),
+            self.version,
+            self.peer_dependencies
+        )
     }
 
     // Go: module/types.go:58 PackageId.PackageName
@@ -123,13 +128,25 @@ impl Extensions {
     pub fn array(self) -> Vec<String> {
         let mut result: Vec<String> = Vec::new();
         if self.intersects(Extensions::TYPE_SCRIPT) {
-            result.extend(SUPPORTED_TS_IMPLEMENTATION_EXTENSIONS.iter().map(|e| (*e).to_string()));
+            result.extend(
+                SUPPORTED_TS_IMPLEMENTATION_EXTENSIONS
+                    .iter()
+                    .map(|e| (*e).to_string()),
+            );
         }
         if self.intersects(Extensions::JAVA_SCRIPT) {
-            result.extend(SUPPORTED_JS_EXTENSIONS_FLAT.iter().map(|e| (*e).to_string()));
+            result.extend(
+                SUPPORTED_JS_EXTENSIONS_FLAT
+                    .iter()
+                    .map(|e| (*e).to_string()),
+            );
         }
         if self.intersects(Extensions::DECLARATION) {
-            result.extend(SUPPORTED_DECLARATION_EXTENSIONS.iter().map(|e| (*e).to_string()));
+            result.extend(
+                SUPPORTED_DECLARATION_EXTENSIONS
+                    .iter()
+                    .map(|e| (*e).to_string()),
+            );
         }
         if self.intersects(Extensions::JSON) {
             result.push(EXTENSION_JSON.to_string());

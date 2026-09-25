@@ -23,7 +23,10 @@ pub struct SymbolAccessibilityDiagnostic {
 }
 
 // Go: transformers/declarations/diagnostics.go:18 wrapSimpleDiagnosticSelector
-fn wrap_simple_diagnostic_selector(node: Node, selector: DiagnosticSelector) -> GetSymbolAccessibilityDiagnostic {
+fn wrap_simple_diagnostic_selector(
+    node: Node,
+    selector: DiagnosticSelector,
+) -> GetSymbolAccessibilityDiagnostic {
     Rc::new(move |symbol_accessibility_result| {
         let diagnostic_message = selector(node, symbol_accessibility_result)?;
         Some(SymbolAccessibilityDiagnostic {
@@ -35,23 +38,37 @@ fn wrap_simple_diagnostic_selector(node: Node, selector: DiagnosticSelector) -> 
 }
 
 // Go: transformers/declarations/diagnostics.go:32 wrapNamedDiagnosticSelector
-fn wrap_named_diagnostic_selector(node: Node, selector: DiagnosticSelector) -> GetSymbolAccessibilityDiagnostic {
+fn wrap_named_diagnostic_selector(
+    node: Node,
+    selector: DiagnosticSelector,
+) -> GetSymbolAccessibilityDiagnostic {
     Rc::new(move |symbol_accessibility_result| {
         let diagnostic_message = selector(node, symbol_accessibility_result)?;
         let name = get_name_of_declaration(node);
-        Some(SymbolAccessibilityDiagnostic { error_node: name, diagnostic_message, type_name: name })
+        Some(SymbolAccessibilityDiagnostic {
+            error_node: name,
+            diagnostic_message,
+            type_name: name,
+        })
     })
 }
 
 // Go: transformers/declarations/diagnostics.go:47 wrapFallbackErrorDiagnosticSelector
-fn wrap_fallback_error_diagnostic_selector(node: Node, selector: DiagnosticSelector) -> GetSymbolAccessibilityDiagnostic {
+fn wrap_fallback_error_diagnostic_selector(
+    node: Node,
+    selector: DiagnosticSelector,
+) -> GetSymbolAccessibilityDiagnostic {
     Rc::new(move |symbol_accessibility_result| {
         let diagnostic_message = selector(node, symbol_accessibility_result)?;
         let mut error_node = get_name_of_declaration(node);
         if error_node.is_nil() {
             error_node = node;
         }
-        Some(SymbolAccessibilityDiagnostic { error_node, diagnostic_message, type_name: Node::NIL })
+        Some(SymbolAccessibilityDiagnostic {
+            error_node,
+            diagnostic_message,
+            type_name: Node::NIL,
+        })
     })
 }
 
@@ -84,7 +101,9 @@ fn select_diagnostic_based_on_module_name_no_name_check(
 }
 
 // Go: transformers/declarations/diagnostics.go:81 createGetSymbolAccessibilityDiagnosticForNodeName
-pub fn create_get_symbol_accessibility_diagnostic_for_node_name(node: Node) -> GetSymbolAccessibilityDiagnostic {
+pub fn create_get_symbol_accessibility_diagnostic_for_node_name(
+    node: Node,
+) -> GetSymbolAccessibilityDiagnostic {
     if is_set_accessor_declaration(node) || is_get_accessor_declaration(node) {
         wrap_simple_diagnostic_selector(node, get_accessor_name_visibility_diagnostic_message)
     } else if is_method_declaration(node) || is_method_signature_declaration(node) {
@@ -95,7 +114,10 @@ pub fn create_get_symbol_accessibility_diagnostic_for_node_name(node: Node) -> G
 }
 
 // Go: transformers/declarations/diagnostics.go:91 getAccessorNameVisibilityDiagnosticMessage
-fn get_accessor_name_visibility_diagnostic_message(node: Node, r: &SymbolAccessibilityResult) -> Option<&'static Message> {
+fn get_accessor_name_visibility_diagnostic_message(
+    node: Node,
+    r: &SymbolAccessibilityResult,
+) -> Option<&'static Message> {
     if is_static(node) {
         select_diagnostic_based_on_module_name(
             r,
@@ -120,7 +142,10 @@ fn get_accessor_name_visibility_diagnostic_message(node: Node, r: &SymbolAccessi
 }
 
 // Go: transformers/declarations/diagnostics.go:115 getMethodNameVisibilityDiagnosticMessage
-fn get_method_name_visibility_diagnostic_message(node: Node, r: &SymbolAccessibilityResult) -> Option<&'static Message> {
+fn get_method_name_visibility_diagnostic_message(
+    node: Node,
+    r: &SymbolAccessibilityResult,
+) -> Option<&'static Message> {
     if is_static(node) {
         select_diagnostic_based_on_module_name(
             r,
@@ -145,7 +170,9 @@ fn get_method_name_visibility_diagnostic_message(node: Node, r: &SymbolAccessibi
 }
 
 // Go: transformers/declarations/diagnostics.go:139 createGetSymbolAccessibilityDiagnosticForNode
-pub fn create_get_symbol_accessibility_diagnostic_for_node(node: Node) -> GetSymbolAccessibilityDiagnostic {
+pub fn create_get_symbol_accessibility_diagnostic_for_node(
+    node: Node,
+) -> GetSymbolAccessibilityDiagnostic {
     if is_variable_declaration(node)
         || is_property_declaration(node)
         || is_property_signature_declaration(node)
@@ -155,9 +182,15 @@ pub fn create_get_symbol_accessibility_diagnostic_for_node(node: Node) -> GetSym
         || is_binding_element(node)
         || is_constructor_declaration(node)
     {
-        wrap_simple_diagnostic_selector(node, get_variable_declaration_type_visibility_diagnostic_message)
+        wrap_simple_diagnostic_selector(
+            node,
+            get_variable_declaration_type_visibility_diagnostic_message,
+        )
     } else if is_set_accessor_declaration(node) || is_get_accessor_declaration(node) {
-        wrap_named_diagnostic_selector(node, get_accessor_declaration_type_visibility_diagnostic_message)
+        wrap_named_diagnostic_selector(
+            node,
+            get_accessor_declaration_type_visibility_diagnostic_message,
+        )
     } else if is_construct_signature_declaration(node)
         || is_call_signature_declaration(node)
         || is_method_declaration(node)
@@ -170,11 +203,20 @@ pub fn create_get_symbol_accessibility_diagnostic_for_node(node: Node) -> GetSym
         if is_parameter_property_declaration(node, node.parent())
             && has_syntactic_modifier(node.parent(), ModifierFlags::PRIVATE)
         {
-            return wrap_simple_diagnostic_selector(node, get_variable_declaration_type_visibility_diagnostic_message);
+            return wrap_simple_diagnostic_selector(
+                node,
+                get_variable_declaration_type_visibility_diagnostic_message,
+            );
         }
-        wrap_simple_diagnostic_selector(node, get_parameter_declaration_type_visibility_diagnostic_message)
+        wrap_simple_diagnostic_selector(
+            node,
+            get_parameter_declaration_type_visibility_diagnostic_message,
+        )
     } else if is_type_parameter_declaration(node) {
-        wrap_simple_diagnostic_selector(node, get_type_parameter_constraint_visibility_diagnostic_message)
+        wrap_simple_diagnostic_selector(
+            node,
+            get_type_parameter_constraint_visibility_diagnostic_message,
+        )
     } else if is_expression_with_type_arguments(node) {
         // unique node selection behavior, inline closure
         Rc::new(move |_symbol_accessibility_result| {
@@ -182,16 +224,22 @@ pub fn create_get_symbol_accessibility_diagnostic_for_node(node: Node) -> GetSym
             // Heritage clause is written by user so it can always be named
             if is_class_declaration(node.parent().parent()) {
                 // Class or Interface implemented/extended is inaccessible
-                if is_heritage_clause(node.parent()) && node.parent().token() == SyntaxKind::ImplementsKeyword {
-                    diagnostic_message = diag::Implements_clause_of_exported_class_0_has_or_is_using_private_name_1;
+                if is_heritage_clause(node.parent())
+                    && node.parent().token() == SyntaxKind::ImplementsKeyword
+                {
+                    diagnostic_message =
+                        diag::Implements_clause_of_exported_class_0_has_or_is_using_private_name_1;
                 } else if node.parent().parent().name().is_some() {
-                    diagnostic_message = diag::X_extends_clause_of_exported_class_0_has_or_is_using_private_name_1;
+                    diagnostic_message =
+                        diag::X_extends_clause_of_exported_class_0_has_or_is_using_private_name_1;
                 } else {
-                    diagnostic_message = diag::X_extends_clause_of_exported_class_has_or_is_using_private_name_0;
+                    diagnostic_message =
+                        diag::X_extends_clause_of_exported_class_has_or_is_using_private_name_0;
                 }
             } else {
                 // interface is inaccessible
-                diagnostic_message = diag::X_extends_clause_of_exported_interface_0_has_or_is_using_private_name_1;
+                diagnostic_message =
+                    diag::X_extends_clause_of_exported_interface_0_has_or_is_using_private_name_1;
             }
             Some(SymbolAccessibilityDiagnostic {
                 diagnostic_message,
@@ -200,7 +248,9 @@ pub fn create_get_symbol_accessibility_diagnostic_for_node(node: Node) -> GetSym
             })
         })
     } else if is_import_equals_declaration(node) {
-        wrap_simple_diagnostic_selector(node, |_, _| Some(diag::Import_declaration_0_is_using_private_name_1))
+        wrap_simple_diagnostic_selector(node, |_, _| {
+            Some(diag::Import_declaration_0_is_using_private_name_1)
+        })
     } else if is_type_alias_declaration(node) || is_js_type_alias_declaration(node) {
         // unique node selection behavior, inline closure
         Rc::new(move |symbol_accessibility_result| {
@@ -209,7 +259,11 @@ pub fn create_get_symbol_accessibility_diagnostic_for_node(node: Node) -> GetSym
                 diag::Exported_type_alias_0_has_or_is_using_private_name_1_from_module_2,
                 diag::Exported_type_alias_0_has_or_is_using_private_name_1,
             )?;
-            Some(SymbolAccessibilityDiagnostic { error_node: node.type_(), diagnostic_message, type_name: node.name() })
+            Some(SymbolAccessibilityDiagnostic {
+                error_node: node.type_(),
+                diagnostic_message,
+                type_name: node.name(),
+            })
         })
     } else if is_call_expression(node) {
         // JS object.defineProperty call
@@ -222,10 +276,17 @@ pub fn create_get_symbol_accessibility_diagnostic_for_node(node: Node) -> GetSym
                 diag::Exported_variable_0_has_or_is_using_private_name_1,
             )?;
             let argument = node.arguments().get(1);
-            Some(SymbolAccessibilityDiagnostic { error_node: argument, diagnostic_message, type_name: argument })
+            Some(SymbolAccessibilityDiagnostic {
+                error_node: argument,
+                diagnostic_message,
+                type_name: argument,
+            })
         })
     } else {
-        panic!("Attempted to set a declaration diagnostic context for unhandled node kind: {:?}", node.kind());
+        panic!(
+            "Attempted to set a declaration diagnostic context for unhandled node kind: {:?}",
+            node.kind()
+        );
     }
 }
 
@@ -249,7 +310,8 @@ fn get_variable_declaration_type_visibility_diagnostic_message(
         || kind == SyntaxKind::ElementAccessExpression
         || kind == SyntaxKind::BinaryExpression
         || kind == SyntaxKind::PropertySignature
-        || (kind == SyntaxKind::Parameter && has_syntactic_modifier(node.parent(), ModifierFlags::PRIVATE))
+        || (kind == SyntaxKind::Parameter
+            && has_syntactic_modifier(node.parent(), ModifierFlags::PRIVATE))
     {
         if is_static(node) {
             return select_diagnostic_based_on_module_name(
@@ -258,7 +320,9 @@ fn get_variable_declaration_type_visibility_diagnostic_message(
                 diag::Public_static_property_0_of_exported_class_has_or_is_using_name_1_from_private_module_2,
                 diag::Public_static_property_0_of_exported_class_has_or_is_using_private_name_1,
             );
-        } else if node.parent().kind() == SyntaxKind::ClassDeclaration || kind == SyntaxKind::Parameter {
+        } else if node.parent().kind() == SyntaxKind::ClassDeclaration
+            || kind == SyntaxKind::Parameter
+        {
             return select_diagnostic_based_on_module_name(
                 r,
                 diag::Public_property_0_of_exported_class_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named,
@@ -316,7 +380,10 @@ fn get_accessor_declaration_type_visibility_diagnostic_message(
 }
 
 // Go: transformers/declarations/diagnostics.go:299 getReturnTypeVisibilityDiagnosticMessage
-fn get_return_type_visibility_diagnostic_message(node: Node, r: &SymbolAccessibilityResult) -> Option<&'static Message> {
+fn get_return_type_visibility_diagnostic_message(
+    node: Node,
+    r: &SymbolAccessibilityResult,
+) -> Option<&'static Message> {
     match node.kind() {
         SyntaxKind::ConstructSignature => select_diagnostic_based_on_module_name_no_name_check(
             r,
@@ -585,7 +652,9 @@ fn add_parent_declaration_related_info(node: Node, diag: &mut Diagnostic) {
     }
     diag.add_related_info(Some(create_diagnostic_for_node(
         parent_declaration,
-        message(get_related_suggestion_by_declaration_kind(parent_declaration.kind())),
+        message(get_related_suggestion_by_declaration_kind(
+            parent_declaration.kind(),
+        )),
         args![target_str],
     )));
 }
@@ -602,18 +671,26 @@ fn create_accessor_type_error(node: Node) -> Diagnostic {
     if is_set_accessor_declaration(node) && node.parameters().len() > 0 {
         target_node = node.parameters().get(0);
     }
-    let mut diag = create_diagnostic_for_node(target_node, message(get_error_by_declaration_kind(node.kind())), args![]);
+    let mut diag = create_diagnostic_for_node(
+        target_node,
+        message(get_error_by_declaration_kind(node.kind())),
+        args![],
+    );
     if set_accessor.is_some() {
         diag.add_related_info(Some(create_diagnostic_for_node(
             set_accessor,
-            message(get_related_suggestion_by_declaration_kind(set_accessor.kind())),
+            message(get_related_suggestion_by_declaration_kind(
+                set_accessor.kind(),
+            )),
             args![],
         )));
     }
     if get_accessor.is_some() {
         diag.add_related_info(Some(create_diagnostic_for_node(
             get_accessor,
-            message(get_related_suggestion_by_declaration_kind(get_accessor.kind())),
+            message(get_related_suggestion_by_declaration_kind(
+                get_accessor.kind(),
+            )),
             args![],
         )));
     }
@@ -622,26 +699,44 @@ fn create_accessor_type_error(node: Node) -> Diagnostic {
 
 /// The declarations of a binder symbol. Go reads `symbol.Declarations`.
 pub(crate) fn bound_symbol_declarations(symbol: SymbolId) -> Vec<Node> {
-    prog().bound_symbols.get().expect("program not bound").sym(symbol).declarations.clone()
+    prog()
+        .bound_symbols
+        .get()
+        .expect("program not bound")
+        .sym(symbol)
+        .declarations
+        .clone()
 }
 
 // Go: transformers/declarations/diagnostics.go:603 createObjectLiteralError
 fn create_object_literal_error(node: Node) -> Diagnostic {
-    let mut diag = create_diagnostic_for_node(node, message(get_error_by_declaration_kind(node.kind())), args![]);
+    let mut diag = create_diagnostic_for_node(
+        node,
+        message(get_error_by_declaration_kind(node.kind())),
+        args![],
+    );
     add_parent_declaration_related_info(node, &mut diag);
     diag
 }
 
 // Go: transformers/declarations/diagnostics.go:609 createArrayLiteralError
 fn create_array_literal_error(node: Node) -> Diagnostic {
-    let mut diag = create_diagnostic_for_node(node, message(get_error_by_declaration_kind(node.kind())), args![]);
+    let mut diag = create_diagnostic_for_node(
+        node,
+        message(get_error_by_declaration_kind(node.kind())),
+        args![],
+    );
     add_parent_declaration_related_info(node, &mut diag);
     diag
 }
 
 // Go: transformers/declarations/diagnostics.go:615 createReturnTypeError
 fn create_return_type_error(node: Node) -> Diagnostic {
-    let mut diag = create_diagnostic_for_node(node, message(get_error_by_declaration_kind(node.kind())), args![]);
+    let mut diag = create_diagnostic_for_node(
+        node,
+        message(get_error_by_declaration_kind(node.kind())),
+        args![],
+    );
     add_parent_declaration_related_info(node, &mut diag);
     diag.add_related_info(Some(create_diagnostic_for_node(
         node,
@@ -653,12 +748,20 @@ fn create_return_type_error(node: Node) -> Diagnostic {
 
 // Go: transformers/declarations/diagnostics.go:622 createBindingElementError
 fn create_binding_element_error(node: Node) -> Diagnostic {
-    create_diagnostic_for_node(node, diag::Binding_elements_can_t_be_exported_directly_with_isolatedDeclarations, args![])
+    create_diagnostic_for_node(
+        node,
+        diag::Binding_elements_can_t_be_exported_directly_with_isolatedDeclarations,
+        args![],
+    )
 }
 
 // Go: transformers/declarations/diagnostics.go:626 createVariableOrPropertyError
 fn create_variable_or_property_error(node: Node) -> Diagnostic {
-    let mut diag = create_diagnostic_for_node(node, message(get_error_by_declaration_kind(node.kind())), args![]);
+    let mut diag = create_diagnostic_for_node(
+        node,
+        message(get_error_by_declaration_kind(node.kind())),
+        args![],
+    );
     diag.add_related_info(Some(create_diagnostic_for_node(
         node,
         message(get_related_suggestion_by_declaration_kind(node.kind())),
@@ -674,7 +777,10 @@ fn create_expression_error(node: Node) -> Diagnostic {
 
 // Go: transformers/declarations/diagnostics.go:636 createClassExpressionError
 fn create_class_expression_error(node: Node) -> Diagnostic {
-    create_expression_error_ex(node, Some(diag::Inference_from_class_expressions_is_not_supported_with_isolatedDeclarations))
+    create_expression_error_ex(
+        node,
+        Some(diag::Inference_from_class_expressions_is_not_supported_with_isolatedDeclarations),
+    )
 }
 
 // Go: transformers/declarations/diagnostics.go:640 isParentForIDDIagnostic
@@ -689,10 +795,14 @@ fn is_parent_for_idd_iagnostic(node: Node) -> FindAncestorResult {
 }
 
 // Go: transformers/declarations/diagnostics.go:650 createExpressionErrorEx
-fn create_expression_error_ex(node: Node, mut diagnostic_message: Option<&'static Message>) -> Diagnostic {
+fn create_expression_error_ex(
+    node: Node,
+    mut diagnostic_message: Option<&'static Message>,
+) -> Diagnostic {
     let parent_declaration = find_nearest_declaration(node);
     if parent_declaration.is_nil() {
-        let msg = diagnostic_message.unwrap_or(diag::Expression_type_can_t_be_inferred_with_isolatedDeclarations);
+        let msg = diagnostic_message
+            .unwrap_or(diag::Expression_type_can_t_be_inferred_with_isolatedDeclarations);
         return create_diagnostic_for_node(node, msg, args![]);
     }
 
@@ -709,16 +819,21 @@ fn create_expression_error_ex(node: Node, mut diagnostic_message: Option<&'stati
         let mut diag = create_diagnostic_for_node(node, message(diagnostic_message), args![]);
         diag.add_related_info(Some(create_diagnostic_for_node(
             parent_declaration,
-            message(get_related_suggestion_by_declaration_kind(parent_declaration.kind())),
+            message(get_related_suggestion_by_declaration_kind(
+                parent_declaration.kind(),
+            )),
             args![target_str],
         )));
         return diag;
     }
-    let msg = diagnostic_message.unwrap_or(diag::Expression_type_can_t_be_inferred_with_isolatedDeclarations);
+    let msg = diagnostic_message
+        .unwrap_or(diag::Expression_type_can_t_be_inferred_with_isolatedDeclarations);
     let mut diag = create_diagnostic_for_node(node, msg, args![]);
     diag.add_related_info(Some(create_diagnostic_for_node(
         parent_declaration,
-        message(get_related_suggestion_by_declaration_kind(parent_declaration.kind())),
+        message(get_related_suggestion_by_declaration_kind(
+            parent_declaration.kind(),
+        )),
         args![target_str],
     )));
     diag.add_related_info(Some(create_diagnostic_for_node(
@@ -733,13 +848,16 @@ fn create_expression_error_ex(node: Node, mut diagnostic_message: Option<&'stati
 pub type GetIsolatedDeclarationError = Box<dyn Fn(Node) -> Diagnostic>;
 
 // Go: transformers/declarations/diagnostics.go:682 createGetIsolatedDeclarationErrors
-pub fn create_get_isolated_declaration_errors(resolver: Rc<dyn EmitResolver>) -> GetIsolatedDeclarationError {
+pub fn create_get_isolated_declaration_errors(
+    resolver: Rc<dyn EmitResolver>,
+) -> GetIsolatedDeclarationError {
     let create_parameter_error = move |node: Node| -> Diagnostic {
         if is_set_accessor_declaration(node.parent()) {
             return create_accessor_type_error(node.parent());
         }
         // skip checker lock - node builder will already have one
-        let add_undefined = resolver.requires_adding_implicit_undefined_unsafe(node, SymbolId::NIL, Node::NIL);
+        let add_undefined =
+            resolver.requires_adding_implicit_undefined_unsafe(node, SymbolId::NIL, Node::NIL);
         if !add_undefined && node.initializer().is_some() {
             return create_expression_error(node);
         }
@@ -774,17 +892,21 @@ pub fn create_get_isolated_declaration_errors(resolver: Rc<dyn EmitResolver>) ->
         }
         match node.kind() {
             SyntaxKind::GetAccessor | SyntaxKind::SetAccessor => create_accessor_type_error(node),
-            SyntaxKind::ComputedPropertyName | SyntaxKind::ShorthandPropertyAssignment | SyntaxKind::SpreadAssignment => {
-                create_object_literal_error(node)
+            SyntaxKind::ComputedPropertyName
+            | SyntaxKind::ShorthandPropertyAssignment
+            | SyntaxKind::SpreadAssignment => create_object_literal_error(node),
+            SyntaxKind::ArrayLiteralExpression | SyntaxKind::SpreadElement => {
+                create_array_literal_error(node)
             }
-            SyntaxKind::ArrayLiteralExpression | SyntaxKind::SpreadElement => create_array_literal_error(node),
             SyntaxKind::MethodDeclaration
             | SyntaxKind::ConstructSignature
             | SyntaxKind::FunctionExpression
             | SyntaxKind::ArrowFunction
             | SyntaxKind::FunctionDeclaration => create_return_type_error(node),
             SyntaxKind::BindingElement => create_binding_element_error(node),
-            SyntaxKind::PropertyDeclaration | SyntaxKind::VariableDeclaration => create_variable_or_property_error(node),
+            SyntaxKind::PropertyDeclaration | SyntaxKind::VariableDeclaration => {
+                create_variable_or_property_error(node)
+            }
             SyntaxKind::Parameter => create_parameter_error(node),
             SyntaxKind::PropertyAssignment => create_expression_error(node.initializer()),
             SyntaxKind::ClassExpression => create_class_expression_error(node),
@@ -794,6 +916,10 @@ pub fn create_get_isolated_declaration_errors(resolver: Rc<dyn EmitResolver>) ->
 }
 
 // Go: transformers/declarations/tracker.go:207 createDiagnosticForNode
-pub(crate) fn create_diagnostic_for_node(node: Node, message: &'static Message, args: Vec<String>) -> Diagnostic {
+pub(crate) fn create_diagnostic_for_node(
+    node: Node,
+    message: &'static Message,
+    args: Vec<String>,
+) -> Diagnostic {
     new_diagnostic_for_node(node, message, args)
 }

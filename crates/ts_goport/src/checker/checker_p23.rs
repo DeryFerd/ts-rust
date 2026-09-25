@@ -5,11 +5,24 @@ use crate::prelude::*;
 
 impl Checker {
     // Go: checker/checker.go:20351 reportErrorsFromWidening
-    pub fn report_errors_from_widening(&mut self, declaration: Node, t: TypeId, widening_kind: WideningKind) {
-        if self.no_implicit_any && self.ty(t).object_flags.intersects(ObjectFlags::CONTAINS_WIDENING_TYPE) {
+    pub fn report_errors_from_widening(
+        &mut self,
+        declaration: Node,
+        t: TypeId,
+        widening_kind: WideningKind,
+    ) {
+        if self.no_implicit_any
+            && self
+                .ty(t)
+                .object_flags
+                .intersects(ObjectFlags::CONTAINS_WIDENING_TYPE)
+        {
             if widening_kind == WideningKind::NORMAL
                 || is_function_like_declaration(declaration)
-                    && self.should_report_errors_from_widening_with_contextual_signature(declaration, widening_kind)
+                    && self.should_report_errors_from_widening_with_contextual_signature(
+                        declaration,
+                        widening_kind,
+                    )
             {
                 // Report implicit any error within type if possible, otherwise report error on declaration
                 if !self.report_widening_errors_in_type(t) {
@@ -78,7 +91,11 @@ impl Checker {
     // Go: checker/checker.go:20396 reportWideningErrorsInType
     pub fn report_widening_errors_in_type(&mut self, t: TypeId) -> bool {
         let mut error_reported = false;
-        if self.ty(t).object_flags.intersects(ObjectFlags::CONTAINS_WIDENING_TYPE) {
+        if self
+            .ty(t)
+            .object_flags
+            .intersects(ObjectFlags::CONTAINS_WIDENING_TYPE)
+        {
             if self.ty(t).flags.intersects(TypeFlags::UNION) {
                 let types = self.ty(t).types().to_vec();
                 if types.iter().any(|&s| self.is_empty_object_type(s)) {
@@ -95,7 +112,11 @@ impl Checker {
             } else if self.is_object_literal_type(t) {
                 for p in self.get_properties_of_object_type(t) {
                     let s = self.get_type_of_symbol(p);
-                    if self.ty(s).object_flags.intersects(ObjectFlags::CONTAINS_WIDENING_TYPE) {
+                    if self
+                        .ty(s)
+                        .object_flags
+                        .intersects(ObjectFlags::CONTAINS_WIDENING_TYPE)
+                    {
                         error_reported = self.report_widening_errors_in_type(s);
                         if !error_reported {
                             // we need to account for property types coming from object literal type normalization in unions
@@ -107,7 +128,8 @@ impl Checker {
                                 .copied()
                                 .find(|&d| {
                                     let value_declaration = self.sym(d.symbol()).value_declaration;
-                                    value_declaration.is_some() && value_declaration.parent() == t_value_declaration
+                                    value_declaration.is_some()
+                                        && value_declaration.parent() == t_value_declaration
                                 })
                                 .unwrap_or(Node::NIL);
                             if value_declaration.is_some() {
@@ -163,7 +185,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:20464 checkIfExpressionRefinesAnyParameter
-    pub fn check_if_expression_refines_any_parameter(&mut self, fn_: Node, expr: Node) -> TypePredicateId {
+    pub fn check_if_expression_refines_any_parameter(
+        &mut self,
+        fn_: Node,
+        expr: Node,
+    ) -> TypePredicateId {
         let expr = skip_parentheses(expr);
         let return_type = self.check_expression_cached(expr);
         if !self.ty(return_type).flags.intersects(TypeFlags::BOOLEAN) {
@@ -182,7 +208,12 @@ impl Checker {
             }
             let true_type = self.check_if_expression_refines_parameter(fn_, expr, param, init_type);
             if true_type.is_some() {
-                return self.new_type_predicate(TypePredicateKind::IDENTIFIER, param.name().text(), i as i32, true_type);
+                return self.new_type_predicate(
+                    TypePredicateKind::IDENTIFIER,
+                    param.name().text(),
+                    i as i32,
+                    true_type,
+                );
             }
         }
         TypePredicateId::NIL
@@ -206,15 +237,29 @@ impl Checker {
         if antecedent.is_nil() {
             antecedent = self.new_synthetic_flow_node(FlowFlags::START, Node::NIL, FlowNodeId::NIL);
         }
-        let true_condition = self.new_synthetic_flow_node(FlowFlags::TRUE_CONDITION, expr, antecedent);
-        let true_type = self.get_flow_type_of_reference_ex(param.name(), init_type, init_type, fn_, true_condition);
+        let true_condition =
+            self.new_synthetic_flow_node(FlowFlags::TRUE_CONDITION, expr, antecedent);
+        let true_type = self.get_flow_type_of_reference_ex(
+            param.name(),
+            init_type,
+            init_type,
+            fn_,
+            true_condition,
+        );
         if true_type == init_type {
             return TypeId::NIL;
         }
         // "x is T" means that x is T if and only if it returns true. If it returns false then x is not T.
         // This means that if the function is called with an argument of type trueType, there can't be anything left in the `else` branch. It must reduce to `never`.
-        let false_condition = self.new_synthetic_flow_node(FlowFlags::FALSE_CONDITION, expr, antecedent);
-        let false_flow_type = self.get_flow_type_of_reference_ex(param.name(), init_type, true_type, fn_, false_condition);
+        let false_condition =
+            self.new_synthetic_flow_node(FlowFlags::FALSE_CONDITION, expr, antecedent);
+        let false_flow_type = self.get_flow_type_of_reference_ex(
+            param.name(),
+            init_type,
+            true_type,
+            fn_,
+            false_condition,
+        );
         let false_subtype = self.get_reduced_type(false_flow_type);
         if self.ty(false_subtype).flags.intersects(TypeFlags::NEVER) {
             return true_type;
@@ -238,7 +283,12 @@ impl Checker {
     }
 
     // Go: checker/checker.go:20518 instantiateSignatureEx
-    pub fn instantiate_signature_ex(&mut self, sig: SignatureId, m: MapperId, erase_type_parameters: bool) -> SignatureId {
+    pub fn instantiate_signature_ex(
+        &mut self,
+        sig: SignatureId,
+        m: MapperId,
+        erase_type_parameters: bool,
+    ) -> SignatureId {
         let mut m = m;
         let mut fresh_type_parameters: Vec<TypeId> = Vec::new();
         let sig_type_parameters = self.sig(sig).type_parameters.clone();
@@ -246,7 +296,10 @@ impl Checker {
             // First create a fresh set of type parameters, then include a mapping from the old to the
             // new type parameters in the mapper function. Finally store this mapper in the new type
             // parameters such that we can use it when instantiating constraints.
-            fresh_type_parameters = sig_type_parameters.iter().map(|&tp| self.clone_type_parameter(tp)).collect();
+            fresh_type_parameters = sig_type_parameters
+                .iter()
+                .map(|&tp| self.clone_type_parameter(tp))
+                .collect();
             let fresh_mapper = self.new_type_mapper(&sig_type_parameters, &fresh_type_parameters);
             m = self.combine_type_mappers(fresh_mapper, m);
             for &tp in &fresh_type_parameters {
@@ -256,9 +309,21 @@ impl Checker {
         // Don't compute resolvedReturnType and resolvedTypePredicate now,
         // because using `mapper` now could trigger inferences to become fixed. (See `createInferenceContext`.)
         // See GH#17600.
-        let (sig_flags, sig_declaration, sig_this_parameter, sig_parameters, sig_min_argument_count) = {
+        let (
+            sig_flags,
+            sig_declaration,
+            sig_this_parameter,
+            sig_parameters,
+            sig_min_argument_count,
+        ) = {
             let s = self.sig(sig);
-            (s.flags, s.declaration, s.this_parameter, s.parameters.clone(), s.min_argument_count)
+            (
+                s.flags,
+                s.declaration,
+                s.this_parameter,
+                s.parameters.clone(),
+                s.min_argument_count,
+            )
         };
         let this_parameter = self.instantiate_symbol(sig_this_parameter, m);
         let parameters = self.instantiate_symbols(&sig_parameters, m);
@@ -287,9 +352,20 @@ impl Checker {
         }
         let (key_type, is_readonly, declaration, components) = {
             let i = self.index_info(info);
-            (i.key_type, i.is_readonly, i.declaration, i.components.clone())
+            (
+                i.key_type,
+                i.is_readonly,
+                i.declaration,
+                i.components.clone(),
+            )
         };
-        self.new_index_info(key_type, new_value_type, is_readonly, declaration, &components)
+        self.new_index_info(
+            key_type,
+            new_value_type,
+            is_readonly,
+            declaration,
+            &components,
+        )
     }
 
     // Go: checker/checker.go:20549 resolveAnonymousTypeMembers
@@ -304,11 +380,19 @@ impl Checker {
             let members = self.create_instantiated_symbol_table(&properties, d_mapper);
             let target_call_signatures = self.get_signatures_of_type(d_target, SignatureKind::CALL);
             let call_signatures = self.instantiate_signatures(&target_call_signatures, d_mapper);
-            let target_construct_signatures = self.get_signatures_of_type(d_target, SignatureKind::CONSTRUCT);
-            let construct_signatures = self.instantiate_signatures(&target_construct_signatures, d_mapper);
+            let target_construct_signatures =
+                self.get_signatures_of_type(d_target, SignatureKind::CONSTRUCT);
+            let construct_signatures =
+                self.instantiate_signatures(&target_construct_signatures, d_mapper);
             let target_index_infos = self.get_index_infos_of_type(d_target);
             let index_infos = self.instantiate_index_infos(&target_index_infos, d_mapper);
-            self.set_structured_type_members(t, members, &call_signatures, &construct_signatures, &index_infos);
+            self.set_structured_type_members(
+                t,
+                members,
+                &call_signatures,
+                &construct_signatures,
+                &index_infos,
+            );
             return;
         }
         let t_symbol = self.ty(t).symbol;
@@ -321,7 +405,13 @@ impl Checker {
             let new_symbol = self.symbols.get(members, INTERNAL_SYMBOL_NAME_NEW);
             let construct_signatures = self.get_signatures_of_symbol(new_symbol);
             let index_infos = self.get_index_infos_of_symbol(symbol);
-            self.set_structured_type_members(t, members, &call_signatures, &construct_signatures, &index_infos);
+            self.set_structured_type_members(
+                t,
+                members,
+                &call_signatures,
+                &construct_signatures,
+                &index_infos,
+            );
             return;
         }
         // Combinations of function, class, enum and module
@@ -396,7 +486,11 @@ impl Checker {
         // typeof with a qualified name expression that circularly references the type we are
         // in the process of resolving (see issue #6072). The temporarily empty signature list
         // will never be observed because a qualified name can't reference signatures.
-        if self.sym(symbol).flags.intersects(SymbolFlags::FUNCTION | SymbolFlags::METHOD) {
+        if self
+            .sym(symbol)
+            .flags
+            .intersects(SymbolFlags::FUNCTION | SymbolFlags::METHOD)
+        {
             let signatures = self.get_signatures_of_symbol(symbol);
             let d = &mut self.ty_mut(t).as_object_type_mut().structured;
             d.call_signature_count = signatures.len() as i32;
@@ -406,17 +500,27 @@ impl Checker {
         if self.sym(symbol).flags.intersects(SymbolFlags::CLASS) {
             let class_type = self.get_declared_type_of_class_or_interface(symbol);
             let symbol_members = self.sym(symbol).members;
-            let constructor_symbol = self.symbols.get(symbol_members, INTERNAL_SYMBOL_NAME_CONSTRUCTOR);
+            let constructor_symbol = self
+                .symbols
+                .get(symbol_members, INTERNAL_SYMBOL_NAME_CONSTRUCTOR);
             let mut construct_signatures = self.get_signatures_of_symbol(constructor_symbol);
             if construct_signatures.is_empty() {
                 construct_signatures = self.get_default_construct_signatures(class_type);
             }
-            self.ty_mut(t).as_object_type_mut().structured.signatures.extend(construct_signatures);
+            self.ty_mut(t)
+                .as_object_type_mut()
+                .structured
+                .signatures
+                .extend(construct_signatures);
         }
     }
 
     // Go: checker/checker.go:20628 createInstantiatedSymbolTable
-    pub fn create_instantiated_symbol_table(&mut self, symbols: &[SymbolId], m: MapperId) -> SymbolTable {
+    pub fn create_instantiated_symbol_table(
+        &mut self,
+        symbols: &[SymbolId],
+        m: MapperId,
+    ) -> SymbolTable {
         if symbols.is_empty() {
             return SymbolTable::NIL;
         }
@@ -453,14 +557,21 @@ impl Checker {
         let mut m = m;
         let (links_resolved_type, links_write_type, links_target, links_mapper, links_name_type) = {
             let links = self.value_symbol_links.get(symbol);
-            (links.resolved_type, links.write_type, links.target, links.mapper, links.name_type)
+            (
+                links.resolved_type,
+                links.write_type,
+                links.target,
+                links.mapper,
+                links.name_type,
+            )
         };
         if m.is_some() && self.mapper(m).maps_this_only() && self.is_thisless(symbol) {
             return symbol;
         }
         // If the type of the symbol is already resolved, and if that type could not possibly
         // be affected by instantiation, simply return the symbol itself.
-        if links_resolved_type.is_some() && !self.could_contain_type_variables(links_resolved_type) {
+        if links_resolved_type.is_some() && !self.could_contain_type_variables(links_resolved_type)
+        {
             if !self.sym(symbol).flags.intersects(SymbolFlags::SET_ACCESSOR) {
                 return symbol;
             }
@@ -469,7 +580,11 @@ impl Checker {
                 return symbol;
             }
         }
-        if self.sym(symbol).check_flags.intersects(CheckFlags::INSTANTIATED) {
+        if self
+            .sym(symbol)
+            .check_flags
+            .intersects(CheckFlags::INSTANTIATED)
+        {
             // If symbol being instantiated is itself a instantiation, fetch the original target and combine the
             // type mappers. This ensures that original type identities are properly preserved and that aliases
             // always reference a non-aliases.
@@ -480,14 +595,24 @@ impl Checker {
         // also transient so that we can just store data on it directly.
         let (s_flags, s_name, s_check_flags, s_declarations, s_parent, s_value_declaration) = {
             let s = self.sym(symbol);
-            (s.flags, s.name.clone(), s.check_flags, s.declarations.clone(), s.parent, s.value_declaration)
+            (
+                s.flags,
+                s.name.clone(),
+                s.check_flags,
+                s.declarations.clone(),
+                s.parent,
+                s.value_declaration,
+            )
         };
         let result = self.new_symbol(s_flags, s_name.as_str());
         {
             let r = self.sym_mut(result);
             r.check_flags = CheckFlags::INSTANTIATED
                 | s_check_flags
-                    & (CheckFlags::READONLY | CheckFlags::LATE | CheckFlags::OPTIONAL_PARAMETER | CheckFlags::REST_PARAMETER);
+                    & (CheckFlags::READONLY
+                        | CheckFlags::LATE
+                        | CheckFlags::OPTIONAL_PARAMETER
+                        | CheckFlags::REST_PARAMETER);
             r.declarations = s_declarations;
             r.parent = s_parent;
             r.value_declaration = s_value_declaration;
@@ -562,7 +687,11 @@ pub fn is_thisless_type(node: Node) -> bool {
         | SyntaxKind::NeverKeyword
         | SyntaxKind::LiteralType => true,
         SyntaxKind::ArrayType => is_thisless_type(node.element_type()),
-        SyntaxKind::TypeReference => node.type_arguments().to_vec().into_iter().all(is_thisless_type),
+        SyntaxKind::TypeReference => node
+            .type_arguments()
+            .to_vec()
+            .into_iter()
+            .all(is_thisless_type),
         _ => false,
     }
 }
@@ -574,8 +703,16 @@ pub fn is_thisless_type(node: Node) -> bool {
 pub fn is_thisless_function_like_declaration(node: Node) -> bool {
     let return_type = node.type_();
     (is_constructor_declaration(node) || return_type.is_some() && is_thisless_type(return_type))
-        && node.parameters().to_vec().into_iter().all(is_thisless_variable_like_declaration)
-        && node.type_parameters().to_vec().into_iter().all(is_thisless_type_parameter)
+        && node
+            .parameters()
+            .to_vec()
+            .into_iter()
+            .all(is_thisless_variable_like_declaration)
+        && node
+            .type_parameters()
+            .to_vec()
+            .into_iter()
+            .all(is_thisless_type_parameter)
 }
 
 // A type parameter is thisless if its constraint is thisless, or if it has no constraint. */
@@ -589,17 +726,23 @@ impl Checker {
     // Go: checker/checker.go:20756 getDefaultConstructSignatures
     pub fn get_default_construct_signatures(&mut self, class_type: TypeId) -> Vec<SignatureId> {
         let base_constructor_type = self.get_base_constructor_type_of_class(class_type);
-        let base_signatures = self.get_signatures_of_type(base_constructor_type, SignatureKind::CONSTRUCT);
+        let base_signatures =
+            self.get_signatures_of_type(base_constructor_type, SignatureKind::CONSTRUCT);
         let class_symbol = self.ty(class_type).symbol;
         let declaration = get_class_like_declaration_of_symbol(&self.symbols, class_symbol);
-        let is_abstract = declaration.is_some() && has_syntactic_modifier(declaration, ModifierFlags::ABSTRACT);
+        let is_abstract =
+            declaration.is_some() && has_syntactic_modifier(declaration, ModifierFlags::ABSTRACT);
         if base_signatures.is_empty() {
             let flags = if is_abstract {
                 SignatureFlags::CONSTRUCT | SignatureFlags::ABSTRACT
             } else {
                 SignatureFlags::CONSTRUCT
             };
-            let local_type_parameters = self.ty(class_type).as_interface_type().local_type_parameters().to_vec();
+            let local_type_parameters = self
+                .ty(class_type)
+                .as_interface_type()
+                .local_type_parameters()
+                .to_vec();
             return vec![self.new_signature(
                 flags,
                 Node::NIL,
@@ -618,9 +761,12 @@ impl Checker {
         let mut result: Vec<SignatureId> = Vec::new();
         for base_sig in base_signatures {
             let base_sig_type_parameters = self.sig(base_sig).type_parameters.clone();
-            let min_type_argument_count = self.get_min_type_argument_count(&base_sig_type_parameters);
+            let min_type_argument_count =
+                self.get_min_type_argument_count(&base_sig_type_parameters);
             let type_param_count = base_sig_type_parameters.len() as i32;
-            if is_java_script || type_arg_count >= min_type_argument_count && type_arg_count <= type_param_count {
+            if is_java_script
+                || type_arg_count >= min_type_argument_count && type_arg_count <= type_param_count
+            {
                 let sig = if type_param_count != 0 {
                     let filled = self.fill_missing_type_arguments(
                         &type_arguments,
@@ -632,7 +778,11 @@ impl Checker {
                 } else {
                     self.clone_signature(base_sig)
                 };
-                let local_type_parameters = self.ty(class_type).as_interface_type().local_type_parameters().to_vec();
+                let local_type_parameters = self
+                    .ty(class_type)
+                    .as_interface_type()
+                    .local_type_parameters()
+                    .to_vec();
                 let s = self.sig_mut(sig);
                 s.type_parameters = local_type_parameters;
                 s.resolved_return_type = class_type;
@@ -673,89 +823,125 @@ impl Checker {
         {
             // PORT: Go closure `addMemberForKeyTypeWorker`. It writes `members` (a
             // table handle) and `indexInfos` (captured by `&mut`).
-            let mut add_member_for_key_type_worker = |c: &mut Checker, key_type: TypeId, prop_name_type: TypeId| {
-                // If the current iteration type constituent is a string literal type, create a property.
-                // Otherwise, for type string create a string index signature.
-                if c.is_type_usable_as_property_name(prop_name_type) {
-                    let prop_name = c.get_property_name_from_type(prop_name_type);
-                    // String enum members from separate enums with identical values
-                    // are distinct types with the same property name. Make the resulting
-                    // property symbol's name type be the union of those enum member types.
-                    let existing_prop = c.symbols.get(members, &prop_name);
-                    if existing_prop.is_some() {
-                        let existing_name_type = c.value_symbol_links.get(existing_prop).name_type;
-                        let name_type_union = c.get_union_type(&[existing_name_type, prop_name_type]);
-                        c.value_symbol_links.get(existing_prop).name_type = name_type_union;
-                        let existing_key_type = c.mapped_symbol_links.get(existing_prop).key_type;
-                        let key_type_union = c.get_union_type(&[existing_key_type, key_type]);
-                        c.mapped_symbol_links.get(existing_prop).key_type = key_type_union;
-                    } else {
-                        let mut modifiers_prop = SymbolId::NIL;
-                        if c.is_type_usable_as_property_name(key_type) {
-                            let key_name = c.get_property_name_from_type(key_type);
-                            modifiers_prop = c.get_property_of_type(modifiers_type, &key_name);
-                        }
-                        let is_optional = template_modifiers.intersects(MappedTypeModifiers::INCLUDE_OPTIONAL)
-                            || !template_modifiers.intersects(MappedTypeModifiers::EXCLUDE_OPTIONAL)
-                                && modifiers_prop.is_some()
-                                && c.sym(modifiers_prop).flags.intersects(SymbolFlags::OPTIONAL);
-                        let is_readonly = template_modifiers.intersects(MappedTypeModifiers::INCLUDE_READONLY)
-                            || !template_modifiers.intersects(MappedTypeModifiers::EXCLUDE_READONLY)
-                                && modifiers_prop.is_some()
-                                && c.is_readonly_symbol(modifiers_prop);
-                        let strip_optional = c.strict_null_checks
-                            && !is_optional
-                            && modifiers_prop.is_some()
-                            && c.sym(modifiers_prop).flags.intersects(SymbolFlags::OPTIONAL);
-                        let mut late_flag = CheckFlags::NONE;
-                        if modifiers_prop.is_some() {
-                            late_flag = c.sym(modifiers_prop).check_flags & CheckFlags::LATE;
-                        }
-                        let prop = c.new_symbol(
-                            SymbolFlags::PROPERTY | if is_optional { SymbolFlags::OPTIONAL } else { SymbolFlags::NONE },
-                            prop_name.as_str(),
-                        );
-                        c.sym_mut(prop).check_flags = late_flag
-                            | CheckFlags::MAPPED
-                            | if is_readonly { CheckFlags::READONLY } else { CheckFlags::NONE }
-                            | if strip_optional { CheckFlags::STRIP_OPTIONAL } else { CheckFlags::NONE };
-                        let value_links = c.value_symbol_links.get(prop);
-                        value_links.containing_type = t;
-                        value_links.name_type = prop_name_type;
-                        let mapped_links = c.mapped_symbol_links.get(prop);
-                        mapped_links.key_type = key_type;
-                        if modifiers_prop.is_some() {
-                            mapped_links.synthetic_origin = modifiers_prop;
-                            if should_link_prop_declarations {
-                                let declarations = c.sym(modifiers_prop).declarations.clone();
-                                c.sym_mut(prop).declarations = declarations;
+            let mut add_member_for_key_type_worker =
+                |c: &mut Checker, key_type: TypeId, prop_name_type: TypeId| {
+                    // If the current iteration type constituent is a string literal type, create a property.
+                    // Otherwise, for type string create a string index signature.
+                    if c.is_type_usable_as_property_name(prop_name_type) {
+                        let prop_name = c.get_property_name_from_type(prop_name_type);
+                        // String enum members from separate enums with identical values
+                        // are distinct types with the same property name. Make the resulting
+                        // property symbol's name type be the union of those enum member types.
+                        let existing_prop = c.symbols.get(members, &prop_name);
+                        if existing_prop.is_some() {
+                            let existing_name_type =
+                                c.value_symbol_links.get(existing_prop).name_type;
+                            let name_type_union =
+                                c.get_union_type(&[existing_name_type, prop_name_type]);
+                            c.value_symbol_links.get(existing_prop).name_type = name_type_union;
+                            let existing_key_type =
+                                c.mapped_symbol_links.get(existing_prop).key_type;
+                            let key_type_union = c.get_union_type(&[existing_key_type, key_type]);
+                            c.mapped_symbol_links.get(existing_prop).key_type = key_type_union;
+                        } else {
+                            let mut modifiers_prop = SymbolId::NIL;
+                            if c.is_type_usable_as_property_name(key_type) {
+                                let key_name = c.get_property_name_from_type(key_type);
+                                modifiers_prop = c.get_property_of_type(modifiers_type, &key_name);
                             }
+                            let is_optional = template_modifiers
+                                .intersects(MappedTypeModifiers::INCLUDE_OPTIONAL)
+                                || !template_modifiers
+                                    .intersects(MappedTypeModifiers::EXCLUDE_OPTIONAL)
+                                    && modifiers_prop.is_some()
+                                    && c.sym(modifiers_prop)
+                                        .flags
+                                        .intersects(SymbolFlags::OPTIONAL);
+                            let is_readonly = template_modifiers
+                                .intersects(MappedTypeModifiers::INCLUDE_READONLY)
+                                || !template_modifiers
+                                    .intersects(MappedTypeModifiers::EXCLUDE_READONLY)
+                                    && modifiers_prop.is_some()
+                                    && c.is_readonly_symbol(modifiers_prop);
+                            let strip_optional = c.strict_null_checks
+                                && !is_optional
+                                && modifiers_prop.is_some()
+                                && c.sym(modifiers_prop)
+                                    .flags
+                                    .intersects(SymbolFlags::OPTIONAL);
+                            let mut late_flag = CheckFlags::NONE;
+                            if modifiers_prop.is_some() {
+                                late_flag = c.sym(modifiers_prop).check_flags & CheckFlags::LATE;
+                            }
+                            let prop = c.new_symbol(
+                                SymbolFlags::PROPERTY
+                                    | if is_optional {
+                                        SymbolFlags::OPTIONAL
+                                    } else {
+                                        SymbolFlags::NONE
+                                    },
+                                prop_name.as_str(),
+                            );
+                            c.sym_mut(prop).check_flags = late_flag
+                                | CheckFlags::MAPPED
+                                | if is_readonly {
+                                    CheckFlags::READONLY
+                                } else {
+                                    CheckFlags::NONE
+                                }
+                                | if strip_optional {
+                                    CheckFlags::STRIP_OPTIONAL
+                                } else {
+                                    CheckFlags::NONE
+                                };
+                            let value_links = c.value_symbol_links.get(prop);
+                            value_links.containing_type = t;
+                            value_links.name_type = prop_name_type;
+                            let mapped_links = c.mapped_symbol_links.get(prop);
+                            mapped_links.key_type = key_type;
+                            if modifiers_prop.is_some() {
+                                mapped_links.synthetic_origin = modifiers_prop;
+                                if should_link_prop_declarations {
+                                    let declarations = c.sym(modifiers_prop).declarations.clone();
+                                    c.sym_mut(prop).declarations = declarations;
+                                }
+                            }
+                            c.symbols.set(members, prop_name, prop);
                         }
-                        c.symbols.set(members, prop_name, prop);
+                    } else if c.is_valid_index_key_type(prop_name_type)
+                        || c.ty(prop_name_type)
+                            .flags
+                            .intersects(TypeFlags::ANY | TypeFlags::ENUM)
+                    {
+                        let mut index_key_type = prop_name_type;
+                        let prop_name_flags = c.ty(prop_name_type).flags;
+                        if prop_name_flags.intersects(TypeFlags::ANY | TypeFlags::STRING) {
+                            index_key_type = c.string_type;
+                        } else if prop_name_flags.intersects(TypeFlags::NUMBER | TypeFlags::ENUM) {
+                            index_key_type = c.number_type;
+                        }
+                        let t_mapper = c.ty(t).as_mapped_type().object.mapper;
+                        let prop_mapper = c.append_type_mapping(t_mapper, type_parameter, key_type);
+                        let prop_type = c.instantiate_type(template_type, prop_mapper);
+                        let modifiers_index_info =
+                            c.get_applicable_index_info(modifiers_type, prop_name_type);
+                        let is_readonly = template_modifiers
+                            .intersects(MappedTypeModifiers::INCLUDE_READONLY)
+                            || !template_modifiers
+                                .intersects(MappedTypeModifiers::EXCLUDE_READONLY)
+                                && modifiers_index_info.is_some()
+                                && c.index_info(modifiers_index_info).is_readonly;
+                        let index_info = c.new_index_info(
+                            index_key_type,
+                            prop_type,
+                            is_readonly,
+                            Node::NIL,
+                            &[],
+                        );
+                        let current = std::mem::take(&mut index_infos);
+                        index_infos = c.append_index_info(current, index_info, true /*union*/);
                     }
-                } else if c.is_valid_index_key_type(prop_name_type)
-                    || c.ty(prop_name_type).flags.intersects(TypeFlags::ANY | TypeFlags::ENUM)
-                {
-                    let mut index_key_type = prop_name_type;
-                    let prop_name_flags = c.ty(prop_name_type).flags;
-                    if prop_name_flags.intersects(TypeFlags::ANY | TypeFlags::STRING) {
-                        index_key_type = c.string_type;
-                    } else if prop_name_flags.intersects(TypeFlags::NUMBER | TypeFlags::ENUM) {
-                        index_key_type = c.number_type;
-                    }
-                    let t_mapper = c.ty(t).as_mapped_type().object.mapper;
-                    let prop_mapper = c.append_type_mapping(t_mapper, type_parameter, key_type);
-                    let prop_type = c.instantiate_type(template_type, prop_mapper);
-                    let modifiers_index_info = c.get_applicable_index_info(modifiers_type, prop_name_type);
-                    let is_readonly = template_modifiers.intersects(MappedTypeModifiers::INCLUDE_READONLY)
-                        || !template_modifiers.intersects(MappedTypeModifiers::EXCLUDE_READONLY)
-                            && modifiers_index_info.is_some()
-                            && c.index_info(modifiers_index_info).is_readonly;
-                    let index_info = c.new_index_info(index_key_type, prop_type, is_readonly, Node::NIL, &[]);
-                    let current = std::mem::take(&mut index_infos);
-                    index_infos = c.append_index_info(current, index_info, true /*union*/);
-                }
-            };
+                };
             let mut add_member_for_key_type = |c: &mut Checker, key_type: TypeId| {
                 let mut prop_name_type = key_type;
                 if name_type.is_some() {
@@ -787,16 +973,20 @@ impl Checker {
     pub fn get_type_of_mapped_symbol(&mut self, symbol: SymbolId) -> TypeId {
         if self.value_symbol_links.get(symbol).resolved_type.is_nil() {
             let mapped_type = self.value_symbol_links.get(symbol).containing_type;
-            if !self.push_type_resolution(TypeSystemEntity::Symbol(symbol), TypeSystemPropertyName::TYPE) {
+            if !self.push_type_resolution(
+                TypeSystemEntity::Symbol(symbol),
+                TypeSystemPropertyName::TYPE,
+            ) {
                 self.ty_mut(mapped_type).as_mapped_type_mut().contains_error = true;
                 return self.error_type;
             }
             let mapped_type_target = self.ty(mapped_type).as_mapped_type().object.target;
-            let template_type = self.get_template_type_from_mapped_type(if mapped_type_target.is_some() {
-                mapped_type_target
-            } else {
-                mapped_type
-            });
+            let template_type =
+                self.get_template_type_from_mapped_type(if mapped_type_target.is_some() {
+                    mapped_type_target
+                } else {
+                    mapped_type
+                });
             let mapped_type_mapper = self.ty(mapped_type).as_mapped_type().object.mapper;
             let type_parameter = self.get_type_parameter_from_mapped_type(mapped_type);
             let key_type = self.mapped_symbol_links.get(symbol).key_type;
@@ -810,7 +1000,11 @@ impl Checker {
                 && !self.maybe_type_of_kind(prop_type, TypeFlags::UNDEFINED | TypeFlags::VOID)
             {
                 prop_type = self.get_optional_type(prop_type, true /*isProperty*/);
-            } else if self.sym(symbol).check_flags.intersects(CheckFlags::STRIP_OPTIONAL) {
+            } else if self
+                .sym(symbol)
+                .check_flags
+                .intersects(CheckFlags::STRIP_OPTIONAL)
+            {
                 prop_type = self.remove_missing_or_undefined_type(prop_type);
             }
             if self.pop_type_resolution() {
@@ -861,7 +1055,10 @@ impl Checker {
                 if constraint != check_type {
                     let t_mapper = self.ty(t).as_conditional_type().mapper;
                     let mapper = self.prepend_type_mapping(root_check_type, constraint, t_mapper);
-                    return self.get_conditional_type_instantiation(t, mapper, false /*forConstraint*/, None);
+                    return self.get_conditional_type_instantiation(
+                        t, mapper, false, /*forConstraint*/
+                        None,
+                    );
                 }
             }
             return t;
@@ -876,12 +1073,18 @@ impl Checker {
             // and bigint & {} intersections that are used to prevent subtype reduction in union types.
             let types = self.ty(t).types().to_vec();
             if types.len() == 2
-                && self.ty(types[0]).flags.intersects(TypeFlags::STRING | TypeFlags::NUMBER | TypeFlags::BIG_INT)
+                && self
+                    .ty(types[0])
+                    .flags
+                    .intersects(TypeFlags::STRING | TypeFlags::NUMBER | TypeFlags::BIG_INT)
                 && types[1] == self.empty_type_literal_type
             {
                 return t;
             }
-            let mapped: Vec<TypeId> = types.iter().map(|&u| self.get_lower_bound_of_key_type(u)).collect();
+            let mapped: Vec<TypeId> = types
+                .iter()
+                .map(|&u| self.get_lower_bound_of_key_type(u))
+                .collect();
             return self.get_intersection_type(&mapped);
         }
         t
@@ -905,11 +1108,19 @@ impl Checker {
         if call_signatures.is_empty() {
             call_signatures = self.get_array_member_call_signatures(t);
         }
-        let construct_signature_lists: Vec<Vec<SignatureId>> =
-            types.iter().map(|&u| self.get_signatures_of_type(u, SignatureKind::CONSTRUCT)).collect();
+        let construct_signature_lists: Vec<Vec<SignatureId>> = types
+            .iter()
+            .map(|&u| self.get_signatures_of_type(u, SignatureKind::CONSTRUCT))
+            .collect();
         let construct_signatures = self.get_union_signatures(&construct_signature_lists);
         let index_infos = self.get_union_index_infos(&types);
-        self.set_structured_type_members(t, SymbolTable::NIL, &call_signatures, &construct_signatures, &index_infos);
+        self.set_structured_type_members(
+            t,
+            SymbolTable::NIL,
+            &call_signatures,
+            &construct_signatures,
+            &index_infos,
+        );
     }
 
     // Go: checker/checker.go:20970 getArrayMemberCallSignatures
@@ -959,11 +1170,15 @@ impl Checker {
     pub fn is_array_or_tuple_symbol(&mut self, symbol: SymbolId) -> bool {
         let global_array_symbol = self.ty(self.global_array_type).symbol;
         let global_readonly_array_symbol = self.ty(self.global_readonly_array_type).symbol;
-        if symbol.is_nil() || global_array_symbol.is_nil() || global_readonly_array_symbol.is_nil() {
+        if symbol.is_nil() || global_array_symbol.is_nil() || global_readonly_array_symbol.is_nil()
+        {
             return false;
         }
-        self.get_symbol_if_same_reference(symbol, global_array_symbol).is_some()
-            || self.get_symbol_if_same_reference(symbol, global_readonly_array_symbol).is_some()
+        self.get_symbol_if_same_reference(symbol, global_array_symbol)
+            .is_some()
+            || self
+                .get_symbol_if_same_reference(symbol, global_readonly_array_symbol)
+                .is_some()
     }
 
     // Go: checker/checker.go:21000 isReadonlyArraySymbol
@@ -972,7 +1187,8 @@ impl Checker {
         if symbol.is_nil() || global_readonly_array_symbol.is_nil() {
             return false;
         }
-        self.get_symbol_if_same_reference(symbol, global_readonly_array_symbol).is_some()
+        self.get_symbol_if_same_reference(symbol, global_readonly_array_symbol)
+            .is_some()
     }
 
     // The signatures of a union type are those signatures that are present in each of the constituent types.
@@ -980,7 +1196,10 @@ impl Checker {
     // parameters and may differ in return types. When signatures differ in return types, the resulting return
     // type is the union of the constituent return types.
     // Go: checker/checker.go:21011 getUnionSignatures
-    pub fn get_union_signatures(&mut self, signature_lists: &[Vec<SignatureId>]) -> Vec<SignatureId> {
+    pub fn get_union_signatures(
+        &mut self,
+        signature_lists: &[Vec<SignatureId>],
+    ) -> Vec<SignatureId> {
         let mut result: Vec<SignatureId> = Vec::new();
         let mut index_with_length_over_one: usize = 0;
         let mut count_length_over_one: i32 = 0;
@@ -997,9 +1216,7 @@ impl Checker {
                 if result.is_empty()
                     || self
                         .find_matching_signature(
-                            &result,
-                            signature,
-                            false, /*partialMatch*/
+                            &result, signature, false, /*partialMatch*/
                             false, /*ignoreThisTypes*/
                             true,  /*ignoreReturnTypes*/
                         )
@@ -1007,7 +1224,8 @@ impl Checker {
                 {
                     // PORT: Go checks `unionSignatures != nil`. Go findMatchingSignatures
                     // never returns an empty non-nil slice, so `!is_empty()` matches.
-                    let union_signatures = self.find_matching_signatures(signature_lists, signature, i as i32);
+                    let union_signatures =
+                        self.find_matching_signatures(signature_lists, signature, i as i32);
                     if !union_signatures.is_empty() {
                         let mut s = signature;
                         // Union the result types when more than one signature matches
@@ -1030,8 +1248,10 @@ impl Checker {
                                     }
                                 }
                                 let this_type = self.get_intersection_type(&this_types);
-                                this_parameter =
-                                    self.create_symbol_with_type(first_this_parameter_of_union_signatures, this_type);
+                                this_parameter = self.create_symbol_with_type(
+                                    first_this_parameter_of_union_signatures,
+                                    this_type,
+                                );
                             }
                             s = self.create_union_signature(signature, &union_signatures);
                             self.sig_mut(s).this_parameter = this_parameter;
@@ -1063,14 +1283,21 @@ impl Checker {
                         && results.iter().any(|&s| {
                             let s_type_parameters = self.sig(s).type_parameters.clone();
                             !s_type_parameters.is_empty()
-                                && !self.compare_type_parameters_identical(&signature_type_parameters, &s_type_parameters)
+                                && !self.compare_type_parameters_identical(
+                                    &signature_type_parameters,
+                                    &s_type_parameters,
+                                )
                         })
                     {
                         results = Vec::new();
                     } else {
                         results = results
                             .iter()
-                            .map(|&sig| self.combine_union_or_intersection_member_signatures(sig, signature, true /*isUnion*/))
+                            .map(|&sig| {
+                                self.combine_union_or_intersection_member_signatures(
+                                    sig, signature, true, /*isUnion*/
+                                )
+                            })
                             .collect();
                     }
                     if results.is_empty() {
@@ -1105,15 +1332,31 @@ impl Checker {
         let mut flags = (self.sig(left).flags | self.sig(right).flags)
             & SignatureFlags::PROPAGATING_FLAGS.without(SignatureFlags::HAS_REST_PARAMETER);
         let declaration = self.sig(left).declaration;
-        let params = self.combine_union_or_intersection_parameters(left, right, param_mapper, is_union);
+        let params =
+            self.combine_union_or_intersection_parameters(left, right, param_mapper, is_union);
         let last_param = params.last().copied().unwrap_or(SymbolId::NIL);
-        if last_param.is_some() && self.sym(last_param).check_flags.intersects(CheckFlags::REST_PARAMETER) {
+        if last_param.is_some()
+            && self
+                .sym(last_param)
+                .check_flags
+                .intersects(CheckFlags::REST_PARAMETER)
+        {
             flags |= SignatureFlags::HAS_REST_PARAMETER;
         }
-        let (left_this_parameter, right_this_parameter) = (self.sig(left).this_parameter, self.sig(right).this_parameter);
-        let this_param =
-            self.combine_union_or_intersection_this_param(left_this_parameter, right_this_parameter, param_mapper, is_union);
-        let min_arg_count = std::cmp::max(self.sig(left).min_argument_count, self.sig(right).min_argument_count);
+        let (left_this_parameter, right_this_parameter) = (
+            self.sig(left).this_parameter,
+            self.sig(right).this_parameter,
+        );
+        let this_param = self.combine_union_or_intersection_this_param(
+            left_this_parameter,
+            right_this_parameter,
+            param_mapper,
+            is_union,
+        );
+        let min_arg_count = std::cmp::max(
+            self.sig(left).min_argument_count,
+            self.sig(right).min_argument_count,
+        );
         let result = self.new_signature(
             flags,
             declaration,
@@ -1131,15 +1374,25 @@ impl Checker {
             _ => vec![left],
         };
         left_signatures.push(right);
-        self.sig_mut(result).composite = Some(Rc::new(CompositeSignature { is_union, signatures: left_signatures }));
+        self.sig_mut(result).composite = Some(Rc::new(CompositeSignature {
+            is_union,
+            signatures: left_signatures,
+        }));
         if param_mapper.is_some() {
-            if left_composite.as_ref().is_some_and(|c| c.is_union == is_union) && left_mapper.is_some() {
+            if left_composite
+                .as_ref()
+                .is_some_and(|c| c.is_union == is_union)
+                && left_mapper.is_some()
+            {
                 let combined = self.combine_type_mappers(left_mapper, param_mapper);
                 self.sig_mut(result).mapper = combined;
             } else {
                 self.sig_mut(result).mapper = param_mapper;
             }
-        } else if left_composite.as_ref().is_some_and(|c| c.is_union == is_union) {
+        } else if left_composite
+            .as_ref()
+            .is_some_and(|c| c.is_union == is_union)
+        {
             self.sig_mut(result).mapper = left_mapper;
         }
         result
@@ -1160,10 +1413,15 @@ impl Checker {
         } else {
             (right_count, right, left)
         };
-        let either_has_effective_rest = self.has_effective_rest_parameter(left) || self.has_effective_rest_parameter(right);
-        let needs_extra_rest_element = either_has_effective_rest && !self.has_effective_rest_parameter(longest);
-        let mut params: Vec<SymbolId> =
-            vec![SymbolId::NIL; (longest_count + if needs_extra_rest_element { 1 } else { 0 }) as usize];
+        let either_has_effective_rest =
+            self.has_effective_rest_parameter(left) || self.has_effective_rest_parameter(right);
+        let needs_extra_rest_element =
+            either_has_effective_rest && !self.has_effective_rest_parameter(longest);
+        let mut params: Vec<SymbolId> = vec![
+            SymbolId::NIL;
+            (longest_count + if needs_extra_rest_element { 1 } else { 0 })
+                as usize
+        ];
         for i in 0..longest_count {
             let mut longest_param_type = self.try_get_type_at_position(longest, i);
             if longest == right {
@@ -1181,8 +1439,10 @@ impl Checker {
                 !is_union,
                 UnionReduction::LITERAL,
             );
-            let is_rest_param = either_has_effective_rest && !needs_extra_rest_element && i == (longest_count - 1);
-            let is_optional = i >= self.get_min_argument_count(longest) && i >= self.get_min_argument_count(shorter);
+            let is_rest_param =
+                either_has_effective_rest && !needs_extra_rest_element && i == (longest_count - 1);
+            let is_optional = i >= self.get_min_argument_count(longest)
+                && i >= self.get_min_argument_count(shorter);
             let mut left_name = String::new();
             let mut right_name = String::new();
             if i < left_count {
@@ -1204,7 +1464,11 @@ impl Checker {
             }
             let param_symbol = self.new_symbol_ex(
                 SymbolFlags::FUNCTION_SCOPED_VARIABLE
-                    | if is_optional && !is_rest_param { SymbolFlags::OPTIONAL } else { SymbolFlags::NONE },
+                    | if is_optional && !is_rest_param {
+                        SymbolFlags::OPTIONAL
+                    } else {
+                        SymbolFlags::NONE
+                    },
                 param_name.as_str(),
                 if is_rest_param {
                     CheckFlags::REST_PARAMETER
@@ -1223,8 +1487,11 @@ impl Checker {
             params[i as usize] = param_symbol;
         }
         if needs_extra_rest_element {
-            let rest_param_symbol =
-                self.new_symbol_ex(SymbolFlags::FUNCTION_SCOPED_VARIABLE, "args", CheckFlags::REST_PARAMETER);
+            let rest_param_symbol = self.new_symbol_ex(
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                "args",
+                CheckFlags::REST_PARAMETER,
+            );
             let type_at_position = self.get_type_at_position(shorter, longest_count);
             let mut resolved_type = self.create_array_type(type_at_position);
             self.value_symbol_links.get(rest_param_symbol).resolved_type = resolved_type;
@@ -1257,8 +1524,11 @@ impl Checker {
         let left_type = self.get_type_of_symbol(left);
         let right_type = self.get_type_of_symbol(right);
         let right_instantiated = self.instantiate_type(right_type, mapper);
-        let this_type =
-            self.get_union_or_intersection_type(&[left_type, right_instantiated], !is_union, UnionReduction::LITERAL);
+        let this_type = self.get_union_or_intersection_type(
+            &[left_type, right_instantiated],
+            !is_union,
+            UnionReduction::LITERAL,
+        );
         self.create_symbol_with_type(left, this_type)
     }
 
@@ -1285,7 +1555,12 @@ impl Checker {
                         .map(|&s| {
                             let clone = self.clone_signature(s);
                             let return_type = self.get_return_type_of_signature(s);
-                            let mixed = self.include_mixin_type(return_type, &types, &mixin_flags, i as i32);
+                            let mixed = self.include_mixin_type(
+                                return_type,
+                                &types,
+                                &mixin_flags,
+                                i as i32,
+                            );
                             self.sig_mut(clone).resolved_return_type = mixed;
                             clone
                         })
@@ -1299,11 +1574,21 @@ impl Checker {
                 index_infos = self.append_index_info(index_infos, info, false /*union*/);
             }
         }
-        self.set_structured_type_members(t, SymbolTable::NIL, &call_signatures, &construct_signatures, &index_infos);
+        self.set_structured_type_members(
+            t,
+            SymbolTable::NIL,
+            &call_signatures,
+            &construct_signatures,
+            &index_infos,
+        );
     }
 
     // Go: checker/checker.go:21234 appendSignatures
-    pub fn append_signatures(&mut self, signatures: Vec<SignatureId>, new_signatures: &[SignatureId]) -> Vec<SignatureId> {
+    pub fn append_signatures(
+        &mut self,
+        signatures: Vec<SignatureId>,
+        new_signatures: &[SignatureId],
+    ) -> Vec<SignatureId> {
         let mut signatures = signatures;
         for &sig in new_signatures {
             let should_append = signatures.is_empty()
@@ -1314,7 +1599,9 @@ impl Checker {
                         false, /*partialMatch*/
                         false, /*ignoreThisTypes*/
                         false, /*ignoreReturnTypes*/
-                        &mut |c: &mut Checker, s: TypeId, t: TypeId| c.compare_types_identical(s, t),
+                        &mut |c: &mut Checker, s: TypeId, t: TypeId| {
+                            c.compare_types_identical(s, t)
+                        },
                     ) == Ternary::FALSE
                 });
             if should_append {
@@ -1352,7 +1639,13 @@ impl Checker {
                     result_value_type = self.get_intersection_type(&[value_type, new_value_type]);
                     result_is_readonly = is_readonly && new_is_readonly;
                 }
-                index_infos[i] = self.new_index_info(key_type, result_value_type, result_is_readonly, Node::NIL, &[]);
+                index_infos[i] = self.new_index_info(
+                    key_type,
+                    result_value_type,
+                    result_is_readonly,
+                    Node::NIL,
+                    &[],
+                );
                 return index_infos;
             }
         }

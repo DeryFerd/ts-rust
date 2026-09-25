@@ -97,7 +97,10 @@ pub trait ModuleSpecifierGenerationHost {
     fn use_case_sensitive_file_names(&self) -> bool;
     fn get_current_directory(&self) -> String;
 
-    fn get_project_reference_from_source(&self, path: &tspath::Path) -> Option<&'static SourceOutputAndProjectReference>;
+    fn get_project_reference_from_source(
+        &self,
+        path: &tspath::Path,
+    ) -> Option<&'static SourceOutputAndProjectReference>;
     fn get_redirect_targets(&self, path: &tspath::Path) -> Vec<String>;
     fn get_source_of_project_reference_if_output_included(&self, file: Node) -> String;
 
@@ -106,7 +109,11 @@ pub trait ModuleSpecifierGenerationHost {
     fn get_nearest_ancestor_directory_with_package_json(&self, dirname: &str) -> String;
     fn get_package_json_info(&self, pkg_json_path: &str) -> Option<Rc<InfoCacheEntry>>;
     fn get_default_resolution_mode_for_file(&self, file: Node) -> ResolutionMode;
-    fn get_resolved_module_from_module_specifier(&self, file: Node, module_specifier: Node) -> Option<ResolvedModule>;
+    fn get_resolved_module_from_module_specifier(
+        &self,
+        file: Node,
+        module_specifier: Node,
+    ) -> Option<ResolvedModule>;
     fn get_mode_for_usage_location(&self, file: Node, module_specifier: Node) -> ResolutionMode;
 
     // PORT: Go passes the same host value as an `outputpaths.OutputPathsHost`.

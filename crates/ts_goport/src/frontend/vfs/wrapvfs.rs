@@ -14,9 +14,8 @@ pub struct Replacements {
     pub write_file: Option<Box<dyn Fn(&str, &str) -> Result<(), FsError>>>,
     pub append_file: Option<Box<dyn Fn(&str, &str) -> Result<(), FsError>>>,
     pub remove: Option<Box<dyn Fn(&str) -> Result<(), FsError>>>,
-    pub chtimes: Option<
-        Box<dyn Fn(&str, Option<SystemTime>, Option<SystemTime>) -> Result<(), FsError>>,
-    >,
+    pub chtimes:
+        Option<Box<dyn Fn(&str, Option<SystemTime>, Option<SystemTime>) -> Result<(), FsError>>>,
     pub directory_exists: Option<Box<dyn Fn(&str) -> bool>>,
     pub get_accessible_entries: Option<Box<dyn Fn(&str) -> Entries>>,
     pub stat: Option<Box<dyn Fn(&str) -> Option<FileInfo>>>,

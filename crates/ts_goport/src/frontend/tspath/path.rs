@@ -102,7 +102,8 @@ fn equate_string_case_insensitive(a: &str, b: &str) -> bool {
                 let (sr, tr) = if tr < sr { (tr, sr) } else { (sr, tr) };
                 if (tr as u32) < 0x80 {
                     // ASCII only, sr/tr must be upper/lower case
-                    if sr.is_ascii_uppercase() && tr as u32 == sr as u32 + ('a' as u32 - 'A' as u32) {
+                    if sr.is_ascii_uppercase() && tr as u32 == sr as u32 + ('a' as u32 - 'A' as u32)
+                    {
                         continue;
                     }
                     return false;
@@ -171,7 +172,10 @@ fn get_string_comparer(ignore_case: bool) -> fn(&str, &str) -> i32 {
 
 // PORT: Go `strings.LastIndex(s, "/")` / `LastIndexByte` as a signed index.
 fn last_index_byte(s: &str, c: u8) -> isize {
-    s.as_bytes().iter().rposition(|&b| b == c).map_or(-1, |i| i as isize)
+    s.as_bytes()
+        .iter()
+        .rposition(|&b| b == c)
+        .map_or(-1, |i| i as isize)
 }
 
 //// Path Tests
@@ -308,7 +312,7 @@ pub fn get_encoded_root_length(path: &str) -> i32 {
         let offset = 2;
         let p1 = bytes[offset..].iter().position(|&b| b == ch0);
         return match p1 {
-            None => ln as i32, // UNC: "//server" or "\\server"
+            None => ln as i32,                    // UNC: "//server" or "\\server"
             Some(p1) => (p1 + offset + 1) as i32, // UNC: "//server/" or "\\server\"
         };
     }
@@ -346,7 +350,8 @@ pub fn get_encoded_root_length(path: &str) -> i32 {
                 && (ln > authority_end + 2)
                 && is_volume_character(bytes[authority_end + 1])
             {
-                let volume_separator_end = get_file_url_volume_separator_end(path, authority_end + 2);
+                let volume_separator_end =
+                    get_file_url_volume_separator_end(path, authority_end + 2);
                 if volume_separator_end != -1 {
                     if volume_separator_end as usize == ln {
                         // URL: "file:///c:", "file://localhost/c:", "file:///c$3a", "file://localhost/c%3a"
@@ -454,7 +459,11 @@ fn reduce_path_components(components: Vec<String>) -> Vec<String> {
 // Combines and resolves paths. If a path is absolute, it replaces any previous path. Any
 // `.` and `..` path components are resolved. Trailing directory separators are preserved.
 pub fn resolve_path(path: &str, paths: &[&str]) -> String {
-    let combined_path = if !paths.is_empty() { combine_paths(path, paths) } else { normalize_slashes(path) };
+    let combined_path = if !paths.is_empty() {
+        combine_paths(path, paths)
+    } else {
+        normalize_slashes(path)
+    };
     normalize_path(&combined_path)
 }
 
@@ -519,7 +528,10 @@ fn get_normalized_path_components_from_combined(path: &str) -> Vec<String> {
 }
 
 // Go: tspath/path.go:387 GetNormalizedAbsolutePathWithoutRoot
-pub fn get_normalized_absolute_path_without_root(file_name: &str, current_directory: &str) -> String {
+pub fn get_normalized_absolute_path_without_root(
+    file_name: &str,
+    current_directory: &str,
+) -> String {
     let absolute_path = get_normalized_absolute_path(file_name, current_directory);
     let root_length = get_root_length(&absolute_path);
     absolute_path[root_length..].to_string()
@@ -662,7 +674,10 @@ fn simple_normalize_path(path: &str) -> Option<String> {
     // Some paths only require cleanup of `/./` or leading `./`
     let simplified = path.replace("/./", "/");
     let trimmed = simplified.strip_prefix("./").unwrap_or(&simplified);
-    if trimmed != path && !has_relative_path_segment(trimmed) && !(trimmed != simplified && trimmed.starts_with('/')) {
+    if trimmed != path
+        && !has_relative_path_segment(trimmed)
+        && !(trimmed != simplified && trimmed.starts_with('/'))
+    {
         // If we trimmed a leading "./" and the path now starts with "/", we changed the meaning
         return Some(trimmed.to_string());
     }
@@ -792,7 +807,16 @@ pub fn to_file_name_lower_case(file_name: &str) -> String {
         return file_name.to_ascii_lowercase();
     }
 
-    file_name.chars().map(|r| if r == I_WITH_DOT { r } else { simple_to_lower(r) }).collect()
+    file_name
+        .chars()
+        .map(|r| {
+            if r == I_WITH_DOT {
+                r
+            } else {
+                simple_to_lower(r)
+            }
+        })
+        .collect()
 }
 
 // Go: tspath/path.go:687 ToPath
@@ -802,7 +826,10 @@ pub fn to_path(file_name: &str, base_path: &str, use_case_sensitive_file_names: 
     } else {
         get_normalized_absolute_path(file_name, base_path)
     };
-    Path(get_canonical_file_name(&non_canonicalized_path, use_case_sensitive_file_names))
+    Path(get_canonical_file_name(
+        &non_canonicalized_path,
+        use_case_sensitive_file_names,
+    ))
 }
 
 // Go: tspath/path.go:697 RemoveTrailingDirectorySeparator
@@ -848,8 +875,13 @@ impl Path {
 //// Relative Paths
 
 // Go: tspath/path.go:729 GetPathComponentsRelativeTo
-pub fn get_path_components_relative_to(from: &str, to: &str, options: &ComparePathsOptions) -> Vec<String> {
-    let from_components = reduce_path_components(get_path_components(from, &options.current_directory));
+pub fn get_path_components_relative_to(
+    from: &str,
+    to: &str,
+    options: &ComparePathsOptions,
+) -> Vec<String> {
+    let from_components =
+        reduce_path_components(get_path_components(from, &options.current_directory));
     let to_components = reduce_path_components(get_path_components(to, &options.current_directory));
 
     let mut start = 0;
@@ -887,7 +919,11 @@ pub fn get_path_components_relative_to(from: &str, to: &str, options: &ComparePa
 }
 
 // Go: tspath/path.go:773 GetRelativePathFromDirectory
-pub fn get_relative_path_from_directory(from_directory: &str, to: &str, options: &ComparePathsOptions) -> String {
+pub fn get_relative_path_from_directory(
+    from_directory: &str,
+    to: &str,
+    options: &ComparePathsOptions,
+) -> String {
     if (get_root_length(from_directory) > 0) != (get_root_length(to) > 0) {
         panic!("paths must either both be absolute or both be relative");
     }
@@ -897,11 +933,18 @@ pub fn get_relative_path_from_directory(from_directory: &str, to: &str, options:
 
 // Go: tspath/path.go:781 GetRelativePathFromFile
 pub fn get_relative_path_from_file(from: &str, to: &str, options: &ComparePathsOptions) -> String {
-    ensure_path_is_non_module_name(&get_relative_path_from_directory(&get_directory_path(from), to, options))
+    ensure_path_is_non_module_name(&get_relative_path_from_directory(
+        &get_directory_path(from),
+        to,
+        options,
+    ))
 }
 
 // Go: tspath/path.go:785 ConvertToRelativePath
-pub fn convert_to_relative_path(absolute_or_relative_path: &str, options: &ComparePathsOptions) -> String {
+pub fn convert_to_relative_path(
+    absolute_or_relative_path: &str,
+    options: &ComparePathsOptions,
+) -> String {
     if !is_rooted_disk_path(absolute_or_relative_path) {
         return absolute_or_relative_path.to_string();
     }
@@ -926,7 +969,11 @@ pub fn get_relative_path_to_directory_or_url(
 
     let first_component = path_components[0].clone();
     if is_absolute_path_an_url && is_rooted_disk_path(&first_component) {
-        let prefix = if first_component.as_bytes()[0] == DIRECTORY_SEPARATOR { "file://" } else { "file:///" };
+        let prefix = if first_component.as_bytes()[0] == DIRECTORY_SEPARATOR {
+            "file://"
+        } else {
+            "file:///"
+        };
         path_components[0] = format!("{prefix}{first_component}");
     }
 
@@ -949,7 +996,8 @@ pub fn get_base_file_name(path: &str) -> String {
     // return the trailing portion of the path starting after the last (non-terminal) directory
     // separator but not including any trailing directory separator.
     let path = remove_trailing_directory_separator(&path);
-    let start = (get_root_length(path) as isize).max(last_index_byte(path, DIRECTORY_SEPARATOR) + 1) as usize;
+    let start = (get_root_length(path) as isize).max(last_index_byte(path, DIRECTORY_SEPARATOR) + 1)
+        as usize;
     path[start..].to_string()
 }
 
@@ -997,7 +1045,11 @@ fn try_get_extension_from_path_worker(
     extension: &str,
     string_equality_comparer: fn(&str, &str) -> bool,
 ) -> String {
-    let extension = if !extension.starts_with('.') { format!(".{extension}") } else { extension.to_string() };
+    let extension = if !extension.starts_with('.') {
+        format!(".{extension}")
+    } else {
+        extension.to_string()
+    };
     let pb = path.as_bytes();
     if pb.len() >= extension.len() && pb[pb.len() - extension.len()] == b'.' {
         let path_extension = &path[path.len() - extension.len()..];
@@ -1116,7 +1168,10 @@ pub fn compare_paths_case_sensitive(a: &str, b: &str, current_directory: &str) -
     compare_paths(
         a,
         b,
-        &ComparePathsOptions { use_case_sensitive_file_names: true, current_directory: current_directory.to_string() },
+        &ComparePathsOptions {
+            use_case_sensitive_file_names: true,
+            current_directory: current_directory.to_string(),
+        },
     )
 }
 
@@ -1125,7 +1180,10 @@ pub fn compare_paths_case_insensitive(a: &str, b: &str, current_directory: &str)
     compare_paths(
         a,
         b,
-        &ComparePathsOptions { use_case_sensitive_file_names: false, current_directory: current_directory.to_string() },
+        &ComparePathsOptions {
+            use_case_sensitive_file_names: false,
+            current_directory: current_directory.to_string(),
+        },
     )
 }
 
@@ -1147,7 +1205,11 @@ pub fn contains_path(parent: &str, child: &str, options: &ComparePathsOptions) -
 
     let component_comparer = options.get_equality_comparer();
     for (i, parent_component) in parent_components.iter().enumerate() {
-        let comparer: fn(&str, &str) -> bool = if i == 0 { equate_string_case_insensitive } else { component_comparer };
+        let comparer: fn(&str, &str) -> bool = if i == 0 {
+            equate_string_case_insensitive
+        } else {
+            component_comparer
+        };
         if !comparer(parent_component, &child_components[i]) {
             return false;
         }
@@ -1167,7 +1229,10 @@ impl Path {
         if p.is_empty() {
             return false;
         }
-        self == child || c.len() > p.len() && c.starts_with(p) && (p[p.len() - 1] == b'/' || c[p.len()] == b'/')
+        self == child
+            || c.len() > p.len()
+                && c.starts_with(p)
+                && (p[p.len() - 1] == b'/' || c[p.len()] == b'/')
     }
 }
 
@@ -1221,7 +1286,9 @@ pub fn for_each_ancestor_directory_path<T: Default>(
     directory: &Path,
     mut callback: impl FnMut(Path) -> (T, bool),
 ) -> (T, bool) {
-    for_each_ancestor_directory(&directory.0, |directory| callback(Path(directory.to_string())))
+    for_each_ancestor_directory(&directory.0, |directory| {
+        callback(Path(directory.to_string()))
+    })
 }
 
 // Go: tspath/path.go:1089 HasExtension
@@ -1259,7 +1326,8 @@ pub fn get_common_parents(
         return (Vec::new(), FxHashSet::default());
     }
     if paths.len() == 1 {
-        if (reduce_path_components(get_path_components(&paths[0], &options.current_directory)).len() as i32)
+        if (reduce_path_components(get_path_components(&paths[0], &options.current_directory)).len()
+            as i32)
             < min_components
         {
             let mut ignored = FxHashSet::default();
@@ -1272,7 +1340,8 @@ pub fn get_common_parents(
     let mut ignored = FxHashSet::default();
     let mut path_components: Vec<Vec<String>> = Vec::with_capacity(paths.len());
     for path in paths {
-        let components = reduce_path_components(get_path_components(path, &options.current_directory));
+        let components =
+            reduce_path_components(get_path_components(path, &options.current_directory));
         if (components.len() as i32) < min_components {
             ignored.insert(path.clone());
         } else {
@@ -1281,7 +1350,10 @@ pub fn get_common_parents(
     }
 
     let results = get_common_parents_worker(&path_components, min_components, options);
-    let result_paths = results.iter().map(|comps| get_path_from_path_components(comps)).collect();
+    let result_paths = results
+        .iter()
+        .map(|comps| get_path_from_path_components(comps))
+        .collect();
 
     (result_paths, ignored)
 }
@@ -1317,7 +1389,8 @@ fn get_common_parents_worker(
                 if (last_common_index as i32) < min_components {
                     // Not enough components, we need to fan out
                     let mut ordered_groups: Vec<Path> = Vec::new();
-                    let mut new_groups: FxHashMap<Path, (Vec<String>, Vec<Vec<String>>)> = FxHashMap::default();
+                    let mut new_groups: FxHashMap<Path, (Vec<String>, Vec<Vec<String>>)> =
+                        FxHashMap::default();
                     for g in component_groups {
                         let key = to_path(
                             &g[last_common_index],
@@ -1335,8 +1408,11 @@ fn get_common_parents_worker(
                     let mut result = Vec::with_capacity(new_groups.len());
                     for key in &ordered_groups {
                         let (head, tails) = &new_groups[key];
-                        let sub_results =
-                            get_common_parents_worker(tails, min_components - (last_common_index as i32 + 1), options);
+                        let sub_results = get_common_parents_worker(
+                            tails,
+                            min_components - (last_common_index as i32 + 1),
+                            options,
+                        );
                         for sr in sub_results {
                             let mut combined = head.clone();
                             combined.extend(sr);
@@ -1354,15 +1430,24 @@ fn get_common_parents_worker(
 }
 
 // Go: tspath/path.go:1203 StartsWithDirectory
-pub fn starts_with_directory(file_name: &str, directory_name: &str, use_case_sensitive_file_names: bool) -> bool {
+pub fn starts_with_directory(
+    file_name: &str,
+    directory_name: &str,
+    use_case_sensitive_file_names: bool,
+) -> bool {
     if directory_name.is_empty() {
         return false;
     }
 
     let canonical_file_name = get_canonical_file_name(file_name, use_case_sensitive_file_names);
-    let canonical_directory_name = get_canonical_file_name(directory_name, use_case_sensitive_file_names);
-    let canonical_directory_name = canonical_directory_name.strip_suffix('/').unwrap_or(&canonical_directory_name);
-    let canonical_directory_name = canonical_directory_name.strip_suffix('\\').unwrap_or(canonical_directory_name);
+    let canonical_directory_name =
+        get_canonical_file_name(directory_name, use_case_sensitive_file_names);
+    let canonical_directory_name = canonical_directory_name
+        .strip_suffix('/')
+        .unwrap_or(&canonical_directory_name);
+    let canonical_directory_name = canonical_directory_name
+        .strip_suffix('\\')
+        .unwrap_or(canonical_directory_name);
 
     canonical_file_name.starts_with(&format!("{canonical_directory_name}/"))
         || canonical_file_name.starts_with(&format!("{canonical_directory_name}\\"))

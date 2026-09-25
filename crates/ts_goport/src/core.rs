@@ -195,13 +195,20 @@ impl Default for SymbolArena {
 impl SymbolArena {
     #[must_use]
     pub fn new() -> Self {
-        Self { symbols: vec![Symbol::default()], tables: vec![IndexMap::new()] }
+        Self {
+            symbols: vec![Symbol::default()],
+            tables: vec![IndexMap::new()],
+        }
     }
 
     /// Go `&ast.Symbol{Flags: flags, Name: name}`.
     pub fn new_symbol(&mut self, flags: SymbolFlags, name: impl Into<String>) -> SymbolId {
         let id = SymbolId(u32::try_from(self.symbols.len()).expect("symbol overflow"));
-        self.symbols.push(Symbol { flags, name: name.into(), ..Symbol::default() });
+        self.symbols.push(Symbol {
+            flags,
+            name: name.into(),
+            ..Symbol::default()
+        });
         id
     }
 
@@ -229,7 +236,10 @@ impl SymbolArena {
         if table.is_nil() {
             return SymbolId::NIL;
         }
-        self.tables[table.index()].get(name).copied().unwrap_or_default()
+        self.tables[table.index()]
+            .get(name)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Go `table[name] = symbol`. Panics on a nil table, like Go.
@@ -248,7 +258,11 @@ impl SymbolArena {
     /// Go `len(table)`.
     #[must_use]
     pub fn len(&self, table: SymbolTable) -> usize {
-        if table.is_nil() { 0 } else { self.tables[table.index()].len() }
+        if table.is_nil() {
+            0
+        } else {
+            self.tables[table.index()].len()
+        }
     }
 
     /// Snapshot of `(name, symbol)` pairs in insertion order. Go map order is
@@ -258,7 +272,10 @@ impl SymbolArena {
         if table.is_nil() {
             return Vec::new();
         }
-        self.tables[table.index()].iter().map(|(k, v)| (k.clone(), *v)).collect()
+        self.tables[table.index()]
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
     }
 
     /// Snapshot of the values in insertion order.
@@ -349,7 +366,9 @@ pub struct LinkStore<K: std::hash::Hash + Eq, V: Default> {
 
 impl<K: std::hash::Hash + Eq, V: Default> Default for LinkStore<K, V> {
     fn default() -> Self {
-        Self { entries: rustc_hash::FxHashMap::default() }
+        Self {
+            entries: rustc_hash::FxHashMap::default(),
+        }
     }
 }
 
@@ -442,14 +461,17 @@ impl GoFile {
     /// `ast::store::has_file_store` first.
     #[must_use]
     pub fn legacy_source(&self) -> &'static ts_compiler::SourceFile {
-        self.source.expect("legacy source read for a Go frontend file")
+        self.source
+            .expect("legacy source read for a Go frontend file")
     }
 }
 
 impl GoProgram {
     /// Go `Program.SourceFiles()`: the program files in Go order.
     pub fn source_files(&self) -> impl Iterator<Item = &GoFile> {
-        self.source_file_order.iter().map(|&index| &self.files[index])
+        self.source_file_order
+            .iter()
+            .map(|&index| &self.files[index])
     }
 }
 

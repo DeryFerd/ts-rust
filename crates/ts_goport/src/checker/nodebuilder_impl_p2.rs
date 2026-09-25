@@ -114,7 +114,12 @@ impl Checker {
     // Go: checker/nodebuilderimpl.go:1019 lookupTypeParameterNodes
     // PORT: `typeParameterSymbolList` is keyed by `SymbolId` for Go
     // `ast.GetSymbolId(symbol)`. The two are one to one.
-    pub fn lookup_type_parameter_nodes(&mut self, b: &Nb, chain: &[SymbolId], index: i32) -> NodeList {
+    pub fn lookup_type_parameter_nodes(
+        &mut self,
+        b: &Nb,
+        chain: &[SymbolId],
+        index: i32,
+    ) -> NodeList {
         debug_assert!(!chain.is_empty() && 0 <= index && (index as usize) < chain.len());
         let symbol = chain[index as usize];
         {
@@ -129,11 +134,13 @@ impl Checker {
         if nb_flags(b).intersects(NodeBuilderFlags::WRITE_TYPE_PARAMETERS_IN_QUALIFIED_NAME)
             && (index as usize) < chain.len() - 1
         {
-            let type_argument_nodes = self.lookup_instantiated_type_argument_nodes(b, chain, index as usize);
+            let type_argument_nodes =
+                self.lookup_instantiated_type_argument_nodes(b, chain, index as usize);
             if type_argument_nodes.is_some() {
                 return type_argument_nodes;
             }
-            let type_parameter_nodes = self.type_parameters_to_type_parameter_declarations(b, symbol);
+            let type_parameter_nodes =
+                self.type_parameters_to_type_parameter_declarations(b, symbol);
             if !type_parameter_nodes.is_empty() {
                 return nb_e(b).factory.new_node_list(&type_parameter_nodes);
             }
@@ -144,27 +151,52 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:1044 lookupSymbolChain
-    pub fn lookup_symbol_chain(&mut self, b: &Nb, symbol: SymbolId, meaning: SymbolFlags, yield_module_symbol: bool) -> Vec<SymbolId> {
+    pub fn lookup_symbol_chain(
+        &mut self,
+        b: &Nb,
+        symbol: SymbolId,
+        meaning: SymbolFlags,
+        yield_module_symbol: bool,
+    ) -> Vec<SymbolId> {
         let enclosing = nb_enclosing_declaration(b);
         nb_tracker(b).track_symbol(self, symbol, enclosing, meaning);
         self.lookup_symbol_chain_worker(b, symbol, meaning, yield_module_symbol)
     }
 
     // Go: checker/nodebuilderimpl.go:1049 lookupSymbolChainWorker
-    pub fn lookup_symbol_chain_worker(&mut self, b: &Nb, symbol: SymbolId, meaning: SymbolFlags, yield_module_symbol: bool) -> Vec<SymbolId> {
+    pub fn lookup_symbol_chain_worker(
+        &mut self,
+        b: &Nb,
+        symbol: SymbolId,
+        meaning: SymbolFlags,
+        yield_module_symbol: bool,
+    ) -> Vec<SymbolId> {
         // Try to get qualified name if the symbol is not a type parameter and there is an enclosing declaration.
         let mut chain: Vec<SymbolId> = Vec::new();
-        let is_type_parameter = self.sym(symbol).flags.intersects(SymbolFlags::TYPE_PARAMETER);
+        let is_type_parameter = self
+            .sym(symbol)
+            .flags
+            .intersects(SymbolFlags::TYPE_PARAMETER);
         let (has_enclosing, flags, internal_flags) = {
             let ctx = nb_ctx(b);
             let ctx = ctx.borrow();
-            (ctx.enclosing_declaration.is_some(), ctx.flags, ctx.internal_flags)
+            (
+                ctx.enclosing_declaration.is_some(),
+                ctx.flags,
+                ctx.internal_flags,
+            )
         };
         if !is_type_parameter
             && (has_enclosing || flags.intersects(NodeBuilderFlags::USE_FULLY_QUALIFIED_TYPE))
             && !internal_flags.intersects(InternalNodeBuilderFlags::DO_NOT_INCLUDE_SYMBOL_CHAIN)
         {
-            let res = self.get_symbol_chain(b, symbol, meaning, true /*endOfChain*/, yield_module_symbol);
+            let res = self.get_symbol_chain(
+                b,
+                symbol,
+                meaning,
+                true, /*endOfChain*/
+                yield_module_symbol,
+            );
             chain = res;
             debug_assert!(!chain.is_empty());
         } else {
@@ -175,39 +207,78 @@ impl Checker {
 
     // Go: checker/nodebuilderimpl.go:1070 getSymbolChain
     /// `end_of_chain` is false for recursive calls. Non-recursive calls always output something.
-    fn get_symbol_chain(&mut self, b: &Nb, symbol: SymbolId, meaning: SymbolFlags, end_of_chain: bool, yield_module_symbol: bool) -> Vec<SymbolId> {
+    fn get_symbol_chain(
+        &mut self,
+        b: &Nb,
+        symbol: SymbolId,
+        meaning: SymbolFlags,
+        end_of_chain: bool,
+        yield_module_symbol: bool,
+    ) -> Vec<SymbolId> {
         let enclosing = nb_enclosing_declaration(b);
-        let use_only_external_aliasing = nb_flags(b).intersects(NodeBuilderFlags::USE_ONLY_EXTERNAL_ALIASING);
-        let mut accessible_symbol_chain = self.get_accessible_symbol_chain(symbol, enclosing, meaning, use_only_external_aliasing);
+        let use_only_external_aliasing =
+            nb_flags(b).intersects(NodeBuilderFlags::USE_ONLY_EXTERNAL_ALIASING);
+        let mut accessible_symbol_chain = self.get_accessible_symbol_chain(
+            symbol,
+            enclosing,
+            meaning,
+            use_only_external_aliasing,
+        );
         let mut qualifier_meaning = meaning;
         if accessible_symbol_chain.len() > 1 {
             qualifier_meaning = get_qualified_left_meaning(meaning);
         }
-        if accessible_symbol_chain.is_empty() || self.needs_qualification(accessible_symbol_chain[0], enclosing, qualifier_meaning) {
+        if accessible_symbol_chain.is_empty()
+            || self.needs_qualification(accessible_symbol_chain[0], enclosing, qualifier_meaning)
+        {
             // Go up and add our parent.
-            let root = if !accessible_symbol_chain.is_empty() { accessible_symbol_chain[0] } else { symbol };
+            let root = if !accessible_symbol_chain.is_empty() {
+                accessible_symbol_chain[0]
+            } else {
+                symbol
+            };
             let parents = self.get_containers_of_symbol(root, enclosing, meaning);
             if !parents.is_empty() {
-                let mut parent_specifiers: Vec<SortedSymbolNamePair> = Vec::with_capacity(parents.len());
+                let mut parent_specifiers: Vec<SortedSymbolNamePair> =
+                    Vec::with_capacity(parents.len());
                 for parent in parents {
                     let declarations = self.sym(parent).declarations.clone();
-                    if declarations.iter().any(|&d| has_non_global_augmentation_external_module_symbol(d)) {
-                        let name = self.get_specifier_for_module_symbol(b, parent, ResolutionMode::NONE);
+                    if declarations
+                        .iter()
+                        .any(|&d| has_non_global_augmentation_external_module_symbol(d))
+                    {
+                        let name =
+                            self.get_specifier_for_module_symbol(b, parent, ResolutionMode::NONE);
                         parent_specifiers.push(SortedSymbolNamePair { sym: parent, name });
                     } else {
-                        parent_specifiers.push(SortedSymbolNamePair { sym: parent, name: String::new() });
+                        parent_specifiers.push(SortedSymbolNamePair {
+                            sym: parent,
+                            name: String::new(),
+                        });
                     }
                 }
                 // PORT: `sort_by` is stable, like Go `slices.SortStableFunc`.
                 parent_specifiers.sort_by(|x, y| self.sort_by_best_name(x, y).cmp(&0));
                 for pair in &parent_specifiers {
                     let parent = pair.sym;
-                    let parent_chain = self.get_symbol_chain(b, parent, get_qualified_left_meaning(meaning), false, yield_module_symbol);
+                    let parent_chain = self.get_symbol_chain(
+                        b,
+                        parent,
+                        get_qualified_left_meaning(meaning),
+                        false,
+                        yield_module_symbol,
+                    );
                     if !parent_chain.is_empty() {
                         let exports = self.sym(parent).exports;
                         if exports.is_some() {
-                            let exported = self.symbols.get(exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS);
-                            if exported.is_some() && self.get_symbol_if_same_reference(exported, symbol).is_some() {
+                            let exported = self
+                                .symbols
+                                .get(exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS);
+                            if exported.is_some()
+                                && self
+                                    .get_symbol_if_same_reference(exported, symbol)
+                                    .is_some()
+                            {
                                 // parentChain root _is_ symbol - symbol is a module export=, so it kinda looks like it's own parent
                                 // No need to lookup an alias for the symbol in itself
                                 accessible_symbol_chain = parent_chain;
@@ -216,7 +287,8 @@ impl Checker {
                         }
                         let mut next_syms = accessible_symbol_chain;
                         if next_syms.is_empty() {
-                            let mut fallback = self.get_alias_for_symbol_in_container(parent, symbol);
+                            let mut fallback =
+                                self.get_alias_for_symbol_in_container(parent, symbol);
                             if fallback.is_nil() {
                                 fallback = symbol;
                             }
@@ -242,7 +314,11 @@ impl Checker {
             // If a parent symbol is an external module, don't write it. (We prefer just `x` vs `"foo/bar".x`.)
             if !end_of_chain
                 && !yield_module_symbol
-                && self.sym(symbol).declarations.iter().any(|&d| has_non_global_augmentation_external_module_symbol(d))
+                && self
+                    .sym(symbol)
+                    .declarations
+                    .iter()
+                    .any(|&d| has_non_global_augmentation_external_module_symbol(d))
             {
                 return Vec::new();
             }
@@ -277,7 +353,12 @@ impl Checker {
     // Go: checker/nodebuilderimpl.go:1232 getSpecifierForModuleSymbol
     // PORT: the specifier cache key is `(path, mode)` for Go
     // `module.ModeAwareCacheKey{Name, Mode}`.
-    pub fn get_specifier_for_module_symbol(&mut self, b: &Nb, symbol: SymbolId, override_import_mode: ResolutionMode) -> String {
+    pub fn get_specifier_for_module_symbol(
+        &mut self,
+        b: &Nb,
+        symbol: SymbolId,
+        override_import_mode: ResolutionMode,
+    ) -> String {
         let mut file = get_declaration_of_kind(&self.symbols, symbol, SyntaxKind::SourceFile);
         if file.is_nil() {
             let declarations = self.sym(symbol).declarations.clone();
@@ -290,7 +371,11 @@ impl Checker {
                 }
             }
             if equivalent_symbol.is_some() {
-                file = get_declaration_of_kind(&self.symbols, equivalent_symbol, SyntaxKind::SourceFile);
+                file = get_declaration_of_kind(
+                    &self.symbols,
+                    equivalent_symbol,
+                    SyntaxKind::SourceFile,
+                );
             }
         }
 
@@ -303,14 +388,16 @@ impl Checker {
             if is_ambient_module_symbol_name(&symbol_name) {
                 return strip_quotes(&symbol_name);
             }
-            return source_file_file_name(get_source_file_of_module(&self.symbols, symbol)).to_string();
+            return source_file_file_name(get_source_file_of_module(&self.symbols, symbol))
+                .to_string();
         }
 
         let e = nb_e(b);
         let enclosing_declaration = e.most_original(nb_enclosing_declaration(b));
         let mut original_module_specifier = Node::NIL;
         if can_have_module_specifier(enclosing_declaration) {
-            original_module_specifier = try_get_module_specifier_from_declaration(enclosing_declaration);
+            original_module_specifier =
+                try_get_module_specifier_from_declaration(enclosing_declaration);
         }
         let context_file = enclosing_file;
         let mut resolution_mode = override_import_mode;
@@ -354,12 +441,18 @@ impl Checker {
                     import_module_specifier_ending: ending_pref,
                     ..Default::default()
                 },
-                ms::ModuleSpecifierOptions { override_import_mode },
+                ms::ModuleSpecifierOptions {
+                    override_import_mode,
+                },
                 false, /*forAutoImports*/
             )
         };
         let mut nb = b.borrow_mut();
-        let cache = nb.symbol_links.get(symbol).specifier_cache.get_or_insert_with(FxHashMap::default);
+        let cache = nb
+            .symbol_links
+            .get(symbol)
+            .specifier_cache
+            .get_or_insert_with(FxHashMap::default);
         if all_specifiers.is_empty() {
             cache.insert(cache_key, String::new());
             return String::new();
@@ -370,12 +463,19 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:1312 typeParameterToDeclarationWithConstraint
-    pub fn type_parameter_to_declaration_with_constraint(&mut self, b: &Nb, type_parameter: TypeId, constraint_node: Node) -> Node {
+    pub fn type_parameter_to_declaration_with_constraint(
+        &mut self,
+        b: &Nb,
+        type_parameter: TypeId,
+        constraint_node: Node,
+    ) -> Node {
         let restore_flags = self.save_restore_flags(b);
         nb_clear_flags(b, NodeBuilderFlags::WRITE_TYPE_PARAMETERS_IN_QUALIFIED_NAME); // Avoids potential infinite loop when building for a claimspace with a generic
         let e = nb_e(b);
         let modifier_flags = self.get_type_parameter_modifiers(type_parameter);
-        let modifiers = create_modifiers_from_modifier_flags(modifier_flags, &mut |k| e.factory.new_modifier(k));
+        let modifiers = create_modifiers_from_modifier_flags(modifier_flags, &mut |k| {
+            e.factory.new_modifier(k)
+        });
         let mut modifiers_list = ModifierList::NIL;
         if !modifiers.is_empty() {
             modifiers_list = e.factory.new_modifier_list(&modifiers);
@@ -436,7 +536,9 @@ impl Checker {
         }
 
         // only set positions if range comes from the same file since copying text across files isn't supported by the emitter
-        if enclosing_file.is_some() && enclosing_file == get_source_file_of_node(e.most_original(location)) {
+        if enclosing_file.is_some()
+            && enclosing_file == get_source_file_of_node(e.most_original(location))
+        {
             set_node_loc(range, location.loc());
             return range;
         } else {
@@ -446,10 +548,20 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:1379 typeParameterShadowsOtherTypeParameterInScope
-    fn type_parameter_shadows_other_type_parameter_in_scope(&mut self, b: &Nb, name: &str, type_parameter: TypeId) -> bool {
+    fn type_parameter_shadows_other_type_parameter_in_scope(
+        &mut self,
+        b: &Nb,
+        name: &str,
+        type_parameter: TypeId,
+    ) -> bool {
         let enclosing = nb_enclosing_declaration(b);
         let result = self.resolve_name(enclosing, name, SymbolFlags::TYPE, None, false, false);
-        if result.is_some() && self.sym(result).flags.intersects(SymbolFlags::TYPE_PARAMETER) {
+        if result.is_some()
+            && self
+                .sym(result)
+                .flags
+                .intersects(SymbolFlags::TYPE_PARAMETER)
+        {
             return result != self.ty(type_parameter).symbol;
         }
         false
@@ -459,12 +571,22 @@ impl Checker {
     // PORT: `typeParameterNames` is keyed by `TypeId` for Go `typeParameter.id`.
     pub fn type_parameter_to_name(&mut self, b: &Nb, type_parameter: TypeId) -> Node {
         if nb_flags(b).intersects(NodeBuilderFlags::GENERATE_NAMES_FOR_SHADOWED_TYPE_PARAMS) {
-            if let Some(cached) = nb_ctx(b).borrow().type_parameter_names.get(&type_parameter).copied() {
+            if let Some(cached) = nb_ctx(b)
+                .borrow()
+                .type_parameter_names
+                .get(&type_parameter)
+                .copied()
+            {
                 return cached;
             }
         }
         let tp_symbol = self.ty(type_parameter).symbol;
-        let mut result = self.symbol_to_name(b, tp_symbol, SymbolFlags::TYPE, true /*expectsIdentifier*/);
+        let mut result = self.symbol_to_name(
+            b,
+            tp_symbol,
+            SymbolFlags::TYPE,
+            true, /*expectsIdentifier*/
+        );
         if !is_identifier(result) {
             return nb_e(b).factory.new_identifier("(Missing type parameter)");
         }
@@ -476,12 +598,23 @@ impl Checker {
         }
         if nb_flags(b).intersects(NodeBuilderFlags::GENERATE_NAMES_FOR_SHADOWED_TYPE_PARAMS) {
             let raw_text = result.text().to_string();
-            let mut i: i32 = nb_ctx(b).borrow().type_parameter_names_by_text_next_name_count.get(&raw_text).copied().unwrap_or(0);
+            let mut i: i32 = nb_ctx(b)
+                .borrow()
+                .type_parameter_names_by_text_next_name_count
+                .get(&raw_text)
+                .copied()
+                .unwrap_or(0);
             let mut text = raw_text.clone();
 
             loop {
                 let taken = nb_ctx(b).borrow().type_parameter_names_by_text.has(&text);
-                if !taken && !self.type_parameter_shadows_other_type_parameter_in_scope(b, &text, type_parameter) {
+                if !taken
+                    && !self.type_parameter_shadows_other_type_parameter_in_scope(
+                        b,
+                        &text,
+                        type_parameter,
+                    )
+                {
                     break;
                 }
                 i += 1;
@@ -499,7 +632,8 @@ impl Checker {
             // `i` we've used thus far, to save work later
             let ctx = nb_ctx(b);
             let mut ctx = ctx.borrow_mut();
-            ctx.type_parameter_names_by_text_next_name_count.set(raw_text, i);
+            ctx.type_parameter_names_by_text_next_name_count
+                .set(raw_text, i);
             ctx.type_parameter_names.set(type_parameter, result);
             ctx.type_parameter_names_by_text.add(text);
         }
@@ -513,9 +647,14 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:1437 isHomomorphicMappedTypeWithNonHomomorphicInstantiation
-    fn is_homomorphic_mapped_type_with_non_homomorphic_instantiation(&mut self, mapped: TypeId) -> bool {
+    fn is_homomorphic_mapped_type_with_non_homomorphic_instantiation(
+        &mut self,
+        mapped: TypeId,
+    ) -> bool {
         let target = self.ty(mapped).as_mapped_type().object.target;
-        target.is_some() && !self.is_mapped_type_homomorphic(mapped) && self.is_mapped_type_homomorphic(target)
+        target.is_some()
+            && !self.is_mapped_type_homomorphic(mapped)
+            && self.is_mapped_type_homomorphic(target)
     }
 
     // Go: checker/nodebuilderimpl.go:1441 createMappedTypeNodeFromType
@@ -541,17 +680,23 @@ impl Checker {
 
         // If the mapped type isn't `keyof` constraint-declared, _but_ still has modifiers preserved, and its naive instantiation won't preserve modifiers because its constraint isn't `keyof` constrained, we have work to do
         // PORT: the Go `&&` chain is split into ifs to keep its order without nested borrows.
-        let mut needs_modifier_preserving_wrapper = !self.is_mapped_type_with_keyof_constraint_declaration(t);
+        let mut needs_modifier_preserving_wrapper =
+            !self.is_mapped_type_with_keyof_constraint_declaration(t);
         if needs_modifier_preserving_wrapper {
             let modifiers_type = self.get_modifiers_type_from_mapped_type(t);
-            needs_modifier_preserving_wrapper = !self.ty(modifiers_type).flags.intersects(TypeFlags::UNKNOWN);
+            needs_modifier_preserving_wrapper =
+                !self.ty(modifiers_type).flags.intersects(TypeFlags::UNKNOWN);
         }
         if needs_modifier_preserving_wrapper {
-            needs_modifier_preserving_wrapper = nb_flags(b).intersects(NodeBuilderFlags::GENERATE_NAMES_FOR_SHADOWED_TYPE_PARAMS);
+            needs_modifier_preserving_wrapper =
+                nb_flags(b).intersects(NodeBuilderFlags::GENERATE_NAMES_FOR_SHADOWED_TYPE_PARAMS);
         }
         if needs_modifier_preserving_wrapper {
             let constraint_type = self.get_constraint_type_from_mapped_type(t);
-            let mut keyof_constrained = self.ty(constraint_type).flags.intersects(TypeFlags::TYPE_PARAMETER);
+            let mut keyof_constrained = self
+                .ty(constraint_type)
+                .flags
+                .intersects(TypeFlags::TYPE_PARAMETER);
             if keyof_constrained {
                 let constraint_type = self.get_constraint_type_from_mapped_type(t);
                 let constraint = self.get_constraint_of_type_parameter(constraint_type);
@@ -574,7 +719,10 @@ impl Checker {
                 let target_template = self.get_template_type_from_mapped_type(target);
                 let target_type_parameter = self.get_type_parameter_from_mapped_type(target);
                 let target_modifiers = self.get_modifiers_type_from_mapped_type(target);
-                let mapper = self.new_type_mapper(&[target_type_parameter, target_modifiers], &[type_parameter, new_constraint_param]);
+                let mapper = self.new_type_mapper(
+                    &[target_type_parameter, target_modifiers],
+                    &[type_parameter, new_constraint_param],
+                );
                 template_type = self.instantiate_type(target_template, mapper);
             }
             let mut index_target = new_type_variable;
@@ -582,7 +730,9 @@ impl Checker {
                 let modifiers_type = self.get_modifiers_type_from_mapped_type(t);
                 index_target = self.type_to_type_node(b, modifiers_type);
             }
-            appropriate_constraint_type_node = e.factory.new_type_operator_node(SyntaxKind::KeyOfKeyword, index_target);
+            appropriate_constraint_type_node = e
+                .factory
+                .new_type_operator_node(SyntaxKind::KeyOfKeyword, index_target);
         } else if needs_modifier_preserving_wrapper {
             // So, step 1: new type variable
             let new_symbol = self.new_symbol(SymbolFlags::TYPE_PARAMETER, "T");
@@ -600,14 +750,27 @@ impl Checker {
         // PORT: Go passes nil expandedParams, originalParameters and mapper;
         // empty slices and MapperId::NIL are the Rust nil values.
         let scope_type_parameter = self.get_type_parameter_from_mapped_type(t);
-        let cleanup = self.enter_new_scope(b, declaration, &[], &[scope_type_parameter], &[], MapperId::NIL);
-        let type_parameter_declaration_node = self.type_parameter_to_declaration_with_constraint(b, type_parameter, appropriate_constraint_type_node);
+        let cleanup = self.enter_new_scope(
+            b,
+            declaration,
+            &[],
+            &[scope_type_parameter],
+            &[],
+            MapperId::NIL,
+        );
+        let type_parameter_declaration_node = self.type_parameter_to_declaration_with_constraint(
+            b,
+            type_parameter,
+            appropriate_constraint_type_node,
+        );
         let mut name_type_node = Node::NIL;
         if declaration.name_type().is_some() {
             let name_type = self.get_name_type_from_mapped_type(t);
             name_type_node = self.type_to_type_node(b, name_type);
         }
-        let is_optional = self.get_mapped_type_modifiers(t).intersects(MappedTypeModifiers::INCLUDE_OPTIONAL);
+        let is_optional = self
+            .get_mapped_type_modifiers(t)
+            .intersects(MappedTypeModifiers::INCLUDE_OPTIONAL);
         let without_missing = self.remove_missing_type(template_type, is_optional);
         let template_type_node = self.type_to_type_node(b, without_missing);
         cleanup(self);
@@ -630,17 +793,24 @@ impl Checker {
             // type stays homomorphic
 
             let constraint_operand = declaration.type_parameter().constraint().type_();
-            let mut raw_constraint_type_from_declaration = self.nb_get_type_from_type_node(b, constraint_operand, false);
+            let mut raw_constraint_type_from_declaration =
+                self.nb_get_type_from_type_node(b, constraint_operand, false);
             if raw_constraint_type_from_declaration.is_some() {
-                raw_constraint_type_from_declaration = self.get_constraint_of_type_parameter(raw_constraint_type_from_declaration);
+                raw_constraint_type_from_declaration =
+                    self.get_constraint_of_type_parameter(raw_constraint_type_from_declaration);
             }
             if raw_constraint_type_from_declaration.is_nil() {
                 raw_constraint_type_from_declaration = self.unknown_type;
             }
-            let original_constraint = self.instantiate_type(raw_constraint_type_from_declaration, mapped_mapper);
+            let original_constraint =
+                self.instantiate_type(raw_constraint_type_from_declaration, mapped_mapper);
 
             let mut original_constraint_node = Node::NIL;
-            if !self.ty(original_constraint).flags.intersects(TypeFlags::UNKNOWN) {
+            if !self
+                .ty(original_constraint)
+                .flags
+                .intersects(TypeFlags::UNKNOWN)
+            {
                 original_constraint_node = self.type_to_type_node(b, original_constraint);
             }
 
@@ -649,13 +819,14 @@ impl Checker {
             let infer_name = e.factory.clone_node(new_type_variable.type_name());
             return e.factory.new_conditional_type_node(
                 check_type,
-                e.factory.new_infer_type_node(e.factory.new_type_parameter_declaration(
-                    ModifierList::NIL,
-                    infer_name,
-                    original_constraint_node,
-                    Node::NIL,
-                    Node::NIL,
-                )),
+                e.factory
+                    .new_infer_type_node(e.factory.new_type_parameter_declaration(
+                        ModifierList::NIL,
+                        infer_name,
+                        original_constraint_node,
+                        Node::NIL,
+                        Node::NIL,
+                    )),
                 result,
                 e.factory.new_keyword_type_node(SyntaxKind::NeverKeyword),
             );
@@ -671,13 +842,16 @@ impl Checker {
             let modifiers_type_node = self.type_to_type_node(b, modifiers_type);
             return e.factory.new_conditional_type_node(
                 check_type,
-                e.factory.new_infer_type_node(e.factory.new_type_parameter_declaration(
-                    ModifierList::NIL,
-                    infer_name,
-                    e.factory.new_type_operator_node(SyntaxKind::KeyOfKeyword, modifiers_type_node),
-                    Node::NIL,
-                    Node::NIL,
-                )),
+                e.factory.new_infer_type_node(
+                    e.factory.new_type_parameter_declaration(
+                        ModifierList::NIL,
+                        infer_name,
+                        e.factory
+                            .new_type_operator_node(SyntaxKind::KeyOfKeyword, modifiers_type_node),
+                        Node::NIL,
+                        Node::NIL,
+                    ),
+                ),
                 result,
                 e.factory.new_keyword_type_node(SyntaxKind::NeverKeyword),
             );
@@ -687,14 +861,19 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:1557 typePredicateToTypePredicateNode
-    pub fn type_predicate_to_type_predicate_node(&mut self, b: &Nb, predicate: TypePredicateId) -> Node {
+    pub fn type_predicate_to_type_predicate_node(
+        &mut self,
+        b: &Nb,
+        predicate: TypePredicateId,
+    ) -> Node {
         let e = nb_e(b);
         let (kind, parameter_name_text, pt) = {
             let p = self.pred(predicate);
             (p.kind, p.parameter_name.clone(), p.t)
         };
         let mut asserts_modifier = Node::NIL;
-        if kind == TypePredicateKind::ASSERTS_IDENTIFIER || kind == TypePredicateKind::ASSERTS_THIS {
+        if kind == TypePredicateKind::ASSERTS_IDENTIFIER || kind == TypePredicateKind::ASSERTS_THIS
+        {
             asserts_modifier = e.factory.new_token(SyntaxKind::AssertsKeyword);
         }
         let parameter_name;
@@ -708,15 +887,26 @@ impl Checker {
         if pt.is_some() {
             type_node = self.type_to_type_node(b, pt);
         }
-        e.factory.new_type_predicate_node(asserts_modifier, parameter_name, type_node)
+        e.factory
+            .new_type_predicate_node(asserts_modifier, parameter_name, type_node)
     }
 
     // Go: checker/nodebuilderimpl.go:1580 typeToTypeNodeHelperWithPossibleReusableTypeNode
-    fn type_to_type_node_helper_with_possible_reusable_type_node(&mut self, b: &Nb, t: TypeId, type_node: Node) -> Node {
+    fn type_to_type_node_helper_with_possible_reusable_type_node(
+        &mut self,
+        b: &Nb,
+        t: TypeId,
+        type_node: Node,
+    ) -> Node {
         if t.is_nil() {
-            return nb_e(b).factory.new_keyword_type_node(SyntaxKind::AnyKeyword);
+            return nb_e(b)
+                .factory
+                .new_keyword_type_node(SyntaxKind::AnyKeyword);
         }
-        if !self.is_actively_expanding(b) && type_node.is_some() && self.nb_get_type_from_type_node(b, type_node, false) == t {
+        if !self.is_actively_expanding(b)
+            && type_node.is_some()
+            && self.nb_get_type_from_type_node(b, type_node, false) == t
+        {
             let reused = self.try_reuse_existing_node_helper(b, type_node);
             if reused.is_some() {
                 self.check_type_expandability(b, t);
@@ -732,7 +922,11 @@ impl Checker {
         let mut constraint_node = Node::NIL;
         if constraint.is_some() {
             let constraint_declaration = self.get_constraint_declaration(parameter);
-            constraint_node = self.type_to_type_node_helper_with_possible_reusable_type_node(b, constraint, constraint_declaration);
+            constraint_node = self.type_to_type_node_helper_with_possible_reusable_type_node(
+                b,
+                constraint,
+                constraint_declaration,
+            );
         }
         self.type_parameter_to_declaration_with_constraint(b, parameter, constraint_node)
     }
@@ -743,10 +937,15 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:1607 typeParametersToTypeParameterDeclarations
-    pub fn type_parameters_to_type_parameter_declarations(&mut self, b: &Nb, symbol: SymbolId) -> Vec<Node> {
+    pub fn type_parameters_to_type_parameter_declarations(
+        &mut self,
+        b: &Nb,
+        symbol: SymbolId,
+    ) -> Vec<Node> {
         let target_symbol = self.get_target_symbol(symbol);
         let target_flags = self.sym(target_symbol).flags;
-        if target_flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE | SymbolFlags::ALIAS) {
+        if target_flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE | SymbolFlags::ALIAS)
+        {
             let mut results = Vec::new();
             let params = self.get_local_type_parameters_of_class_or_interface_or_type_alias(symbol);
             for param in params {
@@ -768,7 +967,8 @@ impl Checker {
     // PORT: a free function in Go. It reads symbols, so it is a `&self`
     // Checker method here.
     pub fn get_effective_parameter_declaration(&self, symbol: SymbolId) -> Node {
-        let parameter_declaration = get_declaration_of_kind(&self.symbols, symbol, SyntaxKind::Parameter);
+        let parameter_declaration =
+            get_declaration_of_kind(&self.symbols, symbol, SyntaxKind::Parameter);
         if parameter_declaration.is_some() {
             return parameter_declaration;
         }
@@ -779,11 +979,22 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:1637 symbolToParameterDeclaration
-    pub fn symbol_to_parameter_declaration(&mut self, b: &Nb, parameter_symbol: SymbolId, preserve_modifier_flags: bool) -> Node {
+    pub fn symbol_to_parameter_declaration(
+        &mut self,
+        b: &Nb,
+        parameter_symbol: SymbolId,
+        preserve_modifier_flags: bool,
+    ) -> Node {
         let parameter_declaration = self.get_effective_parameter_declaration(parameter_symbol);
 
         let parameter_type = self.get_type_of_symbol(parameter_symbol);
-        let parameter_type_node = self.serialize_type_for_declaration(b, parameter_declaration, parameter_type, parameter_symbol, true);
+        let parameter_type_node = self.serialize_type_for_declaration(
+            b,
+            parameter_declaration,
+            parameter_type,
+            parameter_symbol,
+            true,
+        );
         let e = nb_e(b);
         let mut modifiers = ModifierList::NIL;
         if !nb_flags(b).intersects(NodeBuilderFlags::OMIT_PARAMETER_MODIFIERS)
@@ -808,8 +1019,13 @@ impl Checker {
         if is_rest {
             dot_dot_dot_token = e.factory.new_token(SyntaxKind::DotDotDotToken);
         }
-        let name = self.parameter_to_parameter_declaration_name(b, parameter_symbol, parameter_declaration);
-        let is_optional = parameter_declaration.is_some() && self.is_optional_parameter(parameter_declaration)
+        let name = self.parameter_to_parameter_declaration_name(
+            b,
+            parameter_symbol,
+            parameter_declaration,
+        );
+        let is_optional = parameter_declaration.is_some()
+            && self.is_optional_parameter(parameter_declaration)
             || check_flags.intersects(CheckFlags::OPTIONAL_PARAMETER);
         let mut question_token = Node::NIL;
         if is_optional {
@@ -830,7 +1046,12 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:1674 parameterToParameterDeclarationName
-    pub(crate) fn parameter_to_parameter_declaration_name(&mut self, b: &Nb, parameter_symbol: SymbolId, parameter_declaration: Node) -> Node {
+    pub(crate) fn parameter_to_parameter_declaration_name(
+        &mut self,
+        b: &Nb,
+        parameter_symbol: SymbolId,
+        parameter_declaration: Node,
+    ) -> Node {
         if parameter_declaration.is_nil() || parameter_declaration.name().is_nil() {
             let name = self.sym(parameter_symbol).name.clone();
             return self.nb_new_identifier(b, &name, parameter_symbol);
@@ -894,7 +1115,10 @@ impl Checker {
             visited = e.factory.deep_clone_node(visited);
         }
 
-        e.set_emit_flags(visited, EmitFlags::SINGLE_LINE | EmitFlags::NO_ASCII_ESCAPING);
+        e.set_emit_flags(
+            visited,
+            EmitFlags::SINGLE_LINE | EmitFlags::NO_ASCII_ESCAPING,
+        );
         visited
     }
 
@@ -909,7 +1133,12 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:1728 serializeInferredReturnTypeForSignature
-    fn serialize_inferred_return_type_for_signature(&mut self, b: &Nb, signature: SignatureId, return_type: TypeId) -> Node {
+    fn serialize_inferred_return_type_for_signature(
+        &mut self,
+        b: &Nb,
+        signature: SignatureId,
+        return_type: TypeId,
+    ) -> Node {
         let old_suppress_report_inference_fallback = {
             let ctx = nb_ctx(b);
             let mut ctx = ctx.borrow_mut();
@@ -921,30 +1150,42 @@ impl Checker {
         let return_type_node;
         if type_predicate.is_some() {
             let mapper = nb_mapper(b);
-            let predicate = if mapper.is_some() { self.instantiate_type_predicate(type_predicate, mapper) } else { type_predicate };
+            let predicate = if mapper.is_some() {
+                self.instantiate_type_predicate(type_predicate, mapper)
+            } else {
+                type_predicate
+            };
             return_type_node = self.type_predicate_to_type_predicate_node_helper(b, predicate);
         } else {
             return_type_node = self.type_to_type_node(b, return_type);
         }
-        nb_ctx(b).borrow_mut().suppress_report_inference_fallback = old_suppress_report_inference_fallback;
+        nb_ctx(b).borrow_mut().suppress_report_inference_fallback =
+            old_suppress_report_inference_fallback;
         return_type_node
     }
 
     // Go: checker/nodebuilderimpl.go:1748 typePredicateToTypePredicateNodeHelper
-    fn type_predicate_to_type_predicate_node_helper(&mut self, b: &Nb, type_predicate: TypePredicateId) -> Node {
+    fn type_predicate_to_type_predicate_node_helper(
+        &mut self,
+        b: &Nb,
+        type_predicate: TypePredicateId,
+    ) -> Node {
         let e = nb_e(b);
         let (kind, parameter_name_text, pt) = {
             let p = self.pred(type_predicate);
             (p.kind, p.parameter_name.clone(), p.t)
         };
-        let asserts_modifier = if kind == TypePredicateKind::ASSERTS_THIS || kind == TypePredicateKind::ASSERTS_IDENTIFIER {
+        let asserts_modifier = if kind == TypePredicateKind::ASSERTS_THIS
+            || kind == TypePredicateKind::ASSERTS_IDENTIFIER
+        {
             e.factory.new_token(SyntaxKind::AssertsKeyword)
         } else {
             Node::NIL
         };
         let parameter_name;
         if kind == TypePredicateKind::IDENTIFIER || kind == TypePredicateKind::ASSERTS_IDENTIFIER {
-            parameter_name = self.nb_new_identifier(b, &parameter_name_text, SymbolId::NIL /*symbol*/);
+            parameter_name =
+                self.nb_new_identifier(b, &parameter_name_text, SymbolId::NIL /*symbol*/);
             e.set_emit_flags(parameter_name, EmitFlags::NO_ASCII_ESCAPING);
         } else {
             parameter_name = e.factory.new_this_type_node();
@@ -953,7 +1194,8 @@ impl Checker {
         if pt.is_some() {
             type_node = self.type_to_type_node(b, pt);
         }
-        e.factory.new_type_predicate_node(asserts_modifier, parameter_name, type_node)
+        e.factory
+            .new_type_predicate_node(asserts_modifier, parameter_name, type_node)
     }
 
     // Go: checker/nodebuilderimpl.go:1775 signatureToSignatureDeclarationHelper
@@ -972,9 +1214,19 @@ impl Checker {
 
         let (sig_target, sig_mapper, sig_type_parameters, sig_parameters, sig_flags) = {
             let s = self.sig(signature);
-            (s.target, s.mapper, s.type_parameters.clone(), s.parameters.clone(), s.flags)
+            (
+                s.target,
+                s.mapper,
+                s.type_parameters.clone(),
+                s.parameters.clone(),
+                s.flags,
+            )
         };
-        let target_type_parameters = if sig_target.is_some() { self.sig(sig_target).type_parameters.clone() } else { Vec::new() };
+        let target_type_parameters = if sig_target.is_some() {
+            self.sig(sig_target).type_parameters.clone()
+        } else {
+            Vec::new()
+        };
         if nb_flags(b).intersects(NodeBuilderFlags::WRITE_TYPE_ARGUMENTS_OF_SIGNATURE)
             && sig_target.is_some()
             && sig_mapper.is_some()
@@ -994,12 +1246,24 @@ impl Checker {
         nb_clear_flags(b, NodeBuilderFlags::SUPPRESS_ANY_RETURN_TYPE);
         // If the expanded parameter list had a variadic in a non-trailing position, don't expand it
         let has_non_trailing_rest = expanded_params.iter().any(|&p| {
-            p != expanded_params[expanded_params.len() - 1] && self.sym(p).check_flags.intersects(CheckFlags::REST_PARAMETER)
+            p != expanded_params[expanded_params.len() - 1]
+                && self
+                    .sym(p)
+                    .check_flags
+                    .intersects(CheckFlags::REST_PARAMETER)
         });
-        let source_params = if has_non_trailing_rest { sig_parameters } else { expanded_params };
+        let source_params = if has_non_trailing_rest {
+            sig_parameters
+        } else {
+            expanded_params
+        };
         let mut parameters: Vec<Node> = Vec::with_capacity(source_params.len() + 1);
         for parameter in source_params {
-            parameters.push(self.symbol_to_parameter_declaration(b, parameter, kind == SyntaxKind::Constructor));
+            parameters.push(self.symbol_to_parameter_declaration(
+                b,
+                parameter,
+                kind == SyntaxKind::Constructor,
+            ));
         }
         let this_parameter = if nb_flags(b).intersects(NodeBuilderFlags::OMIT_THIS_PARAMETER) {
             Node::NIL
@@ -1020,7 +1284,10 @@ impl Checker {
         }
         if kind == SyntaxKind::ConstructorType && sig_flags.intersects(SignatureFlags::ABSTRACT) {
             let flags = modifiers_to_flags(&modifiers);
-            modifiers = create_modifiers_from_modifier_flags(flags | ModifierFlags::ABSTRACT, &mut |k| e.factory.new_modifier(k));
+            modifiers =
+                create_modifiers_from_modifier_flags(flags | ModifierFlags::ABSTRACT, &mut |k| {
+                    e.factory.new_modifier(k)
+                });
         }
 
         let param_list = e.factory.new_node_list(&parameters);
@@ -1042,11 +1309,22 @@ impl Checker {
 
         let f = &e.factory;
         let node = match kind {
-            SyntaxKind::CallSignature => f.new_call_signature_declaration(type_param_list, param_list, return_type_node),
-            SyntaxKind::ConstructSignature => f.new_construct_signature_declaration(type_param_list, param_list, return_type_node),
+            SyntaxKind::CallSignature => {
+                f.new_call_signature_declaration(type_param_list, param_list, return_type_node)
+            }
+            SyntaxKind::ConstructSignature => {
+                f.new_construct_signature_declaration(type_param_list, param_list, return_type_node)
+            }
             SyntaxKind::MethodSignature => {
                 let question_token = options.map_or(Node::NIL, |o| o.question_token);
-                f.new_method_signature_declaration(modifier_list, name, question_token, type_param_list, param_list, return_type_node)
+                f.new_method_signature_declaration(
+                    modifier_list,
+                    name,
+                    question_token,
+                    type_param_list,
+                    param_list,
+                    return_type_node,
+                )
             }
             SyntaxKind::MethodDeclaration => f.new_method_declaration(
                 modifier_list,
@@ -1085,21 +1363,30 @@ impl Checker {
                 Node::NIL, // fullSignature
                 Node::NIL, // body
             ),
-            SyntaxKind::IndexSignature => f.new_index_signature_declaration(modifier_list, param_list, return_type_node),
+            SyntaxKind::IndexSignature => {
+                f.new_index_signature_declaration(modifier_list, param_list, return_type_node)
+            }
             // !!! JSDoc Support
             // case kind == ast.KindJSDocFunctionType:
             // 	node = b.f.NewJSDocFunctionType(parameters, returnTypeNode)
             SyntaxKind::FunctionType => {
                 if return_type_node.is_nil() {
-                    return_type_node = f.new_type_reference_node(f.new_identifier(""), NodeList::NIL);
+                    return_type_node =
+                        f.new_type_reference_node(f.new_identifier(""), NodeList::NIL);
                 }
                 f.new_function_type_node(type_param_list, param_list, return_type_node)
             }
             SyntaxKind::ConstructorType => {
                 if return_type_node.is_nil() {
-                    return_type_node = f.new_type_reference_node(f.new_identifier(""), NodeList::NIL);
+                    return_type_node =
+                        f.new_type_reference_node(f.new_identifier(""), NodeList::NIL);
                 }
-                f.new_constructor_type_node(modifier_list, type_param_list, param_list, return_type_node)
+                f.new_constructor_type_node(
+                    modifier_list,
+                    type_param_list,
+                    param_list,
+                    return_type_node,
+                )
             }
             // TODO: assert name is Identifier
             SyntaxKind::FunctionDeclaration => f.new_function_declaration(
@@ -1145,7 +1432,11 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:1895 getExpandedParameters
-    pub fn get_expanded_parameters(&mut self, sig: SignatureId, skip_union_expanding: bool) -> Vec<Vec<SymbolId>> {
+    pub fn get_expanded_parameters(
+        &mut self,
+        sig: SignatureId,
+        skip_union_expanding: bool,
+    ) -> Vec<Vec<SymbolId>> {
         let sig_parameters = self.sig(sig).parameters.clone();
         if self.signature_has_rest_parameter(sig) {
             let rest_index = sig_parameters.len() - 1;
@@ -1153,15 +1444,38 @@ impl Checker {
             let rest_type = self.get_type_of_symbol(rest_symbol);
 
             if self.is_tuple_type(rest_type) {
-                return vec![self.get_expanded_parameters_expand_tuple_members(&sig_parameters, rest_type, rest_index, rest_symbol)];
+                return vec![self.get_expanded_parameters_expand_tuple_members(
+                    &sig_parameters,
+                    rest_type,
+                    rest_index,
+                    rest_symbol,
+                )];
             } else if !skip_union_expanding
                 && self.ty(rest_type).flags.intersects(TypeFlags::UNION)
-                && self.ty(rest_type).as_union_type().union_or_intersection.types.iter().all(|&t| self.is_tuple_type(t))
+                && self
+                    .ty(rest_type)
+                    .as_union_type()
+                    .union_or_intersection
+                    .types
+                    .iter()
+                    .all(|&t| self.is_tuple_type(t))
             {
-                let types = self.ty(rest_type).as_union_type().union_or_intersection.types.clone();
+                let types = self
+                    .ty(rest_type)
+                    .as_union_type()
+                    .union_or_intersection
+                    .types
+                    .clone();
                 return types
                     .into_iter()
-                    .map(|t| self.get_expanded_parameters_expand_tuple_members(&sig_parameters, t, rest_index, rest_symbol))
+                    .map(|t| {
+                        self.get_expanded_parameters_expand_tuple_members(
+                            &sig_parameters,
+                            t,
+                            rest_index,
+                            rest_symbol,
+                        )
+                    })
                     .collect();
             }
         }
@@ -1172,7 +1486,11 @@ impl Checker {
     // PORT: a Go closure inside getExpandedParameters. It captures nothing
     // but `c`, so it is a private method. The name has a prefix because
     // checker.go has a different function with the Go name.
-    fn get_expanded_parameters_uniq_associated_names(&mut self, t: TypeId, rest_symbol: SymbolId) -> Vec<String> {
+    fn get_expanded_parameters_uniq_associated_names(
+        &mut self,
+        t: TypeId,
+        rest_symbol: SymbolId,
+    ) -> Vec<String> {
         let target = self.ty(t).target();
         let element_infos = self.ty(target).as_tuple_type().element_infos.clone();
         let mut names: Vec<String> = element_infos
@@ -1224,7 +1542,8 @@ impl Checker {
         rest_symbol: SymbolId,
     ) -> Vec<SymbolId> {
         let element_types = self.get_type_arguments(rest_type);
-        let associated_names = self.get_expanded_parameters_uniq_associated_names(rest_type, rest_symbol);
+        let associated_names =
+            self.get_expanded_parameters_uniq_associated_names(rest_type, rest_symbol);
         let target = self.ty(rest_type).target();
         let mut rest_params: Vec<SymbolId> = Vec::with_capacity(element_types.len());
         for (i, &t) in element_types.iter().enumerate() {
@@ -1239,8 +1558,13 @@ impl Checker {
             } else {
                 CheckFlags::NONE
             };
-            let symbol = self.new_symbol_ex(SymbolFlags::FUNCTION_SCOPED_VARIABLE, &name, check_flags);
-            let resolved_type = if flags.intersects(ElementFlags::REST) { self.create_array_type(t) } else { t };
+            let symbol =
+                self.new_symbol_ex(SymbolFlags::FUNCTION_SCOPED_VARIABLE, &name, check_flags);
+            let resolved_type = if flags.intersects(ElementFlags::REST) {
+                self.create_array_type(t)
+            } else {
+                t
+            };
             self.value_symbol_links.get(symbol).resolved_type = resolved_type;
             rest_params.push(symbol);
         }
@@ -1279,7 +1603,12 @@ impl Checker {
     // PORT: `enclosingSymbolTypes` is keyed by `SymbolId` for Go
     // `ast.GetSymbolId(symbol)`. The pseudochecker result is held in an
     // `Option` so the Go `pt = nil` step has a value.
-    pub fn serialize_return_type_for_signature(&mut self, b: &Nb, signature: SignatureId, try_reuse: bool) -> Node {
+    pub fn serialize_return_type_for_signature(
+        &mut self,
+        b: &Nb,
+        signature: SignatureId,
+        try_reuse: bool,
+    ) -> Node {
         let suppress_any = nb_flags(b).intersects(NodeBuilderFlags::SUPPRESS_ANY_RETURN_TYPE);
         let restore_flags = self.save_restore_flags(b);
         if suppress_any {
@@ -1291,7 +1620,11 @@ impl Checker {
         let return_type;
         if declaration.is_some() && !node_is_synthesized(declaration) {
             let symbol = self.get_symbol_of_declaration(declaration);
-            let cached = nb_ctx(b).borrow().enclosing_symbol_types.get(&symbol).copied();
+            let cached = nb_ctx(b)
+                .borrow()
+                .enclosing_symbol_types
+                .get(&symbol)
+                .copied();
             match cached {
                 Some(t) if t.is_some() => return_type = t,
                 _ => {
@@ -1316,7 +1649,13 @@ impl Checker {
                 let mut pt = Some(pc.get_return_type_of_signature(&self.symbols, declaration));
                 let report_fallback = !nb_ctx(b).borrow().suppress_report_inference_fallback;
                 let equivalent = match &pt {
-                    Some(p) => self.pseudo_type_equivalent_to_type(b, p, return_type, false, report_fallback),
+                    Some(p) => self.pseudo_type_equivalent_to_type(
+                        b,
+                        p,
+                        return_type,
+                        false,
+                        report_fallback,
+                    ),
                     None => false,
                 };
                 if equivalent {
@@ -1326,7 +1665,9 @@ impl Checker {
                     let type_predicate = self.get_type_predicate_of_signature(signature);
                     if type_predicate.is_some() {
                         let matches = match &pt {
-                            Some(p) => self.pseudo_return_type_matches_predicate(b, p, type_predicate),
+                            Some(p) => {
+                                self.pseudo_return_type_matches_predicate(b, p, type_predicate)
+                            }
                             None => false,
                         };
                         if !matches {
@@ -1339,18 +1680,22 @@ impl Checker {
                     if let Some(p) = &pt {
                         // !!! TODO: If annotated type node is a reference with insufficient type arguments, we should still fall back to type serialization
                         // see: canReuseTypeNodeAnnotation in strada for context
-                        return_type_node = self.pseudo_type_to_node_with_checker_fallback(b, p, return_type);
+                        return_type_node =
+                            self.pseudo_type_to_node_with_checker_fallback(b, p, return_type);
                     }
                 }
                 restore();
             }
             if return_type_node.is_nil() {
-                return_type_node = self.serialize_inferred_return_type_for_signature(b, signature, return_type);
+                return_type_node =
+                    self.serialize_inferred_return_type_for_signature(b, signature, return_type);
             }
         }
 
         if return_type_node.is_nil() && !suppress_any {
-            return_type_node = nb_e(b).factory.new_keyword_type_node(SyntaxKind::AnyKeyword);
+            return_type_node = nb_e(b)
+                .factory
+                .new_keyword_type_node(SyntaxKind::AnyKeyword);
         }
         restore_flags();
         return_type_node
@@ -1367,19 +1712,27 @@ impl Checker {
         }
         // TODO: going through emit resolver here is weird. Relayer these APIs.
         let enclosing_declaration = nb_ctx(b).borrow().enclosing_declaration;
-        self.get_emit_resolver().is_entity_name_visible(self, e.name().expression(), enclosing_declaration, false).accessibility
+        self.get_emit_resolver()
+            .is_entity_name_visible(self, e.name().expression(), enclosing_declaration, false)
+            .accessibility
             == SymbolAccessibility::ACCESSIBLE
     }
 
     // Go: checker/nodebuilderimpl.go:2070 indexInfoToObjectComputedNamesOrSignatureDeclaration
-    pub fn index_info_to_object_computed_names_or_signature_declaration(&mut self, b: &Nb, index_info: IndexInfoId, type_node: Node) -> Vec<Node> {
+    pub fn index_info_to_object_computed_names_or_signature_declaration(
+        &mut self,
+        b: &Nb,
+        index_info: IndexInfoId,
+        type_node: Node,
+    ) -> Vec<Node> {
         let (components, is_readonly) = {
             let info = self.index_info(index_info);
             (info.components.clone(), info.is_readonly)
         };
         if !components.is_empty() {
             // Index info is derived from object or class computed property names (plus explicit named members) - we can clone those instead of writing out the result computed index signature
-            let mut all_component_computed_names_serializable = nb_enclosing_declaration(b).is_some();
+            let mut all_component_computed_names_serializable =
+                nb_enclosing_declaration(b).is_some();
             if all_component_computed_names_serializable {
                 for &c in &components {
                     if !self.is_trivially_serializable_computed_name(b, c) {
@@ -1409,7 +1762,9 @@ impl Checker {
                         self.track_computed_name(b, e.name().expression(), enclosing);
                         let mut mods = ModifierList::NIL;
                         if is_readonly {
-                            mods = e_ctx.factory.new_modifier_list(&[e_ctx.factory.new_modifier(SyntaxKind::ReadonlyKeyword)]);
+                            mods = e_ctx.factory.new_modifier_list(&[e_ctx
+                                .factory
+                                .new_modifier(SyntaxKind::ReadonlyKeyword)]);
                         }
                         let mut postfix_token = Node::NIL;
                         if e.postfix_token().is_some() {
@@ -1421,7 +1776,13 @@ impl Checker {
                             let t = self.get_type_of_symbol(e.symbol());
                             self.type_to_type_node(b, t)
                         };
-                        let sig = e_ctx.factory.new_property_signature_declaration(mods, name, postfix_token, current_type_node, Node::NIL);
+                        let sig = e_ctx.factory.new_property_signature_declaration(
+                            mods,
+                            name,
+                            postfix_token,
+                            current_type_node,
+                            Node::NIL,
+                        );
                         set_node_loc(sig, e.loc());
                         results.push(sig);
                         continue;
@@ -1438,7 +1799,12 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:2121 indexInfoToIndexSignatureDeclarationHelper
-    pub fn index_info_to_index_signature_declaration_helper(&mut self, b: &Nb, index_info: IndexInfoId, mut type_node: Node) -> Node {
+    pub fn index_info_to_index_signature_declaration_helper(
+        &mut self,
+        b: &Nb,
+        index_info: IndexInfoId,
+        mut type_node: Node,
+    ) -> Node {
         let name = self.get_name_from_index_info(index_info);
         let (key_type, value_type, is_readonly) = {
             let info = self.index_info(index_info);
@@ -1448,7 +1814,14 @@ impl Checker {
 
         let name_node = self.nb_new_identifier(b, &name, SymbolId::NIL /*symbol*/);
         let e = nb_e(b);
-        let indexing_parameter = e.factory.new_parameter_declaration(ModifierList::NIL, Node::NIL, name_node, Node::NIL, indexer_type_node, Node::NIL);
+        let indexing_parameter = e.factory.new_parameter_declaration(
+            ModifierList::NIL,
+            Node::NIL,
+            name_node,
+            Node::NIL,
+            indexer_type_node,
+            Node::NIL,
+        );
         if type_node.is_nil() {
             if value_type.is_nil() {
                 type_node = e.factory.new_keyword_type_node(SyntaxKind::AnyKeyword);
@@ -1456,15 +1829,23 @@ impl Checker {
                 type_node = self.type_to_type_node(b, value_type);
             }
         }
-        if value_type.is_nil() && !nb_flags(b).intersects(NodeBuilderFlags::ALLOW_EMPTY_INDEX_INFO_TYPE) {
+        if value_type.is_nil()
+            && !nb_flags(b).intersects(NodeBuilderFlags::ALLOW_EMPTY_INDEX_INFO_TYPE)
+        {
             nb_ctx(b).borrow_mut().encountered_error = true;
         }
         nb_add_approximate_length(b, name.len() as i32 + 4);
         let mut modifiers = ModifierList::NIL;
         if is_readonly {
             nb_add_approximate_length(b, 9);
-            modifiers = e.factory.new_modifier_list(&[e.factory.new_modifier(SyntaxKind::ReadonlyKeyword)]);
+            modifiers = e
+                .factory
+                .new_modifier_list(&[e.factory.new_modifier(SyntaxKind::ReadonlyKeyword)]);
         }
-        e.factory.new_index_signature_declaration(modifiers, e.factory.new_node_list(&[indexing_parameter]), type_node)
+        e.factory.new_index_signature_declaration(
+            modifiers,
+            e.factory.new_node_list(&[indexing_parameter]),
+            type_node,
+        )
     }
 }

@@ -95,7 +95,12 @@ impl Checker {
     }
 
     // Go: checker/inference.go:65 inferFromTypes
-    pub fn infer_from_types(&mut self, n: &Rc<RefCell<InferenceState>>, source: TypeId, target: TypeId) {
+    pub fn infer_from_types(
+        &mut self,
+        n: &Rc<RefCell<InferenceState>>,
+        source: TypeId,
+        target: TypeId,
+    ) {
         let mut source = source;
         let mut target = target;
         let could_contain_type_variables = self.could_contain_type_variables.clone();
@@ -122,10 +127,18 @@ impl Checker {
                     let params = self.type_alias_links.get(sa.symbol).type_parameters.clone();
                     let min_params = self.get_min_type_argument_count(&params);
                     let node_is_in_js_file = is_in_js_file(self.sym(sa.symbol).value_declaration);
-                    let source_types =
-                        self.fill_missing_type_arguments(&sa.type_arguments, &params, min_params, node_is_in_js_file);
-                    let target_types =
-                        self.fill_missing_type_arguments(&ta.type_arguments, &params, min_params, node_is_in_js_file);
+                    let source_types = self.fill_missing_type_arguments(
+                        &sa.type_arguments,
+                        &params,
+                        min_params,
+                        node_is_in_js_file,
+                    );
+                    let target_types = self.fill_missing_type_arguments(
+                        &ta.type_arguments,
+                        &params,
+                        min_params,
+                        node_is_in_js_file,
+                    );
                     let variances = self.get_alias_variances(sa.symbol);
                     self.infer_from_type_arguments(n, &source_types, &target_types, &variances);
                 }
@@ -133,7 +146,12 @@ impl Checker {
                 return;
             }
         }
-        if source == target && self.ty(source).flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
+        if source == target
+            && self
+                .ty(source)
+                .flags
+                .intersects(TypeFlags::UNION_OR_INTERSECTION)
+        {
             // When source and target are the same union or intersection type, just relate each constituent
             // type to itself.
             for t in self.ty(source).types().to_vec() {
@@ -181,18 +199,21 @@ impl Checker {
             source = self.get_union_type(&sources);
         } else if self.ty(target).flags.intersects(TypeFlags::INTERSECTION) && {
             let target_types = self.ty(target).types().to_vec();
-            !target_types.iter().all(|&t| self.is_non_generic_object_type(t))
+            !target_types
+                .iter()
+                .all(|&t| self.is_non_generic_object_type(t))
         } {
             // We reduce intersection types unless they're simple combinations of object types. For example,
             // when inferring from 'string[] & { extra: any }' to 'string[] & T' we want to remove string[] and
             // infer { extra: any } for T. But when inferring to 'string[] & Iterable<T>' we want to keep the
             // string[] on the source side and infer string for T.
             if !self.ty(source).flags.intersects(TypeFlags::UNION) {
-                let source_types: Vec<TypeId> = if self.ty(source).flags.intersects(TypeFlags::INTERSECTION) {
-                    self.ty(source).types().to_vec()
-                } else {
-                    vec![source]
-                };
+                let source_types: Vec<TypeId> =
+                    if self.ty(source).flags.intersects(TypeFlags::INTERSECTION) {
+                        self.ty(source).types().to_vec()
+                    } else {
+                        vec![source]
+                    };
                 // Infer between identically matching source and target constituents and remove the matching types.
                 let target_types = self.ty(target).types().to_vec();
                 let (sources, targets) = self.infer_from_matching_types(
@@ -208,7 +229,11 @@ impl Checker {
                 target = self.get_intersection_type(&targets);
             }
         }
-        if self.ty(target).flags.intersects(TypeFlags::INDEXED_ACCESS | TypeFlags::SUBSTITUTION) {
+        if self
+            .ty(target)
+            .flags
+            .intersects(TypeFlags::INDEXED_ACCESS | TypeFlags::SUBSTITUTION)
+        {
             if self.is_no_infer_type(target) {
                 return;
             }
@@ -238,7 +263,10 @@ impl Checker {
                 //
                 // As a special case, also ignore nonInferrableAnyType, which is a special form of the any type
                 // used as a stand-in for binding elements when they are being inferred.
-                if self.ty(source).object_flags.intersects(ObjectFlags::NON_INFERRABLE_TYPE)
+                if self
+                    .ty(source)
+                    .object_flags
+                    .intersects(ObjectFlags::NON_INFERRABLE_TYPE)
                     || source == self.non_inferrable_any_type
                 {
                     return;
@@ -246,7 +274,11 @@ impl Checker {
                 let ctx = n.borrow().inferences;
                 if !self.inference_context(ctx).inferences[inference].is_fixed {
                     let propagation_type = n.borrow().propagation_type;
-                    let candidate = if propagation_type.is_some() { propagation_type } else { source };
+                    let candidate = if propagation_type.is_some() {
+                        propagation_type
+                    } else {
+                        source
+                    };
                     if candidate == self.blocked_string_type {
                         return;
                     }
@@ -267,12 +299,22 @@ impl Checker {
                         // We make contravariant inferences only if we are in a pure contravariant position,
                         // i.e. only if we have not descended into a bivariant position.
                         if contravariant && !bivariant {
-                            if !self.inference_context(ctx).inferences[inference].contra_candidates.contains(&candidate) {
-                                self.inference_context_mut(ctx).inferences[inference].contra_candidates.push(candidate);
+                            if !self.inference_context(ctx).inferences[inference]
+                                .contra_candidates
+                                .contains(&candidate)
+                            {
+                                self.inference_context_mut(ctx).inferences[inference]
+                                    .contra_candidates
+                                    .push(candidate);
                                 self.clear_cached_inferences(ctx);
                             }
-                        } else if !self.inference_context(ctx).inferences[inference].candidates.contains(&candidate) {
-                            self.inference_context_mut(ctx).inferences[inference].candidates.push(candidate);
+                        } else if !self.inference_context(ctx).inferences[inference]
+                            .candidates
+                            .contains(&candidate)
+                        {
+                            self.inference_context_mut(ctx).inferences[inference]
+                                .candidates
+                                .push(candidate);
                             self.clear_cached_inferences(ctx);
                         }
                     }
@@ -299,14 +341,23 @@ impl Checker {
                 self.infer_from_types(n, source, simplified);
             } else if self.ty(target).flags.intersects(TypeFlags::INDEXED_ACCESS) {
                 let target_index_type = self.ty(target).as_indexed_access_type().index_type;
-                let index_type = self.get_simplified_type(target_index_type, false /*writing*/);
+                let index_type =
+                    self.get_simplified_type(target_index_type, false /*writing*/);
                 // Generally simplifications of instantiable indexes are avoided to keep relationship checking correct, however if our target is an access, we can consider
                 // that key of that access to be "instantiated", since we're looking to find the infernce goal in any way we can.
-                if self.ty(index_type).flags.intersects(TypeFlags::INSTANTIABLE) {
+                if self
+                    .ty(index_type)
+                    .flags
+                    .intersects(TypeFlags::INSTANTIABLE)
+                {
                     let target_object_type = self.ty(target).as_indexed_access_type().object_type;
-                    let simplified_object_type = self.get_simplified_type(target_object_type, false /*writing*/);
-                    let simplified =
-                        self.distribute_index_over_object_type(simplified_object_type, index_type, false /*writing*/);
+                    let simplified_object_type =
+                        self.get_simplified_type(target_object_type, false /*writing*/);
+                    let simplified = self.distribute_index_over_object_type(
+                        simplified_object_type,
+                        index_type,
+                        false, /*writing*/
+                    );
                     if simplified.is_some() && simplified != target {
                         self.infer_from_types(n, source, simplified);
                     }
@@ -315,19 +366,34 @@ impl Checker {
         }
         let source_flags = self.ty(source).flags;
         let target_flags = self.ty(target).flags;
-        if self.ty(source).object_flags.intersects(ObjectFlags::REFERENCE)
-            && self.ty(target).object_flags.intersects(ObjectFlags::REFERENCE)
-            && (self.ty(source).as_type_reference().object.target == self.ty(target).as_type_reference().object.target
+        if self
+            .ty(source)
+            .object_flags
+            .intersects(ObjectFlags::REFERENCE)
+            && self
+                .ty(target)
+                .object_flags
+                .intersects(ObjectFlags::REFERENCE)
+            && (self.ty(source).as_type_reference().object.target
+                == self.ty(target).as_type_reference().object.target
                 || self.is_array_type(source) && self.is_array_type(target))
-            && !(self.ty(source).as_type_reference().node.is_some() && self.ty(target).as_type_reference().node.is_some())
+            && !(self.ty(source).as_type_reference().node.is_some()
+                && self.ty(target).as_type_reference().node.is_some())
         {
             // If source and target are references to the same generic type, infer from type arguments
             let source_type_arguments = self.get_type_arguments(source);
             let target_type_arguments = self.get_type_arguments(target);
             let source_target = self.ty(source).as_type_reference().object.target;
             let variances = self.get_variances(source_target);
-            self.infer_from_type_arguments(n, &source_type_arguments, &target_type_arguments, &variances);
-        } else if source_flags.intersects(TypeFlags::INDEX) && target_flags.intersects(TypeFlags::INDEX) {
+            self.infer_from_type_arguments(
+                n,
+                &source_type_arguments,
+                &target_type_arguments,
+                &variances,
+            );
+        } else if source_flags.intersects(TypeFlags::INDEX)
+            && target_flags.intersects(TypeFlags::INDEX)
+        {
             let s = self.ty(source).as_index_type().target;
             let t = self.ty(target).as_index_type().target;
             self.infer_from_contravariant_types(n, s, t);
@@ -336,8 +402,15 @@ impl Checker {
         {
             let empty = self.create_empty_object_type_from_string_literal(source);
             let t = self.ty(target).as_index_type().target;
-            self.infer_from_contravariant_types_with_priority(n, empty, t, InferencePriority::LITERAL_KEYOF);
-        } else if source_flags.intersects(TypeFlags::INDEXED_ACCESS) && target_flags.intersects(TypeFlags::INDEXED_ACCESS) {
+            self.infer_from_contravariant_types_with_priority(
+                n,
+                empty,
+                t,
+                InferencePriority::LITERAL_KEYOF,
+            );
+        } else if source_flags.intersects(TypeFlags::INDEXED_ACCESS)
+            && target_flags.intersects(TypeFlags::INDEXED_ACCESS)
+        {
             let (s_object, s_index) = {
                 let a = self.ty(source).as_indexed_access_type();
                 (a.object_type, a.index_type)
@@ -348,7 +421,9 @@ impl Checker {
             };
             self.infer_from_types(n, s_object, t_object);
             self.infer_from_types(n, s_index, t_index);
-        } else if source_flags.intersects(TypeFlags::STRING_MAPPING) && target_flags.intersects(TypeFlags::STRING_MAPPING) {
+        } else if source_flags.intersects(TypeFlags::STRING_MAPPING)
+            && target_flags.intersects(TypeFlags::STRING_MAPPING)
+        {
             if self.ty(source).symbol == self.ty(target).symbol {
                 let s = self.ty(source).as_string_mapping_type().target;
                 let t = self.ty(target).as_string_mapping_type().target;
@@ -359,7 +434,12 @@ impl Checker {
             self.infer_from_types(n, base_type, target);
             // Make substitute inference at a lower priority
             let substitution_intersection = self.get_substitution_intersection(source);
-            self.infer_with_priority(n, substitution_intersection, target, InferencePriority::SUBSTITUTE_SOURCE);
+            self.infer_with_priority(
+                n,
+                substitution_intersection,
+                target,
+                InferencePriority::SUBSTITUTE_SOURCE,
+            );
         } else if target_flags.intersects(TypeFlags::CONDITIONAL) {
             self.invoke_once(n, source, target, Checker::infer_to_conditional_type);
         } else if target_flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
@@ -380,21 +460,31 @@ impl Checker {
             }
             let priority = n.borrow().priority;
             if !(priority.intersects(InferencePriority::NO_CONSTRAINTS)
-                && self.ty(source).flags.intersects(TypeFlags::INTERSECTION | TypeFlags::INSTANTIABLE))
+                && self
+                    .ty(source)
+                    .flags
+                    .intersects(TypeFlags::INTERSECTION | TypeFlags::INSTANTIABLE))
             {
                 let apparent_source = self.get_apparent_type(source);
                 // getApparentType can return _any_ type, since an indexed access or conditional may simplify to any other type.
                 // If that occurs and it doesn't simplify to an object or intersection, we'll need to restart `inferFromTypes`
                 // with the simplified source.
                 if apparent_source != source
-                    && !self.ty(apparent_source).flags.intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION)
+                    && !self
+                        .ty(apparent_source)
+                        .flags
+                        .intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION)
                 {
                     self.infer_from_types(n, apparent_source, target);
                     return;
                 }
                 source = apparent_source;
             }
-            if self.ty(source).flags.intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION) {
+            if self
+                .ty(source)
+                .flags
+                .intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION)
+            {
                 self.invoke_once(n, source, target, Checker::infer_from_object_types);
             }
         }
@@ -409,7 +499,9 @@ impl Checker {
         variances: &[VarianceFlags],
     ) {
         for i in 0..std::cmp::min(source_types.len(), target_types.len()) {
-            if i < variances.len() && variances[i] & VarianceFlags::VARIANCE_MASK == VarianceFlags::CONTRAVARIANT {
+            if i < variances.len()
+                && variances[i] & VarianceFlags::VARIANCE_MASK == VarianceFlags::CONTRAVARIANT
+            {
                 self.infer_from_contravariant_types(n, source_types[i], target_types[i]);
             } else {
                 self.infer_from_types(n, source_types[i], target_types[i]);
@@ -446,7 +538,12 @@ impl Checker {
     }
 
     // Go: checker/inference.go:308 inferFromContravariantTypes
-    pub fn infer_from_contravariant_types(&mut self, n: &Rc<RefCell<InferenceState>>, source: TypeId, target: TypeId) {
+    pub fn infer_from_contravariant_types(
+        &mut self,
+        n: &Rc<RefCell<InferenceState>>,
+        source: TypeId,
+        target: TypeId,
+    ) {
         {
             let mut s = n.borrow_mut();
             s.contravariant = !s.contravariant;
@@ -494,8 +591,15 @@ impl Checker {
         target: TypeId,
         action: fn(&mut Checker, &Rc<RefCell<InferenceState>>, TypeId, TypeId),
     ) {
-        let key = InferenceKey { s: self.ty(source).id, t: self.ty(target).id };
-        let status = n.borrow().visited.as_ref().and_then(|v| v.get(&key).copied());
+        let key = InferenceKey {
+            s: self.ty(source).id,
+            t: self.ty(target).id,
+        };
+        let status = n
+            .borrow()
+            .visited
+            .as_ref()
+            .and_then(|v| v.get(&key).copied());
         if let Some(status) = status {
             let mut s = n.borrow_mut();
             s.inference_priority = std::cmp::min(s.inference_priority, status);
@@ -505,7 +609,9 @@ impl Checker {
         let save_expanding_flags;
         {
             let mut s = n.borrow_mut();
-            s.visited.get_or_insert_with(FxHashMap::default).insert(key, InferencePriority::CIRCULARITY);
+            s.visited
+                .get_or_insert_with(FxHashMap::default)
+                .insert(key, InferencePriority::CIRCULARITY);
             save_inference_priority = s.inference_priority;
             s.inference_priority = InferencePriority::MAX_VALUE;
             // We stop inferring and report a circularity if we encounter duplicate recursion identities on both
@@ -534,7 +640,9 @@ impl Checker {
             s.source_stack.pop();
             s.expanding_flags = save_expanding_flags;
             let inference_priority = s.inference_priority;
-            s.visited.get_or_insert_with(FxHashMap::default).insert(key, inference_priority);
+            s.visited
+                .get_or_insert_with(FxHashMap::default)
+                .insert(key, inference_priority);
             s.inference_priority = std::cmp::min(s.inference_priority, save_inference_priority);
         }
     }
@@ -565,10 +673,16 @@ impl Checker {
         let mut sources: Vec<TypeId> = sources.to_vec();
         let mut targets: Vec<TypeId> = targets.to_vec();
         if !matched_sources.is_empty() {
-            sources = sources.into_iter().filter(|t| !matched_sources.contains(t)).collect();
+            sources = sources
+                .into_iter()
+                .filter(|t| !matched_sources.contains(t))
+                .collect();
         }
         if !matched_targets.is_empty() {
-            targets = targets.into_iter().filter(|t| !matched_targets.contains(t)).collect();
+            targets = targets
+                .into_iter()
+                .filter(|t| !matched_targets.contains(t))
+                .collect();
         }
         (sources, targets)
     }
@@ -608,9 +722,10 @@ impl Checker {
                         if s.inference_priority == s.priority {
                             matched[i] = true;
                         }
-                        inference_circularity =
-                            inference_circularity || s.inference_priority == InferencePriority::CIRCULARITY;
-                        s.inference_priority = std::cmp::min(s.inference_priority, save_inference_priority);
+                        inference_circularity = inference_circularity
+                            || s.inference_priority == InferencePriority::CIRCULARITY;
+                        s.inference_priority =
+                            std::cmp::min(s.inference_priority, save_inference_priority);
                     }
                 }
             }
@@ -618,9 +733,15 @@ impl Checker {
                 // If every target is an intersection of types containing a single naked type variable,
                 // make a lower priority inference to that type variable. This handles inferring from
                 // 'A | B' to 'T & (X | Y)' where we want to infer 'A | B' for T.
-                let intersection_type_variable = self.get_single_type_variable_from_intersection_types(n, targets);
+                let intersection_type_variable =
+                    self.get_single_type_variable_from_intersection_types(n, targets);
                 if intersection_type_variable.is_some() {
-                    self.infer_with_priority(n, source, intersection_type_variable, InferencePriority::NAKED_TYPE_VARIABLE);
+                    self.infer_with_priority(
+                        n,
+                        source,
+                        intersection_type_variable,
+                        InferencePriority::NAKED_TYPE_VARIABLE,
+                    );
                 }
                 return;
             }
@@ -714,7 +835,12 @@ impl Checker {
     }
 
     // Go: checker/inference.go:497 inferToConditionalType
-    pub fn infer_to_conditional_type(&mut self, n: &Rc<RefCell<InferenceState>>, source: TypeId, target: TypeId) {
+    pub fn infer_to_conditional_type(
+        &mut self,
+        n: &Rc<RefCell<InferenceState>>,
+        source: TypeId,
+        target: TypeId,
+    ) {
         if self.ty(source).flags.intersects(TypeFlags::CONDITIONAL) {
             let (s_check, s_extends) = {
                 let c = self.ty(source).as_conditional_type();
@@ -733,15 +859,23 @@ impl Checker {
             let t_false = self.get_false_type_from_conditional_type(target);
             self.infer_from_types(n, s_false, t_false);
         } else {
-            let target_types =
-                [self.get_true_type_from_conditional_type(target), self.get_false_type_from_conditional_type(target)];
+            let target_types = [
+                self.get_true_type_from_conditional_type(target),
+                self.get_false_type_from_conditional_type(target),
+            ];
             let priority = if n.borrow().contravariant {
                 InferencePriority::CONTRAVARIANT_CONDITIONAL
             } else {
                 InferencePriority::NONE
             };
             let target_flags = self.ty(target).flags;
-            self.infer_to_multiple_types_with_priority(n, source, &target_types, target_flags, priority);
+            self.infer_to_multiple_types_with_priority(
+                n,
+                source,
+                &target_types,
+                target_flags,
+                priority,
+            );
         }
     }
 
@@ -762,7 +896,11 @@ impl Checker {
         // succeed. That would be a pointless and confusing outcome.
         if !matches.is_empty() || target.texts.iter().all(|s| s.is_empty()) {
             'outer: for (i, &target) in types.iter().enumerate() {
-                let source = if !matches.is_empty() { matches[i] } else { self.never_type };
+                let source = if !matches.is_empty() {
+                    matches[i]
+                } else {
+                    self.never_type
+                };
                 // If we are inferring from a string literal type to a type variable whose constraint includes one of the
                 // allowed template literal placeholder types, infer from a literal type corresponding to the constraint.
                 if self.ty(source).flags.intersects(TypeFlags::STRING_LITERAL)
@@ -771,7 +909,9 @@ impl Checker {
                     let inference_context = self.get_inference_info_for_type(&n.borrow(), target);
                     if let Some(inference_context) = inference_context {
                         let ctx = n.borrow().inferences;
-                        let type_parameter = self.inference_context(ctx).inferences[inference_context].type_parameter;
+                        let type_parameter = self.inference_context(ctx).inferences
+                            [inference_context]
+                            .type_parameter;
                         let constraint = self.get_base_constraint_of_type(type_parameter);
                         if constraint.is_some() && !self.is_type_any(constraint) {
                             let mut all_type_flags = TypeFlags::NONE;
@@ -791,9 +931,13 @@ impl Checker {
                                 if all_type_flags.intersects(TypeFlags::BIG_INT_LIKE)
                                     && !is_valid_big_int_string(&str, true /*roundTripOnly*/)
                                 {
-                                    all_type_flags = all_type_flags.without(TypeFlags::BIG_INT_LIKE);
+                                    all_type_flags =
+                                        all_type_flags.without(TypeFlags::BIG_INT_LIKE);
                                 }
-                                let choose = |c: &mut Checker, left: TypeId, right: TypeId| -> TypeId {
+                                let choose = |c: &mut Checker,
+                                              left: TypeId,
+                                              right: TypeId|
+                                 -> TypeId {
                                     let left_flags = c.ty(left).flags;
                                     let right_flags = c.ty(right).flags;
                                     if !right_flags.intersects(all_type_flags) {
@@ -804,15 +948,18 @@ impl Checker {
                                         source
                                     } else if left_flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
                                         left
-                                    } else if right_flags.intersects(TypeFlags::TEMPLATE_LITERAL) && {
-                                        let right_template = c.ty(right).as_template_literal_type().clone();
-                                        let cmp = c.compare_types_assignable.clone();
-                                        c.is_type_matched_by_template_literal_type(
+                                    } else if right_flags.intersects(TypeFlags::TEMPLATE_LITERAL)
+                                        && {
+                                            let right_template =
+                                                c.ty(right).as_template_literal_type().clone();
+                                            let cmp = c.compare_types_assignable.clone();
+                                            c.is_type_matched_by_template_literal_type(
                                             source,
                                             &right_template,
                                             &mut |c: &mut Checker, s: TypeId, t: TypeId, r: bool| cmp(c, s, t, r),
                                         )
-                                    } {
+                                        }
+                                    {
                                         source
                                     } else if left_flags.intersects(TypeFlags::STRING_MAPPING) {
                                         left
@@ -837,7 +984,8 @@ impl Checker {
                                     } else if left_flags.intersects(TypeFlags::NUMBER_LITERAL) {
                                         left
                                     } else if right_flags.intersects(TypeFlags::NUMBER_LITERAL)
-                                        && c.get_number_literal_value(right) == ts_jsnum::from_string(&str)
+                                        && c.get_number_literal_value(right)
+                                            == ts_jsnum::from_string(&str)
                                     {
                                         right
                                     } else if left_flags.intersects(TypeFlags::BIG_INT) {
@@ -847,7 +995,9 @@ impl Checker {
                                     } else if left_flags.intersects(TypeFlags::BIG_INT_LITERAL) {
                                         left
                                     } else if right_flags.intersects(TypeFlags::BIG_INT_LITERAL)
-                                        && pseudo_big_int_to_string(&c.get_big_int_literal_value(right)) == str
+                                        && pseudo_big_int_to_string(
+                                            &c.get_big_int_literal_value(right),
+                                        ) == str
                                     {
                                         right
                                     } else if left_flags.intersects(TypeFlags::BOOLEAN) {
@@ -863,7 +1013,11 @@ impl Checker {
                                     } else if left_flags.intersects(TypeFlags::BOOLEAN_LITERAL) {
                                         left
                                     } else if right_flags.intersects(TypeFlags::BOOLEAN_LITERAL)
-                                        && (if c.get_boolean_literal_value(right) { "true" } else { "false" }) == str
+                                        && (if c.get_boolean_literal_value(right) {
+                                            "true"
+                                        } else {
+                                            "false"
+                                        }) == str
                                     {
                                         right
                                     } else if left_flags.intersects(TypeFlags::UNDEFINED) {
@@ -900,7 +1054,12 @@ impl Checker {
     }
 
     // Go: checker/inference.go:630 inferFromGenericMappedTypes
-    pub fn infer_from_generic_mapped_types(&mut self, n: &Rc<RefCell<InferenceState>>, source: TypeId, target: TypeId) {
+    pub fn infer_from_generic_mapped_types(
+        &mut self,
+        n: &Rc<RefCell<InferenceState>>,
+        source: TypeId,
+        target: TypeId,
+    ) {
         // The source and target types are generic types { [P in S]: X } and { [P in T]: Y }, so we infer
         // from S to T and from X to Y.
         let s = self.get_constraint_type_from_mapped_type(source);
@@ -917,9 +1076,20 @@ impl Checker {
     }
 
     // Go: checker/inference.go:642 inferFromObjectTypes
-    pub fn infer_from_object_types(&mut self, n: &Rc<RefCell<InferenceState>>, source: TypeId, target: TypeId) {
-        if self.ty(source).object_flags.intersects(ObjectFlags::REFERENCE)
-            && self.ty(target).object_flags.intersects(ObjectFlags::REFERENCE)
+    pub fn infer_from_object_types(
+        &mut self,
+        n: &Rc<RefCell<InferenceState>>,
+        source: TypeId,
+        target: TypeId,
+    ) {
+        if self
+            .ty(source)
+            .object_flags
+            .intersects(ObjectFlags::REFERENCE)
+            && self
+                .ty(target)
+                .object_flags
+                .intersects(ObjectFlags::REFERENCE)
             && (self.ty(source).target() == self.ty(target).target()
                 || self.is_array_type(source) && self.is_array_type(target))
         {
@@ -928,14 +1098,24 @@ impl Checker {
             let target_type_arguments = self.get_type_arguments(target);
             let source_target = self.ty(source).target();
             let variances = self.get_variances(source_target);
-            self.infer_from_type_arguments(n, &source_type_arguments, &target_type_arguments, &variances);
+            self.infer_from_type_arguments(
+                n,
+                &source_type_arguments,
+                &target_type_arguments,
+                &variances,
+            );
             return;
         }
         if self.is_generic_mapped_type(source) && self.is_generic_mapped_type(target) {
             self.infer_from_generic_mapped_types(n, source, target);
         }
         if self.ty(target).object_flags.intersects(ObjectFlags::MAPPED)
-            && self.ty(target).as_mapped_type().declaration.name_type().is_nil()
+            && self
+                .ty(target)
+                .as_mapped_type()
+                .declaration
+                .name_type()
+                .is_nil()
         {
             let constraint_type = self.get_constraint_type_from_mapped_type(target);
             if self.infer_to_mapped_type(n, source, target, constraint_type) {
@@ -951,10 +1131,13 @@ impl Checker {
                 let source_arity = self.get_type_reference_arity(source);
                 let target_arity = self.get_type_reference_arity(target);
                 let element_types = self.get_type_arguments(target);
-                let element_infos: Vec<TupleElementInfo> = self.target_tuple_type(target).element_infos.clone();
+                let element_infos: Vec<TupleElementInfo> =
+                    self.target_tuple_type(target).element_infos.clone();
                 // When source and target are tuple types with the same structure (fixed, variadic, and rest are matched
                 // to the same kind in each position), simply infer between the element types.
-                if self.is_tuple_type(source) && self.is_tuple_type_structure_matching(source, target) {
+                if self.is_tuple_type(source)
+                    && self.is_tuple_type_structure_matching(source, target)
+                {
                     for i in 0..target_arity as usize {
                         let s = self.get_type_arguments(source)[i];
                         self.infer_from_types(n, s, element_types[i]);
@@ -968,10 +1151,20 @@ impl Checker {
                         self.target_tuple_type(source).fixed_length,
                         self.target_tuple_type(target).fixed_length,
                     );
-                    if self.target_tuple_type(target).combined_flags.intersects(ElementFlags::VARIABLE) {
+                    if self
+                        .target_tuple_type(target)
+                        .combined_flags
+                        .intersects(ElementFlags::VARIABLE)
+                    {
                         end_length = std::cmp::min(
-                            get_end_element_count(self.target_tuple_type(source), ElementFlags::FIXED),
-                            get_end_element_count(self.target_tuple_type(target), ElementFlags::FIXED),
+                            get_end_element_count(
+                                self.target_tuple_type(source),
+                                ElementFlags::FIXED,
+                            ),
+                            get_end_element_count(
+                                self.target_tuple_type(target),
+                                ElementFlags::FIXED,
+                            ),
                         );
                     }
                 }
@@ -990,7 +1183,10 @@ impl Checker {
                     let rest_type = self.get_type_arguments(source)[start_length as usize];
                     for i in start_length..target_arity - end_length {
                         let mut t = rest_type;
-                        if element_infos[i as usize].flags.intersects(ElementFlags::VARIADIC) {
+                        if element_infos[i as usize]
+                            .flags
+                            .intersects(ElementFlags::VARIADIC)
+                        {
                             t = self.create_array_type(t);
                         }
                         self.infer_from_types(n, t, element_types[i as usize]);
@@ -999,12 +1195,17 @@ impl Checker {
                     let middle_length = target_arity - start_length - end_length;
                     let sl = start_length as usize;
                     if middle_length == 2 {
-                        if (element_infos[sl].flags & element_infos[sl + 1].flags).intersects(ElementFlags::VARIADIC) {
+                        if (element_infos[sl].flags & element_infos[sl + 1].flags)
+                            .intersects(ElementFlags::VARIADIC)
+                        {
                             // Middle of target is [...T, ...U] and source is tuple type
-                            let target_info = self.get_inference_info_for_type(&n.borrow(), element_types[sl]);
+                            let target_info =
+                                self.get_inference_info_for_type(&n.borrow(), element_types[sl]);
                             if let Some(target_info) = target_info {
                                 let ctx = n.borrow().inferences;
-                                let implied_arity = self.inference_context(ctx).inferences[target_info].implied_arity;
+                                let implied_arity = self.inference_context(ctx).inferences
+                                    [target_info]
+                                    .implied_arity;
                                 if implied_arity >= 0 {
                                     // Infer slices from source based on implied arity of T.
                                     let slice = self.slice_tuple_type(
@@ -1013,7 +1214,11 @@ impl Checker {
                                         end_length + source_arity - implied_arity,
                                     );
                                     self.infer_from_types(n, slice, element_types[sl]);
-                                    let slice = self.slice_tuple_type(source, start_length + implied_arity, end_length);
+                                    let slice = self.slice_tuple_type(
+                                        source,
+                                        start_length + implied_arity,
+                                        end_length,
+                                    );
                                     self.infer_from_types(n, slice, element_types[sl + 1]);
                                 }
                             }
@@ -1022,16 +1227,22 @@ impl Checker {
                         {
                             // Middle of target is [...T, ...rest] and source is tuple type
                             // if T is constrained by a fixed-size tuple we might be able to use its arity to infer T
-                            let info = self.get_inference_info_for_type(&n.borrow(), element_types[sl]);
+                            let info =
+                                self.get_inference_info_for_type(&n.borrow(), element_types[sl]);
                             if let Some(info) = info {
                                 let ctx = n.borrow().inferences;
-                                let type_parameter = self.inference_context(ctx).inferences[info].type_parameter;
+                                let type_parameter =
+                                    self.inference_context(ctx).inferences[info].type_parameter;
                                 let constraint = self.get_base_constraint_of_type(type_parameter);
                                 if constraint.is_some()
                                     && self.is_tuple_type(constraint)
-                                    && !self.target_tuple_type(constraint).combined_flags.intersects(ElementFlags::VARIABLE)
+                                    && !self
+                                        .target_tuple_type(constraint)
+                                        .combined_flags
+                                        .intersects(ElementFlags::VARIABLE)
                                 {
-                                    let implied_arity = self.target_tuple_type(constraint).fixed_length;
+                                    let implied_arity =
+                                        self.target_tuple_type(constraint).fixed_length;
                                     let slice = self.slice_tuple_type(
                                         source,
                                         start_length,
@@ -1051,52 +1262,74 @@ impl Checker {
                                 }
                             }
                         } else if element_infos[sl].flags.intersects(ElementFlags::REST)
-                            && element_infos[sl + 1].flags.intersects(ElementFlags::VARIADIC)
+                            && element_infos[sl + 1]
+                                .flags
+                                .intersects(ElementFlags::VARIADIC)
                         {
                             // Middle of target is [...rest, ...T] and source is tuple type
                             // if T is constrained by a fixed-size tuple we might be able to use its arity to infer T
-                            let info = self.get_inference_info_for_type(&n.borrow(), element_types[sl + 1]);
+                            let info = self
+                                .get_inference_info_for_type(&n.borrow(), element_types[sl + 1]);
                             if let Some(info) = info {
                                 let ctx = n.borrow().inferences;
-                                let type_parameter = self.inference_context(ctx).inferences[info].type_parameter;
+                                let type_parameter =
+                                    self.inference_context(ctx).inferences[info].type_parameter;
                                 let constraint = self.get_base_constraint_of_type(type_parameter);
                                 if constraint.is_some()
                                     && self.is_tuple_type(constraint)
-                                    && !self.target_tuple_type(constraint).combined_flags.intersects(ElementFlags::VARIABLE)
+                                    && !self
+                                        .target_tuple_type(constraint)
+                                        .combined_flags
+                                        .intersects(ElementFlags::VARIABLE)
                                 {
-                                    let implied_arity = self.target_tuple_type(constraint).fixed_length;
+                                    let implied_arity =
+                                        self.target_tuple_type(constraint).fixed_length;
                                     let end_index = source_arity
-                                        - get_end_element_count(self.target_tuple_type(target), ElementFlags::FIXED);
+                                        - get_end_element_count(
+                                            self.target_tuple_type(target),
+                                            ElementFlags::FIXED,
+                                        );
                                     let start_index = end_index - implied_arity;
                                     if start_index >= start_length {
                                         let source_type_arguments = self.get_type_arguments(source);
-                                        let source_element_infos: Vec<TupleElementInfo> = self.target_tuple_type(source)
-                                            .element_infos[start_index as usize..end_index as usize]
-                                            .to_vec();
+                                        let source_element_infos: Vec<TupleElementInfo> =
+                                            self.target_tuple_type(source).element_infos
+                                                [start_index as usize..end_index as usize]
+                                                .to_vec();
                                         let trailing_slice = self.create_tuple_type_ex(
-                                            &source_type_arguments[start_index as usize..end_index as usize],
+                                            &source_type_arguments
+                                                [start_index as usize..end_index as usize],
                                             &source_element_infos,
                                             false, /*readonly*/
                                         );
-                                        let rest_type = self.get_element_type_of_slice_of_tuple_type(
-                                            source,
-                                            start_length,
-                                            end_length + implied_arity,
-                                            false,
-                                            false,
-                                        );
+                                        let rest_type = self
+                                            .get_element_type_of_slice_of_tuple_type(
+                                                source,
+                                                start_length,
+                                                end_length + implied_arity,
+                                                false,
+                                                false,
+                                            );
                                         if rest_type.is_some() {
                                             self.infer_from_types(n, rest_type, element_types[sl]);
                                         }
-                                        self.infer_from_types(n, trailing_slice, element_types[sl + 1]);
+                                        self.infer_from_types(
+                                            n,
+                                            trailing_slice,
+                                            element_types[sl + 1],
+                                        );
                                     }
                                 }
                             }
                         }
-                    } else if middle_length == 1 && element_infos[sl].flags.intersects(ElementFlags::VARIADIC) {
+                    } else if middle_length == 1
+                        && element_infos[sl].flags.intersects(ElementFlags::VARIADIC)
+                    {
                         // Middle of target is exactly one variadic element. Infer the slice between the fixed parts in the source.
                         // If target ends in optional element(s), make a lower priority a speculative inference.
-                        let priority = if element_infos[(target_arity - 1) as usize].flags.intersects(ElementFlags::OPTIONAL)
+                        let priority = if element_infos[(target_arity - 1) as usize]
+                            .flags
+                            .intersects(ElementFlags::OPTIONAL)
                         {
                             InferencePriority::SPECULATIVE_TUPLE
                         } else {
@@ -1104,10 +1337,17 @@ impl Checker {
                         };
                         let source_slice = self.slice_tuple_type(source, start_length, end_length);
                         self.infer_with_priority(n, source_slice, element_types[sl], priority);
-                    } else if middle_length == 1 && element_infos[sl].flags.intersects(ElementFlags::REST) {
+                    } else if middle_length == 1
+                        && element_infos[sl].flags.intersects(ElementFlags::REST)
+                    {
                         // Middle of target is exactly one rest element. If middle of source is not empty, infer union of middle element types.
-                        let rest_type =
-                            self.get_element_type_of_slice_of_tuple_type(source, start_length, end_length, false, false);
+                        let rest_type = self.get_element_type_of_slice_of_tuple_type(
+                            source,
+                            start_length,
+                            end_length,
+                            false,
+                            false,
+                        );
                         if rest_type.is_some() {
                             self.infer_from_types(n, rest_type, element_types[sl]);
                         }
@@ -1132,20 +1372,33 @@ impl Checker {
     }
 
     // Go: checker/inference.go:771 inferFromProperties
-    pub fn infer_from_properties(&mut self, n: &Rc<RefCell<InferenceState>>, source: TypeId, target: TypeId) {
+    pub fn infer_from_properties(
+        &mut self,
+        n: &Rc<RefCell<InferenceState>>,
+        source: TypeId,
+        target: TypeId,
+    ) {
         let properties = self.get_properties_of_object_type(target);
         for target_prop in properties {
             let name = self.sym(target_prop).name.clone();
             let source_prop = self.get_property_of_type(source, &name);
             if source_prop.is_some() && {
                 let declarations = self.sym(source_prop).declarations.clone();
-                !declarations.iter().any(|&d| self.is_skip_direct_inference_node(d))
+                !declarations
+                    .iter()
+                    .any(|&d| self.is_skip_direct_inference_node(d))
             } {
                 let source_type = self.get_type_of_symbol(source_prop);
-                let source_optional = self.sym(source_prop).flags.intersects(SymbolFlags::OPTIONAL);
+                let source_optional = self
+                    .sym(source_prop)
+                    .flags
+                    .intersects(SymbolFlags::OPTIONAL);
                 let s = self.remove_missing_type(source_type, source_optional);
                 let target_type = self.get_type_of_symbol(target_prop);
-                let target_optional = self.sym(target_prop).flags.intersects(SymbolFlags::OPTIONAL);
+                let target_optional = self
+                    .sym(target_prop)
+                    .flags
+                    .intersects(SymbolFlags::OPTIONAL);
                 let t = self.remove_missing_type(target_type, target_optional);
                 self.infer_from_types(n, s, t);
             }
@@ -1177,8 +1430,17 @@ impl Checker {
     }
 
     // Go: checker/inference.go:796 inferFromSignature
-    pub fn infer_from_signature(&mut self, n: &Rc<RefCell<InferenceState>>, source: SignatureId, target: SignatureId) {
-        if !self.sig(source).flags.intersects(SignatureFlags::IS_NON_INFERRABLE) {
+    pub fn infer_from_signature(
+        &mut self,
+        n: &Rc<RefCell<InferenceState>>,
+        source: SignatureId,
+        target: SignatureId,
+    ) {
+        if !self
+            .sig(source)
+            .flags
+            .intersects(SignatureFlags::IS_NON_INFERRABLE)
+        {
             let save_bivariant = n.borrow().bivariant;
             let mut kind = SyntaxKind::Unknown;
             let declaration = self.sig(target).declaration;
@@ -1193,14 +1455,20 @@ impl Checker {
                     || kind == SyntaxKind::MethodSignature
                     || kind == SyntaxKind::Constructor;
             }
-            self.apply_to_parameter_types(source, target, &mut |c: &mut Checker, s: TypeId, t: TypeId| {
-                c.infer_from_contravariant_types_if_strict_function_types(n, s, t)
-            });
+            self.apply_to_parameter_types(
+                source,
+                target,
+                &mut |c: &mut Checker, s: TypeId, t: TypeId| {
+                    c.infer_from_contravariant_types_if_strict_function_types(n, s, t)
+                },
+            );
             n.borrow_mut().bivariant = save_bivariant;
         }
-        self.apply_to_return_types(source, target, &mut |c: &mut Checker, s: TypeId, t: TypeId| {
-            c.infer_from_types(n, s, t)
-        });
+        self.apply_to_return_types(
+            source,
+            target,
+            &mut |c: &mut Checker, s: TypeId, t: TypeId| c.infer_from_types(n, s, t),
+        );
     }
 
     // PORT: Go `callback func(s, t *Type)` closes over the checker; the Rust
@@ -1238,7 +1506,9 @@ impl Checker {
         }
         if target_rest_type.is_some() {
             let readonly = self.is_const_type_variable(target_rest_type, 0)
-                && !self.some_type(target_rest_type, &mut |c: &mut Checker, t: TypeId| c.is_mutable_array_like_type(t));
+                && !self.some_type(target_rest_type, &mut |c: &mut Checker, t: TypeId| {
+                    c.is_mutable_array_like_type(t)
+                });
             let s = self.get_rest_type_at_position(source, param_count, readonly /*readonly*/);
             callback(self, s, target_rest_type);
         }
@@ -1274,10 +1544,17 @@ impl Checker {
     }
 
     // Go: checker/inference.go:854 inferFromIndexTypes
-    pub fn infer_from_index_types(&mut self, n: &Rc<RefCell<InferenceState>>, source: TypeId, target: TypeId) {
+    pub fn infer_from_index_types(
+        &mut self,
+        n: &Rc<RefCell<InferenceState>>,
+        source: TypeId,
+        target: TypeId,
+    ) {
         // Inferences across mapped type index signatures are pretty much the same a inferences to homomorphic variables
         let mut priority = InferencePriority::NONE;
-        if (self.ty(source).object_flags & self.ty(target).object_flags).intersects(ObjectFlags::MAPPED) {
+        if (self.ty(source).object_flags & self.ty(target).object_flags)
+            .intersects(ObjectFlags::MAPPED)
+        {
             priority = InferencePriority::HOMOMORPHIC_MAPPED_TYPE;
         }
         let index_infos = self.get_index_infos_of_type(target);
@@ -1287,8 +1564,11 @@ impl Checker {
                 let target_value_type = self.index_info(target_info).value_type;
                 let mut prop_types: Vec<TypeId> = Vec::new();
                 for prop in self.get_properties_of_type(source) {
-                    let literal =
-                        self.get_literal_type_from_property(prop, TypeFlags::STRING_OR_NUMBER_LITERAL_OR_UNIQUE, false);
+                    let literal = self.get_literal_type_from_property(
+                        prop,
+                        TypeFlags::STRING_OR_NUMBER_LITERAL_OR_UNIQUE,
+                        false,
+                    );
                     if self.is_applicable_index_type(literal, target_key_type) {
                         let mut prop_type = self.get_type_of_symbol(prop);
                         if self.sym(prop).flags.intersects(SymbolFlags::OPTIONAL) {
@@ -1329,7 +1609,10 @@ impl Checker {
         constraint_type: TypeId,
     ) -> bool {
         if self.ty(constraint_type).flags.intersects(TypeFlags::UNION)
-            || self.ty(constraint_type).flags.intersects(TypeFlags::INTERSECTION)
+            || self
+                .ty(constraint_type)
+                .flags
+                .intersects(TypeFlags::INTERSECTION)
         {
             let mut result = false;
             for t in self.ty(constraint_type).types().to_vec() {
@@ -1352,12 +1635,20 @@ impl Checker {
                     (info.is_fixed, info.type_parameter)
                 };
                 if !is_fixed && !self.is_from_inference_blocked_source(source) {
-                    let inferred_type = self.infer_type_for_homomorphic_mapped_type(source, target, constraint_type);
+                    let inferred_type = self.infer_type_for_homomorphic_mapped_type(
+                        source,
+                        target,
+                        constraint_type,
+                    );
                     if inferred_type.is_some() {
                         // We assign a lower priority to inferences made from types containing non-inferrable
                         // types because we may only have a partial result (i.e. we may have failed to make
                         // reverse inferences for some properties).
-                        let priority = if self.ty(source).object_flags.intersects(ObjectFlags::NON_INFERRABLE_TYPE) {
+                        let priority = if self
+                            .ty(source)
+                            .object_flags
+                            .intersects(ObjectFlags::NON_INFERRABLE_TYPE)
+                        {
                             InferencePriority::PARTIAL_HOMOMORPHIC_MAPPED_TYPE
                         } else {
                             InferencePriority::HOMOMORPHIC_MAPPED_TYPE
@@ -1368,22 +1659,37 @@ impl Checker {
             }
             return true;
         }
-        if self.ty(constraint_type).flags.intersects(TypeFlags::TYPE_PARAMETER) {
+        if self
+            .ty(constraint_type)
+            .flags
+            .intersects(TypeFlags::TYPE_PARAMETER)
+        {
             // We're inferring from some source type S to a mapped type { [P in K]: X }, where K is a type
             // parameter. First infer from 'keyof S' to K.
-            let index_flags = if self.pattern_for_type.get(&source).is_some_and(|p| p.is_some()) {
+            let index_flags = if self
+                .pattern_for_type
+                .get(&source)
+                .is_some_and(|p| p.is_some())
+            {
                 IndexFlags::NO_INDEX_SIGNATURES
             } else {
                 IndexFlags::NONE
             };
             let index_type = self.get_index_type_ex(source, index_flags);
-            self.infer_with_priority(n, index_type, constraint_type, InferencePriority::MAPPED_TYPE_CONSTRAINT);
+            self.infer_with_priority(
+                n,
+                index_type,
+                constraint_type,
+                InferencePriority::MAPPED_TYPE_CONSTRAINT,
+            );
             // If K is constrained to a type C, also infer to C. Thus, for a mapped type { [P in K]: X },
             // where K extends keyof T, we make the same inferences as for a homomorphic mapped type
             // { [P in keyof T]: X }. This enables us to make meaningful inferences when the target is a
             // Pick<T, K>.
             let extended_constraint = self.get_constraint_of_type(constraint_type);
-            if extended_constraint.is_some() && self.infer_to_mapped_type(n, source, target, extended_constraint) {
+            if extended_constraint.is_some()
+                && self.infer_to_mapped_type(n, source, target, extended_constraint)
+            {
                 return true;
             }
             // If no inferences can be made to K's constraint, infer from a union of the property types

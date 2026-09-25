@@ -28,7 +28,10 @@ impl Binder {
     }
 
     fn p3_node_bind_mut(&mut self, node: Node) -> &mut NodeBindData {
-        debug_assert!(node.file_index() == self.file.file_index(), "binder data for a node in another file");
+        debug_assert!(
+            node.file_index() == self.file.file_index(),
+            "binder data for a node in another file"
+        );
         &mut self.node_bind[node.node_id().index()]
     }
 }
@@ -137,7 +140,8 @@ impl Binder {
             }
             _ => {
                 if is_narrowable_reference(node) {
-                    self.current_flow = self.create_flow_mutation(FlowFlags::ASSIGNMENT, self.current_flow, node);
+                    self.current_flow =
+                        self.create_flow_mutation(FlowFlags::ASSIGNMENT, self.current_flow, node);
                 }
             }
         }
@@ -259,12 +263,20 @@ impl Binder {
 
     // Go: binder/binder.go:1955 bindBreakStatement
     pub fn bind_break_statement(&mut self, node: Node) {
-        self.bind_break_or_continue_statement(node.label(), self.current_break_target, ActiveLabel::break_target_exported);
+        self.bind_break_or_continue_statement(
+            node.label(),
+            self.current_break_target,
+            ActiveLabel::break_target_exported,
+        );
     }
 
     // Go: binder/binder.go:1959 bindContinueStatement
     pub fn bind_continue_statement(&mut self, node: Node) {
-        self.bind_break_or_continue_statement(node.label(), self.current_continue_target, ActiveLabel::continue_target_exported);
+        self.bind_break_or_continue_statement(
+            node.label(),
+            self.current_continue_target,
+            ActiveLabel::continue_target_exported,
+        );
     }
 
     // Go: binder/binder.go:1963 bindBreakOrContinueStatement
@@ -368,27 +380,42 @@ impl Binder {
             self.p3_set_flow_antecedents(finally_label, combined);
             self.current_flow = finally_label;
             self.bind(finally_block);
-            if self.p3_flow_flags(self.current_flow).intersects(FlowFlags::UNREACHABLE) {
+            if self
+                .p3_flow_flags(self.current_flow)
+                .intersects(FlowFlags::UNREACHABLE)
+            {
                 // If the end of the finally block is unreachable, the end of the entire try statement is unreachable.
                 self.current_flow = self.unreachable_flow;
             } else {
                 // If we have an IIFE return target and return statements in the try or catch blocks, add a control
                 // flow that goes back through the finally block and back through only the return statements.
                 if self.current_return_target.is_some() && !return_antecedents.is_empty() {
-                    let reduce = self.create_reduce_label(finally_label, &return_antecedents, self.current_flow);
+                    let reduce = self.create_reduce_label(
+                        finally_label,
+                        &return_antecedents,
+                        self.current_flow,
+                    );
                     self.add_antecedent(self.current_return_target, reduce);
                 }
                 // If we have an outer exception target (i.e. a containing try-finally or try-catch-finally), add a
                 // control flow that goes back through the finally block and back through each possible exception source.
                 if self.current_exception_target.is_some() && !exception_antecedents.is_empty() {
-                    let reduce = self.create_reduce_label(finally_label, &exception_antecedents, self.current_flow);
+                    let reduce = self.create_reduce_label(
+                        finally_label,
+                        &exception_antecedents,
+                        self.current_flow,
+                    );
                     self.add_antecedent(self.current_exception_target, reduce);
                 }
                 // If the end of the finally block is reachable, but the end of the try and catch blocks are not,
                 // convert the current flow to unreachable. For example, 'try { return 1; } finally { ... }' should
                 // result in an unreachable current control flow.
                 if !normal_exit_antecedents.is_empty() {
-                    self.current_flow = self.create_reduce_label(finally_label, &normal_exit_antecedents, self.current_flow);
+                    self.current_flow = self.create_reduce_label(
+                        finally_label,
+                        &normal_exit_antecedents,
+                        self.current_flow,
+                    );
                 } else {
                     self.current_flow = self.unreachable_flow;
                 }
@@ -409,7 +436,11 @@ impl Binder {
         let case_block = node.case_block();
         self.bind(case_block);
         self.add_antecedent(post_switch_label, self.current_flow);
-        let has_default = case_block.clauses().nodes().iter().any(|c| c.kind() == SyntaxKind::DefaultClause);
+        let has_default = case_block
+            .clauses()
+            .nodes()
+            .iter()
+            .any(|c| c.kind() == SyntaxKind::DefaultClause);
         if !has_default {
             let clause_flow = self.create_flow_switch_clause(self.pre_switch_case_flow, node, 0, 0);
             self.add_antecedent(post_switch_label, clause_flow);
@@ -452,7 +483,11 @@ impl Binder {
             let clause = clauses.get(i);
             self.bind(clause);
             fallthrough_flow = self.current_flow;
-            if !self.p3_flow_flags(self.current_flow).intersects(FlowFlags::UNREACHABLE) && i != clauses.len() - 1 {
+            if !self
+                .p3_flow_flags(self.current_flow)
+                .intersects(FlowFlags::UNREACHABLE)
+                && i != clauses.len() - 1
+            {
                 // PORT: Go `clause.AsCaseOrDefaultClause().FallthroughFlowNode`. `NodeBindData` has no
                 // separate field, and case/default clauses have no Go `FlowNodeData`, so the fallthrough
                 // flow node is stored in the clause's `flow_node` slot (read it with `clause.flow_node()`).
@@ -487,7 +522,9 @@ impl Binder {
         // A top level or comma expression call expression with a dotted function name and at least one argument
         // is potentially an assertion and is therefore included in the control flow.
         if is_call_expression(node) {
-            if node.expression().kind() != SyntaxKind::SuperKeyword && is_dotted_name(node.expression()) {
+            if node.expression().kind() != SyntaxKind::SuperKeyword
+                && is_dotted_name(node.expression())
+            {
                 self.current_flow = self.create_flow_call(self.current_flow, node);
             }
         }
@@ -566,13 +603,19 @@ impl Binder {
     // Go: binder/binder.go:2219 bindBinaryExpressionFlow
     pub fn bind_binary_expression_flow(&mut self, node: Node) {
         let operator = node.operator_token().kind();
-        if is_logical_or_coalescing_binary_operator(operator) || is_logical_or_coalescing_assignment_operator(operator) {
+        if is_logical_or_coalescing_binary_operator(operator)
+            || is_logical_or_coalescing_assignment_operator(operator)
+        {
             if is_top_level_logical_expression(node) {
                 let post_expression_label = self.create_branch_label();
                 let save_current_flow = self.current_flow;
                 let save_has_flow_effects = self.has_flow_effects;
                 self.has_flow_effects = false;
-                self.bind_logical_like_expression(node, post_expression_label, post_expression_label);
+                self.bind_logical_like_expression(
+                    node,
+                    post_expression_label,
+                    post_expression_label,
+                );
                 if self.has_flow_effects {
                     self.current_flow = self.finish_flow_label(post_expression_label);
                 } else {
@@ -580,7 +623,11 @@ impl Binder {
                 }
                 self.has_flow_effects = self.has_flow_effects || save_has_flow_effects;
             } else {
-                self.bind_logical_like_expression(node, self.current_true_target, self.current_false_target);
+                self.bind_logical_like_expression(
+                    node,
+                    self.current_true_target,
+                    self.current_false_target,
+                );
             }
         } else {
             let left = node.left();
@@ -597,9 +644,15 @@ impl Binder {
             }
             if is_assignment_operator(operator) && !is_assignment_target(node) {
                 self.bind_assignment_target_flow(left);
-                if operator == SyntaxKind::EqualsToken && left.kind() == SyntaxKind::ElementAccessExpression {
+                if operator == SyntaxKind::EqualsToken
+                    && left.kind() == SyntaxKind::ElementAccessExpression
+                {
                     if is_narrowable_operand(left.expression()) {
-                        self.current_flow = self.create_flow_mutation(FlowFlags::ARRAY_MUTATION, self.current_flow, node);
+                        self.current_flow = self.create_flow_mutation(
+                            FlowFlags::ARRAY_MUTATION,
+                            self.current_flow,
+                            node,
+                        );
                     }
                 }
             }
@@ -607,7 +660,12 @@ impl Binder {
     }
 
     // Go: binder/binder.go:2261 bindLogicalLikeExpression
-    pub fn bind_logical_like_expression(&mut self, node: Node, true_target: FlowNodeId, false_target: FlowNodeId) {
+    pub fn bind_logical_like_expression(
+        &mut self,
+        node: Node,
+        true_target: FlowNodeId,
+        false_target: FlowNodeId,
+    ) {
         let operator_token = node.operator_token();
         let pre_right_label = self.create_branch_label();
         if operator_token.kind() == SyntaxKind::AmpersandAmpersandToken
@@ -620,11 +678,18 @@ impl Binder {
         self.current_flow = self.finish_flow_label(pre_right_label);
         self.bind(operator_token);
         if is_logical_or_coalescing_assignment_operator(operator_token.kind()) {
-            self.do_with_conditional_branches(&mut Binder::bind, node.right(), true_target, false_target);
+            self.do_with_conditional_branches(
+                &mut Binder::bind,
+                node.right(),
+                true_target,
+                false_target,
+            );
             self.bind_assignment_target_flow(node.left());
-            let true_flow = self.create_flow_condition(FlowFlags::TRUE_CONDITION, self.current_flow, node);
+            let true_flow =
+                self.create_flow_condition(FlowFlags::TRUE_CONDITION, self.current_flow, node);
             self.add_antecedent(true_target, true_flow);
-            let false_flow = self.create_flow_condition(FlowFlags::FALSE_CONDITION, self.current_flow, node);
+            let false_flow =
+                self.create_flow_condition(FlowFlags::FALSE_CONDITION, self.current_flow, node);
             self.add_antecedent(false_target, false_flow);
         } else {
             self.bind_condition(node.right(), true_target, false_target);
@@ -689,7 +754,8 @@ impl Binder {
                 self.bind_initialized_variable_flow(child);
             }
         } else {
-            self.current_flow = self.create_flow_mutation(FlowFlags::ASSIGNMENT, self.current_flow, node);
+            self.current_flow =
+                self.create_flow_mutation(FlowFlags::ASSIGNMENT, self.current_flow, node);
         }
     }
 
@@ -721,7 +787,12 @@ impl Binder {
     }
 
     // Go: binder/binder.go:2363 bindOptionalChain
-    pub fn bind_optional_chain(&mut self, node: Node, true_target: FlowNodeId, false_target: FlowNodeId) {
+    pub fn bind_optional_chain(
+        &mut self,
+        node: Node,
+        true_target: FlowNodeId,
+        false_target: FlowNodeId,
+    ) {
         // For an optional chain, we emulate the behavior of a logical expression:
         //
         // a?.b         -> a && a.b
@@ -737,27 +808,45 @@ impl Binder {
         if is_optional_chain_root(node) {
             pre_chain_label = self.create_branch_label();
         }
-        let optional_true_target = if pre_chain_label.is_some() { pre_chain_label } else { true_target };
+        let optional_true_target = if pre_chain_label.is_some() {
+            pre_chain_label
+        } else {
+            true_target
+        };
         self.bind_optional_expression(node.expression(), optional_true_target, false_target);
         if pre_chain_label.is_some() {
             self.current_flow = self.finish_flow_label(pre_chain_label);
         }
-        self.do_with_conditional_branches(&mut Binder::bind_optional_chain_rest, node, true_target, false_target);
+        self.do_with_conditional_branches(
+            &mut Binder::bind_optional_chain_rest,
+            node,
+            true_target,
+            false_target,
+        );
         if is_outermost_optional_chain(node) {
-            let true_flow = self.create_flow_condition(FlowFlags::TRUE_CONDITION, self.current_flow, node);
+            let true_flow =
+                self.create_flow_condition(FlowFlags::TRUE_CONDITION, self.current_flow, node);
             self.add_antecedent(true_target, true_flow);
-            let false_flow = self.create_flow_condition(FlowFlags::FALSE_CONDITION, self.current_flow, node);
+            let false_flow =
+                self.create_flow_condition(FlowFlags::FALSE_CONDITION, self.current_flow, node);
             self.add_antecedent(false_target, false_flow);
         }
     }
 
     // Go: binder/binder.go:2390 bindOptionalExpression
-    pub fn bind_optional_expression(&mut self, node: Node, true_target: FlowNodeId, false_target: FlowNodeId) {
+    pub fn bind_optional_expression(
+        &mut self,
+        node: Node,
+        true_target: FlowNodeId,
+        false_target: FlowNodeId,
+    ) {
         self.do_with_conditional_branches(&mut Binder::bind, node, true_target, false_target);
         if !is_optional_chain(node) || is_outermost_optional_chain(node) {
-            let true_flow = self.create_flow_condition(FlowFlags::TRUE_CONDITION, self.current_flow, node);
+            let true_flow =
+                self.create_flow_condition(FlowFlags::TRUE_CONDITION, self.current_flow, node);
             self.add_antecedent(true_target, true_flow);
-            let false_flow = self.create_flow_condition(FlowFlags::FALSE_CONDITION, self.current_flow, node);
+            let false_flow =
+                self.create_flow_condition(FlowFlags::FALSE_CONDITION, self.current_flow, node);
             self.add_antecedent(false_target, false_flow);
         }
     }
@@ -793,7 +882,9 @@ impl Binder {
             // an immediately invoked function expression (IIFE). Initialize the flowNode property to
             // the current control flow (which includes evaluation of the IIFE arguments).
             let expr = skip_parentheses(call_expression);
-            if expr.kind() == SyntaxKind::FunctionExpression || expr.kind() == SyntaxKind::ArrowFunction {
+            if expr.kind() == SyntaxKind::FunctionExpression
+                || expr.kind() == SyntaxKind::ArrowFunction
+            {
                 self.bind_node_list(node.type_argument_list());
                 self.bind_each(&node.arguments().to_vec());
                 self.bind(call_expression);
@@ -810,7 +901,8 @@ impl Binder {
                 && is_narrowable_operand(access.expression())
                 && is_push_or_unshift_identifier(access.name())
             {
-                self.current_flow = self.create_flow_mutation(FlowFlags::ARRAY_MUTATION, self.current_flow, node);
+                self.current_flow =
+                    self.create_flow_mutation(FlowFlags::ARRAY_MUTATION, self.current_flow, node);
             }
         }
     }
@@ -904,7 +996,12 @@ impl Binder {
     }
 
     // Go: binder/binder.go:2520 addDeclarationToSymbol
-    pub fn add_declaration_to_symbol(&mut self, symbol: SymbolId, node: Node, symbol_flags: SymbolFlags) {
+    pub fn add_declaration_to_symbol(
+        &mut self,
+        symbol: SymbolId,
+        node: Node,
+        symbol_flags: SymbolFlags,
+    ) {
         self.symbols.sym_mut(symbol).flags |= symbol_flags;
         self.p3_node_bind_mut(node).symbol = symbol;
         if self.symbols.sym(symbol).declarations.is_empty() {
@@ -920,7 +1017,8 @@ impl Binder {
         // On merge of const enum module with class or function, reset const enum only flag (namespaces will already recalculate)
         let flags = self.symbols.sym(symbol).flags;
         if flags.intersects(SymbolFlags::CONST_ENUM_ONLY_MODULE)
-            && flags.intersects(SymbolFlags::FUNCTION | SymbolFlags::CLASS | SymbolFlags::REGULAR_ENUM)
+            && flags
+                .intersects(SymbolFlags::FUNCTION | SymbolFlags::CLASS | SymbolFlags::REGULAR_ENUM)
         {
             let s = self.symbols.sym_mut(symbol);
             s.flags = s.flags.without(SymbolFlags::CONST_ENUM_ONLY_MODULE);
@@ -937,7 +1035,8 @@ pub fn set_value_declaration(symbols: &mut SymbolArena, symbol: SymbolId, node: 
     let value_declaration = symbols.sym(symbol).value_declaration;
     if value_declaration.is_nil()
         || is_assignment_declaration(value_declaration) && !is_assignment_declaration(node)
-        || value_declaration.kind() != node.kind() && is_effective_module_declaration(value_declaration)
+        || value_declaration.kind() != node.kind()
+            && is_effective_module_declaration(value_declaration)
     {
         // Non-assignment declarations take precedence over assignment declarations and
         // non-namespace declarations take precedence over namespace declarations.
@@ -967,7 +1066,9 @@ pub fn get_container_flags(node: Node) -> ContainerFlags {
             return ContainerFlags::IS_CONTAINER | ContainerFlags::HAS_LOCALS;
         }
         SyntaxKind::SourceFile => {
-            return ContainerFlags::IS_CONTAINER | ContainerFlags::IS_CONTROL_FLOW_CONTAINER | ContainerFlags::HAS_LOCALS;
+            return ContainerFlags::IS_CONTAINER
+                | ContainerFlags::IS_CONTROL_FLOW_CONTAINER
+                | ContainerFlags::HAS_LOCALS;
         }
         SyntaxKind::GetAccessor
         | SyntaxKind::SetAccessor
@@ -975,8 +1076,10 @@ pub fn get_container_flags(node: Node) -> ContainerFlags {
         | SyntaxKind::Constructor
         | SyntaxKind::FunctionDeclaration
         | SyntaxKind::ClassStaticBlockDeclaration => {
-            if matches!(node.kind(), SyntaxKind::GetAccessor | SyntaxKind::SetAccessor | SyntaxKind::MethodDeclaration)
-                && is_object_literal_or_class_expression_method_or_accessor(node)
+            if matches!(
+                node.kind(),
+                SyntaxKind::GetAccessor | SyntaxKind::SetAccessor | SyntaxKind::MethodDeclaration
+            ) && is_object_literal_or_class_expression_method_or_accessor(node)
             {
                 return ContainerFlags::IS_CONTAINER
                     | ContainerFlags::IS_CONTROL_FLOW_CONTAINER
@@ -1024,7 +1127,8 @@ pub fn get_container_flags(node: Node) -> ContainerFlags {
         }
         SyntaxKind::PropertyDeclaration => {
             if node.initializer().is_some() {
-                return ContainerFlags::IS_CONTROL_FLOW_CONTAINER | ContainerFlags::IS_THIS_CONTAINER;
+                return ContainerFlags::IS_CONTROL_FLOW_CONTAINER
+                    | ContainerFlags::IS_THIS_CONTAINER;
             } else {
                 return ContainerFlags::NONE;
             }
@@ -1056,12 +1160,13 @@ pub fn is_narrowing_expression(expr: Node) -> bool {
             contains_narrowable_reference(expr)
         }
         SyntaxKind::CallExpression => has_narrowable_argument(expr),
-        SyntaxKind::ParenthesizedExpression | SyntaxKind::NonNullExpression | SyntaxKind::TypeOfExpression => {
-            is_narrowing_expression(expr.expression())
-        }
+        SyntaxKind::ParenthesizedExpression
+        | SyntaxKind::NonNullExpression
+        | SyntaxKind::TypeOfExpression => is_narrowing_expression(expr.expression()),
         SyntaxKind::BinaryExpression => is_narrowing_binary_expression(expr),
         SyntaxKind::PrefixUnaryExpression => {
-            expr.operator() == SyntaxKind::ExclamationToken && is_narrowing_expression(expr.operand())
+            expr.operator() == SyntaxKind::ExclamationToken
+                && is_narrowing_expression(expr.operand())
         }
         _ => false,
     }
@@ -1089,14 +1194,18 @@ pub fn contains_narrowable_reference(expr: Node) -> bool {
 // Go: binder/binder.go:2633 isNarrowableReference
 pub fn is_narrowable_reference(node: Node) -> bool {
     match node.kind() {
-        SyntaxKind::Identifier | SyntaxKind::ThisKeyword | SyntaxKind::SuperKeyword | SyntaxKind::MetaProperty => true,
-        SyntaxKind::PropertyAccessExpression | SyntaxKind::ParenthesizedExpression | SyntaxKind::NonNullExpression => {
-            is_narrowable_reference(node.expression())
-        }
+        SyntaxKind::Identifier
+        | SyntaxKind::ThisKeyword
+        | SyntaxKind::SuperKeyword
+        | SyntaxKind::MetaProperty => true,
+        SyntaxKind::PropertyAccessExpression
+        | SyntaxKind::ParenthesizedExpression
+        | SyntaxKind::NonNullExpression => is_narrowable_reference(node.expression()),
         SyntaxKind::ElementAccessExpression => {
             let argument_expression = node.argument_expression();
             is_string_or_numeric_literal_like(argument_expression)
-                || is_entity_name_expression(argument_expression) && is_narrowable_reference(node.expression())
+                || is_entity_name_expression(argument_expression)
+                    && is_narrowable_reference(node.expression())
         }
         SyntaxKind::BinaryExpression => {
             let operator = node.operator_token().kind();
@@ -1173,24 +1282,41 @@ pub fn is_narrowable_operand(expr: Node) -> bool {
 
 // Go: binder/binder.go:2702 isNarrowingTypeOfOperands
 pub fn is_narrowing_type_of_operands(expr1: Node, expr2: Node) -> bool {
-    is_type_of_expression(expr1) && is_narrowable_operand(expr1.expression()) && is_string_literal_like(expr2)
+    is_type_of_expression(expr1)
+        && is_narrowable_operand(expr1.expression())
+        && is_string_literal_like(expr2)
 }
 
 impl Binder {
     // Go: binder/binder.go:2706 errorOnNode
-    pub fn error_on_node(&mut self, node: Node, message: &'static ts_diagnostics::Message, args: Vec<String>) {
+    pub fn error_on_node(
+        &mut self,
+        node: Node,
+        message: &'static ts_diagnostics::Message,
+        args: Vec<String>,
+    ) {
         let diagnostic = self.create_diagnostic_for_node(node, message, args);
         self.add_diagnostic(diagnostic);
     }
 
     // Go: binder/binder.go:2710 errorOnFirstToken
-    pub fn error_on_first_token(&mut self, node: Node, message: &'static ts_diagnostics::Message, args: Vec<String>) {
+    pub fn error_on_first_token(
+        &mut self,
+        node: Node,
+        message: &'static ts_diagnostics::Message,
+        args: Vec<String>,
+    ) {
         let span = get_range_of_token_at_position(self.file, node.pos());
         self.add_diagnostic(new_diagnostic(self.file, span, message, args));
     }
 
     // Go: binder/binder.go:2715 errorOrSuggestionOnNode
-    pub fn error_or_suggestion_on_node(&mut self, is_error: bool, node: Node, message: &'static ts_diagnostics::Message) {
+    pub fn error_or_suggestion_on_node(
+        &mut self,
+        is_error: bool,
+        node: Node,
+        message: &'static ts_diagnostics::Message,
+    ) {
         self.error_or_suggestion_on_range(is_error, node, node, message);
     }
 
@@ -1203,7 +1329,10 @@ impl Binder {
         message: &'static ts_diagnostics::Message,
     ) {
         // PORT: Go `core.NewTextRange(pos, end)` -> `TextRange::new(pos, end)`.
-        let text_range = TextRange::new(get_range_of_token_at_position(self.file, start_node.pos()).pos(), end_node.end());
+        let text_range = TextRange::new(
+            get_range_of_token_at_position(self.file, start_node.pos()).pos(),
+            end_node.end(),
+        );
         let mut diagnostic = new_diagnostic(self.file, text_range, message, Vec::new());
         if is_error {
             self.add_diagnostic(diagnostic);
@@ -1217,8 +1346,18 @@ impl Binder {
     // Inside the binder, we may create a diagnostic for an as-yet unbound node (with potentially no parent pointers, implying no accessible source file)
     // If so, the node _must_ be in the current file (as that's the only way anything could have traversed to it to yield it as the error node)
     // This version of `createDiagnosticForNode` uses the binder's context to account for this, and always yields correct diagnostics even in these situations.
-    pub fn create_diagnostic_for_node(&mut self, node: Node, message: &'static ts_diagnostics::Message, args: Vec<String>) -> Diagnostic {
-        new_diagnostic(self.file, get_error_range_for_node(self.file, node), message, args)
+    pub fn create_diagnostic_for_node(
+        &mut self,
+        node: Node,
+        message: &'static ts_diagnostics::Message,
+        args: Vec<String>,
+    ) -> Diagnostic {
+        new_diagnostic(
+            self.file,
+            get_error_range_for_node(self.file, node),
+            message,
+            args,
+        )
     }
 
     // Go: binder/binder.go:2737 addDiagnostic
@@ -1226,7 +1365,6 @@ impl Binder {
         self.file_bind.bind_diagnostics.push(diagnostic);
     }
 }
-
 
 // Go: binder/binder.go:2749 getOptionalSymbolFlagForNode
 pub fn get_optional_symbol_flag_for_node(node: Node) -> SymbolFlags {
@@ -1259,7 +1397,9 @@ pub fn is_function_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool {
 pub fn is_statement_condition(node: Node) -> bool {
     let parent = node.parent();
     match parent.kind() {
-        SyntaxKind::IfStatement | SyntaxKind::WhileStatement | SyntaxKind::DoStatement => parent.expression() == node,
+        SyntaxKind::IfStatement | SyntaxKind::WhileStatement | SyntaxKind::DoStatement => {
+            parent.expression() == node
+        }
         SyntaxKind::ForStatement => parent.condition() == node,
         SyntaxKind::ConditionalExpression => parent.condition() == node,
         _ => false,
@@ -1270,7 +1410,8 @@ pub fn is_statement_condition(node: Node) -> bool {
 pub fn is_top_level_logical_expression(node: Node) -> bool {
     let mut node = node;
     while is_parenthesized_expression(node.parent())
-        || is_prefix_unary_expression(node.parent()) && node.parent().operator() == SyntaxKind::ExclamationToken
+        || is_prefix_unary_expression(node.parent())
+            && node.parent().operator() == SyntaxKind::ExclamationToken
     {
         node = node.parent();
     }
@@ -1281,7 +1422,10 @@ pub fn is_top_level_logical_expression(node: Node) -> bool {
 
 // Go: binder/binder.go:2789 isAssignmentDeclaration
 pub fn is_assignment_declaration(decl: Node) -> bool {
-    is_binary_expression(decl) || is_access_expression(decl) || is_identifier(decl) || is_call_expression(decl)
+    is_binary_expression(decl)
+        || is_access_expression(decl)
+        || is_identifier(decl)
+        || is_call_expression(decl)
 }
 
 // Go: binder/binder.go:2793 isEffectiveModuleDeclaration

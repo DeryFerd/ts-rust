@@ -49,15 +49,26 @@ fn info_exists(info: &Option<Rc<InfoCacheEntry>>) -> bool {
 
 impl ResolutionState<'_> {
     // Go: module/resolver.go:1153 createResolvedModuleHandlingSymlink
-    pub fn create_resolved_module_handling_symlink(&mut self, mut resolved: Option<Resolved>) -> ResolvedModule {
-        let is_external_library_import = resolved.as_ref().is_some_and(|r| r.path.contains("/node_modules/"));
+    pub fn create_resolved_module_handling_symlink(
+        &mut self,
+        mut resolved: Option<Resolved>,
+    ) -> ResolvedModule {
+        let is_external_library_import = resolved
+            .as_ref()
+            .is_some_and(|r| r.path.contains("/node_modules/"));
         if self.compiler_options.preserve_symlinks != Tristate::True
             && is_external_library_import
-            && resolved.as_ref().is_some_and(|r| r.original_path.is_empty())
+            && resolved
+                .as_ref()
+                .is_some_and(|r| r.original_path.is_empty())
             && !is_external_module_name_relative(&self.name)
         {
-            let path = resolved.as_ref().map(|r| r.path.clone()).unwrap_or_default();
-            let (original_path, resolved_file_name) = self.get_original_and_resolved_file_name(&path);
+            let path = resolved
+                .as_ref()
+                .map(|r| r.path.clone())
+                .unwrap_or_default();
+            let (original_path, resolved_file_name) =
+                self.get_original_and_resolved_file_name(&path);
             if !original_path.is_empty() {
                 if let Some(r) = resolved.as_mut() {
                     r.path = resolved_file_name;
@@ -69,7 +80,11 @@ impl ResolutionState<'_> {
     }
 
     // Go: module/resolver.go:1168 createResolvedModule
-    pub fn create_resolved_module(&self, resolved: Option<Resolved>, is_external_library_import: bool) -> ResolvedModule {
+    pub fn create_resolved_module(
+        &self,
+        resolved: Option<Resolved>,
+        is_external_library_import: bool,
+    ) -> ResolvedModule {
         let mut resolved_module = ResolvedModule::default();
         resolved_module.resolution_diagnostics = self.diagnostics.clone();
 
@@ -101,10 +116,12 @@ impl ResolutionState<'_> {
             resolved_type_reference_directive.resolved_file_name = resolved.path.clone();
             resolved_type_reference_directive.primary = primary;
             resolved_type_reference_directive.package_id = resolved.package_id;
-            resolved_type_reference_directive.is_external_library_import = resolved.path.contains("/node_modules/");
+            resolved_type_reference_directive.is_external_library_import =
+                resolved.path.contains("/node_modules/");
 
             if self.compiler_options.preserve_symlinks != Tristate::True {
-                let (original_path, resolved_file_name) = self.get_original_and_resolved_file_name(&resolved.path);
+                let (original_path, resolved_file_name) =
+                    self.get_original_and_resolved_file_name(&resolved.path);
                 if !original_path.is_empty() {
                     resolved_type_reference_directive.resolved_file_name = resolved_file_name;
                     resolved_type_reference_directive.original_path = original_path;
@@ -152,7 +169,9 @@ impl ResolutionState<'_> {
             return self.resolver.get_parsed_patterns_for_paths();
         }
         if self.parsed_patterns_for_paths.is_none() {
-            self.parsed_patterns_for_paths = Some(Rc::new(try_parse_patterns(self.compiler_options.paths.as_ref())));
+            self.parsed_patterns_for_paths = Some(Rc::new(try_parse_patterns(
+                self.compiler_options.paths.as_ref(),
+            )));
         }
         self.parsed_patterns_for_paths.clone().unwrap()
     }
@@ -161,8 +180,14 @@ impl ResolutionState<'_> {
     pub fn try_load_module_using_paths_if_eligible(&mut self) -> Option<Resolved> {
         let compiler_options = self.compiler_options.clone();
         // Go `Paths.Size()` is 0 for a nil map.
-        if compiler_options.paths.as_ref().map_or(0, IndexMap::len) > 0 && !path_is_relative(&self.name) {
-            trace_write!(self, diag::X_paths_option_is_specified_looking_for_a_pattern_to_match_module_name_0, self.name);
+        if compiler_options.paths.as_ref().map_or(0, IndexMap::len) > 0
+            && !path_is_relative(&self.name)
+        {
+            trace_write!(
+                self,
+                diag::X_paths_option_is_specified_looking_for_a_pattern_to_match_module_name_0,
+                self.name
+            );
         } else {
             return continue_searching();
         }
@@ -178,7 +203,9 @@ impl ResolutionState<'_> {
             compiler_options.paths.as_ref(),
             &path_patterns,
             &mut |state: &mut ResolutionState<'_>, extensions: Extensions, candidate: &str| {
-                state.node_load_module_by_relative_name(extensions, candidate, true /*considerPackageJson*/)
+                state.node_load_module_by_relative_name(
+                    extensions, candidate, true, /*considerPackageJson*/
+                )
             },
         )
     }
@@ -198,13 +225,26 @@ impl ResolutionState<'_> {
         let matched_pattern = match_pattern_or_exact(path_patterns, module_name);
         if matched_pattern.is_valid() {
             let matched_star = matched_pattern.matched_text(module_name);
-            trace_write!(self, diag::Module_name_0_matched_pattern_1, module_name, matched_pattern.text);
+            trace_write!(
+                self,
+                diag::Module_name_0_matched_pattern_1,
+                module_name,
+                matched_pattern.text
+            );
             // Go `paths.GetOrZero(text)`: nil for a missing key or a nil map.
-            let substitutions = paths.and_then(|p| p.get(&matched_pattern.text)).cloned().unwrap_or_default();
+            let substitutions = paths
+                .and_then(|p| p.get(&matched_pattern.text))
+                .cloned()
+                .unwrap_or_default();
             for subst in &substitutions {
                 let path = subst.replacen('*', matched_star, 1);
                 let candidate = normalize_path(&combine_paths(containing_directory, &[&path]));
-                trace_write!(self, diag::Trying_substitution_0_candidate_module_location_Colon_1, subst, path);
+                trace_write!(
+                    self,
+                    diag::Trying_substitution_0_candidate_module_location_Colon_1,
+                    subst,
+                    path
+                );
                 // A path mapping may have an extension
                 let extension_from_subst = try_get_extension_from_path(subst);
                 if !extension_from_subst.is_empty() {
@@ -239,7 +279,11 @@ impl ResolutionState<'_> {
             return continue_searching();
         }
 
-        trace_write!(self, diag::X_rootDirs_option_is_set_using_it_to_resolve_relative_module_name_0, self.name);
+        trace_write!(
+            self,
+            diag::X_rootDirs_option_is_set_using_it_to_resolve_relative_module_name_0,
+            self.name
+        );
 
         let candidate = normalize_path(&combine_paths(&self.containing_directory, &[&self.name]));
 
@@ -255,7 +299,8 @@ impl ResolutionState<'_> {
                 normalized_root.push('/');
             }
             let is_longest_matching_prefix = candidate.starts_with(&normalized_root)
-                && (matched_normalized_prefix.is_empty() || matched_normalized_prefix.len() < normalized_root.len());
+                && (matched_normalized_prefix.is_empty()
+                    || matched_normalized_prefix.len() < normalized_root.len());
 
             trace_write!(
                 self,
@@ -272,7 +317,12 @@ impl ResolutionState<'_> {
         }
 
         if !matched_normalized_prefix.is_empty() {
-            trace_write!(self, diag::Longest_matching_prefix_for_0_is_1, candidate, matched_normalized_prefix);
+            trace_write!(
+                self,
+                diag::Longest_matching_prefix_for_0_is_1,
+                candidate,
+                matched_normalized_prefix
+            );
             let suffix = candidate[matched_normalized_prefix.len()..].to_string();
 
             // first - try to load from a initial location
@@ -284,7 +334,9 @@ impl ResolutionState<'_> {
                 candidate
             );
             let loader = |state: &mut Self, extensions: Extensions, candidate: &str| {
-                state.node_load_module_by_relative_name(extensions, candidate, true /*considerPackageJson*/)
+                state.node_load_module_by_relative_name(
+                    extensions, candidate, true, /*considerPackageJson*/
+                )
             };
             let extensions = self.extensions;
             let resolved_file_name = loader(self, extensions, &candidate);
@@ -300,7 +352,13 @@ impl ResolutionState<'_> {
                     continue;
                 }
                 let candidate = combine_paths(&normalize_path(root_dir), &[&suffix]);
-                trace_write!(self, diag::Loading_0_from_the_root_dir_1_candidate_location_2, suffix, root_dir, candidate);
+                trace_write!(
+                    self,
+                    diag::Loading_0_from_the_root_dir_1_candidate_location_2,
+                    suffix,
+                    root_dir,
+                    candidate
+                );
                 let extensions = self.extensions;
                 let resolved_file_name = loader(self, extensions, &candidate);
                 if resolved_file_name.is_some() {
@@ -327,14 +385,26 @@ impl ResolutionState<'_> {
         );
         if !has_trailing_directory_separator(candidate) {
             let parent_of_candidate = get_directory_path(candidate);
-            if !self.resolver.host.fs().directory_exists(&parent_of_candidate) {
-                trace_write!(self, diag::Directory_0_does_not_exist_skipping_all_lookups_in_it, parent_of_candidate);
+            if !self
+                .resolver
+                .host
+                .fs()
+                .directory_exists(&parent_of_candidate)
+            {
+                trace_write!(
+                    self,
+                    diag::Directory_0_does_not_exist_skipping_all_lookups_in_it,
+                    parent_of_candidate
+                );
                 return continue_searching();
             }
             let resolved_from_file = self.load_module_from_file(extensions, candidate);
             if let Some(mut resolved_from_file) = resolved_from_file {
                 if consider_package_json {
-                    let package_directory = parse_node_module_from_path(&resolved_from_file.path, false /*isFolder*/);
+                    let package_directory = parse_node_module_from_path(
+                        &resolved_from_file.path,
+                        false, /*isFolder*/
+                    );
                     if !package_directory.is_empty() {
                         let package_info = self.get_package_json_info(&package_directory);
                         let path = resolved_from_file.path.clone();
@@ -345,22 +415,35 @@ impl ResolutionState<'_> {
             }
         }
         if !self.resolver.host.fs().directory_exists(candidate) {
-            trace_write!(self, diag::Directory_0_does_not_exist_skipping_all_lookups_in_it, candidate);
+            trace_write!(
+                self,
+                diag::Directory_0_does_not_exist_skipping_all_lookups_in_it,
+                candidate
+            );
             return continue_searching();
         }
         // esm mode relative imports shouldn't do any directory lookups (either inside `package.json`
         // files or implicit `index.js`es). This is a notable departure from cjs norms, where `./foo/pkg`
         // could have been redirected by `./foo/pkg/package.json` to an arbitrary location!
         if !self.esm_mode {
-            return self.load_node_module_from_directory(extensions, candidate, consider_package_json);
+            return self.load_node_module_from_directory(
+                extensions,
+                candidate,
+                consider_package_json,
+            );
         }
         continue_searching()
     }
 
     // Go: module/resolver.go:1418 loadModuleFromFile
-    pub fn load_module_from_file(&mut self, extensions: Extensions, candidate: &str) -> Option<Resolved> {
+    pub fn load_module_from_file(
+        &mut self,
+        extensions: Extensions,
+        candidate: &str,
+    ) -> Option<Resolved> {
         // ./foo.js -> ./foo.ts
-        let resolved_by_replacing_extension = self.load_module_from_file_no_implicit_extensions(extensions, candidate);
+        let resolved_by_replacing_extension =
+            self.load_module_from_file_no_implicit_extensions(extensions, candidate);
         if resolved_by_replacing_extension.is_some() {
             return resolved_by_replacing_extension;
         }
@@ -390,7 +473,12 @@ impl ResolutionState<'_> {
         }
 
         let extension = &candidate[extensionless.len()..];
-        trace_write!(self, diag::File_name_0_has_a_1_extension_stripping_it, candidate, extension);
+        trace_write!(
+            self,
+            diag::File_name_0_has_a_1_extension_stripping_it,
+            candidate,
+            extension
+        );
         self.try_adding_extensions(extensionless, extensions, extension)
     }
 
@@ -408,7 +496,8 @@ impl ResolutionState<'_> {
 
         match original_extension {
             EXTENSION_MJS | EXTENSION_MTS | EXTENSION_DMTS => {
-                let from_ts = original_extension == EXTENSION_MTS || original_extension == EXTENSION_DMTS;
+                let from_ts =
+                    original_extension == EXTENSION_MTS || original_extension == EXTENSION_DMTS;
                 if extensions.intersects(Extensions::TYPE_SCRIPT) {
                     let resolved = self.try_extension(EXTENSION_MTS, extensionless, from_ts);
                     if resolved.is_some() {
@@ -430,7 +519,8 @@ impl ResolutionState<'_> {
                 continue_searching()
             }
             EXTENSION_CJS | EXTENSION_CTS | EXTENSION_DCTS => {
-                let from_ts = original_extension == EXTENSION_CTS || original_extension == EXTENSION_DCTS;
+                let from_ts =
+                    original_extension == EXTENSION_CTS || original_extension == EXTENSION_DCTS;
                 if extensions.intersects(Extensions::TYPE_SCRIPT) {
                     let resolved = self.try_extension(EXTENSION_CTS, extensionless, from_ts);
                     if resolved.is_some() {
@@ -500,7 +590,8 @@ impl ResolutionState<'_> {
                 continue_searching()
             }
             EXTENSION_TS | EXTENSION_DTS | EXTENSION_JS | "" => {
-                let from_ts = original_extension == EXTENSION_TS || original_extension == EXTENSION_DTS;
+                let from_ts =
+                    original_extension == EXTENSION_TS || original_extension == EXTENSION_DTS;
                 if extensions.intersects(Extensions::TYPE_SCRIPT) {
                     let resolved = self.try_extension(EXTENSION_TS, extensionless, from_ts);
                     if resolved.is_some() {
@@ -539,8 +630,11 @@ impl ResolutionState<'_> {
                 if extensions.intersects(Extensions::DECLARATION)
                     && !is_declaration_file_name(&format!("{extensionless}{original_extension}"))
                 {
-                    let resolved =
-                        self.try_extension(&format!(".d{original_extension}.ts"), extensionless, false);
+                    let resolved = self.try_extension(
+                        &format!(".d{original_extension}.ts"),
+                        extensionless,
+                        false,
+                    );
                     if resolved.is_some() {
                         return resolved;
                     }
@@ -563,7 +657,8 @@ impl ResolutionState<'_> {
             return Some(Resolved {
                 path,
                 extension: extension.to_string(),
-                resolved_using_ts_extension: !self.candidate_ending_is_from_config && resolved_using_ts_extension,
+                resolved_using_ts_extension: !self.candidate_ending_is_from_config
+                    && resolved_using_ts_extension,
                 ..Default::default()
             });
         }
@@ -591,7 +686,11 @@ impl ResolutionState<'_> {
     // Go: module/resolver.go:1603 tryFileLookup
     pub fn try_file_lookup(&mut self, file_name: &str) -> bool {
         if self.resolver.host.fs().file_exists(file_name) {
-            trace_write!(self, diag::File_0_exists_use_it_as_a_name_resolution_result, file_name);
+            trace_write!(
+                self,
+                diag::File_0_exists_use_it_as_a_name_resolution_result,
+                file_name
+            );
             return true;
         } else {
             trace_write!(self, diag::File_0_does_not_exist, file_name);
@@ -627,7 +726,11 @@ impl ResolutionState<'_> {
             let contents = info.contents.clone().unwrap();
             version_paths = contents.get_version_paths(self.get_trace_func());
             let options = ComparePathsOptions {
-                use_case_sensitive_file_names: self.resolver.host.fs().use_case_sensitive_file_names(),
+                use_case_sensitive_file_names: self
+                    .resolver
+                    .host
+                    .fs()
+                    .use_case_sensitive_file_names(),
                 ..Default::default()
             };
             if compare_paths(candidate, &info.package_directory, &options) == 0 {
@@ -638,12 +741,22 @@ impl ResolutionState<'_> {
             }
         }
 
-        let package_is_module = package_info
-            .as_ref()
-            .filter(|p| p.exists())
-            .map(|p| p.contents.as_ref().unwrap().fields.header_fields.type_.value == "module");
-        let mut loader = |state: &mut Self, extensions: Extensions, candidate: &str| -> Option<Resolved> {
-            let from_file = state.load_file_name_from_package_json_field(extensions, candidate, &package_file);
+        let package_is_module = package_info.as_ref().filter(|p| p.exists()).map(|p| {
+            p.contents
+                .as_ref()
+                .unwrap()
+                .fields
+                .header_fields
+                .type_
+                .value
+                == "module"
+        });
+        let mut loader = |state: &mut Self,
+                          extensions: Extensions,
+                          candidate: &str|
+         -> Option<Resolved> {
+            let from_file =
+                state.load_file_name_from_package_json_field(extensions, candidate, &package_file);
             if from_file.is_some() {
                 return from_file;
             }
@@ -663,7 +776,11 @@ impl ResolutionState<'_> {
             if package_is_module == Some(false) {
                 state.esm_mode = false;
             }
-            let result = state.node_load_module_by_relative_name(expanded_extensions, candidate, false /*considerPackageJson*/);
+            let result = state.node_load_module_by_relative_name(
+                expanded_extensions,
+                candidate,
+                false, /*considerPackageJson*/
+            );
             state.esm_mode = save_esm_mode;
             state.candidate_ending_is_from_config = save_candidate_ending_is_from_config;
             result
@@ -680,9 +797,17 @@ impl ResolutionState<'_> {
                 || contains_path(candidate, &package_file, &ComparePathsOptions::default()))
         {
             let module_name = if !package_file.is_empty() {
-                get_relative_path_from_directory(candidate, &package_file, &ComparePathsOptions::default())
+                get_relative_path_from_directory(
+                    candidate,
+                    &package_file,
+                    &ComparePathsOptions::default(),
+                )
             } else {
-                get_relative_path_from_directory(candidate, &index_path, &ComparePathsOptions::default())
+                get_relative_path_from_directory(
+                    candidate,
+                    &index_path,
+                    &ComparePathsOptions::default(),
+                )
             };
             trace_write!(
                 self,
@@ -693,8 +818,14 @@ impl ResolutionState<'_> {
             );
             let paths = version_paths.get_paths().cloned();
             let path_patterns = try_parse_patterns(paths.as_ref());
-            let result =
-                self.try_load_module_using_paths(ext, &module_name, candidate, paths.as_ref(), &path_patterns, &mut loader);
+            let result = self.try_load_module_using_paths(
+                ext,
+                &module_name,
+                candidate,
+                paths.as_ref(),
+                &path_patterns,
+                &mut loader,
+            );
             if let Some(result) = result {
                 if !result.package_id.name.is_empty() {
                     // !!! are these asserts really necessary?
@@ -735,7 +866,8 @@ impl ResolutionState<'_> {
         candidate: &str,
         package_json_value: &str,
     ) -> Option<Resolved> {
-        if extensions.intersects(Extensions::TYPE_SCRIPT) && has_implementation_ts_file_extension(candidate)
+        if extensions.intersects(Extensions::TYPE_SCRIPT)
+            && has_implementation_ts_file_extension(candidate)
             || extensions.intersects(Extensions::DECLARATION) && is_declaration_file_name(candidate)
         {
             let (path, ok) = self.try_file(candidate);
@@ -747,7 +879,8 @@ impl ResolutionState<'_> {
                 // - import "pkg/foo.ts" with pattern "./*" -> true
                 // - import "pkg/foo.ts.omg" with pattern "./*.omg" -> true (star matched .ts)
                 // - import "pkg/foo" with pattern "./*.ts" -> false (extension in pattern, not specifier)
-                let resolved_using_ts_extension = package_json_value.ends_with('*') && !extension.is_empty();
+                let resolved_using_ts_extension =
+                    package_json_value.ends_with('*') && !extension.is_empty();
                 return Some(Resolved {
                     path,
                     extension: extension.to_string(),
@@ -764,7 +897,11 @@ impl ResolutionState<'_> {
         {
             let (path, ok) = self.try_file(candidate);
             if ok {
-                return Some(Resolved { path, extension: EXTENSION_JSON.to_string(), ..Default::default() });
+                return Some(Resolved {
+                    path,
+                    extension: EXTENSION_JSON.to_string(),
+                    ..Default::default()
+                });
             }
         }
 
@@ -784,22 +921,36 @@ impl ResolutionState<'_> {
         let contents = package_info.contents.clone().unwrap();
         let path_fields = &contents.fields.path_fields;
         if self.is_config_lookup {
-            return self.get_package_json_path_field("tsconfig", &path_fields.ts_config, &package_info.package_directory);
+            return self.get_package_json_path_field(
+                "tsconfig",
+                &path_fields.ts_config,
+                &package_info.package_directory,
+            );
         }
         if extensions.intersects(Extensions::DECLARATION) {
-            let (package_file, ok) =
-                self.get_package_json_path_field("typings", &path_fields.typings, &package_info.package_directory);
+            let (package_file, ok) = self.get_package_json_path_field(
+                "typings",
+                &path_fields.typings,
+                &package_info.package_directory,
+            );
             if ok {
                 return (package_file, ok);
             }
-            let (package_file, ok) =
-                self.get_package_json_path_field("types", &path_fields.types, &package_info.package_directory);
+            let (package_file, ok) = self.get_package_json_path_field(
+                "types",
+                &path_fields.types,
+                &package_info.package_directory,
+            );
             if ok {
                 return (package_file, ok);
             }
         }
         if extensions.intersects(Extensions::IMPLEMENTATION_FILES | Extensions::DECLARATION) {
-            return self.get_package_json_path_field("main", &path_fields.main, &package_info.package_directory);
+            return self.get_package_json_path_field(
+                "main",
+                &path_fields.main,
+                &package_info.package_directory,
+            );
         }
         (String::new(), false)
     }
@@ -808,13 +959,26 @@ impl ResolutionState<'_> {
     pub fn get_package_json_info(&mut self, package_directory: &str) -> Option<Rc<InfoCacheEntry>> {
         let package_json_path = combine_paths(package_directory, &["package.json"]);
 
-        if let Some(existing) = self.resolver.caches.package_json_info_cache.get(&package_json_path) {
+        if let Some(existing) = self
+            .resolver
+            .caches
+            .package_json_info_cache
+            .get(&package_json_path)
+        {
             if existing.contents.is_some() {
-                trace_write!(self, diag::File_0_exists_according_to_earlier_cached_lookups, package_json_path);
+                trace_write!(
+                    self,
+                    diag::File_0_exists_according_to_earlier_cached_lookups,
+                    package_json_path
+                );
                 return Some(existing.with_package_directory(package_directory));
             } else {
                 if existing.directory_exists {
-                    trace_write!(self, diag::File_0_does_not_exist_according_to_earlier_cached_lookups, package_json_path);
+                    trace_write!(
+                        self,
+                        diag::File_0_does_not_exist_according_to_earlier_cached_lookups,
+                        package_json_path
+                    );
                 }
                 return None;
             }
@@ -838,7 +1002,11 @@ impl ResolutionState<'_> {
                     ..Default::default()
                 })),
             });
-            let result = self.resolver.caches.package_json_info_cache.set(&package_json_path, result);
+            let result = self
+                .resolver
+                .caches
+                .package_json_info_cache
+                .set(&package_json_path, result);
             return Some(result.with_package_directory(package_directory));
         } else {
             if directory_exists {
@@ -857,17 +1025,27 @@ impl ResolutionState<'_> {
     }
 
     // Go: module/resolver.go:1800 getPackageId
-    pub fn get_package_id(&mut self, resolved_file_name: &str, package_info: &Option<Rc<InfoCacheEntry>>) -> PackageId {
+    pub fn get_package_id(
+        &mut self,
+        resolved_file_name: &str,
+        package_info: &Option<Rc<InfoCacheEntry>>,
+    ) -> PackageId {
         if info_exists(package_info) {
             let package_info = package_info.as_ref().unwrap();
             let package_json_content = package_info.contents.clone().unwrap();
             let (name, ok) = package_json_content.fields.header_fields.name.get_value();
             if ok {
-                let (version, ok) = package_json_content.fields.header_fields.version.get_value();
+                let (version, ok) = package_json_content
+                    .fields
+                    .header_fields
+                    .version
+                    .get_value();
                 if ok {
                     let mut sub_module_name = String::new();
                     if resolved_file_name.len() > package_info.package_directory.len() {
-                        sub_module_name = resolved_file_name[package_info.package_directory.len() + 1..].to_string();
+                        sub_module_name = resolved_file_name
+                            [package_info.package_directory.len() + 1..]
+                            .to_string();
                     }
                     return PackageId {
                         name,
@@ -882,7 +1060,10 @@ impl ResolutionState<'_> {
     }
 
     // Go: module/resolver.go:1821 readPackageJsonPeerDependencies
-    pub fn read_package_json_peer_dependencies(&mut self, package_json_info: &Rc<InfoCacheEntry>) -> String {
+    pub fn read_package_json_peer_dependencies(
+        &mut self,
+        package_json_info: &Rc<InfoCacheEntry>,
+    ) -> String {
         let contents = package_json_info.contents.clone().unwrap();
         let peer_dependencies = &contents.fields.dependency_fields.peer_dependencies;
         let ok = self.validate_package_json_field("peerDependencies", peer_dependencies);
@@ -894,19 +1075,35 @@ impl ResolutionState<'_> {
         let Some(node_modules_index) = package_directory.rfind("/node_modules") else {
             return String::new();
         };
-        let node_modules = format!("{}/", &package_directory[..node_modules_index + "/node_modules".len()]);
+        let node_modules = format!(
+            "{}/",
+            &package_directory[..node_modules_index + "/node_modules".len()]
+        );
         let mut names: Vec<String> = peer_dependencies.value.keys().cloned().collect();
         names.sort();
         let mut builder = String::new();
         for name in &names {
             let peer_package_json = self.get_package_json_info(&format!("{node_modules}{name}"));
             if let Some(peer_package_json) = peer_package_json {
-                let version = peer_package_json.contents.as_ref().unwrap().fields.header_fields.version.value.clone();
+                let version = peer_package_json
+                    .contents
+                    .as_ref()
+                    .unwrap()
+                    .fields
+                    .header_fields
+                    .version
+                    .value
+                    .clone();
                 builder.push('+');
                 builder.push_str(name);
                 builder.push('@');
                 builder.push_str(&version);
-                trace_write!(self, diag::Found_peerDependency_0_with_1_version, name, version);
+                trace_write!(
+                    self,
+                    diag::Found_peerDependency_0_with_1_version,
+                    name,
+                    version
+                );
             } else {
                 trace_write!(self, diag::Failed_to_find_peerDependency_0, name);
             }
@@ -922,7 +1119,11 @@ impl ResolutionState<'_> {
     }
 
     // Go: module/resolver.go:1864 validatePackageJSONField
-    pub fn validate_package_json_field(&mut self, field_name: &str, field: &dyn TypeValidatedField) -> bool {
+    pub fn validate_package_json_field(
+        &mut self,
+        field_name: &str,
+        field: &dyn TypeValidatedField,
+    ) -> bool {
         if field.is_present() {
             if field.is_valid() {
                 return true;
@@ -935,7 +1136,11 @@ impl ResolutionState<'_> {
                 field.actual_json_type()
             );
         }
-        trace_write!(self, diag::X_package_json_does_not_have_a_0_field, field_name);
+        trace_write!(
+            self,
+            diag::X_package_json_does_not_have_a_0_field,
+            field_name
+        );
         false
     }
 
@@ -954,7 +1159,13 @@ impl ResolutionState<'_> {
             return (String::new(), false);
         }
         let path = normalize_path(&combine_paths(directory, &[&field.value]));
-        trace_write!(self, diag::X_package_json_has_0_field_1_that_references_2, field_name, field.value, path);
+        trace_write!(
+            self,
+            diag::X_package_json_has_0_field_1_that_references_2,
+            field_name,
+            field.value,
+            path
+        );
         (path, true)
     }
 
@@ -971,7 +1182,9 @@ impl ResolutionState<'_> {
 
     // Go: module/resolver.go:1904 getTraceFunc
     // PORT: the Go method value `r.tracer.write` is a closure over the shared tracer.
-    pub fn get_trace_func(&self) -> Option<Box<dyn Fn(&'static ts_diagnostics::Message, Vec<String>)>> {
+    pub fn get_trace_func(
+        &self,
+    ) -> Option<Box<dyn Fn(&'static ts_diagnostics::Message, Vec<String>)>> {
         if let Some(tracer) = &self.tracer {
             let tracer = tracer.clone();
             return Some(Box::new(move |m, args| tracer.borrow_mut().write(m, args)));
@@ -1028,7 +1241,11 @@ pub fn get_node_resolution_features(options: &CompilerOptions) -> NodeResolution
 }
 
 // Go: module/resolver.go:1958 moveToNextDirectorySeparatorIfAvailable
-pub fn move_to_next_directory_separator_if_available(path: &str, prev_separator_index: i32, is_folder: bool) -> i32 {
+pub fn move_to_next_directory_separator_if_available(
+    path: &str,
+    prev_separator_index: i32,
+    is_folder: bool,
+) -> i32 {
     let offset = (prev_separator_index + 1) as usize;
     match path[offset..].find('/') {
         None => {
@@ -1085,8 +1302,14 @@ impl Pattern {
 pub fn try_parse_pattern(pattern: &str) -> Pattern {
     let star_index = pattern.find('*');
     match star_index {
-        None => Pattern { text: pattern.to_string(), star_index: -1 },
-        Some(i) if !pattern[i + 1..].contains('*') => Pattern { text: pattern.to_string(), star_index: i as i32 },
+        None => Pattern {
+            text: pattern.to_string(),
+            star_index: -1,
+        },
+        Some(i) if !pattern[i + 1..].contains('*') => Pattern {
+            text: pattern.to_string(),
+            star_index: i as i32,
+        },
         Some(_) => Pattern::default(),
     }
 }
@@ -1097,7 +1320,9 @@ pub fn find_best_pattern_match(values: &[Pattern], candidate: &str) -> Pattern {
     let mut best_pattern = Pattern::default();
     let mut longest_match_prefix_length: i32 = -1;
     for pattern in values {
-        if (pattern.star_index == -1 || pattern.star_index > longest_match_prefix_length) && pattern.matches(candidate) {
+        if (pattern.star_index == -1 || pattern.star_index > longest_match_prefix_length)
+            && pattern.matches(candidate)
+        {
             best_pattern = pattern.clone();
             longest_match_prefix_length = pattern.star_index;
         }
@@ -1119,7 +1344,9 @@ impl Resolver {
     pub fn get_parsed_patterns_for_paths(&self) -> Rc<ParsedPatterns> {
         let mut cached = self.caches.parsed_patterns_for_paths.borrow_mut();
         if cached.is_none() {
-            *cached = Some(Rc::new(try_parse_patterns(self.compiler_options.paths.as_ref())));
+            *cached = Some(Rc::new(try_parse_patterns(
+                self.compiler_options.paths.as_ref(),
+            )));
         }
         cached.clone().unwrap()
     }
@@ -1160,13 +1387,19 @@ pub fn try_parse_patterns(path_mappings: Option<&IndexMap<String, Vec<String>>>)
             }
         }
     }
-    ParsedPatterns { matchable_string_set, patterns }
+    ParsedPatterns {
+        matchable_string_set,
+        patterns,
+    }
 }
 
 // Go: module/resolver.go:2023 MatchPatternOrExact
 pub fn match_pattern_or_exact(patterns: &ParsedPatterns, candidate: &str) -> Pattern {
     if patterns.matchable_string_set.contains(candidate) {
-        return Pattern { text: candidate.to_string(), star_index: -1 };
+        return Pattern {
+            text: candidate.to_string(),
+            star_index: -1,
+        };
     }
     if patterns.patterns.is_empty() {
         return Pattern::default();
@@ -1205,22 +1438,34 @@ pub fn matches_pattern_with_trailer(target: &str, name: &str) -> bool {
 /** True if `extension` is one of the supported `extensions`. */
 pub fn extension_is_ok(extensions: Extensions, extension: &str) -> bool {
     extensions.intersects(Extensions::JAVA_SCRIPT)
-        && (extension == EXTENSION_JS || extension == EXTENSION_JSX || extension == EXTENSION_MJS || extension == EXTENSION_CJS)
+        && (extension == EXTENSION_JS
+            || extension == EXTENSION_JSX
+            || extension == EXTENSION_MJS
+            || extension == EXTENSION_CJS)
         || (extensions.intersects(Extensions::TYPE_SCRIPT)
             && (extension == EXTENSION_TS
                 || extension == EXTENSION_TSX
                 || extension == EXTENSION_MTS
                 || extension == EXTENSION_CTS))
         || (extensions.intersects(Extensions::DECLARATION)
-            && (extension == EXTENSION_DTS || extension == EXTENSION_DMTS || extension == EXTENSION_DCTS))
+            && (extension == EXTENSION_DTS
+                || extension == EXTENSION_DMTS
+                || extension == EXTENSION_DCTS))
         || (extensions.intersects(Extensions::JSON) && extension == EXTENSION_JSON)
 }
 
 // Go: module/resolver.go:2070 ResolveConfig
-pub fn resolve_config(module_name: &str, containing_file: &str, host: Rc<dyn ResolutionHost>) -> ResolvedModule {
+pub fn resolve_config(
+    module_name: &str,
+    containing_file: &str,
+    host: Rc<dyn ResolutionHost>,
+) -> ResolvedModule {
     let resolver = new_resolver(
         host,
-        Rc::new(CompilerOptions { module_resolution: ModuleResolutionKind::NODE_NEXT, ..Default::default() }),
+        Rc::new(CompilerOptions {
+            module_resolution: ModuleResolutionKind::NODE_NEXT,
+            ..Default::default()
+        }),
         "",
         "",
     );
@@ -1229,7 +1474,10 @@ pub fn resolve_config(module_name: &str, containing_file: &str, host: Rc<dyn Res
 
 // Go: module/resolver.go:2075 GetAutomaticTypeDirectiveNames
 // PORT: Go `options.Types` nil and empty are both an empty `Vec`; both return `[]string{}`.
-pub fn get_automatic_type_directive_names(options: &CompilerOptions, host: &dyn ResolutionHost) -> Vec<String> {
+pub fn get_automatic_type_directive_names(
+    options: &CompilerOptions,
+    host: &dyn ResolutionHost,
+) -> Vec<String> {
     if !options.uses_wildcard_types() {
         return options.types.clone();
     }
@@ -1247,7 +1495,8 @@ pub fn get_automatic_type_directive_names(options: &CompilerOptions, host: &dyn 
                 if host.fs().file_exists(&package_json_path) {
                     let (contents, _) = host.fs().read_file(&package_json_path);
                     let package_json_content =
-                        crate::frontend::packagejson::parse(contents.as_bytes()).unwrap_or_default();
+                        crate::frontend::packagejson::parse(contents.as_bytes())
+                            .unwrap_or_default();
                     // `types-publisher` sometimes creates packages with `"typings": null` for packages that don't provide their own types.
                     // See `createNotNeededPackageJSON` in the types-publisher` repo.
                     is_not_needed_package = package_json_content.path_fields.typings.null;

@@ -57,7 +57,10 @@ enum StoreSlot {
     /// A node of another file (or a synthetic node) used as a child.
     Alias(Node),
     /// A node the factory created in this file.
-    Node { node: &'static ts_ast::Node, header: NodeHeader },
+    Node {
+        node: &'static ts_ast::Node,
+        header: NodeHeader,
+    },
 }
 
 /// The Go nodes of one parsed file.
@@ -105,7 +108,10 @@ fn with_slot<R>(n: Node, f: impl FnOnce(&'static ts_ast::Node, &NodeHeader) -> R
 }
 
 /// Writes the node slot of a store handle. Panics on a frozen store.
-fn with_slot_mut<R>(n: Node, f: impl FnOnce(&mut &'static ts_ast::Node, &mut NodeHeader) -> R) -> R {
+fn with_slot_mut<R>(
+    n: Node,
+    f: impl FnOnce(&mut &'static ts_ast::Node, &mut NodeHeader) -> R,
+) -> R {
     with_store_mut(n.file_index(), |s| {
         assert!(!s.frozen, "cannot mutate a node of a finished file");
         match &mut s.slots[slot_index(n)] {
@@ -256,7 +262,11 @@ pub fn set_store_node_flags(n: Node, flags: NodeFlags) {
 /// `internIdentifier`). The new data replaces the old; the old node leaks.
 pub fn replace_store_node_data(n: Node, data: NodeData) {
     with_slot_mut(n, |node, _| {
-        debug_assert!(data.matches_syntax_kind(node.kind), "{:?} does not fit its NodeData", node.kind);
+        debug_assert!(
+            data.matches_syntax_kind(node.kind),
+            "{:?} does not fit its NodeData",
+            node.kind
+        );
         *node = leak_ast_node(node.kind, data);
     });
 }
@@ -280,14 +290,21 @@ fn leak_ast_node(kind: SyntaxKind, data: NodeData) -> &'static ts_ast::Node {
 /// Go `newNode(kind, data, hooks)` in store `file`: `Loc =
 /// UndefinedTextRange()`, nil parent, no flags.
 pub fn alloc_store_node(file: usize, kind: SyntaxKind, data: NodeData) -> Node {
-    debug_assert!(data.matches_syntax_kind(kind), "{kind:?} does not fit its NodeData");
+    debug_assert!(
+        data.matches_syntax_kind(kind),
+        "{kind:?} does not fit its NodeData"
+    );
     let node = leak_ast_node(kind, data);
     with_store_mut(file, |s| {
         assert!(!s.frozen, "cannot create a node in a finished file");
         let index = s.slots.len() as u32;
         s.slots.push(StoreSlot::Node {
             node,
-            header: NodeHeader { parent: Node::NIL, flags: NodeFlags::NONE, loc: TextRange::undefined() },
+            header: NodeHeader {
+                parent: Node::NIL,
+                flags: NodeFlags::NONE,
+                loc: TextRange::undefined(),
+            },
         });
         handle(file, index)
     })
@@ -318,12 +335,19 @@ pub fn store_child_id(file: usize, n: Node) -> ts_ast::NodeId {
 /// Like `store_child_id`, for ts_ast fields that are `Option<NodeId>`.
 #[must_use]
 pub fn store_opt_child_id(file: usize, n: Node) -> Option<ts_ast::NodeId> {
-    if n.is_nil() { None } else { Some(store_child_id(file, n)) }
+    if n.is_nil() {
+        None
+    } else {
+        Some(store_child_id(file, n))
+    }
 }
 
 /// A Go `core.TextRange` in ts_ast form (`-1` is stored as `u32::MAX`).
 fn ts_range(loc: TextRange) -> ts_core::TextRange {
-    ts_core::TextRange { start: ts_core::TextPos::new(loc.pos() as u32), end: ts_core::TextPos::new(loc.end() as u32) }
+    ts_core::TextRange {
+        start: ts_core::TextPos::new(loc.pos() as u32),
+        end: ts_core::TextPos::new(loc.end() as u32),
+    }
 }
 
 /// The ts_ast list for a list of store `file`.
@@ -339,7 +363,10 @@ fn ts_list(file: usize, nodes: &[Node], loc: TextRange) -> ts_ast::NodeList {
 #[must_use]
 pub fn new_store_node_list(file: usize, nodes: &[Node], loc: TextRange) -> NodeList {
     let list: &'static ts_ast::NodeList = Box::leak(Box::new(ts_list(file, nodes, loc)));
-    NodeList { file: file as u32, list: Some(list) }
+    NodeList {
+        file: file as u32,
+        list: Some(list),
+    }
 }
 
 /// Go `f.NewModifierList(nodes)` followed by `list.Loc = loc`, in store
@@ -350,7 +377,10 @@ pub fn new_store_modifier_list(file: usize, nodes: &[Node], loc: TextRange) -> M
         list: ts_list(file, nodes, loc),
         flags: ts_ast::ModifierFlags(modifiers_to_flags(nodes).0 as u32),
     }));
-    ModifierList { file: file as u32, list: Some(list) }
+    ModifierList {
+        file: file as u32,
+        list: Some(list),
+    }
 }
 
 /// A list value to store inside new `NodeData` of store `file`. Go stores
@@ -377,7 +407,10 @@ pub fn store_list_value(file: usize, list: NodeList) -> Option<ts_ast::NodeList>
 #[must_use]
 pub fn store_req_list_value(file: usize, list: NodeList) -> ts_ast::NodeList {
     store_list_value(file, list).unwrap_or_else(|| ts_ast::NodeList {
-        range: ts_core::TextRange { start: ts_core::TextPos::new(NIL_LIST_POS), end: ts_core::TextPos::new(NIL_LIST_POS) },
+        range: ts_core::TextRange {
+            start: ts_core::TextPos::new(NIL_LIST_POS),
+            end: ts_core::TextPos::new(NIL_LIST_POS),
+        },
         nodes: Vec::new(),
         has_trailing_comma: false,
     })

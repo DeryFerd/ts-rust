@@ -1,5 +1,5 @@
 //! Go package `tspath`.
-pub mod path;
 pub mod extension;
-pub use path::*;
+pub mod path;
 pub use extension::*;
+pub use path::*;

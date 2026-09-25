@@ -21,8 +21,15 @@ impl Parser {
         let jsdoc = self.jsdoc_scanner_info();
         self.parse_expected(SyntaxKind::DefaultKeyword);
         self.parse_expected(SyntaxKind::ColonToken);
-        let statements = self.parse_list(ParsingContext::SwitchClauseStatements, Parser::parse_statement);
-        let node = self.factory.new_case_or_default_clause(SyntaxKind::DefaultClause, Node::NIL /*expression*/, statements);
+        let statements = self.parse_list(
+            ParsingContext::SwitchClauseStatements,
+            Parser::parse_statement,
+        );
+        let node = self.factory.new_case_or_default_clause(
+            SyntaxKind::DefaultClause,
+            Node::NIL, /*expression*/
+            statements,
+        );
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         result
@@ -41,7 +48,10 @@ impl Parser {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
         self.parse_expected(SyntaxKind::OpenBraceToken);
-        let clauses = self.parse_list(ParsingContext::SwitchClauses, Parser::parse_case_or_default_clause);
+        let clauses = self.parse_list(
+            ParsingContext::SwitchClauses,
+            Parser::parse_case_or_default_clause,
+        );
         self.parse_expected(SyntaxKind::CloseBraceToken);
         let node = self.factory.new_case_block(clauses);
         let result = self.finish_node(node, pos);
@@ -105,10 +115,16 @@ impl Parser {
         // one out no matter what.
         let mut finally_block = Node::NIL;
         if catch_clause.is_nil() || self.token == SyntaxKind::FinallyKeyword {
-            self.parse_expected_with_diagnostic(SyntaxKind::FinallyKeyword, Some(diag::X_catch_or_finally_expected), true /*shouldAdvance*/);
+            self.parse_expected_with_diagnostic(
+                SyntaxKind::FinallyKeyword,
+                Some(diag::X_catch_or_finally_expected),
+                true, /*shouldAdvance*/
+            );
             finally_block = self.parse_block(false /*ignoreMissingOpenBrace*/, None);
         }
-        let node = self.factory.new_try_statement(try_block, catch_clause, finally_block);
+        let node = self
+            .factory
+            .new_try_statement(try_block, catch_clause, finally_block);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         result
@@ -150,7 +166,9 @@ impl Parser {
         let has_paren = self.token == SyntaxKind::OpenParenToken;
         let expression = self.parse_expression();
 
-        if expression.kind() == SyntaxKind::Identifier && self.parse_optional(SyntaxKind::ColonToken) {
+        if expression.kind() == SyntaxKind::Identifier
+            && self.parse_optional(SyntaxKind::ColonToken)
+        {
             let statement = self.parse_statement();
             let node = self.factory.new_labeled_statement(expression, statement);
             let result = self.finish_node(node, pos);
@@ -171,10 +189,18 @@ impl Parser {
     }
 
     // Go: parser/parser.go:1547 parseVariableStatement
-    pub fn parse_variable_statement(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
-        let declaration_list = self.parse_variable_declaration_list(false /*inForStatementInitializer*/);
+    pub fn parse_variable_statement(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
+        let declaration_list =
+            self.parse_variable_declaration_list(false /*inForStatementInitializer*/);
         self.parse_semicolon();
-        let node = self.factory.new_variable_statement(modifiers, declaration_list);
+        let node = self
+            .factory
+            .new_variable_statement(modifiers, declaration_list);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.check_js_syntax(result);
@@ -210,7 +236,9 @@ impl Parser {
         // this context.
         // The checker will then give an error that there is an empty declaration list.
         let declarations;
-        if self.token == SyntaxKind::OfKeyword && self.look_ahead(Parser::next_is_identifier_and_close_paren) {
+        if self.token == SyntaxKind::OfKeyword
+            && self.look_ahead(Parser::next_is_identifier_and_close_paren)
+        {
             declarations = self.create_missing_list();
         } else {
             let save_context_flags = self.context_flags;
@@ -220,10 +248,13 @@ impl Parser {
             } else {
                 Parser::parse_variable_declaration_allow_exclamation
             };
-            declarations = self.parse_delimited_list(ParsingContext::VariableDeclarations, parse_element);
+            declarations =
+                self.parse_delimited_list(ParsingContext::VariableDeclarations, parse_element);
             self.context_flags = save_context_flags;
         }
-        let node = self.factory.new_variable_declaration_list(declarations, flags);
+        let node = self
+            .factory
+            .new_variable_declaration_list(declarations, flags);
         self.finish_node(node, pos)
     }
 
@@ -252,7 +283,9 @@ impl Parser {
     pub fn parse_variable_declaration_worker(&mut self, allow_exclamation: bool) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
-        let name = self.parse_identifier_or_pattern_with_diagnostic(Some(diag::Private_identifiers_are_not_allowed_in_variable_declarations));
+        let name = self.parse_identifier_or_pattern_with_diagnostic(Some(
+            diag::Private_identifiers_are_not_allowed_in_variable_declarations,
+        ));
         let mut exclamation_token = Node::NIL;
         if allow_exclamation
             && name.kind() == SyntaxKind::Identifier
@@ -266,7 +299,9 @@ impl Parser {
         if self.token != SyntaxKind::InKeyword && self.token != SyntaxKind::OfKeyword {
             initializer = self.parse_initializer();
         }
-        let node = self.factory.new_variable_declaration(name, exclamation_token, type_node, initializer);
+        let node =
+            self.factory
+                .new_variable_declaration(name, exclamation_token, type_node, initializer);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.check_js_syntax(result);
@@ -279,7 +314,10 @@ impl Parser {
     }
 
     // Go: parser/parser.go:1640 parseIdentifierOrPatternWithDiagnostic
-    pub fn parse_identifier_or_pattern_with_diagnostic(&mut self, private_identifier_diagnostic_message: Option<&'static Message>) -> Node {
+    pub fn parse_identifier_or_pattern_with_diagnostic(
+        &mut self,
+        private_identifier_diagnostic_message: Option<&'static Message>,
+    ) -> Node {
         if self.token == SyntaxKind::OpenBracketToken {
             return self.parse_array_binding_pattern();
         }
@@ -295,10 +333,15 @@ impl Parser {
         self.parse_expected(SyntaxKind::OpenBracketToken);
         let save_context_flags = self.context_flags;
         self.set_context_flags(NodeFlags::DISALLOW_IN_CONTEXT, false);
-        let elements = self.parse_delimited_list(ParsingContext::ArrayBindingElements, Parser::parse_array_binding_element);
+        let elements = self.parse_delimited_list(
+            ParsingContext::ArrayBindingElements,
+            Parser::parse_array_binding_element,
+        );
         self.context_flags = save_context_flags;
         self.parse_expected(SyntaxKind::CloseBracketToken);
-        let node = self.factory.new_binding_pattern(SyntaxKind::ArrayBindingPattern, elements);
+        let node = self
+            .factory
+            .new_binding_pattern(SyntaxKind::ArrayBindingPattern, elements);
         self.finish_node(node, pos)
     }
 
@@ -314,7 +357,12 @@ impl Parser {
             name = self.parse_identifier_or_pattern();
             initializer = self.parse_initializer();
         }
-        let node = self.factory.new_binding_element(dot_dot_dot_token, Node::NIL /*propertyName*/, name, initializer);
+        let node = self.factory.new_binding_element(
+            dot_dot_dot_token,
+            Node::NIL, /*propertyName*/
+            name,
+            initializer,
+        );
         self.finish_node(node, pos)
     }
 
@@ -324,10 +372,15 @@ impl Parser {
         self.parse_expected(SyntaxKind::OpenBraceToken);
         let save_context_flags = self.context_flags;
         self.set_context_flags(NodeFlags::DISALLOW_IN_CONTEXT, false);
-        let elements = self.parse_delimited_list(ParsingContext::ObjectBindingElements, Parser::parse_object_binding_element);
+        let elements = self.parse_delimited_list(
+            ParsingContext::ObjectBindingElements,
+            Parser::parse_object_binding_element,
+        );
         self.context_flags = save_context_flags;
         self.parse_expected(SyntaxKind::CloseBraceToken);
-        let node = self.factory.new_binding_pattern(SyntaxKind::ObjectBindingPattern, elements);
+        let node = self
+            .factory
+            .new_binding_pattern(SyntaxKind::ObjectBindingPattern, elements);
         self.finish_node(node, pos)
     }
 
@@ -346,7 +399,9 @@ impl Parser {
             name = self.parse_identifier_or_pattern();
         }
         let initializer = self.parse_initializer();
-        let node = self.factory.new_binding_element(dot_dot_dot_token, property_name, name, initializer);
+        let node =
+            self.factory
+                .new_binding_element(dot_dot_dot_token, property_name, name, initializer);
         self.finish_node(node, pos)
     }
 
@@ -367,20 +422,35 @@ impl Parser {
     }
 
     // Go: parser/parser.go:1717 parseFunctionDeclaration
-    pub fn parse_function_declaration(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
+    pub fn parse_function_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
         self.parse_expected(SyntaxKind::FunctionKeyword);
         let asterisk_token = self.parse_optional_token(SyntaxKind::AsteriskToken);
         // We don't parse the name here in await context, instead we will report a grammar error in the checker.
         let mut name = Node::NIL;
-        if modifiers.is_nil() || !modifiers.modifier_flags().intersects(ModifierFlags::DEFAULT) || self.is_binding_identifier() {
+        if modifiers.is_nil()
+            || !modifiers
+                .modifier_flags()
+                .intersects(ModifierFlags::DEFAULT)
+            || self.is_binding_identifier()
+        {
             name = self.parse_binding_identifier();
         }
-        let signature_flags = (if asterisk_token.is_some() { ParseFlags::YIELD } else { ParseFlags::NONE })
-            | (if modifiers.is_some() && modifiers.modifier_flags().intersects(ModifierFlags::ASYNC) {
-                ParseFlags::AWAIT
-            } else {
-                ParseFlags::NONE
-            });
+        let signature_flags = (if asterisk_token.is_some() {
+            ParseFlags::YIELD
+        } else {
+            ParseFlags::NONE
+        }) | (if modifiers.is_some()
+            && modifiers.modifier_flags().intersects(ModifierFlags::ASYNC)
+        {
+            ParseFlags::AWAIT
+        } else {
+            ParseFlags::NONE
+        });
         let type_parameters = self.parse_type_parameters();
         let save_context_flags = self.context_flags;
         if modifiers.is_some() && modifiers.modifier_flags().intersects(ModifierFlags::EXPORT) {
@@ -388,7 +458,8 @@ impl Parser {
         }
         let parameters = self.parse_parameters(signature_flags);
         let return_type = self.parse_return_type(SyntaxKind::ColonToken, false /*isType*/);
-        let body = self.parse_function_block_or_semicolon(signature_flags, Some(diag::X_or_expected));
+        let body =
+            self.parse_function_block_or_semicolon(signature_flags, Some(diag::X_or_expected));
         self.context_flags = save_context_flags;
         let node = self.factory.new_function_declaration(
             modifiers,
@@ -407,15 +478,30 @@ impl Parser {
     }
 
     // Go: parser/parser.go:1741 parseClassDeclaration
-    pub fn parse_class_declaration(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
-        self.parse_class_declaration_or_expression(pos, jsdoc, modifiers, SyntaxKind::ClassDeclaration)
+    pub fn parse_class_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
+        self.parse_class_declaration_or_expression(
+            pos,
+            jsdoc,
+            modifiers,
+            SyntaxKind::ClassDeclaration,
+        )
     }
 
     // Go: parser/parser.go:1745 parseClassExpression
     pub fn parse_class_expression(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
-        self.parse_class_declaration_or_expression(pos, jsdoc, ModifierList::NIL /*modifiers*/, SyntaxKind::ClassExpression)
+        self.parse_class_declaration_or_expression(
+            pos,
+            jsdoc,
+            ModifierList::NIL, /*modifiers*/
+            SyntaxKind::ClassExpression,
+        )
     }
 
     // Go: parser/parser.go:1749 parseClassDeclarationOrExpression
@@ -446,13 +532,27 @@ impl Parser {
             members = self.create_missing_list();
         }
         self.context_flags = save_context_flags;
-        if modifiers.is_some() && modifiers_to_flags(&modifiers.nodes().to_vec()).intersects(ModifierFlags::AMBIENT) {
+        if modifiers.is_some()
+            && modifiers_to_flags(&modifiers.nodes().to_vec()).intersects(ModifierFlags::AMBIENT)
+        {
             self.statement_has_await_identifier = save_has_await_identifier;
         }
         let result = if kind == SyntaxKind::ClassDeclaration {
-            self.factory.new_class_declaration(modifiers, name, type_parameters, heritage_clauses, members)
+            self.factory.new_class_declaration(
+                modifiers,
+                name,
+                type_parameters,
+                heritage_clauses,
+                members,
+            )
         } else {
-            self.factory.new_class_expression(modifiers, name, type_parameters, heritage_clauses, members)
+            self.factory.new_class_expression(
+                modifiers,
+                name,
+                type_parameters,
+                heritage_clauses,
+                members,
+            )
         };
         self.finish_node(result, pos);
         self.with_js_doc(result, jsdoc);
@@ -490,7 +590,8 @@ impl Parser {
 
     // Go: parser/parser.go:1811 isImplementsClause
     pub fn is_implements_clause(&mut self) -> bool {
-        self.token == SyntaxKind::ImplementsKeyword && self.look_ahead(Parser::next_token_is_identifier_or_keyword)
+        self.token == SyntaxKind::ImplementsKeyword
+            && self.look_ahead(Parser::next_token_is_identifier_or_keyword)
     }
 }
 
@@ -510,7 +611,10 @@ impl Parser {
         // ClassTail[Yield,Await] : (Modified) See 14.5
         //      ClassHeritage[?Yield,?Await]opt { ClassBody[?Yield,?Await]opt }
         if self.is_heritage_clause() {
-            return self.parse_list(ParsingContext::HeritageClauses, Parser::parse_heritage_clause);
+            return self.parse_list(
+                ParsingContext::HeritageClauses,
+                Parser::parse_heritage_clause,
+            );
         }
         NodeList::NIL
     }
@@ -520,7 +624,10 @@ impl Parser {
         let pos = self.node_pos();
         let kind = self.token;
         self.next_token();
-        let types = self.parse_delimited_list(ParsingContext::HeritageClauseElement, Parser::parse_expression_with_type_arguments);
+        let types = self.parse_delimited_list(
+            ParsingContext::HeritageClauseElement,
+            Parser::parse_expression_with_type_arguments,
+        );
         let node = self.factory.new_heritage_clause(kind, types);
         let node = self.finish_node(node, pos);
         self.check_js_syntax(node)
@@ -534,7 +641,9 @@ impl Parser {
             return expression;
         }
         let type_arguments = self.parse_type_arguments();
-        let node = self.factory.new_expression_with_type_arguments(expression, type_arguments);
+        let node = self
+            .factory
+            .new_expression_with_type_arguments(expression, type_arguments);
         self.finish_node(node, pos)
     }
 
@@ -549,18 +658,37 @@ impl Parser {
             self.with_js_doc(result, jsdoc);
             return result;
         }
-        let modifiers = self.parse_modifiers_ex(true /*allowDecorators*/, true /*permitConstAsModifier*/, true /*stopOnStartOfClassStaticBlock*/);
-        if self.token == SyntaxKind::StaticKeyword && self.look_ahead(Parser::next_token_is_open_brace) {
+        let modifiers = self.parse_modifiers_ex(
+            true, /*allowDecorators*/
+            true, /*permitConstAsModifier*/
+            true, /*stopOnStartOfClassStaticBlock*/
+        );
+        if self.token == SyntaxKind::StaticKeyword
+            && self.look_ahead(Parser::next_token_is_open_brace)
+        {
             return self.parse_class_static_block_declaration(pos, jsdoc, modifiers);
         }
         if self.parse_contextual_modifier(SyntaxKind::GetKeyword) {
-            return self.parse_accessor_declaration(pos, jsdoc, modifiers, SyntaxKind::GetAccessor, ParseFlags::NONE);
+            return self.parse_accessor_declaration(
+                pos,
+                jsdoc,
+                modifiers,
+                SyntaxKind::GetAccessor,
+                ParseFlags::NONE,
+            );
         }
         if self.parse_contextual_modifier(SyntaxKind::SetKeyword) {
-            return self.parse_accessor_declaration(pos, jsdoc, modifiers, SyntaxKind::SetAccessor, ParseFlags::NONE);
+            return self.parse_accessor_declaration(
+                pos,
+                jsdoc,
+                modifiers,
+                SyntaxKind::SetAccessor,
+                ParseFlags::NONE,
+            );
         }
         if self.token == SyntaxKind::ConstructorKeyword || self.token == SyntaxKind::StringLiteral {
-            let constructor_declaration = self.try_parse_constructor_declaration(pos, jsdoc, modifiers);
+            let constructor_declaration =
+                self.try_parse_constructor_declaration(pos, jsdoc, modifiers);
             if constructor_declaration.is_some() {
                 return constructor_declaration;
             }
@@ -578,7 +706,8 @@ impl Parser {
             || self.token == SyntaxKind::AsteriskToken
             || self.token == SyntaxKind::OpenBracketToken
         {
-            let is_ambient = modifiers.is_some() && modifiers.nodes().iter().any(is_declare_modifier);
+            let is_ambient =
+                modifiers.is_some() && modifiers.nodes().iter().any(is_declare_modifier);
             if is_ambient {
                 for m in modifiers.nodes().iter() {
                     set_node_flags(m, m.flags() | NodeFlags::AMBIENT);
@@ -597,17 +726,30 @@ impl Parser {
             let node_pos = self.node_pos();
             self.parse_error_at(node_pos, node_pos, diag::Declaration_expected, args![]);
             let name = self.create_missing_identifier();
-            return self.parse_property_declaration(pos, jsdoc, modifiers, name, Node::NIL /*questionToken*/);
+            return self.parse_property_declaration(
+                pos,
+                jsdoc,
+                modifiers,
+                name,
+                Node::NIL, /*questionToken*/
+            );
         }
         // 'isClassMemberStart' should have hinted not to attempt parsing.
         panic!("Should not have attempted to parse class member declaration.");
     }
 
     // Go: parser/parser.go:1905 parseClassStaticBlockDeclaration
-    pub fn parse_class_static_block_declaration(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
+    pub fn parse_class_static_block_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
         self.parse_expected_token(SyntaxKind::StaticKeyword);
         let body = self.parse_class_static_block_body();
-        let node = self.factory.new_class_static_block_declaration(modifiers, body);
+        let node = self
+            .factory
+            .new_class_static_block_declaration(modifiers, body);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         result
@@ -618,13 +760,21 @@ impl Parser {
         let save_context_flags = self.context_flags;
         self.set_context_flags(NodeFlags::YIELD_CONTEXT, false);
         self.set_context_flags(NodeFlags::AWAIT_CONTEXT, true);
-        let body = self.parse_block(false /*ignoreMissingOpenBrace*/, None /*diagnosticMessage*/);
+        let body = self.parse_block(
+            false, /*ignoreMissingOpenBrace*/
+            None,  /*diagnosticMessage*/
+        );
         self.context_flags = save_context_flags;
         body
     }
 
     // Go: parser/parser.go:1922 tryParseConstructorDeclaration
-    pub fn try_parse_constructor_declaration(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
+    pub fn try_parse_constructor_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
         let state = self.mark();
         if self.token == SyntaxKind::ConstructorKeyword
             || self.token == SyntaxKind::StringLiteral
@@ -635,7 +785,8 @@ impl Parser {
             let type_parameters = self.parse_type_parameters();
             let parameters = self.parse_parameters(ParseFlags::NONE);
             let return_type = self.parse_return_type(SyntaxKind::ColonToken, false /*isType*/);
-            let body = self.parse_function_block_or_semicolon(ParseFlags::NONE, Some(diag::X_or_expected));
+            let body =
+                self.parse_function_block_or_semicolon(ParseFlags::NONE, Some(diag::X_or_expected));
             let node = self.factory.new_constructor_declaration(
                 modifiers,
                 type_parameters,
@@ -659,14 +810,30 @@ impl Parser {
     }
 
     // Go: parser/parser.go:1943 parsePropertyOrMethodDeclaration
-    pub fn parse_property_or_method_declaration(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
+    pub fn parse_property_or_method_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
         let asterisk_token = self.parse_optional_token(SyntaxKind::AsteriskToken);
         let name = self.parse_property_name();
         // Note: this is not legal as per the grammar.  But we allow it in the parser and
         // report an error in the grammar checker.
         let question_token = self.parse_optional_token(SyntaxKind::QuestionToken);
-        if asterisk_token.is_some() || self.token == SyntaxKind::OpenParenToken || self.token == SyntaxKind::LessThanToken {
-            return self.parse_method_declaration(pos, jsdoc, modifiers, asterisk_token, name, question_token, Some(diag::X_or_expected));
+        if asterisk_token.is_some()
+            || self.token == SyntaxKind::OpenParenToken
+            || self.token == SyntaxKind::LessThanToken
+        {
+            return self.parse_method_declaration(
+                pos,
+                jsdoc,
+                modifiers,
+                asterisk_token,
+                name,
+                question_token,
+                Some(diag::X_or_expected),
+            );
         }
         self.parse_property_declaration(pos, jsdoc, modifiers, name, question_token)
     }
@@ -683,8 +850,15 @@ impl Parser {
         question_token: Node,
         diagnostic_message: Option<&'static Message>,
     ) -> Node {
-        let signature_flags = (if asterisk_token.is_some() { ParseFlags::YIELD } else { ParseFlags::NONE })
-            | (if modifier_list_has_async(modifiers) { ParseFlags::AWAIT } else { ParseFlags::NONE });
+        let signature_flags = (if asterisk_token.is_some() {
+            ParseFlags::YIELD
+        } else {
+            ParseFlags::NONE
+        }) | (if modifier_list_has_async(modifiers) {
+            ParseFlags::AWAIT
+        } else {
+            ParseFlags::NONE
+        });
         let type_parameters = self.parse_type_parameters();
         let parameters = self.parse_parameters(signature_flags);
         let type_node = self.parse_return_type(SyntaxKind::ColonToken, false /*isType*/);
@@ -734,7 +908,13 @@ impl Parser {
             Parser::parse_initializer,
         );
         self.parse_semicolon_after_property_name(name, type_node, initializer);
-        let node = self.factory.new_property_declaration(modifiers, name, postfix_token, type_node, initializer);
+        let node = self.factory.new_property_declaration(
+            modifiers,
+            name,
+            postfix_token,
+            type_node,
+            initializer,
+        );
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.check_js_syntax(result);
@@ -742,19 +922,33 @@ impl Parser {
     }
 
     // Go: parser/parser.go:1985 parseSemicolonAfterPropertyName
-    pub fn parse_semicolon_after_property_name(&mut self, name: Node, type_node: Node, initializer: Node) {
+    pub fn parse_semicolon_after_property_name(
+        &mut self,
+        name: Node,
+        type_node: Node,
+        initializer: Node,
+    ) {
         if self.token == SyntaxKind::AtToken && !self.has_preceding_line_break() {
-            self.parse_error_at_current_token(diag::Decorators_must_precede_the_name_and_all_keywords_of_property_declarations, args![]);
+            self.parse_error_at_current_token(
+                diag::Decorators_must_precede_the_name_and_all_keywords_of_property_declarations,
+                args![],
+            );
             return;
         }
         if self.token == SyntaxKind::OpenParenToken {
-            self.parse_error_at_current_token(diag::Cannot_start_a_function_call_in_a_type_annotation, args![]);
+            self.parse_error_at_current_token(
+                diag::Cannot_start_a_function_call_in_a_type_annotation,
+                args![],
+            );
             self.next_token();
             return;
         }
         if type_node.is_some() && !self.can_parse_semicolon() {
             if initializer.is_some() {
-                self.parse_error_at_current_token(diag::X_0_expected, args![token_to_string(SyntaxKind::SemicolonToken)]);
+                self.parse_error_at_current_token(
+                    diag::X_0_expected,
+                    args![token_to_string(SyntaxKind::SemicolonToken)],
+                );
             } else {
                 self.parse_error_at_current_token(diag::Expected_for_property_initializer, args![]);
             }
@@ -764,7 +958,10 @@ impl Parser {
             return;
         }
         if initializer.is_some() {
-            self.parse_error_at_current_token(diag::X_0_expected, args![token_to_string(SyntaxKind::SemicolonToken)]);
+            self.parse_error_at_current_token(
+                diag::X_0_expected,
+                args![token_to_string(SyntaxKind::SemicolonToken)],
+            );
             return;
         }
         self.parse_error_for_missing_semicolon_after(name);
@@ -777,7 +974,11 @@ impl Parser {
         //   ^^^^^^^^^^^ This block is parsed as a template literal like module`M1`.
         if node.kind() == SyntaxKind::TaggedTemplateExpression {
             let range = self.skip_range_trivia(node.template().loc());
-            self.parse_error_at_range(range, diag::Module_declaration_names_may_only_use_or_quoted_strings, args![]);
+            self.parse_error_at_range(
+                range,
+                diag::Module_declaration_names_may_only_use_or_quoted_strings,
+                args![],
+            );
             return;
         }
         // Otherwise, if this isn't a well-known keyword-like identifier, give the generic fallback message.
@@ -786,14 +987,22 @@ impl Parser {
             expression_text = node.text();
         }
         if expression_text.is_empty() {
-            self.parse_error_at_current_token(diag::X_0_expected, args![token_to_string(SyntaxKind::SemicolonToken)]);
+            self.parse_error_at_current_token(
+                diag::X_0_expected,
+                args![token_to_string(SyntaxKind::SemicolonToken)],
+            );
             return;
         }
         let pos = skip_trivia(self.source_text, node.pos());
         // Some known keywords are likely signs of syntax being used improperly.
         match expression_text {
             "const" | "let" | "var" => {
-                self.parse_error_at(pos, node.end(), diag::Variable_declaration_not_allowed_at_this_location, args![]);
+                self.parse_error_at(
+                    pos,
+                    node.end(),
+                    diag::Variable_declaration_not_allowed_at_this_location,
+                    args![],
+                );
                 return;
             }
             "declare" => {
@@ -801,7 +1010,11 @@ impl Parser {
                 return;
             }
             "interface" => {
-                self.parse_error_for_invalid_name(diag::Interface_name_cannot_be_0, diag::Interface_must_be_given_a_name, SyntaxKind::OpenBraceToken);
+                self.parse_error_for_invalid_name(
+                    diag::Interface_name_cannot_be_0,
+                    diag::Interface_must_be_given_a_name,
+                    SyntaxKind::OpenBraceToken,
+                );
                 return;
             }
             "is" => {
@@ -815,22 +1028,38 @@ impl Parser {
                 return;
             }
             "module" | "namespace" => {
-                self.parse_error_for_invalid_name(diag::Namespace_name_cannot_be_0, diag::Namespace_must_be_given_a_name, SyntaxKind::OpenBraceToken);
+                self.parse_error_for_invalid_name(
+                    diag::Namespace_name_cannot_be_0,
+                    diag::Namespace_must_be_given_a_name,
+                    SyntaxKind::OpenBraceToken,
+                );
                 return;
             }
             "type" => {
-                self.parse_error_for_invalid_name(diag::Type_alias_name_cannot_be_0, diag::Type_alias_must_be_given_a_name, SyntaxKind::EqualsToken);
+                self.parse_error_for_invalid_name(
+                    diag::Type_alias_name_cannot_be_0,
+                    diag::Type_alias_must_be_given_a_name,
+                    SyntaxKind::EqualsToken,
+                );
                 return;
             }
             _ => {}
         }
         // The user alternatively might have misspelled or forgotten to add a space after a common keyword.
-        let mut suggestion = get_spelling_suggestion_for_strings(expression_text, viable_keyword_suggestions().iter().cloned());
+        let mut suggestion = get_spelling_suggestion_for_strings(
+            expression_text,
+            viable_keyword_suggestions().iter().cloned(),
+        );
         if suggestion.is_empty() {
             suggestion = get_space_suggestion(expression_text);
         }
         if !suggestion.is_empty() {
-            self.parse_error_at(pos, node.end(), diag::Unknown_keyword_or_identifier_Did_you_mean_0, args![suggestion]);
+            self.parse_error_at(
+                pos,
+                node.end(),
+                diag::Unknown_keyword_or_identifier_Did_you_mean_0,
+                args![suggestion],
+            );
             return;
         }
         // Unknown tokens are handled with their own errors in the scanner
@@ -838,14 +1067,21 @@ impl Parser {
             return;
         }
         // Otherwise, we know this some kind of unknown word, not just a missing expected semicolon.
-        self.parse_error_at(pos, node.end(), diag::Unexpected_keyword_or_identifier, args![]);
+        self.parse_error_at(
+            pos,
+            node.end(),
+            diag::Unexpected_keyword_or_identifier,
+            args![],
+        );
     }
 }
 
 // Go: parser/parser.go:2069 getSpaceSuggestion
 pub fn get_space_suggestion(expression_text: &str) -> String {
     for keyword in viable_keyword_suggestions().iter() {
-        if expression_text.len() > keyword.len() + 2 && expression_text.starts_with(keyword.as_str()) {
+        if expression_text.len() > keyword.len() + 2
+            && expression_text.starts_with(keyword.as_str())
+        {
             return format!("{} {}", keyword, &expression_text[keyword.len()..]);
         }
     }
@@ -869,13 +1105,24 @@ impl Parser {
     }
 
     // Go: parser/parser.go:2086 parseInterfaceDeclaration
-    pub fn parse_interface_declaration(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
+    pub fn parse_interface_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
         self.parse_expected(SyntaxKind::InterfaceKeyword);
         let name = self.parse_identifier();
         let type_parameters = self.parse_type_parameters();
         let heritage_clauses = self.parse_heritage_clauses();
         let members = self.parse_object_type_members();
-        let node = self.factory.new_interface_declaration(modifiers, name, type_parameters, heritage_clauses, members);
+        let node = self.factory.new_interface_declaration(
+            modifiers,
+            name,
+            type_parameters,
+            heritage_clauses,
+            members,
+        );
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.check_js_syntax(result);
@@ -883,7 +1130,12 @@ impl Parser {
     }
 
     // Go: parser/parser.go:2098 parseTypeAliasDeclaration
-    pub fn parse_type_alias_declaration(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
+    pub fn parse_type_alias_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
         self.parse_expected(SyntaxKind::TypeKeyword);
         if self.has_preceding_line_break() {
             self.parse_error_at_current_token(diag::Line_break_not_permitted_here, args![]);
@@ -891,13 +1143,17 @@ impl Parser {
         let name = self.parse_identifier();
         let type_parameters = self.parse_type_parameters();
         self.parse_expected(SyntaxKind::EqualsToken);
-        let type_node = if self.token == SyntaxKind::IntrinsicKeyword && self.look_ahead(Parser::next_is_not_dot) {
+        let type_node = if self.token == SyntaxKind::IntrinsicKeyword
+            && self.look_ahead(Parser::next_is_not_dot)
+        {
             self.parse_keyword_type_node()
         } else {
             self.parse_type()
         };
         self.parse_semicolon();
-        let node = self.factory.new_type_alias_declaration(modifiers, name, type_parameters, type_node);
+        let node =
+            self.factory
+                .new_type_alias_declaration(modifiers, name, type_parameters, type_node);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.check_js_syntax(result);
@@ -918,7 +1174,12 @@ impl Parser {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
         let name = self.parse_property_name();
-        let initializer = do_in_context(self, NodeFlags::DISALLOW_IN_CONTEXT, false, Parser::parse_initializer);
+        let initializer = do_in_context(
+            self,
+            NodeFlags::DISALLOW_IN_CONTEXT,
+            false,
+            Parser::parse_initializer,
+        );
         let node = self.factory.new_enum_member(name, initializer);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
@@ -926,7 +1187,12 @@ impl Parser {
     }
 
     // Go: parser/parser.go:2137 parseEnumDeclaration
-    pub fn parse_enum_declaration(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
+    pub fn parse_enum_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
         let save_has_await_identifier = self.statement_has_await_identifier;
         self.parse_expected(SyntaxKind::EnumKeyword);
         let name = self.parse_identifier();
@@ -934,7 +1200,8 @@ impl Parser {
         if self.parse_expected(SyntaxKind::OpenBraceToken) {
             let save_context_flags = self.context_flags;
             self.set_context_flags(NodeFlags::YIELD_CONTEXT | NodeFlags::AWAIT_CONTEXT, false);
-            members = self.parse_delimited_list(ParsingContext::EnumMembers, Parser::parse_enum_member);
+            members =
+                self.parse_delimited_list(ParsingContext::EnumMembers, Parser::parse_enum_member);
             self.context_flags = save_context_flags;
             self.parse_expected(SyntaxKind::CloseBraceToken);
         } else {
@@ -949,7 +1216,12 @@ impl Parser {
     }
 
     // Go: parser/parser.go:2158 parseModuleDeclaration
-    pub fn parse_module_declaration(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
+    pub fn parse_module_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
         let mut keyword = SyntaxKind::ModuleKeyword;
         if self.token == SyntaxKind::GlobalKeyword {
             // global augmentation
@@ -962,11 +1234,19 @@ impl Parser {
                 return self.parse_ambient_external_module_declaration(pos, jsdoc, modifiers);
             }
         }
-        self.parse_module_or_namespace_declaration(pos, jsdoc, modifiers, false /*nested*/, keyword)
+        self.parse_module_or_namespace_declaration(
+            pos, jsdoc, modifiers, false, /*nested*/
+            keyword,
+        )
     }
 
     // Go: parser/parser.go:2174 parseAmbientExternalModuleDeclaration
-    pub fn parse_ambient_external_module_declaration(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
+    pub fn parse_ambient_external_module_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
         let name;
         let mut keyword = SyntaxKind::ModuleKeyword;
         let save_has_await_identifier = self.statement_has_await_identifier;
@@ -984,7 +1264,9 @@ impl Parser {
         } else {
             self.parse_semicolon();
         }
-        let node = self.factory.new_module_declaration(modifiers, keyword, name, body);
+        let node = self
+            .factory
+            .new_module_declaration(modifiers, keyword, name, body);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.statement_has_await_identifier = save_has_await_identifier;
@@ -1015,7 +1297,11 @@ impl Parser {
         keyword: SyntaxKind,
     ) -> Node {
         let save_has_await_identifier = self.statement_has_await_identifier;
-        let name = if nested { self.parse_identifier_name() } else { self.parse_identifier() };
+        let name = if nested {
+            self.parse_identifier_name()
+        } else {
+            self.parse_identifier()
+        };
         let body;
         if self.parse_optional(SyntaxKind::DotToken) {
             let implicit_export = self.factory.new_modifier(SyntaxKind::ExportKeyword);
@@ -1023,7 +1309,8 @@ impl Parser {
             set_node_loc(implicit_export, TextRange::new(node_pos, node_pos));
             set_node_flags(implicit_export, NodeFlags::REPARSED);
             // PORT: Go `p.nodeSliceArena.NewSlice1(implicitExport)` is a one-element slice.
-            let implicit_modifiers = self.new_modifier_list(implicit_export.loc(), &[implicit_export]);
+            let implicit_modifiers =
+                self.new_modifier_list(implicit_export.loc(), &[implicit_export]);
             let inner_pos = self.node_pos();
             body = self.parse_module_or_namespace_declaration(
                 inner_pos,
@@ -1035,7 +1322,9 @@ impl Parser {
         } else {
             body = self.parse_module_block();
         }
-        let node = self.factory.new_module_declaration(modifiers, keyword, name, body);
+        let node = self
+            .factory
+            .new_module_declaration(modifiers, keyword, name, body);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.check_js_syntax(result);
@@ -1062,8 +1351,10 @@ impl Parser {
         if identifier.is_some()
             && identifier.text() == "type"
             && (self.token != SyntaxKind::FromKeyword
-                || self.is_identifier() && self.look_ahead(Parser::next_token_is_from_keyword_or_equals_token))
-            && (self.is_identifier() || self.token_after_import_definitely_produces_import_declaration())
+                || self.is_identifier()
+                    && self.look_ahead(Parser::next_token_is_from_keyword_or_equals_token))
+            && (self.is_identifier()
+                || self.token_after_import_definitely_produces_import_declaration())
         {
             phase_modifier = SyntaxKind::TypeKeyword;
             identifier = Node::NIL;
@@ -1088,17 +1379,33 @@ impl Parser {
             && !self.token_after_imported_identifier_definitely_produces_import_declaration()
             && phase_modifier != SyntaxKind::DeferKeyword
         {
-            let node = self.parse_import_equals_declaration(pos, jsdoc, modifiers, identifier, phase_modifier == SyntaxKind::TypeKeyword);
+            let node = self.parse_import_equals_declaration(
+                pos,
+                jsdoc,
+                modifiers,
+                identifier,
+                phase_modifier == SyntaxKind::TypeKeyword,
+            );
             let import_equals = self.check_js_syntax(node);
             self.statement_has_await_identifier = save_has_await_identifier; // Import= declaration is always parsed in an Await context, no need to reparse
             return import_equals;
         }
-        let import_clause = self.try_parse_import_clause(identifier, after_import_pos, phase_modifier, false /*skipJSDocLeadingAsterisks*/);
+        let import_clause = self.try_parse_import_clause(
+            identifier,
+            after_import_pos,
+            phase_modifier,
+            false, /*skipJSDocLeadingAsterisks*/
+        );
         self.statement_has_await_identifier = save_has_await_identifier; // import clause is always parsed in an Await context
         let module_specifier = self.parse_module_specifier();
         let attributes = self.try_parse_import_attributes();
         self.parse_semicolon();
-        let node = self.factory.new_import_declaration(modifiers, import_clause, module_specifier, attributes);
+        let node = self.factory.new_import_declaration(
+            modifiers,
+            import_clause,
+            module_specifier,
+            attributes,
+        );
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.check_js_syntax(result);
@@ -1135,7 +1442,12 @@ impl Parser {
         self.parse_expected(SyntaxKind::EqualsToken);
         let module_reference = self.parse_module_reference();
         self.parse_semicolon();
-        let node = self.factory.new_import_equals_declaration(modifiers, is_type_only, identifier, module_reference);
+        let node = self.factory.new_import_equals_declaration(
+            modifiers,
+            is_type_only,
+            identifier,
+            module_reference,
+        );
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         result
@@ -1143,10 +1455,15 @@ impl Parser {
 
     // Go: parser/parser.go:2308 parseModuleReference
     pub fn parse_module_reference(&mut self) -> Node {
-        if self.token == SyntaxKind::RequireKeyword && self.look_ahead(Parser::next_token_is_open_paren) {
+        if self.token == SyntaxKind::RequireKeyword
+            && self.look_ahead(Parser::next_token_is_open_paren)
+        {
             return self.parse_external_module_reference();
         }
-        self.parse_entity_name(false /*allowReservedWords*/, None /*diagnosticMessage*/)
+        self.parse_entity_name(
+            false, /*allowReservedWords*/
+            None,  /*diagnosticMessage*/
+        )
     }
 
     // Go: parser/parser.go:2315 parseExternalModuleReference
@@ -1185,8 +1502,16 @@ impl Parser {
         // ImportDeclaration:
         //  import ImportClause from ModuleSpecifier ;
         //  import ModuleSpecifier;
-        if identifier.is_some() || self.token == SyntaxKind::AsteriskToken || self.token == SyntaxKind::OpenBraceToken {
-            let import_clause = self.parse_import_clause(identifier, pos, phase_modifier, skip_js_doc_leading_asterisks);
+        if identifier.is_some()
+            || self.token == SyntaxKind::AsteriskToken
+            || self.token == SyntaxKind::OpenBraceToken
+        {
+            let import_clause = self.parse_import_clause(
+                identifier,
+                pos,
+                phase_modifier,
+                skip_js_doc_leading_asterisks,
+            );
             self.parse_expected(SyntaxKind::FromKeyword);
             return import_clause;
         }
@@ -1224,7 +1549,9 @@ impl Parser {
                 self.scanner.set_skip_js_doc_leading_asterisks(false);
             }
         }
-        let node = self.factory.new_import_clause(phase_modifier, identifier, named_bindings);
+        let node = self
+            .factory
+            .new_import_clause(phase_modifier, identifier, named_bindings);
         let result = self.finish_node(node, pos);
         self.statement_has_await_identifier = save_has_await_identifier;
         result
@@ -1262,7 +1589,8 @@ impl Parser {
     // Go: parser/parser.go:2399 parseImportSpecifier
     pub fn parse_import_specifier(&mut self) -> Node {
         let pos = self.node_pos();
-        let (is_type_only, property_name, name) = self.parse_import_or_export_specifier(SyntaxKind::ImportSpecifier);
+        let (is_type_only, property_name, name) =
+            self.parse_import_or_export_specifier(SyntaxKind::ImportSpecifier);
         let identifier_name;
         if name.kind() == SyntaxKind::Identifier {
             identifier_name = name;
@@ -1272,7 +1600,9 @@ impl Parser {
             identifier_name = self.new_identifier("");
             self.finish_node(identifier_name, name.pos());
         }
-        let node = self.factory.new_import_specifier(is_type_only, property_name, identifier_name);
+        let node = self
+            .factory
+            .new_import_specifier(is_type_only, property_name, identifier_name);
         let node = self.finish_node(node, pos);
         self.check_js_syntax(node)
     }
@@ -1372,7 +1702,9 @@ impl Parser {
 
     // Go: parser/parser.go:2502 tryParseImportAttributes
     pub fn try_parse_import_attributes(&mut self) -> Node {
-        if self.token == SyntaxKind::WithKeyword || (self.token == SyntaxKind::AssertKeyword && !self.has_preceding_line_break()) {
+        if self.token == SyntaxKind::WithKeyword
+            || (self.token == SyntaxKind::AssertKeyword && !self.has_preceding_line_break())
+        {
             if self.token == SyntaxKind::AssertKeyword {
                 self.parse_error_at_current_token(
                     diag::Import_assertions_have_been_replaced_by_import_attributes_Use_with_instead_of_assert,
@@ -1386,7 +1718,12 @@ impl Parser {
     }
 
     // Go: parser/parser.go:2512 parseExportAssignment
-    pub fn parse_export_assignment(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
+    pub fn parse_export_assignment(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
         let save_context_flags = self.context_flags;
         let save_has_await_identifier = self.statement_has_await_identifier;
         self.set_context_flags(NodeFlags::AWAIT_CONTEXT, true);
@@ -1400,7 +1737,12 @@ impl Parser {
         self.parse_semicolon();
         self.context_flags = save_context_flags;
         self.statement_has_await_identifier = save_has_await_identifier;
-        let node = self.factory.new_export_assignment(modifiers, is_export_equals, Node::NIL /*typeNode*/, expression);
+        let node = self.factory.new_export_assignment(
+            modifiers,
+            is_export_equals,
+            Node::NIL, /*typeNode*/
+            expression,
+        );
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.check_js_syntax(result);
@@ -1408,7 +1750,12 @@ impl Parser {
     }
 
     // Go: parser/parser.go:2532 parseNamespaceExportDeclaration
-    pub fn parse_namespace_export_declaration(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
+    pub fn parse_namespace_export_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
         self.parse_expected(SyntaxKind::AsKeyword);
         self.parse_expected(SyntaxKind::NamespaceKeyword);
         let save_has_await_identifier = self.statement_has_await_identifier;
@@ -1416,14 +1763,21 @@ impl Parser {
         self.statement_has_await_identifier = save_has_await_identifier;
         self.parse_semicolon();
         // NamespaceExportDeclaration nodes cannot have decorators or modifiers, we attach them here so we can report them in the grammar checker
-        let node = self.factory.new_namespace_export_declaration(modifiers, name);
+        let node = self
+            .factory
+            .new_namespace_export_declaration(modifiers, name);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         result
     }
 
     // Go: parser/parser.go:2545 parseExportDeclaration
-    pub fn parse_export_declaration(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
+    pub fn parse_export_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
         let save_context_flags = self.context_flags;
         let save_has_await_identifier = self.statement_has_await_identifier;
         self.set_context_flags(NodeFlags::AWAIT_CONTEXT, true);
@@ -1443,7 +1797,9 @@ impl Parser {
             // It is not uncommon to accidentally omit the 'from' keyword. Additionally, in editing scenarios,
             // the 'from' keyword can be parsed as a named export when the export clause is unterminated (i.e. `export { from "moduleName";`)
             // If we don't have a 'from' keyword, see if we have a string literal such that ASI won't take effect.
-            if self.token == SyntaxKind::FromKeyword || (self.token == SyntaxKind::StringLiteral && !self.has_preceding_line_break()) {
+            if self.token == SyntaxKind::FromKeyword
+                || (self.token == SyntaxKind::StringLiteral && !self.has_preceding_line_break())
+            {
                 self.parse_expected(SyntaxKind::FromKeyword);
                 module_specifier = self.parse_module_specifier();
             }
@@ -1464,7 +1820,13 @@ impl Parser {
         self.parse_semicolon();
         self.context_flags = save_context_flags;
         self.statement_has_await_identifier = save_has_await_identifier;
-        let node = self.factory.new_export_declaration(modifiers, is_type_only, export_clause, module_specifier, attributes);
+        let node = self.factory.new_export_declaration(
+            modifiers,
+            is_type_only,
+            export_clause,
+            module_specifier,
+            attributes,
+        );
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.check_js_syntax(result);
@@ -1499,8 +1861,11 @@ impl Parser {
     pub fn parse_export_specifier(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
-        let (is_type_only, property_name, name) = self.parse_import_or_export_specifier(SyntaxKind::ExportSpecifier);
-        let node = self.factory.new_export_specifier(is_type_only, property_name, name);
+        let (is_type_only, property_name, name) =
+            self.parse_import_or_export_specifier(SyntaxKind::ExportSpecifier);
+        let node = self
+            .factory
+            .new_export_specifier(is_type_only, property_name, name);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.check_js_syntax(result);
@@ -1524,12 +1889,32 @@ impl Parser {
                 && self.parse_optional(SyntaxKind::ExtendsKeyword)
             {
                 // The type following 'extends' is not permitted to be another conditional type
-                let extends_type = do_in_context(self, NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT, true, Parser::parse_type);
+                let extends_type = do_in_context(
+                    self,
+                    NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT,
+                    true,
+                    Parser::parse_type,
+                );
                 self.parse_expected(SyntaxKind::QuestionToken);
-                let true_type = do_in_context(self, NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT, false, Parser::parse_type);
+                let true_type = do_in_context(
+                    self,
+                    NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT,
+                    false,
+                    Parser::parse_type,
+                );
                 self.parse_expected(SyntaxKind::ColonToken);
-                let false_type = do_in_context(self, NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT, false, Parser::parse_type);
-                let conditional_type = self.factory.new_conditional_type_node(type_node, extends_type, true_type, false_type);
+                let false_type = do_in_context(
+                    self,
+                    NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT,
+                    false,
+                    Parser::parse_type,
+                );
+                let conditional_type = self.factory.new_conditional_type_node(
+                    type_node,
+                    extends_type,
+                    true_type,
+                    false_type,
+                );
                 self.finish_node(conditional_type, pos);
                 type_node = conditional_type;
             }
@@ -1540,16 +1925,26 @@ impl Parser {
 
     // Go: parser/parser.go:2637 parseUnionTypeOrHigher
     pub fn parse_union_type_or_higher(&mut self) -> Node {
-        self.parse_union_or_intersection_type(SyntaxKind::BarToken, Parser::parse_intersection_type_or_higher)
+        self.parse_union_or_intersection_type(
+            SyntaxKind::BarToken,
+            Parser::parse_intersection_type_or_higher,
+        )
     }
 
     // Go: parser/parser.go:2641 parseIntersectionTypeOrHigher
     pub fn parse_intersection_type_or_higher(&mut self) -> Node {
-        self.parse_union_or_intersection_type(SyntaxKind::AmpersandToken, Parser::parse_type_operator_or_higher)
+        self.parse_union_or_intersection_type(
+            SyntaxKind::AmpersandToken,
+            Parser::parse_type_operator_or_higher,
+        )
     }
 
     // Go: parser/parser.go:2645 parseUnionOrIntersectionType
-    pub fn parse_union_or_intersection_type(&mut self, operator: SyntaxKind, parse_constituent_type: fn(&mut Parser) -> Node) -> Node {
+    pub fn parse_union_or_intersection_type(
+        &mut self,
+        operator: SyntaxKind,
+        parse_constituent_type: fn(&mut Parser) -> Node,
+    ) -> Node {
         let pos = self.node_pos();
         let is_union_type = operator == SyntaxKind::BarToken;
         let has_leading_operator = self.parse_optional(operator);
@@ -1562,7 +1957,10 @@ impl Parser {
             let mut types: Vec<Node> = Vec::with_capacity(8);
             types.push(type_node);
             while self.parse_optional(operator) {
-                let t = self.parse_function_or_constructor_type_to_error(is_union_type, parse_constituent_type);
+                let t = self.parse_function_or_constructor_type_to_error(
+                    is_union_type,
+                    parse_constituent_type,
+                );
                 types.push(t);
             }
             // PORT: Go `p.nodeSliceArena.Clone(types)` copies into the arena; the list copies the slice.
@@ -1575,7 +1973,11 @@ impl Parser {
     }
 
     // Go: parser/parser.go:2667 createUnionOrIntersectionTypeNode
-    pub fn create_union_or_intersection_type_node(&mut self, operator: SyntaxKind, types: NodeList) -> Node {
+    pub fn create_union_or_intersection_type_node(
+        &mut self,
+        operator: SyntaxKind,
+        types: NodeList,
+    ) -> Node {
         match operator {
             SyntaxKind::BarToken => self.factory.new_union_type_node(types),
             SyntaxKind::AmpersandToken => self.factory.new_intersection_type_node(types),
@@ -1595,7 +1997,12 @@ impl Parser {
             }
             _ => {}
         }
-        do_in_context(self, NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT, false, Parser::parse_postfix_type_or_higher)
+        do_in_context(
+            self,
+            NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT,
+            false,
+            Parser::parse_postfix_type_or_higher,
+        )
     }
 
     // Go: parser/parser.go:2689 parseTypeOperator
@@ -1635,8 +2042,15 @@ impl Parser {
     pub fn try_parse_constraint_of_infer_type(&mut self) -> Node {
         let state = self.mark();
         if self.parse_optional(SyntaxKind::ExtendsKeyword) {
-            let constraint = do_in_context(self, NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT, true, Parser::parse_type);
-            if self.in_disallow_conditional_types_context() || self.token != SyntaxKind::QuestionToken {
+            let constraint = do_in_context(
+                self,
+                NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT,
+                true,
+                Parser::parse_type,
+            );
+            if self.in_disallow_conditional_types_context()
+                || self.token != SyntaxKind::QuestionToken
+            {
                 return constraint;
             }
         }
@@ -1669,7 +2083,9 @@ impl Parser {
                     if self.is_start_of_type(false /*isStartOfParameter*/) {
                         let index_type = self.parse_type();
                         self.parse_expected(SyntaxKind::CloseBracketToken);
-                        let node = self.factory.new_indexed_access_type_node(type_node, index_type);
+                        let node = self
+                            .factory
+                            .new_indexed_access_type_node(type_node, index_type);
                         type_node = self.finish_node(node, pos);
                     } else {
                         self.parse_expected(SyntaxKind::CloseBracketToken);

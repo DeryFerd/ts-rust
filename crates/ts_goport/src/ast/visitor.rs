@@ -29,7 +29,8 @@ pub type VisitNodeHook<'a, C> = Rc<dyn Fn(Node, &mut NodeVisitor<'a, C>) -> Node
 /// A Go hook over a `NodeList`.
 pub type VisitNodesHook<'a, C> = Rc<dyn Fn(NodeList, &mut NodeVisitor<'a, C>) -> NodeList + 'a>;
 /// A Go hook over a `ModifierList`.
-pub type VisitModifiersHook<'a, C> = Rc<dyn Fn(ModifierList, &mut NodeVisitor<'a, C>) -> ModifierList + 'a>;
+pub type VisitModifiersHook<'a, C> =
+    Rc<dyn Fn(ModifierList, &mut NodeVisitor<'a, C>) -> ModifierList + 'a>;
 
 // Go: ast/visitor.go:16 NodeVisitorHooks
 /// These hooks are used to intercept the default behavior of the visitor.
@@ -114,7 +115,13 @@ pub fn new_node_visitor<'a, C>(
     hooks: NodeVisitorHooks<'a, C>,
     ctx: C,
 ) -> NodeVisitor<'a, C> {
-    NodeVisitor { visit: Some(Rc::new(visit)), factory, default_factory: NodeFactory::default(), hooks, ctx }
+    NodeVisitor {
+        visit: Some(Rc::new(visit)),
+        factory,
+        default_factory: NodeFactory::default(),
+        hooks,
+        ctx,
+    }
 }
 
 /// Go `node.AsSyntaxList().Children`.
@@ -122,7 +129,10 @@ pub fn new_node_visitor<'a, C>(
 pub(crate) fn syntax_list_children(node: Node) -> Vec<Node> {
     match ast_data_of(node) {
         NodeData::SyntaxList(d) => NodeSlice::from_ids(node.file_index(), &d.children).to_vec(),
-        _ => panic!("ast field Children does not exist on node kind {:?}", node.kind()),
+        _ => panic!(
+            "ast field Children does not exist on node kind {:?}",
+            node.kind()
+        ),
     }
 }
 
@@ -440,7 +450,9 @@ impl Node {
             NodeData::Block(_) => visit_each_child_block(node, v),
             NodeData::VariableStatement(_) => visit_each_child_variable_statement(node, v),
             NodeData::VariableDeclaration(_) => visit_each_child_variable_declaration(node, v),
-            NodeData::VariableDeclarationList(_) => visit_each_child_variable_declaration_list(node, v),
+            NodeData::VariableDeclarationList(_) => {
+                visit_each_child_variable_declaration_list(node, v)
+            }
             NodeData::BindingPattern(_) => visit_each_child_binding_pattern(node, v),
             NodeData::ParameterDeclaration(_) => visit_each_child_parameter_declaration(node, v),
             NodeData::BindingElement(_) => visit_each_child_binding_element(node, v),
@@ -455,36 +467,64 @@ impl Node {
             NodeData::EnumDeclaration(_) => visit_each_child_enum_declaration(node, v),
             NodeData::ModuleBlock(_) => visit_each_child_module_block(node, v),
             NodeData::ImportDeclaration(_) => visit_each_child_import_declaration(node, v),
-            NodeData::ExternalModuleReference(_) => visit_each_child_external_module_reference(node, v),
+            NodeData::ExternalModuleReference(_) => {
+                visit_each_child_external_module_reference(node, v)
+            }
             NodeData::NamespaceImport(_) => visit_each_child_namespace_import(node, v),
             NodeData::NamedImports(_) => visit_each_child_named_imports(node, v),
             NodeData::ExportAssignment(_) => visit_each_child_export_assignment(node, v),
-            NodeData::NamespaceExportDeclaration(_) => visit_each_child_namespace_export_declaration(node, v),
+            NodeData::NamespaceExportDeclaration(_) => {
+                visit_each_child_namespace_export_declaration(node, v)
+            }
             NodeData::NamespaceExport(_) => visit_each_child_namespace_export(node, v),
             NodeData::NamedExports(_) => visit_each_child_named_exports(node, v),
             NodeData::ExportSpecifier(_) => visit_each_child_export_specifier(node, v),
-            NodeData::CallSignatureDeclaration(_) => visit_each_child_call_signature_declaration(node, v),
-            NodeData::ConstructSignatureDeclaration(_) => visit_each_child_construct_signature_declaration(node, v),
-            NodeData::ConstructorDeclaration(_) => visit_each_child_constructor_declaration(node, v),
-            NodeData::GetAccessorDeclaration(_) => visit_each_child_get_accessor_declaration(node, v),
-            NodeData::SetAccessorDeclaration(_) => visit_each_child_set_accessor_declaration(node, v),
-            NodeData::IndexSignatureDeclaration(_) => visit_each_child_index_signature_declaration(node, v),
-            NodeData::MethodSignatureDeclaration(_) => visit_each_child_method_signature_declaration(node, v),
+            NodeData::CallSignatureDeclaration(_) => {
+                visit_each_child_call_signature_declaration(node, v)
+            }
+            NodeData::ConstructSignatureDeclaration(_) => {
+                visit_each_child_construct_signature_declaration(node, v)
+            }
+            NodeData::ConstructorDeclaration(_) => {
+                visit_each_child_constructor_declaration(node, v)
+            }
+            NodeData::GetAccessorDeclaration(_) => {
+                visit_each_child_get_accessor_declaration(node, v)
+            }
+            NodeData::SetAccessorDeclaration(_) => {
+                visit_each_child_set_accessor_declaration(node, v)
+            }
+            NodeData::IndexSignatureDeclaration(_) => {
+                visit_each_child_index_signature_declaration(node, v)
+            }
+            NodeData::MethodSignatureDeclaration(_) => {
+                visit_each_child_method_signature_declaration(node, v)
+            }
             NodeData::MethodDeclaration(_) => visit_each_child_method_declaration(node, v),
-            NodeData::PropertySignatureDeclaration(_) => visit_each_child_property_signature_declaration(node, v),
+            NodeData::PropertySignatureDeclaration(_) => {
+                visit_each_child_property_signature_declaration(node, v)
+            }
             NodeData::PropertyDeclaration(_) => visit_each_child_property_declaration(node, v),
-            NodeData::ClassStaticBlockDeclaration(_) => visit_each_child_class_static_block_declaration(node, v),
+            NodeData::ClassStaticBlockDeclaration(_) => {
+                visit_each_child_class_static_block_declaration(node, v)
+            }
             NodeData::BinaryExpression(_) => visit_each_child_binary_expression(node, v),
             NodeData::PrefixUnaryExpression(_) => visit_each_child_prefix_unary_expression(node, v),
-            NodeData::PostfixUnaryExpression(_) => visit_each_child_postfix_unary_expression(node, v),
+            NodeData::PostfixUnaryExpression(_) => {
+                visit_each_child_postfix_unary_expression(node, v)
+            }
             NodeData::YieldExpression(_) => visit_each_child_yield_expression(node, v),
             NodeData::ArrowFunction(_) => visit_each_child_arrow_function(node, v),
             NodeData::FunctionExpression(_) => visit_each_child_function_expression(node, v),
             NodeData::AsExpression(_) => visit_each_child_as_expression(node, v),
             NodeData::SatisfiesExpression(_) => visit_each_child_satisfies_expression(node, v),
             NodeData::ConditionalExpression(_) => visit_each_child_conditional_expression(node, v),
-            NodeData::PropertyAccessExpression(_) => visit_each_child_property_access_expression(node, v),
-            NodeData::ElementAccessExpression(_) => visit_each_child_element_access_expression(node, v),
+            NodeData::PropertyAccessExpression(_) => {
+                visit_each_child_property_access_expression(node, v)
+            }
+            NodeData::ElementAccessExpression(_) => {
+                visit_each_child_element_access_expression(node, v)
+            }
             NodeData::CallExpression(_) => visit_each_child_call_expression(node, v),
             NodeData::NewExpression(_) => visit_each_child_new_expression(node, v),
             NodeData::MetaProperty(_) => visit_each_child_meta_property(node, v),
@@ -492,13 +532,23 @@ impl Node {
             NodeData::SpreadElement(_) => visit_each_child_spread_element(node, v),
             NodeData::TemplateExpression(_) => visit_each_child_template_expression(node, v),
             NodeData::TemplateSpan(_) => visit_each_child_template_span(node, v),
-            NodeData::TaggedTemplateExpression(_) => visit_each_child_tagged_template_expression(node, v),
-            NodeData::ParenthesizedExpression(_) => visit_each_child_parenthesized_expression(node, v),
-            NodeData::ArrayLiteralExpression(_) => visit_each_child_array_literal_expression(node, v),
-            NodeData::ObjectLiteralExpression(_) => visit_each_child_object_literal_expression(node, v),
+            NodeData::TaggedTemplateExpression(_) => {
+                visit_each_child_tagged_template_expression(node, v)
+            }
+            NodeData::ParenthesizedExpression(_) => {
+                visit_each_child_parenthesized_expression(node, v)
+            }
+            NodeData::ArrayLiteralExpression(_) => {
+                visit_each_child_array_literal_expression(node, v)
+            }
+            NodeData::ObjectLiteralExpression(_) => {
+                visit_each_child_object_literal_expression(node, v)
+            }
             NodeData::SpreadAssignment(_) => visit_each_child_spread_assignment(node, v),
             NodeData::PropertyAssignment(_) => visit_each_child_property_assignment(node, v),
-            NodeData::ShorthandPropertyAssignment(_) => visit_each_child_shorthand_property_assignment(node, v),
+            NodeData::ShorthandPropertyAssignment(_) => {
+                visit_each_child_shorthand_property_assignment(node, v)
+            }
             NodeData::DeleteExpression(_) => visit_each_child_delete_expression(node, v),
             NodeData::TypeOfExpression(_) => visit_each_child_type_of_expression(node, v),
             NodeData::VoidExpression(_) => visit_each_child_void_expression(node, v),
@@ -510,9 +560,13 @@ impl Node {
             NodeData::TypeOperatorNode(_) => visit_each_child_type_operator_node(node, v),
             NodeData::InferTypeNode(_) => visit_each_child_infer_type_node(node, v),
             NodeData::ArrayTypeNode(_) => visit_each_child_array_type_node(node, v),
-            NodeData::IndexedAccessTypeNode(_) => visit_each_child_indexed_access_type_node(node, v),
+            NodeData::IndexedAccessTypeNode(_) => {
+                visit_each_child_indexed_access_type_node(node, v)
+            }
             NodeData::TypeReferenceNode(_) => visit_each_child_type_reference_node(node, v),
-            NodeData::ExpressionWithTypeArguments(_) => visit_each_child_expression_with_type_arguments(node, v),
+            NodeData::ExpressionWithTypeArguments(_) => {
+                visit_each_child_expression_with_type_arguments(node, v)
+            }
             NodeData::LiteralTypeNode(_) => visit_each_child_literal_type_node(node, v),
             NodeData::TypePredicateNode(_) => visit_each_child_type_predicate_node(node, v),
             NodeData::ImportAttribute(_) => visit_each_child_import_attribute(node, v),
@@ -527,15 +581,23 @@ impl Node {
             NodeData::ParenthesizedTypeNode(_) => visit_each_child_parenthesized_type_node(node, v),
             NodeData::FunctionTypeNode(_) => visit_each_child_function_type_node(node, v),
             NodeData::ConstructorTypeNode(_) => visit_each_child_constructor_type_node(node, v),
-            NodeData::TemplateLiteralTypeNode(_) => visit_each_child_template_literal_type_node(node, v),
-            NodeData::TemplateLiteralTypeSpan(_) => visit_each_child_template_literal_type_span(node, v),
+            NodeData::TemplateLiteralTypeNode(_) => {
+                visit_each_child_template_literal_type_node(node, v)
+            }
+            NodeData::TemplateLiteralTypeSpan(_) => {
+                visit_each_child_template_literal_type_span(node, v)
+            }
             NodeData::SyntheticExpression(_) => visit_each_child_synthetic_expression(node, v),
-            NodeData::PartiallyEmittedExpression(_) => visit_each_child_partially_emitted_expression(node, v),
+            NodeData::PartiallyEmittedExpression(_) => {
+                visit_each_child_partially_emitted_expression(node, v)
+            }
             NodeData::JsxElement(_) => visit_each_child_jsx_element(node, v),
             NodeData::JsxAttributes(_) => visit_each_child_jsx_attributes(node, v),
             NodeData::JsxNamespacedName(_) => visit_each_child_jsx_namespaced_name(node, v),
             NodeData::JsxOpeningElement(_) => visit_each_child_jsx_opening_element(node, v),
-            NodeData::JsxSelfClosingElement(_) => visit_each_child_jsx_self_closing_element(node, v),
+            NodeData::JsxSelfClosingElement(_) => {
+                visit_each_child_jsx_self_closing_element(node, v)
+            }
             NodeData::JsxFragment(_) => visit_each_child_jsx_fragment(node, v),
             NodeData::JsxAttribute(_) => visit_each_child_jsx_attribute(node, v),
             NodeData::JsxSpreadAttribute(_) => visit_each_child_jsx_spread_attribute(node, v),
@@ -571,7 +633,9 @@ impl Node {
             NodeData::JsDocSignature(_) => visit_each_child_js_doc_signature(node, v),
             NodeData::JsDocNameReference(_) => visit_each_child_js_doc_name_reference(node, v),
             NodeData::ModuleDeclaration(_) => visit_each_child_module_declaration(node, v),
-            NodeData::ImportEqualsDeclaration(_) => visit_each_child_import_equals_declaration(node, v),
+            NodeData::ImportEqualsDeclaration(_) => {
+                visit_each_child_import_equals_declaration(node, v)
+            }
             NodeData::ExportDeclaration(_) => visit_each_child_export_declaration(node, v),
             NodeData::ImportTypeNode(_) => visit_each_child_import_type_node(node, v),
             NodeData::ImportClause(_) => visit_each_child_import_clause(node, v),
@@ -579,10 +643,16 @@ impl Node {
             NodeData::JsDocLink(_) => visit_each_child_js_doc_link(node, v),
             NodeData::JsDocLinkPlain(_) => visit_each_child_js_doc_link_plain(node, v),
             NodeData::JsDocLinkCode(_) => visit_each_child_js_doc_link_code(node, v),
-            NodeData::TypeParameterDeclaration(_) => visit_each_child_type_parameter_declaration(node, v),
-            NodeData::SyntheticReferenceExpression(_) => visit_each_child_synthetic_reference_expression(node, v),
+            NodeData::TypeParameterDeclaration(_) => {
+                visit_each_child_type_parameter_declaration(node, v)
+            }
+            NodeData::SyntheticReferenceExpression(_) => {
+                visit_each_child_synthetic_reference_expression(node, v)
+            }
             NodeData::JsDocTypeLiteral(_) => visit_each_child_js_doc_type_literal(node, v),
-            NodeData::JsDocParameterOrPropertyTag(_) => visit_each_child_js_doc_parameter_or_property_tag(node, v),
+            NodeData::JsDocParameterOrPropertyTag(_) => {
+                visit_each_child_js_doc_parameter_or_property_tag(node, v)
+            }
             // Go: ast/ast.go:1216 (node *NodeDefault) VisitEachChild
             _ => node,
         }
@@ -593,16 +663,28 @@ impl Node {
 fn visit_each_child_source_file<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let statements = v.visit_top_level_statements(node.statement_list());
     let end_of_file_token = v.visit_token(node.end_of_file_token());
-    v.factory().update_source_file(node, statements, end_of_file_token)
+    v.factory()
+        .update_source_file(node, statements, end_of_file_token)
 }
 
 // Go: ast/ast.go:3051 visitEachChild_JSDocParameterOrPropertyTag
-fn visit_each_child_js_doc_parameter_or_property_tag_impl<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
+fn visit_each_child_js_doc_parameter_or_property_tag_impl<C>(
+    node: Node,
+    v: &mut NodeVisitor<'_, C>,
+) -> Node {
     let tag_name = v.visit_node_hooked(node.tag_name());
     let name = v.visit_node_hooked(node.name());
     let type_expression = v.visit_node_hooked(node.type_expression());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_parameter_or_property_tag(node, tag_name, name, node.is_bracketed(), type_expression, node.is_name_first(), comment)
+    v.factory().update_js_doc_parameter_or_property_tag(
+        node,
+        tag_name,
+        name,
+        node.is_bracketed(),
+        type_expression,
+        node.is_name_first(),
+        comment,
+    )
 }
 
 // Go: ast/ast_generated.go:861 (node *QualifiedName) VisitEachChild
@@ -629,7 +711,8 @@ fn visit_each_child_if_statement<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> N
     let expression = v.visit_node_hooked(node.expression());
     let then_statement = v.visit_embedded_statement_hooked(node.then_statement());
     let else_statement = v.visit_embedded_statement_hooked(node.else_statement());
-    v.factory().update_if_statement(node, expression, then_statement, else_statement)
+    v.factory()
+        .update_if_statement(node, expression, then_statement, else_statement)
 }
 
 // Go: ast/ast_generated.go:1058 (node *DoStatement) VisitEachChild
@@ -643,7 +726,8 @@ fn visit_each_child_do_statement<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> N
 fn visit_each_child_while_statement<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let expression = v.visit_node_hooked(node.expression());
     let statement = v.visit_iteration_body(node.statement());
-    v.factory().update_while_statement(node, expression, statement)
+    v.factory()
+        .update_while_statement(node, expression, statement)
 }
 
 // Go: ast/ast_generated.go:1156 (node *ForStatement) VisitEachChild
@@ -652,7 +736,8 @@ fn visit_each_child_for_statement<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> 
     let condition = v.visit_node_hooked(node.condition());
     let incrementor = v.visit_node_hooked(node.incrementor());
     let statement = v.visit_iteration_body(node.statement());
-    v.factory().update_for_statement(node, initializer, condition, incrementor, statement)
+    v.factory()
+        .update_for_statement(node, initializer, condition, incrementor, statement)
 }
 
 // Go: ast/ast_generated.go:1212 (node *ForInOrOfStatement) VisitEachChild
@@ -661,7 +746,13 @@ fn visit_each_child_for_in_or_of_statement<C>(node: Node, v: &mut NodeVisitor<'_
     let initializer = v.visit_node_hooked(node.initializer());
     let expression = v.visit_node_hooked(node.expression());
     let statement = v.visit_iteration_body(node.statement());
-    v.factory().update_for_in_or_of_statement(node, await_modifier, initializer, expression, statement)
+    v.factory().update_for_in_or_of_statement(
+        node,
+        await_modifier,
+        initializer,
+        expression,
+        statement,
+    )
 }
 
 // Go: ast/ast_generated.go:1254 (node *BreakStatement) VisitEachChild
@@ -686,14 +777,16 @@ fn visit_each_child_return_statement<C>(node: Node, v: &mut NodeVisitor<'_, C>) 
 fn visit_each_child_with_statement<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let expression = v.visit_node_hooked(node.expression());
     let statement = v.visit_embedded_statement_hooked(node.statement());
-    v.factory().update_with_statement(node, expression, statement)
+    v.factory()
+        .update_with_statement(node, expression, statement)
 }
 
 // Go: ast/ast_generated.go:1418 (node *SwitchStatement) VisitEachChild
 fn visit_each_child_switch_statement<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let expression = v.visit_node_hooked(node.expression());
     let case_block = v.visit_node_hooked(node.case_block());
-    v.factory().update_switch_statement(node, expression, case_block)
+    v.factory()
+        .update_switch_statement(node, expression, case_block)
 }
 
 // Go: ast/ast_generated.go:1463 (node *CaseBlock) VisitEachChild
@@ -706,7 +799,8 @@ fn visit_each_child_case_block<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Nod
 fn visit_each_child_case_or_default_clause<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let expression = v.visit_node_hooked(node.expression());
     let statements = v.visit_nodes_hooked(node.statement_list());
-    v.factory().update_case_or_default_clause(node, expression, statements)
+    v.factory()
+        .update_case_or_default_clause(node, expression, statements)
 }
 
 // Go: ast/ast_generated.go:1557 (node *ThrowStatement) VisitEachChild
@@ -720,14 +814,16 @@ fn visit_each_child_try_statement<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> 
     let try_block = v.visit_node_hooked(node.try_block());
     let catch_clause = v.visit_node_hooked(node.catch_clause());
     let finally_block = v.visit_node_hooked(node.finally_block());
-    v.factory().update_try_statement(node, try_block, catch_clause, finally_block)
+    v.factory()
+        .update_try_statement(node, try_block, catch_clause, finally_block)
 }
 
 // Go: ast/ast_generated.go:1652 (node *CatchClause) VisitEachChild
 fn visit_each_child_catch_clause<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let variable_declaration = v.visit_node_hooked(node.variable_declaration());
     let block = v.visit_node_hooked(node.block());
-    v.factory().update_catch_clause(node, variable_declaration, block)
+    v.factory()
+        .update_catch_clause(node, variable_declaration, block)
 }
 
 // Go: ast/ast_generated.go:1713 (node *LabeledStatement) VisitEachChild
@@ -746,14 +842,16 @@ fn visit_each_child_expression_statement<C>(node: Node, v: &mut NodeVisitor<'_, 
 // Go: ast/ast_generated.go:1802 (node *Block) VisitEachChild
 fn visit_each_child_block<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let statements = v.visit_nodes_hooked(node.statement_list());
-    v.factory().update_block(node, statements, node.multi_line())
+    v.factory()
+        .update_block(node, statements, node.multi_line())
 }
 
 // Go: ast/ast_generated.go:1847 (node *VariableStatement) VisitEachChild
 fn visit_each_child_variable_statement<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let modifiers = v.visit_modifiers_hooked(node.modifiers());
     let declaration_list = v.visit_node_hooked(node.declaration_list());
-    v.factory().update_variable_statement(node, modifiers, declaration_list)
+    v.factory()
+        .update_variable_statement(node, modifiers, declaration_list)
 }
 
 // Go: ast/ast_generated.go:1897 (node *VariableDeclaration) VisitEachChild
@@ -762,13 +860,15 @@ fn visit_each_child_variable_declaration<C>(node: Node, v: &mut NodeVisitor<'_, 
     let exclamation_token = v.visit_node_hooked(node.exclamation_token());
     let type_node = v.visit_node_hooked(node.type_());
     let initializer = v.visit_node_hooked(node.initializer());
-    v.factory().update_variable_declaration(node, name, exclamation_token, type_node, initializer)
+    v.factory()
+        .update_variable_declaration(node, name, exclamation_token, type_node, initializer)
 }
 
 // Go: ast/ast_generated.go:1942 (node *VariableDeclarationList) VisitEachChild
 fn visit_each_child_variable_declaration_list<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let declarations = v.visit_nodes_hooked(node.declarations());
-    v.factory().update_variable_declaration_list(node, declarations, node.flags())
+    v.factory()
+        .update_variable_declaration_list(node, declarations, node.flags())
 }
 
 // Go: ast/ast_generated.go:1981 (node *BindingPattern) VisitEachChild
@@ -785,7 +885,15 @@ fn visit_each_child_parameter_declaration<C>(node: Node, v: &mut NodeVisitor<'_,
     let question_token = v.visit_node_hooked(node.question_token());
     let type_node = v.visit_node_hooked(node.type_());
     let initializer = v.visit_node_hooked(node.initializer());
-    v.factory().update_parameter_declaration(node, modifiers, dot_dot_dot_token, name, question_token, type_node, initializer)
+    v.factory().update_parameter_declaration(
+        node,
+        modifiers,
+        dot_dot_dot_token,
+        name,
+        question_token,
+        type_node,
+        initializer,
+    )
 }
 
 // Go: ast/ast_generated.go:2095 (node *BindingElement) VisitEachChild
@@ -794,7 +902,8 @@ fn visit_each_child_binding_element<C>(node: Node, v: &mut NodeVisitor<'_, C>) -
     let property_name = v.visit_node_hooked(node.property_name());
     let name = v.visit_node_hooked(node.name());
     let initializer = v.visit_node_hooked(node.initializer());
-    v.factory().update_binding_element(node, dot_dot_dot_token, property_name, name, initializer)
+    v.factory()
+        .update_binding_element(node, dot_dot_dot_token, property_name, name, initializer)
 }
 
 // Go: ast/ast_generated.go:2138 (node *MissingDeclaration) VisitEachChild
@@ -813,7 +922,17 @@ fn visit_each_child_function_declaration<C>(node: Node, v: &mut NodeVisitor<'_, 
     let type_node = v.visit_node_hooked(node.type_());
     let full_signature = v.visit_node_hooked(node.full_signature());
     let body = v.visit_function_body(node.body());
-    v.factory().update_function_declaration(node, modifiers, asterisk_token, name, type_parameters, parameters, type_node, full_signature, body)
+    v.factory().update_function_declaration(
+        node,
+        modifiers,
+        asterisk_token,
+        name,
+        type_parameters,
+        parameters,
+        type_node,
+        full_signature,
+        body,
+    )
 }
 
 // Go: ast/ast_generated.go:2247 (node *ClassDeclaration) VisitEachChild
@@ -823,7 +942,14 @@ fn visit_each_child_class_declaration<C>(node: Node, v: &mut NodeVisitor<'_, C>)
     let type_parameters = v.visit_nodes_hooked(node.type_parameter_list());
     let heritage_clauses = v.visit_nodes_hooked(node.heritage_clauses());
     let members = v.visit_nodes_hooked(node.member_list());
-    v.factory().update_class_declaration(node, modifiers, name, type_parameters, heritage_clauses, members)
+    v.factory().update_class_declaration(
+        node,
+        modifiers,
+        name,
+        type_parameters,
+        heritage_clauses,
+        members,
+    )
 }
 
 // Go: ast/ast_generated.go:2297 (node *ClassExpression) VisitEachChild
@@ -833,13 +959,21 @@ fn visit_each_child_class_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) 
     let type_parameters = v.visit_nodes_hooked(node.type_parameter_list());
     let heritage_clauses = v.visit_nodes_hooked(node.heritage_clauses());
     let members = v.visit_nodes_hooked(node.member_list());
-    v.factory().update_class_expression(node, modifiers, name, type_parameters, heritage_clauses, members)
+    v.factory().update_class_expression(
+        node,
+        modifiers,
+        name,
+        type_parameters,
+        heritage_clauses,
+        members,
+    )
 }
 
 // Go: ast/ast_generated.go:2342 (node *HeritageClause) VisitEachChild
 fn visit_each_child_heritage_clause<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let types = v.visit_nodes_hooked(node.types());
-    v.factory().update_heritage_clause(node, node.token(), types)
+    v.factory()
+        .update_heritage_clause(node, node.token(), types)
 }
 
 // Go: ast/ast_generated.go:2395 (node *InterfaceDeclaration) VisitEachChild
@@ -849,7 +983,14 @@ fn visit_each_child_interface_declaration<C>(node: Node, v: &mut NodeVisitor<'_,
     let type_parameters = v.visit_nodes_hooked(node.type_parameter_list());
     let heritage_clauses = v.visit_nodes_hooked(node.heritage_clauses());
     let members = v.visit_nodes_hooked(node.member_list());
-    v.factory().update_interface_declaration(node, modifiers, name, type_parameters, heritage_clauses, members)
+    v.factory().update_interface_declaration(
+        node,
+        modifiers,
+        name,
+        type_parameters,
+        heritage_clauses,
+        members,
+    )
 }
 
 // Go: ast/ast_generated.go:2466 (node *TypeAliasDeclaration) VisitEachChild
@@ -858,7 +999,8 @@ fn visit_each_child_type_alias_declaration<C>(node: Node, v: &mut NodeVisitor<'_
     let name = v.visit_node_hooked(node.name());
     let type_parameters = v.visit_nodes_hooked(node.type_parameter_list());
     let type_node = v.visit_node_hooked(node.type_());
-    v.factory().update_type_alias_declaration(node, modifiers, name, type_parameters, type_node)
+    v.factory()
+        .update_type_alias_declaration(node, modifiers, name, type_parameters, type_node)
 }
 
 // Go: ast/ast_generated.go:2522 (node *EnumMember) VisitEachChild
@@ -873,7 +1015,8 @@ fn visit_each_child_enum_declaration<C>(node: Node, v: &mut NodeVisitor<'_, C>) 
     let modifiers = v.visit_modifiers_hooked(node.modifiers());
     let name = v.visit_node_hooked(node.name());
     let members = v.visit_nodes_hooked(node.member_list());
-    v.factory().update_enum_declaration(node, modifiers, name, members)
+    v.factory()
+        .update_enum_declaration(node, modifiers, name, members)
 }
 
 // Go: ast/ast_generated.go:2614 (node *ModuleBlock) VisitEachChild
@@ -888,13 +1031,20 @@ fn visit_each_child_import_declaration<C>(node: Node, v: &mut NodeVisitor<'_, C>
     let import_clause = v.visit_node_hooked(node.import_clause());
     let module_specifier = v.visit_node_hooked(node.module_specifier());
     let attributes = v.visit_node_hooked(node.attributes());
-    v.factory().update_import_declaration(node, modifiers, import_clause, module_specifier, attributes)
+    v.factory().update_import_declaration(
+        node,
+        modifiers,
+        import_clause,
+        module_specifier,
+        attributes,
+    )
 }
 
 // Go: ast/ast_generated.go:2782 (node *ExternalModuleReference) VisitEachChild
 fn visit_each_child_external_module_reference<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let expression = v.visit_node_hooked(node.expression());
-    v.factory().update_external_module_reference(node, expression)
+    v.factory()
+        .update_external_module_reference(node, expression)
 }
 
 // Go: ast/ast_generated.go:2826 (node *NamespaceImport) VisitEachChild
@@ -914,14 +1064,24 @@ fn visit_each_child_export_assignment<C>(node: Node, v: &mut NodeVisitor<'_, C>)
     let modifiers = v.visit_modifiers_hooked(node.modifiers());
     let type_node = v.visit_node_hooked(node.type_());
     let expression = v.visit_node_hooked(node.expression());
-    v.factory().update_export_assignment(node, modifiers, node.is_export_equals(), type_node, expression)
+    v.factory().update_export_assignment(
+        node,
+        modifiers,
+        node.is_export_equals(),
+        type_node,
+        expression,
+    )
 }
 
 // Go: ast/ast_generated.go:2965 (node *NamespaceExportDeclaration) VisitEachChild
-fn visit_each_child_namespace_export_declaration<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
+fn visit_each_child_namespace_export_declaration<C>(
+    node: Node,
+    v: &mut NodeVisitor<'_, C>,
+) -> Node {
     let modifiers = v.visit_modifiers_hooked(node.modifiers());
     let name = v.visit_node_hooked(node.name());
-    v.factory().update_namespace_export_declaration(node, modifiers, name)
+    v.factory()
+        .update_namespace_export_declaration(node, modifiers, name)
 }
 
 // Go: ast/ast_generated.go:3008 (node *NamespaceExport) VisitEachChild
@@ -940,7 +1100,8 @@ fn visit_each_child_named_exports<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> 
 fn visit_each_child_export_specifier<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let property_name = v.visit_node_hooked(node.property_name());
     let name = v.visit_node_hooked(node.name());
-    v.factory().update_export_specifier(node, node.is_type_only(), property_name, name)
+    v.factory()
+        .update_export_specifier(node, node.is_type_only(), property_name, name)
 }
 
 // Go: ast/ast_generated.go:3151 (node *CallSignatureDeclaration) VisitEachChild
@@ -948,15 +1109,20 @@ fn visit_each_child_call_signature_declaration<C>(node: Node, v: &mut NodeVisito
     let type_parameters = v.visit_nodes_hooked(node.type_parameter_list());
     let parameters = v.visit_nodes_hooked(node.parameter_list());
     let type_node = v.visit_node_hooked(node.type_());
-    v.factory().update_call_signature_declaration(node, type_parameters, parameters, type_node)
+    v.factory()
+        .update_call_signature_declaration(node, type_parameters, parameters, type_node)
 }
 
 // Go: ast/ast_generated.go:3194 (node *ConstructSignatureDeclaration) VisitEachChild
-fn visit_each_child_construct_signature_declaration<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
+fn visit_each_child_construct_signature_declaration<C>(
+    node: Node,
+    v: &mut NodeVisitor<'_, C>,
+) -> Node {
     let type_parameters = v.visit_nodes_hooked(node.type_parameter_list());
     let parameters = v.visit_nodes_hooked(node.parameter_list());
     let type_node = v.visit_node_hooked(node.type_());
-    v.factory().update_construct_signature_declaration(node, type_parameters, parameters, type_node)
+    v.factory()
+        .update_construct_signature_declaration(node, type_parameters, parameters, type_node)
 }
 
 // Go: ast/ast_generated.go:3247 (node *ConstructorDeclaration) VisitEachChild
@@ -967,7 +1133,15 @@ fn visit_each_child_constructor_declaration<C>(node: Node, v: &mut NodeVisitor<'
     let type_node = v.visit_node_hooked(node.type_());
     let full_signature = v.visit_node_hooked(node.full_signature());
     let body = v.visit_function_body(node.body());
-    v.factory().update_constructor_declaration(node, modifiers, type_parameters, parameters, type_node, full_signature, body)
+    v.factory().update_constructor_declaration(
+        node,
+        modifiers,
+        type_parameters,
+        parameters,
+        type_node,
+        full_signature,
+        body,
+    )
 }
 
 // Go: ast/ast_generated.go:3296 (node *GetAccessorDeclaration) VisitEachChild
@@ -979,7 +1153,16 @@ fn visit_each_child_get_accessor_declaration<C>(node: Node, v: &mut NodeVisitor<
     let type_node = v.visit_node_hooked(node.type_());
     let full_signature = v.visit_node_hooked(node.full_signature());
     let body = v.visit_function_body(node.body());
-    v.factory().update_get_accessor_declaration(node, modifiers, name, type_parameters, parameters, type_node, full_signature, body)
+    v.factory().update_get_accessor_declaration(
+        node,
+        modifiers,
+        name,
+        type_parameters,
+        parameters,
+        type_node,
+        full_signature,
+        body,
+    )
 }
 
 // Go: ast/ast_generated.go:3349 (node *SetAccessorDeclaration) VisitEachChild
@@ -991,7 +1174,16 @@ fn visit_each_child_set_accessor_declaration<C>(node: Node, v: &mut NodeVisitor<
     let type_node = v.visit_node_hooked(node.type_());
     let full_signature = v.visit_node_hooked(node.full_signature());
     let body = v.visit_function_body(node.body());
-    v.factory().update_set_accessor_declaration(node, modifiers, name, type_parameters, parameters, type_node, full_signature, body)
+    v.factory().update_set_accessor_declaration(
+        node,
+        modifiers,
+        name,
+        type_parameters,
+        parameters,
+        type_node,
+        full_signature,
+        body,
+    )
 }
 
 // Go: ast/ast_generated.go:3398 (node *IndexSignatureDeclaration) VisitEachChild
@@ -999,18 +1191,30 @@ fn visit_each_child_index_signature_declaration<C>(node: Node, v: &mut NodeVisit
     let modifiers = v.visit_modifiers_hooked(node.modifiers());
     let parameters = v.visit_nodes_hooked(node.parameter_list());
     let type_node = v.visit_node_hooked(node.type_());
-    v.factory().update_index_signature_declaration(node, modifiers, parameters, type_node)
+    v.factory()
+        .update_index_signature_declaration(node, modifiers, parameters, type_node)
 }
 
 // Go: ast/ast_generated.go:3449 (node *MethodSignatureDeclaration) VisitEachChild
-fn visit_each_child_method_signature_declaration<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
+fn visit_each_child_method_signature_declaration<C>(
+    node: Node,
+    v: &mut NodeVisitor<'_, C>,
+) -> Node {
     let modifiers = v.visit_modifiers_hooked(node.modifiers());
     let name = v.visit_node_hooked(node.name());
     let postfix_token = v.visit_node_hooked(node.postfix_token());
     let type_parameters = v.visit_nodes_hooked(node.type_parameter_list());
     let parameters = v.visit_nodes_hooked(node.parameter_list());
     let type_node = v.visit_node_hooked(node.type_());
-    v.factory().update_method_signature_declaration(node, modifiers, name, postfix_token, type_parameters, parameters, type_node)
+    v.factory().update_method_signature_declaration(
+        node,
+        modifiers,
+        name,
+        postfix_token,
+        type_parameters,
+        parameters,
+        type_node,
+    )
 }
 
 // Go: ast/ast_generated.go:3512 (node *MethodDeclaration) VisitEachChild
@@ -1024,17 +1228,38 @@ fn visit_each_child_method_declaration<C>(node: Node, v: &mut NodeVisitor<'_, C>
     let type_node = v.visit_node_hooked(node.type_());
     let full_signature = v.visit_node_hooked(node.full_signature());
     let body = v.visit_function_body(node.body());
-    v.factory().update_method_declaration(node, modifiers, asterisk_token, name, postfix_token, type_parameters, parameters, type_node, full_signature, body)
+    v.factory().update_method_declaration(
+        node,
+        modifiers,
+        asterisk_token,
+        name,
+        postfix_token,
+        type_parameters,
+        parameters,
+        type_node,
+        full_signature,
+        body,
+    )
 }
 
 // Go: ast/ast_generated.go:3566 (node *PropertySignatureDeclaration) VisitEachChild
-fn visit_each_child_property_signature_declaration<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
+fn visit_each_child_property_signature_declaration<C>(
+    node: Node,
+    v: &mut NodeVisitor<'_, C>,
+) -> Node {
     let modifiers = v.visit_modifiers_hooked(node.modifiers());
     let name = v.visit_node_hooked(node.name());
     let postfix_token = v.visit_node_hooked(node.postfix_token());
     let type_node = v.visit_node_hooked(node.type_());
     let initializer = v.visit_node_hooked(node.initializer());
-    v.factory().update_property_signature_declaration(node, modifiers, name, postfix_token, type_node, initializer)
+    v.factory().update_property_signature_declaration(
+        node,
+        modifiers,
+        name,
+        postfix_token,
+        type_node,
+        initializer,
+    )
 }
 
 // Go: ast/ast_generated.go:3620 (node *PropertyDeclaration) VisitEachChild
@@ -1044,14 +1269,25 @@ fn visit_each_child_property_declaration<C>(node: Node, v: &mut NodeVisitor<'_, 
     let postfix_token = v.visit_node_hooked(node.postfix_token());
     let type_node = v.visit_node_hooked(node.type_());
     let initializer = v.visit_node_hooked(node.initializer());
-    v.factory().update_property_declaration(node, modifiers, name, postfix_token, type_node, initializer)
+    v.factory().update_property_declaration(
+        node,
+        modifiers,
+        name,
+        postfix_token,
+        type_node,
+        initializer,
+    )
 }
 
 // Go: ast/ast_generated.go:3692 (node *ClassStaticBlockDeclaration) VisitEachChild
-fn visit_each_child_class_static_block_declaration<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
+fn visit_each_child_class_static_block_declaration<C>(
+    node: Node,
+    v: &mut NodeVisitor<'_, C>,
+) -> Node {
     let modifiers = v.visit_modifiers_hooked(node.modifiers());
     let body = v.visit_node_hooked(node.body());
-    v.factory().update_class_static_block_declaration(node, modifiers, body)
+    v.factory()
+        .update_class_static_block_declaration(node, modifiers, body)
 }
 
 // Go: ast/ast_generated.go:3918 (node *BinaryExpression) VisitEachChild
@@ -1061,26 +1297,30 @@ fn visit_each_child_binary_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>)
     let type_node = v.visit_node_hooked(node.type_());
     let operator_token = v.visit_node_hooked(node.operator_token());
     let right = v.visit_node_hooked(node.right());
-    v.factory().update_binary_expression(node, modifiers, left, type_node, operator_token, right)
+    v.factory()
+        .update_binary_expression(node, modifiers, left, type_node, operator_token, right)
 }
 
 // Go: ast/ast_generated.go:3958 (node *PrefixUnaryExpression) VisitEachChild
 fn visit_each_child_prefix_unary_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let operand = v.visit_node_hooked(node.operand());
-    v.factory().update_prefix_unary_expression(node, node.operator(), operand)
+    v.factory()
+        .update_prefix_unary_expression(node, node.operator(), operand)
 }
 
 // Go: ast/ast_generated.go:4002 (node *PostfixUnaryExpression) VisitEachChild
 fn visit_each_child_postfix_unary_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let operand = v.visit_node_hooked(node.operand());
-    v.factory().update_postfix_unary_expression(node, operand, node.operator())
+    v.factory()
+        .update_postfix_unary_expression(node, operand, node.operator())
 }
 
 // Go: ast/ast_generated.go:4046 (node *YieldExpression) VisitEachChild
 fn visit_each_child_yield_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let asterisk_token = v.visit_node_hooked(node.asterisk_token());
     let expression = v.visit_node_hooked(node.expression());
-    v.factory().update_yield_expression(node, asterisk_token, expression)
+    v.factory()
+        .update_yield_expression(node, asterisk_token, expression)
 }
 
 // Go: ast/ast_generated.go:4101 (node *ArrowFunction) VisitEachChild
@@ -1092,7 +1332,16 @@ fn visit_each_child_arrow_function<C>(node: Node, v: &mut NodeVisitor<'_, C>) ->
     let full_signature = v.visit_node_hooked(node.full_signature());
     let equals_greater_than_token = v.visit_node_hooked(node.equals_greater_than_token());
     let body = v.visit_function_body(node.body());
-    v.factory().update_arrow_function(node, modifiers, type_parameters, parameters, type_node, full_signature, equals_greater_than_token, body)
+    v.factory().update_arrow_function(
+        node,
+        modifiers,
+        type_parameters,
+        parameters,
+        type_node,
+        full_signature,
+        equals_greater_than_token,
+        body,
+    )
 }
 
 // Go: ast/ast_generated.go:4159 (node *FunctionExpression) VisitEachChild
@@ -1105,21 +1354,33 @@ fn visit_each_child_function_expression<C>(node: Node, v: &mut NodeVisitor<'_, C
     let type_node = v.visit_node_hooked(node.type_());
     let full_signature = v.visit_node_hooked(node.full_signature());
     let body = v.visit_function_body(node.body());
-    v.factory().update_function_expression(node, modifiers, asterisk_token, name, type_parameters, parameters, type_node, full_signature, body)
+    v.factory().update_function_expression(
+        node,
+        modifiers,
+        asterisk_token,
+        name,
+        type_parameters,
+        parameters,
+        type_node,
+        full_signature,
+        body,
+    )
 }
 
 // Go: ast/ast_generated.go:4203 (node *AsExpression) VisitEachChild
 fn visit_each_child_as_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let expression = v.visit_node_hooked(node.expression());
     let type_node = v.visit_node_hooked(node.type_());
-    v.factory().update_as_expression(node, expression, type_node)
+    v.factory()
+        .update_as_expression(node, expression, type_node)
 }
 
 // Go: ast/ast_generated.go:4243 (node *SatisfiesExpression) VisitEachChild
 fn visit_each_child_satisfies_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let expression = v.visit_node_hooked(node.expression());
     let type_node = v.visit_node_hooked(node.type_());
-    v.factory().update_satisfies_expression(node, expression, type_node)
+    v.factory()
+        .update_satisfies_expression(node, expression, type_node)
 }
 
 // Go: ast/ast_generated.go:4294 (node *ConditionalExpression) VisitEachChild
@@ -1129,7 +1390,14 @@ fn visit_each_child_conditional_expression<C>(node: Node, v: &mut NodeVisitor<'_
     let when_true = v.visit_node_hooked(node.when_true());
     let colon_token = v.visit_node_hooked(node.colon_token());
     let when_false = v.visit_node_hooked(node.when_false());
-    v.factory().update_conditional_expression(node, condition, question_token, when_true, colon_token, when_false)
+    v.factory().update_conditional_expression(
+        node,
+        condition,
+        question_token,
+        when_true,
+        colon_token,
+        when_false,
+    )
 }
 
 // Go: ast/ast_generated.go:4348 (node *PropertyAccessExpression) VisitEachChild
@@ -1137,7 +1405,13 @@ fn visit_each_child_property_access_expression<C>(node: Node, v: &mut NodeVisito
     let expression = v.visit_node_hooked(node.expression());
     let question_dot_token = v.visit_node_hooked(node.question_dot_token());
     let name = v.visit_node_hooked(node.name());
-    v.factory().update_property_access_expression(node, expression, question_dot_token, name, node.flags())
+    v.factory().update_property_access_expression(
+        node,
+        expression,
+        question_dot_token,
+        name,
+        node.flags(),
+    )
 }
 
 // Go: ast/ast_generated.go:4398 (node *ElementAccessExpression) VisitEachChild
@@ -1145,7 +1419,13 @@ fn visit_each_child_element_access_expression<C>(node: Node, v: &mut NodeVisitor
     let expression = v.visit_node_hooked(node.expression());
     let question_dot_token = v.visit_node_hooked(node.question_dot_token());
     let argument_expression = v.visit_node_hooked(node.argument_expression());
-    v.factory().update_element_access_expression(node, expression, question_dot_token, argument_expression, node.flags())
+    v.factory().update_element_access_expression(
+        node,
+        expression,
+        question_dot_token,
+        argument_expression,
+        node.flags(),
+    )
 }
 
 // Go: ast/ast_generated.go:4455 (node *CallExpression) VisitEachChild
@@ -1154,7 +1434,14 @@ fn visit_each_child_call_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -
     let question_dot_token = v.visit_node_hooked(node.question_dot_token());
     let type_arguments = v.visit_nodes_hooked(node.type_argument_list());
     let arguments = v.visit_nodes_hooked(node.argument_list());
-    v.factory().update_call_expression(node, expression, question_dot_token, type_arguments, arguments, node.flags())
+    v.factory().update_call_expression(
+        node,
+        expression,
+        question_dot_token,
+        type_arguments,
+        arguments,
+        node.flags(),
+    )
 }
 
 // Go: ast/ast_generated.go:4498 (node *NewExpression) VisitEachChild
@@ -1162,19 +1449,22 @@ fn visit_each_child_new_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) ->
     let expression = v.visit_node_hooked(node.expression());
     let type_arguments = v.visit_nodes_hooked(node.type_argument_list());
     let arguments = v.visit_nodes_hooked(node.argument_list());
-    v.factory().update_new_expression(node, expression, type_arguments, arguments)
+    v.factory()
+        .update_new_expression(node, expression, type_arguments, arguments)
 }
 
 // Go: ast/ast_generated.go:4540 (node *MetaProperty) VisitEachChild
 fn visit_each_child_meta_property<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let name = v.visit_node_hooked(node.name());
-    v.factory().update_meta_property(node, node.keyword_token(), name)
+    v.factory()
+        .update_meta_property(node, node.keyword_token(), name)
 }
 
 // Go: ast/ast_generated.go:4584 (node *NonNullExpression) VisitEachChild
 fn visit_each_child_non_null_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let expression = v.visit_node_hooked(node.expression());
-    v.factory().update_non_null_expression(node, expression, node.flags())
+    v.factory()
+        .update_non_null_expression(node, expression, node.flags())
 }
 
 // Go: ast/ast_generated.go:4622 (node *SpreadElement) VisitEachChild
@@ -1187,7 +1477,8 @@ fn visit_each_child_spread_element<C>(node: Node, v: &mut NodeVisitor<'_, C>) ->
 fn visit_each_child_template_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let head = v.visit_node_hooked(node.head());
     let template_spans = v.visit_nodes_hooked(node.template_spans());
-    v.factory().update_template_expression(node, head, template_spans)
+    v.factory()
+        .update_template_expression(node, head, template_spans)
 }
 
 // Go: ast/ast_generated.go:4708 (node *TemplateSpan) VisitEachChild
@@ -1203,25 +1494,35 @@ fn visit_each_child_tagged_template_expression<C>(node: Node, v: &mut NodeVisito
     let question_dot_token = v.visit_node_hooked(node.question_dot_token());
     let type_arguments = v.visit_nodes_hooked(node.type_argument_list());
     let template = v.visit_node_hooked(node.template());
-    v.factory().update_tagged_template_expression(node, tag, question_dot_token, type_arguments, template, node.flags())
+    v.factory().update_tagged_template_expression(
+        node,
+        tag,
+        question_dot_token,
+        type_arguments,
+        template,
+        node.flags(),
+    )
 }
 
 // Go: ast/ast_generated.go:4801 (node *ParenthesizedExpression) VisitEachChild
 fn visit_each_child_parenthesized_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let expression = v.visit_node_hooked(node.expression());
-    v.factory().update_parenthesized_expression(node, expression)
+    v.factory()
+        .update_parenthesized_expression(node, expression)
 }
 
 // Go: ast/ast_generated.go:4846 (node *ArrayLiteralExpression) VisitEachChild
 fn visit_each_child_array_literal_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let elements = v.visit_nodes_hooked(node.element_list());
-    v.factory().update_array_literal_expression(node, elements, node.multi_line())
+    v.factory()
+        .update_array_literal_expression(node, elements, node.multi_line())
 }
 
 // Go: ast/ast_generated.go:4892 (node *ObjectLiteralExpression) VisitEachChild
 fn visit_each_child_object_literal_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let properties = v.visit_nodes_hooked(node.property_list());
-    v.factory().update_object_literal_expression(node, properties, node.multi_line())
+    v.factory()
+        .update_object_literal_expression(node, properties, node.multi_line())
 }
 
 // Go: ast/ast_generated.go:4936 (node *SpreadAssignment) VisitEachChild
@@ -1237,18 +1538,36 @@ fn visit_each_child_property_assignment<C>(node: Node, v: &mut NodeVisitor<'_, C
     let postfix_token = v.visit_node_hooked(node.postfix_token());
     let type_node = v.visit_node_hooked(node.type_());
     let initializer = v.visit_node_hooked(node.initializer());
-    v.factory().update_property_assignment(node, modifiers, name, postfix_token, type_node, initializer)
+    v.factory().update_property_assignment(
+        node,
+        modifiers,
+        name,
+        postfix_token,
+        type_node,
+        initializer,
+    )
 }
 
 // Go: ast/ast_generated.go:5043 (node *ShorthandPropertyAssignment) VisitEachChild
-fn visit_each_child_shorthand_property_assignment<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
+fn visit_each_child_shorthand_property_assignment<C>(
+    node: Node,
+    v: &mut NodeVisitor<'_, C>,
+) -> Node {
     let modifiers = v.visit_modifiers_hooked(node.modifiers());
     let name = v.visit_node_hooked(node.name());
     let postfix_token = v.visit_node_hooked(node.postfix_token());
     let type_node = v.visit_node_hooked(node.type_());
     let equals_token = v.visit_node_hooked(node.equals_token());
     let object_assignment_initializer = v.visit_node_hooked(node.object_assignment_initializer());
-    v.factory().update_shorthand_property_assignment(node, modifiers, name, postfix_token, type_node, equals_token, object_assignment_initializer)
+    v.factory().update_shorthand_property_assignment(
+        node,
+        modifiers,
+        name,
+        postfix_token,
+        type_node,
+        equals_token,
+        object_assignment_initializer,
+    )
 }
 
 // Go: ast/ast_generated.go:5085 (node *DeleteExpression) VisitEachChild
@@ -1279,7 +1598,8 @@ fn visit_each_child_await_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) 
 fn visit_each_child_type_assertion<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let type_node = v.visit_node_hooked(node.type_());
     let expression = v.visit_node_hooked(node.expression());
-    v.factory().update_type_assertion(node, type_node, expression)
+    v.factory()
+        .update_type_assertion(node, type_node, expression)
 }
 
 // Go: ast/ast_generated.go:5325 (node *UnionTypeNode) VisitEachChild
@@ -1300,13 +1620,15 @@ fn visit_each_child_conditional_type_node<C>(node: Node, v: &mut NodeVisitor<'_,
     let extends_type = v.visit_node_hooked(node.extends_type());
     let true_type = v.visit_node_hooked(node.true_type());
     let false_type = v.visit_node_hooked(node.false_type());
-    v.factory().update_conditional_type_node(node, check_type, extends_type, true_type, false_type)
+    v.factory()
+        .update_conditional_type_node(node, check_type, extends_type, true_type, false_type)
 }
 
 // Go: ast/ast_generated.go:5451 (node *TypeOperatorNode) VisitEachChild
 fn visit_each_child_type_operator_node<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let type_node = v.visit_node_hooked(node.type_());
-    v.factory().update_type_operator_node(node, node.operator(), type_node)
+    v.factory()
+        .update_type_operator_node(node, node.operator(), type_node)
 }
 
 // Go: ast/ast_generated.go:5489 (node *InferTypeNode) VisitEachChild
@@ -1325,21 +1647,27 @@ fn visit_each_child_array_type_node<C>(node: Node, v: &mut NodeVisitor<'_, C>) -
 fn visit_each_child_indexed_access_type_node<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let object_type = v.visit_node_hooked(node.object_type());
     let index_type = v.visit_node_hooked(node.index_type());
-    v.factory().update_indexed_access_type_node(node, object_type, index_type)
+    v.factory()
+        .update_indexed_access_type_node(node, object_type, index_type)
 }
 
 // Go: ast/ast_generated.go:5606 (node *TypeReferenceNode) VisitEachChild
 fn visit_each_child_type_reference_node<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let type_name = v.visit_node_hooked(node.type_name());
     let type_arguments = v.visit_nodes_hooked(node.type_argument_list());
-    v.factory().update_type_reference_node(node, type_name, type_arguments)
+    v.factory()
+        .update_type_reference_node(node, type_name, type_arguments)
 }
 
 // Go: ast/ast_generated.go:5647 (node *ExpressionWithTypeArguments) VisitEachChild
-fn visit_each_child_expression_with_type_arguments<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
+fn visit_each_child_expression_with_type_arguments<C>(
+    node: Node,
+    v: &mut NodeVisitor<'_, C>,
+) -> Node {
     let expression = v.visit_node_hooked(node.expression());
     let type_arguments = v.visit_nodes_hooked(node.type_argument_list());
-    v.factory().update_expression_with_type_arguments(node, expression, type_arguments)
+    v.factory()
+        .update_expression_with_type_arguments(node, expression, type_arguments)
 }
 
 // Go: ast/ast_generated.go:5685 (node *LiteralTypeNode) VisitEachChild
@@ -1353,7 +1681,8 @@ fn visit_each_child_type_predicate_node<C>(node: Node, v: &mut NodeVisitor<'_, C
     let asserts_modifier = v.visit_node_hooked(node.asserts_modifier());
     let parameter_name = v.visit_node_hooked(node.parameter_name());
     let type_node = v.visit_node_hooked(node.type_());
-    v.factory().update_type_predicate_node(node, asserts_modifier, parameter_name, type_node)
+    v.factory()
+        .update_type_predicate_node(node, asserts_modifier, parameter_name, type_node)
 }
 
 // Go: ast/ast_generated.go:5789 (node *ImportAttribute) VisitEachChild
@@ -1366,14 +1695,16 @@ fn visit_each_child_import_attribute<C>(node: Node, v: &mut NodeVisitor<'_, C>) 
 // Go: ast/ast_generated.go:5841 (node *ImportAttributes) VisitEachChild
 fn visit_each_child_import_attributes<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let attributes = v.visit_nodes_hooked(import_attributes_list(node));
-    v.factory().update_import_attributes(node, node.token(), attributes, node.multi_line())
+    v.factory()
+        .update_import_attributes(node, node.token(), attributes, node.multi_line())
 }
 
 // Go: ast/ast_generated.go:5884 (node *TypeQueryNode) VisitEachChild
 fn visit_each_child_type_query_node<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let expr_name = v.visit_node_hooked(node.expr_name());
     let type_arguments = v.visit_nodes_hooked(node.type_argument_list());
-    v.factory().update_type_query_node(node, expr_name, type_arguments)
+    v.factory()
+        .update_type_query_node(node, expr_name, type_arguments)
 }
 
 // Go: ast/ast_generated.go:5939 (node *MappedTypeNode) VisitEachChild
@@ -1384,7 +1715,15 @@ fn visit_each_child_mapped_type_node<C>(node: Node, v: &mut NodeVisitor<'_, C>) 
     let question_token = v.visit_node_hooked(node.question_token());
     let type_node = v.visit_node_hooked(node.type_());
     let members = v.visit_nodes_hooked(node.member_list());
-    v.factory().update_mapped_type_node(node, readonly_token, type_parameter, name_type, question_token, type_node, members)
+    v.factory().update_mapped_type_node(
+        node,
+        readonly_token,
+        type_parameter,
+        name_type,
+        question_token,
+        type_node,
+        members,
+    )
 }
 
 // Go: ast/ast_generated.go:5978 (node *TypeLiteralNode) VisitEachChild
@@ -1405,7 +1744,8 @@ fn visit_each_child_named_tuple_member<C>(node: Node, v: &mut NodeVisitor<'_, C>
     let name = v.visit_node_hooked(node.name());
     let question_token = v.visit_node_hooked(node.question_token());
     let type_node = v.visit_node_hooked(node.type_());
-    v.factory().update_named_tuple_member(node, dot_dot_dot_token, name, question_token, type_node)
+    v.factory()
+        .update_named_tuple_member(node, dot_dot_dot_token, name, question_token, type_node)
 }
 
 // Go: ast/ast_generated.go:6106 (node *OptionalTypeNode) VisitEachChild
@@ -1431,7 +1771,8 @@ fn visit_each_child_function_type_node<C>(node: Node, v: &mut NodeVisitor<'_, C>
     let type_parameters = v.visit_nodes_hooked(node.type_parameter_list());
     let parameters = v.visit_nodes_hooked(node.parameter_list());
     let type_node = v.visit_node_hooked(node.type_());
-    v.factory().update_function_type_node(node, type_parameters, parameters, type_node)
+    v.factory()
+        .update_function_type_node(node, type_parameters, parameters, type_node)
 }
 
 // Go: ast/ast_generated.go:6266 (node *ConstructorTypeNode) VisitEachChild
@@ -1440,33 +1781,50 @@ fn visit_each_child_constructor_type_node<C>(node: Node, v: &mut NodeVisitor<'_,
     let type_parameters = v.visit_nodes_hooked(node.type_parameter_list());
     let parameters = v.visit_nodes_hooked(node.parameter_list());
     let type_node = v.visit_node_hooked(node.type_());
-    v.factory().update_constructor_type_node(node, modifiers, type_parameters, parameters, type_node)
+    v.factory().update_constructor_type_node(
+        node,
+        modifiers,
+        type_parameters,
+        parameters,
+        type_node,
+    )
 }
 
 // Go: ast/ast_generated.go:6384 (node *TemplateLiteralTypeNode) VisitEachChild
 fn visit_each_child_template_literal_type_node<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let head = v.visit_node_hooked(node.head());
     let template_spans = v.visit_nodes_hooked(node.template_spans());
-    v.factory().update_template_literal_type_node(node, head, template_spans)
+    v.factory()
+        .update_template_literal_type_node(node, head, template_spans)
 }
 
 // Go: ast/ast_generated.go:6424 (node *TemplateLiteralTypeSpan) VisitEachChild
 fn visit_each_child_template_literal_type_span<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let type_node = v.visit_node_hooked(node.type_());
     let literal = v.visit_node_hooked(node.literal());
-    v.factory().update_template_literal_type_span(node, type_node, literal)
+    v.factory()
+        .update_template_literal_type_span(node, type_node, literal)
 }
 
 // Go: ast/ast_generated.go:6466 (node *SyntheticExpression) VisitEachChild
 fn visit_each_child_synthetic_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let tuple_name_source = v.visit_node_hooked(node.tuple_name_source());
-    v.factory().update_synthetic_expression(node, synthetic_expression_type(node), node.is_spread(), tuple_name_source)
+    v.factory().update_synthetic_expression(
+        node,
+        synthetic_expression_type(node),
+        node.is_spread(),
+        tuple_name_source,
+    )
 }
 
 // Go: ast/ast_generated.go:6504 (node *PartiallyEmittedExpression) VisitEachChild
-fn visit_each_child_partially_emitted_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
+fn visit_each_child_partially_emitted_expression<C>(
+    node: Node,
+    v: &mut NodeVisitor<'_, C>,
+) -> Node {
     let expression = v.visit_node_hooked(node.expression());
-    v.factory().update_partially_emitted_expression(node, expression)
+    v.factory()
+        .update_partially_emitted_expression(node, expression)
 }
 
 // Go: ast/ast_generated.go:6551 (node *JsxElement) VisitEachChild
@@ -1474,7 +1832,8 @@ fn visit_each_child_jsx_element<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> No
     let opening_element = v.visit_node_hooked(node.opening_element());
     let children = v.visit_nodes_hooked(node.children());
     let closing_element = v.visit_node_hooked(node.closing_element());
-    v.factory().update_jsx_element(node, opening_element, children, closing_element)
+    v.factory()
+        .update_jsx_element(node, opening_element, children, closing_element)
 }
 
 // Go: ast/ast_generated.go:6591 (node *JsxAttributes) VisitEachChild
@@ -1487,7 +1846,8 @@ fn visit_each_child_jsx_attributes<C>(node: Node, v: &mut NodeVisitor<'_, C>) ->
 fn visit_each_child_jsx_namespaced_name<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let namespace = v.visit_node_hooked(node.namespace());
     let name = v.visit_node_hooked(node.name());
-    v.factory().update_jsx_namespaced_name(node, namespace, name)
+    v.factory()
+        .update_jsx_namespaced_name(node, namespace, name)
 }
 
 // Go: ast/ast_generated.go:6679 (node *JsxOpeningElement) VisitEachChild
@@ -1495,7 +1855,8 @@ fn visit_each_child_jsx_opening_element<C>(node: Node, v: &mut NodeVisitor<'_, C
     let tag_name = v.visit_node_hooked(node.tag_name());
     let type_arguments = v.visit_nodes_hooked(node.type_argument_list());
     let attributes = v.visit_node_hooked(node.attributes());
-    v.factory().update_jsx_opening_element(node, tag_name, type_arguments, attributes)
+    v.factory()
+        .update_jsx_opening_element(node, tag_name, type_arguments, attributes)
 }
 
 // Go: ast/ast_generated.go:6722 (node *JsxSelfClosingElement) VisitEachChild
@@ -1503,7 +1864,8 @@ fn visit_each_child_jsx_self_closing_element<C>(node: Node, v: &mut NodeVisitor<
     let tag_name = v.visit_node_hooked(node.tag_name());
     let type_arguments = v.visit_nodes_hooked(node.type_argument_list());
     let attributes = v.visit_node_hooked(node.attributes());
-    v.factory().update_jsx_self_closing_element(node, tag_name, type_arguments, attributes)
+    v.factory()
+        .update_jsx_self_closing_element(node, tag_name, type_arguments, attributes)
 }
 
 // Go: ast/ast_generated.go:6765 (node *JsxFragment) VisitEachChild
@@ -1511,7 +1873,8 @@ fn visit_each_child_jsx_fragment<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> N
     let opening_fragment = v.visit_node_hooked(node.opening_fragment());
     let children = v.visit_nodes_hooked(node.children());
     let closing_fragment = v.visit_node_hooked(node.closing_fragment());
-    v.factory().update_jsx_fragment(node, opening_fragment, children, closing_fragment)
+    v.factory()
+        .update_jsx_fragment(node, opening_fragment, children, closing_fragment)
 }
 
 // Go: ast/ast_generated.go:6849 (node *JsxAttribute) VisitEachChild
@@ -1537,14 +1900,18 @@ fn visit_each_child_jsx_closing_element<C>(node: Node, v: &mut NodeVisitor<'_, C
 fn visit_each_child_jsx_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let dot_dot_dot_token = v.visit_node_hooked(node.dot_dot_dot_token());
     let expression = v.visit_node_hooked(node.expression());
-    v.factory().update_jsx_expression(node, dot_dot_dot_token, expression)
+    v.factory()
+        .update_jsx_expression(node, dot_dot_dot_token, expression)
 }
 
 // Go: ast/ast_generated.go:7034 (node *SyntaxList) VisitEachChild
 fn visit_each_child_syntax_list<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     // PORT: Go `core.SameMap` returns the original slice when no element changed;
     // the update compares elements, so a mapped copy with equal elements is the same.
-    let children: Vec<Node> = syntax_list_children(node).into_iter().map(|n| v.visit_node_hooked(n)).collect();
+    let children: Vec<Node> = syntax_list_children(node)
+        .into_iter()
+        .map(|n| v.visit_node_hooked(n))
+        .collect();
     v.factory().update_syntax_list(node, &children)
 }
 
@@ -1590,14 +1957,16 @@ fn visit_each_child_js_doc_type_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>) -
     let tag_name = v.visit_node_hooked(node.tag_name());
     let type_expression = v.visit_node_hooked(node.type_expression());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_type_tag(node, tag_name, type_expression, comment)
+    v.factory()
+        .update_js_doc_type_tag(node, tag_name, type_expression, comment)
 }
 
 // Go: ast/ast_generated.go:7364 (node *JSDocUnknownTag) VisitEachChild
 fn visit_each_child_js_doc_unknown_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let tag_name = v.visit_node_hooked(node.tag_name());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_unknown_tag(node, tag_name, comment)
+    v.factory()
+        .update_js_doc_unknown_tag(node, tag_name, comment)
 }
 
 // Go: ast/ast_generated.go:7409 (node *JSDocTemplateTag) VisitEachChild
@@ -1606,7 +1975,8 @@ fn visit_each_child_js_doc_template_tag<C>(node: Node, v: &mut NodeVisitor<'_, C
     let constraint = v.visit_node_hooked(node.constraint());
     let type_parameters = v.visit_nodes_hooked(node.type_parameter_list());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_template_tag(node, tag_name, constraint, type_parameters, comment)
+    v.factory()
+        .update_js_doc_template_tag(node, tag_name, constraint, type_parameters, comment)
 }
 
 // Go: ast/ast_generated.go:7449 (node *JSDocReturnTag) VisitEachChild
@@ -1614,49 +1984,56 @@ fn visit_each_child_js_doc_return_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>)
     let tag_name = v.visit_node_hooked(node.tag_name());
     let type_expression = v.visit_node_hooked(node.type_expression());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_return_tag(node, tag_name, type_expression, comment)
+    v.factory()
+        .update_js_doc_return_tag(node, tag_name, type_expression, comment)
 }
 
 // Go: ast/ast_generated.go:7487 (node *JSDocPublicTag) VisitEachChild
 fn visit_each_child_js_doc_public_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let tag_name = v.visit_node_hooked(node.tag_name());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_public_tag(node, tag_name, comment)
+    v.factory()
+        .update_js_doc_public_tag(node, tag_name, comment)
 }
 
 // Go: ast/ast_generated.go:7525 (node *JSDocPrivateTag) VisitEachChild
 fn visit_each_child_js_doc_private_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let tag_name = v.visit_node_hooked(node.tag_name());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_private_tag(node, tag_name, comment)
+    v.factory()
+        .update_js_doc_private_tag(node, tag_name, comment)
 }
 
 // Go: ast/ast_generated.go:7563 (node *JSDocProtectedTag) VisitEachChild
 fn visit_each_child_js_doc_protected_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let tag_name = v.visit_node_hooked(node.tag_name());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_protected_tag(node, tag_name, comment)
+    v.factory()
+        .update_js_doc_protected_tag(node, tag_name, comment)
 }
 
 // Go: ast/ast_generated.go:7601 (node *JSDocReadonlyTag) VisitEachChild
 fn visit_each_child_js_doc_readonly_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let tag_name = v.visit_node_hooked(node.tag_name());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_readonly_tag(node, tag_name, comment)
+    v.factory()
+        .update_js_doc_readonly_tag(node, tag_name, comment)
 }
 
 // Go: ast/ast_generated.go:7639 (node *JSDocOverrideTag) VisitEachChild
 fn visit_each_child_js_doc_override_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let tag_name = v.visit_node_hooked(node.tag_name());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_override_tag(node, tag_name, comment)
+    v.factory()
+        .update_js_doc_override_tag(node, tag_name, comment)
 }
 
 // Go: ast/ast_generated.go:7677 (node *JSDocDeprecatedTag) VisitEachChild
 fn visit_each_child_js_doc_deprecated_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let tag_name = v.visit_node_hooked(node.tag_name());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_deprecated_tag(node, tag_name, comment)
+    v.factory()
+        .update_js_doc_deprecated_tag(node, tag_name, comment)
 }
 
 // Go: ast/ast_generated.go:7717 (node *JSDocSeeTag) VisitEachChild
@@ -1664,7 +2041,8 @@ fn visit_each_child_js_doc_see_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>) ->
     let tag_name = v.visit_node_hooked(node.tag_name());
     let name_expression = v.visit_node_hooked(node.name_expression());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_see_tag(node, tag_name, name_expression, comment)
+    v.factory()
+        .update_js_doc_see_tag(node, tag_name, name_expression, comment)
 }
 
 // Go: ast/ast_generated.go:7757 (node *JSDocImplementsTag) VisitEachChild
@@ -1672,7 +2050,8 @@ fn visit_each_child_js_doc_implements_tag<C>(node: Node, v: &mut NodeVisitor<'_,
     let tag_name = v.visit_node_hooked(node.tag_name());
     let class_name = v.visit_node_hooked(node.class_name());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_implements_tag(node, tag_name, class_name, comment)
+    v.factory()
+        .update_js_doc_implements_tag(node, tag_name, class_name, comment)
 }
 
 // Go: ast/ast_generated.go:7797 (node *JSDocAugmentsTag) VisitEachChild
@@ -1680,7 +2059,8 @@ fn visit_each_child_js_doc_augments_tag<C>(node: Node, v: &mut NodeVisitor<'_, C
     let tag_name = v.visit_node_hooked(node.tag_name());
     let class_name = v.visit_node_hooked(node.class_name());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_augments_tag(node, tag_name, class_name, comment)
+    v.factory()
+        .update_js_doc_augments_tag(node, tag_name, class_name, comment)
 }
 
 // Go: ast/ast_generated.go:7837 (node *JSDocSatisfiesTag) VisitEachChild
@@ -1688,7 +2068,8 @@ fn visit_each_child_js_doc_satisfies_tag<C>(node: Node, v: &mut NodeVisitor<'_, 
     let tag_name = v.visit_node_hooked(node.tag_name());
     let type_expression = v.visit_node_hooked(node.type_expression());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_satisfies_tag(node, tag_name, type_expression, comment)
+    v.factory()
+        .update_js_doc_satisfies_tag(node, tag_name, type_expression, comment)
 }
 
 // Go: ast/ast_generated.go:7877 (node *JSDocThrowsTag) VisitEachChild
@@ -1696,7 +2077,8 @@ fn visit_each_child_js_doc_throws_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>)
     let tag_name = v.visit_node_hooked(node.tag_name());
     let type_expression = v.visit_node_hooked(node.type_expression());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_throws_tag(node, tag_name, type_expression, comment)
+    v.factory()
+        .update_js_doc_throws_tag(node, tag_name, type_expression, comment)
 }
 
 // Go: ast/ast_generated.go:7917 (node *JSDocThisTag) VisitEachChild
@@ -1704,7 +2086,8 @@ fn visit_each_child_js_doc_this_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>) -
     let tag_name = v.visit_node_hooked(node.tag_name());
     let type_expression = v.visit_node_hooked(node.type_expression());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_this_tag(node, tag_name, type_expression, comment)
+    v.factory()
+        .update_js_doc_this_tag(node, tag_name, type_expression, comment)
 }
 
 // Go: ast/ast_generated.go:7965 (node *JSDocImportTag) VisitEachChild
@@ -1714,7 +2097,14 @@ fn visit_each_child_js_doc_import_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>)
     let module_specifier = v.visit_node_hooked(node.module_specifier());
     let attributes = v.visit_node_hooked(node.attributes());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_import_tag(node, tag_name, import_clause, module_specifier, attributes, comment)
+    v.factory().update_js_doc_import_tag(
+        node,
+        tag_name,
+        import_clause,
+        module_specifier,
+        attributes,
+        comment,
+    )
 }
 
 // Go: ast/ast_generated.go:8010 (node *JSDocCallbackTag) VisitEachChild
@@ -1723,7 +2113,8 @@ fn visit_each_child_js_doc_callback_tag<C>(node: Node, v: &mut NodeVisitor<'_, C
     let type_expression = v.visit_node_hooked(node.type_expression());
     let name = v.visit_node_hooked(node.name());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_callback_tag(node, tag_name, type_expression, name, comment)
+    v.factory()
+        .update_js_doc_callback_tag(node, tag_name, type_expression, name, comment)
 }
 
 // Go: ast/ast_generated.go:8054 (node *JSDocOverloadTag) VisitEachChild
@@ -1731,7 +2122,8 @@ fn visit_each_child_js_doc_overload_tag<C>(node: Node, v: &mut NodeVisitor<'_, C
     let tag_name = v.visit_node_hooked(node.tag_name());
     let type_expression = v.visit_node_hooked(node.type_expression());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_overload_tag(node, tag_name, type_expression, comment)
+    v.factory()
+        .update_js_doc_overload_tag(node, tag_name, type_expression, comment)
 }
 
 // Go: ast/ast_generated.go:8099 (node *JSDocTypedefTag) VisitEachChild
@@ -1740,7 +2132,8 @@ fn visit_each_child_js_doc_typedef_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>
     let type_expression = v.visit_node_hooked(node.type_expression());
     let name = v.visit_node_hooked(node.name());
     let comment = v.visit_nodes_hooked(node.comment());
-    v.factory().update_js_doc_typedef_tag(node, tag_name, type_expression, name, comment)
+    v.factory()
+        .update_js_doc_typedef_tag(node, tag_name, type_expression, name, comment)
 }
 
 // Go: ast/ast_generated.go:8143 (node *JSDocSignature) VisitEachChild
@@ -1748,7 +2141,8 @@ fn visit_each_child_js_doc_signature<C>(node: Node, v: &mut NodeVisitor<'_, C>) 
     let type_parameters = v.visit_nodes_hooked(node.type_parameter_list());
     let parameters = v.visit_nodes_hooked(node.parameter_list());
     let type_node = v.visit_node_hooked(node.type_());
-    v.factory().update_js_doc_signature(node, type_parameters, parameters, type_node)
+    v.factory()
+        .update_js_doc_signature(node, type_parameters, parameters, type_node)
 }
 
 // Go: ast/ast_generated.go:8181 (node *JSDocNameReference) VisitEachChild
@@ -1762,7 +2156,8 @@ fn visit_each_child_module_declaration<C>(node: Node, v: &mut NodeVisitor<'_, C>
     let modifiers = v.visit_modifiers_hooked(node.modifiers());
     let name = v.visit_node_hooked(node.name());
     let body = v.visit_node_hooked(node.body());
-    v.factory().update_module_declaration(node, modifiers, node.keyword(), name, body)
+    v.factory()
+        .update_module_declaration(node, modifiers, node.keyword(), name, body)
 }
 
 // Go: ast/ast_generated.go:8293 (node *ImportEqualsDeclaration) VisitEachChild
@@ -1770,7 +2165,13 @@ fn visit_each_child_import_equals_declaration<C>(node: Node, v: &mut NodeVisitor
     let modifiers = v.visit_modifiers_hooked(node.modifiers());
     let name = v.visit_node_hooked(node.name());
     let module_reference = v.visit_node_hooked(node.module_reference());
-    v.factory().update_import_equals_declaration(node, modifiers, node.is_type_only(), name, module_reference)
+    v.factory().update_import_equals_declaration(
+        node,
+        modifiers,
+        node.is_type_only(),
+        name,
+        module_reference,
+    )
 }
 
 // Go: ast/ast_generated.go:8348 (node *ExportDeclaration) VisitEachChild
@@ -1779,7 +2180,14 @@ fn visit_each_child_export_declaration<C>(node: Node, v: &mut NodeVisitor<'_, C>
     let export_clause = v.visit_node_hooked(node.export_clause());
     let module_specifier = v.visit_node_hooked(node.module_specifier());
     let attributes = v.visit_node_hooked(node.attributes());
-    v.factory().update_export_declaration(node, modifiers, node.is_type_only(), export_clause, module_specifier, attributes)
+    v.factory().update_export_declaration(
+        node,
+        modifiers,
+        node.is_type_only(),
+        export_clause,
+        module_specifier,
+        attributes,
+    )
 }
 
 // Go: ast/ast_generated.go:8396 (node *ImportTypeNode) VisitEachChild
@@ -1788,21 +2196,30 @@ fn visit_each_child_import_type_node<C>(node: Node, v: &mut NodeVisitor<'_, C>) 
     let attributes = v.visit_node_hooked(node.attributes());
     let qualifier = v.visit_node_hooked(node.qualifier());
     let type_arguments = v.visit_nodes_hooked(node.type_argument_list());
-    v.factory().update_import_type_node(node, node.is_type_of(), argument, attributes, qualifier, type_arguments)
+    v.factory().update_import_type_node(
+        node,
+        node.is_type_of(),
+        argument,
+        attributes,
+        qualifier,
+        type_arguments,
+    )
 }
 
 // Go: ast/ast_generated.go:8441 (node *ImportClause) VisitEachChild
 fn visit_each_child_import_clause<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let name = v.visit_node_hooked(node.name());
     let named_bindings = v.visit_node_hooked(node.named_bindings());
-    v.factory().update_import_clause(node, node.phase_modifier(), name, named_bindings)
+    v.factory()
+        .update_import_clause(node, node.phase_modifier(), name, named_bindings)
 }
 
 // Go: ast/ast_generated.go:8490 (node *ImportSpecifier) VisitEachChild
 fn visit_each_child_import_specifier<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let property_name = v.visit_node_hooked(node.property_name());
     let name = v.visit_node_hooked(node.name());
-    v.factory().update_import_specifier(node, node.is_type_only(), property_name, name)
+    v.factory()
+        .update_import_specifier(node, node.is_type_only(), property_name, name)
 }
 
 // Go: ast/ast_generated.go:8557 (node *JSDocLink) VisitEachChild
@@ -1814,7 +2231,8 @@ fn visit_each_child_js_doc_link<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> No
 // Go: ast/ast_generated.go:8601 (node *JSDocLinkPlain) VisitEachChild
 fn visit_each_child_js_doc_link_plain<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let name = v.visit_node_hooked(node.name());
-    v.factory().update_js_doc_link_plain(node, name, node.text())
+    v.factory()
+        .update_js_doc_link_plain(node, name, node.text())
 }
 
 // Go: ast/ast_generated.go:8645 (node *JSDocLinkCode) VisitEachChild
@@ -1830,25 +2248,44 @@ fn visit_each_child_type_parameter_declaration<C>(node: Node, v: &mut NodeVisito
     let constraint = v.visit_node_hooked(node.constraint());
     let expression = v.visit_node_hooked(node.expression());
     let default_type = v.visit_node_hooked(node.default_type());
-    v.factory().update_type_parameter_declaration(node, modifiers, name, constraint, expression, default_type)
+    v.factory().update_type_parameter_declaration(
+        node,
+        modifiers,
+        name,
+        constraint,
+        expression,
+        default_type,
+    )
 }
 
 // Go: ast/ast_generated.go:8745 (node *SyntheticReferenceExpression) VisitEachChild
-fn visit_each_child_synthetic_reference_expression<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
+fn visit_each_child_synthetic_reference_expression<C>(
+    node: Node,
+    v: &mut NodeVisitor<'_, C>,
+) -> Node {
     let expression = v.visit_node_hooked(node.expression());
     let this_arg = v.visit_node_hooked(node.this_arg());
-    v.factory().update_synthetic_reference_expression(node, expression, this_arg)
+    v.factory()
+        .update_synthetic_reference_expression(node, expression, this_arg)
 }
 
 // Go: ast/ast_generated.go:8791 (node *JSDocTypeLiteral) VisitEachChild
 fn visit_each_child_js_doc_type_literal<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     // PORT: Go `core.SameMap` returns the original slice when no element changed;
     // the update compares elements, so a mapped copy with equal elements is the same.
-    let jsdoc_property_tags: Vec<Node> = node.js_doc_property_tags().into_iter().map(|n| v.visit_node_hooked(n)).collect();
-    v.factory().update_js_doc_type_literal(node, &jsdoc_property_tags, node.is_array_type())
+    let jsdoc_property_tags: Vec<Node> = node
+        .js_doc_property_tags()
+        .into_iter()
+        .map(|n| v.visit_node_hooked(n))
+        .collect();
+    v.factory()
+        .update_js_doc_type_literal(node, &jsdoc_property_tags, node.is_array_type())
 }
 
 // Go: ast/ast_generated.go:8838 (node *JSDocParameterOrPropertyTag) VisitEachChild
-fn visit_each_child_js_doc_parameter_or_property_tag<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
+fn visit_each_child_js_doc_parameter_or_property_tag<C>(
+    node: Node,
+    v: &mut NodeVisitor<'_, C>,
+) -> Node {
     visit_each_child_js_doc_parameter_or_property_tag_impl(node, v)
 }

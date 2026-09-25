@@ -19,9 +19,18 @@ pub fn synthetic_flow(id: FlowNodeId) -> &'static FlowNode {
 
 impl Checker {
     /// Go `&ast.FlowNode{Flags: flags, Node: node, Antecedent: antecedent}` in the checker.
-    pub fn new_synthetic_flow_node(&mut self, flags: FlowFlags, node: Node, antecedent: FlowNodeId) -> FlowNodeId {
-        let flow: &'static FlowNode =
-            Box::leak(Box::new(FlowNode { flags, node, antecedent, antecedents: Vec::new() }));
+    pub fn new_synthetic_flow_node(
+        &mut self,
+        flags: FlowFlags,
+        node: Node,
+        antecedent: FlowNodeId,
+    ) -> FlowNodeId {
+        let flow: &'static FlowNode = Box::leak(Box::new(FlowNode {
+            flags,
+            node,
+            antecedent,
+            antecedents: Vec::new(),
+        }));
         SYNTHETIC_FLOWS.with(|f| {
             let mut f = f.borrow_mut();
             f.push(flow);
@@ -31,7 +40,11 @@ impl Checker {
 
     // Go: checker/emitresolver.go:685 isConstEnumOrConstEnumOnlyModule
     pub fn is_const_enum_or_const_enum_only_module(&self, s: SymbolId) -> bool {
-        self.is_const_enum_symbol(s) || self.sym(s).flags.intersects(SymbolFlags::CONST_ENUM_ONLY_MODULE)
+        self.is_const_enum_symbol(s)
+            || self
+                .sym(s)
+                .flags
+                .intersects(SymbolFlags::CONST_ENUM_ONLY_MODULE)
     }
 
     // Go: checker/symbolaccessibility.go:595 compareSymbolChainsWorker
@@ -69,9 +82,9 @@ fn try_get_module_specifier_from_declaration_worker(node: Node) -> Node {
             }
             require_call.arguments().get(0)
         }
-        SyntaxKind::ImportDeclaration | SyntaxKind::ExportDeclaration | SyntaxKind::JsDocImportTag => {
-            node.module_specifier()
-        }
+        SyntaxKind::ImportDeclaration
+        | SyntaxKind::ExportDeclaration
+        | SyntaxKind::JsDocImportTag => node.module_specifier(),
         SyntaxKind::ImportEqualsDeclaration => {
             let r = node.module_reference();
             if r.kind() != SyntaxKind::ExternalModuleReference {
@@ -80,7 +93,9 @@ fn try_get_module_specifier_from_declaration_worker(node: Node) -> Node {
             r.expression()
         }
         SyntaxKind::ImportClause | SyntaxKind::NamespaceExport => node.parent().module_specifier(),
-        SyntaxKind::NamespaceImport | SyntaxKind::ExportSpecifier => node.parent().parent().module_specifier(),
+        SyntaxKind::NamespaceImport | SyntaxKind::ExportSpecifier => {
+            node.parent().parent().module_specifier()
+        }
         SyntaxKind::ImportSpecifier => node.parent().parent().parent().module_specifier(),
         SyntaxKind::ImportType => {
             if is_literal_import_type_node(node) {

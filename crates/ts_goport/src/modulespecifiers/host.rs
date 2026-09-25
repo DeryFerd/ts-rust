@@ -32,7 +32,9 @@ thread_local! {
 fn get_package_json_info_for_directory(package_directory: &str) -> Option<Rc<InfoCacheEntry>> {
     let package_json_path = tspath::combine_paths(package_directory, &["package.json"]);
 
-    if let Some(existing) = PACKAGE_JSON_INFO_CACHE.with(|c| c.borrow().get(&package_json_path).cloned()) {
+    if let Some(existing) =
+        PACKAGE_JSON_INFO_CACHE.with(|c| c.borrow().get(&package_json_path).cloned())
+    {
         if existing.contents.is_some() {
             return Some(existing);
         }
@@ -52,8 +54,12 @@ fn get_package_json_info_for_directory(package_directory: &str) -> Option<Rc<Inf
             contents: Some(PackageJson::new(parsed.unwrap_or_default(), parseable)),
         });
         // Go: packageJsonInfoCache.Set keeps the first stored value.
-        let result = PACKAGE_JSON_INFO_CACHE
-            .with(|c| c.borrow_mut().entry(package_json_path).or_insert(result).clone());
+        let result = PACKAGE_JSON_INFO_CACHE.with(|c| {
+            c.borrow_mut()
+                .entry(package_json_path)
+                .or_insert(result)
+                .clone()
+        });
         return Some(result);
     }
     PACKAGE_JSON_INFO_CACHE.with(|c| {
@@ -85,31 +91,42 @@ fn get_package_scope_for_path(directory: &str) -> Option<Rc<InfoCacheEntry>> {
 // `<dep>` and then `@types/<dep>`, and uses the real path of the first
 // directory that exists. It returns `(original_path, resolved)`. Like Go,
 // `original_path` is empty when the real path is the same.
-fn resolve_package_directory(package_name: &str, containing_file: &str) -> Option<(String, String)> {
+fn resolve_package_directory(
+    package_name: &str,
+    containing_file: &str,
+) -> Option<(String, String)> {
     let fs = ts_vfs::OsFileSystem::default();
     let containing_directory = tspath::get_directory_path(containing_file);
-    tspath::for_each_ancestor_directory_stopping_at_global_cache("", &containing_directory, |directory| {
-        if tspath::get_base_file_name(directory) == "node_modules" {
-            return (None, false);
-        }
-        let node_modules = tspath::combine_paths(directory, &["node_modules"]);
-        let mut candidates = vec![tspath::combine_paths(&node_modules, &[package_name])];
-        if !package_name.starts_with("@types/") {
-            candidates.push(tspath::combine_paths(
-                &node_modules,
-                &["@types", &deps::mangle_scoped_package_name(package_name)],
-            ));
-        }
-        for candidate in candidates {
-            if fs.directory_exists(&candidate) {
-                let candidate = tspath::normalize_path(&candidate);
-                let real = tspath::normalize_path(&fs.realpath(&candidate));
-                let original = if real == candidate { String::new() } else { candidate };
-                return (Some((original, real)), true);
+    tspath::for_each_ancestor_directory_stopping_at_global_cache(
+        "",
+        &containing_directory,
+        |directory| {
+            if tspath::get_base_file_name(directory) == "node_modules" {
+                return (None, false);
             }
-        }
-        (None, false)
-    })
+            let node_modules = tspath::combine_paths(directory, &["node_modules"]);
+            let mut candidates = vec![tspath::combine_paths(&node_modules, &[package_name])];
+            if !package_name.starts_with("@types/") {
+                candidates.push(tspath::combine_paths(
+                    &node_modules,
+                    &["@types", &deps::mangle_scoped_package_name(package_name)],
+                ));
+            }
+            for candidate in candidates {
+                if fs.directory_exists(&candidate) {
+                    let candidate = tspath::normalize_path(&candidate);
+                    let real = tspath::normalize_path(&fs.realpath(&candidate));
+                    let original = if real == candidate {
+                        String::new()
+                    } else {
+                        candidate
+                    };
+                    return (Some((original, real)), true);
+                }
+            }
+            (None, false)
+        },
+    )
 }
 
 impl OutputPathsHost for ProgramHost {
@@ -141,7 +158,8 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
         // program in this crate.
         for resolutions in crate::program::get_resolved_modules().values() {
             for resolution in resolutions.values() {
-                known_symlinks.process_resolution(&resolution.original_path, &resolution.resolved_file_name);
+                known_symlinks
+                    .process_resolution(&resolution.original_path, &resolution.resolved_file_name);
             }
         }
 
@@ -151,14 +169,23 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
             let meta = crate::program::get_source_file_meta_data(&source_file_info(file).path);
             if meta.package_json_directory.is_empty()
                 || !crate::program::source_file_may_be_emitted(file, false)
-                || !seen_package_jsons.insert(tspath::to_path(&meta.package_json_directory, cwd, case))
+                || !seen_package_jsons.insert(tspath::to_path(
+                    &meta.package_json_directory,
+                    cwd,
+                    case,
+                ))
             {
                 continue;
             }
-            let package_json_name = tspath::combine_paths(&meta.package_json_directory, &["package.json"]);
-            let Some(contents) = self.get_package_json_info(&package_json_name).and_then(|info| {
-                info.get_contents().map(|c| c.fields.get_runtime_dependency_names())
-            }) else {
+            let package_json_name =
+                tspath::combine_paths(&meta.package_json_directory, &["package.json"]);
+            let Some(contents) = self
+                .get_package_json_info(&package_json_name)
+                .and_then(|info| {
+                    info.get_contents()
+                        .map(|c| c.fields.get_runtime_dependency_names())
+                })
+            else {
                 continue;
             };
 
@@ -176,7 +203,10 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
                 if !dep.starts_with("@types") {
                     let types_name = format!("@types/{}", deps::mangle_scoped_package_name(&dep));
                     let possible_types_directory_path = tspath::to_path(
-                        &tspath::combine_paths(&meta.package_json_directory, &["node_modules", &types_name]),
+                        &tspath::combine_paths(
+                            &meta.package_json_directory,
+                            &["node_modules", &types_name],
+                        ),
                         cwd,
                         case,
                     );
@@ -185,7 +215,9 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
                     }
                 }
 
-                if let Some((original_path, resolved)) = resolve_package_directory(&dep, &package_json_name) {
+                if let Some((original_path, resolved)) =
+                    resolve_package_directory(&dep, &package_json_name)
+                {
                     known_symlinks.process_resolution(
                         &tspath::combine_paths(&original_path, &["package.json"]),
                         &tspath::combine_paths(&resolved, &["package.json"]),
@@ -217,7 +249,10 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
     }
 
     // Go: compiler/program.go:173 GetProjectReferenceFromSource
-    fn get_project_reference_from_source(&self, path: &tspath::Path) -> Option<&'static SourceOutputAndProjectReference> {
+    fn get_project_reference_from_source(
+        &self,
+        path: &tspath::Path,
+    ) -> Option<&'static SourceOutputAndProjectReference> {
         crate::program::get_project_reference_from_source(path)
     }
 
@@ -253,7 +288,9 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
     fn get_package_json_info(&self, pkg_json_path: &str) -> Option<Rc<InfoCacheEntry>> {
         let directory = tspath::get_directory_path(pkg_json_path);
         match get_package_scope_for_path(&directory) {
-            Some(scoped) if scoped.exists() && scoped.package_directory == directory => Some(scoped),
+            Some(scoped) if scoped.exists() && scoped.package_directory == directory => {
+                Some(scoped)
+            }
             _ => None,
         }
     }
@@ -262,7 +299,11 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
         crate::program::get_default_resolution_mode_for_file(file)
     }
 
-    fn get_resolved_module_from_module_specifier(&self, file: Node, module_specifier: Node) -> Option<ResolvedModule> {
+    fn get_resolved_module_from_module_specifier(
+        &self,
+        file: Node,
+        module_specifier: Node,
+    ) -> Option<ResolvedModule> {
         crate::program::get_resolved_module_from_module_specifier(file, module_specifier)
     }
 

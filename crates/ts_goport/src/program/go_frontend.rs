@@ -8,11 +8,13 @@
 use super::*;
 use crate::ast::store::{file_store_count, file_store_file_name, file_store_parser_flags};
 use crate::frontend::bundled;
-use crate::frontend::compiler::{new_cached_fs_compiler_host, new_program, NewProgram, ProgramOptions};
+use crate::frontend::compiler::{
+    NewProgram, ProgramOptions, new_cached_fs_compiler_host, new_program,
+};
 use crate::frontend::parser::ParsedSourceFile;
-use crate::frontend::tsoptions::{get_parsed_command_line_of_config_file, ParseConfigHost};
+use crate::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
 use crate::frontend::tspath::Path as GoPath;
-use crate::frontend::vfs::{osvfs_fs, Fs};
+use crate::frontend::vfs::{Fs, osvfs_fs};
 use std::rc::Rc;
 
 /// Go frontend data that the program functions dispatch to.
@@ -57,8 +59,11 @@ pub(super) fn try_load_with(
     let cwd = ts_path::normalize_path(&cwd.to_string_lossy().replace('\\', "/"));
     // Go: sys.FS() is bundled.WrapFS(osvfs.FS()).
     let fs = bundled::wrap_fs(osvfs_fs());
-    let case_sensitivity =
-        if fs.use_case_sensitive_file_names() { CaseSensitivity::Sensitive } else { CaseSensitivity::Insensitive };
+    let case_sensitivity = if fs.use_case_sensitive_file_names() {
+        CaseSensitivity::Sensitive
+    } else {
+        CaseSensitivity::Insensitive
+    };
     let mut config_abs = ts_path::resolve_path(&cwd, &[config_path]);
     // Go tsc `-p <dir>` reads `<dir>/tsconfig.json`.
     if fs.directory_exists(&config_abs) {
@@ -70,13 +75,23 @@ pub(super) fn try_load_with(
     // and the command line here has none, so it is nil.
     let mut command_line_options = CompilerOptions::default();
     edit_options(&mut command_line_options);
-    let sys = System { fs: fs.clone(), current_directory: cwd.clone() };
-    let (config, errors) =
-        get_parsed_command_line_of_config_file(&config_abs, Some(&command_line_options), None, &sys, None);
+    let sys = System {
+        fs: fs.clone(),
+        current_directory: cwd.clone(),
+    };
+    let (config, errors) = get_parsed_command_line_of_config_file(
+        &config_abs,
+        Some(&command_line_options),
+        None,
+        &sys,
+        None,
+    );
     if !errors.is_empty() {
         // Go reports these unrecoverable errors and exits.
-        let messages: Vec<String> =
-            errors.iter().map(|d| format!("error TS{}: {}", d.code, d.localize())).collect();
+        let messages: Vec<String> = errors
+            .iter()
+            .map(|d| format!("error TS{}: {}", d.code, d.localize()))
+            .collect();
         return Err(messages.join("\n"));
     }
     let config = config.ok_or_else(|| format!("cannot parse {config_abs}"))?;
@@ -144,7 +159,11 @@ pub(super) fn try_load_with(
         common_source_directory: OnceCell::new(),
         pool: RefCell::new(None),
         declaration_diagnostic_cache: RefCell::new(FxHashMap::default()),
-        go: Some(GoFrontendState { program: new_program, parsed, lazy_jsdoc: RefCell::new(FxHashMap::default()) }),
+        go: Some(GoFrontendState {
+            program: new_program,
+            parsed,
+            lazy_jsdoc: RefCell::new(FxHashMap::default()),
+        }),
     }));
     STATE.with(|cell| {
         assert!(cell.set(program_state).is_ok(), "program already loaded");
@@ -155,7 +174,12 @@ pub(super) fn try_load_with(
 
 /// `SourceFileInfo` of a program file, from the Go parser fields and the
 /// Go program (metadata, default library).
-fn program_file_info(store: usize, file: &ParsedSourceFile, p: &NewProgram, path: &GoPath) -> SourceFileInfo {
+fn program_file_info(
+    store: usize,
+    file: &ParsedSourceFile,
+    p: &NewProgram,
+    path: &GoPath,
+) -> SourceFileInfo {
     let info = SourceFileInfo {
         file_name: file.file_name().to_string(),
         path: path.0.clone(),
@@ -242,8 +266,13 @@ impl GoFrontendState {
         }
         let parsed = self.parsed_file(file);
         let jsdocs: &'static [Node] = Box::leak(
-            crate::frontend::parser::parse_js_doc_for_node(&parsed.parse_options, parsed.text, parsed.script_kind, node)
-                .into_boxed_slice(),
+            crate::frontend::parser::parse_js_doc_for_node(
+                &parsed.parse_options,
+                parsed.text,
+                parsed.script_kind,
+                node,
+            )
+            .into_boxed_slice(),
         );
         self.lazy_jsdoc.borrow_mut().insert(node, jsdocs);
         jsdocs
@@ -251,6 +280,8 @@ impl GoFrontendState {
 
     /// The parsed program file of `file`.
     pub(super) fn parsed_file(&self, file: Node) -> &Rc<ParsedSourceFile> {
-        self.parsed.get(&file.file_index()).expect("not a Go frontend program file")
+        self.parsed
+            .get(&file.file_index())
+            .expect("not a Go frontend program file")
     }
 }

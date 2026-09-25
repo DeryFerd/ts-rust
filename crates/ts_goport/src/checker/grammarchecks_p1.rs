@@ -5,7 +5,12 @@ use ts_diagnostics::Message;
 
 impl Checker {
     // Go: checker/grammarchecks.go:18 grammarErrorOnFirstToken
-    pub fn grammar_error_on_first_token(&mut self, node: Node, message: &'static Message, args: Vec<String>) -> bool {
+    pub fn grammar_error_on_first_token(
+        &mut self,
+        node: Node,
+        message: &'static Message,
+        args: Vec<String>,
+    ) -> bool {
         let source_file = get_source_file_of_node(node);
         if !self.has_parse_diagnostics(source_file) {
             let span = get_range_of_token_at_position(source_file, node.pos());
@@ -26,14 +31,24 @@ impl Checker {
     ) -> bool {
         let source_file = get_source_file_of_node(node_for_source_file);
         if !self.has_parse_diagnostics(source_file) {
-            self.add_diagnostic(new_diagnostic(source_file, TextRange::new(start, start + length), message, args));
+            self.add_diagnostic(new_diagnostic(
+                source_file,
+                TextRange::new(start, start + length),
+                message,
+                args,
+            ));
             return true;
         }
         false
     }
 
     // Go: checker/grammarchecks.go:37 grammarErrorOnNode
-    pub fn grammar_error_on_node(&mut self, node: Node, message: &'static Message, args: Vec<String>) -> bool {
+    pub fn grammar_error_on_node(
+        &mut self,
+        node: Node,
+        message: &'static Message,
+        args: Vec<String>,
+    ) -> bool {
         let source_file = get_source_file_of_node(node);
         if !self.has_parse_diagnostics(source_file) {
             self.error(node, message, args);
@@ -82,14 +97,17 @@ impl Checker {
     pub fn check_grammar_regular_expression_literal(&mut self, node: Node) -> bool {
         let source_file = get_source_file_of_node(node);
         if !self.has_parse_diagnostics(source_file) {
-            let reports: Rc<RefCell<Vec<(&'static Message, i32, i32)>>> = Rc::new(RefCell::new(Vec::new()));
+            let reports: Rc<RefCell<Vec<(&'static Message, i32, i32)>>> =
+                Rc::new(RefCell::new(Vec::new()));
             let mut reg_exp_scanner = rs_new_scanner();
             reg_exp_scanner.set_script_target(self.language_version);
             reg_exp_scanner.set_language_variant(source_file_info(source_file).language_variant);
             let sink = reports.clone();
-            reg_exp_scanner.set_on_error(Some(Box::new(move |message: &'static Message, start: i32, length: i32| {
-                sink.borrow_mut().push((message, start, length));
-            })));
+            reg_exp_scanner.set_on_error(Some(Box::new(
+                move |message: &'static Message, start: i32, length: i32| {
+                    sink.borrow_mut().push((message, start, length));
+                },
+            )));
             reg_exp_scanner.set_text(source_file_text(source_file));
             reg_exp_scanner.reset_token_state(node.pos());
             reg_exp_scanner.scan();
@@ -108,13 +126,26 @@ impl Checker {
                     let e = &pending[i];
                     start == e.pos() && length == e.len()
                 });
-                if message.category() == ts_diagnostics::Category::Message && last_error.is_some() && matches_last {
+                if message.category() == ts_diagnostics::Category::Message
+                    && last_error.is_some()
+                    && matches_last
+                {
                     // For providing spelling suggestions.
-                    let err = new_diagnostic(Node::NIL, TextRange::new(start, start + length), message, args![]);
+                    let err = new_diagnostic(
+                        Node::NIL,
+                        TextRange::new(start, start + length),
+                        message,
+                        args![],
+                    );
                     let i = last_error.unwrap();
                     pending[i].add_related_info(Some(err));
                 } else if last_error.is_none() || start != pending[last_error.unwrap()].pos() {
-                    pending.push(new_diagnostic(source_file, TextRange::new(start, start + length), message, args![]));
+                    pending.push(new_diagnostic(
+                        source_file,
+                        TextRange::new(start, start + length),
+                        message,
+                        args![],
+                    ));
                     last_error = Some(pending.len() - 1);
                 }
             }
@@ -149,8 +180,16 @@ impl Checker {
 
             let is_in_operation = is_binary_expression(priv_id.parent())
                 && priv_id.parent().operator_token().kind() == SyntaxKind::InKeyword;
-            if self.get_symbol_for_private_identifier_expression(priv_id_as_node).is_nil() && !is_in_operation {
-                return self.grammar_error_on_node(priv_id_as_node, diag::Cannot_find_name_0, args![priv_id.text()]);
+            if self
+                .get_symbol_for_private_identifier_expression(priv_id_as_node)
+                .is_nil()
+                && !is_in_operation
+            {
+                return self.grammar_error_on_node(
+                    priv_id_as_node,
+                    diag::Cannot_find_name_0,
+                    args![priv_id.text()],
+                );
             }
         }
 
@@ -260,14 +299,21 @@ impl Checker {
         // PORT: Go reads the `IsTypeOnly` field; the Go `IsTypeOnly()` method
         // returns it for an export declaration.
         let export_clause = node.export_clause();
-        if node.is_type_only() && export_clause.is_some() && export_clause.kind() == SyntaxKind::NamedExports {
+        if node.is_type_only()
+            && export_clause.is_some()
+            && export_clause.kind() == SyntaxKind::NamedExports
+        {
             return self.check_grammar_type_only_named_imports_or_exports(export_clause);
         }
         false
     }
 
     // Go: checker/grammarchecks.go:205 checkGrammarModuleElementContext
-    pub fn check_grammar_module_element_context(&mut self, node: Node, error_message: &'static Message) -> bool {
+    pub fn check_grammar_module_element_context(
+        &mut self,
+        node: Node,
+        error_message: &'static Message,
+    ) -> bool {
         let parent_kind = node.parent().kind();
         let is_in_appropriate_context = parent_kind == SyntaxKind::SourceFile
             || parent_kind == SyntaxKind::ModuleBlock
@@ -279,7 +325,10 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:213 checkGrammarModifiers
-    pub fn check_grammar_modifiers(&mut self, node: Node /*Union[HasModifiers, HasDecorators, HasIllegalModifiers, HasIllegalDecorators]*/) -> bool {
+    pub fn check_grammar_modifiers(
+        &mut self,
+        node: Node, /*Union[HasModifiers, HasDecorators, HasIllegalModifiers, HasIllegalDecorators]*/
+    ) -> bool {
         if node.modifiers().is_nil() {
             return false;
         }
@@ -311,23 +360,36 @@ impl Checker {
         let modifiers = node.modifier_nodes().to_vec();
         for modifier in modifiers {
             if is_decorator(modifier) {
-                if !node_can_be_decorated(self.legacy_decorators, node, node.parent(), node.parent().parent()) {
-                    if node.kind() == SyntaxKind::MethodDeclaration && !node_is_present(node.body()) {
+                if !node_can_be_decorated(
+                    self.legacy_decorators,
+                    node,
+                    node.parent(),
+                    node.parent().parent(),
+                ) {
+                    if node.kind() == SyntaxKind::MethodDeclaration && !node_is_present(node.body())
+                    {
                         return self.grammar_error_on_first_token(
                             node,
                             diag::A_decorator_can_only_decorate_a_method_implementation_not_an_overload,
                             args![],
                         );
                     } else {
-                        return self.grammar_error_on_first_token(node, diag::Decorators_are_not_valid_here, args![]);
+                        return self.grammar_error_on_first_token(
+                            node,
+                            diag::Decorators_are_not_valid_here,
+                            args![],
+                        );
                     }
                 } else if self.legacy_decorators
-                    && (node.kind() == SyntaxKind::GetAccessor || node.kind() == SyntaxKind::SetAccessor)
+                    && (node.kind() == SyntaxKind::GetAccessor
+                        || node.kind() == SyntaxKind::SetAccessor)
                 {
                     let symbol = self.get_symbol_of_declaration(node);
                     let declarations = self.sym(symbol).declarations.clone();
-                    let accessors = get_all_accessor_declarations_for_declaration(node, &declarations);
-                    if has_decorators(accessors.first_accessor) && node == accessors.second_accessor {
+                    let accessors =
+                        get_all_accessor_declarations_for_declaration(node, &declarations);
+                    if has_decorators(accessors.first_accessor) && node == accessors.second_accessor
+                    {
                         return self.grammar_error_on_first_token(
                             node,
                             diag::Decorators_cannot_be_applied_to_multiple_get_Slashset_accessors_of_the_same_name,
@@ -337,8 +399,15 @@ impl Checker {
                 }
 
                 // if we've seen any modifiers aside from `export`, `default`, or another decorator, then this is an invalid position
-                if !flags.without(ModifierFlags::EXPORT_DEFAULT | ModifierFlags::DECORATOR).is_empty() {
-                    return self.grammar_error_on_node(modifier, diag::Decorators_are_not_valid_here, args![]);
+                if !flags
+                    .without(ModifierFlags::EXPORT_DEFAULT | ModifierFlags::DECORATOR)
+                    .is_empty()
+                {
+                    return self.grammar_error_on_node(
+                        modifier,
+                        diag::Decorators_are_not_valid_here,
+                        args![],
+                    );
                 }
 
                 // if we've already seen leading decorators and leading modifiers, then trailing decorators are an invalid position
@@ -382,7 +451,9 @@ impl Checker {
                 let modifier_kind = modifier.kind();
                 let not_reparsed = !modifier.flags().intersects(NodeFlags::REPARSED);
                 if modifier_kind != SyntaxKind::ReadonlyKeyword {
-                    if node.kind() == SyntaxKind::PropertySignature || node.kind() == SyntaxKind::MethodSignature {
+                    if node.kind() == SyntaxKind::PropertySignature
+                        || node.kind() == SyntaxKind::MethodSignature
+                    {
                         return self.grammar_error_on_node(
                             modifier,
                             diag::X_0_modifier_cannot_appear_on_a_type_member,
@@ -390,7 +461,8 @@ impl Checker {
                         );
                     }
                     if node.kind() == SyntaxKind::IndexSignature
-                        && (modifier_kind != SyntaxKind::StaticKeyword || !is_class_like(node.parent()))
+                        && (modifier_kind != SyntaxKind::StaticKeyword
+                            || !is_class_like(node.parent()))
                     {
                         return self.grammar_error_on_node(
                             modifier,
@@ -413,7 +485,9 @@ impl Checker {
                 }
                 match modifier_kind {
                     SyntaxKind::ConstKeyword => {
-                        if node.kind() != SyntaxKind::EnumDeclaration && node.kind() != SyntaxKind::TypeParameter {
+                        if node.kind() != SyntaxKind::EnumDeclaration
+                            && node.kind() != SyntaxKind::TypeParameter
+                        {
                             return self.grammar_error_on_node(
                                 node,
                                 diag::A_class_member_cannot_have_the_0_keyword,
@@ -441,7 +515,11 @@ impl Checker {
                     SyntaxKind::OverrideKeyword => {
                         // If node.kind === SyntaxKind.Parameter, checkParameter reports an error if it's not a parameter property.
                         if flags.intersects(ModifierFlags::OVERRIDE) {
-                            return self.grammar_error_on_node(modifier, diag::X_0_modifier_already_seen, args!["override"]);
+                            return self.grammar_error_on_node(
+                                modifier,
+                                diag::X_0_modifier_already_seen,
+                                args!["override"],
+                            );
                         } else if flags.intersects(ModifierFlags::AMBIENT) {
                             return self.grammar_error_on_node(
                                 modifier,
@@ -471,11 +549,17 @@ impl Checker {
                         last_override = modifier;
                     }
 
-                    SyntaxKind::PublicKeyword | SyntaxKind::ProtectedKeyword | SyntaxKind::PrivateKeyword => {
+                    SyntaxKind::PublicKeyword
+                    | SyntaxKind::ProtectedKeyword
+                    | SyntaxKind::PrivateKeyword => {
                         let text = visibility_to_string(modifier_to_flag(modifier_kind));
 
                         if flags.intersects(ModifierFlags::ACCESSIBILITY_MODIFIER) {
-                            return self.grammar_error_on_node(modifier, diag::Accessibility_modifier_already_seen, args![]);
+                            return self.grammar_error_on_node(
+                                modifier,
+                                diag::Accessibility_modifier_already_seen,
+                                args![],
+                            );
                         } else if flags.intersects(ModifierFlags::OVERRIDE) && not_reparsed {
                             return self.grammar_error_on_node(
                                 modifier,
@@ -539,7 +623,11 @@ impl Checker {
                     }
                     SyntaxKind::StaticKeyword => {
                         if flags.intersects(ModifierFlags::STATIC) {
-                            return self.grammar_error_on_node(modifier, diag::X_0_modifier_already_seen, args!["static"]);
+                            return self.grammar_error_on_node(
+                                modifier,
+                                diag::X_0_modifier_already_seen,
+                                args!["static"],
+                            );
                         } else if flags.intersects(ModifierFlags::READONLY) && not_reparsed {
                             return self.grammar_error_on_node(
                                 modifier,
@@ -590,7 +678,11 @@ impl Checker {
                     }
                     SyntaxKind::AccessorKeyword => {
                         if flags.intersects(ModifierFlags::ACCESSOR) {
-                            return self.grammar_error_on_node(modifier, diag::X_0_modifier_already_seen, args!["accessor"]);
+                            return self.grammar_error_on_node(
+                                modifier,
+                                diag::X_0_modifier_already_seen,
+                                args!["accessor"],
+                            );
                         } else if flags.intersects(ModifierFlags::READONLY) {
                             return self.grammar_error_on_node(
                                 modifier,
@@ -615,7 +707,11 @@ impl Checker {
                     }
                     SyntaxKind::ReadonlyKeyword => {
                         if flags.intersects(ModifierFlags::READONLY) {
-                            return self.grammar_error_on_node(modifier, diag::X_0_modifier_already_seen, args!["readonly"]);
+                            return self.grammar_error_on_node(
+                                modifier,
+                                diag::X_0_modifier_already_seen,
+                                args!["readonly"],
+                            );
                         } else if node.kind() != SyntaxKind::PropertyDeclaration
                             && node.kind() != SyntaxKind::PropertySignature
                             && node.kind() != SyntaxKind::IndexSignature
@@ -643,7 +739,8 @@ impl Checker {
                             && node.kind() != SyntaxKind::InterfaceDeclaration
                             && node.kind() != SyntaxKind::ModuleDeclaration
                             && node.parent().kind() == SyntaxKind::SourceFile
-                            && get_emit_module_format_of_file(get_source_file_of_node(node)) == ModuleKind::COMMON_JS
+                            && get_emit_module_format_of_file(get_source_file_of_node(node))
+                                == ModuleKind::COMMON_JS
                         {
                             return self.grammar_error_on_node(
                                 modifier,
@@ -652,7 +749,11 @@ impl Checker {
                             );
                         }
                         if flags.intersects(ModifierFlags::EXPORT) {
-                            return self.grammar_error_on_node(modifier, diag::X_0_modifier_already_seen, args!["export"]);
+                            return self.grammar_error_on_node(
+                                modifier,
+                                diag::X_0_modifier_already_seen,
+                                args!["export"],
+                            );
                         } else if flags.intersects(ModifierFlags::AMBIENT) && not_reparsed {
                             return self.grammar_error_on_node(
                                 modifier,
@@ -671,7 +772,9 @@ impl Checker {
                                 diag::X_0_modifier_must_precede_1_modifier,
                                 args!["export", "async"],
                             );
-                        } else if is_class_like(node.parent()) && !is_js_type_alias_declaration(node) {
+                        } else if is_class_like(node.parent())
+                            && !is_js_type_alias_declaration(node)
+                        {
                             return self.grammar_error_on_node(
                                 modifier,
                                 diag::X_0_modifier_cannot_appear_on_class_elements_of_this_kind,
@@ -704,7 +807,9 @@ impl Checker {
                         } else {
                             node.parent().parent()
                         };
-                        if container.kind() == SyntaxKind::ModuleDeclaration && !is_ambient_module(container) {
+                        if container.kind() == SyntaxKind::ModuleDeclaration
+                            && !is_ambient_module(container)
+                        {
                             return self.grammar_error_on_node(
                                 modifier,
                                 diag::A_default_export_can_only_be_used_in_an_ECMAScript_style_module,
@@ -729,14 +834,22 @@ impl Checker {
                                 args!["export", "default"],
                             );
                         } else if saw_export_before_decorators {
-                            return self.grammar_error_on_node(first_decorator, diag::Decorators_are_not_valid_here, args![]);
+                            return self.grammar_error_on_node(
+                                first_decorator,
+                                diag::Decorators_are_not_valid_here,
+                                args![],
+                            );
                         }
 
                         flags |= ModifierFlags::DEFAULT;
                     }
                     SyntaxKind::DeclareKeyword => {
                         if flags.intersects(ModifierFlags::AMBIENT) {
-                            return self.grammar_error_on_node(modifier, diag::X_0_modifier_already_seen, args!["declare"]);
+                            return self.grammar_error_on_node(
+                                modifier,
+                                diag::X_0_modifier_already_seen,
+                                args!["declare"],
+                            );
                         } else if flags.intersects(ModifierFlags::ASYNC) {
                             return self.grammar_error_on_node(
                                 modifier,
@@ -799,9 +912,15 @@ impl Checker {
                     }
                     SyntaxKind::AbstractKeyword => {
                         if flags.intersects(ModifierFlags::ABSTRACT) {
-                            return self.grammar_error_on_node(modifier, diag::X_0_modifier_already_seen, args!["abstract"]);
+                            return self.grammar_error_on_node(
+                                modifier,
+                                diag::X_0_modifier_already_seen,
+                                args!["abstract"],
+                            );
                         }
-                        if node.kind() != SyntaxKind::ClassDeclaration && node.kind() != SyntaxKind::ConstructorType {
+                        if node.kind() != SyntaxKind::ClassDeclaration
+                            && node.kind() != SyntaxKind::ConstructorType
+                        {
                             if node.kind() != SyntaxKind::MethodDeclaration
                                 && node.kind() != SyntaxKind::PropertyDeclaration
                                 && node.kind() != SyntaxKind::GetAccessor
@@ -872,7 +991,11 @@ impl Checker {
                     }
                     SyntaxKind::AsyncKeyword => {
                         if flags.intersects(ModifierFlags::ASYNC) {
-                            return self.grammar_error_on_node(modifier, diag::X_0_modifier_already_seen, args!["async"]);
+                            return self.grammar_error_on_node(
+                                modifier,
+                                diag::X_0_modifier_already_seen,
+                                args!["async"],
+                            );
                         } else if flags.intersects(ModifierFlags::AMBIENT)
                             || node.parent().flags().intersects(NodeFlags::AMBIENT)
                         {
@@ -904,7 +1027,11 @@ impl Checker {
                         } else {
                             ModifierFlags::OUT
                         };
-                        let in_out_text = if modifier_kind == SyntaxKind::InKeyword { "in" } else { "out" };
+                        let in_out_text = if modifier_kind == SyntaxKind::InKeyword {
+                            "in"
+                        } else {
+                            "out"
+                        };
                         let parent = node.parent();
                         if node.kind() != SyntaxKind::TypeParameter
                             || parent.is_some()
@@ -919,9 +1046,15 @@ impl Checker {
                             );
                         }
                         if flags.intersects(in_out_flag) {
-                            return self.grammar_error_on_node(modifier, diag::X_0_modifier_already_seen, args![in_out_text]);
+                            return self.grammar_error_on_node(
+                                modifier,
+                                diag::X_0_modifier_already_seen,
+                                args![in_out_text],
+                            );
                         }
-                        if in_out_flag.intersects(ModifierFlags::IN) && flags.intersects(ModifierFlags::OUT) {
+                        if in_out_flag.intersects(ModifierFlags::IN)
+                            && flags.intersects(ModifierFlags::OUT)
+                        {
                             return self.grammar_error_on_node(
                                 modifier,
                                 diag::X_0_modifier_must_precede_1_modifier,
@@ -1004,7 +1137,11 @@ impl Checker {
 
     // Go: checker/grammarchecks.go:578 findFirstModifierExcept
     pub fn find_first_modifier_except(&self, node: Node, allowed_modifier: SyntaxKind) -> Node {
-        let modifier = node.modifier_nodes().iter().find(|&m| is_modifier(m)).unwrap_or(Node::NIL);
+        let modifier = node
+            .modifier_nodes()
+            .iter()
+            .find(|&m| is_modifier(m))
+            .unwrap_or(Node::NIL);
         if modifier.is_some() && modifier.kind() != allowed_modifier {
             return modifier;
         }
@@ -1037,30 +1174,43 @@ impl Checker {
             | SyntaxKind::PropertyAssignment
             | SyntaxKind::ShorthandPropertyAssignment
             | SyntaxKind::NamespaceExportDeclaration
-            | SyntaxKind::MissingDeclaration => {
-                node.modifier_nodes().iter().find(|&m| is_modifier(m)).unwrap_or(Node::NIL)
-            }
+            | SyntaxKind::MissingDeclaration => node
+                .modifier_nodes()
+                .iter()
+                .find(|&m| is_modifier(m))
+                .unwrap_or(Node::NIL),
             _ => {
-                if node.parent().kind() == SyntaxKind::ModuleBlock || node.parent().kind() == SyntaxKind::SourceFile {
+                if node.parent().kind() == SyntaxKind::ModuleBlock
+                    || node.parent().kind() == SyntaxKind::SourceFile
+                {
                     return Node::NIL;
                 }
                 match node.kind() {
-                    SyntaxKind::FunctionDeclaration => self.find_first_modifier_except(node, SyntaxKind::AsyncKeyword),
+                    SyntaxKind::FunctionDeclaration => {
+                        self.find_first_modifier_except(node, SyntaxKind::AsyncKeyword)
+                    }
                     SyntaxKind::ClassDeclaration | SyntaxKind::ConstructorType => {
                         self.find_first_modifier_except(node, SyntaxKind::AbstractKeyword)
                     }
                     SyntaxKind::ClassExpression
                     | SyntaxKind::InterfaceDeclaration
-                    | SyntaxKind::TypeAliasDeclaration => {
-                        node.modifier_nodes().iter().find(|&m| is_modifier(m)).unwrap_or(Node::NIL)
-                    }
+                    | SyntaxKind::TypeAliasDeclaration => node
+                        .modifier_nodes()
+                        .iter()
+                        .find(|&m| is_modifier(m))
+                        .unwrap_or(Node::NIL),
                     SyntaxKind::VariableStatement => {
                         if node.declaration_list().flags().intersects(NodeFlags::USING) {
                             return self.find_first_modifier_except(node, SyntaxKind::AwaitKeyword);
                         }
-                        node.modifier_nodes().iter().find(|&m| is_modifier(m)).unwrap_or(Node::NIL)
+                        node.modifier_nodes()
+                            .iter()
+                            .find(|&m| is_modifier(m))
+                            .unwrap_or(Node::NIL)
                     }
-                    SyntaxKind::EnumDeclaration => self.find_first_modifier_except(node, SyntaxKind::ConstKeyword),
+                    SyntaxKind::EnumDeclaration => {
+                        self.find_first_modifier_except(node, SyntaxKind::ConstKeyword)
+                    }
                     _ => panic!("Unhandled case in findFirstIllegalModifier."),
                 }
             }
@@ -1079,7 +1229,11 @@ impl Checker {
     // Go: checker/grammarchecks.go:649 findFirstIllegalDecorator
     pub fn find_first_illegal_decorator(&self, node: Node) -> Node {
         if can_have_illegal_decorators(node) {
-            let decorator = node.modifier_nodes().iter().find(|&m| is_decorator(m)).unwrap_or(Node::NIL);
+            let decorator = node
+                .modifier_nodes()
+                .iter()
+                .find(|&m| is_decorator(m))
+                .unwrap_or(Node::NIL);
             decorator
         } else {
             Node::NIL
@@ -1098,24 +1252,48 @@ impl Checker {
             _ => {}
         }
 
-        self.grammar_error_on_node(async_modifier, diag::X_0_modifier_cannot_be_used_here, args!["async"])
+        self.grammar_error_on_node(
+            async_modifier,
+            diag::X_0_modifier_cannot_be_used_here,
+            args!["async"],
+        )
     }
 
     // Go: checker/grammarchecks.go:670 checkGrammarForDisallowedTrailingComma
-    pub fn check_grammar_for_disallowed_trailing_comma(&mut self, list: NodeList, diag: &'static Message) -> bool {
+    pub fn check_grammar_for_disallowed_trailing_comma(
+        &mut self,
+        list: NodeList,
+        diag: &'static Message,
+    ) -> bool {
         if list.is_some() && list.has_trailing_comma() {
             let len_comma = ",".len() as i32;
-            return self.grammar_error_at_pos(list.nodes().get(0), list.end() - len_comma, len_comma, diag, args![]);
+            return self.grammar_error_at_pos(
+                list.nodes().get(0),
+                list.end() - len_comma,
+                len_comma,
+                diag,
+                args![],
+            );
         }
         false
     }
 
     // Go: checker/grammarchecks.go:677 checkGrammarTypeParameterList
-    pub fn check_grammar_type_parameter_list(&mut self, type_parameters: NodeList, file: Node) -> bool {
+    pub fn check_grammar_type_parameter_list(
+        &mut self,
+        type_parameters: NodeList,
+        file: Node,
+    ) -> bool {
         if type_parameters.is_some() && type_parameters.nodes().len() == 0 {
             let start = type_parameters.pos() - "<".len() as i32;
             let end = skip_trivia(source_file_text(file), type_parameters.end()) + ">".len() as i32;
-            return self.grammar_error_at_pos(file, start, end - start, diag::Type_parameter_list_cannot_be_empty, args![]);
+            return self.grammar_error_at_pos(
+                file,
+                start,
+                end - start,
+                diag::Type_parameter_list_cannot_be_empty,
+                args![],
+            );
         }
         false
     }
@@ -1190,8 +1368,10 @@ impl Checker {
             let body = node.body();
             let mut use_strict_directive = Node::NIL;
             if body.is_some() && is_block(body) {
-                use_strict_directive =
-                    find_use_strict_prologue(get_source_file_of_node(node), &body.statements().to_vec());
+                use_strict_directive = find_use_strict_prologue(
+                    get_source_file_of_node(node),
+                    &body.statements().to_vec(),
+                );
             }
             if use_strict_directive.is_some() {
                 let non_simple_parameters: Vec<Node> = node
@@ -1231,7 +1411,11 @@ impl Checker {
                         } else {
                             diag::X_and_here
                         };
-                        err.add_related_info(Some(create_diagnostic_for_node(parameter, related_message, args![])));
+                        err.add_related_info(Some(create_diagnostic_for_node(
+                            parameter,
+                            related_message,
+                            args![],
+                        )));
                     }
                     self.add_diagnostic(err);
 
@@ -1255,7 +1439,8 @@ impl Checker {
             || self.check_grammar_type_parameter_list(type_parameters, file)
             || self.check_grammar_parameter_list(parameters)
             || self.check_grammar_arrow_function(node, file)
-            || (is_function_like_declaration(node) && self.check_grammar_for_use_strict_simple_parameter_list(node))
+            || (is_function_like_declaration(node)
+                && self.check_grammar_for_use_strict_simple_parameter_list(node))
     }
 
     // Go: checker/grammarchecks.go:766 checkGrammarClassLikeDeclaration
@@ -1274,8 +1459,12 @@ impl Checker {
         let type_parameters = node.type_parameter_list();
         if type_parameters.is_some() {
             let type_param_nodes = type_parameters.nodes();
-            let has_constraint = type_param_nodes.len() > 0 && type_param_nodes.get(0).constraint().is_some();
-            if !(type_param_nodes.len() > 1 || type_parameters.has_trailing_comma() || has_constraint) {
+            let has_constraint =
+                type_param_nodes.len() > 0 && type_param_nodes.get(0).constraint().is_some();
+            if !(type_param_nodes.len() > 1
+                || type_parameters.has_trailing_comma()
+                || has_constraint)
+            {
                 if file_extension_is_one_of_gc1(source_file_file_name(file), &[".mts", ".cts"]) {
                     // TODO(danielr): should we return early here?
                     self.grammar_error_on_node(
@@ -1304,7 +1493,11 @@ impl Checker {
         let param_nodes = parameters.nodes();
 
         if param_nodes.len() == 0 {
-            return self.grammar_error_on_node(node, diag::An_index_signature_must_have_exactly_one_parameter, args![]);
+            return self.grammar_error_on_node(
+                node,
+                diag::An_index_signature_must_have_exactly_one_parameter,
+                args![],
+            );
         }
 
         let parameter = param_nodes.get(0);
@@ -1316,7 +1509,10 @@ impl Checker {
             );
         }
 
-        self.check_grammar_for_disallowed_trailing_comma(parameters, diag::An_index_signature_cannot_have_a_trailing_comma);
+        self.check_grammar_for_disallowed_trailing_comma(
+            parameters,
+            diag::An_index_signature_cannot_have_a_trailing_comma,
+        );
         if parameter.dot_dot_dot_token().is_some() {
             return self.grammar_error_on_node(
                 parameter.dot_dot_dot_token(),
@@ -1355,7 +1551,9 @@ impl Checker {
         }
         let t = self.get_type_from_type_node(type_node);
         if self.some_type(t, &mut |c: &mut Checker, t: TypeId| {
-            c.ty(t).flags.intersects(TypeFlags::STRING_OR_NUMBER_LITERAL_OR_UNIQUE)
+            c.ty(t)
+                .flags
+                .intersects(TypeFlags::STRING_OR_NUMBER_LITERAL_OR_UNIQUE)
         }) || self.is_generic_type(t)
         {
             return self.grammar_error_on_node(
@@ -1364,7 +1562,9 @@ impl Checker {
                 args![],
             );
         }
-        if !self.every_type(t, &mut |c: &mut Checker, t: TypeId| c.is_valid_index_key_type(t)) {
+        if !self.every_type(t, &mut |c: &mut Checker, t: TypeId| {
+            c.is_valid_index_key_type(t)
+        }) {
             return self.grammar_error_on_node(
                 parameter.name(),
                 diag::An_index_signature_parameter_type_must_be_string_number_symbol_or_a_template_literal_type,
@@ -1372,7 +1572,11 @@ impl Checker {
             );
         }
         if node.type_().is_nil() {
-            return self.grammar_error_on_node(node, diag::An_index_signature_must_have_a_type_annotation, args![]);
+            return self.grammar_error_on_node(
+                node,
+                diag::An_index_signature_must_have_a_type_annotation,
+                args![],
+            );
         }
         false
     }
@@ -1384,11 +1588,16 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:844 checkGrammarForAtLeastOneTypeArgument
-    pub fn check_grammar_for_at_least_one_type_argument(&mut self, node: Node, type_arguments: NodeList) -> bool {
+    pub fn check_grammar_for_at_least_one_type_argument(
+        &mut self,
+        node: Node,
+        type_arguments: NodeList,
+    ) -> bool {
         if type_arguments.is_some() && type_arguments.nodes().len() == 0 {
             let source_file = get_source_file_of_node(node);
             let start = type_arguments.pos() - "<".len() as i32;
-            let end = skip_trivia(source_file_text(source_file), type_arguments.end()) + ">".len() as i32;
+            let end =
+                skip_trivia(source_file_text(source_file), type_arguments.end()) + ">".len() as i32;
             return self.grammar_error_at_pos(
                 source_file,
                 start,
@@ -1402,13 +1611,16 @@ impl Checker {
 
     // Go: checker/grammarchecks.go:854 checkGrammarTypeArguments
     pub fn check_grammar_type_arguments(&mut self, node: Node, type_arguments: NodeList) -> bool {
-        self.check_grammar_for_disallowed_trailing_comma(type_arguments, diag::Trailing_comma_not_allowed)
-            || self.check_grammar_for_at_least_one_type_argument(node, type_arguments)
+        self.check_grammar_for_disallowed_trailing_comma(
+            type_arguments,
+            diag::Trailing_comma_not_allowed,
+        ) || self.check_grammar_for_at_least_one_type_argument(node, type_arguments)
     }
 
     // Go: checker/grammarchecks.go:858 checkGrammarTaggedTemplateChain
     pub fn check_grammar_tagged_template_chain(&mut self, node: Node) -> bool {
-        if node.question_dot_token().is_some() || node.flags().intersects(NodeFlags::OPTIONAL_CHAIN) {
+        if node.question_dot_token().is_some() || node.flags().intersects(NodeFlags::OPTIONAL_CHAIN)
+        {
             return self.grammar_error_on_node(
                 node.template(),
                 diag::Tagged_template_expressions_are_not_permitted_in_an_optional_chain,
@@ -1421,13 +1633,20 @@ impl Checker {
     // Go: checker/grammarchecks.go:865 checkGrammarHeritageClause
     pub fn check_grammar_heritage_clause(&mut self, node: Node) -> bool {
         let types = node.types();
-        if self.check_grammar_for_disallowed_trailing_comma(types, diag::Trailing_comma_not_allowed) {
+        if self.check_grammar_for_disallowed_trailing_comma(types, diag::Trailing_comma_not_allowed)
+        {
             return true;
         }
         if types.is_some() && types.nodes().len() == 0 {
             let list_type = token_to_string(node.token());
             // TODO(danielr): why not error on the token?
-            return self.grammar_error_at_pos(node, types.pos(), 0, diag::X_0_list_cannot_be_empty, args![list_type]);
+            return self.grammar_error_at_pos(
+                node,
+                types.pos(),
+                0,
+                diag::X_0_list_cannot_be_empty,
+                args![list_type],
+            );
         }
 
         for node in types.nodes().to_vec() {
@@ -1439,7 +1658,10 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:884 checkGrammarExpressionWithTypeArguments
-    pub fn check_grammar_expression_with_type_arguments(&mut self, node: Node /*Union[ExpressionWithTypeArguments, TypeQuery]*/) -> bool {
+    pub fn check_grammar_expression_with_type_arguments(
+        &mut self,
+        node: Node, /*Union[ExpressionWithTypeArguments, TypeQuery]*/
+    ) -> bool {
         if is_expression_with_type_arguments(node)
             && node.expression().kind() == SyntaxKind::ImportKeyword
             && node.type_argument_list().is_some()
@@ -1454,7 +1676,11 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:891 checkGrammarClassDeclarationHeritageClauses
-    pub fn check_grammar_class_declaration_heritage_clauses(&mut self, node: Node, file: Node) -> bool {
+    pub fn check_grammar_class_declaration_heritage_clauses(
+        &mut self,
+        node: Node,
+        file: Node,
+    ) -> bool {
         let mut seen_extends_clause = false;
         let mut seen_implements_clause = false;
 
@@ -1501,8 +1727,12 @@ impl Checker {
                                 if tag.kind() == SyntaxKind::JsDocAugmentsTag {
                                     let target = type_nodes.get(0);
                                     let source = tag.class_name();
-                                    let target_name = get_identifier_from_entity_name_expression(target.expression());
-                                    let source_name = get_identifier_from_entity_name_expression(source.expression());
+                                    let target_name = get_identifier_from_entity_name_expression(
+                                        target.expression(),
+                                    );
+                                    let source_name = get_identifier_from_entity_name_expression(
+                                        source.expression(),
+                                    );
                                     if target_name.is_some()
                                         && source_name.is_some()
                                         && target_name.text() != source_name.text()
@@ -1510,7 +1740,11 @@ impl Checker {
                                         return self.grammar_error_on_node(
                                             source_name,
                                             diag::JSDoc_0_1_does_not_match_the_extends_2_clause,
-                                            args![tag.tag_name().text(), source_name.text(), target_name.text()],
+                                            args![
+                                                tag.tag_name().text(),
+                                                source_name.text(),
+                                                target_name.text()
+                                            ],
                                         );
                                     }
                                 }

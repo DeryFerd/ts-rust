@@ -12,7 +12,12 @@ impl Checker {
     }
 
     // Go: checker/checker.go:18540 addOptionalityEx
-    pub fn add_optionality_ex(&mut self, t: TypeId, is_property: bool, is_optional: bool) -> TypeId {
+    pub fn add_optionality_ex(
+        &mut self,
+        t: TypeId,
+        is_property: bool,
+        is_optional: bool,
+    ) -> TypeId {
         if self.strict_null_checks && is_optional {
             return self.get_optional_type(t, is_property);
         }
@@ -22,9 +27,14 @@ impl Checker {
     // Go: checker/checker.go:18547 getOptionalType
     pub fn get_optional_type(&mut self, t: TypeId, is_property: bool) -> TypeId {
         debug_assert!(self.strict_null_checks);
-        let missing_or_undefined = if is_property { self.undefined_or_missing_type } else { self.undefined_type };
+        let missing_or_undefined = if is_property {
+            self.undefined_or_missing_type
+        } else {
+            self.undefined_type
+        };
         if t == missing_or_undefined
-            || self.ty(t).flags.intersects(TypeFlags::UNION) && self.ty(t).types()[0] == missing_or_undefined
+            || self.ty(t).flags.intersects(TypeFlags::UNION)
+                && self.ty(t).types()[0] == missing_or_undefined
         {
             return t;
         }
@@ -99,7 +109,10 @@ impl Checker {
     }
 
     // Go: checker/checker.go:18610 getEffectivePropertyNameForPropertyNameNode
-    pub fn get_effective_property_name_for_property_name_node(&mut self, node: Node) -> (String, bool) {
+    pub fn get_effective_property_name_for_property_name_node(
+        &mut self,
+        node: Node,
+    ) -> (String, bool) {
         let name = get_property_name_for_property_name_node(node);
         if name != INTERNAL_SYMBOL_NAME_MISSING {
             return (name, true);
@@ -147,8 +160,13 @@ impl Checker {
     ///
     /// target: The symbol, type, or signature whose type is being queried
     /// property_name: The property name that should be used to query the target for its type
-    pub fn push_type_resolution(&mut self, target: TypeSystemEntity, property_name: TypeSystemPropertyName) -> bool {
-        let resolution_cycle_start_index = self.find_resolution_cycle_start_index(target, property_name);
+    pub fn push_type_resolution(
+        &mut self,
+        target: TypeSystemEntity,
+        property_name: TypeSystemPropertyName,
+    ) -> bool {
+        let resolution_cycle_start_index =
+            self.find_resolution_cycle_start_index(target, property_name);
         if resolution_cycle_start_index >= 0 {
             // A cycle was found
             for i in resolution_cycle_start_index as usize..self.type_resolutions.len() {
@@ -156,7 +174,11 @@ impl Checker {
             }
             return false;
         }
-        self.type_resolutions.push(TypeResolution { target, property_name, result: true });
+        self.type_resolutions.push(TypeResolution {
+            target,
+            property_name,
+            result: true,
+        });
         true
     }
 
@@ -164,7 +186,10 @@ impl Checker {
     /// Pop an entry from the type resolution stack and return its associated result value. The result value will
     /// be true if no circularities were detected, or false if a circularity was found.
     pub fn pop_type_resolution(&mut self) -> bool {
-        let last = self.type_resolutions.pop().expect("popTypeResolution on empty stack");
+        let last = self
+            .type_resolutions
+            .pop()
+            .expect("popTypeResolution on empty stack");
         last.result
     }
 
@@ -199,38 +224,62 @@ impl Checker {
             _ => panic!("interface conversion: TypeSystemEntity is not *Type"),
         };
         match r.property_name {
-            TypeSystemPropertyName::TYPE => self.value_symbol_links.get(as_symbol(r.target)).resolved_type.is_some(),
-            TypeSystemPropertyName::DECLARED_TYPE => {
-                self.type_alias_links.get(as_symbol(r.target)).declared_type.is_some()
-            }
+            TypeSystemPropertyName::TYPE => self
+                .value_symbol_links
+                .get(as_symbol(r.target))
+                .resolved_type
+                .is_some(),
+            TypeSystemPropertyName::DECLARED_TYPE => self
+                .type_alias_links
+                .get(as_symbol(r.target))
+                .declared_type
+                .is_some(),
             TypeSystemPropertyName::RESOLVED_TYPE_ARGUMENTS => {
                 // PORT: Go checks `resolvedTypeArguments != nil`. The Rust field
                 // is a plain `Vec`, so an empty list reads as unresolved.
-                !self.ty(as_type(r.target)).as_type_reference().resolved_type_arguments.is_empty()
+                !self
+                    .ty(as_type(r.target))
+                    .as_type_reference()
+                    .resolved_type_arguments
+                    .is_empty()
             }
             TypeSystemPropertyName::RESOLVED_BASE_TYPES => {
-                self.ty(as_type(r.target)).as_interface_type().base_types_resolved
+                self.ty(as_type(r.target))
+                    .as_interface_type()
+                    .base_types_resolved
             }
-            TypeSystemPropertyName::RESOLVED_BASE_CONSTRUCTOR_TYPE => {
-                self.ty(as_type(r.target)).as_interface_type().resolved_base_constructor_type.is_some()
-            }
+            TypeSystemPropertyName::RESOLVED_BASE_CONSTRUCTOR_TYPE => self
+                .ty(as_type(r.target))
+                .as_interface_type()
+                .resolved_base_constructor_type
+                .is_some(),
             TypeSystemPropertyName::RESOLVED_RETURN_TYPE => match r.target {
                 TypeSystemEntity::Signature(s) => self.sig(s).resolved_return_type.is_some(),
                 _ => panic!("interface conversion: TypeSystemEntity is not *Signature"),
             },
-            TypeSystemPropertyName::RESOLVED_BASE_CONSTRAINT => {
-                self.ty(as_type(r.target)).as_constrained_type().resolved_base_constraint.is_some()
-            }
+            TypeSystemPropertyName::RESOLVED_BASE_CONSTRAINT => self
+                .ty(as_type(r.target))
+                .as_constrained_type()
+                .resolved_base_constraint
+                .is_some(),
             TypeSystemPropertyName::INITIALIZER_IS_UNDEFINED => match r.target {
-                TypeSystemEntity::Node(n) => {
-                    self.node_links.get(n).flags.intersects(NodeCheckFlags::INITIALIZER_IS_UNDEFINED_COMPUTED)
-                }
+                TypeSystemEntity::Node(n) => self
+                    .node_links
+                    .get(n)
+                    .flags
+                    .intersects(NodeCheckFlags::INITIALIZER_IS_UNDEFINED_COMPUTED),
                 _ => panic!("interface conversion: TypeSystemEntity is not *ast.Node"),
             },
-            TypeSystemPropertyName::WRITE_TYPE => self.value_symbol_links.get(as_symbol(r.target)).write_type.is_some(),
-            TypeSystemPropertyName::ALIAS_TARGET => {
-                self.alias_symbol_links.get(as_symbol(r.target)).alias_target.is_some()
-            }
+            TypeSystemPropertyName::WRITE_TYPE => self
+                .value_symbol_links
+                .get(as_symbol(r.target))
+                .write_type
+                .is_some(),
+            TypeSystemPropertyName::ALIAS_TARGET => self
+                .alias_symbol_links
+                .get(as_symbol(r.target))
+                .alias_target
+                .is_some(),
             _ => panic!("Unhandled case in typeResolutionHasProperty"),
         }
     }
@@ -250,7 +299,9 @@ impl Checker {
                 return self.error_type;
             }
             // Check if variable has initializer that circularly references the variable itself
-            if self.no_implicit_any && (!is_parameter_declaration(declaration) || declaration.initializer().is_some()) {
+            if self.no_implicit_any
+                && (!is_parameter_declaration(declaration) || declaration.initializer().is_some())
+            {
                 let name = self.symbol_to_string(symbol);
                 self.error(
                     declaration,
@@ -262,7 +313,11 @@ impl Checker {
             let node = self.get_declaration_of_alias_symbol(symbol);
             if node.is_some() {
                 let name = self.symbol_to_string(symbol);
-                self.error(node, diag::Circular_definition_of_import_alias_0, args![name]);
+                self.error(
+                    node,
+                    diag::Circular_definition_of_import_alias_0,
+                    args![name],
+                );
             }
         }
         // Circularities could also result from parameters in function expressions that end up
@@ -274,7 +329,11 @@ impl Checker {
     // Go: checker/checker.go:18745 getPropertiesOfType
     pub fn get_properties_of_type(&mut self, t: TypeId) -> Vec<SymbolId> {
         let t = self.get_reduced_apparent_type(t);
-        if self.ty(t).flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
+        if self
+            .ty(t)
+            .flags
+            .intersects(TypeFlags::UNION_OR_INTERSECTION)
+        {
             return self.get_properties_of_union_or_intersection_type(t);
         }
         self.get_properties_of_object_type(t)
@@ -293,7 +352,12 @@ impl Checker {
         // PORT: Go checks `resolvedProperties == nil`. The Rust field is a
         // plain `Vec`, so an empty result is recomputed; the recomputation is
         // idempotent because the property lookups are cached.
-        if self.ty(t).as_union_or_intersection_type().resolved_properties.is_empty() {
+        if self
+            .ty(t)
+            .as_union_or_intersection_type()
+            .resolved_properties
+            .is_empty()
+        {
             let mut checked: FxHashSet<String> = FxHashSet::default();
             let mut props: Vec<SymbolId> = Vec::new();
             let types = self.ty(t).as_union_or_intersection_type().types.clone();
@@ -315,21 +379,26 @@ impl Checker {
                 }
                 // The properties of a union type are those that are present in all constituent types, so
                 // we only need to check the properties of the first type without index signature
-                if t_flags.intersects(TypeFlags::UNION) && self.get_index_infos_of_type(current).is_empty() {
+                if t_flags.intersects(TypeFlags::UNION)
+                    && self.get_index_infos_of_type(current).is_empty()
+                {
                     break;
                 }
             }
-            self.ty_mut(t).as_union_or_intersection_type_mut().resolved_properties = props;
+            self.ty_mut(t)
+                .as_union_or_intersection_type_mut()
+                .resolved_properties = props;
         }
-        self.ty(t).as_union_or_intersection_type().resolved_properties.clone()
+        self.ty(t)
+            .as_union_or_intersection_type()
+            .resolved_properties
+            .clone()
     }
 
     // Go: checker/checker.go:18786 getPropertyOfType
     pub fn get_property_of_type(&mut self, t: TypeId, name: &str) -> SymbolId {
         self.get_property_of_type_ex(
-            t,
-            name,
-            false, /*skipObjectFunctionPropertyAugment*/
+            t, name, false, /*skipObjectFunctionPropertyAugment*/
             false, /*includeTypeOnlyMembers*/
         )
     }
@@ -358,8 +427,16 @@ impl Checker {
                 let t_symbol = self.ty(t).symbol;
                 if !include_type_only_members
                     && t_symbol.is_some()
-                    && self.sym(t_symbol).flags.intersects(SymbolFlags::VALUE_MODULE)
-                    && self.module_symbol_links.get(t_symbol).type_only_export_star_map.get(name).is_some_and(|n| n.is_some())
+                    && self
+                        .sym(t_symbol)
+                        .flags
+                        .intersects(SymbolFlags::VALUE_MODULE)
+                    && self
+                        .module_symbol_links
+                        .get(t_symbol)
+                        .type_only_export_star_map
+                        .get(name)
+                        .is_some_and(|n| n.is_some())
                 {
                     // If this is the type of a module, `resolved.members.get(name)` might have effectively skipped over
                     // an `export type * from './foo'`, leaving `symbolIsValue` unable to see that the symbol is being
@@ -394,16 +471,26 @@ impl Checker {
             let global_object_type = self.global_object_type;
             return self.get_property_of_object_type(global_object_type, name);
         } else if flags.intersects(TypeFlags::INTERSECTION) {
-            let prop = self.get_property_of_union_or_intersection_type(t, name, true /*skipObjectFunctionPropertyAugment*/);
+            let prop = self.get_property_of_union_or_intersection_type(
+                t, name, true, /*skipObjectFunctionPropertyAugment*/
+            );
             if prop.is_some() {
                 return prop;
             }
             if !skip_object_function_property_augment {
-                return self.get_property_of_union_or_intersection_type(t, name, skip_object_function_property_augment);
+                return self.get_property_of_union_or_intersection_type(
+                    t,
+                    name,
+                    skip_object_function_property_augment,
+                );
             }
             return SymbolId::NIL;
         } else if flags.intersects(TypeFlags::UNION) {
-            return self.get_property_of_union_or_intersection_type(t, name, skip_object_function_property_augment);
+            return self.get_property_of_union_or_intersection_type(
+                t,
+                name,
+                skip_object_function_property_augment,
+            );
         }
         SymbolId::NIL
     }
@@ -425,7 +512,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:18862 getSignaturesOfStructuredType
-    pub fn get_signatures_of_structured_type(&mut self, t: TypeId, kind: SignatureKind) -> Vec<SignatureId> {
+    pub fn get_signatures_of_structured_type(
+        &mut self,
+        t: TypeId,
+        kind: SignatureKind,
+    ) -> Vec<SignatureId> {
         if !self.ty(t).flags.intersects(TypeFlags::STRUCTURED_TYPE) {
             return Vec::new();
         }
@@ -470,7 +561,12 @@ impl Checker {
     }
 
     // Go: checker/checker.go:18900 getIndexTypeOfTypeEx
-    pub fn get_index_type_of_type_ex(&mut self, t: TypeId, key_type: TypeId, default_type: TypeId) -> TypeId {
+    pub fn get_index_type_of_type_ex(
+        &mut self,
+        t: TypeId,
+        key_type: TypeId,
+        default_type: TypeId,
+    ) -> TypeId {
         let result = self.get_index_type_of_type(t, key_type);
         if result.is_some() {
             return result;
@@ -495,7 +591,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:18918 findApplicableIndexInfo
-    pub fn find_applicable_index_info(&mut self, index_infos: &[IndexInfoId], key_type: TypeId) -> IndexInfoId {
+    pub fn find_applicable_index_info(
+        &mut self,
+        index_infos: &[IndexInfoId],
+        key_type: TypeId,
+    ) -> IndexInfoId {
         // Index signatures for type 'string' are considered only when no other index signatures apply.
         let mut string_index_info = IndexInfoId::NIL;
         let mut applicable_infos: Vec<IndexInfoId> = Vec::with_capacity(8);
@@ -513,7 +613,9 @@ impl Checker {
         match applicable_infos.len() {
             0 => {
                 let string_type = self.string_type;
-                if string_index_info.is_some() && self.is_applicable_index_type(key_type, string_type) {
+                if string_index_info.is_some()
+                    && self.is_applicable_index_type(key_type, string_type)
+                {
                     return string_index_info;
                 }
                 IndexInfoId::NIL
@@ -595,7 +697,11 @@ impl Checker {
     // Go: checker/checker.go:18994 resolveTypeReferenceMembers
     pub fn resolve_type_reference_members(&mut self, t: TypeId) {
         let source = self.ty(t).target();
-        let type_parameters = self.ty(source).as_interface_type().all_type_parameters.clone();
+        let type_parameters = self
+            .ty(source)
+            .as_interface_type()
+            .all_type_parameters
+            .clone();
         let type_arguments = self.get_type_arguments(t).to_vec();
         let mut padded_type_arguments = type_arguments.clone();
         if type_arguments.len() == type_parameters.len().wrapping_sub(1) {
@@ -619,7 +725,12 @@ impl Checker {
         let mut index_infos: Vec<IndexInfoId>;
         let mut instantiated = false;
         self.resolve_declared_members(source);
-        let (declared_members, declared_call_signatures, declared_construct_signatures, declared_index_infos) = {
+        let (
+            declared_members,
+            declared_call_signatures,
+            declared_construct_signatures,
+            declared_index_infos,
+        ) = {
             let resolved = self.ty(source).as_interface_type();
             (
                 resolved.declared_members,
@@ -638,7 +749,8 @@ impl Checker {
             mapper = self.new_type_mapper(type_parameters, type_arguments);
             members = self.instantiate_symbol_table(declared_members, mapper);
             call_signatures = self.instantiate_signatures(&declared_call_signatures, mapper);
-            construct_signatures = self.instantiate_signatures(&declared_construct_signatures, mapper);
+            construct_signatures =
+                self.instantiate_signatures(&declared_construct_signatures, mapper);
             index_infos = self.instantiate_index_infos(&declared_index_infos, mapper);
         }
         let base_types = self.get_base_types(source);
@@ -654,26 +766,39 @@ impl Checker {
                     members = cloned;
                 }
             }
-            self.set_structured_type_members(t, members, &call_signatures, &construct_signatures, &index_infos);
+            self.set_structured_type_members(
+                t,
+                members,
+                &call_signatures,
+                &construct_signatures,
+                &index_infos,
+            );
             let this_argument = type_arguments.last().copied().unwrap_or(TypeId::NIL);
             self.ty_mut(t).object_flags |= ObjectFlags::UNRESOLVED_MEMBERS;
             for base_type in base_types {
                 let mut instantiated_base_type = base_type;
                 if this_argument.is_some() {
                     let instantiated_type = self.instantiate_type(base_type, mapper);
-                    instantiated_base_type =
-                        self.get_type_with_this_argument(instantiated_type, this_argument, false /*needsApparentType*/);
+                    instantiated_base_type = self.get_type_with_this_argument(
+                        instantiated_type,
+                        this_argument,
+                        false, /*needsApparentType*/
+                    );
                 }
                 let base_properties = self.get_properties_of_type(instantiated_base_type);
                 members = self.add_inherited_members(members, &base_properties);
-                call_signatures.extend(self.get_signatures_of_type(instantiated_base_type, SignatureKind::CALL));
-                construct_signatures
-                    .extend(self.get_signatures_of_type(instantiated_base_type, SignatureKind::CONSTRUCT));
-                let inherited_index_infos: Vec<IndexInfoId> = if instantiated_base_type != self.any_type {
-                    self.get_index_infos_of_type(instantiated_base_type)
-                } else {
-                    vec![self.any_base_type_index_info]
-                };
+                call_signatures.extend(
+                    self.get_signatures_of_type(instantiated_base_type, SignatureKind::CALL),
+                );
+                construct_signatures.extend(
+                    self.get_signatures_of_type(instantiated_base_type, SignatureKind::CONSTRUCT),
+                );
+                let inherited_index_infos: Vec<IndexInfoId> =
+                    if instantiated_base_type != self.any_type {
+                        self.get_index_infos_of_type(instantiated_base_type)
+                    } else {
+                        vec![self.any_base_type_index_info]
+                    };
                 let filtered: Vec<IndexInfoId> = inherited_index_infos
                     .into_iter()
                     .filter(|&info| {
@@ -684,11 +809,20 @@ impl Checker {
                 index_infos.extend(filtered);
             }
             {
-                let object_flags = self.ty(t).object_flags.without(ObjectFlags::UNRESOLVED_MEMBERS);
+                let object_flags = self
+                    .ty(t)
+                    .object_flags
+                    .without(ObjectFlags::UNRESOLVED_MEMBERS);
                 self.ty_mut(t).object_flags = object_flags;
             }
         }
-        self.set_structured_type_members(t, members, &call_signatures, &construct_signatures, &index_infos);
+        self.set_structured_type_members(
+            t,
+            members,
+            &call_signatures,
+            &construct_signatures,
+            &index_infos,
+        );
     }
 }
 
@@ -707,18 +841,29 @@ impl Checker {
 
     // Go: checker/checker.go:19066 getBaseTypes
     pub fn get_base_types(&mut self, t: TypeId) -> Vec<TypeId> {
-        if !self.ty(t).object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE) {
+        if !self
+            .ty(t)
+            .object_flags
+            .intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE)
+        {
             return Vec::new();
         }
         if !self.ty(t).as_interface_type().base_types_resolved {
-            if !self.push_type_resolution(TypeSystemEntity::Type(t), TypeSystemPropertyName::RESOLVED_BASE_TYPES) {
+            if !self.push_type_resolution(
+                TypeSystemEntity::Type(t),
+                TypeSystemPropertyName::RESOLVED_BASE_TYPES,
+            ) {
                 return self.ty(t).as_interface_type().resolved_base_types.clone();
             }
             let t_symbol = self.ty(t).symbol;
             if self.ty(t).object_flags.intersects(ObjectFlags::TUPLE) {
                 let base = self.get_tuple_base_type(t);
                 self.ty_mut(t).as_interface_type_mut().resolved_base_types = vec![base];
-            } else if self.sym(t_symbol).flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
+            } else if self
+                .sym(t_symbol)
+                .flags
+                .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+            {
                 if self.sym(t_symbol).flags.intersects(SymbolFlags::CLASS) {
                     self.resolve_base_types_of_class(t);
                 }
@@ -730,7 +875,10 @@ impl Checker {
             }
             // PORT: Go checks `t.symbol.Declarations != nil`; an empty list
             // has nothing to report either way.
-            if !self.pop_type_resolution() && t_symbol.is_some() && !self.sym(t_symbol).declarations.is_empty() {
+            if !self.pop_type_resolution()
+                && t_symbol.is_some()
+                && !self.sym(t_symbol).declarations.is_empty()
+            {
                 let declarations = self.sym(t_symbol).declarations.clone();
                 for declaration in declarations {
                     if is_class_declaration(declaration) || is_interface_declaration(declaration) {
@@ -743,7 +891,10 @@ impl Checker {
             // members partially resolved. Here we ensure any such partial resolution is reset.
             // See https://github.com/microsoft/TypeScript/issues/16861 for an example.
             {
-                let object_flags = self.ty(t).object_flags.without(ObjectFlags::MEMBERS_RESOLVED);
+                let object_flags = self
+                    .ty(t)
+                    .object_flags
+                    .without(ObjectFlags::MEMBERS_RESOLVED);
                 self.ty_mut(t).object_flags = object_flags;
             }
             self.ty_mut(t).as_interface_type_mut().base_types_resolved = true;
@@ -754,8 +905,13 @@ impl Checker {
     // Go: checker/checker.go:19105 getTupleBaseType
     pub fn get_tuple_base_type(&mut self, t: TypeId) -> TypeId {
         let type_parameters = self.ty(t).as_interface_type().type_parameters().to_vec();
-        let element_flags: Vec<ElementFlags> =
-            self.ty(t).as_tuple_type().element_infos.iter().map(|info| info.flags).collect();
+        let element_flags: Vec<ElementFlags> = self
+            .ty(t)
+            .as_tuple_type()
+            .element_infos
+            .iter()
+            .map(|info| info.flags)
+            .collect();
         let mut element_types: Vec<TypeId> = Vec::with_capacity(type_parameters.len());
         for (i, &tp) in type_parameters.iter().enumerate() {
             if element_flags[i].intersects(ElementFlags::VARIADIC) {
@@ -774,7 +930,11 @@ impl Checker {
     pub fn resolve_base_types_of_class(&mut self, t: TypeId) {
         let base_constructor_type_of_class = self.get_base_constructor_type_of_class(t);
         let base_constructor_type = self.get_apparent_type(base_constructor_type_of_class);
-        if !self.ty(base_constructor_type).flags.intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION | TypeFlags::ANY) {
+        if !self
+            .ty(base_constructor_type)
+            .flags
+            .intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION | TypeFlags::ANY)
+        {
             return;
         }
         let base_type_node = self.get_base_type_node_of_class(t);
@@ -785,14 +945,24 @@ impl Checker {
             original_base_type = self.get_declared_type_of_symbol(base_constructor_symbol);
         }
         if base_constructor_symbol.is_some()
-            && self.sym(base_constructor_symbol).flags.intersects(SymbolFlags::CLASS)
+            && self
+                .sym(base_constructor_symbol)
+                .flags
+                .intersects(SymbolFlags::CLASS)
             && self.are_all_outer_type_parameters_applied(original_base_type)
         {
             // When base constructor type is a class with no captured type arguments we know that the constructors all have the same type parameters as the
             // class and all return the instance type of the class. There is no need for further checks and we can apply the
             // type arguments in the same manner as a type reference to get the same error reporting experience.
-            base_type = self.get_type_from_class_or_interface_reference(base_type_node, base_constructor_symbol);
-        } else if self.ty(base_constructor_type).flags.intersects(TypeFlags::ANY) {
+            base_type = self.get_type_from_class_or_interface_reference(
+                base_type_node,
+                base_constructor_symbol,
+            );
+        } else if self
+            .ty(base_constructor_type)
+            .flags
+            .intersects(TypeFlags::ANY)
+        {
             base_type = base_constructor_type;
         } else {
             // The class derives from a "class-like" constructor function, check that we have at least one construct signature
@@ -834,7 +1004,11 @@ impl Checker {
         if t == reduced_base_type || self.has_base_type(reduced_base_type, t) {
             let value_declaration = self.sym(self.ty(t).symbol).value_declaration;
             let type_string = self.type_to_string_exported(t);
-            self.error(value_declaration, diag::Type_0_recursively_references_itself_as_a_base_type, args![type_string]);
+            self.error(
+                value_declaration,
+                diag::Type_0_recursively_references_itself_as_a_base_type,
+                args![type_string],
+            );
             return;
         }
         self.ty_mut(t).as_interface_type_mut().resolved_base_types = vec![reduced_base_type];
@@ -859,12 +1033,19 @@ impl Checker {
         location: Node,
     ) -> Vec<SignatureId> {
         let signatures = self.get_constructors_for_type_arguments(t, type_argument_nodes, location);
-        let type_arguments: Vec<TypeId> =
-            type_argument_nodes.iter().map(|&n| self.get_type_from_type_node(n)).collect();
+        let type_arguments: Vec<TypeId> = type_argument_nodes
+            .iter()
+            .map(|&n| self.get_type_from_type_node(n))
+            .collect();
         let mut result = Vec::with_capacity(signatures.len());
         for sig in signatures {
             if !self.sig(sig).type_parameters.is_empty() {
-                result.push(self.get_signature_instantiation(sig, &type_arguments, is_in_js_file(location), &[]));
+                result.push(self.get_signature_instantiation(
+                    sig,
+                    &type_arguments,
+                    is_in_js_file(location),
+                    &[],
+                ));
             } else {
                 result.push(sig);
             }
@@ -903,20 +1084,27 @@ impl Checker {
     ) -> SignatureId {
         let type_parameters = self.sig(sig).type_parameters.clone();
         let min_type_argument_count = self.get_min_type_argument_count(&type_parameters);
-        let filled =
-            self.fill_missing_type_arguments(type_arguments, &type_parameters, min_type_argument_count, is_java_script);
-        let instantiated_signature = self.get_signature_instantiation_without_filling_in_type_arguments(sig, &filled);
+        let filled = self.fill_missing_type_arguments(
+            type_arguments,
+            &type_parameters,
+            min_type_argument_count,
+            is_java_script,
+        );
+        let instantiated_signature =
+            self.get_signature_instantiation_without_filling_in_type_arguments(sig, &filled);
         if !inferred_type_parameters.is_empty() {
             let return_type = self.get_return_type_of_signature(instantiated_signature);
             let return_signature = self.get_single_call_or_construct_signature(return_type);
             if return_signature.is_some() {
                 let new_return_signature = self.clone_signature(return_signature);
-                self.sig_mut(new_return_signature).type_parameters = inferred_type_parameters.to_vec();
+                self.sig_mut(new_return_signature).type_parameters =
+                    inferred_type_parameters.to_vec();
                 let new_return_type = self.get_or_create_type_from_signature(new_return_signature);
                 let instantiated_mapper = self.sig(instantiated_signature).mapper;
                 self.ty_mut(new_return_type).as_object_type_mut().mapper = instantiated_mapper;
                 let new_instantiated_signature = self.clone_signature(instantiated_signature);
-                self.sig_mut(new_instantiated_signature).resolved_return_type = new_return_type;
+                self.sig_mut(new_instantiated_signature)
+                    .resolved_return_type = new_return_type;
                 return new_instantiated_signature;
             }
         }
@@ -958,8 +1146,15 @@ impl Checker {
         sig: SignatureId,
         type_arguments: &[TypeId],
     ) -> SignatureId {
-        let key = CachedSignatureKey { sig, key: get_type_list_key(type_arguments) };
-        let mut instantiation = self.cached_signatures.get(&key).copied().unwrap_or_default();
+        let key = CachedSignatureKey {
+            sig,
+            key: get_type_list_key(type_arguments),
+        };
+        let mut instantiation = self
+            .cached_signatures
+            .get(&key)
+            .copied()
+            .unwrap_or_default();
         if instantiation.is_nil() {
             instantiation = self.create_signature_instantiation(sig, type_arguments);
             self.cached_signatures.insert(key, instantiation);
@@ -968,13 +1163,21 @@ impl Checker {
     }
 
     // Go: checker/checker.go:19227 createSignatureInstantiation
-    pub fn create_signature_instantiation(&mut self, sig: SignatureId, type_arguments: &[TypeId]) -> SignatureId {
+    pub fn create_signature_instantiation(
+        &mut self,
+        sig: SignatureId,
+        type_arguments: &[TypeId],
+    ) -> SignatureId {
         let mapper = self.create_signature_type_mapper(sig, type_arguments);
         self.instantiate_signature_ex(sig, mapper, true /*eraseTypeParameters*/)
     }
 
     // Go: checker/checker.go:19231 createSignatureTypeMapper
-    pub fn create_signature_type_mapper(&mut self, sig: SignatureId, type_arguments: &[TypeId]) -> MapperId {
+    pub fn create_signature_type_mapper(
+        &mut self,
+        sig: SignatureId,
+        type_arguments: &[TypeId],
+    ) -> MapperId {
         let type_parameters = self.get_type_parameters_for_mapper(sig);
         self.new_type_mapper(&type_parameters, type_arguments)
     }
@@ -998,7 +1201,8 @@ impl Checker {
 
     // Go: checker/checker.go:19244 getSingleCallOrConstructSignature
     pub fn get_single_call_or_construct_signature(&mut self, t: TypeId) -> SignatureId {
-        let call_sig = self.get_single_signature(t, SignatureKind::CALL, false /*allowMembers*/);
+        let call_sig =
+            self.get_single_signature(t, SignatureKind::CALL, false /*allowMembers*/);
         if call_sig.is_some() {
             return call_sig;
         }
@@ -1006,7 +1210,12 @@ impl Checker {
     }
 
     // Go: checker/checker.go:19252 getSingleSignature
-    pub fn get_single_signature(&mut self, t: TypeId, kind: SignatureKind, allow_members: bool) -> SignatureId {
+    pub fn get_single_signature(
+        &mut self,
+        t: TypeId,
+        kind: SignatureKind,
+        allow_members: bool,
+    ) -> SignatureId {
         if self.ty(t).flags.intersects(TypeFlags::OBJECT) {
             let resolved = self.resolve_structured_type_members(t);
             if allow_members || resolved.properties.is_empty() && resolved.index_infos.is_empty() {
@@ -1035,15 +1244,26 @@ impl Checker {
         // will result in a different declaration kind.
         if self.sig(sig).isolated_signature_type.is_nil() {
             let declaration = self.sig(sig).declaration;
-            let kind = if declaration.is_some() { declaration.kind() } else { SyntaxKind::Unknown };
+            let kind = if declaration.is_some() {
+                declaration.kind()
+            } else {
+                SyntaxKind::Unknown
+            };
             // If declaration is undefined, it is likely to be the signature of the default constructor.
             let is_constructor = kind == SyntaxKind::Unknown
                 || kind == SyntaxKind::Constructor
                 || kind == SyntaxKind::ConstructSignature
                 || kind == SyntaxKind::ConstructorType;
 
-            let symbol = if declaration.is_some() { declaration.symbol() } else { SymbolId::NIL };
-            let t = self.new_object_type(ObjectFlags::ANONYMOUS | ObjectFlags::SINGLE_SIGNATURE_TYPE, symbol);
+            let symbol = if declaration.is_some() {
+                declaration.symbol()
+            } else {
+                SymbolId::NIL
+            };
+            let t = self.new_object_type(
+                ObjectFlags::ANONYMOUS | ObjectFlags::SINGLE_SIGNATURE_TYPE,
+                symbol,
+            );
             if is_constructor {
                 self.set_structured_type_members(t, SymbolTable::NIL, &[], &[sig], &[]);
             } else {
@@ -1059,13 +1279,21 @@ impl Checker {
         if self.sig(signature).type_parameters.is_empty() {
             return signature;
         }
-        let key = CachedSignatureKey { sig: signature, key: *SIGNATURE_KEY_ERASED };
-        let mut erased = self.cached_signatures.get(&key).copied().unwrap_or_default();
+        let key = CachedSignatureKey {
+            sig: signature,
+            key: *SIGNATURE_KEY_ERASED,
+        };
+        let mut erased = self
+            .cached_signatures
+            .get(&key)
+            .copied()
+            .unwrap_or_default();
         if erased.is_nil() {
             let type_parameters = self.sig(signature).type_parameters.clone();
             let any_type = self.any_type;
             let mapper = self.new_array_to_single_type_mapper(&type_parameters, any_type);
-            erased = self.instantiate_signature_ex(signature, mapper, true /*eraseTypeParameters*/);
+            erased =
+                self.instantiate_signature_ex(signature, mapper, true /*eraseTypeParameters*/);
             self.cached_signatures.insert(key, erased);
         }
         erased
@@ -1076,8 +1304,15 @@ impl Checker {
         if self.sig(signature).type_parameters.is_empty() {
             return signature;
         }
-        let key = CachedSignatureKey { sig: signature, key: *SIGNATURE_KEY_CANONICAL };
-        let mut canonical = self.cached_signatures.get(&key).copied().unwrap_or_default();
+        let key = CachedSignatureKey {
+            sig: signature,
+            key: *SIGNATURE_KEY_CANONICAL,
+        };
+        let mut canonical = self
+            .cached_signatures
+            .get(&key)
+            .copied()
+            .unwrap_or_default();
         if canonical.is_nil() {
             canonical = self.create_canonical_signature(signature);
             self.cached_signatures.insert(key, canonical);
@@ -1104,7 +1339,12 @@ impl Checker {
             }
         }
         let declaration = self.sig(signature).declaration;
-        self.get_signature_instantiation(signature, &type_arguments, is_in_js_file(declaration), &[] /*inferredTypeParameters*/)
+        self.get_signature_instantiation(
+            signature,
+            &type_arguments,
+            is_in_js_file(declaration),
+            &[], /*inferredTypeParameters*/
+        )
     }
 
     // Go: checker/checker.go:19337 getBaseSignature
@@ -1113,7 +1353,10 @@ impl Checker {
         if type_parameters.is_empty() {
             return signature;
         }
-        let key = CachedSignatureKey { sig: signature, key: *SIGNATURE_KEY_BASE };
+        let key = CachedSignatureKey {
+            sig: signature,
+            key: *SIGNATURE_KEY_BASE,
+        };
         if let Some(&cached) = self.cached_signatures.get(&key) {
             if cached.is_some() {
                 return cached;
@@ -1122,7 +1365,11 @@ impl Checker {
         let mut constraints = Vec::with_capacity(type_parameters.len());
         for &tp in &type_parameters {
             let constraint = self.get_constraint_of_type_parameter(tp);
-            constraints.push(if constraint.is_some() { constraint } else { self.unknown_type });
+            constraints.push(if constraint.is_some() {
+                constraint
+            } else {
+                self.unknown_type
+            });
         }
         let base_constraint_mapper = self.new_type_mapper(&type_parameters, &constraints);
         let mut base_constraints = Vec::with_capacity(type_parameters.len());
@@ -1139,7 +1386,8 @@ impl Checker {
         let eraser = self.new_array_to_single_type_mapper(&type_parameters, any_type);
         base_constraints = self.instantiate_types(&base_constraints, eraser);
         let mapper = self.new_type_mapper(&type_parameters, &base_constraints);
-        let result = self.instantiate_signature_ex(signature, mapper, true /*eraseTypeParameters*/);
+        let result =
+            self.instantiate_signature_ex(signature, mapper, true /*eraseTypeParameters*/);
         self.cached_signatures.insert(key, result);
         result
     }
@@ -1154,14 +1402,24 @@ impl Checker {
         compare_types: Option<TypeComparer>,
     ) -> SignatureId {
         let type_parameters = self.get_type_parameters_for_mapper(signature);
-        let context = self.new_inference_context(&type_parameters, signature, InferenceFlags::NONE, compare_types);
+        let context = self.new_inference_context(
+            &type_parameters,
+            signature,
+            InferenceFlags::NONE,
+            compare_types,
+        );
         // We clone the inferenceContext to avoid fixing. For example, when the source signature is <T>(x: T) => T[] and
         // the contextual signature is (...args: A) => B, we want to infer the element type of A's constraint (say 'any')
         // for T but leave it possible to later infer '[any]' back to A.
         let rest_type = self.get_effective_rest_type(contextual_signature);
         let mut mapper = MapperId::NIL;
         if inference_context.is_some() {
-            if rest_type.is_some() && self.ty(rest_type).flags.intersects(TypeFlags::TYPE_PARAMETER) {
+            if rest_type.is_some()
+                && self
+                    .ty(rest_type)
+                    .flags
+                    .intersects(TypeFlags::TYPE_PARAMETER)
+            {
                 mapper = self.inference_context(inference_context).non_fixing_mapper;
             } else {
                 mapper = self.inference_context(inference_context).mapper;
@@ -1172,18 +1430,37 @@ impl Checker {
         } else {
             contextual_signature
         };
-        self.apply_to_parameter_types(source_signature, signature, &mut |c: &mut Checker, source: TypeId, target: TypeId| {
-            // Type parameters from outer context referenced by source type are fixed by instantiation of the source type
-            c.infer_types(context, source, target, InferencePriority::NONE, false);
-        });
+        self.apply_to_parameter_types(
+            source_signature,
+            signature,
+            &mut |c: &mut Checker, source: TypeId, target: TypeId| {
+                // Type parameters from outer context referenced by source type are fixed by instantiation of the source type
+                c.infer_types(context, source, target, InferencePriority::NONE, false);
+            },
+        );
         if inference_context.is_nil() {
-            self.apply_to_return_types(contextual_signature, signature, &mut |c: &mut Checker, source: TypeId, target: TypeId| {
-                c.infer_types(context, source, target, InferencePriority::RETURN_TYPE, false);
-            });
+            self.apply_to_return_types(
+                contextual_signature,
+                signature,
+                &mut |c: &mut Checker, source: TypeId, target: TypeId| {
+                    c.infer_types(
+                        context,
+                        source,
+                        target,
+                        InferencePriority::RETURN_TYPE,
+                        false,
+                    );
+                },
+            );
         }
         let inferred_types = self.get_inferred_types(context);
         let declaration = self.sig(contextual_signature).declaration;
-        self.get_signature_instantiation(signature, &inferred_types, is_in_js_file(declaration), &[] /*inferredTypeParameters*/)
+        self.get_signature_instantiation(
+            signature,
+            &inferred_types,
+            is_in_js_file(declaration),
+            &[], /*inferredTypeParameters*/
+        )
     }
 
     // Go: checker/checker.go:19397 resolveBaseTypesOfInterface
@@ -1197,7 +1474,10 @@ impl Checker {
                     if !self.is_error_type(base_type) {
                         if self.is_valid_base_type(base_type) {
                             if t != base_type && !self.has_base_type(base_type, t) {
-                                self.ty_mut(t).as_interface_type_mut().resolved_base_types.push(base_type);
+                                self.ty_mut(t)
+                                    .as_interface_type_mut()
+                                    .resolved_base_types
+                                    .push(base_type);
                             } else {
                                 self.report_circular_base_type(declaration, t);
                             }
@@ -1218,18 +1498,32 @@ impl Checker {
     pub fn are_all_outer_type_parameters_applied(&mut self, t: TypeId) -> bool {
         // An unapplied type parameter has its symbol still the same as the matching argument symbol.
         // Since parameters are applied outer-to-inner, only the last outer parameter needs to be checked.
-        let outer_type_parameters = self.ty(t).as_interface_type().outer_type_parameters().to_vec();
+        let outer_type_parameters = self
+            .ty(t)
+            .as_interface_type()
+            .outer_type_parameters()
+            .to_vec();
         if !outer_type_parameters.is_empty() {
             let last = outer_type_parameters.len() - 1;
             let type_arguments = self.get_type_arguments(t).to_vec();
-            return self.ty(outer_type_parameters[last]).symbol != self.ty(type_arguments[last]).symbol;
+            return self.ty(outer_type_parameters[last]).symbol
+                != self.ty(type_arguments[last]).symbol;
         }
         true
     }
 
     // Go: checker/checker.go:19431 reportCircularBaseType
     pub fn report_circular_base_type(&mut self, node: Node, t: TypeId) {
-        let type_string = self.type_to_string_ex(t, Node::NIL, TypeFormatFlags::WRITE_ARRAY_AS_GENERIC_TYPE, None);
-        self.error(node, diag::Type_0_recursively_references_itself_as_a_base_type, args![type_string]);
+        let type_string = self.type_to_string_ex(
+            t,
+            Node::NIL,
+            TypeFormatFlags::WRITE_ARRAY_AS_GENERIC_TYPE,
+            None,
+        );
+        self.error(
+            node,
+            diag::Type_0_recursively_references_itself_as_a_base_type,
+            args![type_string],
+        );
     }
 }

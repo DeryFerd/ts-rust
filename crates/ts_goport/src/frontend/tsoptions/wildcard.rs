@@ -40,14 +40,20 @@ pub fn get_wildcard_directories(
     let mut recursive_keys: Vec<String> = Vec::new();
 
     for file in include {
-        let spec = normalize_slashes(&combine_paths(&compare_paths_options.current_directory, &[file.as_str()]));
+        let spec = normalize_slashes(&combine_paths(
+            &compare_paths_options.current_directory,
+            &[file.as_str()],
+        ));
         if let Some(exclude_matcher) = &exclude_matcher
             && exclude_matcher.match_string(&spec)
         {
             continue;
         }
 
-        let match_ = get_wildcard_directory_from_spec(&spec, compare_paths_options.use_case_sensitive_file_names);
+        let match_ = get_wildcard_directory_from_spec(
+            &spec,
+            compare_paths_options.use_case_sensitive_file_names,
+        );
         if let Some(match_) = match_ {
             let key = match_.key;
             let path = match_.path;
@@ -58,7 +64,10 @@ pub fn get_wildcard_directories(
             let mut existing_recursive = false;
 
             if let Some(existing_path) = &existing_path {
-                existing_recursive = wildcard_directories.get(existing_path).copied().unwrap_or(false);
+                existing_recursive = wildcard_directories
+                    .get(existing_path)
+                    .copied()
+                    .unwrap_or(false);
             }
 
             if !exists_path || (!existing_recursive && recursive) {
@@ -81,8 +90,11 @@ pub fn get_wildcard_directories(
         // Remove any subpaths under an existing recursively watched directory
         wildcard_directories.retain(|path, _| {
             for recursive_key in &recursive_keys {
-                let key = to_canonical_key(path, compare_paths_options.use_case_sensitive_file_names);
-                if &key != recursive_key && contains_path(recursive_key, &key, compare_paths_options) {
+                let key =
+                    to_canonical_key(path, compare_paths_options.use_case_sensitive_file_names);
+                if &key != recursive_key
+                    && contains_path(recursive_key, &key, compare_paths_options)
+                {
                     return false;
                 }
             }
@@ -113,7 +125,10 @@ struct WildcardDirectoryMatch {
 // Go: tsoptions/wildcarddirectories.go:101 getWildcardDirectoryFromSpec
 // PORT: Go `strings.ToLower` and Rust `to_lowercase` agree on the ASCII and
 // common Unicode cases that appear in paths.
-fn get_wildcard_directory_from_spec(spec: &str, use_case_sensitive_file_names: bool) -> Option<WildcardDirectoryMatch> {
+fn get_wildcard_directory_from_spec(
+    spec: &str,
+    use_case_sensitive_file_names: bool,
+) -> Option<WildcardDirectoryMatch> {
     // Find the first occurrence of a wildcard character
     if let Some(first_wildcard) = spec.find(['*', '?']) {
         // Find the last directory separator before the wildcard

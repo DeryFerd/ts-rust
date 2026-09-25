@@ -140,7 +140,12 @@ impl Checker {
     }
 
     // Go: checker/relater.go:136 compareTypesAssignableWorker
-    pub fn compare_types_assignable_worker(&mut self, source: TypeId, target: TypeId, report_errors: bool) -> Ternary {
+    pub fn compare_types_assignable_worker(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        report_errors: bool,
+    ) -> Ternary {
         let relation = self.assignable_relation.clone();
         if self.is_type_related_to(source, target, &relation) {
             return Ternary::TRUE;
@@ -187,7 +192,12 @@ impl Checker {
     }
 
     // Go: checker/relater.go:170 isTypeRelatedTo
-    pub fn is_type_related_to(&mut self, source: TypeId, target: TypeId, relation: &Rc<RefCell<Relation>>) -> bool {
+    pub fn is_type_related_to(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        relation: &Rc<RefCell<Relation>>,
+    ) -> bool {
         let mut source = source;
         let mut target = target;
         if self.is_fresh_literal_type(source) {
@@ -209,7 +219,10 @@ impl Checker {
                 return true;
             }
         } else if !(self.ty(source).flags | self.ty(target).flags).intersects(
-            TypeFlags::UNION_OR_INTERSECTION | TypeFlags::INDEXED_ACCESS | TypeFlags::CONDITIONAL | TypeFlags::SUBSTITUTION,
+            TypeFlags::UNION_OR_INTERSECTION
+                | TypeFlags::INDEXED_ACCESS
+                | TypeFlags::CONDITIONAL
+                | TypeFlags::SUBSTITUTION,
         ) {
             // We have excluded types that may simplify to other forms, so types must have identical flags
             if self.ty(source).flags != self.ty(target).flags {
@@ -219,17 +232,31 @@ impl Checker {
                 return true;
             }
         }
-        if self.ty(source).flags.intersects(TypeFlags::OBJECT) && self.ty(target).flags.intersects(TypeFlags::OBJECT) {
-            let (id, _) = self.get_relation_key(source, target, IntersectionState::NONE, is_identity, false);
+        if self.ty(source).flags.intersects(TypeFlags::OBJECT)
+            && self.ty(target).flags.intersects(TypeFlags::OBJECT)
+        {
+            let (id, _) =
+                self.get_relation_key(source, target, IntersectionState::NONE, is_identity, false);
             let related = relation.borrow().get(id);
             if related != RelationComparisonResult::NONE {
                 return related.intersects(RelationComparisonResult::SUCCEEDED);
             }
         }
-        if self.ty(source).flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
-            || self.ty(target).flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
+        if self
+            .ty(source)
+            .flags
+            .intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
+            || self
+                .ty(target)
+                .flags
+                .intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
         {
-            return self.check_type_related_to(source, target, relation, Node::NIL /*errorNode*/);
+            return self.check_type_related_to(
+                source,
+                target,
+                relation,
+                Node::NIL, /*errorNode*/
+            );
         }
         false
     }
@@ -244,11 +271,15 @@ impl Checker {
     ) -> bool {
         let s = self.ty(source).flags;
         let t = self.ty(target).flags;
-        if t.intersects(TypeFlags::ANY) || s.intersects(TypeFlags::NEVER) || source == self.wildcard_type {
+        if t.intersects(TypeFlags::ANY)
+            || s.intersects(TypeFlags::NEVER)
+            || source == self.wildcard_type
+        {
             return true;
         }
         if t.intersects(TypeFlags::UNKNOWN)
-            && !(Rc::ptr_eq(relation, &self.strict_subtype_relation) && s.intersects(TypeFlags::ANY))
+            && !(Rc::ptr_eq(relation, &self.strict_subtype_relation)
+                && s.intersects(TypeFlags::ANY))
         {
             return true;
         }
@@ -291,21 +322,34 @@ impl Checker {
         if s.intersects(TypeFlags::ENUM)
             && t.intersects(TypeFlags::ENUM)
             && self.sym(source_symbol).name == self.sym(target_symbol).name
-            && self.is_enum_type_related_to(source_symbol, target_symbol, reborrow_error_reporter(&mut error_reporter))
+            && self.is_enum_type_related_to(
+                source_symbol,
+                target_symbol,
+                reborrow_error_reporter(&mut error_reporter),
+            )
         {
             return true;
         }
         if s.intersects(TypeFlags::ENUM_LITERAL) && t.intersects(TypeFlags::ENUM_LITERAL) {
             if s.intersects(TypeFlags::UNION)
                 && t.intersects(TypeFlags::UNION)
-                && self.is_enum_type_related_to(source_symbol, target_symbol, reborrow_error_reporter(&mut error_reporter))
+                && self.is_enum_type_related_to(
+                    source_symbol,
+                    target_symbol,
+                    reborrow_error_reporter(&mut error_reporter),
+                )
             {
                 return true;
             }
             if s.intersects(TypeFlags::LITERAL)
                 && t.intersects(TypeFlags::LITERAL)
-                && self.ty(source).as_literal_type().value == self.ty(target).as_literal_type().value
-                && self.is_enum_type_related_to(source_symbol, target_symbol, reborrow_error_reporter(&mut error_reporter))
+                && self.ty(source).as_literal_type().value
+                    == self.ty(target).as_literal_type().value
+                && self.is_enum_type_related_to(
+                    source_symbol,
+                    target_symbol,
+                    reborrow_error_reporter(&mut error_reporter),
+                )
             {
                 return true;
             }
@@ -319,7 +363,8 @@ impl Checker {
             return true;
         }
         if s.intersects(TypeFlags::NULL)
-            && (!self.strict_null_checks && !t.intersects(TypeFlags::UNION_OR_INTERSECTION) || t.intersects(TypeFlags::NULL))
+            && (!self.strict_null_checks && !t.intersects(TypeFlags::UNION_OR_INTERSECTION)
+                || t.intersects(TypeFlags::NULL))
         {
             return true;
         }
@@ -327,11 +372,16 @@ impl Checker {
             && t.intersects(TypeFlags::NON_PRIMITIVE)
             && !(Rc::ptr_eq(relation, &self.strict_subtype_relation)
                 && self.is_empty_anonymous_object_type(source)
-                && !self.ty(source).object_flags.intersects(ObjectFlags::FRESH_LITERAL))
+                && !self
+                    .ty(source)
+                    .object_flags
+                    .intersects(ObjectFlags::FRESH_LITERAL))
         {
             return true;
         }
-        if Rc::ptr_eq(relation, &self.assignable_relation) || Rc::ptr_eq(relation, &self.comparable_relation) {
+        if Rc::ptr_eq(relation, &self.assignable_relation)
+            || Rc::ptr_eq(relation, &self.comparable_relation)
+        {
             if s.intersects(TypeFlags::ANY) {
                 return true;
             }
@@ -340,7 +390,8 @@ impl Checker {
             // with a matching value. These rules exist such that enums can be used for bit-flag purposes.
             if s.intersects(TypeFlags::NUMBER)
                 && (t.intersects(TypeFlags::ENUM)
-                    || t.intersects(TypeFlags::NUMBER_LITERAL) && t.intersects(TypeFlags::ENUM_LITERAL))
+                    || t.intersects(TypeFlags::NUMBER_LITERAL)
+                        && t.intersects(TypeFlags::ENUM_LITERAL))
             {
                 return true;
             }
@@ -349,7 +400,8 @@ impl Checker {
                 && (t.intersects(TypeFlags::ENUM)
                     || t.intersects(TypeFlags::NUMBER_LITERAL)
                         && t.intersects(TypeFlags::ENUM_LITERAL)
-                        && self.ty(source).as_literal_type().value == self.ty(target).as_literal_type().value)
+                        && self.ty(source).as_literal_type().value
+                            == self.ty(target).as_literal_type().value)
             {
                 return true;
             }
@@ -382,13 +434,22 @@ impl Checker {
             return true;
         }
         if self.sym(source_symbol).name != self.sym(target_symbol).name
-            || !self.sym(source_symbol).flags.intersects(SymbolFlags::REGULAR_ENUM)
-            || !self.sym(target_symbol).flags.intersects(SymbolFlags::REGULAR_ENUM)
+            || !self
+                .sym(source_symbol)
+                .flags
+                .intersects(SymbolFlags::REGULAR_ENUM)
+            || !self
+                .sym(target_symbol)
+                .flags
+                .intersects(SymbolFlags::REGULAR_ENUM)
         {
             return false;
         }
         // PORT: Go keys by `ast.GetSymbolId`; `EnumRelationKey` holds symbol handles.
-        let key = EnumRelationKey { source_id: source_symbol, target_id: target_symbol };
+        let key = EnumRelationKey {
+            source_id: source_symbol,
+            target_id: target_symbol,
+        };
         let entry = self.enum_relation.get(&key).copied().unwrap_or_default();
         if entry != RelationComparisonResult::NONE
             && !(entry.intersects(RelationComparisonResult::FAILED) && error_reporter.is_some())
@@ -398,10 +459,20 @@ impl Checker {
         let target_enum_type = self.get_type_of_symbol(target_symbol);
         let source_enum_type = self.get_type_of_symbol(source_symbol);
         for source_property in self.get_properties_of_type(source_enum_type) {
-            if self.sym(source_property).flags.intersects(SymbolFlags::ENUM_MEMBER) {
+            if self
+                .sym(source_property)
+                .flags
+                .intersects(SymbolFlags::ENUM_MEMBER)
+            {
                 let source_property_name = self.sym(source_property).name.clone();
-                let target_property = self.get_property_of_type(target_enum_type, &source_property_name);
-                if target_property.is_nil() || !self.sym(target_property).flags.intersects(SymbolFlags::ENUM_MEMBER) {
+                let target_property =
+                    self.get_property_of_type(target_enum_type, &source_property_name);
+                if target_property.is_nil()
+                    || !self
+                        .sym(target_property)
+                        .flags
+                        .intersects(SymbolFlags::ENUM_MEMBER)
+                {
                     if let Some(reporter) = error_reporter.as_mut() {
                         let property_string = self.symbol_to_string(source_property);
                         let declared_type = self.get_declared_type_of_symbol(target_symbol);
@@ -411,14 +482,21 @@ impl Checker {
                             TypeFormatFlags::USE_FULLY_QUALIFIED_TYPE,
                             None,
                         );
-                        (**reporter)(self, diag::Property_0_is_missing_in_type_1, args![property_string, type_string]);
+                        (**reporter)(
+                            self,
+                            diag::Property_0_is_missing_in_type_1,
+                            args![property_string, type_string],
+                        );
                     }
-                    self.enum_relation.insert(key, RelationComparisonResult::FAILED);
+                    self.enum_relation
+                        .insert(key, RelationComparisonResult::FAILED);
                     return false;
                 }
-                let source_declaration = get_declaration_of_kind(&self.symbols, source_property, SyntaxKind::EnumMember);
+                let source_declaration =
+                    get_declaration_of_kind(&self.symbols, source_property, SyntaxKind::EnumMember);
                 let source_value = self.get_enum_member_value(source_declaration).value;
-                let target_declaration = get_declaration_of_kind(&self.symbols, target_property, SyntaxKind::EnumMember);
+                let target_declaration =
+                    get_declaration_of_kind(&self.symbols, target_property, SyntaxKind::EnumMember);
                 let target_value = self.get_enum_member_value(target_declaration).value;
                 if source_value != target_value {
                     // If we have 2 enums with *known* values that differ, they are incompatible.
@@ -435,7 +513,8 @@ impl Checker {
                                 args![target_symbol_string, target_property_string, target_value_string, source_value_string],
                             );
                         }
-                        self.enum_relation.insert(key, RelationComparisonResult::FAILED);
+                        self.enum_relation
+                            .insert(key, RelationComparisonResult::FAILED);
                         return false;
                     }
                     // At this point we know that at least one of the values is 'undefined'.
@@ -449,11 +528,17 @@ impl Checker {
                     if source_is_string || target_is_string {
                         if let Some(reporter) = error_reporter.as_mut() {
                             // Go: core.OrElse(sourceValue, targetValue)
-                            let known_string_value = if source_value.is_some() { &source_value } else { &target_value };
+                            let known_string_value = if source_value.is_some() {
+                                &source_value
+                            } else {
+                                &target_value
+                            };
                             let target_symbol_string = self.symbol_to_string(target_symbol);
                             let target_property_string = self.symbol_to_string(target_property);
                             let known_string = value_to_string(
-                                known_string_value.as_ref().expect("unhandled value type in valueToString"),
+                                known_string_value
+                                    .as_ref()
+                                    .expect("unhandled value type in valueToString"),
                             );
                             (**reporter)(
                                 self,
@@ -461,13 +546,15 @@ impl Checker {
                                 args![target_symbol_string, target_property_string, known_string],
                             );
                         }
-                        self.enum_relation.insert(key, RelationComparisonResult::FAILED);
+                        self.enum_relation
+                            .insert(key, RelationComparisonResult::FAILED);
                         return false;
                     }
                 }
             }
         }
-        self.enum_relation.insert(key, RelationComparisonResult::SUCCEEDED);
+        self.enum_relation
+            .insert(key, RelationComparisonResult::SUCCEEDED);
         true
     }
 
@@ -493,7 +580,14 @@ impl Checker {
         diagnostic_output: Option<&mut Vec<Diagnostic>>,
     ) -> bool {
         let relation = self.assignable_relation.clone();
-        self.check_type_related_to_ex(source, target, &relation, error_node, head_message, diagnostic_output)
+        self.check_type_related_to_ex(
+            source,
+            target,
+            &relation,
+            error_node,
+            head_message,
+            diagnostic_output,
+        )
     }
 
     // Go: checker/relater.go:341 checkTypeComparableTo
@@ -560,7 +654,13 @@ impl Checker {
         if overflow {
             // Record this relation as having failed such that we don't attempt the overflowing operation again.
             let is_identity = Rc::ptr_eq(relation, &self.identity_relation);
-            let (id, _) = self.get_relation_key(source, target, IntersectionState::NONE, is_identity, false /*ignoreConstraints*/);
+            let (id, _) = self.get_relation_key(
+                source,
+                target,
+                IntersectionState::NONE,
+                is_identity,
+                false, /*ignoreConstraints*/
+            );
             relation.borrow_mut().set(
                 id,
                 RelationComparisonResult::FAILED
@@ -580,7 +680,8 @@ impl Checker {
             }
             let source_string = self.type_to_string(source);
             let target_string = self.type_to_string(target);
-            let diagnostic = new_diagnostic_for_node(error_node, message, args![source_string, target_string]);
+            let diagnostic =
+                new_diagnostic_for_node(error_node, message, args![source_string, target_string]);
             self.report_diagnostic(diagnostic, diagnostic_output);
         } else if has_error_chain {
             // Check if we should issue an extra diagnostic to produce a quickfix for a slightly incorrect import statement
@@ -597,7 +698,12 @@ impl Checker {
                 };
                 if originating_import.is_some() && !is_import_call(originating_import) {
                     let links_target_type = self.get_type_of_symbol(links_target);
-                    let helpful_retry = self.check_type_related_to(links_target_type, target, relation, Node::NIL /*errorNode*/);
+                    let helpful_retry = self.check_type_related_to(
+                        links_target_type,
+                        target,
+                        relation,
+                        Node::NIL, /*errorNode*/
+                    );
                     if helpful_retry {
                         // Likely an incorrect import. Issue a helpful diagnostic to produce a quickfix to change the import
                         r.borrow_mut().related_info.push(create_diagnostic_for_node(
@@ -610,7 +716,11 @@ impl Checker {
             }
             let diagnostic = {
                 let rb = r.borrow();
-                create_diagnostic_chain_from_error_chain(rb.error_chain.as_deref(), rb.error_node, &rb.related_info)
+                create_diagnostic_chain_from_error_chain(
+                    rb.error_chain.as_deref(),
+                    rb.error_node,
+                    &rb.related_info,
+                )
             };
             // PORT: Go `reportDiagnostic` ignores a nil diagnostic.
             if let Some(diagnostic) = diagnostic {
@@ -638,14 +748,20 @@ pub fn create_diagnostic_chain_from_error_chain(
         chain = c.next.as_deref();
     }
     let chain = chain?;
-    let next = create_diagnostic_chain_from_error_chain(chain.next.as_deref(), error_node, related_info);
+    let next =
+        create_diagnostic_chain_from_error_chain(chain.next.as_deref(), error_node, related_info);
     match next {
         None => {
-            let mut diagnostic = new_diagnostic_for_node(error_node, chain.message, chain.args.clone());
+            let mut diagnostic =
+                new_diagnostic_for_node(error_node, chain.message, chain.args.clone());
             diagnostic.set_related_info(related_info.to_vec());
             Some(diagnostic)
         }
-        Some(next) => Some(new_diagnostic_chain(Some(next), chain.message, chain.args.clone())),
+        Some(next) => Some(new_diagnostic_chain(
+            Some(next),
+            chain.message,
+            chain.args.clone(),
+        )),
     }
 }
 
@@ -654,7 +770,11 @@ impl Checker {
     // PORT: Go takes a nil-able `*ast.Diagnostic`; every Go caller except
     // `checkTypeRelatedToEx` passes a non-nil value, so this takes an owned
     // `Diagnostic` and that caller checks for nil itself.
-    pub fn report_diagnostic(&mut self, diagnostic: Diagnostic, diagnostic_output: Option<&mut Vec<Diagnostic>>) {
+    pub fn report_diagnostic(
+        &mut self,
+        diagnostic: Diagnostic,
+        diagnostic_output: Option<&mut Vec<Diagnostic>>,
+    ) {
         if let Some(diagnostic_output) = diagnostic_output {
             diagnostic_output.push(diagnostic);
         } else {
@@ -699,9 +819,23 @@ impl Checker {
             return true;
         }
         if error_node.is_some()
-            && !self.elaborate_error(expr, source, target, relation, head_message, diagnostic_output.as_deref_mut())
+            && !self.elaborate_error(
+                expr,
+                source,
+                target,
+                relation,
+                head_message,
+                diagnostic_output.as_deref_mut(),
+            )
         {
-            return self.check_type_related_to_ex(source, target, relation, error_node, head_message, diagnostic_output);
+            return self.check_type_related_to_ex(
+                source,
+                target,
+                relation,
+                error_node,
+                head_message,
+                diagnostic_output,
+            );
         }
         false
     }
@@ -742,29 +876,69 @@ impl Checker {
             return true;
         }
         match node.kind() {
-            SyntaxKind::AsExpression | SyntaxKind::JsxExpression | SyntaxKind::ParenthesizedExpression => {
+            SyntaxKind::AsExpression
+            | SyntaxKind::JsxExpression
+            | SyntaxKind::ParenthesizedExpression => {
                 // Go: `case KindAsExpression: if !IsConstAssertion(node) { break }; fallthrough`
                 if !(node.kind() == SyntaxKind::AsExpression && !is_const_assertion(node)) {
-                    return self.elaborate_error(node.expression(), source, target, relation, head_message, diagnostic_output);
+                    return self.elaborate_error(
+                        node.expression(),
+                        source,
+                        target,
+                        relation,
+                        head_message,
+                        diagnostic_output,
+                    );
                 }
             }
             SyntaxKind::BinaryExpression => match node.operator_token().kind() {
                 SyntaxKind::EqualsToken | SyntaxKind::CommaToken => {
-                    return self.elaborate_error(node.right(), source, target, relation, head_message, diagnostic_output);
+                    return self.elaborate_error(
+                        node.right(),
+                        source,
+                        target,
+                        relation,
+                        head_message,
+                        diagnostic_output,
+                    );
                 }
                 _ => {}
             },
             SyntaxKind::ObjectLiteralExpression => {
-                return self.elaborate_object_literal(node, source, target, relation, diagnostic_output);
+                return self.elaborate_object_literal(
+                    node,
+                    source,
+                    target,
+                    relation,
+                    diagnostic_output,
+                );
             }
             SyntaxKind::ArrayLiteralExpression => {
-                return self.elaborate_array_literal(node, source, target, relation, diagnostic_output);
+                return self.elaborate_array_literal(
+                    node,
+                    source,
+                    target,
+                    relation,
+                    diagnostic_output,
+                );
             }
             SyntaxKind::ArrowFunction => {
-                return self.elaborate_arrow_function(node, source, target, relation, diagnostic_output);
+                return self.elaborate_arrow_function(
+                    node,
+                    source,
+                    target,
+                    relation,
+                    diagnostic_output,
+                );
             }
             SyntaxKind::JsxAttributes => {
-                return self.elaborate_jsx_components(node, source, target, relation, diagnostic_output);
+                return self.elaborate_jsx_components(
+                    node,
+                    source,
+                    target,
+                    relation,
+                    diagnostic_output,
+                );
             }
             _ => {}
         }
@@ -775,7 +949,11 @@ impl Checker {
     pub fn is_or_has_generic_conditional(&self, t: TypeId) -> bool {
         self.ty(t).flags.intersects(TypeFlags::CONDITIONAL)
             || (self.ty(t).flags.intersects(TypeFlags::INTERSECTION)
-                && self.ty(t).types().iter().any(|&t| self.is_or_has_generic_conditional(t)))
+                && self
+                    .ty(t)
+                    .types()
+                    .iter()
+                    .any(|&t| self.is_or_has_generic_conditional(t)))
     }
 
     // Go: checker/relater.go:479 elaborateDidYouMeanToCallOrConstruct
@@ -792,8 +970,16 @@ impl Checker {
         let mut some = false;
         for s in self.get_signatures_of_type(source, kind) {
             let return_type = self.get_return_type_of_signature(s);
-            if !self.ty(return_type).flags.intersects(TypeFlags::ANY | TypeFlags::NEVER)
-                && self.check_type_related_to(return_type, target, relation, Node::NIL /*errorNode*/)
+            if !self
+                .ty(return_type)
+                .flags
+                .intersects(TypeFlags::ANY | TypeFlags::NEVER)
+                && self.check_type_related_to(
+                    return_type,
+                    target,
+                    relation,
+                    Node::NIL, /*errorNode*/
+                )
             {
                 some = true;
                 break;
@@ -801,14 +987,25 @@ impl Checker {
         }
         if some {
             let mut diags: Vec<Diagnostic> = Vec::new();
-            if !self.check_type_related_to_ex(source, target, relation, node, head_message, Some(&mut diags)) {
+            if !self.check_type_related_to_ex(
+                source,
+                target,
+                relation,
+                node,
+                head_message,
+                Some(&mut diags),
+            ) {
                 let mut diagnostic = diags.swap_remove(0);
                 let message = if kind == SignatureKind::CONSTRUCT {
                     diag::Did_you_mean_to_use_new_with_this_expression
                 } else {
                     diag::Did_you_mean_to_call_this_expression
                 };
-                diagnostic.add_related_info(Some(create_diagnostic_for_node(node, message, args![])));
+                diagnostic.add_related_info(Some(create_diagnostic_for_node(
+                    node,
+                    message,
+                    args![],
+                )));
                 self.report_diagnostic(diagnostic, diagnostic_output);
                 return true;
             }
@@ -825,7 +1022,11 @@ impl Checker {
         relation: &Rc<RefCell<Relation>>,
         mut diagnostic_output: Option<&mut Vec<Diagnostic>>,
     ) -> bool {
-        if self.ty(target).flags.intersects(TypeFlags::PRIMITIVE | TypeFlags::NEVER) {
+        if self
+            .ty(target)
+            .flags
+            .intersects(TypeFlags::PRIMITIVE | TypeFlags::NEVER)
+        {
             return false;
         }
         let mut reported_error = false;
@@ -834,7 +1035,11 @@ impl Checker {
                 continue;
             }
             let prop_symbol = self.get_symbol_of_declaration(prop);
-            let name_type = self.get_literal_type_from_property(prop_symbol, TypeFlags::STRING_OR_NUMBER_LITERAL_OR_UNIQUE, false);
+            let name_type = self.get_literal_type_from_property(
+                prop_symbol,
+                TypeFlags::STRING_OR_NUMBER_LITERAL_OR_UNIQUE,
+                false,
+            );
             if name_type.is_nil() || self.ty(name_type).flags.intersects(TypeFlags::NEVER) {
                 continue;
             }
@@ -889,7 +1094,11 @@ impl Checker {
         mut diagnostic_output: Option<&mut Vec<Diagnostic>>,
     ) -> bool {
         let mut source = source;
-        if self.ty(target).flags.intersects(TypeFlags::PRIMITIVE | TypeFlags::NEVER) {
+        if self
+            .ty(target)
+            .flags
+            .intersects(TypeFlags::PRIMITIVE | TypeFlags::NEVER)
+        {
             return false;
         }
         if !self.is_tuple_like_type(source) {
@@ -904,7 +1113,9 @@ impl Checker {
         for (i, element) in node.elements().to_vec().into_iter().enumerate() {
             if is_omitted_expression(element)
                 || self.is_tuple_like_type(target)
-                    && self.get_property_of_type(target, &ts_jsnum::Number(i as f64).to_string()).is_nil()
+                    && self
+                        .get_property_of_type(target, &ts_jsnum::Number(i as f64).to_string())
+                        .is_nil()
             {
                 continue;
             }
@@ -940,15 +1151,31 @@ impl Checker {
         diagnostic_factory: Option<&mut dyn FnMut(&mut Checker, Node) -> Diagnostic>,
         mut diagnostic_output: Option<&mut Vec<Diagnostic>>,
     ) -> bool {
-        let mut target_prop_type = self.get_best_match_indexed_access_type_or_undefined(source, target, name_type);
-        if target_prop_type.is_nil() || self.ty(target_prop_type).flags.intersects(TypeFlags::INDEXED_ACCESS) {
+        let mut target_prop_type =
+            self.get_best_match_indexed_access_type_or_undefined(source, target, name_type);
+        if target_prop_type.is_nil()
+            || self
+                .ty(target_prop_type)
+                .flags
+                .intersects(TypeFlags::INDEXED_ACCESS)
+        {
             // Don't elaborate on indexes on generic variables
             return false;
         }
-        let mut source_prop_type =
-            self.get_indexed_access_type_or_undefined(source, name_type, AccessFlags::NONE, Node::NIL, None);
+        let mut source_prop_type = self.get_indexed_access_type_or_undefined(
+            source,
+            name_type,
+            AccessFlags::NONE,
+            Node::NIL,
+            None,
+        );
         if source_prop_type.is_nil()
-            || self.check_type_related_to(source_prop_type, target_prop_type, relation, Node::NIL /*errorNode*/)
+            || self.check_type_related_to(
+                source_prop_type,
+                target_prop_type,
+                relation,
+                Node::NIL, /*errorNode*/
+            )
         {
             // Don't elaborate on indexes on generic variables or when types match
             return false;
@@ -970,7 +1197,8 @@ impl Checker {
         // Use the expression type, if available
         let mut specific_source = source_prop_type;
         if next.is_some() {
-            specific_source = self.check_expression_for_mutable_location_with_contextual_type(next, source_prop_type);
+            specific_source = self
+                .check_expression_for_mutable_location_with_contextual_type(next, source_prop_type);
         }
         if let Some(diagnostic_factory) = diagnostic_factory {
             // Use the custom diagnostic factory if provided (e.g., for JSX text children with dynamic error messages)
@@ -986,24 +1214,45 @@ impl Checker {
                 args![specific_source_string, target_prop_type_string],
             ));
         } else {
-            let prop_name = self.get_property_name_from_index(name_type, Node::NIL /*accessNode*/);
+            let prop_name =
+                self.get_property_name_from_index(name_type, Node::NIL /*accessNode*/);
             let mut target_prop = self.get_property_of_type(target, &prop_name);
             if target_prop.is_nil() {
                 target_prop = self.unknown_symbol;
             }
-            let target_is_optional = self.sym(target_prop).flags.intersects(SymbolFlags::OPTIONAL);
+            let target_is_optional = self
+                .sym(target_prop)
+                .flags
+                .intersects(SymbolFlags::OPTIONAL);
             let mut source_prop = self.get_property_of_type(source, &prop_name);
             if source_prop.is_nil() {
                 source_prop = self.unknown_symbol;
             }
-            let source_is_optional = self.sym(source_prop).flags.intersects(SymbolFlags::OPTIONAL);
+            let source_is_optional = self
+                .sym(source_prop)
+                .flags
+                .intersects(SymbolFlags::OPTIONAL);
             target_prop_type = self.remove_missing_type(target_prop_type, target_is_optional);
-            source_prop_type = self.remove_missing_type(source_prop_type, target_is_optional && source_is_optional);
-            let result =
-                self.check_type_related_to_ex(specific_source, target_prop_type, relation, prop, error_message, Some(&mut diags));
+            source_prop_type = self
+                .remove_missing_type(source_prop_type, target_is_optional && source_is_optional);
+            let result = self.check_type_related_to_ex(
+                specific_source,
+                target_prop_type,
+                relation,
+                prop,
+                error_message,
+                Some(&mut diags),
+            );
             if result && specific_source != source_prop_type {
                 // If for whatever reason the expression type doesn't yield an error, make sure we still issue an error on the sourcePropType
-                self.check_type_related_to_ex(source_prop_type, target_prop_type, relation, prop, error_message, Some(&mut diags));
+                self.check_type_related_to_ex(
+                    source_prop_type,
+                    target_prop_type,
+                    relation,
+                    prop,
+                    error_message,
+                    Some(&mut diags),
+                );
             }
         }
         if diags.is_empty() {
@@ -1025,7 +1274,9 @@ impl Checker {
                 // Program method, ported as a free function; `Path()` reads the
                 // `SourceFileInfo.path` field.
                 if declaration.is_some()
-                    && !is_source_file_default_library(&source_file_info(get_source_file_of_node(declaration)).path)
+                    && !is_source_file_default_library(
+                        &source_file_info(get_source_file_of_node(declaration)).path,
+                    )
                 {
                     issued_elaboration = true;
                     diagnostic.add_related_info(Some(create_diagnostic_for_node(
@@ -1041,15 +1292,23 @@ impl Checker {
             && (target_prop.is_some() && !self.sym(target_prop).declarations.is_empty()
                 || target_symbol.is_some() && !self.sym(target_symbol).declarations.is_empty())
         {
-            let target_node = if target_prop.is_some() && !self.sym(target_prop).declarations.is_empty() {
-                self.sym(target_prop).declarations[0]
-            } else {
-                self.sym(target_symbol).declarations[0]
-            };
-            if property_name.is_empty() || self.ty(name_type).flags.intersects(TypeFlags::UNIQUE_ES_SYMBOL) {
+            let target_node =
+                if target_prop.is_some() && !self.sym(target_prop).declarations.is_empty() {
+                    self.sym(target_prop).declarations[0]
+                } else {
+                    self.sym(target_symbol).declarations[0]
+                };
+            if property_name.is_empty()
+                || self
+                    .ty(name_type)
+                    .flags
+                    .intersects(TypeFlags::UNIQUE_ES_SYMBOL)
+            {
                 property_name = self.type_to_string(name_type);
             }
-            if !is_source_file_default_library(&source_file_info(get_source_file_of_node(target_node)).path) {
+            if !is_source_file_default_library(
+                &source_file_info(get_source_file_of_node(target_node)).path,
+            ) {
                 let target_string = self.type_to_string(target);
                 diagnostic.add_related_info(Some(create_diagnostic_for_node(
                     target_node,
@@ -1069,16 +1328,32 @@ impl Checker {
         target: TypeId,
         name_type: TypeId,
     ) -> TypeId {
-        let idx = self.get_indexed_access_type_or_undefined(target, name_type, AccessFlags::NONE, Node::NIL, None);
+        let idx = self.get_indexed_access_type_or_undefined(
+            target,
+            name_type,
+            AccessFlags::NONE,
+            Node::NIL,
+            None,
+        );
         if idx.is_some() {
             return idx;
         }
         if self.ty(target).flags.intersects(TypeFlags::UNION) {
-            let best = self.get_best_matching_type(source, target, &mut |c: &mut Checker, s: TypeId, t: TypeId| {
-                c.compare_types_assignable_simple(s, t)
-            });
+            let best = self.get_best_matching_type(
+                source,
+                target,
+                &mut |c: &mut Checker, s: TypeId, t: TypeId| {
+                    c.compare_types_assignable_simple(s, t)
+                },
+            );
             if best.is_some() {
-                return self.get_indexed_access_type_or_undefined(best, name_type, AccessFlags::NONE, Node::NIL, None);
+                return self.get_indexed_access_type_or_undefined(
+                    best,
+                    name_type,
+                    AccessFlags::NONE,
+                    Node::NIL,
+                    None,
+                );
             }
         }
         TypeId::NIL
@@ -1124,7 +1399,12 @@ impl Checker {
             target_return_types.push(self.get_return_type_of_signature(sig));
         }
         let target_return = self.get_union_type(&target_return_types);
-        if self.check_type_related_to(source_return, target_return, relation, Node::NIL /*errorNode*/) {
+        if self.check_type_related_to(
+            source_return,
+            target_return,
+            relation,
+            Node::NIL, /*errorNode*/
+        ) {
             return false;
         }
         if return_expression.is_some()
@@ -1140,7 +1420,14 @@ impl Checker {
             return true;
         }
         let mut diags: Vec<Diagnostic> = Vec::new();
-        self.check_type_related_to_ex(source_return, target_return, relation, return_expression, None /*headMessage*/, Some(&mut diags));
+        self.check_type_related_to_ex(
+            source_return,
+            target_return,
+            relation,
+            return_expression,
+            None, /*headMessage*/
+            Some(&mut diags),
+        );
         if !diags.is_empty() {
             let mut diagnostic = diags.swap_remove(0);
             let target_symbol = self.ty(target).symbol;
@@ -1153,10 +1440,17 @@ impl Checker {
                 )));
             }
             if !get_function_flags(node).intersects(FunctionFlags::ASYNC)
-                && self.get_type_of_property_of_type(source_return, "then").is_nil()
+                && self
+                    .get_type_of_property_of_type(source_return, "then")
+                    .is_nil()
             {
                 let promise_type = self.create_promise_type(source_return);
-                if self.check_type_related_to(promise_type, target_return, relation, Node::NIL /*errorNode*/) {
+                if self.check_type_related_to(
+                    promise_type,
+                    target_return,
+                    relation,
+                    Node::NIL, /*errorNode*/
+                ) {
                     diagnostic.add_related_info(Some(create_diagnostic_for_node(
                         node,
                         diag::Did_you_mean_to_mark_this_function_as_async,
@@ -1177,12 +1471,18 @@ impl Checker {
         if self.ty(t).flags.intersects(TypeFlags::OBJECT) {
             let (signature_count, index_info_count, properties) = {
                 let resolved = self.resolve_structured_type_members(t);
-                (resolved.signatures.len(), resolved.index_infos.len(), resolved.properties.clone())
+                (
+                    resolved.signatures.len(),
+                    resolved.index_infos.len(),
+                    resolved.properties.clone(),
+                )
             };
             return signature_count == 0
                 && index_info_count == 0
                 && !properties.is_empty()
-                && properties.iter().all(|&p| self.sym(p).flags.intersects(SymbolFlags::OPTIONAL));
+                && properties
+                    .iter()
+                    .all(|&p| self.sym(p).flags.intersects(SymbolFlags::OPTIONAL));
         }
         if self.ty(t).flags.intersects(TypeFlags::SUBSTITUTION) {
             let base_type = self.ty(t).as_substitution_type().base_type;
@@ -1200,7 +1500,12 @@ impl Checker {
     }
 
     // Go: checker/relater.go:698 hasCommonProperties
-    pub fn has_common_properties(&mut self, source: TypeId, target: TypeId, is_comparing_jsx_attributes: bool) -> bool {
+    pub fn has_common_properties(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        is_comparing_jsx_attributes: bool,
+    ) -> bool {
         for prop in self.get_properties_of_type(source) {
             let name = self.sym(prop).name.clone();
             if self.is_known_property(target, &name, is_comparing_jsx_attributes) {
@@ -1224,16 +1529,26 @@ impl Checker {
      * @param name a property name to search
      * @param isComparingJsxAttributes a boolean flag indicating whether we are searching in JsxAttributesType
      */
-    pub fn is_known_property(&mut self, target_type: TypeId, name: &str, is_comparing_jsx_attributes: bool) -> bool {
+    pub fn is_known_property(
+        &mut self,
+        target_type: TypeId,
+        name: &str,
+        is_comparing_jsx_attributes: bool,
+    ) -> bool {
         if self.ty(target_type).flags.intersects(TypeFlags::OBJECT) {
             // For backwards compatibility a symbol-named property is satisfied by a string index signature. This
             // is incorrect and inconsistent with element access expressions, where it is an error, so eventually
             // we should remove this exception.
-            if self.get_property_of_object_type(target_type, name).is_some()
-                || self.get_applicable_index_info_for_name(target_type, name).is_some()
+            if self
+                .get_property_of_object_type(target_type, name)
+                .is_some()
+                || self
+                    .get_applicable_index_info_for_name(target_type, name)
+                    .is_some()
                 || is_late_bound_name(name) && {
                     let string_type = self.string_type;
-                    self.get_index_info_of_type(target_type, string_type).is_some()
+                    self.get_index_info_of_type(target_type, string_type)
+                        .is_some()
                 }
                 || is_comparing_jsx_attributes && is_hyphenated_jsx_name(name)
             {
@@ -1241,11 +1556,18 @@ impl Checker {
                 return true;
             }
         }
-        if self.ty(target_type).flags.intersects(TypeFlags::SUBSTITUTION) {
+        if self
+            .ty(target_type)
+            .flags
+            .intersects(TypeFlags::SUBSTITUTION)
+        {
             let base_type = self.ty(target_type).as_substitution_type().base_type;
             return self.is_known_property(base_type, name, is_comparing_jsx_attributes);
         }
-        if self.ty(target_type).flags.intersects(TypeFlags::UNION_OR_INTERSECTION)
+        if self
+            .ty(target_type)
+            .flags
+            .intersects(TypeFlags::UNION_OR_INTERSECTION)
             && self.is_excess_property_check_target(target_type)
         {
             for t in self.ty(target_type).types().to_vec() {
@@ -1261,14 +1583,22 @@ impl Checker {
     pub fn is_excess_property_check_target(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
         ty.flags.intersects(TypeFlags::OBJECT)
-            && !ty.object_flags.intersects(ObjectFlags::OBJECT_LITERAL_PATTERN_WITH_COMPUTED_PROPERTIES)
+            && !ty
+                .object_flags
+                .intersects(ObjectFlags::OBJECT_LITERAL_PATTERN_WITH_COMPUTED_PROPERTIES)
             || ty.flags.intersects(TypeFlags::NON_PRIMITIVE)
             || ty.flags.intersects(TypeFlags::SUBSTITUTION)
                 && self.is_excess_property_check_target(ty.as_substitution_type().base_type)
             || ty.flags.intersects(TypeFlags::UNION)
-                && ty.types().iter().any(|&t| self.is_excess_property_check_target(t))
+                && ty
+                    .types()
+                    .iter()
+                    .any(|&t| self.is_excess_property_check_target(t))
             || ty.flags.intersects(TypeFlags::INTERSECTION)
-                && ty.types().iter().all(|&t| self.is_excess_property_check_target(t))
+                && ty
+                    .types()
+                    .iter()
+                    .all(|&t| self.is_excess_property_check_target(t))
     }
 
     // Go: checker/relater.go:773 isDeeplyNestedType
@@ -1286,7 +1616,11 @@ impl Checker {
     pub fn is_deeply_nested_type(&mut self, t: TypeId, stack: &[TypeId], max_depth: i32) -> bool {
         let mut t = t;
         if stack.len() as i32 >= max_depth {
-            if self.ty(t).object_flags.contains(ObjectFlags::INSTANTIATED_MAPPED) {
+            if self
+                .ty(t)
+                .object_flags
+                .contains(ObjectFlags::INSTANTIATED_MAPPED)
+            {
                 t = self.get_mapped_target_with_symbol(t);
             }
             if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
@@ -1325,12 +1659,20 @@ impl Checker {
     pub fn get_mapped_target_with_symbol(&mut self, t: TypeId) -> TypeId {
         let mut t = t;
         loop {
-            if self.ty(t).object_flags.contains(ObjectFlags::INSTANTIATED_MAPPED) {
+            if self
+                .ty(t)
+                .object_flags
+                .contains(ObjectFlags::INSTANTIATED_MAPPED)
+            {
                 let target = self.get_modifiers_type_from_mapped_type(t);
                 if target.is_some()
                     && (self.ty(target).symbol.is_some()
                         || self.ty(target).flags.intersects(TypeFlags::INTERSECTION)
-                            && self.ty(target).types().iter().any(|&t| self.ty(t).symbol.is_some()))
+                            && self
+                                .ty(target)
+                                .types()
+                                .iter()
+                                .any(|&t| self.ty(t).symbol.is_some()))
                 {
                     t = target;
                     continue;
@@ -1343,7 +1685,11 @@ impl Checker {
     // Go: checker/relater.go:821 hasMatchingRecursionIdentity
     pub fn has_matching_recursion_identity(&mut self, t: TypeId, identity: RecursionId) -> bool {
         let mut t = t;
-        if self.ty(t).object_flags.contains(ObjectFlags::INSTANTIATED_MAPPED) {
+        if self
+            .ty(t)
+            .object_flags
+            .contains(ObjectFlags::INSTANTIATED_MAPPED)
+        {
             t = self.get_mapped_target_with_symbol(t);
         }
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
@@ -1371,14 +1717,17 @@ impl Checker {
         let symbol = self.ty(t).symbol;
         // Object and array literals are known not to contain recursive references and don't need a recursion identity.
         if flags.intersects(TypeFlags::OBJECT) && !self.is_object_or_array_literal_type(t) {
-            if object_flags.intersects(ObjectFlags::REFERENCE) && self.ty(t).as_type_reference().node.is_some() {
+            if object_flags.intersects(ObjectFlags::REFERENCE)
+                && self.ty(t).as_type_reference().node.is_some()
+            {
                 // Deferred type references are tracked through their associated AST node. This gives us finer
                 // granularity than using their associated target because each manifest type reference has a
                 // unique AST node.
                 return as_recursion_id(self.ty(t).as_type_reference().node);
             }
             if symbol.is_some()
-                && !(object_flags.intersects(ObjectFlags::ANONYMOUS) && self.sym(symbol).flags.intersects(SymbolFlags::CLASS))
+                && !(object_flags.intersects(ObjectFlags::ANONYMOUS)
+                    && self.sym(symbol).flags.intersects(SymbolFlags::CLASS))
                 && !object_flags.intersects(ObjectFlags::FROM_TYPE_NODE)
             {
                 // We track object types that have a symbol by that symbol (representing the origin of the type), but
@@ -1443,7 +1792,11 @@ impl Checker {
     }
 
     // Go: checker/relater.go:901 findMatchingTypeReferenceOrTypeAliasReference
-    pub fn find_matching_type_reference_or_type_alias_reference(&self, source: TypeId, union_target: TypeId) -> TypeId {
+    pub fn find_matching_type_reference_or_type_alias_reference(
+        &self,
+        source: TypeId,
+        union_target: TypeId,
+    ) -> TypeId {
         let source_object_flags = self.ty(source).object_flags;
         if source_object_flags.intersects(ObjectFlags::REFERENCE | ObjectFlags::ANONYMOUS)
             && self.ty(union_target).flags.intersects(TypeFlags::UNION)
@@ -1457,7 +1810,9 @@ impl Checker {
                         return target;
                     }
                     if overlap_obj_flags.intersects(ObjectFlags::ANONYMOUS) {
-                        if let (Some(source_alias), Some(target_alias)) = (&self.ty(source).alias, &self.ty(target).alias) {
+                        if let (Some(source_alias), Some(target_alias)) =
+                            (&self.ty(source).alias, &self.ty(target).alias)
+                        {
                             if source_alias.symbol == target_alias.symbol {
                                 return target;
                             }

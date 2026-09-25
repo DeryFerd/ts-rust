@@ -3,7 +3,11 @@
 use crate::prelude::*;
 
 // Go: checker/checker.go:2056 isImmediatelyUsedInInitializerOfBlockScopedVariable
-pub fn is_immediately_used_in_initializer_of_block_scoped_variable(declaration: Node, usage: Node, decl_container: Node) -> bool {
+pub fn is_immediately_used_in_initializer_of_block_scoped_variable(
+    declaration: Node,
+    usage: Node,
+    decl_container: Node,
+) -> bool {
     match declaration.parent().parent().kind() {
         SyntaxKind::VariableStatement | SyntaxKind::ForStatement | SyntaxKind::ForOfStatement => {
             // variable statement/for/for-of statement case,
@@ -16,7 +20,8 @@ pub fn is_immediately_used_in_initializer_of_block_scoped_variable(declaration: 
     }
     // ForIn/ForOf case - use site should not be used in expression part
     let grandparent = declaration.parent().parent();
-    is_for_in_or_of_statement(grandparent) && is_same_scope_descendent_of(usage, grandparent.expression(), decl_container)
+    is_for_in_or_of_statement(grandparent)
+        && is_same_scope_descendent_of(usage, grandparent.expression(), decl_container)
 }
 
 // Go: checker/checker.go:2074 isSameScopeDescendentOf
@@ -65,12 +70,15 @@ pub fn is_property_immediately_referenced_within_declaration(
             SyntaxKind::PropertyDeclaration => {
                 // even when stopping at any property declaration, they need to come from the same class
                 return stop_at_any_property_declaration
-                    && ((is_property_declaration(declaration) && node.parent() == declaration.parent())
+                    && ((is_property_declaration(declaration)
+                        && node.parent() == declaration.parent())
                         || (is_parameter_property_declaration(declaration, declaration.parent())
                             && node.parent() == declaration.parent().parent()));
             }
             SyntaxKind::Block => match node.parent().kind() {
-                SyntaxKind::MethodDeclaration | SyntaxKind::GetAccessor | SyntaxKind::SetAccessor => return false,
+                SyntaxKind::MethodDeclaration
+                | SyntaxKind::GetAccessor
+                | SyntaxKind::SetAccessor => return false,
                 _ => {}
             },
             _ => {}
@@ -107,9 +115,15 @@ impl Checker {
     // Go: checker/checker.go:2127 getTypeOnlyAliasDeclarationEx
     // Return the first type-only alias declaration node (if any) in the resolution chain that affects
     // the symbol for the given meaning
-    pub fn get_type_only_alias_declaration_ex(&mut self, symbol: SymbolId, meaning: SymbolFlags) -> Node {
+    pub fn get_type_only_alias_declaration_ex(
+        &mut self,
+        symbol: SymbolId,
+        meaning: SymbolFlags,
+    ) -> Node {
         let mut symbol = symbol;
-        while self.sym(symbol).flags.intersects(SymbolFlags::ALIAS) && !self.sym(symbol).flags.intersects(meaning) {
+        while self.sym(symbol).flags.intersects(SymbolFlags::ALIAS)
+            && !self.sym(symbol).flags.intersects(meaning)
+        {
             let resolved = self.resolve_alias(symbol);
             let type_only_declaration = self.alias_symbol_links.get(symbol).type_only_declaration;
             if type_only_declaration.is_some() {
@@ -122,8 +136,16 @@ impl Checker {
 
     // Go: checker/checker.go:2139 getImmediateAliasedSymbol
     pub fn get_immediate_aliased_symbol(&mut self, symbol: SymbolId) -> SymbolId {
-        debug_assert!(self.sym(symbol).flags.intersects(SymbolFlags::ALIAS), "Should only get Alias here.");
-        if self.alias_symbol_links.get(symbol).immediate_target.is_nil() {
+        debug_assert!(
+            self.sym(symbol).flags.intersects(SymbolFlags::ALIAS),
+            "Should only get Alias here."
+        );
+        if self
+            .alias_symbol_links
+            .get(symbol)
+            .immediate_target
+            .is_nil()
+        {
             let node = self.get_declaration_of_alias_symbol(symbol);
             if node.is_nil() {
                 panic!("Unexpected nil in getImmediateAliasedSymbol");
@@ -149,13 +171,26 @@ impl Checker {
         let is_export = is_export_specifier(type_only_declaration)
             || is_export_declaration(type_only_declaration)
             || is_namespace_export(type_only_declaration);
-        let message = if is_export { diag::X_0_was_exported_here } else { diag::X_0_was_imported_here };
-        diagnostic.add_related_info(Some(new_diagnostic_for_node(type_only_declaration, message, args![name])));
+        let message = if is_export {
+            diag::X_0_was_exported_here
+        } else {
+            diag::X_0_was_imported_here
+        };
+        diagnostic.add_related_info(Some(new_diagnostic_for_node(
+            type_only_declaration,
+            message,
+            args![name],
+        )));
         diagnostic
     }
 
     // Go: checker/checker.go:2160 getSymbol
-    pub fn get_symbol(&mut self, symbols: SymbolTable, name: &str, meaning: SymbolFlags) -> SymbolId {
+    pub fn get_symbol(
+        &mut self,
+        symbols: SymbolTable,
+        name: &str,
+        meaning: SymbolFlags,
+    ) -> SymbolId {
         if meaning.intersects(SymbolFlags::ALL) {
             let found = self.symbols.get(symbols, name);
             let symbol = self.get_merged_symbol(found);
@@ -204,7 +239,11 @@ impl Checker {
         if check_unused && !self.source_file_links.get(source_file).unused_checked {
             // The unused identifiers check relies on a full type check having first been performed
             if !source_file_info(source_file).is_declaration_file && !self.is_canceled() {
-                let identifier_check_nodes = self.source_file_links.get(source_file).identifier_check_nodes.clone();
+                let identifier_check_nodes = self
+                    .source_file_links
+                    .get(source_file)
+                    .identifier_check_nodes
+                    .clone();
                 self.check_unused_identifiers(&identifier_check_nodes);
             }
             self.source_file_links.get(source_file).unused_checked = true;
@@ -250,7 +289,9 @@ impl Checker {
             }
         }
 
-        if !self.within_unreachable_code && self.compiler_options.allow_unreachable_code != Tristate::True {
+        if !self.within_unreachable_code
+            && self.compiler_options.allow_unreachable_code != Tristate::True
+        {
             if self.check_source_element_unreachable(node) {
                 self.within_unreachable_code = true;
             }
@@ -266,10 +307,16 @@ impl Checker {
             | SyntaxKind::CallSignature
             | SyntaxKind::ConstructSignature
             | SyntaxKind::IndexSignature => self.check_signature_declaration(node),
-            SyntaxKind::MethodDeclaration | SyntaxKind::MethodSignature => self.check_method_declaration(node),
-            SyntaxKind::ClassStaticBlockDeclaration => self.check_class_static_block_declaration(node),
+            SyntaxKind::MethodDeclaration | SyntaxKind::MethodSignature => {
+                self.check_method_declaration(node)
+            }
+            SyntaxKind::ClassStaticBlockDeclaration => {
+                self.check_class_static_block_declaration(node)
+            }
             SyntaxKind::Constructor => self.check_constructor_declaration(node),
-            SyntaxKind::GetAccessor | SyntaxKind::SetAccessor => self.check_accessor_declaration(node),
+            SyntaxKind::GetAccessor | SyntaxKind::SetAccessor => {
+                self.check_accessor_declaration(node)
+            }
             SyntaxKind::TypeReference => {
                 self.check_type_reference_node(node);
             }
@@ -461,7 +508,9 @@ impl Checker {
                 let mut last = offset;
                 for i in (offset + 1)..statements.len() {
                     let next_node = statements[i];
-                    if !is_potentially_executable_node(next_node) || !self.is_source_element_unreachable(next_node) {
+                    if !is_potentially_executable_node(next_node)
+                        || !self.is_source_element_unreachable(next_node)
+                    {
                         break;
                     }
                     last = i;
@@ -497,9 +546,10 @@ impl Checker {
                 SyntaxKind::EnumDeclaration => {
                     !is_enum_const(node) || self.compiler_options.should_preserve_const_enums()
                 }
-                SyntaxKind::ModuleDeclaration => {
-                    is_instantiated_module(node, self.compiler_options.should_preserve_const_enums())
-                }
+                SyntaxKind::ModuleDeclaration => is_instantiated_module(
+                    node,
+                    self.compiler_options.should_preserve_const_enums(),
+                ),
                 _ => true,
             };
         } else {
@@ -538,7 +588,12 @@ impl Checker {
     pub fn check_deferred_nodes(&mut self, context: Node) {
         let mut i = 0;
         loop {
-            let node = match self.source_file_links.get(context).deferred_nodes.get_index(i) {
+            let node = match self
+                .source_file_links
+                .get(context)
+                .deferred_nodes
+                .get_index(i)
+            {
                 Some(&node) => node,
                 None => break,
             };
@@ -667,7 +722,11 @@ impl Checker {
     pub fn check_js_doc_type_is_in_js_file(&mut self, node: Node) {
         if !is_in_js_file(node) {
             if is_js_doc_non_nullable_type(node) || is_js_doc_nullable_type(node) {
-                let token = if is_js_doc_non_nullable_type(node) { "!" } else { "?" };
+                let token = if is_js_doc_non_nullable_type(node) {
+                    "!"
+                } else {
+                    "?"
+                };
                 let postfix = node.pos() == node.type_().pos();
                 let message = if postfix {
                     diag::X_0_at_the_end_of_a_type_is_not_valid_TypeScript_syntax_Did_you_mean_to_write_1
@@ -676,12 +735,23 @@ impl Checker {
                 };
                 let mut t = self.get_type_from_type_node(node.type_());
                 if is_js_doc_nullable_type(node) && t != self.never_type && t != self.void_type {
-                    t = self.get_nullable_type(t, if postfix { TypeFlags::UNDEFINED } else { TypeFlags::NULLABLE });
+                    t = self.get_nullable_type(
+                        t,
+                        if postfix {
+                            TypeFlags::UNDEFINED
+                        } else {
+                            TypeFlags::NULLABLE
+                        },
+                    );
                 }
                 let type_string = self.type_to_string_exported(t);
                 self.grammar_error_on_node(node, message, args![token, type_string]);
             } else {
-                self.grammar_error_on_node(node, diag::JSDoc_types_can_only_be_used_inside_documentation_comments, args![]);
+                self.grammar_error_on_node(
+                    node,
+                    diag::JSDoc_types_can_only_be_used_inside_documentation_comments,
+                    args![],
+                );
             }
         }
     }
@@ -702,9 +772,14 @@ impl Checker {
         let type_parameter = self.get_declared_type_of_type_parameter(symbol);
         // Resolve base constraint to reveal circularity errors
         self.get_base_constraint_of_type(type_parameter);
-        if self.get_resolved_type_parameter_default(type_parameter) == self.circular_constraint_type {
+        if self.get_resolved_type_parameter_default(type_parameter) == self.circular_constraint_type
+        {
             let type_string = self.type_to_string_exported(type_parameter);
-            self.error(default_type_node, diag::Type_parameter_0_has_a_circular_default, args![type_string]);
+            self.error(
+                default_type_node,
+                diag::Type_parameter_0_has_a_circular_default,
+                args![type_string],
+            );
         }
         let constraint_type = self.get_constraint_of_type_parameter(type_parameter);
         let default_type = self.get_default_from_type_parameter(type_parameter);
@@ -726,17 +801,24 @@ impl Checker {
     // Go: checker/checker.go:2613 checkTypeParameterDeferred
     pub fn check_type_parameter_deferred(&mut self, node: Node) {
         let parent = node.parent();
-        if is_interface_declaration(parent) || is_class_like(parent) || is_type_or_js_type_alias_declaration(parent) {
+        if is_interface_declaration(parent)
+            || is_class_like(parent)
+            || is_type_or_js_type_alias_declaration(parent)
+        {
             let tp_symbol = self.get_symbol_of_declaration(node);
             let type_parameter = self.get_declared_type_of_type_parameter(tp_symbol);
-            let modifiers =
-                self.get_type_parameter_modifiers(type_parameter) & (ModifierFlags::IN | ModifierFlags::OUT);
+            let modifiers = self.get_type_parameter_modifiers(type_parameter)
+                & (ModifierFlags::IN | ModifierFlags::OUT);
             if modifiers != ModifierFlags::NONE {
                 let symbol = self.get_symbol_of_declaration(parent);
-                let is_alias_without_object_type = is_type_or_js_type_alias_declaration(parent) && {
-                    let declared = self.get_declared_type_of_symbol(symbol);
-                    !self.ty(declared).object_flags.intersects(ObjectFlags::ANONYMOUS | ObjectFlags::MAPPED)
-                };
+                let is_alias_without_object_type = is_type_or_js_type_alias_declaration(parent)
+                    && {
+                        let declared = self.get_declared_type_of_symbol(symbol);
+                        !self
+                            .ty(declared)
+                            .object_flags
+                            .intersects(ObjectFlags::ANONYMOUS | ObjectFlags::MAPPED)
+                    };
                 if is_alias_without_object_type {
                     self.error(
                         node,
@@ -791,30 +873,69 @@ impl Checker {
         }
         if has_syntactic_modifier(node, ModifierFlags::PARAMETER_PROPERTY_MODIFIER) {
             if self.should_check_erasable_syntax(node) {
-                self.error(node, diag::This_syntax_is_not_allowed_when_erasableSyntaxOnly_is_enabled, args![]);
+                self.error(
+                    node,
+                    diag::This_syntax_is_not_allowed_when_erasableSyntaxOnly_is_enabled,
+                    args![],
+                );
             }
             if !(is_constructor_declaration(fn_) && node_is_present(fn_.body())) {
-                self.error(node, diag::A_parameter_property_is_only_allowed_in_a_constructor_implementation, args![]);
+                self.error(
+                    node,
+                    diag::A_parameter_property_is_only_allowed_in_a_constructor_implementation,
+                    args![],
+                );
             }
             if is_constructor_declaration(fn_) && param_name == "constructor" {
-                self.error(node.name(), diag::X_constructor_cannot_be_used_as_a_parameter_property_name, args![]);
+                self.error(
+                    node.name(),
+                    diag::X_constructor_cannot_be_used_as_a_parameter_property_name,
+                    args![],
+                );
             }
         }
-        if node.initializer().is_nil() && is_optional_declaration(node) && is_binding_pattern(node.name()) && fn_.body().is_some() {
-            self.error(node, diag::A_binding_pattern_parameter_cannot_be_optional_in_an_implementation_signature, args![]);
+        if node.initializer().is_nil()
+            && is_optional_declaration(node)
+            && is_binding_pattern(node.name())
+            && fn_.body().is_some()
+        {
+            self.error(
+                node,
+                diag::A_binding_pattern_parameter_cannot_be_optional_in_an_implementation_signature,
+                args![],
+            );
         }
         if param_name == "this" || param_name == "new" {
             if fn_.parameters().to_vec().iter().position(|&p| p == node) != Some(0) {
-                self.error(node, diag::A_0_parameter_must_be_the_first_parameter, args![param_name]);
+                self.error(
+                    node,
+                    diag::A_0_parameter_must_be_the_first_parameter,
+                    args![param_name],
+                );
             }
-            if is_constructor_declaration(fn_) || is_construct_signature_declaration(fn_) || is_constructor_type_node(fn_) {
-                self.error(node, diag::A_constructor_cannot_have_a_this_parameter, args![]);
+            if is_constructor_declaration(fn_)
+                || is_construct_signature_declaration(fn_)
+                || is_constructor_type_node(fn_)
+            {
+                self.error(
+                    node,
+                    diag::A_constructor_cannot_have_a_this_parameter,
+                    args![],
+                );
             }
             if is_arrow_function(fn_) {
-                self.error(node, diag::An_arrow_function_cannot_have_a_this_parameter, args![]);
+                self.error(
+                    node,
+                    diag::An_arrow_function_cannot_have_a_this_parameter,
+                    args![],
+                );
             }
             if is_accessor(fn_) {
-                self.error(node, diag::X_get_and_set_accessors_cannot_declare_this_parameters, args![]);
+                self.error(
+                    node,
+                    diag::X_get_and_set_accessors_cannot_declare_this_parameters,
+                    args![],
+                );
             }
         }
         // Only check rest parameter type if it's not a binding pattern. Since binding patterns are
@@ -824,7 +945,11 @@ impl Checker {
             let reduced = self.get_reduced_type(symbol_type);
             let any_readonly_array_type = self.any_readonly_array_type;
             if !self.is_type_assignable_to(reduced, any_readonly_array_type) {
-                self.error(node, diag::A_rest_parameter_must_be_of_an_array_type, args![]);
+                self.error(
+                    node,
+                    diag::A_rest_parameter_must_be_of_an_array_type,
+                    args![],
+                );
             }
         }
     }
@@ -852,7 +977,11 @@ impl Checker {
     // Go: checker/checker.go:2702 checkPropertySignature
     pub fn check_property_signature(&mut self, node: Node) {
         if is_private_identifier(node.name()) {
-            self.error(node, diag::Private_identifiers_are_not_allowed_outside_class_bodies, args![]);
+            self.error(
+                node,
+                diag::Private_identifiers_are_not_allowed_outside_class_bodies,
+                args![],
+            );
         }
         self.check_property_declaration(node);
     }
@@ -880,7 +1009,10 @@ impl Checker {
             if (function_flags & FunctionFlags::ASYNC_GENERATOR) == FunctionFlags::ASYNC_GENERATOR
                 && self.language_version < LANGUAGE_FEATURE_MINIMUM_TARGET.async_generators
             {
-                self.check_external_emit_helpers(node, ExternalEmitHelpers::ASYNC_GENERATOR_INCLUDES);
+                self.check_external_emit_helpers(
+                    node,
+                    ExternalEmitHelpers::ASYNC_GENERATOR_INCLUDES,
+                );
             }
             if (function_flags & FunctionFlags::ASYNC_GENERATOR) == FunctionFlags::ASYNC
                 && self.language_version < LANGUAGE_FEATURE_MINIMUM_TARGET.async_functions
@@ -915,10 +1047,16 @@ impl Checker {
             }
         }
         if return_type_node.is_some() {
-            if (function_flags & (FunctionFlags::INVALID | FunctionFlags::GENERATOR)) == FunctionFlags::GENERATOR {
+            if (function_flags & (FunctionFlags::INVALID | FunctionFlags::GENERATOR))
+                == FunctionFlags::GENERATOR
+            {
                 let return_type = self.get_type_from_type_node(return_type_node);
                 if return_type == self.void_type {
-                    self.error(return_type_node, diag::A_generator_cannot_have_a_void_type_annotation, args![]);
+                    self.error(
+                        return_type_node,
+                        diag::A_generator_cannot_have_a_void_type_annotation,
+                        args![],
+                    );
                 } else {
                     self.check_generator_instantiation_assignability_to_return_type(
                         return_type,
@@ -951,11 +1089,17 @@ impl Checker {
         }
         let get_global_promise_type_checked = self.get_global_promise_type_checked.clone();
         let global_promise_type = get_global_promise_type_checked(self);
-        if global_promise_type != self.empty_generic_type && !self.is_reference_to_type(return_type, global_promise_type) {
+        if global_promise_type != self.empty_generic_type
+            && !self.is_reference_to_type(return_type, global_promise_type)
+        {
             // The promise type was not a valid type reference to the global promise type, so we
             // report an error and return the unknown type.
             let awaited = self.get_awaited_type_no_alias(return_type);
-            let shown = if awaited.is_some() { awaited } else { self.void_type };
+            let shown = if awaited.is_some() {
+                awaited
+            } else {
+                self.void_type
+            };
             let type_string = self.type_to_string_exported(shown);
             self.error(
                 return_type_node,
@@ -982,13 +1126,20 @@ impl Checker {
                 && is_identifier(node.name())
                 && node.name().text() == "constructor"
             {
-                self.error(node.name(), diag::Class_constructor_may_not_be_a_generator, args![]);
+                self.error(
+                    node.name(),
+                    diag::Class_constructor_may_not_be_a_generator,
+                    args![],
+                );
             }
         }
         // Grammar checking for modifiers is done inside the function checkGrammarFunctionLikeDeclaration
         self.check_function_or_method_declaration(node);
         // method signatures already report "implementation not allowed in ambient context" elsewhere
-        if has_syntactic_modifier(node, ModifierFlags::ABSTRACT) && is_method_declaration(node) && node.body().is_some() {
+        if has_syntactic_modifier(node, ModifierFlags::ABSTRACT)
+            && is_method_declaration(node)
+            && node.body().is_some()
+        {
             self.error(
                 node,
                 diag::Method_0_cannot_have_an_implementation_because_it_is_marked_abstract,
@@ -997,7 +1148,11 @@ impl Checker {
         }
         // Private named methods are only allowed in class declarations
         if is_private_identifier(node.name()) && get_containing_class(node).is_nil() {
-            self.error(node, diag::Private_identifiers_are_not_allowed_outside_class_bodies, args![]);
+            self.error(
+                node,
+                diag::Private_identifiers_are_not_allowed_outside_class_bodies,
+                args![],
+            );
         }
         self.set_node_links_for_private_identifier_scope(node);
     }
@@ -1035,7 +1190,11 @@ impl Checker {
         let super_call = self.find_first_super_call(node.body());
         if super_call.is_some() {
             if class_extends_null {
-                self.error(super_call, diag::A_constructor_cannot_contain_a_super_call_when_its_class_extends_null, args![]);
+                self.error(
+                    super_call,
+                    diag::A_constructor_cannot_contain_a_super_call_when_its_class_extends_null,
+                    args![],
+                );
             }
             // A super call must be root-level in a constructor if both of the following are true:
             // - The containing class is a derived class.
@@ -1048,11 +1207,9 @@ impl Checker {
                     .to_vec()
                     .into_iter()
                     .any(is_instance_property_with_initializer_or_private_identifier_property)
-                    || node
-                        .parameters()
-                        .to_vec()
-                        .into_iter()
-                        .any(|p: Node| has_syntactic_modifier(p, ModifierFlags::PARAMETER_PROPERTY_MODIFIER)));
+                    || node.parameters().to_vec().into_iter().any(|p: Node| {
+                        has_syntactic_modifier(p, ModifierFlags::PARAMETER_PROPERTY_MODIFIER)
+                    }));
             if super_call_should_be_root_level {
                 // Until we have better flow analysis, it is an error to place the super call within any kind of block or conditional
                 // See GH #8277
@@ -1066,7 +1223,10 @@ impl Checker {
                     let mut super_call_statement = Node::NIL;
                     for statement in node.body().statements().to_vec() {
                         if is_expression_statement(statement)
-                            && is_super_call(skip_outer_expressions(statement.expression(), OuterExpressionKinds::OEK_ALL))
+                            && is_super_call(skip_outer_expressions(
+                                statement.expression(),
+                                OuterExpressionKinds::OEK_ALL,
+                            ))
                         {
                             super_call_statement = statement;
                             break;
@@ -1087,7 +1247,11 @@ impl Checker {
                 }
             }
         } else if !class_extends_null {
-            self.error(node, diag::Constructors_for_derived_classes_must_contain_a_super_call, args![]);
+            self.error(
+                node,
+                diag::Constructors_for_derived_classes_must_contain_a_super_call,
+                args![],
+            );
         }
     }
 
@@ -1145,12 +1309,17 @@ impl Checker {
     // Go: checker/checker.go:2916 checkAccessorDeclaration
     pub fn check_accessor_declaration(&mut self, node: Node) {
         // Grammar checking accessors
-        if !self.check_grammar_function_like_declaration(node) && !self.check_grammar_accessor(node) {
+        if !self.check_grammar_function_like_declaration(node) && !self.check_grammar_accessor(node)
+        {
             self.check_grammar_computed_property_name(node.name());
         }
         let name = node.name();
         if is_identifier(name) && name.text() == "constructor" && is_class_like(node.parent()) {
-            self.error(node.name(), diag::Class_constructor_may_not_be_an_accessor, args![]);
+            self.error(
+                node.name(),
+                diag::Class_constructor_may_not_be_an_accessor,
+                args![],
+            );
         }
         self.check_decorators(node);
         self.check_signature_declaration(node);
@@ -1178,21 +1347,44 @@ impl Checker {
             let setter = get_declaration_of_kind(&self.symbols, symbol, SyntaxKind::SetAccessor);
             if getter.is_some()
                 && setter.is_some()
-                && !self.node_links.get(getter).flags.intersects(NodeCheckFlags::TYPE_CHECKED)
+                && !self
+                    .node_links
+                    .get(getter)
+                    .flags
+                    .intersects(NodeCheckFlags::TYPE_CHECKED)
             {
                 self.node_links.get(getter).flags |= NodeCheckFlags::TYPE_CHECKED;
                 let getter_flags = getter.modifier_flags();
                 let setter_flags = setter.modifier_flags();
-                if (getter_flags & ModifierFlags::ABSTRACT) != (setter_flags & ModifierFlags::ABSTRACT) {
-                    self.error(getter.name(), diag::Accessors_must_both_be_abstract_or_non_abstract, args![]);
-                    self.error(setter.name(), diag::Accessors_must_both_be_abstract_or_non_abstract, args![]);
+                if (getter_flags & ModifierFlags::ABSTRACT)
+                    != (setter_flags & ModifierFlags::ABSTRACT)
+                {
+                    self.error(
+                        getter.name(),
+                        diag::Accessors_must_both_be_abstract_or_non_abstract,
+                        args![],
+                    );
+                    self.error(
+                        setter.name(),
+                        diag::Accessors_must_both_be_abstract_or_non_abstract,
+                        args![],
+                    );
                 }
                 if (getter_flags.intersects(ModifierFlags::PROTECTED)
                     && !setter_flags.intersects(ModifierFlags::PROTECTED | ModifierFlags::PRIVATE))
-                    || (getter_flags.intersects(ModifierFlags::PRIVATE) && !setter_flags.intersects(ModifierFlags::PRIVATE))
+                    || (getter_flags.intersects(ModifierFlags::PRIVATE)
+                        && !setter_flags.intersects(ModifierFlags::PRIVATE))
                 {
-                    self.error(getter.name(), diag::A_get_accessor_must_be_at_least_as_accessible_as_the_setter, args![]);
-                    self.error(setter.name(), diag::A_get_accessor_must_be_at_least_as_accessible_as_the_setter, args![]);
+                    self.error(
+                        getter.name(),
+                        diag::A_get_accessor_must_be_at_least_as_accessible_as_the_setter,
+                        args![],
+                    );
+                    self.error(
+                        setter.name(),
+                        diag::A_get_accessor_must_be_at_least_as_accessible_as_the_setter,
+                        args![],
+                    );
                 }
             }
         }

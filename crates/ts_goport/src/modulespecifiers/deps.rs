@@ -65,14 +65,21 @@ pub fn try_get_js_extension_for_file(file_name: &str, options: &CompilerOptions)
             tspath::EXTENSION_JS
         }
         tspath::EXTENSION_JS | tspath::EXTENSION_JSX | tspath::EXTENSION_JSON => ext,
-        tspath::EXTENSION_DMTS | tspath::EXTENSION_MTS | tspath::EXTENSION_MJS => tspath::EXTENSION_MJS,
-        tspath::EXTENSION_DCTS | tspath::EXTENSION_CTS | tspath::EXTENSION_CJS => tspath::EXTENSION_CJS,
+        tspath::EXTENSION_DMTS | tspath::EXTENSION_MTS | tspath::EXTENSION_MJS => {
+            tspath::EXTENSION_MJS
+        }
+        tspath::EXTENSION_DCTS | tspath::EXTENSION_CTS | tspath::EXTENSION_CJS => {
+            tspath::EXTENSION_CJS
+        }
         _ => "",
     }
 }
 
 // Go: module/resolver.go:1918 GetConditions
-pub fn get_conditions(options: &CompilerOptions, mut resolution_mode: ResolutionMode) -> Vec<String> {
+pub fn get_conditions(
+    options: &CompilerOptions,
+    mut resolution_mode: ResolutionMode,
+) -> Vec<String> {
     let module_resolution = options.get_module_resolution_kind();
     if resolution_mode == ModuleKind::NONE && module_resolution == ModuleResolutionKind::BUNDLER {
         resolution_mode = ModuleKind::ES_NEXT;
@@ -123,8 +130,14 @@ impl Pattern {
 pub fn try_parse_pattern(pattern: &str) -> Pattern {
     let star_index = pattern.find('*');
     match star_index {
-        None => Pattern { text: pattern.to_string(), star_index: -1 },
-        Some(i) if !pattern[i + 1..].contains('*') => Pattern { text: pattern.to_string(), star_index: i as isize },
+        None => Pattern {
+            text: pattern.to_string(),
+            star_index: -1,
+        },
+        Some(i) if !pattern[i + 1..].contains('*') => Pattern {
+            text: pattern.to_string(),
+            star_index: i as isize,
+        },
         Some(_) => Pattern::default(),
     }
 }
@@ -134,7 +147,9 @@ pub fn find_best_pattern_match(values: &[Pattern], candidate: &str) -> Pattern {
     let mut best_pattern = Pattern::default();
     let mut longest_match_prefix_length: isize = -1;
     for pattern in values {
-        if (pattern.star_index == -1 || pattern.star_index > longest_match_prefix_length) && pattern.matches(candidate) {
+        if (pattern.star_index == -1 || pattern.star_index > longest_match_prefix_length)
+            && pattern.matches(candidate)
+        {
             best_pattern = pattern.clone();
             longest_match_prefix_length = pattern.star_index;
         }
@@ -171,7 +186,10 @@ pub fn try_parse_patterns(path_mappings: Option<&IndexMap<String, Vec<String>>>)
 // Go: module/resolver.go:2023 MatchPatternOrExact
 pub fn match_pattern_or_exact(patterns: &ParsedPatterns, candidate: &str) -> Pattern {
     if patterns.matchable_string_set.contains(candidate) {
-        return Pattern { text: candidate.to_string(), star_index: -1 };
+        return Pattern {
+            text: candidate.to_string(),
+            star_index: -1,
+        };
     }
     if patterns.patterns.is_empty() {
         return Pattern::default();
@@ -224,7 +242,12 @@ pub fn has_suffix(s: &str, suffix: &str, case_sensitive: bool) -> bool {
 // ASCII case only, which matches for the ASCII paths in practice.
 
 // Go: stringutil/compare.go:94 HasPrefixAndSuffixWithoutOverlap
-pub fn has_prefix_and_suffix_without_overlap(s: &str, prefix: &str, suffix: &str, case_sensitive: bool) -> bool {
+pub fn has_prefix_and_suffix_without_overlap(
+    s: &str,
+    prefix: &str,
+    suffix: &str,
+    case_sensitive: bool,
+) -> bool {
     if prefix.len() + suffix.len() > s.len() {
         return false;
     }
@@ -239,7 +262,11 @@ pub trait OutputPathsHost {
 }
 
 // Go: outputpaths/outputpaths.go:91 GetOutputJSFileNameWorker
-pub fn get_output_js_file_name_worker(input_file_name: &str, options: &CompilerOptions, host: &dyn OutputPathsHost) -> String {
+pub fn get_output_js_file_name_worker(
+    input_file_name: &str,
+    options: &CompilerOptions,
+    host: &dyn OutputPathsHost,
+) -> String {
     tspath::change_extension(
         &get_output_path_without_changing_extension(input_file_name, &options.out_dir, host),
         get_output_extension(input_file_name, options.jsx),
@@ -267,12 +294,21 @@ pub fn get_output_extension(file_name: &str, jsx: JsxEmit) -> &'static str {
     if tspath::file_extension_is(file_name, tspath::EXTENSION_JSON) {
         tspath::EXTENSION_JSON
     } else if jsx == JsxEmit::PRESERVE
-        && tspath::file_extension_is_one_of(file_name, &[tspath::EXTENSION_JSX, tspath::EXTENSION_TSX])
+        && tspath::file_extension_is_one_of(
+            file_name,
+            &[tspath::EXTENSION_JSX, tspath::EXTENSION_TSX],
+        )
     {
         tspath::EXTENSION_JSX
-    } else if tspath::file_extension_is_one_of(file_name, &[tspath::EXTENSION_MTS, tspath::EXTENSION_MJS]) {
+    } else if tspath::file_extension_is_one_of(
+        file_name,
+        &[tspath::EXTENSION_MTS, tspath::EXTENSION_MJS],
+    ) {
         tspath::EXTENSION_MJS
-    } else if tspath::file_extension_is_one_of(file_name, &[tspath::EXTENSION_CTS, tspath::EXTENSION_CJS]) {
+    } else if tspath::file_extension_is_one_of(
+        file_name,
+        &[tspath::EXTENSION_CTS, tspath::EXTENSION_CJS],
+    ) {
         tspath::EXTENSION_CJS
     } else {
         tspath::EXTENSION_JS

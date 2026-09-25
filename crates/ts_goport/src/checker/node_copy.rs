@@ -41,12 +41,21 @@ impl Checker {
     }
 
     // Go: checker/nodecopy.go:20 tryJSTypeNodeToTypeNode
-    pub fn try_js_type_node_to_type_node(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, node: Node) -> Node {
+    pub fn try_js_type_node_to_type_node(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        node: Node,
+    ) -> Node {
         self.reuse_node(b, node)
     }
 
     // Go: checker/nodecopy.go:24 reuseName
-    pub fn reuse_name(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, node: Node, is_method: bool) -> Node {
+    pub fn reuse_name(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        node: Node,
+        is_method: bool,
+    ) -> Node {
         let res = self.reuse_node(b, node);
         if res.is_nil() {
             return res;
@@ -67,7 +76,9 @@ impl Checker {
 
         let renamed = match kind {
             PropertyNameNodeKind::IDENTIFIER => self.nb_new_identifier(b, &text, SymbolId::NIL),
-            PropertyNameNodeKind::STRING_LITERAL => nb_e(b).factory().new_string_literal(text, TokenFlags::NONE),
+            PropertyNameNodeKind::STRING_LITERAL => {
+                nb_e(b).factory().new_string_literal(text, TokenFlags::NONE)
+            }
             _ => return res,
         };
         nb_e(b).set_original(renamed, res);
@@ -157,13 +168,20 @@ impl RecoveryBoundary {
     pub fn start_recovery_scope(&self) -> OriginalRecoveryScopeState {
         let tracked_symbols_top = self.ctx.borrow().tracked_symbols.len();
         let unreported_errors_top = self.deferred_reports.len();
-        OriginalRecoveryScopeState { tracked_symbols_top, unreported_errors_top, had_error: self.had_error }
+        OriginalRecoveryScopeState {
+            tracked_symbols_top,
+            unreported_errors_top,
+            had_error: self.had_error,
+        }
     }
 
     // Go: checker/nodecopy.go:128 recoveryBoundary.endRecoveryScope
     pub fn end_recovery_scope(&mut self, state: OriginalRecoveryScopeState) {
         self.had_error = state.had_error;
-        self.ctx.borrow_mut().tracked_symbols.truncate(state.tracked_symbols_top);
+        self.ctx
+            .borrow_mut()
+            .tracked_symbols
+            .truncate(state.tracked_symbols_top);
         self.deferred_reports.truncate(state.unreported_errors_top);
     }
 }
@@ -196,13 +214,21 @@ impl SymbolTracker for WrappingTracker {
     // Go: checker/nodecopy.go:147 wrappingTracker.ReportCyclicStructureError
     fn report_cyclic_structure_error(&self, _c: &mut Checker) {
         let w = self.wrapped.clone();
-        self.bound.borrow_mut().mark_error(Some(Box::new(move |c: &mut Checker| w.report_cyclic_structure_error(c))));
+        self.bound
+            .borrow_mut()
+            .mark_error(Some(Box::new(move |c: &mut Checker| {
+                w.report_cyclic_structure_error(c)
+            })));
     }
 
     // Go: checker/nodecopy.go:151 wrappingTracker.ReportInaccessibleThisError
     fn report_inaccessible_this_error(&self, _c: &mut Checker) {
         let w = self.wrapped.clone();
-        self.bound.borrow_mut().mark_error(Some(Box::new(move |c: &mut Checker| w.report_inaccessible_this_error(c))));
+        self.bound
+            .borrow_mut()
+            .mark_error(Some(Box::new(move |c: &mut Checker| {
+                w.report_inaccessible_this_error(c)
+            })));
     }
 
     // Go: checker/nodecopy.go:155 wrappingTracker.ReportInaccessibleUniqueSymbolError
@@ -210,7 +236,9 @@ impl SymbolTracker for WrappingTracker {
         let w = self.wrapped.clone();
         self.bound
             .borrow_mut()
-            .mark_error(Some(Box::new(move |c: &mut Checker| w.report_inaccessible_unique_symbol_error(c))));
+            .mark_error(Some(Box::new(move |c: &mut Checker| {
+                w.report_inaccessible_unique_symbol_error(c)
+            })));
     }
 
     // Go: checker/nodecopy.go:159 wrappingTracker.ReportInferenceFallback
@@ -219,13 +247,20 @@ impl SymbolTracker for WrappingTracker {
     }
 
     // Go: checker/nodecopy.go:163 wrappingTracker.ReportLikelyUnsafeImportRequiredError
-    fn report_likely_unsafe_import_required_error(&self, _c: &mut Checker, specifier: &str, symbol_name: &str) {
+    fn report_likely_unsafe_import_required_error(
+        &self,
+        _c: &mut Checker,
+        specifier: &str,
+        symbol_name: &str,
+    ) {
         let w = self.wrapped.clone();
         let specifier = specifier.to_string();
         let symbol_name = symbol_name.to_string();
-        self.bound.borrow_mut().mark_error(Some(Box::new(move |c: &mut Checker| {
-            w.report_likely_unsafe_import_required_error(c, &specifier, &symbol_name)
-        })));
+        self.bound
+            .borrow_mut()
+            .mark_error(Some(Box::new(move |c: &mut Checker| {
+                w.report_likely_unsafe_import_required_error(c, &specifier, &symbol_name)
+            })));
     }
 
     // Go: checker/nodecopy.go:167 wrappingTracker.ReportNonSerializableProperty
@@ -234,7 +269,9 @@ impl SymbolTracker for WrappingTracker {
         let property_name = property_name.to_string();
         self.bound
             .borrow_mut()
-            .mark_error(Some(Box::new(move |c: &mut Checker| w.report_non_serializable_property(c, &property_name))));
+            .mark_error(Some(Box::new(move |c: &mut Checker| {
+                w.report_non_serializable_property(c, &property_name)
+            })));
     }
 
     // Go: checker/nodecopy.go:171 wrappingTracker.ReportNonlocalAugmentation
@@ -245,16 +282,23 @@ impl SymbolTracker for WrappingTracker {
         parent_symbol: SymbolId,
         augmenting_symbol: SymbolId,
     ) {
-        self.wrapped.report_nonlocal_augmentation(c, containing_file, parent_symbol, augmenting_symbol); // Should this also be deferred?
+        self.wrapped.report_nonlocal_augmentation(
+            c,
+            containing_file,
+            parent_symbol,
+            augmenting_symbol,
+        ); // Should this also be deferred?
     }
 
     // Go: checker/nodecopy.go:175 wrappingTracker.ReportPrivateInBaseOfClassExpression
     fn report_private_in_base_of_class_expression(&self, _c: &mut Checker, property_name: &str) {
         let w = self.wrapped.clone();
         let property_name = property_name.to_string();
-        self.bound.borrow_mut().mark_error(Some(Box::new(move |c: &mut Checker| {
-            w.report_private_in_base_of_class_expression(c, &property_name)
-        })));
+        self.bound
+            .borrow_mut()
+            .mark_error(Some(Box::new(move |c: &mut Checker| {
+                w.report_private_in_base_of_class_expression(c, &property_name)
+            })));
     }
 
     // Go: checker/nodecopy.go:179 wrappingTracker.ReportTruncationError
@@ -263,20 +307,42 @@ impl SymbolTracker for WrappingTracker {
     }
 
     // Go: checker/nodecopy.go:183 wrappingTracker.TrackSymbol
-    fn track_symbol(&self, _c: &mut Checker, symbol: SymbolId, enclosing_declaration: Node, meaning: SymbolFlags) -> bool {
-        self.bound.borrow_mut().tracked_symbols.push(TrackedSymbolArgs { symbol, enclosing_declaration, meaning });
+    fn track_symbol(
+        &self,
+        _c: &mut Checker,
+        symbol: SymbolId,
+        enclosing_declaration: Node,
+        meaning: SymbolFlags,
+    ) -> bool {
+        self.bound
+            .borrow_mut()
+            .tracked_symbols
+            .push(TrackedSymbolArgs {
+                symbol,
+                enclosing_declaration,
+                meaning,
+            });
         false
     }
 }
 
 // Go: checker/nodecopy.go:188 newWrappingTracker
-pub fn new_wrapping_tracker(inner: Rc<dyn SymbolTracker>, bound: Rc<RefCell<RecoveryBoundary>>) -> Rc<WrappingTracker> {
-    Rc::new(WrappingTracker { wrapped: inner, bound })
+pub fn new_wrapping_tracker(
+    inner: Rc<dyn SymbolTracker>,
+    bound: Rc<RefCell<RecoveryBoundary>>,
+) -> Rc<WrappingTracker> {
+    Rc::new(WrappingTracker {
+        wrapped: inner,
+        bound,
+    })
 }
 
 impl Checker {
     // Go: checker/nodecopy.go:195 createRecoveryBoundary
-    pub fn create_recovery_boundary(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>) -> Rc<RefCell<RecoveryBoundary>> {
+    pub fn create_recovery_boundary(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+    ) -> Rc<RefCell<RecoveryBoundary>> {
         self.check_not_canceled();
         let ctx = nb_ctx(b);
         let bound = {
@@ -294,7 +360,8 @@ impl Checker {
         };
         let old_tracker = ctx.borrow().tracker.clone();
         let wrapping: Rc<dyn SymbolTracker> = new_wrapping_tracker(old_tracker, bound.clone());
-        let new_tracker: Rc<dyn SymbolTracker> = new_symbol_tracker_impl(ctx.clone(), Some(wrapping));
+        let new_tracker: Rc<dyn SymbolTracker> =
+            new_symbol_tracker_impl(ctx.clone(), Some(wrapping));
         {
             let mut c = ctx.borrow_mut();
             c.tracker = new_tracker;
@@ -305,7 +372,11 @@ impl Checker {
     }
 
     // Go: checker/nodecopy.go:204 finalizeBoundary
-    pub fn finalize_boundary(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, bound: &Rc<RefCell<RecoveryBoundary>>) -> bool {
+    pub fn finalize_boundary(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        bound: &Rc<RefCell<RecoveryBoundary>>,
+    ) -> bool {
         let ctx = nb_ctx(b);
         let (deferred_reports, had_error, tracked_symbols) = {
             let mut bd = bound.borrow_mut();
@@ -315,7 +386,11 @@ impl Checker {
             c.encountered_error = bd.old_encountered_error;
             c.approximate_length = bd.old_approximate_length;
             // PORT: the reports are FnOnce, so they move out of the boundary.
-            (std::mem::take(&mut bd.deferred_reports), bd.had_error, bd.tracked_symbols.clone())
+            (
+                std::mem::take(&mut bd.deferred_reports),
+                bd.had_error,
+                bd.tracked_symbols.clone(),
+            )
         };
 
         for f in deferred_reports {
@@ -332,7 +407,11 @@ impl Checker {
     }
 
     // Go: checker/nodecopy.go:222 tryReuseExistingNodeHelper
-    pub fn try_reuse_existing_node_helper(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, existing: Node) -> Node {
+    pub fn try_reuse_existing_node_helper(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        existing: Node,
+    ) -> Node {
         let bound = self.create_recovery_boundary(b);
         // !!! TODO: Cache visitor and just reset bound+host builder? We try this for a *lot* of nodes.
         // PORT: the visitor borrows the emit context for its factory (Go `b.f`).
@@ -349,7 +428,12 @@ impl Checker {
     }
 
     // Go: checker/nodecopy.go:234 getModuleSpecifierOverride
-    pub fn get_module_specifier_override(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, parent: Node, lit: Node) -> String {
+    pub fn get_module_specifier_override(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        parent: Node,
+        lit: Node,
+    ) -> String {
         let ctx = nb_ctx(b);
         let (enclosing_file, enclosing_declaration) = {
             let c = ctx.borrow();
@@ -369,7 +453,9 @@ impl Checker {
             }
             let mut parent_symbol = SymbolId::NIL;
             if node_symbol.is_some()
-                && self.is_symbol_accessible(node_symbol, enclosing_declaration, meaning, false).accessibility
+                && self
+                    .is_symbol_accessible(node_symbol, enclosing_declaration, meaning, false)
+                    .accessibility
                     == SymbolAccessibility::ACCESSIBLE
             {
                 parent_symbol = self.lookup_symbol_chain(b, node_symbol, meaning, true)[0];
@@ -394,7 +480,12 @@ impl Checker {
     }
 
     // Go: checker/nodecopy.go:270 rewriteModuleSpecifier
-    pub fn rewrite_module_specifier(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, parent: Node, lit: Node) -> Node {
+    pub fn rewrite_module_specifier(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        parent: Node,
+        lit: Node,
+    ) -> Node {
         let new_name = self.get_module_specifier_override(b, parent, lit);
         if new_name.is_empty() {
             return lit;
@@ -406,9 +497,18 @@ impl Checker {
     }
 
     // Go: checker/nodecopy.go:280 getEnclosingDeclarationIgnoringFakeScope
-    pub fn get_enclosing_declaration_ignoring_fake_scope(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>) -> Node {
+    pub fn get_enclosing_declaration_ignoring_fake_scope(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+    ) -> Node {
         let mut enc = nb_ctx(b).borrow().enclosing_declaration;
-        while enc.is_some() && b.borrow_mut().links.get(enc).fake_scope_for_signature_declaration.is_some() {
+        while enc.is_some()
+            && b.borrow_mut()
+                .links
+                .get(enc)
+                .fake_scope_for_signature_declaration
+                .is_some()
+        {
             enc = enc.parent();
         }
         enc
@@ -434,8 +534,10 @@ fn get_meaning_of_entity_name_reference(entity_name: Node) -> SymbolFlags {
         || entity_name.kind() == SyntaxKind::PropertyAccessExpression
         || parent.kind() == SyntaxKind::ImportEqualsDeclaration
         || (parent.kind() == SyntaxKind::QualifiedName && parent.left() == entity_name)
-        || (parent.kind() == SyntaxKind::PropertyAccessExpression && parent.expression() == entity_name)
-        || (parent.kind() == SyntaxKind::ElementAccessExpression && parent.expression() == entity_name)
+        || (parent.kind() == SyntaxKind::PropertyAccessExpression
+            && parent.expression() == entity_name)
+        || (parent.kind() == SyntaxKind::ElementAccessExpression
+            && parent.expression() == entity_name)
     {
         // Left identifier from type reference or TypeAlias
         // Entity name of the import declaration
@@ -459,15 +561,25 @@ pub fn get_existing_node_tree_visitor<'a>(
     bound: Rc<RefCell<RecoveryBoundary>>,
 ) -> ExistingNodeTreeVisitor<'a> {
     let hooks = NodeVisitorHooks {
-        visit_nodes: Some(Rc::new(|nodes: NodeList, v: &mut ExistingNodeTreeVisitor<'a>| v.hook_visit_nodes(nodes))),
-        visit_node: Some(Rc::new(|node: Node, v: &mut ExistingNodeTreeVisitor<'a>| v.hook_visit_node(node))),
+        visit_nodes: Some(Rc::new(
+            |nodes: NodeList, v: &mut ExistingNodeTreeVisitor<'a>| v.hook_visit_nodes(nodes),
+        )),
+        visit_node: Some(Rc::new(
+            |node: Node, v: &mut ExistingNodeTreeVisitor<'a>| v.hook_visit_node(node),
+        )),
         ..NodeVisitorHooks::default()
     };
     new_node_visitor(
         |node: Node, v: &mut ExistingNodeTreeVisitor<'a>| v.existing_node_tree_visit(node),
         Some(e.factory().as_node_factory()),
         hooks,
-        ExistingNodeTreeState { c, b, bound, e, non_local_node: true },
+        ExistingNodeTreeState {
+            c,
+            b,
+            bound,
+            e,
+            non_local_node: true,
+        },
     )
 }
 
@@ -502,7 +614,12 @@ fn attach_symbol_visitor_func(node: Node, v: &mut AttachSymbolVisitor<'_>) -> No
         let mut name = Node::NIL;
         if st.sym.is_some() {
             let type_ = st.c.get_declared_type_of_symbol(st.sym);
-            if st.c.sym(st.sym).flags.intersects(SymbolFlags::TYPE_PARAMETER) {
+            if st
+                .c
+                .sym(st.sym)
+                .flags
+                .intersects(SymbolFlags::TYPE_PARAMETER)
+            {
                 name = st.c.type_parameter_to_name(st.b, type_);
             }
         }
@@ -532,7 +649,13 @@ fn attach_symbol_to_leftmost_identifier_with<'x>(
         |node: Node, v: &mut AttachSymbolVisitor<'x>| attach_symbol_visitor_func(node, v),
         Some(e.factory().as_node_factory()),
         NodeVisitorHooks::default(),
-        AttachSymbolState { c, b, e, leftmost, sym },
+        AttachSymbolState {
+            c,
+            b,
+            e,
+            leftmost,
+            sym,
+        },
     );
     attach_symbol_visitor_func(node, &mut vis)
 }
@@ -540,13 +663,22 @@ fn attach_symbol_to_leftmost_identifier_with<'x>(
 impl<'a> ExistingNodeTreeVisitor<'a> {
     // Go: checker/nodecopy.go:293 attachSymbolToLeftmostIdentifier
     // note: also handles renaming type parameters renamed within the current context
-    fn attach_symbol_to_leftmost_identifier(&mut self, leftmost: Node, node: Node, sym: SymbolId) -> Node {
+    fn attach_symbol_to_leftmost_identifier(
+        &mut self,
+        leftmost: Node,
+        node: Node,
+        sym: SymbolId,
+    ) -> Node {
         let (b, e) = (self.ctx.b, self.ctx.e);
         attach_symbol_to_leftmost_identifier_with(&mut *self.ctx.c, b, e, leftmost, node, sym)
     }
 
     // Go: checker/nodecopy.go:317 trackExistingEntityName
-    fn track_existing_entity_name(&mut self, node: Node, override_enclosing: Node) -> (bool, Node, SymbolId) {
+    fn track_existing_entity_name(
+        &mut self,
+        node: Node,
+        override_enclosing: Node,
+    ) -> (bool, Node, SymbolId) {
         let b = self.ctx.b;
         let ctx = nb_ctx(b);
         let e = self.ctx.e;
@@ -567,7 +699,11 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         {
             introduces_error = true;
             let cloned = f.deep_clone_node(node);
-            return (introduces_error, self.ctx.c.set_text_range(b, cloned, node), SymbolId::NIL);
+            return (
+                introduces_error,
+                self.ctx.c.set_text_range(b, cloned, node),
+                SymbolId::NIL,
+            );
         }
         let meaning = get_meaning_of_entity_name_reference(node);
         let mut sym;
@@ -575,25 +711,58 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
             // `this` isn't a bindable identifier - skip resolution, find a relevant `this` symbol directly and avoid exhaustive scope traversal
             let container = self.ctx.c.get_this_container(leftmost, false, false);
             sym = self.ctx.c.get_symbol_of_declaration(container);
-            if self.ctx.c.is_symbol_accessible(sym, leftmost, meaning, false).accessibility != SymbolAccessibility::ACCESSIBLE {
+            if self
+                .ctx
+                .c
+                .is_symbol_accessible(sym, leftmost, meaning, false)
+                .accessibility
+                != SymbolAccessibility::ACCESSIBLE
+            {
                 introduces_error = true;
                 nb_tracker(b).report_inaccessible_this_error(self.ctx.c);
             }
-            return (introduces_error, self.attach_symbol_to_leftmost_identifier(leftmost, node, sym), SymbolId::NIL);
+            return (
+                introduces_error,
+                self.attach_symbol_to_leftmost_identifier(leftmost, node, sym),
+                SymbolId::NIL,
+            );
         }
-        sym = self.ctx.c.resolve_entity_name(leftmost, meaning, true, true, Node::NIL);
-        if ctx_enclosing.is_some() && !(sym.is_some() && self.ctx.c.sym(sym).flags.intersects(SymbolFlags::TYPE_PARAMETER)) {
-            sym = self.ctx.c.get_export_symbol_of_value_symbol_if_exported(sym);
+        sym = self
+            .ctx
+            .c
+            .resolve_entity_name(leftmost, meaning, true, true, Node::NIL);
+        if ctx_enclosing.is_some()
+            && !(sym.is_some()
+                && self
+                    .ctx
+                    .c
+                    .sym(sym)
+                    .flags
+                    .intersects(SymbolFlags::TYPE_PARAMETER))
+        {
+            sym = self
+                .ctx
+                .c
+                .get_export_symbol_of_value_symbol_if_exported(sym);
             // Some declarations may be transplanted to a new location.
             // When this happens we need to make sure that the name has the same meaning at both locations
             // We also check for the unknownSymbol because when we create a fake scope some parameters may actually not be usable
             // either because they are the expanded rest parameter,
             // or because they are the newly added parameters from the tuple, which might have different meanings in the original context
-            let sym_at_location = self.ctx.c.resolve_entity_name(leftmost, meaning, true, true, ctx_enclosing);
+            let sym_at_location =
+                self.ctx
+                    .c
+                    .resolve_entity_name(leftmost, meaning, true, true, ctx_enclosing);
             let unknown_symbol = self.ctx.c.unknown_symbol;
             let mismatch = if sym_at_location.is_some() && sym.is_some() {
-                let exported = self.ctx.c.get_export_symbol_of_value_symbol_if_exported(sym_at_location);
-                self.ctx.c.get_symbol_if_same_reference(exported, sym).is_nil()
+                let exported = self
+                    .ctx
+                    .c
+                    .get_export_symbol_of_value_symbol_if_exported(sym_at_location);
+                self.ctx
+                    .c
+                    .get_symbol_if_same_reference(exported, sym)
+                    .is_nil()
             } else {
                 false
             };
@@ -611,7 +780,11 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
                 }
                 introduces_error = true;
                 let cloned = f.deep_clone_node(node);
-                return (introduces_error, self.ctx.c.set_text_range(b, cloned, node), sym);
+                return (
+                    introduces_error,
+                    self.ctx.c.set_text_range(b, cloned, node),
+                    sym,
+                );
             } else {
                 sym = sym_at_location;
             }
@@ -623,9 +796,17 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
                 let s = self.ctx.c.sym(sym);
                 (s.flags, s.value_declaration)
             };
-            if sym_flags.intersects(SymbolFlags::FUNCTION_SCOPED_VARIABLE) && value_declaration.is_some() {
-                if is_part_of_parameter_declaration(value_declaration) || is_js_doc_parameter_tag(value_declaration) {
-                    return (introduces_error, self.attach_symbol_to_leftmost_identifier(leftmost, node, sym), SymbolId::NIL);
+            if sym_flags.intersects(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                && value_declaration.is_some()
+            {
+                if is_part_of_parameter_declaration(value_declaration)
+                    || is_js_doc_parameter_tag(value_declaration)
+                {
+                    return (
+                        introduces_error,
+                        self.attach_symbol_to_leftmost_identifier(leftmost, node, sym),
+                        SymbolId::NIL,
+                    );
                 }
             }
             if !sym_flags.intersects(SymbolFlags::TYPE_PARAMETER) /* Type parameters are visible in the current context if they are are resolvable */
@@ -638,10 +819,18 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
             } else {
                 nb_tracker(b).track_symbol(self.ctx.c, sym, enclosing_declaration, meaning);
             }
-            return (introduces_error, self.attach_symbol_to_leftmost_identifier(leftmost, node, sym), SymbolId::NIL);
+            return (
+                introduces_error,
+                self.attach_symbol_to_leftmost_identifier(leftmost, node, sym),
+                SymbolId::NIL,
+            );
         }
         let cloned = f.deep_clone_node(node);
-        (introduces_error, self.ctx.c.set_text_range(b, cloned, node), SymbolId::NIL)
+        (
+            introduces_error,
+            self.ctx.c.set_text_range(b, cloned, node),
+            SymbolId::NIL,
+        )
     }
 
     // Go: checker/nodecopy.go:385 tryVisitIndexedAccess
@@ -652,7 +841,9 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         }
         let e = self.ctx.e;
         let index_type = self.visit_node(node.index_type());
-        let updated = e.factory().update_indexed_access_type_node(node, result_object_type, index_type);
+        let updated =
+            e.factory()
+                .update_indexed_access_type_node(node, result_object_type, index_type);
         self.ctx.c.set_text_range(self.ctx.b, updated, node)
     }
 
@@ -663,24 +854,35 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
             return Node::NIL;
         }
         let e = self.ctx.e;
-        let updated = e.factory().update_type_operator_node(node, node.operator(), t);
+        let updated = e
+            .factory()
+            .update_type_operator_node(node, node.operator(), t);
         self.ctx.c.set_text_range(self.ctx.b, updated, node)
     }
 
     // Go: checker/nodecopy.go:400 tryVisitTypeQuery
     fn try_visit_type_query(&mut self, node: Node) -> Node {
-        let (introduces_error, expr_name, _) = self.track_existing_entity_name(node.expr_name(), Node::NIL);
+        let (introduces_error, expr_name, _) =
+            self.track_existing_entity_name(node.expr_name(), Node::NIL);
         if !introduces_error {
             let e = self.ctx.e;
             let type_arguments = self.visit_nodes(node.type_argument_list());
-            let updated = e.factory().update_type_query_node(node, expr_name, type_arguments);
+            let updated = e
+                .factory()
+                .update_type_query_node(node, expr_name, type_arguments);
             return self.ctx.c.set_text_range(self.ctx.b, updated, node);
         }
 
         let type_arguments = self.visit_nodes(node.type_argument_list());
-        let serialized_name = self.ctx.c.serialize_type_name(self.ctx.b, node.expr_name(), true, type_arguments);
+        let serialized_name =
+            self.ctx
+                .c
+                .serialize_type_name(self.ctx.b, node.expr_name(), true, type_arguments);
         if serialized_name.is_some() {
-            return self.ctx.c.set_text_range(self.ctx.b, serialized_name, node.expr_name());
+            return self
+                .ctx
+                .c
+                .set_text_range(self.ctx.b, serialized_name, node.expr_name());
         }
         Node::NIL
     }
@@ -694,7 +896,13 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         if s.is_nil() {
             return Node::NIL; // ???
         }
-        if self.ctx.c.sym(s).flags.intersects(SymbolFlags::TYPE_PARAMETER) {
+        if self
+            .ctx
+            .c
+            .sym(s)
+            .flags
+            .intersects(SymbolFlags::TYPE_PARAMETER)
+        {
             let declared_type = self.ctx.c.get_declared_type_of_symbol(s);
             let mapper = nb_ctx(self.ctx.b).borrow().mapper;
             if mapper.is_some() && self.ctx.c.mapper_map(mapper, declared_type) != declared_type {
@@ -702,17 +910,26 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
             }
         }
         // TODO: further bails in JSdoc - not required anymore due to dropped behavior/reparser?
-        let (introduces_error, new_name, _) = self.track_existing_entity_name(node.type_name(), Node::NIL);
+        let (introduces_error, new_name, _) =
+            self.track_existing_entity_name(node.type_name(), Node::NIL);
         if !introduces_error {
             let e = self.ctx.e;
             let type_arguments = self.visit_nodes(node.type_argument_list());
-            let updated = e.factory().update_type_reference_node(node, new_name, type_arguments);
+            let updated = e
+                .factory()
+                .update_type_reference_node(node, new_name, type_arguments);
             self.ctx.c.set_text_range(self.ctx.b, updated, node)
         } else {
             let type_arguments = self.visit_nodes(node.type_argument_list());
-            let serialized_name = self.ctx.c.serialize_type_name(self.ctx.b, node.type_name(), false, type_arguments);
+            let serialized_name =
+                self.ctx
+                    .c
+                    .serialize_type_name(self.ctx.b, node.type_name(), false, type_arguments);
             if serialized_name.is_some() {
-                return self.ctx.c.set_text_range(self.ctx.b, serialized_name, node.type_name());
+                return self
+                    .ctx
+                    .c
+                    .set_text_range(self.ctx.b, serialized_name, node.type_name());
             }
             Node::NIL
         }
@@ -759,13 +976,16 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         if node.kind() == SyntaxKind::JsDocNullableType {
             let union_members = [
                 self.visit_node(node.type_()),
-                factory.new_literal_type_node(factory.new_keyword_expression(SyntaxKind::NullKeyword)),
+                factory
+                    .new_literal_type_node(factory.new_keyword_expression(SyntaxKind::NullKeyword)),
             ];
             return factory.new_union_type_node(factory.new_node_list(&union_members));
         }
         if node.kind() == SyntaxKind::JsDocOptionalType {
-            let union_members =
-                [self.visit_node(node.type_()), factory.new_keyword_type_node(SyntaxKind::UndefinedKeyword)];
+            let union_members = [
+                self.visit_node(node.type_()),
+                factory.new_keyword_type_node(SyntaxKind::UndefinedKeyword),
+            ];
             return factory.new_union_type_node(factory.new_node_list(&union_members));
         }
         if node.kind() == SyntaxKind::JsDocNonNullableType {
@@ -780,7 +1000,9 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         if node.kind() == SyntaxKind::JsDocTypeLiteral {
             let mut members = Vec::new();
             for t in node.js_doc_property_tags() {
-                if t.kind() != SyntaxKind::JsDocPropertyTag && t.kind() != SyntaxKind::JsDocParameterTag {
+                if t.kind() != SyntaxKind::JsDocPropertyTag
+                    && t.kind() != SyntaxKind::JsDocParameterTag
+                {
                     continue;
                 }
                 let n = t.name();
@@ -791,21 +1013,31 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
                 };
                 let name = self.visit_node(target_name);
                 let should_be_optional = t.is_bracketed()
-                    || (t.type_expression().is_some() && t.type_expression().kind() == SyntaxKind::JsDocOptionalType);
+                    || (t.type_expression().is_some()
+                        && t.type_expression().kind() == SyntaxKind::JsDocOptionalType);
                 let mut question = Node::NIL;
                 if should_be_optional {
                     question = factory.new_token(SyntaxKind::QuestionToken);
                 }
                 let ty = self.visit_node(t.type_expression()); // !!! TODO: alternate lookup locations for the type? serialize on demand if it doesn't serialze? strada does something funky here.
 
-                members.push(factory.new_property_signature_declaration(ModifierList::NIL, name, question, ty, Node::NIL));
+                members.push(factory.new_property_signature_declaration(
+                    ModifierList::NIL,
+                    name,
+                    question,
+                    ty,
+                    Node::NIL,
+                ));
             }
             return factory.new_type_literal_node(factory.new_node_list(&members));
         }
         // (Go keeps commented-out JSDocIndexSignature and JSDocFunctionType handling here.)
         // End JSDoc handling
 
-        if is_type_reference_node(node) && is_identifier(node.type_name()) && node.type_name().text().is_empty() {
+        if is_type_reference_node(node)
+            && is_identifier(node.type_name())
+            && node.type_name().text().is_empty()
+        {
             let replacement = factory.new_keyword_type_node(SyntaxKind::AnyKeyword);
             e.set_original(replacement, node);
             return replacement;
@@ -824,7 +1056,14 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
             let constraint = self.visit_node(node.constraint());
             let expression = self.visit_node(node.expression());
             let default_type = self.visit_node(node.default_type());
-            return factory.update_type_parameter_declaration(node, modifiers, new_name, constraint, expression, default_type);
+            return factory.update_type_parameter_declaration(
+                node,
+                modifiers,
+                new_name,
+                constraint,
+                expression,
+                default_type,
+            );
         }
         if is_indexed_access_type_node(node) {
             let result = self.try_visit_indexed_access(node);
@@ -851,8 +1090,11 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
             return node;
         }
         if is_type_operator_node(node) {
-            if node.operator() == SyntaxKind::UniqueKeyword && node.type_().kind() == SyntaxKind::SymbolKeyword {
-                let non_fake_enclosing = self.ctx.c.get_enclosing_declaration_ignoring_fake_scope(b);
+            if node.operator() == SyntaxKind::UniqueKeyword
+                && node.type_().kind() == SyntaxKind::SymbolKeyword
+            {
+                let non_fake_enclosing =
+                    self.ctx.c.get_enclosing_declaration_ignoring_fake_scope(b);
                 let same_scope = find_ancestor(node, |a| a == non_fake_enclosing);
                 if same_scope.is_nil() {
                     self.ctx.bound.borrow_mut().mark_error(None);
@@ -870,7 +1112,8 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         if is_literal_import_type_node(node) {
             // assert keyword in imported attributes is deprecated, so we don't reuse types that contain it
             // Ex: import("pkg", { assert: {} }
-            if node.attributes().is_some() && node.attributes().token() == SyntaxKind::AssertKeyword {
+            if node.attributes().is_some() && node.attributes().token() == SyntaxKind::AssertKeyword
+            {
                 self.ctx.bound.borrow_mut().mark_error(None);
                 return node;
             }
@@ -895,17 +1138,29 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
             let attributes = self.visit_node(node.attributes());
             let qualifier = self.visit_node(node.qualifier());
             let type_arguments = self.visit_nodes(node.type_argument_list());
-            return factory.update_import_type_node(node, node.is_type_of(), arg, attributes, qualifier, type_arguments);
+            return factory.update_import_type_node(
+                node,
+                node.is_type_of(),
+                arg,
+                attributes,
+                qualifier,
+                type_arguments,
+            );
         }
-        if node.name().is_some() && node.name().kind() == SyntaxKind::ComputedPropertyName && !self.ctx.c.has_late_bindable_name(node) {
+        if node.name().is_some()
+            && node.name().kind() == SyntaxKind::ComputedPropertyName
+            && !self.ctx.c.has_late_bindable_name(node)
+        {
             if !has_dynamic_name(node) {
                 // !!! TODO: This matches strada, but rather than recursing, this should probably fall down to later cases.
                 // Take a `["field"]` property declaration - it still needs a `: any` appended to it
                 return self.visit_each_child(node);
             }
             // !!! TODO: this condition matches strada, but it just seems wrong? Or at the very least extraordinarily approximate, and doesn't flag a builder error...
-            let allow_unresolved_names =
-                nb_ctx(b).borrow().internal_flags.intersects(InternalNodeBuilderFlags::ALLOW_UNRESOLVED_NAMES);
+            let allow_unresolved_names = nb_ctx(b)
+                .borrow()
+                .internal_flags
+                .intersects(InternalNodeBuilderFlags::ALLOW_UNRESOLVED_NAMES);
             let should_remove_declaration = !(allow_unresolved_names
                 && is_entity_name_expression(node.name().expression())
                 && {
@@ -918,9 +1173,15 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
             }
         }
         if (is_function_like(node) && node.type_().is_nil())
-            || (is_property_declaration(node) && node.type_().is_nil() && node.initializer().is_nil())
-            || (is_property_signature_declaration(node) && node.type_().is_nil() && node.initializer().is_nil())
-            || (is_parameter_declaration(node) && node.type_().is_nil() && node.initializer().is_nil())
+            || (is_property_declaration(node)
+                && node.type_().is_nil()
+                && node.initializer().is_nil())
+            || (is_property_signature_declaration(node)
+                && node.type_().is_nil()
+                && node.initializer().is_nil())
+            || (is_parameter_declaration(node)
+                && node.type_().is_nil()
+                && node.initializer().is_nil())
         {
             let mut visited = self.visit_each_child(node);
             if visited == node {
@@ -981,7 +1242,12 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
                     );
                 }
                 SyntaxKind::JsDocSignature => {
-                    return factory.update_js_doc_signature(node, node.type_parameter_list(), node.parameter_list(), new_type);
+                    return factory.update_js_doc_signature(
+                        node,
+                        node.type_parameter_list(),
+                        node.parameter_list(),
+                        new_type,
+                    );
                 }
                 SyntaxKind::ConstructSignature => {
                     return factory.update_construct_signature_declaration(
@@ -992,10 +1258,20 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
                     );
                 }
                 SyntaxKind::IndexSignature => {
-                    return factory.update_index_signature_declaration(node, node.modifiers(), node.parameter_list(), new_type);
+                    return factory.update_index_signature_declaration(
+                        node,
+                        node.modifiers(),
+                        node.parameter_list(),
+                        new_type,
+                    );
                 }
                 SyntaxKind::FunctionType => {
-                    return factory.update_function_type_node(node, node.type_parameter_list(), node.parameter_list(), new_type);
+                    return factory.update_function_type_node(
+                        node,
+                        node.type_parameter_list(),
+                        node.parameter_list(),
+                        new_type,
+                    );
                 }
                 SyntaxKind::ConstructorType => {
                     return factory.update_constructor_type_node(
@@ -1010,7 +1286,8 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
             }
         }
         if is_computed_property_name(node) && is_entity_name_expression(node.expression()) {
-            let (introduces_error, result, _) = self.track_existing_entity_name(node.expression(), Node::NIL);
+            let (introduces_error, result, _) =
+                self.track_existing_entity_name(node.expression(), Node::NIL);
             if !introduces_error {
                 return factory.update_computed_property_name(node, result);
             } else {
@@ -1022,7 +1299,8 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         }
         if is_type_predicate_node(node) {
             let parameter_name = if is_identifier(node.parameter_name()) {
-                let (introduces_error, result, _) = self.track_existing_entity_name(node.parameter_name(), Node::NIL);
+                let (introduces_error, result, _) =
+                    self.track_existing_entity_name(node.parameter_name(), Node::NIL);
                 // Should not usually happen the only case is when a type predicate comes from a JSDoc type annotation with it's own parameter symbol definition.
                 // /** @type {(v: unknown) => v is undefined} */
                 // const isUndef = v => v === undefined;
@@ -1035,24 +1313,47 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
             };
             let asserts_modifier = self.visit_node(node.asserts_modifier());
             let type_ = self.visit_node(node.type_());
-            return factory.update_type_predicate_node(node, asserts_modifier, parameter_name, type_);
+            return factory.update_type_predicate_node(
+                node,
+                asserts_modifier,
+                parameter_name,
+                type_,
+            );
         }
         if is_conditional_type_node(node) {
             let check_type = self.visit_node(node.check_type());
             let infer_type_parameters = self.ctx.c.get_infer_type_parameters(node);
             // PORT: Go passes nil slices and a nil mapper.
-            let dispose = self.ctx.c.enter_new_scope(b, node, &[], &infer_type_parameters, &[], MapperId::NIL);
+            let dispose = self.ctx.c.enter_new_scope(
+                b,
+                node,
+                &[],
+                &infer_type_parameters,
+                &[],
+                MapperId::NIL,
+            );
             let extends_type = self.visit_node(node.extends_type());
             let true_type = self.visit_node(node.true_type());
             dispose(&mut *self.ctx.c);
             let false_type = self.visit_node(node.false_type());
-            return factory.update_conditional_type_node(node, check_type, extends_type, true_type, false_type);
+            return factory.update_conditional_type_node(
+                node,
+                check_type,
+                extends_type,
+                true_type,
+                false_type,
+            );
         }
 
         // style applications
-        let multiline_object_literals =
-            nb_ctx(b).borrow().flags.intersects(NodeBuilderFlags::MULTILINE_OBJECT_LITERALS);
-        if is_tuple_type_node(node) || (!multiline_object_literals && is_type_literal_node(node)) || is_mapped_type_node(node) {
+        let multiline_object_literals = nb_ctx(b)
+            .borrow()
+            .flags
+            .intersects(NodeBuilderFlags::MULTILINE_OBJECT_LITERALS);
+        if is_tuple_type_node(node)
+            || (!multiline_object_literals && is_type_literal_node(node))
+            || is_mapped_type_node(node)
+        {
             // make tuples/types/mappedtypes single line
             let mut res = self.visit_each_child(node);
             if res == node {
@@ -1068,15 +1369,23 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
             // rather than escaping them as ASCII Unicode escapes. Mirrors TypeScript's behavior
             // for synthesized string literal types in the node builder (checker.ts:6853).
             let mut c = factory.clone_node(node);
-            let use_single_quotes =
-                nb_ctx(b).borrow().flags.intersects(NodeBuilderFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE);
-            if is_string_literal(node) && use_single_quotes && !node.token_flags().intersects(TokenFlags::SINGLE_QUOTE) {
+            let use_single_quotes = nb_ctx(b)
+                .borrow()
+                .flags
+                .intersects(NodeBuilderFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE);
+            if is_string_literal(node)
+                && use_single_quotes
+                && !node.token_flags().intersects(TokenFlags::SINGLE_QUOTE)
+            {
                 // set single quote on string literals
                 // PORT: Go flips TokenFlags on the clone in place. Synthetic
                 // nodes are immutable, so build the clone again with the flipped
                 // flags and copy its loc and node flags. The ast clone has no
                 // emit-context entries yet, so nothing else is lost.
-                let flipped = factory.new_string_literal(c.text(), TokenFlags(c.token_flags().0 ^ TokenFlags::SINGLE_QUOTE.0));
+                let flipped = factory.new_string_literal(
+                    c.text(),
+                    TokenFlags(c.token_flags().0 ^ TokenFlags::SINGLE_QUOTE.0),
+                );
                 set_node_loc(flipped, c.loc());
                 set_node_flags(flipped, c.flags());
                 c = flipped;
@@ -1116,7 +1425,14 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
                 type_params = vec![self.ctx.c.get_declared_type_of_type_parameter(tp_symbol)];
             }
             // PORT: Go passes nil for originalParameters and mapper.
-            exit = Some(self.ctx.c.enter_new_scope(b, node, &params, &type_params, &[], MapperId::NIL));
+            exit = Some(self.ctx.c.enter_new_scope(
+                b,
+                node,
+                &params,
+                &type_params,
+                &[],
+                MapperId::NIL,
+            ));
         }
         let mut result = self.visit_existing_node_tree_symbols_worker(node);
         if let Some(exit) = exit {
@@ -1169,8 +1485,8 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         // Capture if the current node is in the current file so node lists knoww if they can keep positions or not
         let old_non_local_node = self.ctx.non_local_node;
         let enclosing_file = nb_ctx(self.ctx.b).borrow().enclosing_file;
-        self.ctx.non_local_node =
-            enclosing_file.is_nil() || enclosing_file != get_source_file_of_node(self.ctx.e.most_original(node));
+        self.ctx.non_local_node = enclosing_file.is_nil()
+            || enclosing_file != get_source_file_of_node(self.ctx.e.most_original(node));
         let res = self.visit_node(node);
         self.ctx.non_local_node = old_non_local_node;
         res

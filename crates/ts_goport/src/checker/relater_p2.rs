@@ -5,7 +5,12 @@ use crate::prelude::*;
 
 impl Checker {
     // Go: checker/relater.go:916 findBestTypeForInvokable
-    pub fn find_best_type_for_invokable(&mut self, source: TypeId, union_target: TypeId, kind: SignatureKind) -> TypeId {
+    pub fn find_best_type_for_invokable(
+        &mut self,
+        source: TypeId,
+        union_target: TypeId,
+        kind: SignatureKind,
+    ) -> TypeId {
         if !self.get_signatures_of_type(source, kind).is_empty() {
             let types = self.ty(union_target).types().to_vec();
             for t in types {
@@ -21,24 +26,39 @@ impl Checker {
     // Go: checker/relater.go:923 findMostOverlappyType
     pub fn find_most_overlappy_type(&mut self, source: TypeId, union_target: TypeId) -> TypeId {
         let mut best_match = TypeId::NIL;
-        if !self.ty(source).flags.intersects(TypeFlags::PRIMITIVE | TypeFlags::INSTANTIABLE_PRIMITIVE) {
+        if !self
+            .ty(source)
+            .flags
+            .intersects(TypeFlags::PRIMITIVE | TypeFlags::INSTANTIABLE_PRIMITIVE)
+        {
             let mut matching_count: i32 = 0;
             let types = self.ty(union_target).types().to_vec();
             for target in types {
-                if !self.ty(target).flags.intersects(TypeFlags::PRIMITIVE | TypeFlags::INSTANTIABLE_PRIMITIVE) {
+                if !self
+                    .ty(target)
+                    .flags
+                    .intersects(TypeFlags::PRIMITIVE | TypeFlags::INSTANTIABLE_PRIMITIVE)
+                {
                     let source_index = self.get_index_type(source);
                     let target_index = self.get_index_type(target);
                     let overlap = self.get_intersection_type(&[source_index, target_index]);
                     if self.ty(overlap).flags.intersects(TypeFlags::INDEX) {
                         // perfect overlap of keys
                         return target;
-                    } else if self.is_unit_type(overlap) || self.ty(overlap).flags.intersects(TypeFlags::UNION) {
+                    } else if self.is_unit_type(overlap)
+                        || self.ty(overlap).flags.intersects(TypeFlags::UNION)
+                    {
                         // We only want to account for literal types otherwise.
                         // If we have a union of index types, it seems likely that we
                         // needed to elaborate between two generic mapped types anyway.
                         let mut length: i32 = 1;
                         if self.ty(overlap).flags.intersects(TypeFlags::UNION) {
-                            length = self.ty(overlap).types().iter().filter(|&&t| self.is_unit_type(t)).count() as i32;
+                            length = self
+                                .ty(overlap)
+                                .types()
+                                .iter()
+                                .filter(|&&t| self.is_unit_type(t))
+                                .count() as i32;
                         }
                         if length >= matching_count {
                             best_match = target;
@@ -52,9 +72,18 @@ impl Checker {
     }
 
     // Go: checker/relater.go:951 findBestTypeForObjectLiteral
-    pub fn find_best_type_for_object_literal(&mut self, source: TypeId, union_target: TypeId) -> TypeId {
-        if self.ty(source).object_flags.intersects(ObjectFlags::OBJECT_LITERAL)
-            && self.some_type(union_target, &mut |c: &mut Checker, t: TypeId| c.is_array_like_type(t))
+    pub fn find_best_type_for_object_literal(
+        &mut self,
+        source: TypeId,
+        union_target: TypeId,
+    ) -> TypeId {
+        if self
+            .ty(source)
+            .object_flags
+            .intersects(ObjectFlags::OBJECT_LITERAL)
+            && self.some_type(union_target, &mut |c: &mut Checker, t: TypeId| {
+                c.is_array_like_type(t)
+            })
         {
             let types = self.ty(union_target).types().to_vec();
             for t in types {
@@ -68,13 +97,26 @@ impl Checker {
     }
 
     // Go: checker/relater.go:958 shouldReportUnmatchedPropertyError
-    pub fn should_report_unmatched_property_error(&mut self, source: TypeId, target: TypeId) -> bool {
-        let type_call_signatures = self.get_signatures_of_structured_type(source, SignatureKind::CALL);
-        let type_construct_signatures = self.get_signatures_of_structured_type(source, SignatureKind::CONSTRUCT);
+    pub fn should_report_unmatched_property_error(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+    ) -> bool {
+        let type_call_signatures =
+            self.get_signatures_of_structured_type(source, SignatureKind::CALL);
+        let type_construct_signatures =
+            self.get_signatures_of_structured_type(source, SignatureKind::CONSTRUCT);
         let type_properties = self.get_properties_of_object_type(source);
-        if (!type_call_signatures.is_empty() || !type_construct_signatures.is_empty()) && type_properties.is_empty() {
-            if (!self.get_signatures_of_type(target, SignatureKind::CALL).is_empty() && !type_call_signatures.is_empty())
-                || !self.get_signatures_of_type(target, SignatureKind::CONSTRUCT).is_empty()
+        if (!type_call_signatures.is_empty() || !type_construct_signatures.is_empty())
+            && type_properties.is_empty()
+        {
+            if (!self
+                .get_signatures_of_type(target, SignatureKind::CALL)
+                .is_empty()
+                && !type_call_signatures.is_empty())
+                || !self
+                    .get_signatures_of_type(target, SignatureKind::CONSTRUCT)
+                    .is_empty()
                     && !type_construct_signatures.is_empty()
             {
                 // target has similar signature kinds to source, still focus on the unmatched property
@@ -93,7 +135,13 @@ impl Checker {
         require_optional_properties: bool,
         match_discriminant_properties: bool,
     ) -> SymbolId {
-        self.get_unmatched_properties_worker(source, target, require_optional_properties, match_discriminant_properties, None)
+        self.get_unmatched_properties_worker(
+            source,
+            target,
+            require_optional_properties,
+            match_discriminant_properties,
+            None,
+        )
     }
 
     // Go: checker/relater.go:977 getUnmatchedProperties
@@ -136,7 +184,8 @@ impl Checker {
                 (s.flags, s.check_flags, s.name.clone())
             };
             if require_optional_properties
-                || !target_prop_flags.intersects(SymbolFlags::OPTIONAL) && !target_prop_check_flags.intersects(CheckFlags::PARTIAL)
+                || !target_prop_flags.intersects(SymbolFlags::OPTIONAL)
+                    && !target_prop_check_flags.intersects(CheckFlags::PARTIAL)
             {
                 let source_prop = self.get_property_of_type(source, &target_prop_name);
                 if source_prop.is_nil() {
@@ -168,7 +217,11 @@ impl Checker {
     // PORT: Go package function `excludeProperties` reads symbol names, so it
     // is a `Checker` method. Go `collections.Set[string]` is `FxHashSet<String>`.
     // Go: checker/relater.go:1015 excludeProperties
-    pub fn exclude_properties(&self, properties: &[SymbolId], excluded_properties: &FxHashSet<String>) -> Vec<SymbolId> {
+    pub fn exclude_properties(
+        &self,
+        properties: &[SymbolId],
+        excluded_properties: &FxHashSet<String>,
+    ) -> Vec<SymbolId> {
         if excluded_properties.is_empty() || properties.is_empty() {
             return properties.to_vec();
         }
@@ -246,17 +299,25 @@ impl Checker {
         is_related_to: &mut dyn FnMut(&mut Checker, TypeId, TypeId) -> Ternary,
     ) -> TypeId {
         if self.ty(target).flags.intersects(TypeFlags::UNION)
-            && self.ty(source).flags.intersects(TypeFlags::INTERSECTION | TypeFlags::OBJECT)
+            && self
+                .ty(source)
+                .flags
+                .intersects(TypeFlags::INTERSECTION | TypeFlags::OBJECT)
         {
             let m = self.get_matching_union_constituent_for_type(target, source);
             if m.is_some() {
                 return m;
             }
             let source_properties = self.get_properties_of_type(source);
-            let discriminant_properties = self.find_discriminant_properties(&source_properties, target);
+            let discriminant_properties =
+                self.find_discriminant_properties(&source_properties, target);
             if !discriminant_properties.is_empty() {
-                let mut discriminator = TypeDiscriminator { props: discriminant_properties, is_related_to };
-                let discriminated = self.discriminate_type_by_discriminable_items(target, &mut discriminator);
+                let mut discriminator = TypeDiscriminator {
+                    props: discriminant_properties,
+                    is_related_to,
+                };
+                let discriminated =
+                    self.discriminate_type_by_discriminable_items(target, &mut discriminator);
                 if discriminated != target {
                     return discriminated;
                 }
@@ -266,7 +327,11 @@ impl Checker {
     }
 
     // Go: checker/relater.go:1075 findDiscriminantProperties
-    pub fn find_discriminant_properties(&mut self, source_properties: &[SymbolId], target: TypeId) -> Vec<SymbolId> {
+    pub fn find_discriminant_properties(
+        &mut self,
+        source_properties: &[SymbolId],
+        target: TypeId,
+    ) -> Vec<SymbolId> {
         let mut result: Vec<SymbolId> = Vec::new();
         for &source_property in source_properties {
             let name = self.sym(source_property).name.clone();
@@ -280,25 +345,48 @@ impl Checker {
     // Go: checker/relater.go:1085 isDiscriminantProperty
     pub fn is_discriminant_property(&mut self, t: TypeId, name: &str) -> bool {
         if t.is_some() && self.ty(t).flags.intersects(TypeFlags::UNION) {
-            let prop = self.get_union_or_intersection_property(t, name, false /*skipObjectFunctionPropertyAugment*/);
-            if prop.is_some() && self.sym(prop).check_flags.intersects(CheckFlags::SYNTHETIC_PROPERTY) {
-                if !self.sym(prop).check_flags.intersects(CheckFlags::IS_DISCRIMINANT_COMPUTED) {
+            let prop = self.get_union_or_intersection_property(
+                t, name, false, /*skipObjectFunctionPropertyAugment*/
+            );
+            if prop.is_some()
+                && self
+                    .sym(prop)
+                    .check_flags
+                    .intersects(CheckFlags::SYNTHETIC_PROPERTY)
+            {
+                if !self
+                    .sym(prop)
+                    .check_flags
+                    .intersects(CheckFlags::IS_DISCRIMINANT_COMPUTED)
+                {
                     self.sym_mut(prop).check_flags |= CheckFlags::IS_DISCRIMINANT_COMPUTED;
-                    if self.sym(prop).check_flags.contains(CheckFlags::NON_UNIFORM_AND_LITERAL) && {
-                        let prop_type = self.get_type_of_symbol(prop);
-                        !self.is_generic_type(prop_type)
-                    } {
+                    if self
+                        .sym(prop)
+                        .check_flags
+                        .contains(CheckFlags::NON_UNIFORM_AND_LITERAL)
+                        && {
+                            let prop_type = self.get_type_of_symbol(prop);
+                            !self.is_generic_type(prop_type)
+                        }
+                    {
                         self.sym_mut(prop).check_flags |= CheckFlags::IS_DISCRIMINANT;
                     }
                 }
-                return self.sym(prop).check_flags.intersects(CheckFlags::IS_DISCRIMINANT);
+                return self
+                    .sym(prop)
+                    .check_flags
+                    .intersects(CheckFlags::IS_DISCRIMINANT);
             }
         }
         false
     }
 
     // Go: checker/relater.go:1101 getMatchingUnionConstituentForType
-    pub fn get_matching_union_constituent_for_type(&mut self, union_type: TypeId, t: TypeId) -> TypeId {
+    pub fn get_matching_union_constituent_for_type(
+        &mut self,
+        union_type: TypeId,
+        t: TypeId,
+    ) -> TypeId {
         let key_property_name = self.get_key_property_name(union_type);
         if key_property_name.is_empty() {
             return TypeId::NIL;
@@ -347,11 +435,21 @@ impl Checker {
     }
 
     // Go: checker/relater.go:1137 computeKeyPropertyNameAndMap
-    pub fn compute_key_property_name_and_map(&mut self, t: TypeId) -> (String, Option<FxHashMap<TypeId, TypeId>>) {
+    pub fn compute_key_property_name_and_map(
+        &mut self,
+        t: TypeId,
+    ) -> (String, Option<FxHashMap<TypeId, TypeId>>) {
         let types = self.ty(t).types().to_vec();
         if types.len() < 10
-            || self.ty(t).object_flags.intersects(ObjectFlags::PRIMITIVE_UNION)
-            || types.iter().filter(|&&t| self.is_object_or_instantiable_non_primitive(t)).count() < 10
+            || self
+                .ty(t)
+                .object_flags
+                .intersects(ObjectFlags::PRIMITIVE_UNION)
+            || types
+                .iter()
+                .filter(|&&t| self.is_object_or_instantiable_non_primitive(t))
+                .count()
+                < 10
         {
             return (INTERNAL_SYMBOL_NAME_MISSING.to_string(), None);
         }
@@ -369,13 +467,19 @@ impl Checker {
     // PORT: Go package function; reads type data, so it is a `Checker` method.
     // Go: checker/relater.go:1153 isObjectOrInstantiableNonPrimitive
     pub fn is_object_or_instantiable_non_primitive(&self, t: TypeId) -> bool {
-        self.ty(t).flags.intersects(TypeFlags::OBJECT | TypeFlags::INSTANTIABLE_NON_PRIMITIVE)
+        self.ty(t)
+            .flags
+            .intersects(TypeFlags::OBJECT | TypeFlags::INSTANTIABLE_NON_PRIMITIVE)
     }
 
     // Go: checker/relater.go:1157 getKeyPropertyCandidateName
     pub fn get_key_property_candidate_name(&mut self, types: &[TypeId]) -> String {
         for &t in types {
-            if self.ty(t).flags.intersects(TypeFlags::OBJECT | TypeFlags::INSTANTIABLE_NON_PRIMITIVE) {
+            if self
+                .ty(t)
+                .flags
+                .intersects(TypeFlags::OBJECT | TypeFlags::INSTANTIABLE_NON_PRIMITIVE)
+            {
                 for p in self.get_properties_of_type(t) {
                     let p_type = self.get_type_of_symbol(p);
                     if self.is_unit_type(p_type) {
@@ -392,11 +496,17 @@ impl Checker {
     // has a non-literal type or if less than 10 or less than 50% of the constituents have a unique key.
     // Entries with duplicate keys have unknownType as the value.
     // Go: checker/relater.go:1174 mapTypesByKeyProperty
-    pub fn map_types_by_key_property(&mut self, types: &[TypeId], key_property_name: &str) -> Option<FxHashMap<TypeId, TypeId>> {
+    pub fn map_types_by_key_property(
+        &mut self,
+        types: &[TypeId],
+        key_property_name: &str,
+    ) -> Option<FxHashMap<TypeId, TypeId>> {
         let mut types_by_key: FxHashMap<TypeId, TypeId> = FxHashMap::default();
         let mut count: usize = 0;
         for &t in types {
-            if self.ty(t).flags.intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION | TypeFlags::INSTANTIABLE_NON_PRIMITIVE) {
+            if self.ty(t).flags.intersects(
+                TypeFlags::OBJECT | TypeFlags::INTERSECTION | TypeFlags::INSTANTIABLE_NON_PRIMITIVE,
+            ) {
                 let discriminant = self.get_type_of_property_of_type(t, key_property_name);
                 if discriminant.is_nil() || !self.is_literal_type(discriminant) {
                     return None;
@@ -424,7 +534,11 @@ impl Checker {
     }
 
     // Go: checker/relater.go:1212 discriminateTypeByDiscriminableItems
-    pub fn discriminate_type_by_discriminable_items(&mut self, target: TypeId, discriminator: &mut dyn Discriminator) -> TypeId {
+    pub fn discriminate_type_by_discriminable_items(
+        &mut self,
+        target: TypeId,
+        discriminator: &mut dyn Discriminator,
+    ) -> TypeId {
         let types = self.ty(target).types().to_vec();
         let mut include: Vec<Ternary> = vec![Ternary::FALSE; types.len()];
         for (i, &t) in types.iter().enumerate() {
@@ -443,7 +557,8 @@ impl Checker {
             for i in 0..types.len() {
                 if include[i] != Ternary::FALSE {
                     let name = discriminator.name(self, n);
-                    let target_type = self.get_type_of_property_or_index_signature_of_type(types[i], &name);
+                    let target_type =
+                        self.get_type_of_property_or_index_signature_of_type(types[i], &name);
                     if target_type.is_some() {
                         if discriminator.matches(self, n, target_type) {
                             matched = true;
@@ -471,7 +586,8 @@ impl Checker {
                     filtered_types.push(t);
                 }
             }
-            let filtered = self.get_union_type_ex(&filtered_types, UnionReduction::NONE, None, TypeId::NIL);
+            let filtered =
+                self.get_union_type_ex(&filtered_types, UnionReduction::NONE, None, TypeId::NIL);
             if !self.ty(filtered).flags.intersects(TypeFlags::NEVER) {
                 return filtered;
             }
@@ -482,7 +598,9 @@ impl Checker {
     // Go: checker/relater.go:1265 filterPrimitivesIfContainsNonPrimitive
     pub fn filter_primitives_if_contains_non_primitive(&mut self, union_type: TypeId) -> TypeId {
         if self.maybe_type_of_kind(union_type, TypeFlags::NON_PRIMITIVE) {
-            let result = self.filter_type(union_type, &mut |c: &mut Checker, t: TypeId| c.is_non_primitive_type(t));
+            let result = self.filter_type(union_type, &mut |c: &mut Checker, t: TypeId| {
+                c.is_non_primitive_type(t)
+            });
             if !self.ty(result).flags.intersects(TypeFlags::NEVER) {
                 return result;
             }
@@ -497,7 +615,11 @@ impl Checker {
     }
 
     // Go: checker/relater.go:1279 getTypeNamesForErrorDisplay
-    pub fn get_type_names_for_error_display(&mut self, left: TypeId, right: TypeId) -> (String, String) {
+    pub fn get_type_names_for_error_display(
+        &mut self,
+        left: TypeId,
+        right: TypeId,
+    ) -> (String, String) {
         let mut left_str: String;
         let left_symbol = self.ty(left).symbol;
         if self.symbol_value_declaration_is_context_sensitive(left_symbol) {
@@ -523,7 +645,12 @@ impl Checker {
 
     // Go: checker/relater.go:1296 getTypeNameForErrorDisplay
     pub fn get_type_name_for_error_display(&mut self, t: TypeId) -> String {
-        self.type_to_string_ex(t, Node::NIL /*enclosingDeclaration*/, TypeFormatFlags::USE_FULLY_QUALIFIED_TYPE, None)
+        self.type_to_string_ex(
+            t,
+            Node::NIL, /*enclosingDeclaration*/
+            TypeFormatFlags::USE_FULLY_QUALIFIED_TYPE,
+            None,
+        )
     }
 
     // Go: checker/relater.go:1300 symbolValueDeclarationIsContextSensitive
@@ -532,7 +659,9 @@ impl Checker {
             return false;
         }
         let value_declaration = self.sym(symbol).value_declaration;
-        value_declaration.is_some() && is_expression(value_declaration) && !self.is_context_sensitive(value_declaration)
+        value_declaration.is_some()
+            && is_expression(value_declaration)
+            && !self.is_context_sensitive(value_declaration)
     }
 
     // Go: checker/relater.go:1304 typeCouldHaveTopLevelSingletonTypes
@@ -543,7 +672,11 @@ impl Checker {
         if self.ty(t).flags.intersects(TypeFlags::BOOLEAN) {
             return false;
         }
-        if self.ty(t).flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
+        if self
+            .ty(t)
+            .flags
+            .intersects(TypeFlags::UNION_OR_INTERSECTION)
+        {
             let types = self.ty(t).types().to_vec();
             for s in types {
                 if self.type_could_have_top_level_singleton_types(s) {
@@ -566,7 +699,10 @@ impl Checker {
     // Go: checker/relater.go:1323 getVariances
     pub fn get_variances(&mut self, t: TypeId) -> Vec<VarianceFlags> {
         // Arrays and tuples are known to be covariant, no need to spend time computing this.
-        if t == self.global_array_type || t == self.global_readonly_array_type || self.ty(t).object_flags.intersects(ObjectFlags::TUPLE) {
+        if t == self.global_array_type
+            || t == self.global_readonly_array_type
+            || self.ty(t).object_flags.intersects(ObjectFlags::TUPLE)
+        {
             return self.array_variances.clone();
         }
         let symbol = self.ty(t).symbol;
@@ -592,7 +728,11 @@ impl Checker {
     // exists" stands for "variances != nil": the record is created at the same
     // point Go assigns the empty in-progress slice.
     // Go: checker/relater.go:1341 getVariancesWorker
-    pub fn get_variances_worker(&mut self, symbol: SymbolId, type_parameters: &[TypeId]) -> Vec<VarianceFlags> {
+    pub fn get_variances_worker(
+        &mut self,
+        symbol: SymbolId,
+        type_parameters: &[TypeId],
+    ) -> Vec<VarianceFlags> {
         if !self.variance_links.has(symbol) {
             let old_variance_computation = self.in_variance_computation;
             let save_resolution_start = self.resolution_start;
@@ -601,7 +741,8 @@ impl Checker {
                 self.resolution_start = self.type_resolutions.len() as i32;
             }
             self.variance_links.get(symbol).variances = Vec::new();
-            let mut variances: Vec<VarianceFlags> = vec![VarianceFlags::default(); type_parameters.len()];
+            let mut variances: Vec<VarianceFlags> =
+                vec![VarianceFlags::default(); type_parameters.len()];
             for (i, &tp) in type_parameters.iter().enumerate() {
                 let modifiers = self.get_type_parameter_modifiers(tp);
                 let mut variance: VarianceFlags;
@@ -638,15 +779,22 @@ impl Checker {
                     // replaced with marker types that are known to be unrelated.
                     if variance == VarianceFlags::BIVARIANT && {
                         let marker_other_type = self.marker_other_type;
-                        let type_with_other = self.create_marker_type(symbol, tp, marker_other_type);
+                        let type_with_other =
+                            self.create_marker_type(symbol, tp, marker_other_type);
                         self.is_type_assignable_to(type_with_other, type_with_super)
                     } {
                         variance = VarianceFlags::INDEPENDENT;
                     }
-                    if self.reliability_flags.intersects(RelationComparisonResult::REPORTS_UNMEASURABLE) {
+                    if self
+                        .reliability_flags
+                        .intersects(RelationComparisonResult::REPORTS_UNMEASURABLE)
+                    {
                         variance |= VarianceFlags::UNMEASURABLE;
                     }
-                    if self.reliability_flags.intersects(RelationComparisonResult::REPORTS_UNRELIABLE) {
+                    if self
+                        .reliability_flags
+                        .intersects(RelationComparisonResult::REPORTS_UNRELIABLE)
+                    {
                         variance |= VarianceFlags::UNRELIABLE;
                     }
                     self.reliability_flags = save_reliability_flags;
@@ -663,7 +811,12 @@ impl Checker {
     }
 
     // Go: checker/relater.go:1412 createMarkerType
-    pub fn create_marker_type(&mut self, symbol: SymbolId, source: TypeId, target: TypeId) -> TypeId {
+    pub fn create_marker_type(
+        &mut self,
+        symbol: SymbolId,
+        source: TypeId,
+        target: TypeId,
+    ) -> TypeId {
         let mapper = self.new_simple_type_mapper(source, target);
         let t = self.get_declared_type_of_symbol(symbol);
         if self.is_error_type(t) {
@@ -704,9 +857,15 @@ impl Checker {
     // Return true if the given type reference has a 'void' type argument for a covariant type parameter.
     // See comment at call in recursiveTypeRelatedTo for when this case matters.
     // Go: checker/relater.go:1445 hasCovariantVoidArgument
-    pub fn has_covariant_void_argument(&self, type_arguments: &[TypeId], variances: &[VarianceFlags]) -> bool {
+    pub fn has_covariant_void_argument(
+        &self,
+        type_arguments: &[TypeId],
+        variances: &[VarianceFlags],
+    ) -> bool {
         for (i, &v) in variances.iter().enumerate() {
-            if v & VarianceFlags::VARIANCE_MASK == VarianceFlags::COVARIANT && self.ty(type_arguments[i]).flags.intersects(TypeFlags::VOID) {
+            if v & VarianceFlags::VARIANCE_MASK == VarianceFlags::COVARIANT
+                && self.ty(type_arguments[i]).flags.intersects(TypeFlags::VOID)
+            {
                 return true;
             }
         }
@@ -714,12 +873,21 @@ impl Checker {
     }
 
     // Go: checker/relater.go:1454 isSignatureAssignableTo
-    pub fn is_signature_assignable_to(&mut self, source: SignatureId, target: SignatureId, ignore_return_types: bool) -> bool {
+    pub fn is_signature_assignable_to(
+        &mut self,
+        source: SignatureId,
+        target: SignatureId,
+        ignore_return_types: bool,
+    ) -> bool {
         let compare_types = self.compare_types_assignable.clone();
         self.compare_signatures_related(
             source,
             target,
-            if ignore_return_types { SignatureCheckMode::IGNORE_RETURN_TYPES } else { SignatureCheckMode::NONE },
+            if ignore_return_types {
+                SignatureCheckMode::IGNORE_RETURN_TYPES
+            } else {
+                SignatureCheckMode::NONE
+            },
             false, /*reportErrors*/
             None,  /*errorReporter*/
             compare_types,
@@ -745,17 +913,24 @@ impl Checker {
         if source == target {
             return Ternary::TRUE;
         }
-        if !(check_mode.intersects(SignatureCheckMode::STRICT_TOP_SIGNATURE) && self.is_top_signature(source)) && self.is_top_signature(target) {
+        if !(check_mode.intersects(SignatureCheckMode::STRICT_TOP_SIGNATURE)
+            && self.is_top_signature(source))
+            && self.is_top_signature(target)
+        {
             return Ternary::TRUE;
         }
-        if check_mode.intersects(SignatureCheckMode::STRICT_TOP_SIGNATURE) && self.is_top_signature(source) && !self.is_top_signature(target) {
+        if check_mode.intersects(SignatureCheckMode::STRICT_TOP_SIGNATURE)
+            && self.is_top_signature(source)
+            && !self.is_top_signature(target)
+        {
             return Ternary::FALSE;
         }
         let target_count = self.get_parameter_count(target);
         let mut source_has_more_parameters = false;
         if !self.has_effective_rest_parameter(target) {
             if check_mode.intersects(SignatureCheckMode::STRICT_ARITY) {
-                source_has_more_parameters = self.has_effective_rest_parameter(source) || self.get_parameter_count(source) > target_count;
+                source_has_more_parameters = self.has_effective_rest_parameter(source)
+                    || self.get_parameter_count(source) > target_count;
             } else {
                 source_has_more_parameters = self.get_min_argument_count(source) > target_count;
             }
@@ -776,15 +951,29 @@ impl Checker {
         }
         // PORT: Go `core.Same` compares slice identity (same length and same
         // backing array). Handles are compared by value here.
-        if !self.sig(source).type_parameters.is_empty() && self.sig(source).type_parameters != self.sig(target).type_parameters {
+        if !self.sig(source).type_parameters.is_empty()
+            && self.sig(source).type_parameters != self.sig(target).type_parameters
+        {
             target = self.get_canonical_signature(target);
-            source = self.instantiate_signature_in_context_of(source, target, InferenceContextId::NIL /*inferenceContext*/, Some(compare_types.clone()));
+            source = self.instantiate_signature_in_context_of(
+                source,
+                target,
+                InferenceContextId::NIL, /*inferenceContext*/
+                Some(compare_types.clone()),
+            );
         }
         let source_count = self.get_parameter_count(source);
         let source_rest_type = self.get_non_array_rest_type(source);
         let target_rest_type = self.get_non_array_rest_type(target);
         if source_rest_type.is_some() || target_rest_type.is_some() {
-            self.instantiate_type(if source_rest_type.is_some() { source_rest_type } else { target_rest_type }, report_unreliable_markers);
+            self.instantiate_type(
+                if source_rest_type.is_some() {
+                    source_rest_type
+                } else {
+                    target_rest_type
+                },
+                report_unreliable_markers,
+            );
         }
         let mut kind = SyntaxKind::Unknown;
         let target_declaration = self.sig(target).declaration;
@@ -804,15 +993,25 @@ impl Checker {
                 // void sources are assignable to anything.
                 let mut related = Ternary::FALSE;
                 if !strict_variance {
-                    related = compare_types(self, source_this_type, target_this_type, false /*reportErrors*/);
+                    related = compare_types(
+                        self,
+                        source_this_type,
+                        target_this_type,
+                        false, /*reportErrors*/
+                    );
                 }
                 if related == Ternary::FALSE {
-                    related = compare_types(self, target_this_type, source_this_type, report_errors);
+                    related =
+                        compare_types(self, target_this_type, source_this_type, report_errors);
                 }
                 if related == Ternary::FALSE {
                     if report_errors {
                         let reporter = error_reporter.as_deref_mut().expect("call of nil func");
-                        reporter(self, diag::The_this_types_of_each_signature_are_incompatible, args![]);
+                        reporter(
+                            self,
+                            diag::The_this_types_of_each_signature_are_incompatible,
+                            args![],
+                        );
                     }
                     return Ternary::FALSE;
                 }
@@ -824,7 +1023,11 @@ impl Checker {
         } else {
             source_count.max(target_count)
         };
-        let rest_index: i32 = if source_rest_type.is_some() || target_rest_type.is_some() { param_count - 1 } else { -1 };
+        let rest_index: i32 = if source_rest_type.is_some() || target_rest_type.is_some() {
+            param_count - 1
+        } else {
+            -1
+        };
         for i in 0..param_count {
             let source_type = if i == rest_index {
                 self.get_rest_or_any_type_at_position(source, i)
@@ -838,7 +1041,8 @@ impl Checker {
             };
             if source_type.is_some()
                 && target_type.is_some()
-                && (source_type != target_type || check_mode.intersects(SignatureCheckMode::STRICT_ARITY))
+                && (source_type != target_type
+                    || check_mode.intersects(SignatureCheckMode::STRICT_ARITY))
             {
                 // In order to ensure that any generic type Foo<T> is at least co-variant with respect to T no matter
                 // how Foo uses T, we need to relate parameters bi-variantly (given that parameters are input positions,
@@ -850,11 +1054,15 @@ impl Checker {
                 // with respect to T.
                 let mut source_sig = SignatureId::NIL;
                 let mut target_sig = SignatureId::NIL;
-                if !check_mode.intersects(SignatureCheckMode::CALLBACK) && !self.is_instantiated_generic_parameter(source, i) {
+                if !check_mode.intersects(SignatureCheckMode::CALLBACK)
+                    && !self.is_instantiated_generic_parameter(source, i)
+                {
                     let non_nullable = self.get_non_nullable_type(source_type);
                     source_sig = self.get_single_call_signature(non_nullable);
                 }
-                if !check_mode.intersects(SignatureCheckMode::CALLBACK) && !self.is_instantiated_generic_parameter(target, i) {
+                if !check_mode.intersects(SignatureCheckMode::CALLBACK)
+                    && !self.is_instantiated_generic_parameter(target, i)
+                {
                     let non_nullable = self.get_non_nullable_type(target_type);
                     target_sig = self.get_single_call_signature(non_nullable);
                 }
@@ -870,7 +1078,11 @@ impl Checker {
                         target_sig,
                         source_sig,
                         (check_mode & SignatureCheckMode::STRICT_ARITY)
-                            | if strict_variance { SignatureCheckMode::STRICT_CALLBACK } else { SignatureCheckMode::BIVARIANT_CALLBACK },
+                            | if strict_variance {
+                                SignatureCheckMode::STRICT_CALLBACK
+                            } else {
+                                SignatureCheckMode::BIVARIANT_CALLBACK
+                            },
                         report_errors,
                         error_reporter.as_deref_mut().map(|r| r as ErrorReporter),
                         compare_types.clone(),
@@ -878,7 +1090,12 @@ impl Checker {
                     );
                 } else {
                     if !check_mode.intersects(SignatureCheckMode::CALLBACK) && !strict_variance {
-                        related = compare_types(self, source_type, target_type, false /*reportErrors*/);
+                        related = compare_types(
+                            self,
+                            source_type,
+                            target_type,
+                            false, /*reportErrors*/
+                        );
                     }
                     if related == Ternary::FALSE {
                         related = compare_types(self, target_type, source_type, report_errors);
@@ -889,7 +1106,8 @@ impl Checker {
                     && check_mode.intersects(SignatureCheckMode::STRICT_ARITY)
                     && i >= self.get_min_argument_count(source)
                     && i < self.get_min_argument_count(target)
-                    && compare_types(self, source_type, target_type, false /*reportErrors*/) != Ternary::FALSE
+                    && compare_types(self, source_type, target_type, false /*reportErrors*/)
+                        != Ternary::FALSE
                 {
                     related = Ternary::FALSE;
                 }
@@ -898,7 +1116,11 @@ impl Checker {
                         let source_name = self.get_parameter_name_at_position(source, i);
                         let target_name = self.get_parameter_name_at_position(target, i);
                         let reporter = error_reporter.as_deref_mut().expect("call of nil func");
-                        reporter(self, diag::Types_of_parameters_0_and_1_are_incompatible, args![source_name, target_name]);
+                        reporter(
+                            self,
+                            diag::Types_of_parameters_0_and_1_are_incompatible,
+                            args![source_name, target_name],
+                        );
                     }
                     return Ternary::FALSE;
                 }
@@ -931,7 +1153,11 @@ impl Checker {
                     if report_errors {
                         let source_str = self.signature_to_string(source);
                         let reporter = error_reporter.as_deref_mut().expect("call of nil func");
-                        reporter(self, diag::Signature_0_must_be_a_type_predicate, args![source_str]);
+                        reporter(
+                            self,
+                            diag::Signature_0_must_be_a_type_predicate,
+                            args![source_str],
+                        );
                     }
                     return Ternary::FALSE;
                 }
@@ -941,18 +1167,27 @@ impl Checker {
                 // wouldn't be co-variant for T without this rule.
                 let mut related = Ternary::FALSE;
                 if check_mode.intersects(SignatureCheckMode::BIVARIANT_CALLBACK) {
-                    related = compare_types(self, target_return_type, source_return_type, false /*reportErrors*/);
+                    related = compare_types(
+                        self,
+                        target_return_type,
+                        source_return_type,
+                        false, /*reportErrors*/
+                    );
                 }
                 if related == Ternary::FALSE {
-                    related = compare_types(self, source_return_type, target_return_type, report_errors);
+                    related =
+                        compare_types(self, source_return_type, target_return_type, report_errors);
                 }
                 result &= related;
                 if result == Ternary::FALSE && report_errors {
                     // The errors reported here serve as markers that trigger error chain reduction in the (*Relater).reportError
                     // method. The markers are elided in the final diagnostic chain and never actually reported.
                     let message: &'static ts_diagnostics::Message;
-                    let source_is_construct = self.sig(source).flags.intersects(SignatureFlags::CONSTRUCT);
-                    if self.sig(source).parameters.is_empty() && self.sig(target).parameters.is_empty() {
+                    let source_is_construct =
+                        self.sig(source).flags.intersects(SignatureFlags::CONSTRUCT);
+                    if self.sig(source).parameters.is_empty()
+                        && self.sig(target).parameters.is_empty()
+                    {
                         message = if source_is_construct {
                             diag::Construct_signatures_with_no_arguments_have_incompatible_return_types_0_and_1
                         } else {
@@ -992,11 +1227,17 @@ impl Checker {
                 reporter(self, diag::A_this_based_type_guard_is_not_compatible_with_a_parameter_based_type_guard, args![]);
                 let source_str = self.type_predicate_to_string(source);
                 let target_str = self.type_predicate_to_string(target);
-                reporter(self, diag::Type_predicate_0_is_not_assignable_to_1, args![source_str, target_str]);
+                reporter(
+                    self,
+                    diag::Type_predicate_0_is_not_assignable_to_1,
+                    args![source_str, target_str],
+                );
             }
             return Ternary::FALSE;
         }
-        if source_pred.kind == TypePredicateKind::IDENTIFIER || source_pred.kind == TypePredicateKind::ASSERTS_IDENTIFIER {
+        if source_pred.kind == TypePredicateKind::IDENTIFIER
+            || source_pred.kind == TypePredicateKind::ASSERTS_IDENTIFIER
+        {
             if source_pred.parameter_index != target_pred.parameter_index {
                 if report_errors {
                     let reporter = error_reporter.as_deref_mut().expect("call of nil func");
@@ -1007,7 +1248,11 @@ impl Checker {
                     );
                     let source_str = self.type_predicate_to_string(source);
                     let target_str = self.type_predicate_to_string(target);
-                    reporter(self, diag::Type_predicate_0_is_not_assignable_to_1, args![source_str, target_str]);
+                    reporter(
+                        self,
+                        diag::Type_predicate_0_is_not_assignable_to_1,
+                        args![source_str, target_str],
+                    );
                 }
                 return Ternary::FALSE;
             }
@@ -1023,7 +1268,11 @@ impl Checker {
             let source_str = self.type_predicate_to_string(source);
             let target_str = self.type_predicate_to_string(target);
             let reporter = error_reporter.as_deref_mut().expect("call of nil func");
-            reporter(self, diag::Type_predicate_0_is_not_assignable_to_1, args![source_str, target_str]);
+            reporter(
+                self,
+                diag::Type_predicate_0_is_not_assignable_to_1,
+                args![source_str, target_str],
+            );
         }
         related
     }
@@ -1042,11 +1291,21 @@ impl Checker {
         {
             let first_parameter = self.sig(s).parameters[0];
             let param_type = self.get_type_of_parameter(first_parameter);
-            let rest_type = if self.is_array_type(param_type) { self.get_type_arguments(param_type)[0] } else { param_type };
-            return self.ty(rest_type).flags.intersects(TypeFlags::ANY | TypeFlags::NEVER) && {
-                let return_type = self.get_return_type_of_signature(s);
-                self.ty(return_type).flags.intersects(TypeFlags::ANY_OR_UNKNOWN)
+            let rest_type = if self.is_array_type(param_type) {
+                self.get_type_arguments(param_type)[0]
+            } else {
+                param_type
             };
+            return self
+                .ty(rest_type)
+                .flags
+                .intersects(TypeFlags::ANY | TypeFlags::NEVER)
+                && {
+                    let return_type = self.get_return_type_of_signature(s);
+                    self.ty(return_type)
+                        .flags
+                        .intersects(TypeFlags::ANY_OR_UNKNOWN)
+                };
         }
         false
     }
@@ -1063,7 +1322,12 @@ impl Checker {
             let rest_type = self.get_type_of_symbol(last);
             if self.is_tuple_type(rest_type) {
                 let tuple = self.target_tuple_type(rest_type);
-                return length + tuple.fixed_length - if tuple.combined_flags.intersects(ElementFlags::VARIABLE) { 0 } else { 1 };
+                return length + tuple.fixed_length
+                    - if tuple.combined_flags.intersects(ElementFlags::VARIABLE) {
+                        0
+                    } else {
+                        1
+                    };
             }
         }
         length
@@ -1075,8 +1339,13 @@ impl Checker {
     }
 
     // Go: checker/relater.go:1708 getMinArgumentCountEx
-    pub fn get_min_argument_count_ex(&mut self, signature: SignatureId, flags: MinArgumentCountFlags) -> i32 {
-        let strong_arity_for_untyped_js = flags & MinArgumentCountFlags::STRONG_ARITY_FOR_UNTYPED_JS;
+    pub fn get_min_argument_count_ex(
+        &mut self,
+        signature: SignatureId,
+        flags: MinArgumentCountFlags,
+    ) -> i32 {
+        let strong_arity_for_untyped_js =
+            flags & MinArgumentCountFlags::STRONG_ARITY_FOR_UNTYPED_JS;
         let void_is_non_optional = flags & MinArgumentCountFlags::VOID_IS_NON_OPTIONAL;
         if void_is_non_optional.0 != 0 || self.sig(signature).resolved_min_argument_count == -1 {
             let mut min_argument_count: i32 = -1;
@@ -1101,7 +1370,12 @@ impl Checker {
                 }
             }
             if min_argument_count == -1 {
-                if strong_arity_for_untyped_js.0 == 0 && self.sig(signature).flags.intersects(SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE) {
+                if strong_arity_for_untyped_js.0 == 0
+                    && self
+                        .sig(signature)
+                        .flags
+                        .intersects(SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE)
+                {
                     return 0;
                 }
                 min_argument_count = self.sig(signature).min_argument_count;
@@ -1112,7 +1386,9 @@ impl Checker {
             let mut i = min_argument_count - 1;
             while i >= 0 {
                 let t = self.get_type_at_position(signature, i);
-                if !self.some_type(t, &mut |c: &mut Checker, t: TypeId| c.ty(t).flags.intersects(TypeFlags::VOID)) {
+                if !self.some_type(t, &mut |c: &mut Checker, t: TypeId| {
+                    c.ty(t).flags.intersects(TypeFlags::VOID)
+                }) {
                     break;
                 }
                 min_argument_count = i;
@@ -1129,7 +1405,11 @@ impl Checker {
             let parameters_len = self.sig(signature).parameters.len();
             let last = self.sig(signature).parameters[parameters_len - 1];
             let rest_type = self.get_type_of_symbol(last);
-            return !self.is_tuple_type(rest_type) || self.target_tuple_type(rest_type).combined_flags.intersects(ElementFlags::VARIABLE);
+            return !self.is_tuple_type(rest_type)
+                || self
+                    .target_tuple_type(rest_type)
+                    .combined_flags
+                    .intersects(ElementFlags::VARIABLE);
         }
         false
     }
@@ -1145,8 +1425,12 @@ impl Checker {
 
     // Go: checker/relater.go:1765 tryGetTypeAtPosition
     pub fn try_get_type_at_position(&mut self, signature: SignatureId, pos: i32) -> TypeId {
-        let param_count =
-            self.sig(signature).parameters.len() as i32 - if self.signature_has_rest_parameter(signature) { 1 } else { 0 };
+        let param_count = self.sig(signature).parameters.len() as i32
+            - if self.signature_has_rest_parameter(signature) {
+                1
+            } else {
+                0
+            };
         if pos < param_count {
             let parameter = self.sig(signature).parameters[pos as usize];
             return self.get_type_of_parameter(parameter);
@@ -1159,7 +1443,10 @@ impl Checker {
             let rest_type = self.get_type_of_symbol(rest_parameter);
             let index = pos - param_count;
             if !self.is_tuple_type(rest_type)
-                || self.target_tuple_type(rest_type).combined_flags.intersects(ElementFlags::VARIABLE)
+                || self
+                    .target_tuple_type(rest_type)
+                    .combined_flags
+                    .intersects(ElementFlags::VARIABLE)
                 || index < self.target_tuple_type(rest_type).fixed_length
             {
                 let index_type = self.get_number_literal_type(ts_jsnum::Number(index as f64));
@@ -1185,7 +1472,12 @@ impl Checker {
     }
 
     // Go: checker/relater.go:1796 getRestTypeAtPosition
-    pub fn get_rest_type_at_position(&mut self, source: SignatureId, pos: i32, readonly: bool) -> TypeId {
+    pub fn get_rest_type_at_position(
+        &mut self,
+        source: SignatureId,
+        pos: i32,
+        readonly: bool,
+    ) -> TypeId {
         let parameter_count = self.get_parameter_count(source);
         let min_argument_count = self.get_min_argument_count(source);
         let rest_type = self.get_effective_rest_type(source);
@@ -1210,13 +1502,20 @@ impl Checker {
             let position = i as i32 + pos;
             if rest_type.is_nil() || i < length - 1 {
                 types[i] = self.get_type_at_position(source, position);
-                flags = if position < min_argument_count { ElementFlags::REQUIRED } else { ElementFlags::OPTIONAL };
+                flags = if position < min_argument_count {
+                    ElementFlags::REQUIRED
+                } else {
+                    ElementFlags::OPTIONAL
+                };
             } else {
                 types[i] = rest_type;
                 flags = ElementFlags::VARIADIC;
             }
             let labeled_declaration = self.get_nameable_declaration_at_position(source, position);
-            infos[i] = TupleElementInfo { flags, labeled_declaration };
+            infos[i] = TupleElementInfo {
+                flags,
+                labeled_declaration,
+            };
         }
         self.create_tuple_type_ex(&types, &infos, readonly)
     }

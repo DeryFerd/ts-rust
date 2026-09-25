@@ -8,7 +8,11 @@ use super::tspath;
 use super::types::*;
 
 // Go: modulespecifiers/util.go:29 comparePathsByRedirect
-pub(crate) fn compare_paths_by_redirect(a: &ModulePath, b: &ModulePath, use_case_sensitive_file_names: bool) -> i32 {
+pub(crate) fn compare_paths_by_redirect(
+    a: &ModulePath,
+    b: &ModulePath,
+    use_case_sensitive_file_names: bool,
+) -> i32 {
     // Redirects sort first, matching Strada's compareBooleans(b.isRedirect, a.isRedirect).
     let c = deps::compare_booleans(b.is_redirect, a.is_redirect);
     if c != 0 {
@@ -23,7 +27,10 @@ pub(crate) fn compare_paths_by_redirect(a: &ModulePath, b: &ModulePath, use_case
     tspath::compare_paths(
         &a.file_name,
         &b.file_name,
-        &tspath::ComparePathsOptions { use_case_sensitive_file_names, ..Default::default() },
+        &tspath::ComparePathsOptions {
+            use_case_sensitive_file_names,
+            ..Default::default()
+        },
     )
 }
 
@@ -82,15 +89,24 @@ pub fn try_get_real_file_name_for_non_js_declaration_file_name(file_name: &str) 
     // is no dot. A ".d." is present, so there is always a dot.
     let last_dot_index = no_extension.rfind('.').unwrap_or(0);
     let ext = &no_extension[last_dot_index..];
-    let before = no_extension.split_once(".d.").map_or(no_extension, |(before, _)| before);
+    let before = no_extension
+        .split_once(".d.")
+        .map_or(no_extension, |(before, _)| before);
     format!("{before}{ext}")
 }
 
 // Go: modulespecifiers/util.go:168 getJSExtensionForFile
-pub(crate) fn get_js_extension_for_file(file_name: &str, options: &CompilerOptions) -> &'static str {
+pub(crate) fn get_js_extension_for_file(
+    file_name: &str,
+    options: &CompilerOptions,
+) -> &'static str {
     let result = deps::try_get_js_extension_for_file(file_name, options);
     if result.is_empty() {
-        panic!("Extension {} is unsupported:: FileName:: {}", extension_from_path(file_name), file_name);
+        panic!(
+            "Extension {} is unsupported:: FileName:: {}",
+            extension_from_path(file_name),
+            file_name
+        );
     }
     result
 }
@@ -106,7 +122,10 @@ fn extension_from_path(path: &str) -> &'static str {
 }
 
 // Go: modulespecifiers/util.go:188 tryGetAnyFileFromPath
-pub(crate) fn try_get_any_file_from_path(host: &dyn ModuleSpecifierGenerationHost, path: &str) -> bool {
+pub(crate) fn try_get_any_file_from_path(
+    host: &dyn ModuleSpecifierGenerationHost,
+    path: &str,
+) -> bool {
     // !!! TODO: shouldn't this use readdir instead of fileexists for perf?
     // We check all js, `node` and `json` extensions in addition to TS, since node module resolution would also choose those over the directory
     // PORT: Go builds the groups with tsoptions.GetSupportedExtensions
@@ -117,7 +136,10 @@ pub(crate) fn try_get_any_file_from_path(host: &dyn ModuleSpecifierGenerationHos
     for exts in ext_groups {
         for e in exts.iter() {
             let full_path = format!("{path}{e}");
-            if host.file_exists(&tspath::get_normalized_absolute_path(&full_path, &host.get_current_directory())) {
+            if host.file_exists(&tspath::get_normalized_absolute_path(
+                &full_path,
+                &host.get_current_directory(),
+            )) {
                 return true;
             }
         }
@@ -133,7 +155,8 @@ pub(crate) fn get_paths_relative_to_root_dirs(
 ) -> Vec<String> {
     let mut results = Vec::new();
     for root_dir in root_dirs {
-        let relative_path = get_relative_path_if_in_same_volume(path, root_dir, use_case_sensitive_file_names);
+        let relative_path =
+            get_relative_path_if_in_same_volume(path, root_dir, use_case_sensitive_file_names);
         if !is_path_relative_to_parent(&relative_path) {
             results.push(relative_path);
         }
@@ -168,7 +191,11 @@ pub(crate) fn get_relative_path_if_in_same_volume(
 }
 
 // Go: modulespecifiers/util.go:245 packageJsonPathsAreEqual
-pub(crate) fn package_json_paths_are_equal(a: &str, b: &str, options: &tspath::ComparePathsOptions) -> bool {
+pub(crate) fn package_json_paths_are_equal(
+    a: &str,
+    b: &str,
+    options: &tspath::ComparePathsOptions,
+) -> bool {
     if a == b {
         return true;
     }
@@ -190,7 +217,10 @@ pub(crate) fn prefers_ts_extension(allowed_endings: &[ModuleSpecifierEnding]) ->
 
 /// Go `slices.Index`: the first index of `value`, or -1.
 pub(crate) fn index_of(endings: &[ModuleSpecifierEnding], value: ModuleSpecifierEnding) -> isize {
-    endings.iter().position(|e| *e == value).map_or(-1, |i| i as isize)
+    endings
+        .iter()
+        .position(|e| *e == value)
+        .map_or(-1, |i| i as isize)
 }
 
 // Go: modulespecifiers/util.go:264 replaceFirstStar
@@ -284,7 +314,14 @@ pub fn get_node_modules_package_name(
     options: ModuleSpecifierOptions,
 ) -> String {
     let info = get_info(&importing_source_file.file_name(), host);
-    let module_paths = get_all_module_paths(&info, node_modules_file_name, host, compiler_options, preferences, options);
+    let module_paths = get_all_module_paths(
+        &info,
+        node_modules_file_name,
+        host,
+        compiler_options,
+        preferences,
+        options,
+    );
     for module_path in &module_paths {
         let result = try_get_module_name_as_node_module(
             module_path,
@@ -304,7 +341,9 @@ pub fn get_node_modules_package_name(
 }
 
 // Go: modulespecifiers/util.go:357 allKeysStartWithDot
-pub(crate) fn all_keys_start_with_dot(obj: &IndexMap<String, super::packagejson::ExportsOrImports>) -> bool {
+pub(crate) fn all_keys_start_with_dot(
+    obj: &IndexMap<String, super::packagejson::ExportsOrImports>,
+) -> bool {
     obj.keys().all(|k| k.starts_with('.'))
 }
 

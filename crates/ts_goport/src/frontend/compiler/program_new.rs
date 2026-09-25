@@ -23,7 +23,11 @@ impl ProgramOptions {
     // Go: program.go:46 (*ProgramOptions).canUseProjectReferenceSource
     pub fn can_use_project_reference_source(&self) -> bool {
         self.use_source_of_project_reference
-            && !self.config.compiler_options().disable_source_of_project_reference_redirect.is_true()
+            && !self
+                .config
+                .compiler_options()
+                .disable_source_of_project_reference_redirect
+                .is_true()
     }
 }
 
@@ -36,7 +40,9 @@ pub struct LazyValue<T> {
 
 impl<T> Default for LazyValue<T> {
     fn default() -> Self {
-        Self { value: OnceCell::new() }
+        Self {
+            value: OnceCell::new(),
+        }
     }
 }
 
@@ -117,7 +123,10 @@ impl NewProgram {
     }
 
     pub(crate) fn mapper(&self) -> std::cell::Ref<'_, ProjectReferenceFileMapper> {
-        self.project_reference_file_mapper.as_ref().expect("program project reference file mapper is not set").borrow()
+        self.project_reference_file_mapper
+            .as_ref()
+            .expect("program project reference file mapper is not set")
+            .borrow()
     }
 
     // Go: program.go:122 (*Program).FileExists
@@ -163,16 +172,25 @@ impl NewProgram {
     // GetRedirectTargets returns the list of file paths that redirect to the given path.
     // These are files from the same package (same name@version) installed in different locations.
     pub fn get_redirect_targets(&self, path: &Path) -> Vec<String> {
-        self.redirect_targets_map.as_ref().and_then(|targets| targets.get(path)).cloned().unwrap_or_default()
+        self.redirect_targets_map
+            .as_ref()
+            .and_then(|targets| targets.get(path))
+            .cloned()
+            .unwrap_or_default()
     }
 
     // Go: program.go:165 (*Program).GetSourceOfProjectReferenceIfOutputIncluded
     // gets the original file that was included in program
     // this returns original source file name when including output of project reference
     // otherwise same name
-    pub fn get_source_of_project_reference_if_output_included(&self, file: &dyn HasFileName) -> String {
-        if let Some(source) =
-            self.output_file_to_project_reference_source.as_ref().and_then(|sources| sources.get(&file.path()))
+    pub fn get_source_of_project_reference_if_output_included(
+        &self,
+        file: &dyn HasFileName,
+    ) -> String {
+        if let Some(source) = self
+            .output_file_to_project_reference_source
+            .as_ref()
+            .and_then(|sources| sources.get(&file.path()))
         {
             return source.clone();
         }
@@ -180,7 +198,10 @@ impl NewProgram {
     }
 
     // Go: program.go:173 (*Program).GetProjectReferenceFromSource
-    pub fn get_project_reference_from_source(&self, path: &Path) -> Option<Rc<SourceOutputAndProjectReference>> {
+    pub fn get_project_reference_from_source(
+        &self,
+        path: &Path,
+    ) -> Option<Rc<SourceOutputAndProjectReference>> {
         self.mapper().get_project_reference_from_source(path)
     }
 
@@ -190,24 +211,34 @@ impl NewProgram {
     }
 
     // Go: program.go:182 (*Program).GetProjectReferenceFromOutputDts
-    pub fn get_project_reference_from_output_dts(&self, path: &Path) -> Option<Rc<SourceOutputAndProjectReference>> {
+    pub fn get_project_reference_from_output_dts(
+        &self,
+        path: &Path,
+    ) -> Option<Rc<SourceOutputAndProjectReference>> {
         self.mapper().get_project_reference_from_output_dts(path)
     }
 
     // Go: program.go:186 (*Program).GetResolvedProjectReferenceFor
-    pub fn get_resolved_project_reference_for(&self, path: &Path) -> (Option<Rc<ParsedCommandLine>>, bool) {
+    pub fn get_resolved_project_reference_for(
+        &self,
+        path: &Path,
+    ) -> (Option<Rc<ParsedCommandLine>>, bool) {
         self.mapper().get_resolved_reference_for(path)
     }
 
     // Go: program.go:190 (*Program).GetRedirectForResolution
-    pub fn get_redirect_for_resolution(&self, file: &dyn HasFileName) -> Option<Rc<ParsedCommandLine>> {
+    pub fn get_redirect_for_resolution(
+        &self,
+        file: &dyn HasFileName,
+    ) -> Option<Rc<ParsedCommandLine>> {
         let (redirect, _) = self.mapper().get_redirect_for_resolution(file);
         redirect
     }
 
     // Go: program.go:195 (*Program).GetParseFileRedirect
     pub fn get_parse_file_redirect(&self, file_name: &str) -> String {
-        self.mapper().get_parse_file_redirect(&new_has_file_name(file_name, &self.to_path(file_name)))
+        self.mapper()
+            .get_parse_file_redirect(&new_has_file_name(file_name, &self.to_path(file_name)))
     }
 
     // Go: program.go:199 (*Program).GetResolvedProjectReferences
@@ -218,7 +249,12 @@ impl NewProgram {
     // Go: program.go:203 (*Program).RangeResolvedProjectReference
     pub fn range_resolved_project_reference(
         &self,
-        f: impl FnMut(&Path, Option<&Rc<ParsedCommandLine>>, Option<&Rc<ParsedCommandLine>>, usize) -> bool,
+        f: impl FnMut(
+            &Path,
+            Option<&Rc<ParsedCommandLine>>,
+            Option<&Rc<ParsedCommandLine>>,
+            usize,
+        ) -> bool,
     ) -> bool {
         self.mapper().range_resolved_project_reference(f)
     }
@@ -227,9 +263,15 @@ impl NewProgram {
     pub fn range_resolved_project_reference_in_child_config(
         &self,
         child_config: &Rc<ParsedCommandLine>,
-        f: impl FnMut(&Path, Option<&Rc<ParsedCommandLine>>, Option<&Rc<ParsedCommandLine>>, usize) -> bool,
+        f: impl FnMut(
+            &Path,
+            Option<&Rc<ParsedCommandLine>>,
+            Option<&Rc<ParsedCommandLine>>,
+            usize,
+        ) -> bool,
     ) -> bool {
-        self.mapper().range_resolved_project_reference_in_child_config(child_config, f)
+        self.mapper()
+            .range_resolved_project_reference_in_child_config(child_config, f)
     }
 
     // Go: program.go:215 (*Program).UseCaseSensitiveFileNames
@@ -254,13 +296,17 @@ impl NewProgram {
         // Still, without the failed lookup reporting that only the loader does, this isn't terribly complicated
 
         let file_name = resolve_path(&get_directory_path(origin.file_name()), &[&r.file_name]);
-        let supported_extensions_base = get_supported_extensions(self.options(), &[] /*extraFileExtensions*/);
-        let supported_extensions =
-            get_supported_extensions_with_json_if_resolve_json_module(Some(self.options()), supported_extensions_base);
+        let supported_extensions_base =
+            get_supported_extensions(self.options(), &[] /*extraFileExtensions*/);
+        let supported_extensions = get_supported_extensions_with_json_if_resolve_json_module(
+            Some(self.options()),
+            supported_extensions_base,
+        );
         let allow_non_ts_extensions = self.options().allow_non_ts_extensions.is_true();
         if has_extension(&file_name) {
             if !allow_non_ts_extensions {
-                let canonical_file_name = get_canonical_file_name(&file_name, self.use_case_sensitive_file_names());
+                let canonical_file_name =
+                    get_canonical_file_name(&file_name, self.use_case_sensitive_file_names());
                 let mut supported = false;
                 for group in &supported_extensions {
                     let group: Vec<&str> = group.iter().map(|ext| &**ext).collect();
@@ -336,16 +382,24 @@ impl NewProgram {
         new_opts.host = new_host.clone();
 
         // PORT: Go dereferences a nil old file and panics; so does this.
-        let old_file = self.files_by_path.get(changed_file_path).cloned().expect("changed file is not in the program");
+        let old_file = self
+            .files_by_path
+            .get(changed_file_path)
+            .cloned()
+            .expect("changed file is not in the program");
         let new_file = new_host.get_source_file(old_file.parse_options());
 
         // If this file is part of a package redirect group (same package installed in multiple
         // node_modules locations), we need to rebuild the program because the redirect targets
         // might need recalculation.
-        let in_redirect_files =
-            self.redirect_files_by_path.as_ref().is_some_and(|redirects| redirects.contains_key(changed_file_path));
-        let is_redirect_target =
-            self.redirect_targets_map.as_ref().is_some_and(|targets| targets.contains_key(changed_file_path));
+        let in_redirect_files = self
+            .redirect_files_by_path
+            .as_ref()
+            .is_some_and(|redirects| redirects.contains_key(changed_file_path));
+        let is_redirect_target = self
+            .redirect_targets_map
+            .as_ref()
+            .is_some_and(|targets| targets.contains_key(changed_file_path));
         if in_redirect_files || is_redirect_target {
             return (new_program(new_opts), new_file, false);
         }
@@ -379,7 +433,9 @@ impl NewProgram {
             package_names: LazyValue::default(),
             has_ts_file: OnceCell::new(),
         };
-        result.unresolved_imports.try_reuse(&self.unresolved_imports);
+        result
+            .unresolved_imports
+            .try_reuse(&self.unresolved_imports);
         result.known_symlinks.try_reuse(&self.known_symlinks);
         result.package_names.try_reuse(&self.package_names);
         result.init_checker_pool();
@@ -390,7 +446,10 @@ impl NewProgram {
             .position(|file| file.path() == new_file.path())
             .expect("changed file is not in the file list");
         result.processed_files.files[index] = new_file.clone();
-        result.processed_files.files_by_path.insert(new_file.path().clone(), new_file.clone());
+        result
+            .processed_files
+            .files_by_path
+            .insert(new_file.path().clone(), new_file.clone());
         update_file_include_processor(&mut result);
         (result, Some(new_file), true)
     }
@@ -405,21 +464,43 @@ impl NewProgram {
 }
 
 // Go: program.go:354 canReplaceFileInProgram
-pub fn can_replace_file_in_program(file1: &ParsedSourceFile, file2: Option<&ParsedSourceFile>) -> bool {
+pub fn can_replace_file_in_program(
+    file1: &ParsedSourceFile,
+    file2: Option<&ParsedSourceFile>,
+) -> bool {
     let Some(file2) = file2 else {
         return false;
     };
     file1.parse_options() == file2.parse_options()
         && file1.uses_uri_style_node_core_modules == file2.uses_uri_style_node_core_modules
-        && slices_equal_func(&file1.imports, &file2.imports, |n1, n2| equal_module_specifiers(*n1, *n2))
-        && slices_equal_func(&file1.module_augmentations, &file2.module_augmentations, |n1, n2| {
-            equal_module_augmentation_names(*n1, *n2)
+        && slices_equal_func(&file1.imports, &file2.imports, |n1, n2| {
+            equal_module_specifiers(*n1, *n2)
         })
+        && slices_equal_func(
+            &file1.module_augmentations,
+            &file2.module_augmentations,
+            |n1, n2| equal_module_augmentation_names(*n1, *n2),
+        )
         && file1.ambient_module_names == file2.ambient_module_names
-        && slices_equal_func(&file1.referenced_files, &file2.referenced_files, equal_file_references)
-        && slices_equal_func(&file1.type_reference_directives, &file2.type_reference_directives, equal_file_references)
-        && slices_equal_func(&file1.lib_reference_directives, &file2.lib_reference_directives, equal_file_references)
-        && equal_check_js_directives(file1.check_js_directive.as_ref(), file2.check_js_directive.as_ref())
+        && slices_equal_func(
+            &file1.referenced_files,
+            &file2.referenced_files,
+            equal_file_references,
+        )
+        && slices_equal_func(
+            &file1.type_reference_directives,
+            &file2.type_reference_directives,
+            equal_file_references,
+        )
+        && slices_equal_func(
+            &file1.lib_reference_directives,
+            &file2.lib_reference_directives,
+            equal_file_references,
+        )
+        && equal_check_js_directives(
+            file1.check_js_directive.as_ref(),
+            file2.check_js_directive.as_ref(),
+        )
 }
 
 /// Go `slices.EqualFunc`.
@@ -431,11 +512,12 @@ impl NewProgram {
     // Go: program.go:367 (*Program).needsImportHelpersImportSpecifier
     pub fn needs_import_helpers_import_specifier(&self, file: &ParsedSourceFile) -> bool {
         let (redirect, _) = self.mapper().get_redirect_for_resolution(file);
-        let options_for_file =
-            get_compiler_options_with_redirect(
-                self.opts.config.compiler_options(),
-                redirect.as_deref().map(|r| r as &dyn ModuleResolvedProjectReference),
-            );
+        let options_for_file = get_compiler_options_with_redirect(
+            self.opts.config.compiler_options(),
+            redirect
+                .as_deref()
+                .map(|r| r as &dyn ModuleResolvedProjectReference),
+        );
         if !options_for_file.import_helpers.is_true() {
             return false;
         }
@@ -445,7 +527,8 @@ impl NewProgram {
         let is_java_script_file = file.is_js();
         let is_external_module_file = file.external_module_indicator.is_some();
         if !is_java_script_file
-            && (file.is_declaration_file || (!options_for_file.get_isolated_modules() && !is_external_module_file))
+            && (file.is_declaration_file
+                || (!options_for_file.get_isolated_modules() && !is_external_module_file))
         {
             return false;
         }
@@ -465,11 +548,16 @@ pub fn equal_module_augmentation_names(n1: Node, n2: Node) -> bool {
 
 // Go: program.go:389 equalFileReferences
 pub fn equal_file_references(f1: &FileReference, f2: &FileReference) -> bool {
-    f1.file_name == f2.file_name && f1.resolution_mode == f2.resolution_mode && f1.preserve == f2.preserve
+    f1.file_name == f2.file_name
+        && f1.resolution_mode == f2.resolution_mode
+        && f1.preserve == f2.preserve
 }
 
 // Go: program.go:393 equalCheckJSDirectives
-pub fn equal_check_js_directives(d1: Option<&CheckJsDirective>, d2: Option<&CheckJsDirective>) -> bool {
+pub fn equal_check_js_directives(
+    d1: Option<&CheckJsDirective>,
+    d2: Option<&CheckJsDirective>,
+) -> bool {
     match (d1, d2) {
         (None, None) => true,
         (Some(d1), Some(d2)) => d1.enabled == d2.enabled,
@@ -508,14 +596,18 @@ impl NewProgram {
 
     // Go: program.go:403 (*Program).GetConfigFileParsingDiagnostics
     pub fn get_config_file_parsing_diagnostics(&self) -> Vec<Diagnostic> {
-        self.opts.config.get_config_file_parsing_diagnostics().to_vec()
+        self.opts
+            .config
+            .get_config_file_parsing_diagnostics()
+            .to_vec()
     }
 
     // Go: program.go:409 (*Program).GetUnresolvedImports
     // GetUnresolvedImports returns the unresolved imports for this program.
     // The result is cached and computed only once.
     pub fn get_unresolved_imports(&self) -> &FxHashSet<String> {
-        self.unresolved_imports.get_value(|| self.extract_unresolved_imports())
+        self.unresolved_imports
+            .get_value(|| self.extract_unresolved_imports())
     }
 
     // Go: program.go:413 (*Program).extractUnresolvedImports
@@ -539,7 +631,11 @@ impl NewProgram {
         if let Some(resolved_modules) = self.resolved_modules.get(file.path()) {
             for (cache_key, resolution) in resolved_modules {
                 let resolved = resolution.is_resolved();
-                if (!resolved || !extension_is_one_of(&resolution.extension, SUPPORTED_TS_EXTENSIONS_WITH_JSON_FLAT))
+                if (!resolved
+                    || !extension_is_one_of(
+                        &resolution.extension,
+                        SUPPORTED_TS_EXTENSIONS_WITH_JSON_FLAT,
+                    ))
                     && !is_external_module_name_relative(&cache_key.name)
                 {
                     unresolved_imports.push(cache_key.name.clone());
@@ -562,5 +658,7 @@ impl NewProgram {
 // PORT: the body of Go `(*Program).SingleThreaded`. It reads only `opts`, so
 // `new_program` can call it before the program exists.
 fn single_threaded(opts: &ProgramOptions) -> bool {
-    opts.single_threaded.default_if_unknown(opts.config.compiler_options().single_threaded).is_true()
+    opts.single_threaded
+        .default_if_unknown(opts.config.compiler_options().single_threaded)
+        .is_true()
 }

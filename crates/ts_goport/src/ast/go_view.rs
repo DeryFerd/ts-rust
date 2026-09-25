@@ -125,7 +125,9 @@ fn trivia_len(text: &str, i: usize, limit: usize) -> usize {
         b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c => 1,
         b'/' if i + 1 < limit && bytes[i + 1] == b'/' => line_end(bytes, i).min(limit) - i,
         b'/' if i + 1 < limit && bytes[i + 1] == b'*' => {
-            let end = text[i + 2..].find("*/").map_or(bytes.len(), |p| i + 2 + p + 2);
+            let end = text[i + 2..]
+                .find("*/")
+                .map_or(bytes.len(), |p| i + 2 + p + 2);
             end.min(limit) - i
         }
         b if b < 0x80 => 0,
@@ -140,16 +142,14 @@ fn trivia_len(text: &str, i: usize, limit: usize) -> usize {
 fn is_unicode_trivia(c: char) -> bool {
     matches!(
         c,
-        '\u{0085}'
-            | '\u{00A0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200B}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}'
-            | '\u{FEFF}'
+        '\u{0085}' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200B}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
     )
 }
 
@@ -159,7 +159,12 @@ fn is_unicode_trivia(c: char) -> bool {
 // delimited list starts after its opener. It ends after its last element,
 // or after the trailing comma.
 #[must_use]
-pub fn go_list_range(runs: &TriviaRuns, text: &[u8], range: (u32, u32), elements: Option<((u32, u32), (u32, u32))>) -> (u32, u32) {
+pub fn go_list_range(
+    runs: &TriviaRuns,
+    text: &[u8],
+    range: (u32, u32),
+    elements: Option<((u32, u32), (u32, u32))>,
+) -> (u32, u32) {
     let (s, e) = range;
     let opener_at = |x: u32| matches!(text.get(x as usize), Some(b'(' | b'[' | b'{' | b'<'));
     match elements {
@@ -172,9 +177,17 @@ pub fn go_list_range(runs: &TriviaRuns, text: &[u8], range: (u32, u32), elements
             }
         }
         Some(((first_pos, _), (_, last_end))) => {
-            let pos = if s < first_pos && opener_at(s) { s + 1 } else { runs.full_start(s).min(first_pos) };
+            let pos = if s < first_pos && opener_at(s) {
+                s + 1
+            } else {
+                runs.full_start(s).min(first_pos)
+            };
             let next = runs.skip_from(last_end);
-            let end = if next < e && text.get(next as usize) == Some(&b',') { next + 1 } else { last_end };
+            let end = if next < e && text.get(next as usize) == Some(&b',') {
+                next + 1
+            } else {
+                last_end
+            };
             (pos, end)
         }
     }
@@ -194,13 +207,24 @@ pub fn go_list_range(runs: &TriviaRuns, text: &[u8], range: (u32, u32), elements
 // - a hole in an array binding pattern covers its comma. Go's BindingElement
 //   there is zero-width.
 #[must_use]
-pub fn go_node_range(runs: &TriviaRuns, text: &[u8], arena: &NodeArena, n: &ts_ast::Node) -> (u32, u32) {
+pub fn go_node_range(
+    runs: &TriviaRuns,
+    text: &[u8],
+    arena: &NodeArena,
+    n: &ts_ast::Node,
+) -> (u32, u32) {
     let (s, e) = (n.range.start.get(), n.range.end.get());
     let parent = n.parent.and_then(|p| arena.get(p));
     let pos = match (&n.data, parent) {
-        (NodeData::VariableDeclarationList(_), Some(p)) if p.kind == SyntaxKind::VariableStatement => {
+        (NodeData::VariableDeclarationList(_), Some(p))
+            if p.kind == SyntaxKind::VariableStatement =>
+        {
             let last_modifier = match &p.data {
-                NodeData::VariableStatement(d) => d.modifiers.as_ref().and_then(|m| m.list.nodes.last()).and_then(|&m| arena.get(m)),
+                NodeData::VariableStatement(d) => d
+                    .modifiers
+                    .as_ref()
+                    .and_then(|m| m.list.nodes.last())
+                    .and_then(|&m| arena.get(m)),
                 _ => None,
             };
             match last_modifier {
@@ -224,13 +248,20 @@ pub fn go_node_range(runs: &TriviaRuns, text: &[u8], arena: &NodeArena, n: &ts_a
         }
     };
     let in_type = parent.is_some_and(|p| {
-        matches!(p.kind, SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral | SyntaxKind::MappedType)
+        matches!(
+            p.kind,
+            SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral | SyntaxKind::MappedType
+        )
     });
     let end_of = |id: ts_ast::NodeId| arena.get(id).map_or(e, |c| c.range.end.get());
     // The end after the `)` that follows `x`, if there is one.
     let close_paren = |x: u32| {
         let t = runs.skip_from(x);
-        if at(t) == Some(b')') { Some(t + 1) } else { None }
+        if at(t) == Some(b')') {
+            Some(t + 1)
+        } else {
+            None
+        }
     };
     let end = match &n.data {
         NodeData::FunctionDeclaration(d) if d.body.is_none() => absorb(e, false),
@@ -249,11 +280,19 @@ pub fn go_node_range(runs: &TriviaRuns, text: &[u8], arena: &NodeArena, n: &ts_a
         }
         NodeData::ImportTypeNode(d) if d.qualifier.is_none() && d.type_arguments.is_none() => {
             let last = d.attributes.map_or_else(|| end_of(d.argument), end_of);
-            if last == e { close_paren(e).unwrap_or(e) } else { e }
+            if last == e {
+                close_paren(e).unwrap_or(e)
+            } else {
+                e
+            }
         }
         // Go parseArrayBindingElement makes a zero-width BindingElement at
         // the comma of a hole. The Rust OmittedExpression covers the comma.
-        NodeData::OmittedExpression(_) if parent.is_some_and(|p| p.kind == SyntaxKind::ArrayBindingPattern) => pos,
+        NodeData::OmittedExpression(_)
+            if parent.is_some_and(|p| p.kind == SyntaxKind::ArrayBindingPattern) =>
+        {
+            pos
+        }
         NodeData::DoStatement(d) if end_of(d.expression) == e => match close_paren(e) {
             Some(x) => {
                 let t = runs.skip_from(x);

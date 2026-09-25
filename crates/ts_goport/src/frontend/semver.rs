@@ -43,7 +43,11 @@ fn match_number_component(s: &str, wildcards: bool) -> Option<usize> {
 
 // Matches a run of `[a-z0-9-.]+` (under `(?i)`) at the start of `s`.
 fn match_part_run(s: &str) -> Option<usize> {
-    let n: usize = s.chars().take_while(|&c| is_part_char(c)).map(char::len_utf8).sum();
+    let n: usize = s
+        .chars()
+        .take_while(|&c| is_part_char(c))
+        .map(char::len_utf8)
+        .sum();
     if n == 0 { None } else { Some(n) }
 }
 
@@ -88,7 +92,11 @@ fn match_version_pattern(text: &str, wildcards: bool) -> Option<[&str; 5]> {
             pos += 1 + n;
         }
     }
-    if pos == text.len() { Some(groups) } else { None }
+    if pos == text.len() {
+        Some(groups)
+    } else {
+        None
+    }
 }
 
 // Go: semver/version.go:28 prereleasePartRegexp
@@ -117,7 +125,9 @@ fn is_prerelease(s: &str) -> bool {
 // Go: semver/version.go:37 buildPartRegExp
 // PORT: hand-written matcher for `(?i)^[a-z0-9-]+$`.
 fn is_build_part(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| is_fold_letter(c) || c.is_ascii_digit() || c == '-')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| is_fold_letter(c) || c.is_ascii_digit() || c == '-')
 }
 
 // Go: semver/version.go:36 buildRegExp
@@ -144,7 +154,10 @@ pub struct Version {
 
 // Go: semver/version.go:52 versionZero
 fn version_zero() -> Version {
-    Version { prerelease: vec!["0".to_string()], ..Version::default() }
+    Version {
+        prerelease: vec!["0".to_string()],
+        ..Version::default()
+    }
 }
 
 const COMPARISON_LESS_THAN: i32 = -1;
@@ -164,12 +177,19 @@ impl Version {
     // PORT: Go does not overflow-check `+ 1`. `wrapping_add` keeps the
     // Go uint32 wraparound.
     fn increment_major(&self) -> Version {
-        Version { major: self.major.wrapping_add(1), ..Version::default() }
+        Version {
+            major: self.major.wrapping_add(1),
+            ..Version::default()
+        }
     }
 
     // Go: semver/version.go:62 incrementMinor
     fn increment_minor(&self) -> Version {
-        Version { major: self.major, minor: self.minor.wrapping_add(1), ..Version::default() }
+        Version {
+            major: self.major,
+            minor: self.minor.wrapping_add(1),
+            ..Version::default()
+        }
     }
 
     // Go: semver/version.go:69 incrementPatch
@@ -319,7 +339,10 @@ pub fn try_parse_version(text: &str) -> Result<Version, String> {
     let mut result = Version::default();
 
     let Some(m) = match_version_pattern(text, false) else {
-        return Err(SemverParseError { orig_input: text.to_string() }.error());
+        return Err(SemverParseError {
+            orig_input: text.to_string(),
+        }
+        .error());
     };
 
     let major_str = m[0];
@@ -340,13 +363,19 @@ pub fn try_parse_version(text: &str) -> Result<Version, String> {
 
     if !prerelease_str.is_empty() {
         if !is_prerelease(prerelease_str) {
-            return Err(SemverParseError { orig_input: text.to_string() }.error());
+            return Err(SemverParseError {
+                orig_input: text.to_string(),
+            }
+            .error());
         }
         result.prerelease = prerelease_str.split('.').map(str::to_string).collect();
     }
     if !build_str.is_empty() {
         if !is_build(build_str) {
-            return Err(SemverParseError { orig_input: text.to_string() }.error());
+            return Err(SemverParseError {
+                orig_input: text.to_string(),
+            }
+            .error());
         }
         result.build = build_str.split('.').map(str::to_string).collect();
     }
@@ -369,7 +398,9 @@ pub fn must_parse_version(text: &str) -> Version {
 // accepted; an empty string, a sign or a value above u32::MAX is an error.
 fn get_uint_component(text: &str) -> Result<u32, String> {
     if text.is_empty() || !text.bytes().all(|c| c.is_ascii_digit()) {
-        return Err(format!("strconv.ParseUint: parsing {text:?}: invalid syntax"));
+        return Err(format!(
+            "strconv.ParseUint: parsing {text:?}: invalid syntax"
+        ));
     }
     text.parse::<u32>()
         .map_err(|_| format!("strconv.ParseUint: parsing {text:?}: value out of range"))
@@ -576,11 +607,17 @@ fn is_range_operand_char(c: char) -> bool {
 }
 
 fn operand_run_len(s: &str) -> usize {
-    s.chars().take_while(|&c| is_range_operand_char(c)).map(char::len_utf8).sum()
+    s.chars()
+        .take_while(|&c| is_range_operand_char(c))
+        .map(char::len_utf8)
+        .sum()
 }
 
 fn space_run_len(s: &str) -> usize {
-    s.chars().take_while(|&c| is_re_space(c)).map(char::len_utf8).sum()
+    s.chars()
+        .take_while(|&c| is_re_space(c))
+        .map(char::len_utf8)
+        .sum()
 }
 
 // Go: semver/version_range.go:33 hyphenRegExp
@@ -614,7 +651,11 @@ fn match_hyphen(s: &str) -> Option<(&str, &str)> {
     let right = &s[pos..pos + n];
     pos += n;
     pos += space_run_len(&s[pos..]);
-    if pos == s.len() { Some((left, right)) } else { None }
+    if pos == s.len() {
+        Some((left, right))
+    } else {
+        None
+    }
 }
 
 // Go: semver/version_range.go:41 rangeRegExp
@@ -755,7 +796,10 @@ fn parse_comparator(op: &str, text: &str) -> Option<Vec<VersionComparator>> {
     if !is_wildcard(&result.major_str) {
         match op {
             "~" => {
-                let first = VersionComparator { operator: RangeGreaterThanEqual, operand: result.version.clone() };
+                let first = VersionComparator {
+                    operator: RangeGreaterThanEqual,
+                    operand: result.version.clone(),
+                };
 
                 let second_version = if is_wildcard(&result.minor_str) {
                     result.version.increment_major()
@@ -763,11 +807,17 @@ fn parse_comparator(op: &str, text: &str) -> Option<Vec<VersionComparator>> {
                     result.version.increment_minor()
                 };
 
-                let second = VersionComparator { operator: RangeLessThan, operand: second_version };
+                let second = VersionComparator {
+                    operator: RangeLessThan,
+                    operand: second_version,
+                };
                 comparators_result = vec![first, second];
             }
             "^" => {
-                let first = VersionComparator { operator: RangeGreaterThanEqual, operand: result.version.clone() };
+                let first = VersionComparator {
+                    operator: RangeGreaterThanEqual,
+                    operand: result.version.clone(),
+                };
 
                 let second_version = if result.version.major > 0 || is_wildcard(&result.minor_str) {
                     result.version.increment_major()
@@ -776,19 +826,33 @@ fn parse_comparator(op: &str, text: &str) -> Option<Vec<VersionComparator>> {
                 } else {
                     result.version.increment_patch()
                 };
-                let second = VersionComparator { operator: RangeLessThan, operand: second_version };
+                let second = VersionComparator {
+                    operator: RangeLessThan,
+                    operand: second_version,
+                };
                 comparators_result = vec![first, second];
             }
             "<" | ">=" => {
-                let operator = if op == "<" { RangeLessThan } else { RangeGreaterThanEqual };
+                let operator = if op == "<" {
+                    RangeLessThan
+                } else {
+                    RangeGreaterThanEqual
+                };
                 let mut version = result.version.clone();
                 if is_wildcard(&result.minor_str) || is_wildcard(&result.patch_str) {
                     version.prerelease = vec!["0".to_string()];
                 }
-                comparators_result = vec![VersionComparator { operator, operand: version }];
+                comparators_result = vec![VersionComparator {
+                    operator,
+                    operand: version,
+                }];
             }
             "<=" | ">" => {
-                let mut operator = if op == "<=" { RangeLessThanEqual } else { RangeGreaterThan };
+                let mut operator = if op == "<=" {
+                    RangeLessThanEqual
+                } else {
+                    RangeGreaterThan
+                };
                 let mut version = result.version.clone();
                 if is_wildcard(&result.minor_str) {
                     if operator == RangeLessThanEqual {
@@ -810,7 +874,10 @@ fn parse_comparator(op: &str, text: &str) -> Option<Vec<VersionComparator>> {
                     version.prerelease = vec!["0".to_string()];
                 }
 
-                comparators_result = vec![VersionComparator { operator, operand: version }];
+                comparators_result = vec![VersionComparator {
+                    operator,
+                    operand: version,
+                }];
             }
             "=" | "" => {
                 // normalize empty string to `=`
@@ -830,11 +897,20 @@ fn parse_comparator(op: &str, text: &str) -> Option<Vec<VersionComparator>> {
                     second_version.prerelease = vec!["0".to_string()];
 
                     comparators_result = vec![
-                        VersionComparator { operator: RangeGreaterThanEqual, operand: first_version },
-                        VersionComparator { operator: RangeLessThan, operand: second_version },
+                        VersionComparator {
+                            operator: RangeGreaterThanEqual,
+                            operand: first_version,
+                        },
+                        VersionComparator {
+                            operator: RangeLessThan,
+                            operand: second_version,
+                        },
                     ];
                 } else {
-                    comparators_result = vec![VersionComparator { operator, operand: result.version.clone() }];
+                    comparators_result = vec![VersionComparator {
+                        operator,
+                        operand: result.version.clone(),
+                    }];
                 }
             }
             _ => panic!("Unexpected operator: {op}"),
@@ -842,7 +918,10 @@ fn parse_comparator(op: &str, text: &str) -> Option<Vec<VersionComparator>> {
     } else if op == "<" || op == ">" {
         comparators_result = vec![
             // < 0.0.0-0
-            VersionComparator { operator: RangeLessThan, operand: version_zero() },
+            VersionComparator {
+                operator: RangeLessThan,
+                operand: version_zero(),
+            },
         ];
     }
 

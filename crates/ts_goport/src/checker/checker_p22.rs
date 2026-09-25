@@ -29,7 +29,9 @@ impl Checker {
         // TODO: Given that we allow type parameters here now, is this `!isGenericMappedType(type)` check really needed?
         // There's no reason a `T` should be allowed while a `Readonly<T>` should not.
         let flags = self.ty(t).flags;
-        if flags.intersects(TypeFlags::OBJECT | TypeFlags::NON_PRIMITIVE | TypeFlags::ANY) && !self.is_generic_mapped_type(t) {
+        if flags.intersects(TypeFlags::OBJECT | TypeFlags::NON_PRIMITIVE | TypeFlags::ANY)
+            && !self.is_generic_mapped_type(t)
+        {
             return true;
         }
         if flags.intersects(TypeFlags::INTERSECTION) {
@@ -44,7 +46,10 @@ impl Checker {
     pub fn has_base_type(&mut self, t: TypeId, check_base: TypeId) -> bool {
         // PORT: the Go recursive closure `check` is a nested fn.
         fn check(c: &mut Checker, t: TypeId, check_base: TypeId) -> bool {
-            if c.ty(t).object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE) {
+            if c.ty(t)
+                .object_flags
+                .intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE)
+            {
                 let target = c.get_target_type(t);
                 if target == check_base {
                     return true;
@@ -70,7 +75,12 @@ impl Checker {
     }
 
     // Go: checker/checker.go:19472 getTypeWithThisArgument
-    pub fn get_type_with_this_argument(&mut self, t: TypeId, this_argument: TypeId, need_apparent_type: bool) -> TypeId {
+    pub fn get_type_with_this_argument(
+        &mut self,
+        t: TypeId,
+        this_argument: TypeId,
+        need_apparent_type: bool,
+    ) -> TypeId {
         let mut this_argument = this_argument;
         if self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE) {
             let target = self.ty(t).target();
@@ -88,7 +98,11 @@ impl Checker {
             let types = self.ty(t).types().to_vec();
             let mut new_types = Vec::with_capacity(types.len());
             for &ty in &types {
-                new_types.push(self.get_type_with_this_argument(ty, this_argument, need_apparent_type));
+                new_types.push(self.get_type_with_this_argument(
+                    ty,
+                    this_argument,
+                    need_apparent_type,
+                ));
             }
             // PORT: Go `core.SameMap` + `core.Same` is element-wise identity.
             if new_types == types {
@@ -103,7 +117,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:19497 addInheritedMembers
-    pub fn add_inherited_members(&mut self, symbols: SymbolTable, base_symbols: &[SymbolId]) -> SymbolTable {
+    pub fn add_inherited_members(
+        &mut self,
+        symbols: SymbolTable,
+        base_symbols: &[SymbolId],
+    ) -> SymbolTable {
         let mut symbols = symbols;
         for &base in base_symbols {
             if !self.is_static_private_identifier_property(base) {
@@ -133,10 +151,14 @@ impl Checker {
             }
             let call_symbol = self.symbols.get(members, INTERNAL_SYMBOL_NAME_CALL);
             let call_signatures = self.get_signatures_of_symbol(call_symbol);
-            self.ty_mut(t).as_interface_type_mut().declared_call_signatures = call_signatures;
+            self.ty_mut(t)
+                .as_interface_type_mut()
+                .declared_call_signatures = call_signatures;
             let new_symbol = self.symbols.get(members, INTERNAL_SYMBOL_NAME_NEW);
             let construct_signatures = self.get_signatures_of_symbol(new_symbol);
-            self.ty_mut(t).as_interface_type_mut().declared_construct_signatures = construct_signatures;
+            self.ty_mut(t)
+                .as_interface_type_mut()
+                .declared_construct_signatures = construct_signatures;
             let index_infos = self.get_index_infos_of_symbol(symbol);
             self.ty_mut(t).as_interface_type_mut().declared_index_infos = index_infos;
         }
@@ -157,7 +179,11 @@ impl Checker {
 
     // note intentional similarities to index signature building in `checkObjectLiteral` for parity
     // Go: checker/checker.go:19533 getIndexInfosOfIndexSymbol
-    pub fn get_index_infos_of_index_symbol(&mut self, index_symbol: SymbolId, sibling_symbols: &[SymbolId]) -> Vec<IndexInfoId> {
+    pub fn get_index_infos_of_index_symbol(
+        &mut self,
+        index_symbol: SymbolId,
+        sibling_symbols: &[SymbolId],
+    ) -> Vec<IndexInfoId> {
         let mut index_infos: Vec<IndexInfoId> = Vec::new();
         let mut has_computed_string_property = false;
         let mut has_computed_number_property = false;
@@ -180,7 +206,9 @@ impl Checker {
                         }
                         let key_types = self.get_type_from_type_node(type_node);
                         self.for_each_type(key_types, &mut |c: &mut Checker, key_type: TypeId| {
-                            if c.is_valid_index_key_type(key_type) && c.find_index_info(&index_infos, key_type).is_nil() {
+                            if c.is_valid_index_key_type(key_type)
+                                && c.find_index_info(&index_infos, key_type).is_nil()
+                            {
                                 let index_info = c.new_index_info(
                                     key_type,
                                     value_type,
@@ -194,7 +222,11 @@ impl Checker {
                     }
                 }
             } else if self.has_late_bindable_index_signature(declaration) {
-                let decl_name = if is_binary_expression(declaration) { declaration.left() } else { declaration.name() };
+                let decl_name = if is_binary_expression(declaration) {
+                    declaration.left()
+                } else {
+                    declaration.name()
+                };
                 let key_type = if is_element_access_expression(decl_name) {
                     self.check_expression_cached(decl_name.argument_expression())
                 } else {
@@ -228,7 +260,10 @@ impl Checker {
                 }
             }
         }
-        if has_computed_string_property || has_computed_number_property || has_computed_symbol_property {
+        if has_computed_string_property
+            || has_computed_number_property
+            || has_computed_symbol_property
+        {
             for &sym in sibling_symbols {
                 if sym != index_symbol {
                     property_symbols.push(sym);
@@ -236,18 +271,36 @@ impl Checker {
             }
             // aggregate similar index infos implied to be the same key to the same combined index info
             let string_type = self.string_type;
-            if has_computed_string_property && self.find_index_info(&index_infos, string_type).is_nil() {
-                let info = self.get_object_literal_index_info(readonly_computed_string_property, &property_symbols, string_type);
+            if has_computed_string_property
+                && self.find_index_info(&index_infos, string_type).is_nil()
+            {
+                let info = self.get_object_literal_index_info(
+                    readonly_computed_string_property,
+                    &property_symbols,
+                    string_type,
+                );
                 index_infos.push(info);
             }
             let number_type = self.number_type;
-            if has_computed_number_property && self.find_index_info(&index_infos, number_type).is_nil() {
-                let info = self.get_object_literal_index_info(readonly_computed_number_property, &property_symbols, number_type);
+            if has_computed_number_property
+                && self.find_index_info(&index_infos, number_type).is_nil()
+            {
+                let info = self.get_object_literal_index_info(
+                    readonly_computed_number_property,
+                    &property_symbols,
+                    number_type,
+                );
                 index_infos.push(info);
             }
             let es_symbol_type = self.es_symbol_type;
-            if has_computed_symbol_property && self.find_index_info(&index_infos, es_symbol_type).is_nil() {
-                let info = self.get_object_literal_index_info(readonly_computed_symbol_property, &property_symbols, es_symbol_type);
+            if has_computed_symbol_property
+                && self.find_index_info(&index_infos, es_symbol_type).is_nil()
+            {
+                let info = self.get_object_literal_index_info(
+                    readonly_computed_symbol_property,
+                    &property_symbols,
+                    es_symbol_type,
+                );
                 index_infos.push(info);
             }
         }
@@ -256,7 +309,12 @@ impl Checker {
 
     // NOTE: currently does not make pattern literal indexers, eg `${number}px`
     // Go: checker/checker.go:19620 getObjectLiteralIndexInfo
-    pub fn get_object_literal_index_info(&mut self, is_readonly: bool, properties: &[SymbolId], key_type: TypeId) -> IndexInfoId {
+    pub fn get_object_literal_index_info(
+        &mut self,
+        is_readonly: bool,
+        properties: &[SymbolId],
+        key_type: TypeId,
+    ) -> IndexInfoId {
         let mut prop_types: Vec<TypeId> = Vec::new();
         let mut components: Vec<Node> = Vec::new();
         for &prop in properties {
@@ -273,9 +331,16 @@ impl Checker {
         }
         let mut union_type = self.undefined_type;
         if !prop_types.is_empty() {
-            union_type = self.get_union_type_ex(&prop_types, UnionReduction::SUBTYPE, None, TypeId::NIL);
+            union_type =
+                self.get_union_type_ex(&prop_types, UnionReduction::SUBTYPE, None, TypeId::NIL);
         }
-        self.new_index_info(key_type, union_type, is_readonly, Node::NIL /*declaration*/, &components)
+        self.new_index_info(
+            key_type,
+            union_type,
+            is_readonly,
+            Node::NIL, /*declaration*/
+            &components,
+        )
     }
 
     // Go: checker/checker.go:19640 isSymbolWithSymbolName
@@ -337,7 +402,11 @@ impl Checker {
 
     // Go: checker/checker.go:19686 isValidIndexKeyType
     pub fn is_valid_index_key_type(&mut self, t: TypeId) -> bool {
-        if self.ty(t).flags.intersects(TypeFlags::STRING | TypeFlags::NUMBER | TypeFlags::ES_SYMBOL) {
+        if self
+            .ty(t)
+            .flags
+            .intersects(TypeFlags::STRING | TypeFlags::NUMBER | TypeFlags::ES_SYMBOL)
+        {
             return true;
         }
         if self.is_pattern_literal_type(t) {
@@ -355,7 +424,11 @@ impl Checker {
     // ported elsewhere as `Checker::find_index_info`) and this `*Checker`
     // method with the same body. Both would be `find_index_info`, so this
     // method gets a `_method` suffix.
-    pub fn find_index_info_method(&self, index_infos: &[IndexInfoId], key_type: TypeId) -> IndexInfoId {
+    pub fn find_index_info_method(
+        &self,
+        index_infos: &[IndexInfoId],
+        key_type: TypeId,
+    ) -> IndexInfoId {
         for &info in index_infos {
             if self.index_info(info).key_type == key_type {
                 return info;
@@ -388,7 +461,8 @@ impl Checker {
                 let previous = declarations[i - 1];
                 if decl.parent() == previous.parent()
                     && decl.kind() == previous.kind()
-                    && (decl.pos() == previous.end() || previous.flags().intersects(NodeFlags::REPARSED))
+                    && (decl.pos() == previous.end()
+                        || previous.flags().intersects(NodeFlags::REPARSED))
                 {
                     continue;
                 }
@@ -423,8 +497,13 @@ impl Checker {
                 || is_method_or_accessor(declaration)
                 || is_function_declaration(declaration)
                 || is_constructor_declaration(declaration))
-            && declaration.parameters().iter().all(|param| param.type_().is_nil())
-            && self.get_contextual_type(declaration, ContextFlags::SIGNATURE).is_nil();
+            && declaration
+                .parameters()
+                .iter()
+                .all(|param| param.type_().is_nil())
+            && self
+                .get_contextual_type(declaration, ContextFlags::SIGNATURE)
+                .is_nil();
         if is_untyped_signature_in_js_file {
             flags |= SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE;
         }
@@ -433,7 +512,10 @@ impl Checker {
             let type_node = param.type_();
             // Include parameter symbol instead of property symbol in the signature
             if param_symbol.is_some()
-                && self.sym(param_symbol).flags.intersects(SymbolFlags::PROPERTY)
+                && self
+                    .sym(param_symbol)
+                    .flags
+                    .intersects(SymbolFlags::PROPERTY)
                 && !is_binding_pattern(param.name())
             {
                 let name = self.sym(param_symbol).name.clone();
@@ -443,7 +525,7 @@ impl Checker {
                     param,
                     &name,
                     SymbolFlags::VALUE,
-                    None, /*nameNotFoundMessage*/
+                    None,  /*nameNotFoundMessage*/
                     false, /*isUse*/
                     false, /*excludeGlobals*/
                 );
@@ -462,7 +544,9 @@ impl Checker {
             let is_optional_parameter = is_optional_declaration(param)
                 || param.initializer().is_some()
                 || is_rest_parameter(param)
-                || iife.is_some() && parameters.len() > iife.arguments().len() && type_node.is_nil();
+                || iife.is_some()
+                    && parameters.len() > iife.arguments().len()
+                    && type_node.is_nil();
             if !is_optional_parameter {
                 min_argument_count = parameters.len() as i32;
             }
@@ -472,7 +556,11 @@ impl Checker {
             && self.has_bindable_name(declaration)
             && (!has_this_parameter || this_parameter.is_nil())
         {
-            let other_kind = if is_get_accessor_declaration(declaration) { SyntaxKind::SetAccessor } else { SyntaxKind::GetAccessor };
+            let other_kind = if is_get_accessor_declaration(declaration) {
+                SyntaxKind::SetAccessor
+            } else {
+                SyntaxKind::GetAccessor
+            };
             let symbol = self.get_symbol_of_declaration(declaration);
             let other = get_declaration_of_kind(&self.symbols, symbol, other_kind);
             if other.is_some() {
@@ -485,18 +573,26 @@ impl Checker {
             class_type = self.get_declared_type_of_class_or_interface(merged);
         }
         let type_parameters: Vec<TypeId> = if class_type.is_some() {
-            self.ty(class_type).as_interface_type().local_type_parameters().to_vec()
+            self.ty(class_type)
+                .as_interface_type()
+                .local_type_parameters()
+                .to_vec()
         } else {
             self.get_type_parameters_from_declaration(declaration)
         };
         if has_rest_parameter(declaration) {
             flags |= SignatureFlags::HAS_REST_PARAMETER;
         }
-        if is_constructor_type_node(declaration) || is_constructor_declaration(declaration) || is_construct_signature_declaration(declaration) {
+        if is_constructor_type_node(declaration)
+            || is_constructor_declaration(declaration)
+            || is_construct_signature_declaration(declaration)
+        {
             flags |= SignatureFlags::CONSTRUCT;
         }
-        if is_constructor_type_node(declaration) && has_syntactic_modifier(declaration, ModifierFlags::ABSTRACT)
-            || is_constructor_declaration(declaration) && has_syntactic_modifier(declaration.parent(), ModifierFlags::ABSTRACT)
+        if is_constructor_type_node(declaration)
+            && has_syntactic_modifier(declaration, ModifierFlags::ABSTRACT)
+            || is_constructor_declaration(declaration)
+                && has_syntactic_modifier(declaration.parent(), ModifierFlags::ABSTRACT)
         {
             flags |= SignatureFlags::ABSTRACT;
         }
@@ -539,7 +635,11 @@ impl Checker {
 
     // Go: checker/checker.go:19830 getAccessorThisParameter
     pub fn get_accessor_this_parameter(&self, accessor: Node) -> Node {
-        let expected = if is_get_accessor_declaration(accessor) { 1 } else { 2 };
+        let expected = if is_get_accessor_declaration(accessor) {
+            1
+        } else {
+            2
+        };
         if accessor.parameters().len() == expected {
             return get_this_parameter(accessor);
         }
@@ -627,7 +727,10 @@ impl Checker {
         if self.sig(sig).resolved_return_type.is_some() {
             return self.sig(sig).resolved_return_type;
         }
-        if !self.push_type_resolution(TypeSystemEntity::Signature(sig), TypeSystemPropertyName::RESOLVED_RETURN_TYPE) {
+        if !self.push_type_resolution(
+            TypeSystemEntity::Signature(sig),
+            TypeSystemPropertyName::RESOLVED_RETURN_TYPE,
+        ) {
             return self.error_type;
         }
         let target = self.sig(sig).target;
@@ -643,7 +746,11 @@ impl Checker {
             for &s in &composite.signatures {
                 return_types.push(self.get_return_type_of_signature(s));
             }
-            let combined = self.get_union_or_intersection_type(&return_types, composite.is_union, UnionReduction::SUBTYPE);
+            let combined = self.get_union_or_intersection_type(
+                &return_types,
+                composite.is_union,
+                UnionReduction::SUBTYPE,
+            );
             t = self.instantiate_type(combined, mapper);
         } else {
             t = self.get_return_type_from_annotation(declaration);
@@ -665,7 +772,11 @@ impl Checker {
             if declaration.is_some() {
                 let type_node = declaration.type_();
                 if type_node.is_some() {
-                    self.error(type_node, diag::Return_type_annotation_circularly_references_itself, args![]);
+                    self.error(
+                        type_node,
+                        diag::Return_type_annotation_circularly_references_itself,
+                        args![],
+                    );
                 } else if self.no_implicit_any {
                     let name = get_name_of_declaration(declaration);
                     if name.is_some() {
@@ -711,7 +822,8 @@ impl Checker {
         }
         if is_get_accessor_declaration(declaration) && self.has_bindable_name(declaration) {
             let symbol = self.get_symbol_of_declaration(declaration);
-            let set_accessor = get_declaration_of_kind(&self.symbols, symbol, SyntaxKind::SetAccessor);
+            let set_accessor =
+                get_declaration_of_kind(&self.symbols, symbol, SyntaxKind::SetAccessor);
             return self.get_annotated_accessor_type(set_accessor);
         }
         self.get_return_type_of_full_signature(declaration)
@@ -720,7 +832,9 @@ impl Checker {
     // Go: checker/checker.go:19971 getSignatureOfFullSignatureType
     pub fn get_signature_of_full_signature_type(&mut self, node: Node) -> SignatureId {
         if is_in_js_file(node)
-            && (is_function_declaration(node) || is_method_declaration(node) || is_function_expression_or_arrow_function(node))
+            && (is_function_declaration(node)
+                || is_method_declaration(node)
+                || is_function_expression_or_arrow_function(node))
             && node.full_signature().is_some()
         {
             let t = self.get_type_from_type_node(node.full_signature());
@@ -733,7 +847,11 @@ impl Checker {
     pub fn get_parameter_type_of_full_signature(&mut self, node: Node, parameter: Node) -> TypeId {
         let signature = self.get_signature_of_full_signature_type(node);
         if signature.is_some() {
-            let pos = node.parameters().iter().position(|p| p == parameter).map_or(-1, |p| p as i32);
+            let pos = node
+                .parameters()
+                .iter()
+                .position(|p| p == parameter)
+                .map_or(-1, |p| p as i32);
             if parameter.dot_dot_dot_token().is_some() {
                 return self.get_rest_type_at_position(signature, pos, false /*readonly*/);
             } else {
@@ -765,8 +883,12 @@ impl Checker {
     pub fn get_annotated_accessor_type_node(&self, accessor: Node) -> Node {
         if accessor.is_some() {
             match accessor.kind() {
-                SyntaxKind::GetAccessor | SyntaxKind::PropertyDeclaration => return accessor.type_(),
-                SyntaxKind::SetAccessor => return get_effective_set_accessor_type_annotation_node(accessor),
+                SyntaxKind::GetAccessor | SyntaxKind::PropertyDeclaration => {
+                    return accessor.type_();
+                }
+                SyntaxKind::SetAccessor => {
+                    return get_effective_set_accessor_type_annotation_node(accessor);
+                }
                 _ => {}
             }
         }
@@ -798,7 +920,10 @@ impl Checker {
         let mut next_type = TypeId::NIL;
         let mut fallback_return_type = self.void_type;
         if !is_block(body) {
-            return_type = self.check_expression_cached_ex(body, check_mode.without(CheckMode::SKIP_GENERIC_FUNCTIONS));
+            return_type = self.check_expression_cached_ex(
+                body,
+                check_mode.without(CheckMode::SKIP_GENERIC_FUNCTIONS),
+            );
             if self.is_const_context(body) {
                 return_type = self.get_regular_type_of_literal_type(return_type);
             }
@@ -816,21 +941,34 @@ impl Checker {
                 return_type = self.unwrap_awaited_type(awaited);
             }
         } else if is_generator {
-            let (return_types, is_never_returning) = self.check_and_aggregate_return_expression_types(fn_, check_mode);
+            let (return_types, is_never_returning) =
+                self.check_and_aggregate_return_expression_types(fn_, check_mode);
             if is_never_returning {
                 fallback_return_type = self.never_type;
             } else if !return_types.is_empty() {
-                return_type = self.get_union_type_ex(&return_types, UnionReduction::SUBTYPE, None, TypeId::NIL);
+                return_type = self.get_union_type_ex(
+                    &return_types,
+                    UnionReduction::SUBTYPE,
+                    None,
+                    TypeId::NIL,
+                );
             }
-            let (yield_types, next_types) = self.check_and_aggregate_yield_operand_types(fn_, check_mode);
+            let (yield_types, next_types) =
+                self.check_and_aggregate_yield_operand_types(fn_, check_mode);
             if !yield_types.is_empty() {
-                yield_type = self.get_union_type_ex(&yield_types, UnionReduction::SUBTYPE, None, TypeId::NIL);
+                yield_type = self.get_union_type_ex(
+                    &yield_types,
+                    UnionReduction::SUBTYPE,
+                    None,
+                    TypeId::NIL,
+                );
             }
             if !next_types.is_empty() {
                 next_type = self.get_intersection_type(&next_types);
             }
         } else {
-            let (types, is_never_returning) = self.check_and_aggregate_return_expression_types(fn_, check_mode);
+            let (types, is_never_returning) =
+                self.check_and_aggregate_return_expression_types(fn_, check_mode);
             if is_never_returning {
                 // For an async function, the return type will not be never, but rather a Promise for never.
                 if function_flags.intersects(FunctionFlags::ASYNC) {
@@ -842,14 +980,17 @@ impl Checker {
             }
             if types.is_empty() {
                 // For an async function, the return type will not be void/undefined, but rather a Promise for void/undefined.
-                let contextual_return_type = self.get_contextual_return_type(fn_, ContextFlags::NONE);
+                let contextual_return_type =
+                    self.get_contextual_return_type(fn_, ContextFlags::NONE);
                 let return_type: TypeId;
                 let mut has_undefined = false;
                 if contextual_return_type.is_some() {
                     let unwrapped = self.unwrap_return_type(contextual_return_type, function_flags);
                     let void_type = self.void_type;
                     let t = or_else_type_p22(unwrapped, void_type);
-                    has_undefined = self.some_type(t, &mut |c: &mut Checker, t: TypeId| c.ty(t).flags.intersects(TypeFlags::UNDEFINED));
+                    has_undefined = self.some_type(t, &mut |c: &mut Checker, t: TypeId| {
+                        c.ty(t).flags.intersects(TypeFlags::UNDEFINED)
+                    });
                 }
                 if has_undefined {
                     return_type = self.undefined_type;
@@ -863,7 +1004,8 @@ impl Checker {
                 return return_type;
             }
             // Return a union of the return expression types.
-            return_type = self.get_union_type_ex(&types, UnionReduction::SUBTYPE, None, TypeId::NIL);
+            return_type =
+                self.get_union_type_ex(&types, UnionReduction::SUBTYPE, None, TypeId::NIL);
         }
         if return_type.is_some() || yield_type.is_some() || next_type.is_some() {
             if yield_type.is_some() {
@@ -879,7 +1021,8 @@ impl Checker {
                 || yield_type.is_some() && self.is_unit_type(yield_type)
                 || next_type.is_some() && self.is_unit_type(next_type)
             {
-                let contextual_signature = self.get_contextual_signature_for_function_like_declaration(fn_);
+                let contextual_signature =
+                    self.get_contextual_signature_for_function_like_declaration(fn_);
                 let mut contextual_type = TypeId::NIL;
                 if contextual_signature.is_nil() {
                     // No contextual type
@@ -889,29 +1032,38 @@ impl Checker {
                     }
                 } else {
                     let sig_return_type = self.get_return_type_of_signature(contextual_signature);
-                    contextual_type = self.instantiate_contextual_type(sig_return_type, fn_, ContextFlags::NONE);
+                    contextual_type =
+                        self.instantiate_contextual_type(sig_return_type, fn_, ContextFlags::NONE);
                 }
                 if is_generator {
-                    yield_type = self.get_widened_literal_like_type_for_contextual_iteration_type_if_needed(
-                        yield_type,
-                        contextual_type,
-                        IterationTypeKind::YIELD,
-                        is_async,
-                    );
-                    return_type = self.get_widened_literal_like_type_for_contextual_iteration_type_if_needed(
-                        return_type,
-                        contextual_type,
-                        IterationTypeKind::RETURN,
-                        is_async,
-                    );
-                    next_type = self.get_widened_literal_like_type_for_contextual_iteration_type_if_needed(
-                        next_type,
-                        contextual_type,
-                        IterationTypeKind::NEXT,
-                        is_async,
-                    );
+                    yield_type = self
+                        .get_widened_literal_like_type_for_contextual_iteration_type_if_needed(
+                            yield_type,
+                            contextual_type,
+                            IterationTypeKind::YIELD,
+                            is_async,
+                        );
+                    return_type = self
+                        .get_widened_literal_like_type_for_contextual_iteration_type_if_needed(
+                            return_type,
+                            contextual_type,
+                            IterationTypeKind::RETURN,
+                            is_async,
+                        );
+                    next_type = self
+                        .get_widened_literal_like_type_for_contextual_iteration_type_if_needed(
+                            next_type,
+                            contextual_type,
+                            IterationTypeKind::NEXT,
+                            is_async,
+                        );
                 } else {
-                    return_type = self.get_widened_literal_like_type_for_contextual_return_type_if_needed(return_type, contextual_type, is_async);
+                    return_type = self
+                        .get_widened_literal_like_type_for_contextual_return_type_if_needed(
+                            return_type,
+                            contextual_type,
+                            is_async,
+                        );
                 }
             }
             if yield_type.is_some() {
@@ -950,7 +1102,11 @@ impl Checker {
 
     // Returns the aggregated list of return types, plus a bool indicating a never-returning function.
     // Go: checker/checker.go:20158 checkAndAggregateReturnExpressionTypes
-    pub fn check_and_aggregate_return_expression_types(&mut self, fn_: Node, check_mode: CheckMode) -> (Vec<TypeId>, bool) {
+    pub fn check_and_aggregate_return_expression_types(
+        &mut self,
+        fn_: Node,
+        check_mode: CheckMode,
+    ) -> (Vec<TypeId>, bool) {
         let function_flags = get_function_flags(fn_);
         let mut aggregated_types: Vec<TypeId> = Vec::new();
         let mut has_return_with_no_expression = self.function_has_implicit_return(fn_);
@@ -973,8 +1129,9 @@ impl Checker {
                 let callee_type = self.check_expression_cached(expr.expression());
                 let merged = self.get_merged_symbol(fn_.symbol());
                 if self.ty(callee_type).symbol == merged
-                    && (!is_function_expression_or_arrow_function(self.sym(fn_.symbol()).value_declaration)
-                        || self.is_constant_reference(expr.expression()))
+                    && (!is_function_expression_or_arrow_function(
+                        self.sym(fn_.symbol()).value_declaration,
+                    ) || self.is_constant_reference(expr.expression()))
                 {
                     is_bare_self_call = true;
                 }
@@ -983,7 +1140,10 @@ impl Checker {
                 has_return_of_type_never = true;
                 return false;
             }
-            let mut t = self.check_expression_cached_ex(expr, check_mode.without(CheckMode::SKIP_GENERIC_FUNCTIONS));
+            let mut t = self.check_expression_cached_ex(
+                expr,
+                check_mode.without(CheckMode::SKIP_GENERIC_FUNCTIONS),
+            );
             if function_flags.intersects(FunctionFlags::ASYNC) {
                 // From within an async function you can return either a non-promise value or a promise. Any
                 // Promise/A+ compatible implementation will always assimilate any foreign promise, so the
@@ -1006,10 +1166,14 @@ impl Checker {
             append_if_unique_p22(&mut aggregated_types, t);
             false
         });
-        if aggregated_types.is_empty() && !has_return_with_no_expression && (has_return_of_type_never || may_return_never(fn_)) {
+        if aggregated_types.is_empty()
+            && !has_return_with_no_expression
+            && (has_return_of_type_never || may_return_never(fn_))
+        {
             return (Vec::new(), true);
         }
-        if self.strict_null_checks && !aggregated_types.is_empty() && has_return_with_no_expression {
+        if self.strict_null_checks && !aggregated_types.is_empty() && has_return_with_no_expression
+        {
             let undefined_type = self.undefined_type;
             append_if_unique_p22(&mut aggregated_types, undefined_type);
         }
@@ -1035,25 +1199,45 @@ pub fn may_return_never(fn_: Node) -> bool {
 
 impl Checker {
     // Go: checker/checker.go:20221 checkAndAggregateYieldOperandTypes
-    pub fn check_and_aggregate_yield_operand_types(&mut self, fn_: Node, check_mode: CheckMode) -> (Vec<TypeId>, Vec<TypeId>) {
+    pub fn check_and_aggregate_yield_operand_types(
+        &mut self,
+        fn_: Node,
+        check_mode: CheckMode,
+    ) -> (Vec<TypeId>, Vec<TypeId>) {
         let mut yield_types: Vec<TypeId> = Vec::new();
         let mut next_types: Vec<TypeId> = Vec::new();
         let is_async = get_function_flags(fn_).intersects(FunctionFlags::ASYNC);
         for_each_yield_expression(fn_.body(), &mut |yield_expr: Node| -> bool {
             let mut yield_expr_type = self.undefined_widening_type;
             if yield_expr.expression().is_some() {
-                yield_expr_type = self.check_expression_ex(yield_expr.expression(), check_mode.without(CheckMode::SKIP_GENERIC_FUNCTIONS));
+                yield_expr_type = self.check_expression_ex(
+                    yield_expr.expression(),
+                    check_mode.without(CheckMode::SKIP_GENERIC_FUNCTIONS),
+                );
             }
             if yield_expr.expression().is_some() && self.is_const_context(yield_expr.expression()) {
                 yield_expr_type = self.get_regular_type_of_literal_type(yield_expr_type);
             }
             let any_type = self.any_type;
-            let yielded = self.get_yielded_type_of_yield_expression(yield_expr, yield_expr_type, any_type, is_async);
+            let yielded = self.get_yielded_type_of_yield_expression(
+                yield_expr,
+                yield_expr_type,
+                any_type,
+                is_async,
+            );
             append_if_unique_p22(&mut yield_types, yielded);
             let next_type: TypeId;
             if yield_expr.asterisk_token().is_some() {
-                let use_ = if is_async { IterationUse::ASYNC_YIELD_STAR } else { IterationUse::YIELD_STAR };
-                let iteration_types = self.get_iteration_types_of_iterable(yield_expr_type, use_, yield_expr.expression());
+                let use_ = if is_async {
+                    IterationUse::ASYNC_YIELD_STAR
+                } else {
+                    IterationUse::YIELD_STAR
+                };
+                let iteration_types = self.get_iteration_types_of_iterable(
+                    yield_expr_type,
+                    use_,
+                    yield_expr.expression(),
+                );
                 next_type = iteration_types.next_type;
             } else {
                 next_type = self.get_contextual_type(yield_expr, ContextFlags::NONE);
@@ -1110,7 +1294,8 @@ impl Checker {
             self.error(fn_, message, args![]);
             return self.error_type;
         }
-        let get_global_promise_constructor_symbol = self.get_global_promise_constructor_symbol.clone();
+        let get_global_promise_constructor_symbol =
+            self.get_global_promise_constructor_symbol.clone();
         if get_global_promise_constructor_symbol(self).is_nil() {
             let message: &'static Message = if is_import_call(fn_) {
                 diag::A_dynamic_import_call_in_ES5_requires_the_Promise_constructor_Make_sure_you_have_a_declaration_for_the_Promise_constructor_or_include_ES2015_in_your_lib_option
@@ -1123,11 +1308,19 @@ impl Checker {
     }
 
     // Go: checker/checker.go:20287 unwrapReturnType
-    pub fn unwrap_return_type(&mut self, return_type: TypeId, function_flags: FunctionFlags) -> TypeId {
+    pub fn unwrap_return_type(
+        &mut self,
+        return_type: TypeId,
+        function_flags: FunctionFlags,
+    ) -> TypeId {
         let is_generator = function_flags.intersects(FunctionFlags::GENERATOR);
         let is_async = function_flags.intersects(FunctionFlags::ASYNC);
         if is_generator {
-            let return_iteration_type = self.get_iteration_type_of_generator_function_return_type(IterationTypeKind::RETURN, return_type, is_async);
+            let return_iteration_type = self.get_iteration_type_of_generator_function_return_type(
+                IterationTypeKind::RETURN,
+                return_type,
+                is_async,
+            );
             if return_iteration_type.is_nil() {
                 return self.error_type;
             }
@@ -1157,7 +1350,8 @@ impl Checker {
             if contextual_signature_return_type.is_nil() {
                 // No contextual type
             } else if is_async {
-                contextual_type = self.get_promised_type_of_promise(contextual_signature_return_type);
+                contextual_type =
+                    self.get_promised_type_of_promise(contextual_signature_return_type);
             } else {
                 contextual_type = contextual_signature_return_type;
             }
@@ -1178,7 +1372,11 @@ impl Checker {
         if t.is_some() && self.is_unit_type(t) {
             let mut contextual_type = TypeId::NIL;
             if contextual_signature_return_type.is_some() {
-                contextual_type = self.get_iteration_type_of_generator_function_return_type(kind, contextual_signature_return_type, is_async_generator);
+                contextual_type = self.get_iteration_type_of_generator_function_return_type(
+                    kind,
+                    contextual_signature_return_type,
+                    is_async_generator,
+                );
             }
             t = self.get_widened_literal_like_type_for_contextual_type(t, contextual_type);
         }
@@ -1186,27 +1384,41 @@ impl Checker {
     }
 
     // Go: checker/checker.go:20333 createGeneratorType
-    pub fn create_generator_type(&mut self, yield_type: TypeId, return_type: TypeId, next_type: TypeId, is_async_generator: bool) -> TypeId {
+    pub fn create_generator_type(
+        &mut self,
+        yield_type: TypeId,
+        return_type: TypeId,
+        next_type: TypeId,
+        is_async_generator: bool,
+    ) -> TypeId {
         let resolver = if is_async_generator {
             self.async_iteration_types_resolver.clone()
         } else {
             self.sync_iteration_types_resolver.clone()
         };
         let global_generator_type = (resolver.get_global_generator_type)(self);
-        let resolved_yield = (resolver.resolve_iteration_type)(self, yield_type, Node::NIL /*errorNode*/);
+        let resolved_yield =
+            (resolver.resolve_iteration_type)(self, yield_type, Node::NIL /*errorNode*/);
         let yield_type = or_else_type_p22(resolved_yield, self.unknown_type);
-        let resolved_return = (resolver.resolve_iteration_type)(self, return_type, Node::NIL /*errorNode*/);
+        let resolved_return =
+            (resolver.resolve_iteration_type)(self, return_type, Node::NIL /*errorNode*/);
         let return_type = or_else_type_p22(resolved_return, self.unknown_type);
         if global_generator_type == self.empty_generic_type {
             // Fall back to the global IterableIterator type.
             let global_iterable_iterator_type = (resolver.get_global_iterable_iterator_type)(self);
             if global_iterable_iterator_type != self.empty_generic_type {
-                return self.create_type_from_generic_global_type(global_iterable_iterator_type, &[yield_type, return_type, next_type]);
+                return self.create_type_from_generic_global_type(
+                    global_iterable_iterator_type,
+                    &[yield_type, return_type, next_type],
+                );
             }
             // The global Generator type doesn't exist, so report an error
             (resolver.get_global_iterable_iterator_type_checked)(self);
             return self.empty_object_type;
         }
-        self.create_type_from_generic_global_type(global_generator_type, &[yield_type, return_type, next_type])
+        self.create_type_from_generic_global_type(
+            global_generator_type,
+            &[yield_type, return_type, next_type],
+        )
     }
 }

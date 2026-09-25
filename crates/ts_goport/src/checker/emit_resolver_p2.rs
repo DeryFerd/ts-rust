@@ -16,20 +16,33 @@
 
 use crate::prelude::*;
 
-use crate::checker::emit_resolver_p1::{is_common_js_module_exports, EmitResolver};
-use crate::binder::reference_resolver::{new_reference_resolver, ReferenceResolver, ReferenceResolverHooks};
-use crate::printer::{SymbolAccessibility, SymbolAccessibilityResult, TypeReferenceSerializationKind};
+use crate::binder::reference_resolver::{
+    ReferenceResolver, ReferenceResolverHooks, new_reference_resolver,
+};
+use crate::checker::emit_resolver_p1::{EmitResolver, is_common_js_module_exports};
+use crate::printer::{
+    SymbolAccessibility, SymbolAccessibilityResult, TypeReferenceSerializationKind,
+};
 
 impl EmitResolver {
     // Go: checker/emitresolver.go:601 requiresAddingImplicitUndefinedWorker
-    pub fn requires_adding_implicit_undefined_worker(&self, c: &mut Checker, parameter: Node, enclosing_declaration: Node) -> bool {
+    pub fn requires_adding_implicit_undefined_worker(
+        &self,
+        c: &mut Checker,
+        parameter: Node,
+        enclosing_declaration: Node,
+    ) -> bool {
         (self.is_required_initialized_parameter(c, parameter, enclosing_declaration)
             || self.is_optional_uninitialized_parameter_property(c, parameter))
             && !self.declared_parameter_type_contains_undefined(c, parameter)
     }
 
     // Go: checker/emitresolver.go:605 declaredParameterTypeContainsUndefined
-    pub fn declared_parameter_type_contains_undefined(&self, c: &mut Checker, parameter: Node) -> bool {
+    pub fn declared_parameter_type_contains_undefined(
+        &self,
+        c: &mut Checker,
+        parameter: Node,
+    ) -> bool {
         // typeNode := getNonlocalEffectiveTypeAnnotationNode(parameter); // !!! JSDoc Support
         let type_node = parameter.type_();
         if type_node.is_nil() {
@@ -43,7 +56,11 @@ impl EmitResolver {
     }
 
     // Go: checker/emitresolver.go:618 isOptionalUninitializedParameterProperty
-    pub fn is_optional_uninitialized_parameter_property(&self, c: &mut Checker, parameter: Node) -> bool {
+    pub fn is_optional_uninitialized_parameter_property(
+        &self,
+        c: &mut Checker,
+        parameter: Node,
+    ) -> bool {
         c.strict_null_checks
             && self.is_optional_parameter(c, parameter)
             && ( /*isJSDocParameterTag(parameter) ||*/parameter.initializer().is_nil()) // !!! TODO: JSDoc support
@@ -51,13 +68,20 @@ impl EmitResolver {
     }
 
     // Go: checker/emitresolver.go:625 isRequiredInitializedParameter
-    pub fn is_required_initialized_parameter(&self, c: &mut Checker, parameter: Node, enclosing_declaration: Node) -> bool {
-        if !c.strict_null_checks || self.is_optional_parameter(c, parameter) || /*isJSDocParameterTag(parameter) ||*/ parameter.initializer().is_nil() {
+    pub fn is_required_initialized_parameter(
+        &self,
+        c: &mut Checker,
+        parameter: Node,
+        enclosing_declaration: Node,
+    ) -> bool {
+        if !c.strict_null_checks || self.is_optional_parameter(c, parameter) || /*isJSDocParameterTag(parameter) ||*/ parameter.initializer().is_nil()
+        {
             // !!! TODO: JSDoc Support
             return false;
         }
         if has_syntactic_modifier(parameter, ModifierFlags::PARAMETER_PROPERTY_MODIFIER) {
-            return enclosing_declaration.is_some() && is_function_like_declaration(enclosing_declaration);
+            return enclosing_declaration.is_some()
+                && is_function_like_declaration(enclosing_declaration);
         }
         true
     }
@@ -92,7 +116,11 @@ impl EmitResolver {
 
     // Go: checker/emitresolver.go:652 IsExpandoFunctionDeclarationUnsafe
     // PORT: body of Go `IsExpandoFunctionDeclarationUnsafe` with the checker passed in.
-    pub fn is_expando_function_declaration_unsafe_worker(&self, c: &mut Checker, node: Node) -> bool {
+    pub fn is_expando_function_declaration_unsafe_worker(
+        &self,
+        c: &mut Checker,
+        node: Node,
+    ) -> bool {
         // node = r.emitContext.ParseNode(node)
         if !is_parse_tree_node(node) {
             return false;
@@ -121,7 +149,12 @@ impl EmitResolver {
         meaning: SymbolFlags,
         should_compute_alias_to_mark_visible: bool,
     ) -> SymbolAccessibilityResult {
-        c.is_symbol_accessible(symbol, enclosing_declaration, meaning, should_compute_alias_to_mark_visible)
+        c.is_symbol_accessible(
+            symbol,
+            enclosing_declaration,
+            meaning,
+            should_compute_alias_to_mark_visible,
+        )
     }
 
     // Go: checker/emitresolver.go:677 IsSymbolAccessible
@@ -139,7 +172,13 @@ impl EmitResolver {
         // r.checkerMu.Lock()
         // defer r.checkerMu.Unlock()
         self.with_checker(|c| {
-            self.is_symbol_accessible(c, symbol, enclosing_declaration, meaning, should_compute_alias_to_mark_visible)
+            self.is_symbol_accessible(
+                c,
+                symbol,
+                enclosing_declaration,
+                meaning,
+                should_compute_alias_to_mark_visible,
+            )
         })
     }
 }
@@ -168,7 +207,8 @@ impl EmitResolver {
                     if target.is_some()
                         && node.modifier_flags().intersects(ModifierFlags::EXPORT)
                         && c.get_symbol_flags(target).intersects(SymbolFlags::VALUE)
-                        && (c.compiler_options.should_preserve_const_enums() || !c.is_const_enum_or_const_enum_only_module(target))
+                        && (c.compiler_options.should_preserve_const_enums()
+                            || !c.is_const_enum_or_const_enum_only_module(target))
                     {
                         return true;
                     }
@@ -195,11 +235,18 @@ impl EmitResolver {
         match node.kind() {
             SyntaxKind::ImportEqualsDeclaration => {
                 let symbol = c.get_symbol_of_declaration(node);
-                return self.is_alias_resolved_to_value(c, symbol, false /*excludeTypeOnlyValues*/);
+                return self
+                    .is_alias_resolved_to_value(c, symbol, false /*excludeTypeOnlyValues*/);
             }
-            SyntaxKind::ImportClause | SyntaxKind::NamespaceImport | SyntaxKind::ImportSpecifier | SyntaxKind::ExportSpecifier => {
+            SyntaxKind::ImportClause
+            | SyntaxKind::NamespaceImport
+            | SyntaxKind::ImportSpecifier
+            | SyntaxKind::ExportSpecifier => {
                 let symbol = c.get_symbol_of_declaration(node);
-                return symbol.is_some() && self.is_alias_resolved_to_value(c, symbol, true /*excludeTypeOnlyValues*/);
+                return symbol.is_some()
+                    && self.is_alias_resolved_to_value(
+                        c, symbol, true, /*excludeTypeOnlyValues*/
+                    );
             }
             SyntaxKind::ExportDeclaration => {
                 let export_clause = node.export_clause();
@@ -207,19 +254,27 @@ impl EmitResolver {
                 // `newEmitResolver` sets to `isValueAliasDeclarationWorker`; call the worker.
                 return export_clause.is_some()
                     && (is_namespace_export(export_clause)
-                        || export_clause.elements().iter().any(|e| self.is_value_alias_declaration_worker(c, e)));
+                        || export_clause
+                            .elements()
+                            .iter()
+                            .any(|e| self.is_value_alias_declaration_worker(c, e)));
             }
             SyntaxKind::ExportAssignment => {
-                if node.expression().is_some() && node.expression().kind() == SyntaxKind::Identifier {
+                if node.expression().is_some() && node.expression().kind() == SyntaxKind::Identifier
+                {
                     let symbol = c.get_symbol_of_declaration(node);
-                    return self.is_alias_resolved_to_value(c, symbol, true /*excludeTypeOnlyValues*/);
+                    return self.is_alias_resolved_to_value(
+                        c, symbol, true, /*excludeTypeOnlyValues*/
+                    );
                 }
                 return true;
             }
             SyntaxKind::BinaryExpression => {
                 if is_common_js_module_exports(node) && is_identifier(node.right()) {
                     let symbol = c.get_symbol_of_declaration(node);
-                    return self.is_alias_resolved_to_value(c, symbol, true /*excludeTypeOnlyValues*/);
+                    return self.is_alias_resolved_to_value(
+                        c, symbol, true, /*excludeTypeOnlyValues*/
+                    );
                 }
             }
             _ => {}
@@ -228,7 +283,12 @@ impl EmitResolver {
     }
 
     // Go: checker/emitresolver.go:756 isAliasResolvedToValue
-    pub fn is_alias_resolved_to_value(&self, c: &mut Checker, symbol: SymbolId, exclude_type_only_values: bool) -> bool {
+    pub fn is_alias_resolved_to_value(
+        &self,
+        c: &mut Checker,
+        symbol: SymbolId,
+        exclude_type_only_values: bool,
+    ) -> bool {
         if symbol.is_nil() {
             return false;
         }
@@ -250,8 +310,14 @@ impl EmitResolver {
         }
         // const enums and modules that contain only const enums are not considered values from the emit perspective
         // unless 'preserveConstEnums' option is set to true
-        c.get_symbol_flags_ex(symbol, exclude_type_only_values, true /*excludeLocalMeanings*/).intersects(SymbolFlags::VALUE)
-            && (c.compiler_options.should_preserve_const_enums() || !c.is_const_enum_or_const_enum_only_module(target))
+        c.get_symbol_flags_ex(
+            symbol,
+            exclude_type_only_values,
+            true, /*excludeLocalMeanings*/
+        )
+        .intersects(SymbolFlags::VALUE)
+            && (c.compiler_options.should_preserve_const_enums()
+                || !c.is_const_enum_or_const_enum_only_module(target))
     }
 
     // Go: checker/emitresolver.go:781 IsTopLevelValueImportEqualsWithEntityName
@@ -307,27 +373,54 @@ impl EmitResolver {
         new_reference_resolver(
             c.compiler_options,
             ReferenceResolverHooks {
-                resolve_name: Some(|c, location, name, meaning, name_not_found_message, is_use, exclude_globals| {
-                    c.resolve_name(location, name, meaning, name_not_found_message, is_use, exclude_globals)
-                }),
+                resolve_name: Some(
+                    |c,
+                     location,
+                     name,
+                     meaning,
+                     name_not_found_message,
+                     is_use,
+                     exclude_globals| {
+                        c.resolve_name(
+                            location,
+                            name,
+                            meaning,
+                            name_not_found_message,
+                            is_use,
+                            exclude_globals,
+                        )
+                    },
+                ),
                 get_resolved_symbol: Some(|c, node| c.get_resolved_symbol_or_nil(node)),
                 get_merged_symbol: Some(|c, symbol| c.get_merged_symbol(symbol)),
                 get_parent_of_symbol: Some(|c, symbol| c.get_parent_of_symbol(symbol)),
-                get_symbol_of_declaration: Some(|c, declaration| c.get_symbol_of_declaration(declaration)),
-                get_type_only_alias_declaration: Some(|c, symbol, include| c.get_type_only_alias_declaration_ex(symbol, include)),
-                get_export_symbol_of_value_symbol_if_exported: Some(|c, symbol| c.get_export_symbol_of_value_symbol_if_exported(symbol)),
-                get_element_access_expression_name: Some(|c, expression| c.try_get_element_access_expression_name(expression)),
+                get_symbol_of_declaration: Some(|c, declaration| {
+                    c.get_symbol_of_declaration(declaration)
+                }),
+                get_type_only_alias_declaration: Some(|c, symbol, include| {
+                    c.get_type_only_alias_declaration_ex(symbol, include)
+                }),
+                get_export_symbol_of_value_symbol_if_exported: Some(|c, symbol| {
+                    c.get_export_symbol_of_value_symbol_if_exported(symbol)
+                }),
+                get_element_access_expression_name: Some(|c, expression| {
+                    c.try_get_element_access_expression_name(expression)
+                }),
             },
         )
     }
 
     // Go: checker/emitresolver.go:847 GetReferencedExportContainer
-    pub fn get_referenced_export_container(&self, node: Node, prefix_locals: bool) -> Node /*SourceFile|ModuleDeclaration|EnumDeclaration*/ {
+    pub fn get_referenced_export_container(&self, node: Node, prefix_locals: bool) -> Node /*SourceFile|ModuleDeclaration|EnumDeclaration*/
+    {
         if !is_parse_tree_node(node) {
             return Node::NIL;
         }
 
-        self.with_checker(|c| self.get_reference_resolver(c).get_referenced_export_container(c, node, prefix_locals))
+        self.with_checker(|c| {
+            self.get_reference_resolver(c)
+                .get_referenced_export_container(c, node, prefix_locals)
+        })
     }
 
     // Go: checker/emitresolver.go:858 SetReferencedImportDeclaration
@@ -345,7 +438,8 @@ impl EmitResolver {
 
             let symbol = c.get_referenced_value_or_alias_symbol(node);
             if is_non_local_alias(&c.symbols, symbol, SymbolFlags::VALUE)
-                && c.get_type_only_alias_declaration_ex(symbol, SymbolFlags::VALUE).is_nil()
+                && c.get_type_only_alias_declaration_ex(symbol, SymbolFlags::VALUE)
+                    .is_nil()
             {
                 return c.get_declaration_of_alias_symbol(symbol);
             }
@@ -359,7 +453,10 @@ impl EmitResolver {
             return Node::NIL;
         }
 
-        self.with_checker(|c| self.get_reference_resolver(c).get_referenced_value_declaration(c, node))
+        self.with_checker(|c| {
+            self.get_reference_resolver(c)
+                .get_referenced_value_declaration(c, node)
+        })
     }
 
     // Go: checker/emitresolver.go:889 GetReferencedValueDeclarations
@@ -368,7 +465,10 @@ impl EmitResolver {
             return Vec::new();
         }
 
-        self.with_checker(|c| self.get_reference_resolver(c).get_referenced_value_declarations(c, node))
+        self.with_checker(|c| {
+            self.get_reference_resolver(c)
+                .get_referenced_value_declarations(c, node)
+        })
     }
 
     // Go: checker/emitresolver.go:900 IsNameResolvable
@@ -379,7 +479,7 @@ impl EmitResolver {
                 location,
                 name,
                 SymbolFlags::VALUE | SymbolFlags::TYPE | SymbolFlags::NAMESPACE,
-                None, /*nameNotFoundMessage*/
+                None,  /*nameNotFoundMessage*/
                 false, /*isUse*/
                 false, /*excludeGlobals*/
             );
@@ -393,7 +493,10 @@ impl EmitResolver {
             return String::new();
         }
 
-        self.with_checker(|c| self.get_reference_resolver(c).get_element_access_expression_name(c, expression))
+        self.with_checker(|c| {
+            self.get_reference_resolver(c)
+                .get_element_access_expression_name(c, expression)
+        })
     }
 
     // Go: checker/emitresolver.go:920 GetReferencedMemberValueDeclaration
@@ -402,7 +505,10 @@ impl EmitResolver {
             return Node::NIL;
         }
 
-        self.with_checker(|c| self.get_reference_resolver(c).get_referenced_member_value_declaration(c, node))
+        self.with_checker(|c| {
+            self.get_reference_resolver(c)
+                .get_referenced_member_value_declaration(c, node)
+        })
     }
 
     // TODO: the emit resolver being responsible for some amount of node construction is a very leaky abstraction,
@@ -421,11 +527,16 @@ impl EmitResolver {
     ) -> Node {
         let original = emit_context.parse_node(signature_declaration);
         if original.is_nil() {
-            return emit_context.factory.new_keyword_type_node(SyntaxKind::AnyKeyword);
+            return emit_context
+                .factory
+                .new_keyword_type_node(SyntaxKind::AnyKeyword);
         }
 
         self.with_checker(|c| {
-            let request_node_builder = Rc::new(RefCell::new(new_node_builder(c, emit_context_rc(emit_context)))); // TODO: cache per-context
+            let request_node_builder = Rc::new(RefCell::new(new_node_builder(
+                c,
+                emit_context_rc(emit_context),
+            ))); // TODO: cache per-context
             c.node_builder_serialize_return_type_for_signature(
                 &request_node_builder,
                 original,
@@ -453,7 +564,10 @@ impl EmitResolver {
         }
 
         self.with_checker(|c| {
-            let request_node_builder = Rc::new(RefCell::new(new_node_builder(c, emit_context_rc(emit_context)))); // TODO: cache per-context
+            let request_node_builder = Rc::new(RefCell::new(new_node_builder(
+                c,
+                emit_context_rc(emit_context),
+            ))); // TODO: cache per-context
             c.node_builder_serialize_type_parameters_for_signature(
                 &request_node_builder,
                 original,
@@ -477,11 +591,16 @@ impl EmitResolver {
     ) -> Node {
         let original = emit_context.parse_node(declaration);
         if original.is_nil() {
-            return emit_context.factory.new_keyword_type_node(SyntaxKind::AnyKeyword);
+            return emit_context
+                .factory
+                .new_keyword_type_node(SyntaxKind::AnyKeyword);
         }
 
         self.with_checker(|c| {
-            let request_node_builder = Rc::new(RefCell::new(new_node_builder(c, emit_context_rc(emit_context)))); // TODO: cache per-context
+            let request_node_builder = Rc::new(RefCell::new(new_node_builder(
+                c,
+                emit_context_rc(emit_context),
+            ))); // TODO: cache per-context
             // // Get type of the symbol if this is the valid symbol otherwise get type at location
             let symbol = c.get_symbol_of_declaration(declaration);
             c.node_builder_serialize_type_for_declaration(
@@ -497,7 +616,12 @@ impl EmitResolver {
     }
 
     // Go: checker/emitresolver.go:973 CreateLiteralConstValue
-    pub fn create_literal_const_value(&self, emit_context: &EmitContext, node: Node, tracker: EmitSymbolTracker) -> Node {
+    pub fn create_literal_const_value(
+        &self,
+        emit_context: &EmitContext,
+        node: Node,
+        tracker: EmitSymbolTracker,
+    ) -> Node {
         let node = emit_context.parse_node(node);
         let t = self.with_checker(|c| {
             let symbol = c.get_symbol_of_declaration(node);
@@ -512,7 +636,10 @@ impl EmitResolver {
             self.with_checker(|c| (c.ty(t).flags, c.ty(t).symbol, c.true_type, c.false_type));
         if t_flags.intersects(TypeFlags::ENUM_LIKE) {
             enum_result = self.with_checker(|c| {
-                let request_node_builder = Rc::new(RefCell::new(new_node_builder(c, emit_context_rc(emit_context)))); // TODO: cache per-context
+                let request_node_builder = Rc::new(RefCell::new(new_node_builder(
+                    c,
+                    emit_context_rc(emit_context),
+                ))); // TODO: cache per-context
                 c.node_builder_symbol_to_expression(
                     &request_node_builder,
                     t_symbol,
@@ -526,9 +653,13 @@ impl EmitResolver {
             // What about regularTrueType/regularFalseType - since those aren't fresh, we never make initializers from them
             // TODO: handle those if this function is ever used for more than initializers in declaration emit
         } else if t == true_type {
-            enum_result = emit_context.factory.new_keyword_expression(SyntaxKind::TrueKeyword);
+            enum_result = emit_context
+                .factory
+                .new_keyword_expression(SyntaxKind::TrueKeyword);
         } else if t == false_type {
-            enum_result = emit_context.factory.new_keyword_expression(SyntaxKind::FalseKeyword);
+            enum_result = emit_context
+                .factory
+                .new_keyword_expression(SyntaxKind::FalseKeyword);
         }
         if enum_result.is_some() {
             return enum_result;
@@ -539,13 +670,18 @@ impl EmitResolver {
         let value = self.with_checker(|c| c.ty(t).as_literal_type().value.clone());
         let factory = &emit_context.factory;
         match value {
-            Some(LiteralValue::String(value)) => factory.new_string_literal(value, TokenFlags::NONE),
+            Some(LiteralValue::String(value)) => {
+                factory.new_string_literal(value, TokenFlags::NONE)
+            }
             Some(LiteralValue::Number(value)) => {
                 if value.is_infinite() {
                     if value > ts_jsnum::Number(0.0) {
                         return factory.new_identifier("Infinity");
                     }
-                    return factory.new_prefix_unary_expression(SyntaxKind::MinusToken, factory.new_identifier("Infinity"));
+                    return factory.new_prefix_unary_expression(
+                        SyntaxKind::MinusToken,
+                        factory.new_identifier("Infinity"),
+                    );
                 }
                 if value.is_nan() {
                     return factory.new_identifier("NaN");
@@ -554,14 +690,16 @@ impl EmitResolver {
                     // negative
                     return factory.new_prefix_unary_expression(
                         SyntaxKind::MinusToken,
-                        factory.new_numeric_literal(value.to_string()[1..].to_string(), TokenFlags::NONE),
+                        factory.new_numeric_literal(
+                            value.to_string()[1..].to_string(),
+                            TokenFlags::NONE,
+                        ),
                     );
                 }
                 factory.new_numeric_literal(value.to_string(), TokenFlags::NONE)
             }
-            Some(LiteralValue::PseudoBigInt(value)) => {
-                factory.new_big_int_literal(pseudo_big_int_to_string(&value) + "n", TokenFlags::NONE)
-            }
+            Some(LiteralValue::PseudoBigInt(value)) => factory
+                .new_big_int_literal(pseudo_big_int_to_string(&value) + "n", TokenFlags::NONE),
             Some(LiteralValue::Bool(value)) => {
                 let mut kind = SyntaxKind::FalseKeyword;
                 if value {
@@ -585,11 +723,16 @@ impl EmitResolver {
     ) -> Node {
         let expression = emit_context.parse_node(expression);
         if expression.is_nil() {
-            return emit_context.factory.new_keyword_type_node(SyntaxKind::AnyKeyword);
+            return emit_context
+                .factory
+                .new_keyword_type_node(SyntaxKind::AnyKeyword);
         }
 
         self.with_checker(|c| {
-            let request_node_builder = Rc::new(RefCell::new(new_node_builder(c, emit_context_rc(emit_context)))); // TODO: cache per-context
+            let request_node_builder = Rc::new(RefCell::new(new_node_builder(
+                c,
+                emit_context_rc(emit_context),
+            ))); // TODO: cache per-context
             c.node_builder_serialize_type_for_expression(
                 &request_node_builder,
                 expression,
@@ -623,10 +766,14 @@ impl EmitResolver {
                 // uses the symbol table's own order.
                 let members = c.get_members_of_symbol(sym);
                 let sibling_symbols = c.symbols.values(members);
-                instance_infos = c.get_index_infos_of_index_symbol(instance_index_symbol, &sibling_symbols);
+                instance_infos =
+                    c.get_index_infos_of_index_symbol(instance_index_symbol, &sibling_symbols);
             }
 
-            let request_node_builder = Rc::new(RefCell::new(new_node_builder(c, emit_context_rc(emit_context)))); // TODO: cache per-context
+            let request_node_builder = Rc::new(RefCell::new(new_node_builder(
+                c,
+                emit_context_rc(emit_context),
+            ))); // TODO: cache per-context
             let factory = &emit_context.factory;
 
             let mut result: Vec<Node> = Vec::new();
@@ -648,13 +795,19 @@ impl EmitResolver {
                     let components = c.index_info(info).components.clone();
                     if !components.is_empty() {
                         // !!! TODO: Complete late-bound index info support - getObjectLiteralIndexInfo does not yet add late bound components to index signatures
-                        let all_component_computed_names_serializable = enclosing_declaration.is_some()
+                        let all_component_computed_names_serializable = enclosing_declaration
+                            .is_some()
                             && components.iter().all(|&comp| {
                                 comp.name().is_some()
                                     && is_computed_property_name(comp.name())
                                     && is_entity_name_expression(comp.name().expression())
                                     && self
-                                        .is_entity_name_visible(c, comp.name().expression(), enclosing_declaration, false)
+                                        .is_entity_name_visible(
+                                            c,
+                                            comp.name().expression(),
+                                            enclosing_declaration,
+                                            false,
+                                        )
                                         .accessibility
                                         == SymbolAccessibility::ACCESSIBLE
                             });
@@ -665,13 +818,14 @@ impl EmitResolver {
                                     continue;
                                 }
 
-                                let first_identifier = get_first_identifier(comp.name().expression());
+                                let first_identifier =
+                                    get_first_identifier(comp.name().expression());
                                 let name = c.resolve_name(
                                     first_identifier,
                                     first_identifier.text(),
                                     SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
-                                    None, /*nameNotFoundMessage*/
-                                    true, /*isUse*/
+                                    None,  /*nameNotFoundMessage*/
+                                    true,  /*isUse*/
                                     false, /*excludeGlobals*/
                                 );
                                 if name.is_some() {
@@ -684,10 +838,14 @@ impl EmitResolver {
                                     );
                                 }
 
-                                let mut mods: Option<Vec<Node>> =
-                                    if is_static { Some(vec![factory.new_modifier(SyntaxKind::StaticKeyword)]) } else { None };
+                                let mut mods: Option<Vec<Node>> = if is_static {
+                                    Some(vec![factory.new_modifier(SyntaxKind::StaticKeyword)])
+                                } else {
+                                    None
+                                };
                                 if c.index_info(info).is_readonly {
-                                    mods.get_or_insert_with(Vec::new).push(factory.new_modifier(SyntaxKind::ReadonlyKeyword));
+                                    mods.get_or_insert_with(Vec::new)
+                                        .push(factory.new_modifier(SyntaxKind::ReadonlyKeyword));
                                 }
 
                                 let comp_symbol = comp.symbol();
@@ -727,7 +885,12 @@ impl EmitResolver {
                         let mut mod_nodes = vec![factory.new_modifier(SyntaxKind::StaticKeyword)];
                         mod_nodes.extend(node.modifier_nodes().iter());
                         let mods = factory.new_modifier_list(&mod_nodes);
-                        node = factory.update_index_signature_declaration(node, mods, node.parameter_list(), node.type_());
+                        node = factory.update_index_signature_declaration(
+                            node,
+                            mods,
+                            node.parameter_list(),
+                            node.type_(),
+                        );
                     }
                     if node.is_some() {
                         result.push(node);
@@ -739,7 +902,11 @@ impl EmitResolver {
     }
 
     // Go: checker/emitresolver.go:1136 GetEffectiveDeclarationFlags
-    pub fn get_effective_declaration_flags(&self, node: Node, flags: ModifierFlags) -> ModifierFlags {
+    pub fn get_effective_declaration_flags(
+        &self,
+        node: Node,
+        flags: ModifierFlags,
+    ) -> ModifierFlags {
         // node = emitContext.ParseNode(node)
         self.with_checker(|c| c.get_effective_declaration_flags(node, flags))
     }
@@ -757,7 +924,11 @@ impl EmitResolver {
     }
 
     // Go: checker/emitresolver.go:1157 GetTypeReferenceSerializationKind
-    pub fn get_type_reference_serialization_kind(&self, type_name: Node, location: Node) -> TypeReferenceSerializationKind {
+    pub fn get_type_reference_serialization_kind(
+        &self,
+        type_name: Node,
+        location: Node,
+    ) -> TypeReferenceSerializationKind {
         // typeName = emitContext.ParseNode(typeName)
         // location = emitContext.ParseNode(location)
         self.with_checker(|c| {
@@ -768,36 +939,52 @@ impl EmitResolver {
             // Resolve the symbol as a value to ensure the type can be reached at runtime during emit.
             let mut is_type_only = false;
             if is_qualified_name(type_name) {
-                let root_value_symbol =
-                    c.resolve_entity_name(get_first_identifier(type_name), SymbolFlags::VALUE, true, true, location);
+                let root_value_symbol = c.resolve_entity_name(
+                    get_first_identifier(type_name),
+                    SymbolFlags::VALUE,
+                    true,
+                    true,
+                    location,
+                );
 
-                if root_value_symbol.is_some() && !c.sym(root_value_symbol).declarations.is_empty() {
-                    is_type_only =
-                        c.sym(root_value_symbol).declarations.iter().all(|&d| is_type_only_import_or_export_declaration(d));
+                if root_value_symbol.is_some() && !c.sym(root_value_symbol).declarations.is_empty()
+                {
+                    is_type_only = c
+                        .sym(root_value_symbol)
+                        .declarations
+                        .iter()
+                        .all(|&d| is_type_only_import_or_export_declaration(d));
                 }
             }
-            let value_symbol = c.resolve_entity_name(type_name, SymbolFlags::VALUE, true, true, location);
+            let value_symbol =
+                c.resolve_entity_name(type_name, SymbolFlags::VALUE, true, true, location);
             let mut resolved_value_symbol = value_symbol;
             if value_symbol.is_some() && c.sym(value_symbol).flags.intersects(SymbolFlags::ALIAS) {
                 resolved_value_symbol = c.resolve_alias(value_symbol);
             }
 
             is_type_only = is_type_only
-                || (value_symbol.is_some() && c.get_type_only_alias_declaration_ex(value_symbol, SymbolFlags::VALUE).is_some());
+                || (value_symbol.is_some()
+                    && c.get_type_only_alias_declaration_ex(value_symbol, SymbolFlags::VALUE)
+                        .is_some());
 
             // Resolve the symbol as a type so that we can provide a more useful hint for the type serializer.
-            let type_symbol = c.resolve_entity_name(type_name, SymbolFlags::TYPE, true, true, location);
+            let type_symbol =
+                c.resolve_entity_name(type_name, SymbolFlags::TYPE, true, true, location);
             let mut resolved_type_symbol = type_symbol;
             if type_symbol.is_some() && c.sym(type_symbol).flags.intersects(SymbolFlags::ALIAS) {
                 resolved_type_symbol = c.resolve_alias(type_symbol);
             }
             // In case the value symbol can't be resolved (e.g. because of missing declarations), use type symbol for reachability check.
             is_type_only = is_type_only
-                || (type_symbol.is_some() && c.get_type_only_alias_declaration_ex(type_symbol, SymbolFlags::TYPE).is_some());
+                || (type_symbol.is_some()
+                    && c.get_type_only_alias_declaration_ex(type_symbol, SymbolFlags::TYPE)
+                        .is_some());
 
             if resolved_value_symbol.is_some() && resolved_value_symbol == resolved_type_symbol {
                 let global_promise_symbol = c.get_global_promise_constructor_symbol();
-                if global_promise_symbol.is_some() && resolved_value_symbol == global_promise_symbol {
+                if global_promise_symbol.is_some() && resolved_value_symbol == global_promise_symbol
+                {
                     return TypeReferenceSerializationKind::PROMISE;
                 }
 
@@ -828,7 +1015,10 @@ impl EmitResolver {
 
             if c.ty(type_).flags.intersects(TypeFlags::ANY_OR_UNKNOWN) {
                 TypeReferenceSerializationKind::OBJECT_TYPE
-            } else if c.is_type_assignable_to_kind(type_, TypeFlags::VOID | TypeFlags::NULLABLE | TypeFlags::NEVER) {
+            } else if c.is_type_assignable_to_kind(
+                type_,
+                TypeFlags::VOID | TypeFlags::NULLABLE | TypeFlags::NEVER,
+            ) {
                 TypeReferenceSerializationKind::VOID_NULLABLE_OR_NEVER_TYPE
             } else if c.is_type_assignable_to_kind(type_, TypeFlags::BOOLEAN_LIKE) {
                 TypeReferenceSerializationKind::BOOLEAN_TYPE
@@ -860,7 +1050,11 @@ impl EmitResolver {
 
     // Go: checker/emitresolver.go:1249 GetPropertiesOfContainerFunction
     // PORT: body of Go `GetPropertiesOfContainerFunction` with the checker passed in.
-    pub fn get_properties_of_container_function_worker(&self, c: &mut Checker, node: Node) -> Vec<SymbolId> {
+    pub fn get_properties_of_container_function_worker(
+        &self,
+        c: &mut Checker,
+        node: Node,
+    ) -> Vec<SymbolId> {
         // This is explicitly _not locked_ because it is only called via error reporters invoked via node builder calls
         // to the symbol tracker already within locked contexts.
         // r.checkerMu.Lock()
@@ -888,7 +1082,10 @@ impl EmitResolver {
     ) -> Node {
         let type_node = emit_context.parse_node(type_node);
         self.with_checker(|c| {
-            let request_node_builder = Rc::new(RefCell::new(new_node_builder(c, emit_context_rc(emit_context)))); // TODO: cache per-context
+            let request_node_builder = Rc::new(RefCell::new(new_node_builder(
+                c,
+                emit_context_rc(emit_context),
+            ))); // TODO: cache per-context
             c.node_builder_try_js_type_node_to_type_node(
                 &request_node_builder,
                 type_node,
@@ -939,7 +1136,12 @@ fn mark_linked_references_recursively_visit(c: &mut Checker, n: Node) -> bool {
     if is_import_declaration(n) {
         return false; // likewise, these are ultimately what get marked by calls on other nodes - we want to skip them
     }
-    c.mark_linked_references(n, ReferenceHint::UNSPECIFIED, SymbolId::NIL /*propSymbol*/, TypeId::NIL /*parentType*/);
+    c.mark_linked_references(
+        n,
+        ReferenceHint::UNSPECIFIED,
+        SymbolId::NIL, /*propSymbol*/
+        TypeId::NIL,   /*parentType*/
+    );
     n.for_each_child(|child: Node| mark_linked_references_recursively_visit(c, child));
     false
 }

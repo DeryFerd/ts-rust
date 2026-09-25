@@ -16,7 +16,11 @@ impl Checker {
                 match heritage_clause.token() {
                     SyntaxKind::ExtendsKeyword => {
                         if seen_extends_clause {
-                            return self.grammar_error_on_first_token(heritage_clause_node, diag::X_extends_clause_already_seen, args![]);
+                            return self.grammar_error_on_first_token(
+                                heritage_clause_node,
+                                diag::X_extends_clause_already_seen,
+                                args![],
+                            );
                         }
                         seen_extends_clause = true;
                     }
@@ -46,8 +50,14 @@ impl Checker {
         }
 
         let expression = node.expression();
-        if expression.kind() == SyntaxKind::BinaryExpression && expression.operator_token().kind() == SyntaxKind::CommaToken {
-            return self.grammar_error_on_node(expression, diag::A_comma_expression_is_not_allowed_in_a_computed_property_name, args![]);
+        if expression.kind() == SyntaxKind::BinaryExpression
+            && expression.operator_token().kind() == SyntaxKind::CommaToken
+        {
+            return self.grammar_error_on_node(
+                expression,
+                diag::A_comma_expression_is_not_allowed_in_a_computed_property_name,
+                args![],
+            );
         }
         false
     }
@@ -77,10 +87,18 @@ impl Checker {
                 panic!("Unexpected node kind {:?}", node.kind());
             }
             if node.flags().intersects(NodeFlags::AMBIENT) {
-                return self.grammar_error_on_node(asterisk_token, diag::Generators_are_not_allowed_in_an_ambient_context, args![]);
+                return self.grammar_error_on_node(
+                    asterisk_token,
+                    diag::Generators_are_not_allowed_in_an_ambient_context,
+                    args![],
+                );
             }
             if node.body().is_nil() {
-                return self.grammar_error_on_node(asterisk_token, diag::An_overload_signature_cannot_be_declared_as_a_generator, args![]);
+                return self.grammar_error_on_node(
+                    asterisk_token,
+                    diag::An_overload_signature_cannot_be_declared_as_a_generator,
+                    args![],
+                );
             }
         }
 
@@ -88,21 +106,33 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:1007 checkGrammarForInvalidQuestionMark
-    pub fn check_grammar_for_invalid_question_mark(&mut self, postfix_token: Node, message: &'static Message) -> bool {
+    pub fn check_grammar_for_invalid_question_mark(
+        &mut self,
+        postfix_token: Node,
+        message: &'static Message,
+    ) -> bool {
         postfix_token.is_some()
             && postfix_token.kind() == SyntaxKind::QuestionToken
             && self.grammar_error_on_node(postfix_token, message, args![])
     }
 
     // Go: checker/grammarchecks.go:1011 checkGrammarForInvalidExclamationToken
-    pub fn check_grammar_for_invalid_exclamation_token(&mut self, postfix_token: Node, message: &'static Message) -> bool {
+    pub fn check_grammar_for_invalid_exclamation_token(
+        &mut self,
+        postfix_token: Node,
+        message: &'static Message,
+    ) -> bool {
         postfix_token.is_some()
             && postfix_token.kind() == SyntaxKind::ExclamationToken
             && self.grammar_error_on_node(postfix_token, message, args![])
     }
 
     // Go: checker/grammarchecks.go:1015 checkGrammarObjectLiteralExpression
-    pub fn check_grammar_object_literal_expression(&mut self, node: Node, in_destructuring: bool) -> bool {
+    pub fn check_grammar_object_literal_expression(
+        &mut self,
+        node: Node,
+        in_destructuring: bool,
+    ) -> bool {
         let mut seen: FxHashMap<String, DeclarationMeaning> = FxHashMap::default();
 
         // PORT: Go reads `node.Properties.Nodes` with a nil check; `properties()`
@@ -114,8 +144,14 @@ impl Checker {
                 if in_destructuring {
                     // a rest property cannot be destructured any further
                     let expression = skip_parentheses(spread_expression);
-                    if is_array_literal_expression(expression) || is_object_literal_expression(expression) {
-                        return self.grammar_error_on_node(spread_expression, diag::A_rest_element_cannot_contain_a_binding_pattern, args![]);
+                    if is_array_literal_expression(expression)
+                        || is_object_literal_expression(expression)
+                    {
+                        return self.grammar_error_on_node(
+                            spread_expression,
+                            diag::A_rest_element_cannot_contain_a_binding_pattern,
+                            args![],
+                        );
                     }
                 }
                 continue;
@@ -152,7 +188,11 @@ impl Checker {
             }
 
             if name.kind() == SyntaxKind::PrivateIdentifier {
-                self.grammar_error_on_node(name, diag::Private_identifiers_are_not_allowed_outside_class_bodies, args![]);
+                self.grammar_error_on_node(
+                    name,
+                    diag::Private_identifiers_are_not_allowed_outside_class_bodies,
+                    args![],
+                );
             }
 
             // Modifiers are never allowed on properties except for 'async' on a method declaration
@@ -160,14 +200,25 @@ impl Checker {
             if modifiers.len() != 0 {
                 if can_have_modifiers(prop) {
                     for m in modifiers.iter() {
-                        if is_modifier(m) && (m.kind() != SyntaxKind::AsyncKeyword || prop.kind() != SyntaxKind::MethodDeclaration) {
-                            self.grammar_error_on_node(m, diag::X_0_modifier_cannot_be_used_here, args![get_text_of_node(m)]);
+                        if is_modifier(m)
+                            && (m.kind() != SyntaxKind::AsyncKeyword
+                                || prop.kind() != SyntaxKind::MethodDeclaration)
+                        {
+                            self.grammar_error_on_node(
+                                m,
+                                diag::X_0_modifier_cannot_be_used_here,
+                                args![get_text_of_node(m)],
+                            );
                         }
                     }
                 } else if can_have_illegal_modifiers(prop) {
                     for m in modifiers.iter() {
                         if is_modifier(m) {
-                            self.grammar_error_on_node(m, diag::X_0_modifier_cannot_be_used_here, args![get_text_of_node(m)]);
+                            self.grammar_error_on_node(
+                                m,
+                                diag::X_0_modifier_cannot_be_used_here,
+                                args![get_text_of_node(m)],
+                            );
                         }
                     }
                 }
@@ -195,7 +246,10 @@ impl Checker {
                         postfix_token,
                         diag::A_definite_assignment_assertion_is_not_permitted_in_this_context,
                     );
-                    self.check_grammar_for_invalid_question_mark(postfix_token, diag::An_object_member_cannot_be_declared_optional);
+                    self.check_grammar_for_invalid_question_mark(
+                        postfix_token,
+                        diag::An_object_member_cannot_be_declared_optional,
+                    );
 
                     if name.kind() == SyntaxKind::NumericLiteral {
                         self.check_grammar_numeric_literal(name);
@@ -204,7 +258,11 @@ impl Checker {
                     if name.kind() == SyntaxKind::BigIntLiteral {
                         self.add_error_or_suggestion(
                             true,
-                            create_diagnostic_for_node(name, diag::A_bigint_literal_cannot_be_used_as_a_property_name, args![]),
+                            create_diagnostic_for_node(
+                                name,
+                                diag::A_bigint_literal_cannot_be_used_as_a_property_name,
+                                args![],
+                            ),
                         );
                     }
 
@@ -223,7 +281,8 @@ impl Checker {
             }
 
             if !in_destructuring {
-                let (effective_name, ok) = self.get_effective_property_name_for_property_name_node(name);
+                let (effective_name, ok) =
+                    self.get_effective_property_name_for_property_name_node(name);
                 if !ok {
                     continue;
                 }
@@ -231,8 +290,14 @@ impl Checker {
                 let existing_kind = seen.get(&effective_name).copied().unwrap_or_default();
                 if existing_kind.is_empty() {
                     seen.insert(effective_name, current_kind);
-                } else if current_kind.intersects(DeclarationMeaning::METHOD) && existing_kind.intersects(DeclarationMeaning::METHOD) {
-                    self.grammar_error_on_node(name, diag::Duplicate_identifier_0, args![get_text_of_node(name)]);
+                } else if current_kind.intersects(DeclarationMeaning::METHOD)
+                    && existing_kind.intersects(DeclarationMeaning::METHOD)
+                {
+                    self.grammar_error_on_node(
+                        name,
+                        diag::Duplicate_identifier_0,
+                        args![get_text_of_node(name)],
+                    );
                 } else if current_kind.intersects(DeclarationMeaning::PROPERTY_ASSIGNMENT)
                     && existing_kind.intersects(DeclarationMeaning::PROPERTY_ASSIGNMENT)
                 {
@@ -244,7 +309,9 @@ impl Checker {
                 } else if current_kind.intersects(DeclarationMeaning::GET_OR_SET_ACCESSOR)
                     && existing_kind.intersects(DeclarationMeaning::GET_OR_SET_ACCESSOR)
                 {
-                    if existing_kind != DeclarationMeaning::GET_OR_SET_ACCESSOR && current_kind != existing_kind {
+                    if existing_kind != DeclarationMeaning::GET_OR_SET_ACCESSOR
+                        && current_kind != existing_kind
+                    {
                         seen.insert(effective_name, current_kind | existing_kind);
                     } else {
                         return self.grammar_error_on_node(
@@ -282,9 +349,16 @@ impl Checker {
             if !seen.contains(&text_of_name) {
                 seen.insert(text_of_name);
             } else {
-                return self.grammar_error_on_node(name, diag::JSX_elements_cannot_have_multiple_attributes_with_the_same_name, args![]);
+                return self.grammar_error_on_node(
+                    name,
+                    diag::JSX_elements_cannot_have_multiple_attributes_with_the_same_name,
+                    args![],
+                );
             }
-            if initializer.is_some() && initializer.kind() == SyntaxKind::JsxExpression && initializer.expression().is_nil() {
+            if initializer.is_some()
+                && initializer.kind() == SyntaxKind::JsxExpression
+                && initializer.expression().is_nil()
+            {
                 return self.grammar_error_on_node(
                     initializer,
                     diag::JSX_attributes_must_only_be_assigned_a_non_empty_expression,
@@ -309,7 +383,11 @@ impl Checker {
             && self.compiler_options.get_jsx_transform_enabled()
             && !is_intrinsic_jsx_name(&node.namespace().text())
         {
-            return self.grammar_error_on_node(node, diag::React_components_cannot_include_JSX_namespace_names, args![]);
+            return self.grammar_error_on_node(
+                node,
+                diag::React_components_cannot_include_JSX_namespace_names,
+                args![],
+            );
         }
 
         false
@@ -330,15 +408,23 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:1199 checkGrammarForInOrForOfStatement
-    pub fn check_grammar_for_in_or_for_of_statement(&mut self, for_in_or_of_statement: Node) -> bool {
+    pub fn check_grammar_for_in_or_for_of_statement(
+        &mut self,
+        for_in_or_of_statement: Node,
+    ) -> bool {
         let as_node = for_in_or_of_statement;
         if self.check_grammar_statement_in_ambient_context(as_node) {
             return true;
         }
 
-        if for_in_or_of_statement.kind() == SyntaxKind::ForOfStatement && for_in_or_of_statement.await_modifier().is_some() {
+        if for_in_or_of_statement.kind() == SyntaxKind::ForOfStatement
+            && for_in_or_of_statement.await_modifier().is_some()
+        {
             let await_modifier = for_in_or_of_statement.await_modifier();
-            if !for_in_or_of_statement.flags().intersects(NodeFlags::AWAIT_CONTEXT) {
+            if !for_in_or_of_statement
+                .flags()
+                .intersects(NodeFlags::AWAIT_CONTEXT)
+            {
                 let source_file = get_source_file_of_node(as_node);
                 if is_in_top_level_context(as_node) {
                     if !self.has_parse_diagnostics(source_file) {
@@ -353,9 +439,15 @@ impl Checker {
                         // true when control reaches the `default` case.
                         let mut report_top_level = false;
                         match self.module_kind {
-                            ModuleKind::NODE16 | ModuleKind::NODE18 | ModuleKind::NODE20 | ModuleKind::NODE_NEXT => {
-                                let source_file_meta_data = get_source_file_meta_data(&source_file_info(source_file).path);
-                                if source_file_meta_data.implied_node_format == ModuleKind::COMMON_JS {
+                            ModuleKind::NODE16
+                            | ModuleKind::NODE18
+                            | ModuleKind::NODE20
+                            | ModuleKind::NODE_NEXT => {
+                                let source_file_meta_data =
+                                    get_source_file_meta_data(&source_file_info(source_file).path);
+                                if source_file_meta_data.implied_node_format
+                                    == ModuleKind::COMMON_JS
+                                {
                                     self.add_diagnostic(create_diagnostic_for_node(
                                         await_modifier,
                                         diag::The_current_file_is_a_CommonJS_module_and_cannot_use_await_at_the_top_level,
@@ -366,7 +458,10 @@ impl Checker {
                                     report_top_level = true;
                                 }
                             }
-                            ModuleKind::ES2022 | ModuleKind::ES_NEXT | ModuleKind::PRESERVE | ModuleKind::SYSTEM => {
+                            ModuleKind::ES2022
+                            | ModuleKind::ES_NEXT
+                            | ModuleKind::PRESERVE
+                            | ModuleKind::SYSTEM => {
                                 if self.language_version < ScriptTarget::ES2017 {
                                     // fallthrough
                                     report_top_level = true;
@@ -393,13 +488,19 @@ impl Checker {
                             args![],
                         );
                         let containing_func = get_containing_function(for_in_or_of_statement);
-                        if containing_func.is_some() && containing_func.kind() != SyntaxKind::Constructor {
+                        if containing_func.is_some()
+                            && containing_func.kind() != SyntaxKind::Constructor
+                        {
                             debug_assert!(
-                                !get_function_flags(containing_func).intersects(FunctionFlags::ASYNC),
+                                !get_function_flags(containing_func)
+                                    .intersects(FunctionFlags::ASYNC),
                                 "Enclosing function should never be an async function."
                             );
-                            let related_info =
-                                create_diagnostic_for_node(containing_func, diag::Did_you_mean_to_mark_this_function_as_async, args![]);
+                            let related_info = create_diagnostic_for_node(
+                                containing_func,
+                                diag::Did_you_mean_to_mark_this_function_as_async,
+                                args![],
+                            );
                             diagnostic.add_related_info(Some(related_info));
                         }
                         self.add_diagnostic(diagnostic);
@@ -411,11 +512,17 @@ impl Checker {
 
         let initializer = for_in_or_of_statement.initializer();
         if is_for_of_statement(as_node)
-            && !for_in_or_of_statement.flags().intersects(NodeFlags::AWAIT_CONTEXT)
+            && !for_in_or_of_statement
+                .flags()
+                .intersects(NodeFlags::AWAIT_CONTEXT)
             && is_identifier(initializer)
             && initializer.text() == "async"
         {
-            self.grammar_error_on_node(initializer, diag::The_left_hand_side_of_a_for_of_statement_may_not_be_async, args![]);
+            self.grammar_error_on_node(
+                initializer,
+                diag::The_left_hand_side_of_a_for_of_statement_may_not_be_async,
+                args![],
+            );
             return false;
         }
 
@@ -436,30 +543,45 @@ impl Checker {
                 }
 
                 if declarations.len() > 1 {
-                    let diagnostic = if for_in_or_of_statement.kind() == SyntaxKind::ForInStatement {
+                    let diagnostic = if for_in_or_of_statement.kind() == SyntaxKind::ForInStatement
+                    {
                         diag::Only_a_single_variable_declaration_is_allowed_in_a_for_in_statement
                     } else {
                         diag::Only_a_single_variable_declaration_is_allowed_in_a_for_of_statement
                     };
-                    return self.grammar_error_on_first_token(declarations.get(1), diagnostic, args![]);
+                    return self.grammar_error_on_first_token(
+                        declarations.get(1),
+                        diagnostic,
+                        args![],
+                    );
                 }
 
                 let first_variable_declaration = declarations.get(0);
                 if first_variable_declaration.initializer().is_some() {
-                    let diagnostic = if for_in_or_of_statement.kind() == SyntaxKind::ForInStatement {
+                    let diagnostic = if for_in_or_of_statement.kind() == SyntaxKind::ForInStatement
+                    {
                         diag::The_variable_declaration_of_a_for_in_statement_cannot_have_an_initializer
                     } else {
                         diag::The_variable_declaration_of_a_for_of_statement_cannot_have_an_initializer
                     };
-                    return self.grammar_error_on_node(first_variable_declaration.name(), diagnostic, args![]);
+                    return self.grammar_error_on_node(
+                        first_variable_declaration.name(),
+                        diagnostic,
+                        args![],
+                    );
                 }
                 if first_variable_declaration.type_().is_some() {
-                    let diagnostic = if for_in_or_of_statement.kind() == SyntaxKind::ForInStatement {
+                    let diagnostic = if for_in_or_of_statement.kind() == SyntaxKind::ForInStatement
+                    {
                         diag::The_left_hand_side_of_a_for_in_statement_cannot_use_a_type_annotation
                     } else {
                         diag::The_left_hand_side_of_a_for_of_statement_cannot_use_a_type_annotation
                     };
-                    return self.grammar_error_on_node(first_variable_declaration, diagnostic, args![]);
+                    return self.grammar_error_on_node(
+                        first_variable_declaration,
+                        diagnostic,
+                        args![],
+                    );
                 }
             }
         }
@@ -475,15 +597,31 @@ impl Checker {
             && (accessor.parent().kind() != SyntaxKind::InterfaceDeclaration)
         {
             if body.is_nil() && !has_syntactic_modifier(accessor, ModifierFlags::ABSTRACT) {
-                return self.grammar_error_at_pos(accessor, accessor.end() - 1, ";".len() as i32, diag::X_0_expected, args!["{"]);
+                return self.grammar_error_at_pos(
+                    accessor,
+                    accessor.end() - 1,
+                    ";".len() as i32,
+                    diag::X_0_expected,
+                    args!["{"],
+                );
             }
         }
         if body.is_some() {
             if has_syntactic_modifier(accessor, ModifierFlags::ABSTRACT) {
-                return self.grammar_error_on_node(accessor, diag::An_abstract_accessor_cannot_have_an_implementation, args![]);
+                return self.grammar_error_on_node(
+                    accessor,
+                    diag::An_abstract_accessor_cannot_have_an_implementation,
+                    args![],
+                );
             }
-            if accessor.parent().kind() == SyntaxKind::TypeLiteral || accessor.parent().kind() == SyntaxKind::InterfaceDeclaration {
-                return self.grammar_error_on_node(body, diag::An_implementation_cannot_be_declared_in_ambient_contexts, args![]);
+            if accessor.parent().kind() == SyntaxKind::TypeLiteral
+                || accessor.parent().kind() == SyntaxKind::InterfaceDeclaration
+            {
+                return self.grammar_error_on_node(
+                    body,
+                    diag::An_implementation_cannot_be_declared_in_ambient_contexts,
+                    args![],
+                );
             }
         }
 
@@ -493,7 +631,11 @@ impl Checker {
         let type_parameters = accessor.type_parameter_list();
 
         if !type_parameters.is_nil() {
-            return self.grammar_error_on_node(accessor.name(), diag::An_accessor_cannot_have_type_parameters, args![]);
+            return self.grammar_error_on_node(
+                accessor.name(),
+                diag::An_accessor_cannot_have_type_parameters,
+                args![],
+            );
         }
         if !self.does_accessor_have_correct_parameter_count(accessor) {
             return self.grammar_error_on_node(
@@ -509,7 +651,11 @@ impl Checker {
         if accessor.kind() == SyntaxKind::SetAccessor {
             // PORT: Go `funcData.Type` is the accessor's `Type` field (`type_()`).
             if accessor.type_().is_some() {
-                return self.grammar_error_on_node(accessor.name(), diag::A_set_accessor_cannot_have_a_return_type_annotation, args![]);
+                return self.grammar_error_on_node(
+                    accessor.name(),
+                    diag::A_set_accessor_cannot_have_a_return_type_annotation,
+                    args![],
+                );
             }
 
             let parameter_node = get_set_accessor_value_parameter(accessor);
@@ -518,13 +664,25 @@ impl Checker {
             }
             let parameter = parameter_node;
             if parameter.dot_dot_dot_token().is_some() {
-                return self.grammar_error_on_node(parameter.dot_dot_dot_token(), diag::A_set_accessor_cannot_have_rest_parameter, args![]);
+                return self.grammar_error_on_node(
+                    parameter.dot_dot_dot_token(),
+                    diag::A_set_accessor_cannot_have_rest_parameter,
+                    args![],
+                );
             }
             if parameter.question_token().is_some() {
-                return self.grammar_error_on_node(parameter.question_token(), diag::A_set_accessor_cannot_have_an_optional_parameter, args![]);
+                return self.grammar_error_on_node(
+                    parameter.question_token(),
+                    diag::A_set_accessor_cannot_have_an_optional_parameter,
+                    args![],
+                );
             }
             if parameter.initializer().is_some() {
-                return self.grammar_error_on_node(accessor.name(), diag::A_set_accessor_parameter_cannot_have_an_initializer, args![]);
+                return self.grammar_error_on_node(
+                    accessor.name(),
+                    diag::A_set_accessor_parameter_cannot_have_an_initializer,
+                    args![],
+                );
             }
         }
 
@@ -540,7 +698,12 @@ impl Checker {
         // `getAccessorThisParameter` returns `nil` if the accessor's arity is incorrect,
         // even if there is a `this` parameter declared.
         self.get_accessor_this_parameter(accessor).is_some()
-            || accessor.parameters().len() == if accessor.kind() == SyntaxKind::GetAccessor { 0 } else { 1 }
+            || accessor.parameters().len()
+                == if accessor.kind() == SyntaxKind::GetAccessor {
+                    0
+                } else {
+                    1
+                }
     }
 
     // Go: checker/grammarchecks.go:1368 checkGrammarTypeOperatorNode
@@ -548,7 +711,11 @@ impl Checker {
         if node.operator() == SyntaxKind::UniqueKeyword {
             let inner_type = node.type_();
             if inner_type.kind() != SyntaxKind::SymbolKeyword {
-                return self.grammar_error_on_node(inner_type, diag::X_0_expected, args![token_to_string(SyntaxKind::SymbolKeyword)]);
+                return self.grammar_error_on_node(
+                    inner_type,
+                    diag::X_0_expected,
+                    args![token_to_string(SyntaxKind::SymbolKeyword)],
+                );
             }
             let parent = walk_up_parenthesized_types(node.parent());
             match parent.kind() {
@@ -595,12 +762,18 @@ impl Checker {
                     }
                 }
                 _ => {
-                    return self.grammar_error_on_node(node, diag::X_unique_symbol_types_are_not_allowed_here, args![]);
+                    return self.grammar_error_on_node(
+                        node,
+                        diag::X_unique_symbol_types_are_not_allowed_here,
+                        args![],
+                    );
                 }
             }
         } else if node.operator() == SyntaxKind::ReadonlyKeyword {
             let inner_type = node.type_();
-            if inner_type.kind() != SyntaxKind::ArrayType && inner_type.kind() != SyntaxKind::TupleType {
+            if inner_type.kind() != SyntaxKind::ArrayType
+                && inner_type.kind() != SyntaxKind::TupleType
+            {
                 return self.grammar_error_on_first_token(
                     node,
                     diag::X_readonly_type_modifier_is_only_permitted_on_array_and_tuple_literal_types,
@@ -613,7 +786,11 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:1408 checkGrammarForInvalidDynamicName
-    pub fn check_grammar_for_invalid_dynamic_name(&mut self, node: Node, message: &'static Message) -> bool {
+    pub fn check_grammar_for_invalid_dynamic_name(
+        &mut self,
+        node: Node,
+        message: &'static Message,
+    ) -> bool {
         if !self.is_non_bindable_dynamic_name(node) {
             return false;
         }
@@ -637,7 +814,10 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:1431 checkGrammarMethod
-    pub fn check_grammar_method(&mut self, node: Node /*Union[MethodDeclaration, MethodSignature]*/) -> bool {
+    pub fn check_grammar_method(
+        &mut self,
+        node: Node, /*Union[MethodDeclaration, MethodSignature]*/
+    ) -> bool {
         if self.check_grammar_function_like_declaration(node) {
             return true;
         }
@@ -647,13 +827,21 @@ impl Checker {
                 // We only disallow modifier on a method declaration if it is a property of object-literal-expression
                 let modifiers = node.modifiers();
                 if !modifiers.is_nil()
-                    && !(modifiers.nodes().len() == 1 && modifiers.nodes().get(0).kind() == SyntaxKind::AsyncKeyword)
+                    && !(modifiers.nodes().len() == 1
+                        && modifiers.nodes().get(0).kind() == SyntaxKind::AsyncKeyword)
                 {
-                    return self.grammar_error_on_first_token(node, diag::Modifiers_cannot_appear_here, args![]);
+                    return self.grammar_error_on_first_token(
+                        node,
+                        diag::Modifiers_cannot_appear_here,
+                        args![],
+                    );
                 }
 
                 let postfix_token = node.postfix_token();
-                if self.check_grammar_for_invalid_question_mark(postfix_token, diag::An_object_member_cannot_be_declared_optional) {
+                if self.check_grammar_for_invalid_question_mark(
+                    postfix_token,
+                    diag::An_object_member_cannot_be_declared_optional,
+                ) {
                     return true;
                 }
                 if self.check_grammar_for_invalid_exclamation_token(
@@ -663,7 +851,13 @@ impl Checker {
                     return true;
                 }
                 if node.body().is_nil() {
-                    return self.grammar_error_at_pos(node, node.end() - 1, ";".len() as i32, diag::X_0_expected, args!["{"]);
+                    return self.grammar_error_at_pos(
+                        node,
+                        node.end() - 1,
+                        ";".len() as i32,
+                        diag::X_0_expected,
+                        args!["{"],
+                    );
                 }
             }
             if self.check_grammar_for_generator(node) {
@@ -709,7 +903,11 @@ impl Checker {
         let mut current = node;
         while current.is_some() {
             if is_function_like_or_class_static_block_declaration(current) {
-                return self.grammar_error_on_node(node, diag::Jump_target_cannot_cross_function_boundary, args![]);
+                return self.grammar_error_on_node(
+                    node,
+                    diag::Jump_target_cannot_cross_function_boundary,
+                    args![],
+                );
             }
 
             match current.kind() {
@@ -717,8 +915,12 @@ impl Checker {
                     if target_label.is_some() && current.label().text() == target_label.text() {
                         // found matching label - verify that label usage is correct
                         // continue can only target labels that are on iteration statements
-                        let is_misplaced_continue_label = node.kind() == SyntaxKind::ContinueStatement
-                            && !is_iteration_statement(current.statement(), true /*lookInLabeledStatements*/);
+                        let is_misplaced_continue_label = node.kind()
+                            == SyntaxKind::ContinueStatement
+                            && !is_iteration_statement(
+                                current.statement(),
+                                true, /*lookInLabeledStatements*/
+                            );
 
                         if is_misplaced_continue_label {
                             return self.grammar_error_on_node(
@@ -738,7 +940,9 @@ impl Checker {
                     }
                 }
                 _ => {
-                    if is_iteration_statement(current, false /*lookInLabeledStatements*/) && target_label.is_nil() {
+                    if is_iteration_statement(current, false /*lookInLabeledStatements*/)
+                        && target_label.is_nil()
+                    {
                         // unlabeled break or continue within iteration statement - ok
                         return false;
                     }
@@ -772,9 +976,17 @@ impl Checker {
             let elements = node.parent().element_list();
             // PORT: Go `core.LastOrNil(elements.Nodes)`.
             let element_nodes = elements.nodes();
-            let last = if element_nodes.is_empty() { Node::NIL } else { element_nodes.get(element_nodes.len() - 1) };
+            let last = if element_nodes.is_empty() {
+                Node::NIL
+            } else {
+                element_nodes.get(element_nodes.len() - 1)
+            };
             if node != last {
-                return self.grammar_error_on_node(node, diag::A_rest_element_must_be_last_in_a_destructuring_pattern, args![]);
+                return self.grammar_error_on_node(
+                    node,
+                    diag::A_rest_element_must_be_last_in_a_destructuring_pattern,
+                    args![],
+                );
             }
             self.check_grammar_for_disallowed_trailing_comma(
                 elements,
@@ -782,13 +994,23 @@ impl Checker {
             );
 
             if node.property_name().is_some() {
-                return self.grammar_error_on_node(node.name(), diag::A_rest_element_cannot_have_a_property_name, args![]);
+                return self.grammar_error_on_node(
+                    node.name(),
+                    diag::A_rest_element_cannot_have_a_property_name,
+                    args![],
+                );
             }
         }
 
         if node.dot_dot_dot_token().is_some() && node.initializer().is_some() {
             // Error on equals token which immediately precedes the initializer
-            return self.grammar_error_at_pos(node, node.initializer().pos() - 1, 1, diag::A_rest_element_cannot_have_an_initializer, args![]);
+            return self.grammar_error_at_pos(
+                node,
+                node.initializer().pos() - 1,
+                1,
+                diag::A_rest_element_cannot_have_an_initializer,
+                args![],
+            );
         }
 
         false
@@ -800,25 +1022,51 @@ impl Checker {
         let block_scope_kind = node_flags & NodeFlags::BLOCK_SCOPED;
         if is_binding_pattern(node.name()) {
             if block_scope_kind == NodeFlags::AWAIT_USING {
-                return self.grammar_error_on_node(node, diag::X_0_declarations_may_not_have_binding_patterns, args!["await using"]);
+                return self.grammar_error_on_node(
+                    node,
+                    diag::X_0_declarations_may_not_have_binding_patterns,
+                    args!["await using"],
+                );
             } else if block_scope_kind == NodeFlags::USING {
-                return self.grammar_error_on_node(node, diag::X_0_declarations_may_not_have_binding_patterns, args!["using"]);
+                return self.grammar_error_on_node(
+                    node,
+                    diag::X_0_declarations_may_not_have_binding_patterns,
+                    args!["using"],
+                );
             }
         }
 
-        if node.parent().parent().kind() != SyntaxKind::ForInStatement && node.parent().parent().kind() != SyntaxKind::ForOfStatement {
+        if node.parent().parent().kind() != SyntaxKind::ForInStatement
+            && node.parent().parent().kind() != SyntaxKind::ForOfStatement
+        {
             if node_flags.intersects(NodeFlags::AMBIENT) {
                 self.check_ambient_initializer(node);
             } else if node.initializer().is_nil() {
                 if is_binding_pattern(node.name()) && !is_binding_pattern(node.parent()) {
-                    return self.grammar_error_on_node(node, diag::A_destructuring_declaration_must_have_an_initializer, args![]);
+                    return self.grammar_error_on_node(
+                        node,
+                        diag::A_destructuring_declaration_must_have_an_initializer,
+                        args![],
+                    );
                 }
                 if block_scope_kind == NodeFlags::AWAIT_USING {
-                    return self.grammar_error_on_node(node, diag::X_0_declarations_must_be_initialized, args!["await using"]);
+                    return self.grammar_error_on_node(
+                        node,
+                        diag::X_0_declarations_must_be_initialized,
+                        args!["await using"],
+                    );
                 } else if block_scope_kind == NodeFlags::USING {
-                    return self.grammar_error_on_node(node, diag::X_0_declarations_must_be_initialized, args!["using"]);
+                    return self.grammar_error_on_node(
+                        node,
+                        diag::X_0_declarations_must_be_initialized,
+                        args!["using"],
+                    );
                 } else if block_scope_kind == NodeFlags::CONST {
-                    return self.grammar_error_on_node(node, diag::X_0_declarations_must_be_initialized, args!["const"]);
+                    return self.grammar_error_on_node(
+                        node,
+                        diag::X_0_declarations_must_be_initialized,
+                        args!["const"],
+                    );
                 }
             }
         }
@@ -841,7 +1089,11 @@ impl Checker {
         }
 
         if get_emit_module_format_of_file(get_source_file_of_node(node)) < ModuleKind::SYSTEM
-            && !node.parent().parent().flags().intersects(NodeFlags::AMBIENT)
+            && !node
+                .parent()
+                .parent()
+                .flags()
+                .intersects(NodeFlags::AMBIENT)
             && has_syntactic_modifier(node.parent().parent(), ModifierFlags::EXPORT)
         {
             self.check_grammar_for_es_module_marker_in_binding_name(node.name());
@@ -854,7 +1106,8 @@ impl Checker {
 
         // It is a SyntaxError if a VariableDeclaration or VariableDeclarationNoIn occurs within strict code
         // and its Identifier is eval or arguments
-        !block_scope_kind.is_empty() && self.check_grammar_name_in_let_or_const_declarations(node.name())
+        !block_scope_kind.is_empty()
+            && self.check_grammar_name_in_let_or_const_declarations(node.name())
     }
 
     // Go: checker/grammarchecks.go:1613 checkGrammarForEsModuleMarkerInBindingName
@@ -878,7 +1131,10 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:1628 checkGrammarNameInLetOrConstDeclarations
-    pub fn check_grammar_name_in_let_or_const_declarations(&mut self, name: Node /*Union[Identifier, BindingPattern]*/) -> bool {
+    pub fn check_grammar_name_in_let_or_const_declarations(
+        &mut self,
+        name: Node, /*Union[Identifier, BindingPattern]*/
+    ) -> bool {
         if name.kind() == SyntaxKind::Identifier {
             if name.text() == "let" {
                 return self.grammar_error_on_node(
@@ -902,7 +1158,10 @@ impl Checker {
     // Go: checker/grammarchecks.go:1645 checkGrammarVariableDeclarationList
     pub fn check_grammar_variable_declaration_list(&mut self, declaration_list: Node) -> bool {
         let declarations = declaration_list.declarations();
-        if self.check_grammar_for_disallowed_trailing_comma(declarations, diag::Trailing_comma_not_allowed) {
+        if self.check_grammar_for_disallowed_trailing_comma(
+            declarations,
+            diag::Trailing_comma_not_allowed,
+        ) {
             return true;
         }
 
@@ -941,7 +1200,8 @@ impl Checker {
                 );
             }
             if is_variable_statement(declaration_list.parent())
-                && (is_case_clause(declaration_list.parent().parent()) || is_default_clause(declaration_list.parent().parent()))
+                && (is_case_clause(declaration_list.parent().parent())
+                    || is_default_clause(declaration_list.parent().parent()))
             {
                 return self.grammar_error_on_node(
                     declaration_list,
@@ -999,8 +1259,12 @@ impl Checker {
                     // when control reaches the `default` case.
                     let mut report_default = false;
                     match self.module_kind {
-                        ModuleKind::NODE16 | ModuleKind::NODE18 | ModuleKind::NODE20 | ModuleKind::NODE_NEXT => {
-                            let source_file_meta_data = get_source_file_meta_data(&source_file_info(source_file).path);
+                        ModuleKind::NODE16
+                        | ModuleKind::NODE18
+                        | ModuleKind::NODE20
+                        | ModuleKind::NODE_NEXT => {
+                            let source_file_meta_data =
+                                get_source_file_meta_data(&source_file_info(source_file).path);
                             if source_file_meta_data.implied_node_format == ModuleKind::COMMON_JS {
                                 if !span_calculated {
                                     span = get_range_of_token_at_position(source_file, node.pos());
@@ -1017,7 +1281,10 @@ impl Checker {
                                 report_default = true;
                             }
                         }
-                        ModuleKind::ES2022 | ModuleKind::ES_NEXT | ModuleKind::PRESERVE | ModuleKind::SYSTEM => {
+                        ModuleKind::ES2022
+                        | ModuleKind::ES_NEXT
+                        | ModuleKind::PRESERVE
+                        | ModuleKind::SYSTEM => {
                             if self.language_version < ScriptTarget::ES2017 {
                                 // fallthrough
                                 report_default = true;
@@ -1051,9 +1318,15 @@ impl Checker {
                         diag::X_await_using_statements_are_only_allowed_within_async_functions_and_at_the_top_levels_of_modules
                     };
                     let mut diagnostic = new_diagnostic(source_file, span, message, args![]);
-                    if container.is_some() && container.kind() != SyntaxKind::Constructor && !has_async_modifier(container) {
-                        let related_info =
-                            new_diagnostic_for_node(container, diag::Did_you_mean_to_mark_this_function_as_async, args![]);
+                    if container.is_some()
+                        && container.kind() != SyntaxKind::Constructor
+                        && !has_async_modifier(container)
+                    {
+                        let related_info = new_diagnostic_for_node(
+                            container,
+                            diag::Did_you_mean_to_mark_this_function_as_async,
+                            args![],
+                        );
                         diagnostic.add_related_info(Some(related_info));
                     }
                     self.add_diagnostic(diagnostic);
@@ -1062,9 +1335,15 @@ impl Checker {
             }
         }
 
-        if is_await_expression(node) && self.is_in_parameter_initializer_before_containing_function(node) {
+        if is_await_expression(node)
+            && self.is_in_parameter_initializer_before_containing_function(node)
+        {
             // NOTE: We report this regardless as to whether there are parse diagnostics.
-            self.error(node, diag::X_await_expressions_cannot_be_used_in_a_parameter_initializer, args![]);
+            self.error(
+                node,
+                diag::X_await_expressions_cannot_be_used_in_a_parameter_initializer,
+                args![],
+            );
             has_error = true;
         }
 
@@ -1075,20 +1354,32 @@ impl Checker {
     pub fn check_grammar_yield_expression(&mut self, node: Node) -> bool {
         let mut has_error = false;
         if !node.flags().intersects(NodeFlags::YIELD_CONTEXT) {
-            self.grammar_error_on_first_token(node, diag::A_yield_expression_is_only_allowed_in_a_generator_body, args![]);
+            self.grammar_error_on_first_token(
+                node,
+                diag::A_yield_expression_is_only_allowed_in_a_generator_body,
+                args![],
+            );
             has_error = true;
         }
         if self.is_in_parameter_initializer_before_containing_function(node) {
-            self.error(node, diag::X_yield_expressions_cannot_be_used_in_a_parameter_initializer, args![]);
+            self.error(
+                node,
+                diag::X_yield_expressions_cannot_be_used_in_a_parameter_initializer,
+                args![],
+            );
             has_error = true;
         }
         has_error
     }
 
     // Go: checker/grammarchecks.go:1789 checkGrammarForDisallowedBlockScopedVariableStatement
-    pub fn check_grammar_for_disallowed_block_scoped_variable_statement(&mut self, node: Node) -> bool {
+    pub fn check_grammar_for_disallowed_block_scoped_variable_statement(
+        &mut self,
+        node: Node,
+    ) -> bool {
         if !self.container_allows_block_scoped_variable(node.parent()) {
-            let block_scope_kind = self.get_combined_node_flags_cached(node.declaration_list()) & NodeFlags::BLOCK_SCOPED;
+            let block_scope_kind = self.get_combined_node_flags_cached(node.declaration_list())
+                & NodeFlags::BLOCK_SCOPED;
             if !block_scope_kind.is_empty() {
                 let keyword = if block_scope_kind == NodeFlags::LET {
                     "let"
@@ -1101,7 +1392,11 @@ impl Checker {
                 } else {
                     panic!("Unknown BlockScope flag")
                 };
-                self.error(node, diag::X_0_declarations_can_only_be_declared_inside_a_block, args![keyword]);
+                self.error(
+                    node,
+                    diag::X_0_declarations_can_only_be_declared_inside_a_block,
+                    args![keyword],
+                );
             }
         }
 
@@ -1118,7 +1413,9 @@ impl Checker {
             | SyntaxKind::ForStatement
             | SyntaxKind::ForInStatement
             | SyntaxKind::ForOfStatement => return false,
-            SyntaxKind::LabeledStatement => return self.container_allows_block_scoped_variable(parent.parent()),
+            SyntaxKind::LabeledStatement => {
+                return self.container_allows_block_scoped_variable(parent.parent());
+            }
             _ => {}
         }
 
@@ -1142,10 +1439,17 @@ impl Checker {
             }
             SyntaxKind::ImportKeyword => {
                 if name_text != "meta" {
-                    let is_callee = is_call_expression(node.parent()) && node.parent().expression() == node;
+                    let is_callee =
+                        is_call_expression(node.parent()) && node.parent().expression() == node;
                     if name_text == "defer" {
                         if !is_callee {
-                            return self.grammar_error_at_pos(node, node.end(), 0, diag::X_0_expected, args!["("]);
+                            return self.grammar_error_at_pos(
+                                node,
+                                node.end(),
+                                0,
+                                diag::X_0_expected,
+                                args!["("],
+                            );
                         }
                     } else {
                         if is_callee {

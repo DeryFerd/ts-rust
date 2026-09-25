@@ -10,7 +10,9 @@ pub fn get_super_container(node: Node, stop_on_functions: bool) -> Node {
             SyntaxKind::ComputedPropertyName => {
                 node = node.parent();
             }
-            SyntaxKind::FunctionDeclaration | SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction => {
+            SyntaxKind::FunctionDeclaration
+            | SyntaxKind::FunctionExpression
+            | SyntaxKind::ArrowFunction => {
                 if stop_on_functions {
                     return node;
                 }
@@ -28,7 +30,9 @@ pub fn get_super_container(node: Node, stop_on_functions: bool) -> Node {
             }
             SyntaxKind::Decorator => {
                 // Decorators are always applied outside of the body of a class or method.
-                if node.parent().kind() == SyntaxKind::Parameter && is_class_element(node.parent().parent()) {
+                if node.parent().kind() == SyntaxKind::Parameter
+                    && is_class_element(node.parent().parent())
+                {
                     // If the decorator's parent is a ParameterDeclaration, we resolve the this container from
                     // the grandparent class declaration.
                     node = node.parent().parent();
@@ -91,7 +95,13 @@ pub fn is_import_node(node: Node) -> bool {
 // For more permissive check, use IsImportNode.
 // Go: ast/utilities.go:1872 IsAnyImportSyntax
 pub fn is_any_import_syntax(node: Node) -> bool {
-    node_kind_is(node, &[SyntaxKind::ImportDeclaration, SyntaxKind::ImportEqualsDeclaration])
+    node_kind_is(
+        node,
+        &[
+            SyntaxKind::ImportDeclaration,
+            SyntaxKind::ImportEqualsDeclaration,
+        ],
+    )
 }
 
 // Go: ast/utilities.go:1876 IsJsonSourceFile
@@ -107,7 +117,9 @@ pub fn is_in_json_file(node: Node) -> bool {
 // Go: ast/utilities.go:1884 GetExternalModuleName
 pub fn get_external_module_name(node: Node) -> Node {
     match node.kind() {
-        SyntaxKind::ImportDeclaration | SyntaxKind::JsImportDeclaration | SyntaxKind::ExportDeclaration => {
+        SyntaxKind::ImportDeclaration
+        | SyntaxKind::JsImportDeclaration
+        | SyntaxKind::ExportDeclaration => {
             return node.module_specifier();
         }
         SyntaxKind::ImportEqualsDeclaration => {
@@ -285,7 +297,9 @@ pub fn is_in_expression_context(node: Node) -> bool {
         | SyntaxKind::JsxExpression
         | SyntaxKind::JsxSpreadAttribute
         | SyntaxKind::SpreadAssignment => true,
-        SyntaxKind::ExpressionWithTypeArguments => parent.expression() == node && !is_part_of_type_node(parent),
+        SyntaxKind::ExpressionWithTypeArguments => {
+            parent.expression() == node && !is_part_of_type_node(parent)
+        }
         SyntaxKind::ShorthandPropertyAssignment => parent.object_assignment_initializer() == node,
         _ => is_expression_node(parent),
     }
@@ -294,7 +308,9 @@ pub fn is_in_expression_context(node: Node) -> bool {
 // Go: ast/utilities.go:1990 IsPartOfTypeNode
 pub fn is_part_of_type_node(node: Node) -> bool {
     let kind = node.kind();
-    if (kind as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16) && (kind as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16) {
+    if (kind as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16)
+        && (kind as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16)
+    {
         return true;
     }
     match node.kind() {
@@ -318,7 +334,8 @@ pub fn is_part_of_type_node(node: Node) -> bool {
             return is_part_of_type_expression_with_type_arguments(node);
         }
         SyntaxKind::TypeParameter => {
-            return node.parent().kind() == SyntaxKind::MappedType || node.parent().kind() == SyntaxKind::InferType;
+            return node.parent().kind() == SyntaxKind::MappedType
+                || node.parent().kind() == SyntaxKind::InferType;
         }
         SyntaxKind::Identifier => {
             let parent = node.parent();
@@ -330,7 +347,9 @@ pub fn is_part_of_type_node(node: Node) -> bool {
             }
             return is_part_of_type_node_in_parent(node);
         }
-        SyntaxKind::QualifiedName | SyntaxKind::PropertyAccessExpression | SyntaxKind::ThisKeyword => {
+        SyntaxKind::QualifiedName
+        | SyntaxKind::PropertyAccessExpression
+        | SyntaxKind::ThisKeyword => {
             return is_part_of_type_node_in_parent(node);
         }
         _ => {}
@@ -354,7 +373,9 @@ pub fn is_part_of_type_node_in_parent(node: Node) -> bool {
     //
     // Calling isPartOfTypeNode would consider the qualified name A.B a type node.
     // Only C and A.B.C are type nodes.
-    if (parent.kind() as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16) && (parent.kind() as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16) {
+    if (parent.kind() as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16)
+        && (parent.kind() as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16)
+    {
         return true;
     }
     match parent.kind() {
@@ -382,7 +403,9 @@ pub fn is_part_of_type_node_in_parent(node: Node) -> bool {
         | SyntaxKind::TypeAssertionExpression => {
             return node == parent.type_();
         }
-        SyntaxKind::CallExpression | SyntaxKind::NewExpression | SyntaxKind::TaggedTemplateExpression => {
+        SyntaxKind::CallExpression
+        | SyntaxKind::NewExpression
+        | SyntaxKind::TaggedTemplateExpression => {
             return parent.type_arguments().to_vec().contains(&node);
         }
         _ => {}
@@ -401,12 +424,20 @@ pub fn is_part_of_type_expression_with_type_arguments(node: Node) -> bool {
 
 // Go: ast/utilities.go:2062 IsJSDocLinkLike
 pub fn is_js_doc_link_like(node: Node) -> bool {
-    node_kind_is(node, &[SyntaxKind::JsDocLink, SyntaxKind::JsDocLinkCode, SyntaxKind::JsDocLinkPlain])
+    node_kind_is(
+        node,
+        &[
+            SyntaxKind::JsDocLink,
+            SyntaxKind::JsDocLinkCode,
+            SyntaxKind::JsDocLinkPlain,
+        ],
+    )
 }
 
 // Go: ast/utilities.go:2066 IsJSDocTag
 pub fn is_js_doc_tag(node: Node) -> bool {
-    (node.kind() as u16) >= (SyntaxKind::FIRST_JS_DOC_TAG_NODE as u16) && (node.kind() as u16) <= (SyntaxKind::LAST_JS_DOC_TAG_NODE as u16)
+    (node.kind() as u16) >= (SyntaxKind::FIRST_JS_DOC_TAG_NODE as u16)
+        && (node.kind() as u16) <= (SyntaxKind::LAST_JS_DOC_TAG_NODE as u16)
 }
 
 // Go: ast/utilities.go:2070 IsSuperCall
@@ -421,7 +452,9 @@ pub fn is_import_call(node: Node) -> bool {
     }
     let e = node.expression();
     e.kind() == SyntaxKind::ImportKeyword
-        || is_meta_property(e) && e.keyword_token() == SyntaxKind::ImportKeyword && e.text() == "defer"
+        || is_meta_property(e)
+            && e.keyword_token() == SyntaxKind::ImportKeyword
+            && e.text() == "defer"
 }
 
 // Go: ast/utilities.go:2082 IsComputedNonLiteralName
@@ -436,17 +469,18 @@ pub fn is_question_token(node: Node) -> bool {
 
 // PORT: Go `getTextOfNode func(*Node) string` may be nil, so it is an Option.
 // Go: ast/utilities.go:2090 EntityNameToString
-pub fn entity_name_to_string(name: Node, get_text_of_node: Option<&dyn Fn(Node) -> String>) -> String {
+pub fn entity_name_to_string(
+    name: Node,
+    get_text_of_node: Option<&dyn Fn(Node) -> String>,
+) -> String {
     match name.kind() {
         SyntaxKind::ThisKeyword => {
             return "this".to_string();
         }
-        SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier => {
-            match get_text_of_node {
-                Some(f) if !node_is_synthesized(name) => return f(name),
-                _ => return name.text().to_string(),
-            }
-        }
+        SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier => match get_text_of_node {
+            Some(f) if !node_is_synthesized(name) => return f(name),
+            _ => return name.text().to_string(),
+        },
         SyntaxKind::QualifiedName => {
             return entity_name_to_string(name.left(), get_text_of_node)
                 + "."
@@ -490,7 +524,10 @@ pub fn try_get_text_of_property_name(name: Node) -> (String, bool) {
             }
         }
         SyntaxKind::JsxNamespacedName => {
-            return (format!("{}:{}", name.namespace().text(), name.name().text()), true);
+            return (
+                format!("{}:{}", name.namespace().text(), name.name().text()),
+                true,
+            );
         }
         _ => {}
     }
@@ -499,7 +536,8 @@ pub fn try_get_text_of_property_name(name: Node) -> (String, bool) {
 
 // Go: ast/utilities.go:2129 IsJSDocNode
 pub fn is_js_doc_node(node: Node) -> bool {
-    (node.kind() as u16) >= (SyntaxKind::FIRST_JS_DOC_NODE as u16) && (node.kind() as u16) <= (SyntaxKind::LAST_JS_DOC_NODE as u16)
+    (node.kind() as u16) >= (SyntaxKind::FIRST_JS_DOC_NODE as u16)
+        && (node.kind() as u16) <= (SyntaxKind::LAST_JS_DOC_NODE as u16)
 }
 
 // Go: ast/utilities.go:2133 IsNonWhitespaceToken
@@ -514,10 +552,15 @@ pub fn is_whitespace_only_jsx_text(node: Node) -> bool {
 
 // Go: ast/utilities.go:2141 GetNewTargetContainer
 pub fn get_new_target_container(node: Node) -> Node {
-    let container = get_this_container(node, false /*includeArrowFunctions*/, false /*includeClassComputedPropertyName*/);
+    let container = get_this_container(
+        node, false, /*includeArrowFunctions*/
+        false, /*includeClassComputedPropertyName*/
+    );
     if container.is_some() {
         match container.kind() {
-            SyntaxKind::Constructor | SyntaxKind::FunctionDeclaration | SyntaxKind::FunctionExpression => {
+            SyntaxKind::Constructor
+            | SyntaxKind::FunctionDeclaration
+            | SyntaxKind::FunctionExpression => {
                 return container;
             }
             _ => {}
@@ -528,7 +571,9 @@ pub fn get_new_target_container(node: Node) -> Node {
 
 // Go: ast/utilities.go:2152 GetEnclosingBlockScopeContainer
 pub fn get_enclosing_block_scope_container(node: Node) -> Node {
-    find_ancestor(node.parent(), &mut |current: Node| is_block_scope(current, current.parent()))
+    find_ancestor(node.parent(), &mut |current: Node| {
+        is_block_scope(current, current.parent())
+    })
 }
 
 // Go: ast/utilities.go:2158 IsBlockScope
@@ -665,7 +710,10 @@ pub fn is_jump_statement_target(node: Node) -> bool {
 
 // Go: ast/utilities.go:2268 IsBreakOrContinueStatement
 pub fn is_break_or_continue_statement(node: Node) -> bool {
-    node_kind_is(node, &[SyntaxKind::BreakStatement, SyntaxKind::ContinueStatement])
+    node_kind_is(
+        node,
+        &[SyntaxKind::BreakStatement, SyntaxKind::ContinueStatement],
+    )
 }
 
 // GetModuleInstanceState is used during binding as well as in transformations and tests, and therefore may be invoked
@@ -749,7 +797,9 @@ fn get_module_instance_state_worker(
 ) -> ModuleInstanceState {
     // A module is uninstantiated if it contains only
     match node.kind() {
-        SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeAliasDeclaration | SyntaxKind::JsTypeAliasDeclaration => {
+        SyntaxKind::InterfaceDeclaration
+        | SyntaxKind::TypeAliasDeclaration
+        | SyntaxKind::JsTypeAliasDeclaration => {
             return ModuleInstanceState::NON_INSTANTIATED;
         }
         SyntaxKind::EnumDeclaration => {
@@ -757,7 +807,9 @@ fn get_module_instance_state_worker(
                 return ModuleInstanceState::CONST_ENUM_ONLY;
             }
         }
-        SyntaxKind::ImportDeclaration | SyntaxKind::JsImportDeclaration | SyntaxKind::ImportEqualsDeclaration => {
+        SyntaxKind::ImportDeclaration
+        | SyntaxKind::JsImportDeclaration
+        | SyntaxKind::ImportEqualsDeclaration => {
             if !has_syntactic_modifier(node, ModifierFlags::EXPORT) {
                 return ModuleInstanceState::NON_INSTANTIATED;
             }
@@ -772,7 +824,8 @@ fn get_module_instance_state_worker(
                 let ancestors = push_ancestor(ancestors, node);
                 let ancestors = push_ancestor(&ancestors, export_clause);
                 for specifier in export_clause.elements().to_vec() {
-                    let specifier_state = get_module_instance_state_for_alias_target(specifier, &ancestors, visited);
+                    let specifier_state =
+                        get_module_instance_state_for_alias_target(specifier, &ancestors, visited);
                     if specifier_state > state {
                         state = specifier_state;
                     }
@@ -832,7 +885,8 @@ fn get_module_instance_state_for_alias_target(
             let statements_ancestors = push_ancestor(ancestors, p);
             for statement in p.statements().to_vec() {
                 if node_has_name(statement, name) {
-                    let state = get_module_instance_state_cached(statement, &statements_ancestors, visited);
+                    let state =
+                        get_module_instance_state_cached(statement, &statements_ancestors, visited);
                     if found == ModuleInstanceState::UNKNOWN || state > found {
                         found = state;
                     }
@@ -882,7 +936,8 @@ pub fn node_has_name(statement: Node, id: Node) -> bool {
 
 // Go: ast/utilities.go:2442 IsInternalModuleImportEqualsDeclaration
 pub fn is_internal_module_import_equals_declaration(node: Node) -> bool {
-    is_import_equals_declaration(node) && node.module_reference().kind() != SyntaxKind::ExternalModuleReference
+    is_import_equals_declaration(node)
+        && node.module_reference().kind() != SyntaxKind::ExternalModuleReference
 }
 
 // Go: ast/utilities.go:2446 IsConstAssertion
@@ -992,7 +1047,9 @@ pub fn module_export_name_is_default(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:2524 IsDefaultImport
-pub fn is_default_import(node: Node /*ImportDeclaration | ImportEqualsDeclaration | ExportDeclaration*/) -> bool {
+pub fn is_default_import(
+    node: Node, /*ImportDeclaration | ImportEqualsDeclaration | ExportDeclaration*/
+) -> bool {
     match node.kind() {
         SyntaxKind::ImportDeclaration | SyntaxKind::JsImportDeclaration => {
             let import_clause = node.import_clause();
@@ -1007,7 +1064,9 @@ pub fn is_default_import(node: Node /*ImportDeclaration | ImportEqualsDeclaratio
 // PORT: Go `tspath.FileExtensionIsOneOf`; tspath has no port in this crate, so
 // this private copy follows `tspath.FileExtensionIs` exactly.
 fn file_extension_is_one_of_p3(path: &str, extensions: &[&str]) -> bool {
-    extensions.iter().any(|ext| path.len() > ext.len() && path.ends_with(ext))
+    extensions
+        .iter()
+        .any(|ext| path.len() > ext.len() && path.ends_with(ext))
 }
 
 // Go: ast/utilities.go:2533 GetImpliedNodeFormatForFile
@@ -1019,7 +1078,11 @@ pub fn get_implied_node_format_for_file(path: &str, package_json_type: &str) -> 
     } else if file_extension_is_one_of_p3(path, &[".d.cts", ".cts", ".cjs"]) {
         implied_node_format = ModuleKind::COMMON_JS;
     } else if file_extension_is_one_of_p3(path, &[".d.ts", ".ts", ".tsx", ".js", ".jsx"]) {
-        implied_node_format = if package_json_type == "module" { ModuleKind::ES_NEXT } else { ModuleKind::COMMON_JS };
+        implied_node_format = if package_json_type == "module" {
+            ModuleKind::ES_NEXT
+        } else {
+            ModuleKind::COMMON_JS
+        };
     }
 
     implied_node_format
@@ -1031,7 +1094,11 @@ pub fn get_emit_module_format_of_file_worker(
     options: &CompilerOptions,
     source_file_meta_data: &SourceFileMetaData,
 ) -> ModuleKind {
-    let result = get_implied_node_format_for_emit_worker(file_name, options.get_emit_module_kind(), source_file_meta_data);
+    let result = get_implied_node_format_for_emit_worker(
+        file_name,
+        options.get_emit_module_kind(),
+        source_file_meta_data,
+    );
     if result != ModuleKind::NONE {
         return result;
     }
@@ -1064,15 +1131,18 @@ pub fn get_implied_node_format_for_emit_worker(
 
 // Go: ast/utilities.go:2571 GetDeclarationContainer
 pub fn get_declaration_container(node: Node) -> Node {
-    find_ancestor(get_root_declaration(node), &mut |node: Node| match node.kind() {
-        SyntaxKind::VariableDeclaration
-        | SyntaxKind::VariableDeclarationList
-        | SyntaxKind::ImportSpecifier
-        | SyntaxKind::NamedImports
-        | SyntaxKind::NamespaceImport
-        | SyntaxKind::ImportClause => false,
-        _ => true,
-    })
+    find_ancestor(
+        get_root_declaration(node),
+        &mut |node: Node| match node.kind() {
+            SyntaxKind::VariableDeclaration
+            | SyntaxKind::VariableDeclarationList
+            | SyntaxKind::ImportSpecifier
+            | SyntaxKind::NamedImports
+            | SyntaxKind::NamespaceImport
+            | SyntaxKind::ImportClause => false,
+            _ => true,
+        },
+    )
     .parent()
 }
 
@@ -1217,14 +1287,19 @@ pub fn for_each_dynamic_import_or_require_call(
     let is_java_script_file = is_in_js_file(file);
     let (mut last_index, mut size) = find_import_or_require(source_file_text(file), 0);
     while last_index >= 0 {
-        let node = get_node_at_position(file, last_index, is_java_script_file && include_type_space_imports);
+        let node = get_node_at_position(
+            file,
+            last_index,
+            is_java_script_file && include_type_space_imports,
+        );
         if is_java_script_file && is_require_call(node, require_string_literal_like_argument) {
             if cb(node, node.arguments().get(0)) {
                 return true;
             }
         } else if is_import_call(node)
             && node.arguments().len() > 0
-            && (!require_string_literal_like_argument || is_string_literal_like(node.arguments().get(0)))
+            && (!require_string_literal_like_argument
+                || is_string_literal_like(node.arguments().get(0)))
         {
             if cb(node, node.arguments().get(0)) {
                 return true;

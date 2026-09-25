@@ -52,7 +52,10 @@ impl Parser {
             | SyntaxKind::BigIntLiteral
             | SyntaxKind::StringLiteral => {
                 if self.token == SyntaxKind::NoSubstitutionTemplateLiteral
-                    && self.scanner.token_flags().intersects(TokenFlags::IS_INVALID)
+                    && self
+                        .scanner
+                        .token_flags()
+                        .intersects(TokenFlags::IS_INVALID)
                 {
                     self.re_scan_template_token(false /*isTaggedTemplate*/);
                 }
@@ -129,15 +132,19 @@ impl Parser {
         let open_bracket_position = self.scanner.token_start();
         let open_bracket_parsed = self.parse_expected(SyntaxKind::OpenBracketToken);
         let multi_line = self.has_preceding_line_break();
-        let elements =
-            self.parse_delimited_list(ParsingContext::ArrayLiteralMembers, Parser::parse_argument_or_array_literal_element);
+        let elements = self.parse_delimited_list(
+            ParsingContext::ArrayLiteralMembers,
+            Parser::parse_argument_or_array_literal_element,
+        );
         self.parse_expected_matching_brackets(
             SyntaxKind::OpenBracketToken,
             SyntaxKind::CloseBracketToken,
             open_bracket_parsed,
             open_bracket_position,
         );
-        let node = self.factory.new_array_literal_expression(elements, multi_line);
+        let node = self
+            .factory
+            .new_array_literal_expression(elements, multi_line);
         self.finish_node(node, pos)
     }
 
@@ -147,15 +154,19 @@ impl Parser {
         let open_brace_position = self.scanner.token_start();
         let open_brace_parsed = self.parse_expected(SyntaxKind::OpenBraceToken);
         let multi_line = self.has_preceding_line_break();
-        let properties =
-            self.parse_delimited_list(ParsingContext::ObjectLiteralMembers, Parser::parse_object_literal_element);
+        let properties = self.parse_delimited_list(
+            ParsingContext::ObjectLiteralMembers,
+            Parser::parse_object_literal_element,
+        );
         self.parse_expected_matching_brackets(
             SyntaxKind::OpenBraceToken,
             SyntaxKind::CloseBraceToken,
             open_brace_parsed,
             open_brace_position,
         );
-        let node = self.factory.new_object_literal_expression(properties, multi_line);
+        let node = self
+            .factory
+            .new_object_literal_expression(properties, multi_line);
         self.finish_node(node, pos)
     }
 
@@ -176,10 +187,22 @@ impl Parser {
             false, /*stopOnStartOfClassStaticBlock*/
         );
         if self.parse_contextual_modifier(SyntaxKind::GetKeyword) {
-            return self.parse_accessor_declaration(pos, jsdoc, modifiers, SyntaxKind::GetAccessor, ParseFlags::NONE);
+            return self.parse_accessor_declaration(
+                pos,
+                jsdoc,
+                modifiers,
+                SyntaxKind::GetAccessor,
+                ParseFlags::NONE,
+            );
         }
         if self.parse_contextual_modifier(SyntaxKind::SetKeyword) {
-            return self.parse_accessor_declaration(pos, jsdoc, modifiers, SyntaxKind::SetAccessor, ParseFlags::NONE);
+            return self.parse_accessor_declaration(
+                pos,
+                jsdoc,
+                modifiers,
+                SyntaxKind::SetAccessor,
+                ParseFlags::NONE,
+            );
         }
         let asterisk_token = self.parse_optional_token(SyntaxKind::AsteriskToken);
         let token_is_identifier = self.is_identifier();
@@ -190,7 +213,10 @@ impl Parser {
         if postfix_token.is_nil() {
             postfix_token = self.parse_optional_token(SyntaxKind::ExclamationToken);
         }
-        if asterisk_token.is_some() || self.token == SyntaxKind::OpenParenToken || self.token == SyntaxKind::LessThanToken {
+        if asterisk_token.is_some()
+            || self.token == SyntaxKind::OpenParenToken
+            || self.token == SyntaxKind::LessThanToken
+        {
             return self.parse_method_declaration(
                 pos,
                 jsdoc,
@@ -207,7 +233,8 @@ impl Parser {
         //     IdentifierReference[?Yield] Initializer[In, ?Yield]
         // this is necessary because ObjectLiteral productions are also used to cover grammar for ObjectAssignmentPattern
         let node;
-        let is_shorthand_property_assignment = token_is_identifier && self.token != SyntaxKind::ColonToken;
+        let is_shorthand_property_assignment =
+            token_is_identifier && self.token != SyntaxKind::ColonToken;
         if is_shorthand_property_assignment {
             let equals_token = self.parse_optional_token(SyntaxKind::EqualsToken);
             let mut initializer = Node::NIL;
@@ -229,9 +256,19 @@ impl Parser {
             );
         } else {
             self.parse_expected(SyntaxKind::ColonToken);
-            let initializer =
-                do_in_context(self, NodeFlags::DISALLOW_IN_CONTEXT, false, Parser::parse_assignment_expression_or_higher);
-            node = self.factory.new_property_assignment(modifiers, name, postfix_token, Node::NIL /*typeNode*/, initializer);
+            let initializer = do_in_context(
+                self,
+                NodeFlags::DISALLOW_IN_CONTEXT,
+                false,
+                Parser::parse_assignment_expression_or_higher,
+            );
+            node = self.factory.new_property_assignment(
+                modifiers,
+                name,
+                postfix_token,
+                Node::NIL, /*typeNode*/
+                initializer,
+            );
         }
         self.finish_node(node, pos);
         self.with_js_doc(node, jsdoc);
@@ -254,8 +291,15 @@ impl Parser {
         let asterisk_token = self.parse_optional_token(SyntaxKind::AsteriskToken);
         let is_generator = asterisk_token.is_some();
         let is_async = modifier_list_has_async(modifiers);
-        let signature_flags = (if is_generator { ParseFlags::YIELD } else { ParseFlags::NONE })
-            | (if is_async { ParseFlags::AWAIT } else { ParseFlags::NONE });
+        let signature_flags = (if is_generator {
+            ParseFlags::YIELD
+        } else {
+            ParseFlags::NONE
+        }) | (if is_async {
+            ParseFlags::AWAIT
+        } else {
+            ParseFlags::NONE
+        });
         let name = if is_generator && is_async {
             do_in_context(
                 self,
@@ -264,9 +308,19 @@ impl Parser {
                 Parser::parse_optional_binding_identifier,
             )
         } else if is_generator {
-            do_in_context(self, NodeFlags::YIELD_CONTEXT, true, Parser::parse_optional_binding_identifier)
+            do_in_context(
+                self,
+                NodeFlags::YIELD_CONTEXT,
+                true,
+                Parser::parse_optional_binding_identifier,
+            )
         } else if is_async {
-            do_in_context(self, NodeFlags::AWAIT_CONTEXT, true, Parser::parse_optional_binding_identifier)
+            do_in_context(
+                self,
+                NodeFlags::AWAIT_CONTEXT,
+                true,
+                Parser::parse_optional_binding_identifier,
+            )
         } else {
             self.parse_optional_binding_identifier()
         };
@@ -309,7 +363,12 @@ impl Parser {
             false, /*stopOnStartOfClassStaticBlock*/
         );
         if self.token == SyntaxKind::ClassKeyword {
-            return self.parse_class_declaration_or_expression(pos, jsdoc, modifiers, SyntaxKind::ClassExpression);
+            return self.parse_class_declaration_or_expression(
+                pos,
+                jsdoc,
+                modifiers,
+                SyntaxKind::ClassExpression,
+            );
         }
         let error_pos = self.node_pos();
         self.parse_error_at(error_pos, error_pos, diag::Expression_expected, args![]);
@@ -318,7 +377,12 @@ impl Parser {
     }
 
     // Go: parser/parser.go:5744 unparseExpressionWithTypeArguments
-    pub fn unparse_expression_with_type_arguments(&mut self, expression: Node, type_arguments: NodeList, result: Node) {
+    pub fn unparse_expression_with_type_arguments(
+        &mut self,
+        expression: Node,
+        type_arguments: NodeList,
+        result: Node,
+    ) {
         // force overwrite the `.Parent` of the expression and type arguments to erase the fact that they may have originally been parsed as an ExpressionWithTypeArguments and be parented to such
         if expression.is_some() {
             set_node_parent(expression, result);
@@ -341,7 +405,11 @@ impl Parser {
         }
         let expression_pos = self.node_pos();
         let primary = self.parse_primary_expression();
-        let mut expression = self.parse_member_expression_rest(expression_pos, primary, false /*allowOptionalChain*/);
+        let mut expression = self.parse_member_expression_rest(
+            expression_pos,
+            primary,
+            false, /*allowOptionalChain*/
+        );
         let mut type_arguments = NodeList::NIL;
         // Absorb type arguments into NewExpression when preceding expression is ExpressionWithTypeArguments
         if expression.kind() == SyntaxKind::ExpressionWithTypeArguments {
@@ -349,14 +417,23 @@ impl Parser {
             expression = expression.expression();
         }
         if self.token == SyntaxKind::QuestionDotToken {
-            let text = get_text_of_node_from_source_text(self.source_text, expression, false /*includeTrivia*/);
-            self.parse_error_at_current_token(diag::Invalid_optional_chain_from_new_expression_Did_you_mean_to_call_0, args![text]);
+            let text = get_text_of_node_from_source_text(
+                self.source_text,
+                expression,
+                false, /*includeTrivia*/
+            );
+            self.parse_error_at_current_token(
+                diag::Invalid_optional_chain_from_new_expression_Did_you_mean_to_call_0,
+                args![text],
+            );
         }
         let mut argument_list = NodeList::NIL;
         if self.token == SyntaxKind::OpenParenToken {
             argument_list = self.parse_argument_list();
         }
-        let node = self.factory.new_new_expression(expression, type_arguments, argument_list);
+        let node = self
+            .factory
+            .new_new_expression(expression, type_arguments, argument_list);
         let finished = self.finish_node(node, pos);
         let result = self.check_js_syntax(finished);
         self.unparse_expression_with_type_arguments(expression, type_arguments, result);
@@ -383,10 +460,12 @@ impl Parser {
             SyntaxKind::StringLiteral => self.factory.new_string_literal(text, token_flags),
             SyntaxKind::NumericLiteral => self.factory.new_numeric_literal(text, token_flags),
             SyntaxKind::BigIntLiteral => self.factory.new_big_int_literal(text, token_flags),
-            SyntaxKind::RegularExpressionLiteral => self.factory.new_regular_expression_literal(text, token_flags),
-            SyntaxKind::NoSubstitutionTemplateLiteral => {
-                self.factory.new_no_substitution_template_literal(text, token_flags)
-            }
+            SyntaxKind::RegularExpressionLiteral => self
+                .factory
+                .new_regular_expression_literal(text, token_flags),
+            SyntaxKind::NoSubstitutionTemplateLiteral => self
+                .factory
+                .new_no_substitution_template_literal(text, token_flags),
             _ => panic!("Unhandled case in parseLiteralExpression"),
         };
         self.next_token();
@@ -396,7 +475,10 @@ impl Parser {
     // Go: parser/parser.go:5816 parseIdentifierNameErrorOnUnicodeEscapeSequence
     pub fn parse_identifier_name_error_on_unicode_escape_sequence(&mut self) -> Node {
         if self.scanner.has_unicode_escape() || self.scanner.has_extended_unicode_escape() {
-            self.parse_error_at_current_token(diag::Unicode_escape_sequence_cannot_appear_here, args![]);
+            self.parse_error_at_current_token(
+                diag::Unicode_escape_sequence_cannot_appear_here,
+                args![],
+            );
         }
         self.create_identifier(token_is_identifier_or_keyword(self.token))
     }
@@ -428,8 +510,15 @@ impl Parser {
     }
 
     // Go: parser/parser.go:5838 parseIdentifierNameWithDiagnostic
-    pub fn parse_identifier_name_with_diagnostic(&mut self, diagnostic_message: Option<&'static Message>) -> Node {
-        self.create_identifier_with_diagnostic(token_is_identifier_or_keyword(self.token), diagnostic_message, None)
+    pub fn parse_identifier_name_with_diagnostic(
+        &mut self,
+        diagnostic_message: Option<&'static Message>,
+    ) -> Node {
+        self.create_identifier_with_diagnostic(
+            token_is_identifier_or_keyword(self.token),
+            diagnostic_message,
+            None,
+        )
     }
 
     // Go: parser/parser.go:5842 parseIdentifier
@@ -444,7 +533,11 @@ impl Parser {
         private_identifier_diagnostic_message: Option<&'static Message>,
     ) -> Node {
         let is_identifier = self.is_identifier();
-        self.create_identifier_with_diagnostic(is_identifier, diagnostic_message, private_identifier_diagnostic_message)
+        self.create_identifier_with_diagnostic(
+            is_identifier,
+            diagnostic_message,
+            private_identifier_diagnostic_message,
+        )
     }
 
     // Go: parser/parser.go:5850 createIdentifier
@@ -475,7 +568,10 @@ impl Parser {
             if let Some(message) = private_identifier_diagnostic_message {
                 self.parse_error_at_current_token(message, args![]);
             } else {
-                self.parse_error_at_current_token(diag::Private_identifiers_are_not_allowed_outside_class_bodies, args![]);
+                self.parse_error_at_current_token(
+                    diag::Private_identifiers_are_not_allowed_outside_class_bodies,
+                    args![],
+                );
             }
             return self.create_identifier(true /*isIdentifier*/);
         }
@@ -521,7 +617,8 @@ impl Parser {
             return identifier.clone();
         }
         let identifier = text.to_string();
-        self.identifiers.insert(identifier.clone(), identifier.clone());
+        self.identifiers
+            .insert(identifier.clone(), identifier.clone());
         identifier
     }
 
@@ -650,7 +747,10 @@ impl Parser {
         // If we were able to get any potential identifier...
         if id_token != SyntaxKind::Unknown {
             // If we have a non-keyword identifier, or if we have an accessor, then it's safe to parse.
-            if !is_keyword(id_token) || id_token == SyntaxKind::SetKeyword || id_token == SyntaxKind::GetKeyword {
+            if !is_keyword(id_token)
+                || id_token == SyntaxKind::SetKeyword
+                || id_token == SyntaxKind::GetKeyword
+            {
                 return true;
             }
             // If it *is* a keyword, but not an accessor, check a little farther along
@@ -740,7 +840,10 @@ impl Parser {
             | SyntaxKind::DebuggerKeyword
             | SyntaxKind::CatchKeyword
             | SyntaxKind::FinallyKeyword => true,
-            SyntaxKind::ImportKeyword => self.is_start_of_declaration() || self.is_next_token_open_paren_or_less_than_or_dot(),
+            SyntaxKind::ImportKeyword => {
+                self.is_start_of_declaration()
+                    || self.is_next_token_open_paren_or_less_than_or_dot()
+            }
             SyntaxKind::ConstKeyword | SyntaxKind::ExportKeyword => self.is_start_of_declaration(),
             SyntaxKind::AsyncKeyword
             | SyntaxKind::DeclareKeyword
@@ -806,7 +909,9 @@ impl Parser {
                 //   I {}
                 //
                 // could be legal, it would add complexity for very little gain.
-                SyntaxKind::InterfaceKeyword | SyntaxKind::TypeKeyword | SyntaxKind::DeferKeyword => {
+                SyntaxKind::InterfaceKeyword
+                | SyntaxKind::TypeKeyword
+                | SyntaxKind::DeferKeyword => {
                     return self.next_token_is_identifier_on_same_line();
                 }
                 SyntaxKind::ModuleKeyword | SyntaxKind::NamespaceKeyword => {
@@ -826,7 +931,9 @@ impl Parser {
                     if self.has_preceding_line_break() {
                         return false;
                     }
-                    if previous_token == SyntaxKind::DeclareKeyword && self.token == SyntaxKind::TypeKeyword {
+                    if previous_token == SyntaxKind::DeclareKeyword
+                        && self.token == SyntaxKind::TypeKeyword
+                    {
                         // If we see 'declare type', then commit to parsing a type alias. parseTypeAliasDeclaration will
                         // report Line_break_not_permitted_here if needed.
                         return true;
@@ -935,7 +1042,9 @@ impl Parser {
             | SyntaxKind::SlashToken
             | SyntaxKind::SlashEqualsToken
             | SyntaxKind::Identifier => return true,
-            SyntaxKind::ImportKeyword => return self.is_next_token_open_paren_or_less_than_or_dot(),
+            SyntaxKind::ImportKeyword => {
+                return self.is_next_token_open_paren_or_less_than_or_dot();
+            }
             _ => {}
         }
         self.is_identifier()
@@ -982,12 +1091,14 @@ impl Parser {
             | SyntaxKind::TemplateHead => return true,
             SyntaxKind::FunctionKeyword => return !in_start_of_parameter,
             SyntaxKind::MinusToken => {
-                return !in_start_of_parameter && self.look_ahead(Parser::next_token_is_numeric_or_big_int_literal);
+                return !in_start_of_parameter
+                    && self.look_ahead(Parser::next_token_is_numeric_or_big_int_literal);
             }
             SyntaxKind::OpenParenToken => {
                 // Only consider '(' the start of a type if followed by ')', '...', an identifier, a modifier,
                 // or something that starts a type. We don't want to consider things like '(1)' a type.
-                return !in_start_of_parameter && self.look_ahead(Parser::next_is_parenthesized_or_function_type);
+                return !in_start_of_parameter
+                    && self.look_ahead(Parser::next_is_parenthesized_or_function_type);
             }
             _ => {}
         }
@@ -1047,7 +1158,8 @@ impl Parser {
     // Go: parser/parser.go:6267 nextTokenIsIdentifierOrStringLiteralOnSameLine
     pub fn next_token_is_identifier_or_string_literal_on_same_line(&mut self) -> bool {
         self.next_token();
-        (self.is_identifier() || self.token == SyntaxKind::StringLiteral) && !self.has_preceding_line_break()
+        (self.is_identifier() || self.token == SyntaxKind::StringLiteral)
+            && !self.has_preceding_line_break()
     }
 
     // Go: parser/parser.go:6273 isIdentifier
@@ -1071,7 +1183,8 @@ impl Parser {
     // Go: parser/parser.go:6287 isBindingIdentifier
     pub fn is_binding_identifier(&self) -> bool {
         // `let await`/`let yield` in [Yield] or [Await] are allowed here and disallowed in the binder.
-        self.token == SyntaxKind::Identifier || (self.token as u16) > (SyntaxKind::LAST_RESERVED_WORD as u16)
+        self.token == SyntaxKind::Identifier
+            || (self.token as u16) > (SyntaxKind::LAST_RESERVED_WORD as u16)
     }
 
     // Go: parser/parser.go:6292 isImportAttributeName
@@ -1133,7 +1246,9 @@ impl Parser {
         // |ObjectBindingPattern| so that we can report a grammar error during check. We don't parse out
         // |ArrayBindingPattern| since it potentially conflicts with element access (i.e., `using[x]`).
         self.look_ahead(|p: &mut Parser| {
-            p.next_token_is_binding_identifier_or_start_of_destructuring_on_same_line(false /*disallowOf*/)
+            p.next_token_is_binding_identifier_or_start_of_destructuring_on_same_line(
+                false, /*disallowOf*/
+            )
         })
     }
 
@@ -1146,17 +1261,25 @@ impl Parser {
     }
 
     // Go: parser/parser.go:6349 nextTokenIsBindingIdentifierOrStartOfDestructuringOnSameLine
-    pub fn next_token_is_binding_identifier_or_start_of_destructuring_on_same_line(&mut self, disallow_of: bool) -> bool {
+    pub fn next_token_is_binding_identifier_or_start_of_destructuring_on_same_line(
+        &mut self,
+        disallow_of: bool,
+    ) -> bool {
         self.next_token();
         if disallow_of && self.token == SyntaxKind::OfKeyword {
             return self.look_ahead(Parser::next_token_is_equals_or_semicolon_or_colon_token);
         }
-        (self.is_binding_identifier() || self.token == SyntaxKind::OpenBraceToken) && !self.has_preceding_line_break()
+        (self.is_binding_identifier() || self.token == SyntaxKind::OpenBraceToken)
+            && !self.has_preceding_line_break()
     }
 
     // Go: parser/parser.go:6357 nextTokenIsBindingIdentifierOrStartOfDestructuringOnSameLineDisallowOf
-    pub fn next_token_is_binding_identifier_or_start_of_destructuring_on_same_line_disallow_of(&mut self) -> bool {
-        self.next_token_is_binding_identifier_or_start_of_destructuring_on_same_line(true /*disallowOf*/)
+    pub fn next_token_is_binding_identifier_or_start_of_destructuring_on_same_line_disallow_of(
+        &mut self,
+    ) -> bool {
+        self.next_token_is_binding_identifier_or_start_of_destructuring_on_same_line(
+            true, /*disallowOf*/
+        )
     }
 
     // Go: parser/parser.go:6361 isAwaitUsingDeclaration
@@ -1165,9 +1288,13 @@ impl Parser {
     }
 
     // Go: parser/parser.go:6365 nextIsUsingKeywordThenBindingIdentifierOrStartOfObjectDestructuringOnSameLine
-    pub fn next_is_using_keyword_then_binding_identifier_or_start_of_object_destructuring_on_same_line(&mut self) -> bool {
+    pub fn next_is_using_keyword_then_binding_identifier_or_start_of_object_destructuring_on_same_line(
+        &mut self,
+    ) -> bool {
         self.next_token() == SyntaxKind::UsingKeyword
-            && self.next_token_is_binding_identifier_or_start_of_destructuring_on_same_line(false /*disallowOf*/)
+            && self.next_token_is_binding_identifier_or_start_of_destructuring_on_same_line(
+                false, /*disallowOf*/
+            )
     }
 
     // Go: parser/parser.go:6369 nextTokenIsTokenStringLiteral
@@ -1191,12 +1318,14 @@ impl Parser {
 
     // Go: parser/parser.go:6393 inDisallowInContext
     pub fn in_disallow_in_context(&self) -> bool {
-        self.context_flags.intersects(NodeFlags::DISALLOW_IN_CONTEXT)
+        self.context_flags
+            .intersects(NodeFlags::DISALLOW_IN_CONTEXT)
     }
 
     // Go: parser/parser.go:6397 inDisallowConditionalTypesContext
     pub fn in_disallow_conditional_types_context(&self) -> bool {
-        self.context_flags.intersects(NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT)
+        self.context_flags
+            .intersects(NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT)
     }
 
     // Go: parser/parser.go:6401 inDecoratorContext
@@ -1211,12 +1340,20 @@ impl Parser {
 
     // Go: parser/parser.go:6409 skipRangeTrivia
     pub fn skip_range_trivia(&self, text_range: TextRange) -> TextRange {
-        TextRange::new(skip_trivia(self.source_text, text_range.pos()), text_range.end())
+        TextRange::new(
+            skip_trivia(self.source_text, text_range.pos()),
+            text_range.end(),
+        )
     }
 }
 
 // Go: parser/parser.go:6381 doInContext
-pub fn do_in_context<T>(p: &mut Parser, flags: NodeFlags, value: bool, f: impl FnOnce(&mut Parser) -> T) -> T {
+pub fn do_in_context<T>(
+    p: &mut Parser,
+    flags: NodeFlags,
+    value: bool,
+    f: impl FnOnce(&mut Parser) -> T,
+) -> T {
     let save_context_flags = p.context_flags;
     p.set_context_flags(flags, value);
     let result = f(p);
@@ -1226,7 +1363,8 @@ pub fn do_in_context<T>(p: &mut Parser, flags: NodeFlags, value: bool, f: impl F
 
 // Go: parser/parser.go:6413 isReservedWord
 pub fn is_reserved_word(token: SyntaxKind) -> bool {
-    (SyntaxKind::FIRST_RESERVED_WORD as u16) <= (token as u16) && (token as u16) <= (SyntaxKind::LAST_RESERVED_WORD as u16)
+    (SyntaxKind::FIRST_RESERVED_WORD as u16) <= (token as u16)
+        && (token as u16) <= (SyntaxKind::LAST_RESERVED_WORD as u16)
 }
 
 // Go: parser/parser.go:6417 attachFileToDiagnostics
@@ -1256,8 +1394,17 @@ pub fn get_comment_pragmas(f: &NodeFactory, source_text: &str) -> Vec<Pragma> {
 // PORT: the existing Rust `Pragma` (program.rs) stores the comment range as
 // `range` and `kind`. It has no `has_trailing_new_line`; no Go reader of
 // `Pragma` uses that field.
-fn new_pragma(comment_range: CommentRange, name: String, args: IndexMap<String, PragmaArgument>) -> Pragma {
-    Pragma { name, args, range: comment_range.text_range, kind: comment_range.kind }
+fn new_pragma(
+    comment_range: CommentRange,
+    name: String,
+    args: IndexMap<String, PragmaArgument>,
+) -> Pragma {
+    Pragma {
+        name,
+        args,
+        range: comment_range.text_range,
+        kind: comment_range.kind,
+    }
 }
 
 // Go: parser/parser.go:6435 extractPragmas
@@ -1299,7 +1446,10 @@ pub fn extract_pragmas(comment_range: CommentRange, text: &str) -> Vec<Pragma> {
                     PragmaArgument {
                         name: arg_name,
                         value: value.to_string(),
-                        range: TextRange::new(comment_range.pos() + pos + 1, comment_range.pos() + pos + 1 + value_len),
+                        range: TextRange::new(
+                            comment_range.pos() + pos + 1,
+                            comment_range.pos() + pos + 1 + value_len,
+                        ),
                     },
                 );
                 pos += value_len + 2;
@@ -1352,7 +1502,10 @@ pub fn extract_pragmas(comment_range: CommentRange, text: &str) -> Vec<Pragma> {
                         PragmaArgument {
                             name: "factory".to_string(),
                             value: text[start as usize..arg_end as usize].to_string(),
-                            range: TextRange::new(comment_range.pos() + start, comment_range.pos() + arg_end),
+                            range: TextRange::new(
+                                comment_range.pos() + start,
+                                comment_range.pos() + arg_end,
+                            ),
                         },
                     );
                     pragmas.push(new_pragma(comment_range, pragma_name, args));
@@ -1372,7 +1525,13 @@ pub fn extract_pragmas(comment_range: CommentRange, text: &str) -> Vec<Pragma> {
 // does.
 fn go_to_lower(s: &str) -> String {
     s.chars()
-        .map(|c| if c == '\u{130}' { 'i' } else { c.to_lowercase().next().unwrap_or(c) })
+        .map(|c| {
+            if c == '\u{130}' {
+                'i'
+            } else {
+                c.to_lowercase().next().unwrap_or(c)
+            }
+        })
         .collect()
 }
 
@@ -1384,7 +1543,9 @@ fn match_(text: &str, pos: i32, s: &str) -> bool {
 // Go: parser/parser.go:6543 skipBlanks
 fn skip_blanks(text: &str, mut pos: i32) -> i32 {
     let bytes = text.as_bytes();
-    while (pos as usize) < bytes.len() && (bytes[pos as usize] == b' ' || bytes[pos as usize] == b'\t') {
+    while (pos as usize) < bytes.len()
+        && (bytes[pos as usize] == b' ' || bytes[pos as usize] == b'\t')
+    {
         pos += 1;
     }
     pos
@@ -1393,7 +1554,9 @@ fn skip_blanks(text: &str, mut pos: i32) -> i32 {
 // Go: parser/parser.go:6550 skipNonBlanks
 fn skip_non_blanks(text: &str, mut pos: i32) -> i32 {
     let bytes = text.as_bytes();
-    while (pos as usize) < bytes.len() && !matches!(bytes[pos as usize], b' ' | b'\t' | b'\r' | b'\n') {
+    while (pos as usize) < bytes.len()
+        && !matches!(bytes[pos as usize], b' ' | b'\t' | b'\r' | b'\n')
+    {
         pos += 1;
     }
     pos
@@ -1426,7 +1589,9 @@ fn line_end_pos(text: &str, mut pos: i32) -> i32 {
 fn extract_name(text: &str, mut pos: i32) -> String {
     let bytes = text.as_bytes();
     let start = pos;
-    while (pos as usize) < bytes.len() && (bytes[pos as usize].is_ascii_alphabetic() || bytes[pos as usize] == b'-') {
+    while (pos as usize) < bytes.len()
+        && (bytes[pos as usize].is_ascii_alphabetic() || bytes[pos as usize] == b'-')
+    {
         pos += 1;
     }
     text[start as usize..pos as usize].to_ascii_lowercase()
@@ -1507,7 +1672,11 @@ impl Parser {
                             ..Default::default()
                         });
                     } else {
-                        self.parse_error_at_range(pragma.range, diag::Invalid_reference_directive_syntax, args![]);
+                        self.parse_error_at_range(
+                            pragma.range,
+                            diag::Invalid_reference_directive_syntax,
+                            args![],
+                        );
                     }
                 }
                 "ts-check" | "ts-nocheck" => {
@@ -1519,8 +1688,10 @@ impl Parser {
                     if replace {
                         // PORT: Go stores the whole CommentRange; the Rust
                         // `CheckJsDirective.range` is its TextRange.
-                        context.check_js_directive =
-                            Some(CheckJsDirective { enabled: pragma.name == "ts-check", range: pragma.range });
+                        context.check_js_directive = Some(CheckJsDirective {
+                            enabled: pragma.name == "ts-check",
+                            range: pragma.range,
+                        });
                     }
                 }
                 "jsx" | "jsxfrag" | "jsximportsource" | "jsxruntime" => {
@@ -1539,14 +1710,25 @@ impl Parser {
         if mode == "require" {
             return ModuleKind::COMMON_JS;
         }
-        self.parse_error_at(pos, end, diag::X_resolution_mode_should_be_either_require_or_import, args![]);
+        self.parse_error_at(
+            pos,
+            end,
+            diag::X_resolution_mode_should_be_either_require_or_import,
+            args![],
+        );
         ResolutionMode::default()
     }
 
     // Go: parser/parser.go:6679 jsErrorAtRange
-    pub fn js_error_at_range(&mut self, loc: TextRange, message: &'static Message, args: Vec<String>) {
+    pub fn js_error_at_range(
+        &mut self,
+        loc: TextRange,
+        message: &'static Message,
+        args: Vec<String>,
+    ) {
         let range = TextRange::new(skip_trivia(self.source_text, loc.pos()), loc.end());
-        self.js_diagnostics.push(new_diagnostic(Node::NIL, range, message, args));
+        self.js_diagnostics
+            .push(new_diagnostic(Node::NIL, range, message, args));
     }
 
     // Go: parser/parser.go:6683 checkJSDecoratorSyntax
@@ -1559,7 +1741,11 @@ impl Parser {
         if can_have_illegal_decorators(node) {
             for modifier in modifiers.iter() {
                 if is_decorator(modifier) {
-                    self.js_error_at_range(modifier.loc(), diag::Decorators_are_not_valid_here, args![]);
+                    self.js_error_at_range(
+                        modifier.loc(),
+                        diag::Decorators_are_not_valid_here,
+                        args![],
+                    );
                     break;
                 }
             }
@@ -1568,8 +1754,12 @@ impl Parser {
             if decorator_index >= 0 && is_class_declaration(node) {
                 let export_index = find_index(modifiers, is_export_modifier);
                 if export_index >= 0 {
-                    let default_index = find_index(modifiers, |m| m.kind() == SyntaxKind::DefaultKeyword);
-                    if decorator_index > export_index && default_index >= 0 && decorator_index < default_index {
+                    let default_index =
+                        find_index(modifiers, |m| m.kind() == SyntaxKind::DefaultKeyword);
+                    if decorator_index > export_index
+                        && default_index >= 0
+                        && decorator_index < default_index
+                    {
                         // Decorator between `export` and `default`
                         let loc = modifiers.get(decorator_index as usize).loc();
                         self.js_error_at_range(loc, diag::Decorators_are_not_valid_here, args![]);
@@ -1583,7 +1773,8 @@ impl Parser {
                             }
                         }
                         if trailing_decorator_index >= 0 {
-                            let trailing_loc = modifiers.get(trailing_decorator_index as usize).loc();
+                            let trailing_loc =
+                                modifiers.get(trailing_decorator_index as usize).loc();
                             let decorator_loc = modifiers.get(decorator_index as usize).loc();
                             let mut diag = new_diagnostic(
                                 Node::NIL,
@@ -1593,7 +1784,10 @@ impl Parser {
                             );
                             diag.add_related_info(Some(new_diagnostic(
                                 Node::NIL,
-                                TextRange::new(skip_trivia(self.source_text, decorator_loc.pos()), decorator_loc.end()),
+                                TextRange::new(
+                                    skip_trivia(self.source_text, decorator_loc.pos()),
+                                    decorator_loc.end(),
+                                ),
                                 diag::Decorator_used_before_export_here,
                                 args![],
                             )));
@@ -1611,17 +1805,28 @@ impl Parser {
     // case (second switch) is written as a shared follow-up block.
     pub fn check_js_syntax(&mut self, node: Node) -> Node {
         if !node.flags().intersects(NodeFlags::JAVA_SCRIPT_FILE)
-            || node.flags().intersects(NodeFlags::JS_DOC | NodeFlags::REPARSED)
+            || node
+                .flags()
+                .intersects(NodeFlags::JS_DOC | NodeFlags::REPARSED)
         {
             return node;
         }
         let kind = node.kind();
         let mut check_signature_or_type = false;
         match kind {
-            SyntaxKind::Parameter | SyntaxKind::PropertyDeclaration | SyntaxKind::MethodDeclaration => {
+            SyntaxKind::Parameter
+            | SyntaxKind::PropertyDeclaration
+            | SyntaxKind::MethodDeclaration => {
                 let token = node.question_token();
-                if token.is_some() && !token.flags().intersects(NodeFlags::REPARSED) && is_question_token(token) {
-                    self.js_error_at_range(token.loc(), diag::The_0_modifier_can_only_be_used_in_TypeScript_files, args!["?"]);
+                if token.is_some()
+                    && !token.flags().intersects(NodeFlags::REPARSED)
+                    && is_question_token(token)
+                {
+                    self.js_error_at_range(
+                        token.loc(),
+                        diag::The_0_modifier_can_only_be_used_in_TypeScript_files,
+                        args!["?"],
+                    );
                 }
                 check_signature_or_type = true;
             }
@@ -1674,11 +1879,19 @@ impl Parser {
                 }
             }
             SyntaxKind::ImportEqualsDeclaration => {
-                self.js_error_at_range(node.loc(), diag::X_import_can_only_be_used_in_TypeScript_files, args![]);
+                self.js_error_at_range(
+                    node.loc(),
+                    diag::X_import_can_only_be_used_in_TypeScript_files,
+                    args![],
+                );
             }
             SyntaxKind::ExportAssignment => {
                 if node.is_export_equals() {
-                    self.js_error_at_range(node.loc(), diag::X_export_can_only_be_used_in_TypeScript_files, args![]);
+                    self.js_error_at_range(
+                        node.loc(),
+                        diag::X_export_can_only_be_used_in_TypeScript_files,
+                        args![],
+                    );
                 }
             }
             SyntaxKind::HeritageClause => {
@@ -1772,7 +1985,12 @@ impl Parser {
             | SyntaxKind::FunctionDeclaration
             | SyntaxKind::ArrowFunction => {
                 let list = node.type_parameter_list();
-                if !list.is_nil() && list.nodes().iter().any(|n| !n.flags().intersects(NodeFlags::REPARSED)) {
+                if !list.is_nil()
+                    && list
+                        .nodes()
+                        .iter()
+                        .any(|n| !n.flags().intersects(NodeFlags::REPARSED))
+                {
                     self.js_error_at_range(
                         list.loc(),
                         diag::Type_parameter_declarations_can_only_be_used_in_TypeScript_files,
@@ -1800,7 +2018,12 @@ impl Parser {
             | SyntaxKind::JsxOpeningElement
             | SyntaxKind::TaggedTemplateExpression => {
                 let list = node.type_argument_list();
-                if !list.is_nil() && list.nodes().iter().any(|n| !n.flags().intersects(NodeFlags::REPARSED)) {
+                if !list.is_nil()
+                    && list
+                        .nodes()
+                        .iter()
+                        .any(|n| !n.flags().intersects(NodeFlags::REPARSED))
+                {
                     self.js_error_at_range(
                         list.loc(),
                         diag::Type_arguments_can_only_be_used_in_TypeScript_files,

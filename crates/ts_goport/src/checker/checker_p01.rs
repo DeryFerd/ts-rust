@@ -107,7 +107,9 @@ impl From<&LiteralValue> for LiteralValueKey {
             LiteralValue::String(s) => LiteralValueKey::String(s.clone()),
             LiteralValue::Number(n) => LiteralValueKey::Number(NumberKey::from(Number(n.0))),
             LiteralValue::Bool(b) => LiteralValueKey::Bool(*b),
-            LiteralValue::PseudoBigInt(p) => LiteralValueKey::PseudoBigInt(PseudoBigIntKey::from(p)),
+            LiteralValue::PseudoBigInt(p) => {
+                LiteralValueKey::PseudoBigInt(PseudoBigIntKey::from(p))
+            }
         }
     }
 }
@@ -177,7 +179,8 @@ fn signature_key_of(s: &str) -> CacheHashKey {
 // `*SIGNATURE_KEY_ERASED`.
 pub static SIGNATURE_KEY_ERASED: LazyLock<CacheHashKey> = LazyLock::new(|| signature_key_of("-"));
 // Go: checker/checker.go:172 SignatureKeyCanonical
-pub static SIGNATURE_KEY_CANONICAL: LazyLock<CacheHashKey> = LazyLock::new(|| signature_key_of("*"));
+pub static SIGNATURE_KEY_CANONICAL: LazyLock<CacheHashKey> =
+    LazyLock::new(|| signature_key_of("*"));
 // Go: checker/checker.go:173 SignatureKeyBase
 pub static SIGNATURE_KEY_BASE: LazyLock<CacheHashKey> = LazyLock::new(|| signature_key_of("#"));
 // Go: checker/checker.go:174 SignatureKeyInner
@@ -366,15 +369,16 @@ pub struct IntraExpressionInferenceSite {
 
 // Go: checker/checker.go:348 intrinsicTypeKinds
 // PORT: Go package map var; read with `INTRINSIC_TYPE_KINDS.get(name)`.
-pub static INTRINSIC_TYPE_KINDS: LazyLock<FxHashMap<&'static str, IntrinsicTypeKind>> = LazyLock::new(|| {
-    let mut m = FxHashMap::default();
-    m.insert("Uppercase", IntrinsicTypeKind::UPPERCASE);
-    m.insert("Lowercase", IntrinsicTypeKind::LOWERCASE);
-    m.insert("Capitalize", IntrinsicTypeKind::CAPITALIZE);
-    m.insert("Uncapitalize", IntrinsicTypeKind::UNCAPITALIZE);
-    m.insert("NoInfer", IntrinsicTypeKind::NO_INFER);
-    m
-});
+pub static INTRINSIC_TYPE_KINDS: LazyLock<FxHashMap<&'static str, IntrinsicTypeKind>> =
+    LazyLock::new(|| {
+        let mut m = FxHashMap::default();
+        m.insert("Uppercase", IntrinsicTypeKind::UPPERCASE);
+        m.insert("Lowercase", IntrinsicTypeKind::LOWERCASE);
+        m.insert("Capitalize", IntrinsicTypeKind::CAPITALIZE);
+        m.insert("Uncapitalize", IntrinsicTypeKind::UNCAPITALIZE);
+        m.insert("NoInfer", IntrinsicTypeKind::NO_INFER);
+        m
+    });
 
 // Go: checker/checker.go:514 IterationTypes
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -453,13 +457,19 @@ pub struct PseudoBigIntKey {
 
 impl From<&PseudoBigInt> for PseudoBigIntKey {
     fn from(v: &PseudoBigInt) -> Self {
-        PseudoBigIntKey { negative: v.negative, base10_value: v.base10_value.clone() }
+        PseudoBigIntKey {
+            negative: v.negative,
+            base10_value: v.base10_value.clone(),
+        }
     }
 }
 
 impl From<PseudoBigInt> for PseudoBigIntKey {
     fn from(v: PseudoBigInt) -> Self {
-        PseudoBigIntKey { negative: v.negative, base10_value: v.base10_value }
+        PseudoBigIntKey {
+            negative: v.negative,
+            base10_value: v.base10_value,
+        }
     }
 }
 
@@ -483,7 +493,9 @@ pub type TypeTestFn = Rc<dyn Fn(&mut Checker, TypeId) -> bool>;
 pub type NodeTestFn = Rc<dyn Fn(&mut Checker, Node) -> bool>;
 /// Go `func(location, name, meaning, nameNotFoundMessage, isUse, excludeGlobals) *ast.Symbol`.
 /// A nil Go message is `None`.
-pub type ResolveNameFn = Rc<dyn Fn(&mut Checker, Node, &str, SymbolFlags, Option<&'static Message>, bool, bool) -> SymbolId>;
+pub type ResolveNameFn = Rc<
+    dyn Fn(&mut Checker, Node, &str, SymbolFlags, Option<&'static Message>, bool, bool) -> SymbolId,
+>;
 /// Go `func(*ast.Symbol, *ast.Symbol) int`.
 pub type CompareSymbolsFn = Rc<dyn Fn(&mut Checker, SymbolId, SymbolId) -> i32>;
 /// Go `func([]*ast.Symbol, []*ast.Symbol) int`.
@@ -508,9 +520,16 @@ fn nil_node_test_fn() -> NodeTestFn {
 }
 
 fn nil_resolve_name_fn() -> ResolveNameFn {
-    Rc::new(|_: &mut Checker, _: Node, _: &str, _: SymbolFlags, _: Option<&'static Message>, _: bool, _: bool| -> SymbolId {
-        panic!("call of nil func")
-    })
+    Rc::new(
+        |_: &mut Checker,
+         _: Node,
+         _: &str,
+         _: SymbolFlags,
+         _: Option<&'static Message>,
+         _: bool,
+         _: bool|
+         -> SymbolId { panic!("call of nil func") },
+    )
 }
 
 fn nil_compare_symbols_fn() -> CompareSymbolsFn {
@@ -522,7 +541,9 @@ fn nil_compare_symbol_chains_fn() -> CompareSymbolChainsFn {
 }
 
 fn nil_type_comparer() -> TypeComparer {
-    Rc::new(|_: &mut Checker, _: TypeId, _: TypeId, _: bool| -> Ternary { panic!("call of nil func") })
+    Rc::new(
+        |_: &mut Checker, _: TypeId, _: TypeId, _: bool| -> Ternary { panic!("call of nil func") },
+    )
 }
 
 fn nil_evaluator() -> Evaluator {
@@ -542,11 +563,16 @@ fn nil_iteration_types_resolver() -> Rc<IterationTypesResolver> {
         get_global_iterable_iterator_type_checked: nil_global_type_fn(),
         get_global_iterator_object_type: nil_global_type_fn(),
         get_global_generator_type: nil_global_type_fn(),
-        get_global_builtin_iterator_types: Rc::new(|_: &mut Checker| -> Vec<TypeId> { panic!("call of nil func") }),
-        resolve_iteration_type: Rc::new(|_: &mut Checker, _: TypeId, _: Node| -> TypeId { panic!("call of nil func") }),
+        get_global_builtin_iterator_types: Rc::new(|_: &mut Checker| -> Vec<TypeId> {
+            panic!("call of nil func")
+        }),
+        resolve_iteration_type: Rc::new(|_: &mut Checker, _: TypeId, _: Node| -> TypeId {
+            panic!("call of nil func")
+        }),
         must_have_a_next_method_diagnostic: diag::An_iterator_must_have_a_next_method,
         must_be_a_method_diagnostic: diag::The_0_property_of_an_iterator_must_be_a_method,
-        must_have_a_value_diagnostic: diag::The_type_returned_by_the_0_method_of_an_iterator_must_have_a_value_property,
+        must_have_a_value_diagnostic:
+            diag::The_type_returned_by_the_0_method_of_an_iterator_must_have_a_value_property,
     })
 }
 
@@ -1026,19 +1052,27 @@ impl Checker {
             is_inference_partially_blocked: false,
             legacy_decorators: compiler_options.experimental_decorators == Tristate::True,
             emit_standard_class_fields: compiler_options.get_emit_standard_class_fields(),
-            strict_null_checks: compiler_options.get_strict_option_value(compiler_options.strict_null_checks),
-            strict_function_types: compiler_options.get_strict_option_value(compiler_options.strict_function_types),
-            strict_bind_call_apply: compiler_options.get_strict_option_value(compiler_options.strict_bind_call_apply),
+            strict_null_checks: compiler_options
+                .get_strict_option_value(compiler_options.strict_null_checks),
+            strict_function_types: compiler_options
+                .get_strict_option_value(compiler_options.strict_function_types),
+            strict_bind_call_apply: compiler_options
+                .get_strict_option_value(compiler_options.strict_bind_call_apply),
             strict_property_initialization: compiler_options
                 .get_strict_option_value(compiler_options.strict_property_initialization),
             strict_builtin_iterator_return: compiler_options
                 .get_strict_option_value(compiler_options.strict_builtin_iterator_return),
-            no_implicit_any: compiler_options.get_strict_option_value(compiler_options.no_implicit_any),
-            no_implicit_this: compiler_options.get_strict_option_value(compiler_options.no_implicit_this),
+            no_implicit_any: compiler_options
+                .get_strict_option_value(compiler_options.no_implicit_any),
+            no_implicit_this: compiler_options
+                .get_strict_option_value(compiler_options.no_implicit_this),
             use_unknown_in_catch_variables: compiler_options
                 .get_strict_option_value(compiler_options.use_unknown_in_catch_variables),
-            exact_optional_property_types: compiler_options.exact_optional_property_types == Tristate::True,
-            can_collect_symbol_alias_accessibility_data: compiler_options.verbatim_module_syntax.is_false_or_unknown(),
+            exact_optional_property_types: compiler_options.exact_optional_property_types
+                == Tristate::True,
+            can_collect_symbol_alias_accessibility_data: compiler_options
+                .verbatim_module_syntax
+                .is_false_or_unknown(),
             emit_resolver: None,
             was_canceled: false,
             save_deferred_diagnostics: false,
@@ -1325,26 +1359,35 @@ impl Checker {
             inference_contexts: vec![InferenceContext::default()],
         };
         // Closure optimization
-        c.compare_symbols = Rc::new(|c: &mut Checker, s1: SymbolId, s2: SymbolId| -> i32 { c.compare_symbols_worker(s1, s2) });
-        // Closure optimization
-        c.compare_symbol_chains = Rc::new(|c: &mut Checker, a: &[SymbolId], b: &[SymbolId]| -> i32 {
-            c.compare_symbol_chains_worker(a, b)
+        c.compare_symbols = Rc::new(|c: &mut Checker, s1: SymbolId, s2: SymbolId| -> i32 {
+            c.compare_symbols_worker(s1, s2)
         });
+        // Closure optimization
+        c.compare_symbol_chains =
+            Rc::new(|c: &mut Checker, a: &[SymbolId], b: &[SymbolId]| -> i32 {
+                c.compare_symbol_chains_worker(a, b)
+            });
         // PORT: Go `make(ast.SymbolTable, n)` sizes the map; the arena table
         // reserves the same capacity. `countGlobalSymbols` (checker_p02) is a
         // `Checker` method because it reads the symbol arena.
-        let global_symbol_count = usize::try_from(c.count_global_symbols(&c.files)).expect("negative symbol count");
+        let global_symbol_count =
+            usize::try_from(c.count_global_symbols(&c.files)).expect("negative symbol count");
         c.globals = c.symbols.new_table();
         c.symbols.tables[c.globals.index()].reserve(global_symbol_count);
         c.evaluate = new_evaluator(
-            Rc::new(|c: &mut Checker, expr: Node, location: Node| -> EvaluatorResult { c.evaluate_entity(expr, location) }),
+            Rc::new(
+                |c: &mut Checker, expr: Node, location: Node| -> EvaluatorResult {
+                    c.evaluate_entity(expr, location)
+                },
+            ),
             OuterExpressionKinds::OEK_PARENTHESES,
         );
         c.undefined_symbol = c.new_symbol(SymbolFlags::PROPERTY, "undefined");
         c.arguments_symbol = c.new_symbol(SymbolFlags::PROPERTY, "arguments");
         c.require_symbol = c.new_symbol(SymbolFlags::PROPERTY, "require");
         c.unknown_symbol = c.new_symbol(SymbolFlags::PROPERTY, "unknown");
-        c.global_this_symbol = c.new_symbol_ex(SymbolFlags::MODULE, "globalThis", CheckFlags::READONLY);
+        c.global_this_symbol =
+            c.new_symbol_ex(SymbolFlags::MODULE, "globalThis", CheckFlags::READONLY);
         let globals = c.globals;
         let global_this_symbol = c.global_this_symbol;
         c.sym_mut(global_this_symbol).exports = globals;
@@ -1361,7 +1404,17 @@ impl Checker {
                   name_not_found_message: Option<&'static Message>,
                   is_use: bool,
                   exclude_globals: bool|
-                  -> SymbolId { resolver.resolve(c, location, name, meaning, name_not_found_message, is_use, exclude_globals) },
+                  -> SymbolId {
+                resolver.resolve(
+                    c,
+                    location,
+                    name,
+                    meaning,
+                    name_not_found_message,
+                    is_use,
+                    exclude_globals,
+                )
+            },
         );
         let suggestion_resolver = c.create_name_resolver_for_suggestion();
         c.resolve_name_for_symbol_suggestion = Rc::new(
@@ -1373,22 +1426,36 @@ impl Checker {
                   is_use: bool,
                   exclude_globals: bool|
                   -> SymbolId {
-                suggestion_resolver.resolve(c, location, name, meaning, name_not_found_message, is_use, exclude_globals)
+                suggestion_resolver.resolve(
+                    c,
+                    location,
+                    name,
+                    meaning,
+                    name_not_found_message,
+                    is_use,
+                    exclude_globals,
+                )
             },
         );
         c.any_type = c.new_intrinsic_type(TypeFlags::ANY, "any");
-        c.auto_type = c.new_intrinsic_type_ex(TypeFlags::ANY, "any", ObjectFlags::NON_INFERRABLE_TYPE);
+        c.auto_type =
+            c.new_intrinsic_type_ex(TypeFlags::ANY, "any", ObjectFlags::NON_INFERRABLE_TYPE);
         c.wildcard_type = c.new_intrinsic_type(TypeFlags::ANY, "any");
         c.blocked_string_type = c.new_intrinsic_type(TypeFlags::ANY, "any");
         c.error_type = c.new_intrinsic_type(TypeFlags::ANY, "error");
         c.unresolved_type = c.new_intrinsic_type(TypeFlags::ANY, "unresolved");
-        c.non_inferrable_any_type = c.new_intrinsic_type_ex(TypeFlags::ANY, "any", ObjectFlags::CONTAINS_WIDENING_TYPE);
+        c.non_inferrable_any_type =
+            c.new_intrinsic_type_ex(TypeFlags::ANY, "any", ObjectFlags::CONTAINS_WIDENING_TYPE);
         c.intrinsic_marker_type = c.new_intrinsic_type(TypeFlags::ANY, "intrinsic");
         c.unknown_type = c.new_intrinsic_type(TypeFlags::UNKNOWN, "unknown");
         c.undefined_type = c.new_intrinsic_type(TypeFlags::UNDEFINED, "undefined");
         c.undefined_widening_type = c.create_widening_type(c.undefined_type);
         c.missing_type = c.new_intrinsic_type(TypeFlags::UNDEFINED, "undefined");
-        c.undefined_or_missing_type = if c.exact_optional_property_types { c.missing_type } else { c.undefined_type };
+        c.undefined_or_missing_type = if c.exact_optional_property_types {
+            c.missing_type
+        } else {
+            c.undefined_type
+        };
         c.optional_type = c.new_intrinsic_type(TypeFlags::UNDEFINED, "undefined");
         c.null_type = c.new_intrinsic_type(TypeFlags::NULL, "null");
         c.null_widening_type = c.create_widening_type(c.null_type);
@@ -1396,13 +1463,31 @@ impl Checker {
         c.number_type = c.new_intrinsic_type(TypeFlags::NUMBER, "number");
         c.bigint_type = c.new_intrinsic_type(TypeFlags::BIG_INT, "bigint");
         // PORT: Go `value any` is `Option<LiteralValue>` (see `LiteralType`).
-        c.regular_false_type = c.new_literal_type(TypeFlags::BOOLEAN_LITERAL, Some(LiteralValue::Bool(false)), TypeId::NIL);
-        c.false_type = c.new_literal_type(TypeFlags::BOOLEAN_LITERAL, Some(LiteralValue::Bool(false)), c.regular_false_type);
+        c.regular_false_type = c.new_literal_type(
+            TypeFlags::BOOLEAN_LITERAL,
+            Some(LiteralValue::Bool(false)),
+            TypeId::NIL,
+        );
+        c.false_type = c.new_literal_type(
+            TypeFlags::BOOLEAN_LITERAL,
+            Some(LiteralValue::Bool(false)),
+            c.regular_false_type,
+        );
         let (regular_false_type, false_type) = (c.regular_false_type, c.false_type);
-        c.ty_mut(regular_false_type).as_literal_type_mut().fresh_type = false_type;
+        c.ty_mut(regular_false_type)
+            .as_literal_type_mut()
+            .fresh_type = false_type;
         c.ty_mut(false_type).as_literal_type_mut().fresh_type = false_type;
-        c.regular_true_type = c.new_literal_type(TypeFlags::BOOLEAN_LITERAL, Some(LiteralValue::Bool(true)), TypeId::NIL);
-        c.true_type = c.new_literal_type(TypeFlags::BOOLEAN_LITERAL, Some(LiteralValue::Bool(true)), c.regular_true_type);
+        c.regular_true_type = c.new_literal_type(
+            TypeFlags::BOOLEAN_LITERAL,
+            Some(LiteralValue::Bool(true)),
+            TypeId::NIL,
+        );
+        c.true_type = c.new_literal_type(
+            TypeFlags::BOOLEAN_LITERAL,
+            Some(LiteralValue::Bool(true)),
+            c.regular_true_type,
+        );
         let (regular_true_type, true_type) = (c.regular_true_type, c.true_type);
         c.ty_mut(regular_true_type).as_literal_type_mut().fresh_type = true_type;
         c.ty_mut(true_type).as_literal_type_mut().fresh_type = true_type;
@@ -1410,45 +1495,122 @@ impl Checker {
         c.es_symbol_type = c.new_intrinsic_type(TypeFlags::ES_SYMBOL, "symbol");
         c.void_type = c.new_intrinsic_type(TypeFlags::VOID, "void");
         c.never_type = c.new_intrinsic_type(TypeFlags::NEVER, "never");
-        c.silent_never_type = c.new_intrinsic_type_ex(TypeFlags::NEVER, "never", ObjectFlags::NON_INFERRABLE_TYPE);
+        c.silent_never_type =
+            c.new_intrinsic_type_ex(TypeFlags::NEVER, "never", ObjectFlags::NON_INFERRABLE_TYPE);
         c.implicit_never_type = c.new_intrinsic_type(TypeFlags::NEVER, "never");
         c.unreachable_never_type = c.new_intrinsic_type(TypeFlags::NEVER, "never");
         c.non_primitive_type = c.new_intrinsic_type(TypeFlags::NON_PRIMITIVE, "object");
         c.string_or_number_type = c.get_union_type(&[c.string_type, c.number_type]);
-        c.string_number_symbol_type = c.get_union_type(&[c.string_type, c.number_type, c.es_symbol_type]);
+        c.string_number_symbol_type =
+            c.get_union_type(&[c.string_type, c.number_type, c.es_symbol_type]);
         c.number_or_big_int_type = c.get_union_type(&[c.number_type, c.bigint_type]);
         // The `${number}` type
-        c.numeric_string_type = c.get_template_literal_type(&[String::new(), String::new()], &[c.number_type]);
-        c.template_constraint_type =
-            c.get_union_type(&[c.string_type, c.number_type, c.boolean_type, c.bigint_type, c.null_type, c.undefined_type]);
+        c.numeric_string_type =
+            c.get_template_literal_type(&[String::new(), String::new()], &[c.number_type]);
+        c.template_constraint_type = c.get_union_type(&[
+            c.string_type,
+            c.number_type,
+            c.boolean_type,
+            c.bigint_type,
+            c.null_type,
+            c.undefined_type,
+        ]);
         // Special `never` flagged by union reduction to behave as a literal
         c.unique_literal_type = c.new_intrinsic_type(TypeFlags::NEVER, "never");
         c.unique_literal_mapper =
-            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId { c.get_unique_literal_type_for_type_parameter(t) }));
+            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId {
+                c.get_unique_literal_type_for_type_parameter(t)
+            }));
         c.report_unreliable_mapper =
-            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId { c.report_unreliable_worker(t) }));
+            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId {
+                c.report_unreliable_worker(t)
+            }));
         c.report_unmeasurable_mapper =
-            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId { c.report_unmeasurable_worker(t) }));
+            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId {
+                c.report_unmeasurable_worker(t)
+            }));
         c.restrictive_mapper =
-            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId { c.restrictive_mapper_worker(t) }));
+            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId {
+                c.restrictive_mapper_worker(t)
+            }));
         c.permissive_mapper =
-            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId { c.permissive_mapper_worker(t) }));
-        c.empty_object_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
-        c.empty_jsx_object_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
-        c.empty_fresh_jsx_object_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
-        let type_literal_symbol = c.new_symbol(SymbolFlags::TYPE_LITERAL, INTERNAL_SYMBOL_NAME_TYPE);
-        c.empty_type_literal_type = c.new_anonymous_type(type_literal_symbol, SymbolTable::NIL, &[], &[], &[]);
-        c.unknown_empty_object_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
+            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId {
+                c.permissive_mapper_worker(t)
+            }));
+        c.empty_object_type = c.new_anonymous_type(
+            SymbolId::NIL, /*symbol*/
+            SymbolTable::NIL,
+            &[],
+            &[],
+            &[],
+        );
+        c.empty_jsx_object_type = c.new_anonymous_type(
+            SymbolId::NIL, /*symbol*/
+            SymbolTable::NIL,
+            &[],
+            &[],
+            &[],
+        );
+        c.empty_fresh_jsx_object_type = c.new_anonymous_type(
+            SymbolId::NIL, /*symbol*/
+            SymbolTable::NIL,
+            &[],
+            &[],
+            &[],
+        );
+        let type_literal_symbol =
+            c.new_symbol(SymbolFlags::TYPE_LITERAL, INTERNAL_SYMBOL_NAME_TYPE);
+        c.empty_type_literal_type =
+            c.new_anonymous_type(type_literal_symbol, SymbolTable::NIL, &[], &[], &[]);
+        c.unknown_empty_object_type = c.new_anonymous_type(
+            SymbolId::NIL, /*symbol*/
+            SymbolTable::NIL,
+            &[],
+            &[],
+            &[],
+        );
         c.unknown_union_type = c.create_unknown_union_type();
-        c.empty_generic_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
+        c.empty_generic_type = c.new_anonymous_type(
+            SymbolId::NIL, /*symbol*/
+            SymbolTable::NIL,
+            &[],
+            &[],
+            &[],
+        );
         let empty_generic_type = c.empty_generic_type;
-        c.ty_mut(empty_generic_type).as_object_type_mut().instantiations = Some(FxHashMap::default());
-        c.any_function_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
+        c.ty_mut(empty_generic_type)
+            .as_object_type_mut()
+            .instantiations = Some(FxHashMap::default());
+        c.any_function_type = c.new_anonymous_type(
+            SymbolId::NIL, /*symbol*/
+            SymbolTable::NIL,
+            &[],
+            &[],
+            &[],
+        );
         let any_function_type = c.any_function_type;
         c.ty_mut(any_function_type).object_flags |= ObjectFlags::NON_INFERRABLE_TYPE;
-        c.no_constraint_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
-        c.circular_constraint_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
-        c.resolving_default_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
+        c.no_constraint_type = c.new_anonymous_type(
+            SymbolId::NIL, /*symbol*/
+            SymbolTable::NIL,
+            &[],
+            &[],
+            &[],
+        );
+        c.circular_constraint_type = c.new_anonymous_type(
+            SymbolId::NIL, /*symbol*/
+            SymbolTable::NIL,
+            &[],
+            &[],
+            &[],
+        );
+        c.resolving_default_type = c.new_anonymous_type(
+            SymbolId::NIL, /*symbol*/
+            SymbolTable::NIL,
+            &[],
+            &[],
+            &[],
+        );
         c.marker_super_type = c.new_type_parameter(SymbolId::NIL);
         c.marker_sub_type = c.new_type_parameter(SymbolId::NIL);
         let (marker_sub_type, marker_super_type) = (c.marker_sub_type, c.marker_super_type);
@@ -1456,11 +1618,16 @@ impl Checker {
         c.marker_other_type = c.new_type_parameter(SymbolId::NIL);
         c.marker_super_type_for_check = c.new_type_parameter(SymbolId::NIL);
         c.marker_sub_type_for_check = c.new_type_parameter(SymbolId::NIL);
-        let (marker_sub_type_for_check, marker_super_type_for_check) = (c.marker_sub_type_for_check, c.marker_super_type_for_check);
-        c.ty_mut(marker_sub_type_for_check).as_type_parameter_mut().constraint = marker_super_type_for_check;
+        let (marker_sub_type_for_check, marker_super_type_for_check) =
+            (c.marker_sub_type_for_check, c.marker_super_type_for_check);
+        c.ty_mut(marker_sub_type_for_check)
+            .as_type_parameter_mut()
+            .constraint = marker_super_type_for_check;
         // PORT: Go builds `&TypePredicate{...}` directly (no constructor), so
         // it is pushed into the arena here.
-        c.no_type_predicate = TypePredicateId(u32::try_from(c.type_predicates.len()).expect("type predicate overflow"));
+        c.no_type_predicate = TypePredicateId(
+            u32::try_from(c.type_predicates.len()).expect("type predicate overflow"),
+        );
         let any_type = c.any_type;
         c.type_predicates.push(TypePredicate {
             kind: TypePredicateKind::IDENTIFIER,
@@ -1468,104 +1635,279 @@ impl Checker {
             parameter_name: "<<unresolved>>".to_string(),
             t: any_type,
         });
-        c.any_signature = c.new_signature(SignatureFlags::NONE, Node::NIL, &[], SymbolId::NIL, &[], c.any_type, TypePredicateId::NIL, 0);
-        c.unknown_signature =
-            c.new_signature(SignatureFlags::NONE, Node::NIL, &[], SymbolId::NIL, &[], c.error_type, TypePredicateId::NIL, 0);
-        c.resolving_signature =
-            c.new_signature(SignatureFlags::NONE, Node::NIL, &[], SymbolId::NIL, &[], c.any_type, TypePredicateId::NIL, 0);
-        c.silent_never_signature =
-            c.new_signature(SignatureFlags::NONE, Node::NIL, &[], SymbolId::NIL, &[], c.silent_never_type, TypePredicateId::NIL, 0);
+        c.any_signature = c.new_signature(
+            SignatureFlags::NONE,
+            Node::NIL,
+            &[],
+            SymbolId::NIL,
+            &[],
+            c.any_type,
+            TypePredicateId::NIL,
+            0,
+        );
+        c.unknown_signature = c.new_signature(
+            SignatureFlags::NONE,
+            Node::NIL,
+            &[],
+            SymbolId::NIL,
+            &[],
+            c.error_type,
+            TypePredicateId::NIL,
+            0,
+        );
+        c.resolving_signature = c.new_signature(
+            SignatureFlags::NONE,
+            Node::NIL,
+            &[],
+            SymbolId::NIL,
+            &[],
+            c.any_type,
+            TypePredicateId::NIL,
+            0,
+        );
+        c.silent_never_signature = c.new_signature(
+            SignatureFlags::NONE,
+            Node::NIL,
+            &[],
+            SymbolId::NIL,
+            &[],
+            c.silent_never_type,
+            TypePredicateId::NIL,
+            0,
+        );
         // PORT: Go builds `&IndexInfo{...}` directly (no constructor), so they
         // are pushed into the arena here.
-        c.enum_number_index_info = IndexInfoId(u32::try_from(c.index_infos.len()).expect("index info overflow"));
+        c.enum_number_index_info =
+            IndexInfoId(u32::try_from(c.index_infos.len()).expect("index info overflow"));
         let (number_type, string_type) = (c.number_type, c.string_type);
-        c.index_infos.push(IndexInfo { key_type: number_type, value_type: string_type, is_readonly: true, ..IndexInfo::default() });
-        c.any_base_type_index_info = IndexInfoId(u32::try_from(c.index_infos.len()).expect("index info overflow"));
-        c.index_infos.push(IndexInfo { key_type: string_type, value_type: any_type, is_readonly: false, ..IndexInfo::default() });
+        c.index_infos.push(IndexInfo {
+            key_type: number_type,
+            value_type: string_type,
+            is_readonly: true,
+            ..IndexInfo::default()
+        });
+        c.any_base_type_index_info =
+            IndexInfoId(u32::try_from(c.index_infos.len()).expect("index info overflow"));
+        c.index_infos.push(IndexInfo {
+            key_type: string_type,
+            value_type: any_type,
+            is_readonly: false,
+            ..IndexInfo::default()
+        });
         c.empty_string_type = c.get_string_literal_type("");
         c.zero_type = c.get_number_literal_type(Number(0.0));
         c.zero_big_int_type = c.get_big_int_literal_type(PseudoBigInt::default());
         // PORT: Go `slices.Sorted(maps.Keys(typeofNEFacts))` (flow.go:623).
         // The sorted keys are written out; they must match that map.
-        let typeof_types: Vec<TypeId> = ["bigint", "boolean", "function", "number", "object", "string", "symbol", "undefined"]
-            .iter()
-            .map(|s| c.get_string_literal_type(s))
-            .collect();
+        let typeof_types: Vec<TypeId> = [
+            "bigint",
+            "boolean",
+            "function",
+            "number",
+            "object",
+            "string",
+            "symbol",
+            "undefined",
+        ]
+        .iter()
+        .map(|s| c.get_string_literal_type(s))
+        .collect();
         c.typeof_type = c.get_union_type(&typeof_types);
-        c.get_global_es_symbol_type = c.get_global_type_resolver("Symbol", 0 /*arity*/, false /*reportErrors*/);
-        c.get_global_big_int_type = c.get_global_type_resolver("BigInt", 0 /*arity*/, false /*reportErrors*/);
-        c.get_global_import_meta_type = c.get_global_type_resolver("ImportMeta", 0 /*arity*/, true /*reportErrors*/);
-        c.get_global_import_attributes_type = c.get_global_type_resolver("ImportAttributes", 0 /*arity*/, false /*reportErrors*/);
-        c.get_global_import_attributes_type_checked =
-            c.get_global_type_resolver("ImportAttributes", 0 /*arity*/, true /*reportErrors*/);
-        c.get_global_non_nullable_type_alias_or_nil =
-            c.get_global_type_alias_resolver("NonNullable", 1 /*arity*/, false /*reportErrors*/);
-        c.get_global_extract_symbol = c.get_global_type_alias_resolver("Extract", 2 /*arity*/, true /*reportErrors*/);
-        c.get_global_disposable_type = c.get_global_type_resolver("Disposable", 0 /*arity*/, true /*reportErrors*/);
-        c.get_global_async_disposable_type = c.get_global_type_resolver("AsyncDisposable", 0 /*arity*/, true /*reportErrors*/);
-        c.get_global_awaited_symbol = c.get_global_type_alias_resolver("Awaited", 1 /*arity*/, true /*reportErrors*/);
-        c.get_global_awaited_symbol_or_nil = c.get_global_type_alias_resolver("Awaited", 1 /*arity*/, false /*reportErrors*/);
-        c.get_global_na_n_symbol_or_nil = c.get_global_value_symbol_resolver("NaN", false /*reportErrors*/);
-        c.get_global_record_symbol = c.get_global_type_alias_resolver("Record", 2 /*arity*/, true /*reportErrors*/);
-        c.get_global_template_strings_array_type =
-            c.get_global_type_resolver("TemplateStringsArray", 0 /*arity*/, true /*reportErrors*/);
-        c.get_global_es_symbol_constructor_symbol_or_nil = c.get_global_value_symbol_resolver("Symbol", false /*reportErrors*/);
+        c.get_global_es_symbol_type =
+            c.get_global_type_resolver("Symbol", 0 /*arity*/, false /*reportErrors*/);
+        c.get_global_big_int_type =
+            c.get_global_type_resolver("BigInt", 0 /*arity*/, false /*reportErrors*/);
+        c.get_global_import_meta_type =
+            c.get_global_type_resolver("ImportMeta", 0 /*arity*/, true /*reportErrors*/);
+        c.get_global_import_attributes_type = c.get_global_type_resolver(
+            "ImportAttributes",
+            0,     /*arity*/
+            false, /*reportErrors*/
+        );
+        c.get_global_import_attributes_type_checked = c.get_global_type_resolver(
+            "ImportAttributes",
+            0,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_non_nullable_type_alias_or_nil = c.get_global_type_alias_resolver(
+            "NonNullable",
+            1,     /*arity*/
+            false, /*reportErrors*/
+        );
+        c.get_global_extract_symbol = c.get_global_type_alias_resolver(
+            "Extract", 2,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_disposable_type =
+            c.get_global_type_resolver("Disposable", 0 /*arity*/, true /*reportErrors*/);
+        c.get_global_async_disposable_type = c.get_global_type_resolver(
+            "AsyncDisposable",
+            0,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_awaited_symbol = c.get_global_type_alias_resolver(
+            "Awaited", 1,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_awaited_symbol_or_nil = c.get_global_type_alias_resolver(
+            "Awaited", 1,     /*arity*/
+            false, /*reportErrors*/
+        );
+        c.get_global_na_n_symbol_or_nil =
+            c.get_global_value_symbol_resolver("NaN", false /*reportErrors*/);
+        c.get_global_record_symbol = c
+            .get_global_type_alias_resolver("Record", 2 /*arity*/, true /*reportErrors*/);
+        c.get_global_template_strings_array_type = c.get_global_type_resolver(
+            "TemplateStringsArray",
+            0,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_es_symbol_constructor_symbol_or_nil =
+            c.get_global_value_symbol_resolver("Symbol", false /*reportErrors*/);
         c.get_global_es_symbol_constructor_type_symbol_or_nil =
             c.get_global_type_symbol_resolver("SymbolConstructor", false /*reportErrors*/);
-        c.get_global_import_call_options_type = c.get_global_type_resolver("ImportCallOptions", 0 /*arity*/, false /*reportErrors*/);
-        c.get_global_import_call_options_type_checked =
-            c.get_global_type_resolver("ImportCallOptions", 0 /*arity*/, true /*reportErrors*/);
-        c.get_global_promise_type = c.get_global_type_resolver("Promise", 1 /*arity*/, false /*reportErrors*/);
-        c.get_global_promise_type_checked = c.get_global_type_resolver("Promise", 1 /*arity*/, true /*reportErrors*/);
-        c.get_global_promise_like_type = c.get_global_type_resolver("PromiseLike", 1 /*arity*/, true /*reportErrors*/);
-        c.get_global_promise_constructor_symbol = c.get_global_value_symbol_resolver("Promise", true /*reportErrors*/);
-        c.get_global_promise_constructor_symbol_or_nil = c.get_global_value_symbol_resolver("Promise", false /*reportErrors*/);
-        c.get_global_omit_symbol = c.get_global_type_alias_resolver("Omit", 2 /*arity*/, true /*reportErrors*/);
-        c.get_global_no_infer_symbol_or_nil = c.get_global_type_alias_resolver("NoInfer", 1 /*arity*/, false /*reportErrors*/);
-        c.get_global_iterator_type = c.get_global_type_resolver("Iterator", 3 /*arity*/, false /*reportErrors*/);
-        c.get_global_iterable_type = c.get_global_type_resolver("Iterable", 3 /*arity*/, false /*reportErrors*/);
-        c.get_global_iterable_type_checked = c.get_global_type_resolver("Iterable", 3 /*arity*/, true /*reportErrors*/);
-        c.get_global_iterable_iterator_type = c.get_global_type_resolver("IterableIterator", 3 /*arity*/, false /*reportErrors*/);
-        c.get_global_iterable_iterator_type_checked =
-            c.get_global_type_resolver("IterableIterator", 3 /*arity*/, true /*reportErrors*/);
-        c.get_global_iterator_object_type = c.get_global_type_resolver("IteratorObject", 3 /*arity*/, false /*reportErrors*/);
-        c.get_global_generator_type = c.get_global_type_resolver("Generator", 3 /*arity*/, false /*reportErrors*/);
-        c.get_global_async_iterator_type = c.get_global_type_resolver("AsyncIterator", 3 /*arity*/, false /*reportErrors*/);
-        c.get_global_async_iterable_type = c.get_global_type_resolver("AsyncIterable", 3 /*arity*/, false /*reportErrors*/);
-        c.get_global_async_iterable_type_checked = c.get_global_type_resolver("AsyncIterable", 3 /*arity*/, true /*reportErrors*/);
-        c.get_global_async_iterable_iterator_type =
-            c.get_global_type_resolver("AsyncIterableIterator", 3 /*arity*/, false /*reportErrors*/);
-        c.get_global_async_iterable_iterator_type_checked =
-            c.get_global_type_resolver("AsyncIterableIterator", 3 /*arity*/, true /*reportErrors*/);
-        c.get_global_async_iterator_object_type =
-            c.get_global_type_resolver("AsyncIteratorObject", 3 /*arity*/, false /*reportErrors*/);
-        c.get_global_async_generator_type = c.get_global_type_resolver("AsyncGenerator", 3 /*arity*/, false /*reportErrors*/);
-        c.get_global_iterator_yield_result_type =
-            c.get_global_type_resolver("IteratorYieldResult", 1 /*arity*/, false /*reportErrors*/);
-        c.get_global_iterator_return_result_type =
-            c.get_global_type_resolver("IteratorReturnResult", 1 /*arity*/, false /*reportErrors*/);
-        c.get_global_typed_property_descriptor_type =
-            c.get_global_type_resolver("TypedPropertyDescriptor", 1 /*arity*/, true /*reportErrors*/);
-        c.get_global_class_decorator_context_type =
-            c.get_global_type_resolver("ClassDecoratorContext", 1 /*arity*/, true /*reportErrors*/);
-        c.get_global_class_method_decorator_context_type =
-            c.get_global_type_resolver("ClassMethodDecoratorContext", 2 /*arity*/, true /*reportErrors*/);
-        c.get_global_class_getter_decorator_context_type =
-            c.get_global_type_resolver("ClassGetterDecoratorContext", 2 /*arity*/, true /*reportErrors*/);
-        c.get_global_class_setter_decorator_context_type =
-            c.get_global_type_resolver("ClassSetterDecoratorContext", 2 /*arity*/, true /*reportErrors*/);
-        c.get_global_class_accessor_decorator_context_type =
-            c.get_global_type_resolver("ClassAccessorDecoratorContext", 2 /*arity*/, true /*reportErrors*/);
-        c.get_global_class_accessor_decorator_target_type =
-            c.get_global_type_resolver("ClassAccessorDecoratorTarget", 2 /*arity*/, true /*reportErrors*/);
-        c.get_global_class_accessor_decorator_result_type =
-            c.get_global_type_resolver("ClassAccessorDecoratorResult", 2 /*arity*/, true /*reportErrors*/);
-        c.get_global_class_field_decorator_context_type =
-            c.get_global_type_resolver("ClassFieldDecoratorContext", 2 /*arity*/, true /*reportErrors*/);
+        c.get_global_import_call_options_type = c.get_global_type_resolver(
+            "ImportCallOptions",
+            0,     /*arity*/
+            false, /*reportErrors*/
+        );
+        c.get_global_import_call_options_type_checked = c.get_global_type_resolver(
+            "ImportCallOptions",
+            0,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_promise_type =
+            c.get_global_type_resolver("Promise", 1 /*arity*/, false /*reportErrors*/);
+        c.get_global_promise_type_checked =
+            c.get_global_type_resolver("Promise", 1 /*arity*/, true /*reportErrors*/);
+        c.get_global_promise_like_type =
+            c.get_global_type_resolver("PromiseLike", 1 /*arity*/, true /*reportErrors*/);
+        c.get_global_promise_constructor_symbol =
+            c.get_global_value_symbol_resolver("Promise", true /*reportErrors*/);
+        c.get_global_promise_constructor_symbol_or_nil =
+            c.get_global_value_symbol_resolver("Promise", false /*reportErrors*/);
+        c.get_global_omit_symbol =
+            c.get_global_type_alias_resolver("Omit", 2 /*arity*/, true /*reportErrors*/);
+        c.get_global_no_infer_symbol_or_nil = c.get_global_type_alias_resolver(
+            "NoInfer", 1,     /*arity*/
+            false, /*reportErrors*/
+        );
+        c.get_global_iterator_type =
+            c.get_global_type_resolver("Iterator", 3 /*arity*/, false /*reportErrors*/);
+        c.get_global_iterable_type =
+            c.get_global_type_resolver("Iterable", 3 /*arity*/, false /*reportErrors*/);
+        c.get_global_iterable_type_checked =
+            c.get_global_type_resolver("Iterable", 3 /*arity*/, true /*reportErrors*/);
+        c.get_global_iterable_iterator_type = c.get_global_type_resolver(
+            "IterableIterator",
+            3,     /*arity*/
+            false, /*reportErrors*/
+        );
+        c.get_global_iterable_iterator_type_checked = c.get_global_type_resolver(
+            "IterableIterator",
+            3,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_iterator_object_type = c.get_global_type_resolver(
+            "IteratorObject",
+            3,     /*arity*/
+            false, /*reportErrors*/
+        );
+        c.get_global_generator_type =
+            c.get_global_type_resolver("Generator", 3 /*arity*/, false /*reportErrors*/);
+        c.get_global_async_iterator_type = c.get_global_type_resolver(
+            "AsyncIterator",
+            3,     /*arity*/
+            false, /*reportErrors*/
+        );
+        c.get_global_async_iterable_type = c.get_global_type_resolver(
+            "AsyncIterable",
+            3,     /*arity*/
+            false, /*reportErrors*/
+        );
+        c.get_global_async_iterable_type_checked = c.get_global_type_resolver(
+            "AsyncIterable",
+            3,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_async_iterable_iterator_type = c.get_global_type_resolver(
+            "AsyncIterableIterator",
+            3,     /*arity*/
+            false, /*reportErrors*/
+        );
+        c.get_global_async_iterable_iterator_type_checked = c.get_global_type_resolver(
+            "AsyncIterableIterator",
+            3,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_async_iterator_object_type = c.get_global_type_resolver(
+            "AsyncIteratorObject",
+            3,     /*arity*/
+            false, /*reportErrors*/
+        );
+        c.get_global_async_generator_type = c.get_global_type_resolver(
+            "AsyncGenerator",
+            3,     /*arity*/
+            false, /*reportErrors*/
+        );
+        c.get_global_iterator_yield_result_type = c.get_global_type_resolver(
+            "IteratorYieldResult",
+            1,     /*arity*/
+            false, /*reportErrors*/
+        );
+        c.get_global_iterator_return_result_type = c.get_global_type_resolver(
+            "IteratorReturnResult",
+            1,     /*arity*/
+            false, /*reportErrors*/
+        );
+        c.get_global_typed_property_descriptor_type = c.get_global_type_resolver(
+            "TypedPropertyDescriptor",
+            1,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_class_decorator_context_type = c.get_global_type_resolver(
+            "ClassDecoratorContext",
+            1,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_class_method_decorator_context_type = c.get_global_type_resolver(
+            "ClassMethodDecoratorContext",
+            2,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_class_getter_decorator_context_type = c.get_global_type_resolver(
+            "ClassGetterDecoratorContext",
+            2,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_class_setter_decorator_context_type = c.get_global_type_resolver(
+            "ClassSetterDecoratorContext",
+            2,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_class_accessor_decorator_context_type = c.get_global_type_resolver(
+            "ClassAccessorDecoratorContext",
+            2,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_class_accessor_decorator_target_type = c.get_global_type_resolver(
+            "ClassAccessorDecoratorTarget",
+            2,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_class_accessor_decorator_result_type = c.get_global_type_resolver(
+            "ClassAccessorDecoratorResult",
+            2,    /*arity*/
+            true, /*reportErrors*/
+        );
+        c.get_global_class_field_decorator_context_type = c.get_global_type_resolver(
+            "ClassFieldDecoratorContext",
+            2,    /*arity*/
+            true, /*reportErrors*/
+        );
         c.initialize_closures();
         c.initialize_iteration_resolvers();
         c.initialize_checker();
         c
     }
 }
-

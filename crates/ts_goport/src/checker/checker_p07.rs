@@ -20,10 +20,16 @@ use ts_diagnostics::Message;
 
 impl Checker {
     // Go: checker/checker.go:5715 hasExportedMembersOfKind
-    pub fn has_exported_members_of_kind(&mut self, module_symbol: SymbolId, kind: SymbolFlags) -> bool {
+    pub fn has_exported_members_of_kind(
+        &mut self,
+        module_symbol: SymbolId,
+        kind: SymbolFlags,
+    ) -> bool {
         let exports = self.sym(module_symbol).exports;
         for symbol in self.symbols.values(exports) {
-            if self.sym(symbol).name != INTERNAL_SYMBOL_NAME_EXPORT_EQUALS && self.get_symbol_flags(symbol).intersects(kind) {
+            if self.sym(symbol).name != INTERNAL_SYMBOL_NAME_EXPORT_EQUALS
+                && self.get_symbol_flags(symbol).intersects(kind)
+            {
                 return true;
             }
         }
@@ -36,7 +42,10 @@ impl Checker {
         if flags.intersects(SymbolFlags::NAMESPACE_MODULE) && flags.intersects(SymbolFlags::ALIAS) {
             let target = self.resolve_alias(symbol);
             if self.sym(target).flags.intersects(SymbolFlags::NAMESPACE)
-                && self.has_exported_members_of_kind(target, SymbolFlags::TYPE | SymbolFlags::NAMESPACE)
+                && self.has_exported_members_of_kind(
+                    target,
+                    SymbolFlags::TYPE | SymbolFlags::NAMESPACE,
+                )
             {
                 return true;
             }
@@ -59,7 +68,9 @@ impl Checker {
     // Go: checker/checker.go:5741 checkVariableStatement
     pub fn check_variable_statement(&mut self, node: Node) {
         let declaration_list = node.declaration_list();
-        if !self.check_grammar_modifiers(node) && !self.check_grammar_variable_declaration_list(declaration_list) {
+        if !self.check_grammar_modifiers(node)
+            && !self.check_grammar_variable_declaration_list(declaration_list)
+        {
             self.check_grammar_for_disallowed_block_scoped_variable_statement(node);
         }
         self.check_variable_declaration_list(declaration_list);
@@ -71,7 +82,10 @@ impl Checker {
         if (block_scope_kind == NodeFlags::USING || block_scope_kind == NodeFlags::AWAIT_USING)
             && self.language_version < LANGUAGE_FEATURE_MINIMUM_TARGET.using_and_await_using
         {
-            self.check_external_emit_helpers(node, ExternalEmitHelpers::ADD_DISPOSABLE_RESOURCE_AND_DISPOSE_RESOURCES);
+            self.check_external_emit_helpers(
+                node,
+                ExternalEmitHelpers::ADD_DISPOSABLE_RESOURCE_AND_DISPOSE_RESOURCES,
+            );
         }
         let declarations = node.declarations().nodes().to_vec();
         self.check_source_elements(&declarations);
@@ -132,7 +146,11 @@ impl Checker {
             }
             // check private/protected variable access
             let parent = node.parent().parent();
-            let parent_check_mode = if has_dot_dot_dot_token(node) { CheckMode::REST_BINDING_ELEMENT } else { CheckMode::NORMAL };
+            let parent_check_mode = if has_dot_dot_dot_token(node) {
+                CheckMode::REST_BINDING_ELEMENT
+            } else {
+                CheckMode::NORMAL
+            };
             let parent_type = self.get_type_for_binding_element_parent(parent, parent_check_mode);
             let prop_name_name = node.property_name_or_name();
             if parent_type.is_some() && !is_binding_pattern(prop_name_name) {
@@ -141,10 +159,21 @@ impl Checker {
                     let name_text = self.get_property_name_from_type(expr_type);
                     let property = self.get_property_of_type(parent_type, &name_text);
                     if property.is_some() {
-                        self.mark_property_as_referenced(property, Node::NIL /*nodeForCheckWriteOnly*/, false /*isSelfTypeAccess*/);
+                        self.mark_property_as_referenced(
+                            property,
+                            Node::NIL, /*nodeForCheckWriteOnly*/
+                            false,     /*isSelfTypeAccess*/
+                        );
                         // A destructuring is never a write-only reference.
-                        let is_super = parent.initializer().is_some() && parent.initializer().kind() == SyntaxKind::SuperKeyword;
-                        self.check_property_accessibility(node, is_super, false /*writing*/, parent_type, property);
+                        let is_super = parent.initializer().is_some()
+                            && parent.initializer().kind() == SyntaxKind::SuperKeyword;
+                        self.check_property_accessibility(
+                            node,
+                            is_super,
+                            false, /*writing*/
+                            parent_type,
+                            property,
+                        );
                     }
                 }
             }
@@ -155,7 +184,10 @@ impl Checker {
             self.check_source_elements(&elements);
         }
         // For a parameter declaration with an initializer, error and exit if the containing function doesn't have a body
-        if initializer.is_some() && is_part_of_parameter_declaration(node) && node_is_missing(get_containing_function(node).body()) {
+        if initializer.is_some()
+            && is_part_of_parameter_declaration(node)
+            && node_is_missing(get_containing_function(node).body())
+        {
             self.error(node, diag::A_parameter_initializer_is_only_allowed_in_a_function_or_constructor_implementation, vec![]);
             return;
         }
@@ -164,25 +196,41 @@ impl Checker {
             if is_in_ambient_or_type_node(node) {
                 return;
             }
-            let need_check_initializer = initializer.is_some() && node.parent().parent().kind() != SyntaxKind::ForInStatement;
+            let need_check_initializer = initializer.is_some()
+                && node.parent().parent().kind() != SyntaxKind::ForInStatement;
             let need_check_widened_type = !name.elements().iter().any(|n| n.name().is_some());
             if need_check_initializer || need_check_widened_type {
                 // Don't validate for-in initializer as it is already an error
-                let widened_type = self.get_widened_type_for_variable_like_declaration(node, false /*reportErrors*/);
+                let widened_type = self.get_widened_type_for_variable_like_declaration(
+                    node, false, /*reportErrors*/
+                );
                 if need_check_initializer {
                     let initializer_type = self.check_expression_cached(initializer);
                     if self.strict_null_checks && need_check_widened_type {
                         self.check_non_null_non_void_type(initializer_type, node);
                     } else {
-                        let target = self.get_widened_type_for_variable_like_declaration(node, false);
-                        self.check_type_assignable_to_and_optionally_elaborate(initializer_type, target, node, initializer, None, None);
+                        let target =
+                            self.get_widened_type_for_variable_like_declaration(node, false);
+                        self.check_type_assignable_to_and_optionally_elaborate(
+                            initializer_type,
+                            target,
+                            node,
+                            initializer,
+                            None,
+                            None,
+                        );
                     }
                 }
                 // check the binding pattern with empty elements
                 if need_check_widened_type {
                     if is_array_binding_pattern(name) {
                         let undefined_type = self.undefined_type;
-                        self.check_iterated_type_or_element_type(IterationUse::DESTRUCTURING, widened_type, undefined_type, node);
+                        self.check_iterated_type_or_element_type(
+                            IterationUse::DESTRUCTURING,
+                            widened_type,
+                            undefined_type,
+                            node,
+                        );
                     } else if self.strict_null_checks {
                         self.check_non_null_non_void_type(widened_type, node);
                     }
@@ -192,12 +240,18 @@ impl Checker {
         }
         // For a commonjs `const x = require`, validate the alias and exit
         let symbol = self.get_symbol_of_declaration(node);
-        if self.sym(symbol).flags.intersects(SymbolFlags::ALIAS) && is_variable_declaration_initialized_to_require(node) {
+        if self.sym(symbol).flags.intersects(SymbolFlags::ALIAS)
+            && is_variable_declaration_initialized_to_require(node)
+        {
             self.check_alias_symbol(node);
             return;
         }
         if is_big_int_literal(name) {
-            self.error(name, diag::A_bigint_literal_cannot_be_used_as_a_property_name, vec![]);
+            self.error(
+                name,
+                diag::A_bigint_literal_cannot_be_used_as_a_property_name,
+                vec![],
+            );
         }
         let type_of_symbol = self.get_type_of_symbol(symbol);
         let t = self.convert_auto_to_any(type_of_symbol);
@@ -206,17 +260,36 @@ impl Checker {
             // Don't validate for-in initializer as it is already an error
             if initializer.is_some() && !is_for_in_statement(node.parent().parent()) {
                 let initializer_type = self.check_expression_cached(initializer);
-                self.check_type_assignable_to_and_optionally_elaborate(initializer_type, t, node, initializer, None /*headMessage*/, None);
-                let block_scope_kind = self.get_combined_node_flags_cached(node) & NodeFlags::BLOCK_SCOPED;
+                self.check_type_assignable_to_and_optionally_elaborate(
+                    initializer_type,
+                    t,
+                    node,
+                    initializer,
+                    None, /*headMessage*/
+                    None,
+                );
+                let block_scope_kind =
+                    self.get_combined_node_flags_cached(node) & NodeFlags::BLOCK_SCOPED;
                 if block_scope_kind == NodeFlags::AWAIT_USING {
-                    let global_async_disposable_type = (self.get_global_async_disposable_type.clone())(self);
+                    let global_async_disposable_type =
+                        (self.get_global_async_disposable_type.clone())(self);
                     let global_disposable_type = (self.get_global_disposable_type.clone())(self);
-                    if global_async_disposable_type != self.empty_object_type && global_disposable_type != self.empty_object_type {
+                    if global_async_disposable_type != self.empty_object_type
+                        && global_disposable_type != self.empty_object_type
+                    {
                         let null_type = self.null_type;
                         let undefined_type = self.undefined_type;
-                        let optional_disposable_type =
-                            self.get_union_type(&[global_async_disposable_type, global_disposable_type, null_type, undefined_type]);
-                        let widened = self.widen_type_for_variable_like_declaration(initializer_type, node, false);
+                        let optional_disposable_type = self.get_union_type(&[
+                            global_async_disposable_type,
+                            global_disposable_type,
+                            null_type,
+                            undefined_type,
+                        ]);
+                        let widened = self.widen_type_for_variable_like_declaration(
+                            initializer_type,
+                            node,
+                            false,
+                        );
                         self.check_type_assignable_to(
                             widened,
                             optional_disposable_type,
@@ -229,8 +302,16 @@ impl Checker {
                     if global_disposable_type != self.empty_object_type {
                         let null_type = self.null_type;
                         let undefined_type = self.undefined_type;
-                        let optional_disposable_type = self.get_union_type(&[global_disposable_type, null_type, undefined_type]);
-                        let widened = self.widen_type_for_variable_like_declaration(initializer_type, node, false);
+                        let optional_disposable_type = self.get_union_type(&[
+                            global_disposable_type,
+                            null_type,
+                            undefined_type,
+                        ]);
+                        let widened = self.widen_type_for_variable_like_declaration(
+                            initializer_type,
+                            node,
+                            false,
+                        );
                         self.check_type_assignable_to(
                             widened,
                             optional_disposable_type,
@@ -244,13 +325,20 @@ impl Checker {
             if declarations.len() > 1 {
                 let mut some = false;
                 for &d in &declarations {
-                    if d != node && is_variable_like(d) && !self.are_declaration_flags_identical(d, node) {
+                    if d != node
+                        && is_variable_like(d)
+                        && !self.are_declaration_flags_identical(d, node)
+                    {
                         some = true;
                         break;
                     }
                 }
                 if some {
-                    self.error(name, diag::All_declarations_of_0_must_have_identical_modifiers, args![declaration_name_to_string(name)]);
+                    self.error(
+                        name,
+                        diag::All_declarations_of_0_must_have_identical_modifiers,
+                        args![declaration_name_to_string(name)],
+                    );
                 }
             }
         } else {
@@ -264,15 +352,33 @@ impl Checker {
                 && !self.sym(symbol).flags.intersects(SymbolFlags::ASSIGNMENT)
             {
                 let value_declaration = self.sym(symbol).value_declaration;
-                self.error_next_variable_or_property_declaration_must_have_same_type(value_declaration, t, node, declaration_type);
+                self.error_next_variable_or_property_declaration_must_have_same_type(
+                    value_declaration,
+                    t,
+                    node,
+                    declaration_type,
+                );
             }
             if initializer.is_some() {
                 let initializer_type = self.check_expression_cached(initializer);
-                self.check_type_assignable_to_and_optionally_elaborate(initializer_type, declaration_type, node, initializer, None /*headMessage*/, None);
+                self.check_type_assignable_to_and_optionally_elaborate(
+                    initializer_type,
+                    declaration_type,
+                    node,
+                    initializer,
+                    None, /*headMessage*/
+                    None,
+                );
             }
             let value_declaration = self.sym(symbol).value_declaration;
-            if value_declaration.is_some() && !self.are_declaration_flags_identical(node, value_declaration) {
-                self.error(name, diag::All_declarations_of_0_must_have_identical_modifiers, args![declaration_name_to_string(name)]);
+            if value_declaration.is_some()
+                && !self.are_declaration_flags_identical(node, value_declaration)
+            {
+                self.error(
+                    name,
+                    diag::All_declarations_of_0_must_have_identical_modifiers,
+                    args![declaration_name_to_string(name)],
+                );
             }
         }
         if !is_property_declaration(node) && !is_property_signature_declaration(node) {
@@ -294,7 +400,9 @@ impl Checker {
         next_type: TypeId,
     ) {
         let next_declaration_name = get_name_of_declaration(next_declaration);
-        let message = if is_property_declaration(next_declaration) || is_property_signature_declaration(next_declaration) {
+        let message = if is_property_declaration(next_declaration)
+            || is_property_signature_declaration(next_declaration)
+        {
             diag::Subsequent_property_declarations_must_have_the_same_type_Property_0_must_be_of_type_1_but_here_has_type_2
         } else {
             diag::Subsequent_variable_declarations_must_have_the_same_type_Variable_0_must_be_of_type_1_but_here_has_type_2
@@ -350,14 +458,22 @@ impl Checker {
         //      }
 
         // skip block-scoped variables and parameters
-        if self.get_combined_node_flags_cached(node).intersects(NodeFlags::BLOCK_SCOPED) || is_part_of_parameter_declaration(node) {
+        if self
+            .get_combined_node_flags_cached(node)
+            .intersects(NodeFlags::BLOCK_SCOPED)
+            || is_part_of_parameter_declaration(node)
+        {
             return;
         }
         // NOTE: in ES6 spec initializer is required in variable declarations where name is binding pattern
         // so we'll always treat binding elements as initialized
         let symbol = self.get_symbol_of_declaration(node);
         let name = node.name();
-        if self.sym(symbol).flags.intersects(SymbolFlags::FUNCTION_SCOPED_VARIABLE) {
+        if self
+            .sym(symbol)
+            .flags
+            .intersects(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+        {
             if !is_identifier(name) {
                 panic!("Identifier expected");
             }
@@ -366,19 +482,29 @@ impl Checker {
                 node,
                 name.text(),
                 SymbolFlags::VARIABLE,
-                None, /*nameNotFoundMessage*/
+                None,  /*nameNotFoundMessage*/
                 false, /*isUse*/
                 false,
             );
             if local_declaration_symbol.is_some()
                 && local_declaration_symbol != symbol
-                && self.sym(local_declaration_symbol).flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+                && self
+                    .sym(local_declaration_symbol)
+                    .flags
+                    .intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
             {
-                if self.get_declaration_node_flags_from_symbol(local_declaration_symbol).intersects(NodeFlags::BLOCK_SCOPED) {
-                    let var_decl_list =
-                        find_ancestor_kind(self.sym(local_declaration_symbol).value_declaration, SyntaxKind::VariableDeclarationList);
+                if self
+                    .get_declaration_node_flags_from_symbol(local_declaration_symbol)
+                    .intersects(NodeFlags::BLOCK_SCOPED)
+                {
+                    let var_decl_list = find_ancestor_kind(
+                        self.sym(local_declaration_symbol).value_declaration,
+                        SyntaxKind::VariableDeclarationList,
+                    );
                     let mut container = Node::NIL;
-                    if is_variable_statement(var_decl_list.parent()) && var_decl_list.parent().parent().is_some() {
+                    if is_variable_statement(var_decl_list.parent())
+                        && var_decl_list.parent().parent().is_some()
+                    {
                         container = var_decl_list.parent().parent();
                     }
                     // names of block-scoped and function scoped variables can collide only
@@ -409,11 +535,20 @@ impl Checker {
         // checkGrammarModifiers.
         if !can_have_decorators(node)
             || !has_decorators(node)
-            || !node_can_be_decorated(self.legacy_decorators, node, node.parent(), node.parent().parent())
+            || !node_can_be_decorated(
+                self.legacy_decorators,
+                node,
+                node.parent(),
+                node.parent().parent(),
+            )
         {
             return;
         }
-        let first_decorator = node.modifier_nodes().iter().find(|&m| is_decorator(m)).unwrap_or(Node::NIL);
+        let first_decorator = node
+            .modifier_nodes()
+            .iter()
+            .find(|&m| is_decorator(m))
+            .unwrap_or(Node::NIL);
         if first_decorator.is_nil() {
             return;
         }
@@ -422,21 +557,41 @@ impl Checker {
             if is_parameter_declaration(node) {
                 self.check_external_emit_helpers(first_decorator, ExternalEmitHelpers::PARAM);
             }
-        } else if self.language_version < LANGUAGE_FEATURE_MINIMUM_TARGET.class_and_class_element_decorators {
-            self.check_external_emit_helpers(first_decorator, ExternalEmitHelpers::ES_DECORATE_AND_RUN_INITIALIZERS);
+        } else if self.language_version
+            < LANGUAGE_FEATURE_MINIMUM_TARGET.class_and_class_element_decorators
+        {
+            self.check_external_emit_helpers(
+                first_decorator,
+                ExternalEmitHelpers::ES_DECORATE_AND_RUN_INITIALIZERS,
+            );
             if is_class_declaration(node) {
-                if node.name().is_nil() || self.get_first_transformable_static_class_element(node).is_some() {
-                    self.check_external_emit_helpers(first_decorator, ExternalEmitHelpers::SET_FUNCTION_NAME);
+                if node.name().is_nil()
+                    || self
+                        .get_first_transformable_static_class_element(node)
+                        .is_some()
+                {
+                    self.check_external_emit_helpers(
+                        first_decorator,
+                        ExternalEmitHelpers::SET_FUNCTION_NAME,
+                    );
                 }
             } else if !is_class_expression(node) {
                 let name = node.name();
                 if is_private_identifier(name)
-                    && (is_method_declaration(node) || is_accessor(node) || is_auto_accessor_property_declaration(node))
+                    && (is_method_declaration(node)
+                        || is_accessor(node)
+                        || is_auto_accessor_property_declaration(node))
                 {
-                    self.check_external_emit_helpers(first_decorator, ExternalEmitHelpers::SET_FUNCTION_NAME);
+                    self.check_external_emit_helpers(
+                        first_decorator,
+                        ExternalEmitHelpers::SET_FUNCTION_NAME,
+                    );
                 }
                 if is_computed_property_name(name) {
-                    self.check_external_emit_helpers(first_decorator, ExternalEmitHelpers::PROP_KEY);
+                    self.check_external_emit_helpers(
+                        first_decorator,
+                        ExternalEmitHelpers::PROP_KEY,
+                    );
                 }
             }
         }
@@ -459,12 +614,16 @@ impl Checker {
         }
         // if we fail to get a signature and return type here, we will have already reported a grammar error in `checkDecorators`.
         let decorator_signature = self.get_decorator_call_signature(node);
-        if decorator_signature.is_nil() || self.sig(decorator_signature).resolved_return_type.is_nil() {
+        if decorator_signature.is_nil()
+            || self.sig(decorator_signature).resolved_return_type.is_nil()
+        {
             return;
         }
         let expected_return_type = self.sig(decorator_signature).resolved_return_type;
         let head_message: &'static Message = match node.parent().kind() {
-            SyntaxKind::ClassDeclaration | SyntaxKind::ClassExpression => diag::Decorator_function_return_type_0_is_not_assignable_to_type_1,
+            SyntaxKind::ClassDeclaration | SyntaxKind::ClassExpression => {
+                diag::Decorator_function_return_type_0_is_not_assignable_to_type_1
+            }
             SyntaxKind::PropertyDeclaration if !self.legacy_decorators => {
                 diag::Decorator_function_return_type_0_is_not_assignable_to_type_1
             }
@@ -477,7 +636,12 @@ impl Checker {
             }
             _ => panic!("Unhandled case in checkDecorator"),
         };
-        self.check_type_assignable_to(return_type, expected_return_type, node.expression(), Some(head_message));
+        self.check_type_assignable_to(
+            return_type,
+            expected_return_type,
+            node.expression(),
+            Some(head_message),
+        );
     }
 
     // Go: checker/checker.go:6072 checkIteratedTypeOrElementType
@@ -491,7 +655,9 @@ impl Checker {
         if self.is_type_any(input_type) {
             return input_type;
         }
-        let t = self.get_iterated_type_or_element_type(use_, input_type, sent_type, error_node, true /*checkAssignability*/);
+        let t = self.get_iterated_type_or_element_type(
+            use_, input_type, sent_type, error_node, true, /*checkAssignability*/
+        );
         if t.is_some() {
             return t;
         }
@@ -514,12 +680,21 @@ impl Checker {
             }
             return TypeId::NIL;
         }
-        let iterable_exists = (self.get_global_iterable_type.clone())(self) != self.empty_generic_type;
-        let possible_out_of_bounds = self.compiler_options.no_unchecked_indexed_access == Tristate::True
+        let iterable_exists =
+            (self.get_global_iterable_type.clone())(self) != self.empty_generic_type;
+        let possible_out_of_bounds = self.compiler_options.no_unchecked_indexed_access
+            == Tristate::True
             && use_.intersects(IterationUse::POSSIBLY_OUT_OF_BOUNDS);
         if iterable_exists || allow_async_iterables {
-            let iteration_types =
-                self.get_iteration_types_of_iterable(input_type, use_, if iterable_exists { error_node } else { Node::NIL });
+            let iteration_types = self.get_iteration_types_of_iterable(
+                input_type,
+                use_,
+                if iterable_exists {
+                    error_node
+                } else {
+                    Node::NIL
+                },
+            );
             if check_assignability {
                 if iteration_types.next_type.is_some() {
                     let mut diagnostic: Option<&'static Message> = None;
@@ -533,7 +708,12 @@ impl Checker {
                         diagnostic = Some(diag::Cannot_delegate_iteration_to_value_because_the_next_method_of_its_iterator_expects_type_1_but_the_containing_generator_will_always_send_0);
                     }
                     if diagnostic.is_some() {
-                        self.check_type_assignable_to(sent_type, iteration_types.next_type, error_node, diagnostic);
+                        self.check_type_assignable_to(
+                            sent_type,
+                            iteration_types.next_type,
+                            error_node,
+                            diagnostic,
+                        );
                     }
                 }
             }
@@ -557,12 +737,20 @@ impl Checker {
                 // After we remove all types that are StringLike, we will know if there was a string constituent
                 // based on whether the result of filter is a new array.
                 let array_types = self.ty(input_type).types().to_vec();
-                let filtered_types: Vec<TypeId> =
-                    array_types.iter().copied().filter(|&t| !self.ty(t).flags.intersects(TypeFlags::STRING_LIKE)).collect();
+                let filtered_types: Vec<TypeId> = array_types
+                    .iter()
+                    .copied()
+                    .filter(|&t| !self.ty(t).flags.intersects(TypeFlags::STRING_LIKE))
+                    .collect();
                 // PORT: Go `core.Same(filteredTypes, arrayTypes)` is true exactly when
                 // `core.Filter` kept every element (it then returns the input slice).
                 if filtered_types.len() != array_types.len() {
-                    array_type = self.get_union_type_ex(&filtered_types, UnionReduction::SUBTYPE, None, TypeId::NIL);
+                    array_type = self.get_union_type_ex(
+                        &filtered_types,
+                        UnionReduction::SUBTYPE,
+                        None,
+                        TypeId::NIL,
+                    );
                 }
             } else if self.ty(array_type).flags.intersects(TypeFlags::STRING_LIKE) {
                 array_type = self.never_type;
@@ -587,11 +775,19 @@ impl Checker {
                 // want to say that number is not an array type. But if the input was just
                 // number and string input is allowed, we want to say that number is not an
                 // array type or a string type.
-                let allows_strings = use_.intersects(IterationUse::ALLOWS_STRING_INPUT_FLAG) && !has_string_constituent;
-                let (default_diagnostic, maybe_missing_await) = self.get_iteration_diagnostic_details(use_, input_type, allows_strings);
-                let maybe_missing_await = maybe_missing_await && self.get_awaited_type_of_promise(array_type).is_some();
+                let allows_strings = use_.intersects(IterationUse::ALLOWS_STRING_INPUT_FLAG)
+                    && !has_string_constituent;
+                let (default_diagnostic, maybe_missing_await) =
+                    self.get_iteration_diagnostic_details(use_, input_type, allows_strings);
+                let maybe_missing_await =
+                    maybe_missing_await && self.get_awaited_type_of_promise(array_type).is_some();
                 let array_type_string = self.type_to_string(array_type);
-                self.error_and_maybe_suggest_await(error_node, maybe_missing_await, default_diagnostic, args![array_type_string]);
+                self.error_and_maybe_suggest_await(
+                    error_node,
+                    maybe_missing_await,
+                    default_diagnostic,
+                    args![array_type_string],
+                );
             }
             if has_string_constituent {
                 if possible_out_of_bounds {
@@ -606,7 +802,10 @@ impl Checker {
         let array_element_type = self.get_index_type_of_type(array_type, number_type);
         if has_string_constituent && array_element_type.is_some() {
             // This is just an optimization for the case where arrayOrStringType is string | string[]
-            if self.ty(array_element_type).flags.intersects(TypeFlags::STRING_LIKE)
+            if self
+                .ty(array_element_type)
+                .flags
+                .intersects(TypeFlags::STRING_LIKE)
                 && self.compiler_options.no_unchecked_indexed_access != Tristate::True
             {
                 return self.string_type;
@@ -614,9 +813,19 @@ impl Checker {
             let string_type = self.string_type;
             if possible_out_of_bounds {
                 let undefined_type = self.undefined_type;
-                return self.get_union_type_ex(&[array_element_type, string_type, undefined_type], UnionReduction::SUBTYPE, None, TypeId::NIL);
+                return self.get_union_type_ex(
+                    &[array_element_type, string_type, undefined_type],
+                    UnionReduction::SUBTYPE,
+                    None,
+                    TypeId::NIL,
+                );
             }
-            return self.get_union_type_ex(&[array_element_type, string_type], UnionReduction::SUBTYPE, None, TypeId::NIL);
+            return self.get_union_type_ex(
+                &[array_element_type, string_type],
+                UnionReduction::SUBTYPE,
+                None,
+                TypeId::NIL,
+            );
         }
         if use_.intersects(IterationUse::POSSIBLY_OUT_OF_BOUNDS) {
             return self.include_undefined_in_index_signature(array_element_type);
@@ -637,16 +846,29 @@ impl Checker {
         if self.is_type_any(return_type) {
             return TypeId::NIL;
         }
-        let iteration_types = self.get_iteration_types_of_generator_function_return_type(return_type, is_async_generator);
+        let iteration_types = self
+            .get_iteration_types_of_generator_function_return_type(return_type, is_async_generator);
         iteration_types.get_type(type_kind)
     }
 
     // Go: checker/checker.go:6201 getIterationTypesOfGeneratorFunctionReturnType
-    pub fn get_iteration_types_of_generator_function_return_type(&mut self, t: TypeId, is_async_generator: bool) -> IterationTypes {
+    pub fn get_iteration_types_of_generator_function_return_type(
+        &mut self,
+        t: TypeId,
+        is_async_generator: bool,
+    ) -> IterationTypes {
         if self.is_type_any(t) {
-            return IterationTypes { yield_type: self.any_type, return_type: self.any_type, next_type: self.any_type };
+            return IterationTypes {
+                yield_type: self.any_type,
+                return_type: self.any_type,
+                next_type: self.any_type,
+            };
         }
-        let use_ = if is_async_generator { IterationUse::ASYNC_GENERATOR_RETURN_TYPE } else { IterationUse::GENERATOR_RETURN_TYPE };
+        let use_ = if is_async_generator {
+            IterationUse::ASYNC_GENERATOR_RETURN_TYPE
+        } else {
+            IterationUse::GENERATOR_RETURN_TYPE
+        };
         let resolver = if is_async_generator {
             self.async_iteration_types_resolver.clone()
         } else {
@@ -656,7 +878,12 @@ impl Checker {
         if result.has_types() {
             return result;
         }
-        self.get_iteration_types_of_iterator(t, &resolver, Node::NIL /*errorNode*/, None /*diagnosticOutput*/)
+        self.get_iteration_types_of_iterator(
+            t,
+            &resolver,
+            Node::NIL, /*errorNode*/
+            None,      /*diagnosticOutput*/
+        )
     }
 
     // Gets the requested "iteration type" from an `Iterable`-like or `AsyncIterable`-like type.
@@ -695,12 +922,24 @@ impl Checker {
     // For a **for-await-of** statement or a `yield*` in an async generator we will look for
     // the `[Symbol.asyncIterator]()` method first, and then the `[Symbol.iterator]()` method.
     // Go: checker/checker.go:6242 getIterationTypesOfIterable
-    pub fn get_iteration_types_of_iterable(&mut self, t: TypeId, use_: IterationUse, error_node: Node) -> IterationTypes {
+    pub fn get_iteration_types_of_iterable(
+        &mut self,
+        t: TypeId,
+        use_: IterationUse,
+        error_node: Node,
+    ) -> IterationTypes {
         let t = self.get_reduced_type(t);
         if self.is_type_any(t) {
-            return IterationTypes { yield_type: self.any_type, return_type: self.any_type, next_type: self.any_type };
+            return IterationTypes {
+                yield_type: self.any_type,
+                return_type: self.any_type,
+                next_type: self.any_type,
+            };
         }
-        let key = IterationTypesKey { type_id: self.ty(t).id, use_: use_ & IterationUse::CACHE_FLAGS };
+        let key = IterationTypesKey {
+            type_id: self.ty(t).id,
+            use_: use_ & IterationUse::CACHE_FLAGS,
+        };
         // If we are reporting errors and encounter a cached `noIterationTypes`, we should ignore the cached value and continue as if nothing was cached.
         // In addition, we should not cache any new results for this call.
         let mut no_cache = false;
@@ -729,11 +968,20 @@ impl Checker {
             let types = self.ty(t).types().to_vec();
             let mut all_iteration_types: Vec<IterationTypes> = Vec::with_capacity(types.len());
             for constituent in types {
-                let iteration_types = self.get_iteration_types_of_iterable_worker(constituent, use_, Node::NIL, no_cache);
+                let iteration_types = self.get_iteration_types_of_iterable_worker(
+                    constituent,
+                    use_,
+                    Node::NIL,
+                    no_cache,
+                );
                 if !iteration_types.has_types() {
                     if error_node.is_some() {
                         self.add_deferred_diagnostic(Rc::new(move |c: &mut Checker| {
-                            c.report_type_not_iterable_error(error_node, t, use_.intersects(IterationUse::ALLOWS_ASYNC_ITERABLES_FLAG));
+                            c.report_type_not_iterable_error(
+                                error_node,
+                                t,
+                                use_.intersects(IterationUse::ALLOWS_ASYNC_ITERABLES_FLAG),
+                            );
                         }));
                     }
                     return IterationTypes::default();
@@ -752,7 +1000,12 @@ impl Checker {
                 }
                 return iteration_types;
             }
-            let iteration_types = self.get_iteration_types_of_iterable_slow(t, &resolver, error_node, Some(&mut diags));
+            let iteration_types = self.get_iteration_types_of_iterable_slow(
+                t,
+                &resolver,
+                error_node,
+                Some(&mut diags),
+            );
             if iteration_types.has_types() {
                 if !diags.is_empty() {
                     for d in diags {
@@ -771,7 +1024,12 @@ impl Checker {
                 }
                 return iteration_types;
             }
-            let iteration_types = self.get_iteration_types_of_iterable_slow(t, &resolver, error_node, Some(&mut diags));
+            let iteration_types = self.get_iteration_types_of_iterable_slow(
+                t,
+                &resolver,
+                error_node,
+                Some(&mut diags),
+            );
             if iteration_types.has_types() {
                 if !diags.is_empty() {
                     for d in diags {
@@ -789,8 +1047,11 @@ impl Checker {
             // resolved, possibly causing circularities.
             self.add_deferred_diagnostic(Rc::new(move |c: &mut Checker| {
                 let count_before = c.diagnostics.count;
-                let diagnostic =
-                    c.report_type_not_iterable_error(error_node, t, use_.intersects(IterationUse::ALLOWS_ASYNC_ITERABLES_FLAG));
+                let diagnostic = c.report_type_not_iterable_error(
+                    error_node,
+                    t,
+                    use_.intersects(IterationUse::ALLOWS_ASYNC_ITERABLES_FLAG),
+                );
                 c.add_related_info_to_reported_diagnostic(&diagnostic, count_before, diags.clone());
             }));
         }
@@ -804,13 +1065,21 @@ impl Checker {
     // appends to it. If the diagnostic was discarded (`addDiagnostic` drops it
     // at the maximum serialization level), the count did not change and there
     // is nothing to update, like Go where the mutation is unobservable.
-    fn add_related_info_to_reported_diagnostic(&mut self, reported: &Diagnostic, count_before: i32, related: Vec<Diagnostic>) {
+    fn add_related_info_to_reported_diagnostic(
+        &mut self,
+        reported: &Diagnostic,
+        count_before: i32,
+        related: Vec<Diagnostic>,
+    ) {
         if self.diagnostics.count == count_before {
             return;
         }
         let stored = if reported.file().is_some() {
             let file_name = source_file_file_name(reported.file()).to_string();
-            self.diagnostics.file_diagnostics.get_mut(&file_name).and_then(|list| list.last_mut())
+            self.diagnostics
+                .file_diagnostics
+                .get_mut(&file_name)
+                .and_then(|list| list.last_mut())
         } else {
             self.diagnostics.non_file_diagnostics.last_mut()
         };
@@ -822,7 +1091,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:6334 getIterationTypesOfIterableFast
-    pub fn get_iteration_types_of_iterable_fast(&mut self, t: TypeId, r: &IterationTypesResolver) -> IterationTypes {
+    pub fn get_iteration_types_of_iterable_fast(
+        &mut self,
+        t: TypeId,
+        r: &IterationTypesResolver,
+    ) -> IterationTypes {
         // As an optimization, if the type is an instantiation of the following global type, then
         // just grab its related type arguments:
         // - `Iterable<T, TReturn, TNext>` or `AsyncIterable<T, TReturn, TNext>`
@@ -845,7 +1118,8 @@ impl Checker {
         }
         if matches {
             let type_arguments = self.get_type_arguments(t);
-            let (yield_type, return_type, next_type) = (type_arguments[0], type_arguments[1], type_arguments[2]);
+            let (yield_type, return_type, next_type) =
+                (type_arguments[0], type_arguments[1], type_arguments[2]);
             return r.get_resolved_iteration_types(self, yield_type, return_type, next_type);
         }
         // As an optimization, if the type is an instantiation of one of the following global types, then
@@ -875,11 +1149,21 @@ impl IterationTypesResolver {
         return_type: TypeId,
         next_type: TypeId,
     ) -> IterationTypes {
-        let resolved_yield = (self.resolve_iteration_type)(c, yield_type, Node::NIL /*errorNode*/);
-        let resolved_return = (self.resolve_iteration_type)(c, return_type, Node::NIL /*errorNode*/);
+        let resolved_yield =
+            (self.resolve_iteration_type)(c, yield_type, Node::NIL /*errorNode*/);
+        let resolved_return =
+            (self.resolve_iteration_type)(c, return_type, Node::NIL /*errorNode*/);
         IterationTypes {
-            yield_type: if resolved_yield.is_some() { resolved_yield } else { yield_type },
-            return_type: if resolved_return.is_some() { resolved_return } else { return_type },
+            yield_type: if resolved_yield.is_some() {
+                resolved_yield
+            } else {
+                yield_type
+            },
+            return_type: if resolved_return.is_some() {
+                resolved_return
+            } else {
+                return_type
+            },
             next_type,
         }
     }
@@ -888,17 +1172,25 @@ impl IterationTypesResolver {
 impl Checker {
     // Go: checker/checker.go:6369 isReferenceToType
     pub fn is_reference_to_type(&self, t: TypeId, target: TypeId) -> bool {
-        t.is_some() && self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE) && self.ty(t).target() == target
+        t.is_some()
+            && self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE)
+            && self.ty(t).target() == target
     }
 
     // Go: checker/checker.go:6373 isReferenceToSomeType
     pub fn is_reference_to_some_type(&self, t: TypeId, targets: &[TypeId]) -> bool {
-        t.is_some() && self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE) && targets.contains(&self.ty(t).target())
+        t.is_some()
+            && self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE)
+            && targets.contains(&self.ty(t).target())
     }
 
     // Go: checker/checker.go:6377 getBuiltinIteratorReturnType
     pub fn get_builtin_iterator_return_type(&self) -> TypeId {
-        if self.strict_builtin_iterator_return { self.undefined_type } else { self.any_type }
+        if self.strict_builtin_iterator_return {
+            self.undefined_type
+        } else {
+            self.any_type
+        }
     }
 }
 
@@ -921,7 +1213,10 @@ impl IterationTypes {
 
 impl Checker {
     // Go: checker/checker.go:6397 combineIterationTypes
-    pub fn combine_iteration_types(&mut self, iteration_types: &[IterationTypes]) -> IterationTypes {
+    pub fn combine_iteration_types(
+        &mut self,
+        iteration_types: &[IterationTypes],
+    ) -> IterationTypes {
         IterationTypes {
             yield_type: self.get_iteration_type_union(iteration_types, |t| t.yield_type),
             return_type: self.get_iteration_type_union(iteration_types, |t| t.return_type),
@@ -930,8 +1225,16 @@ impl Checker {
     }
 
     // Go: checker/checker.go:6405 getIterationTypeUnion
-    pub fn get_iteration_type_union(&mut self, iteration_types: &[IterationTypes], f: impl Fn(&IterationTypes) -> TypeId) -> TypeId {
-        let types: Vec<TypeId> = iteration_types.iter().map(|t| f(t)).filter(|t| t.is_some()).collect();
+    pub fn get_iteration_type_union(
+        &mut self,
+        iteration_types: &[IterationTypes],
+        f: impl Fn(&IterationTypes) -> TypeId,
+    ) -> TypeId {
+        let types: Vec<TypeId> = iteration_types
+            .iter()
+            .map(|t| f(t))
+            .filter(|t| t.is_some())
+            .collect();
         if types.is_empty() {
             return TypeId::NIL;
         }
@@ -939,7 +1242,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:6413 getAsyncFromSyncIterationTypes
-    pub fn get_async_from_sync_iteration_types(&mut self, iteration_types: IterationTypes, error_node: Node) -> IterationTypes {
+    pub fn get_async_from_sync_iteration_types(
+        &mut self,
+        iteration_types: IterationTypes,
+        error_node: Node,
+    ) -> IterationTypes {
         if !iteration_types.has_types()
             || iteration_types.yield_type == self.any_type
                 && iteration_types.return_type == self.any_type
@@ -951,11 +1258,21 @@ impl Checker {
         if error_node.is_some() {
             (self.get_global_awaited_symbol.clone())(self);
         }
-        let awaited_yield = self.get_awaited_type_ex(iteration_types.yield_type, error_node, None, args![]);
-        let awaited_return = self.get_awaited_type_ex(iteration_types.return_type, error_node, None, args![]);
+        let awaited_yield =
+            self.get_awaited_type_ex(iteration_types.yield_type, error_node, None, args![]);
+        let awaited_return =
+            self.get_awaited_type_ex(iteration_types.return_type, error_node, None, args![]);
         IterationTypes {
-            yield_type: if awaited_yield.is_some() { awaited_yield } else { self.any_type },
-            return_type: if awaited_return.is_some() { awaited_return } else { self.any_type },
+            yield_type: if awaited_yield.is_some() {
+                awaited_yield
+            } else {
+                self.any_type
+            },
+            return_type: if awaited_return.is_some() {
+                awaited_return
+            } else {
+                self.any_type
+            },
             next_type: iteration_types.next_type,
         }
     }
@@ -981,20 +1298,42 @@ impl Checker {
         if method.is_some() && !self.sym(method).flags.intersects(SymbolFlags::OPTIONAL) {
             let method_type = self.get_type_of_symbol(method);
             if self.is_type_any(method_type) {
-                return IterationTypes { yield_type: self.any_type, return_type: self.any_type, next_type: self.any_type };
+                return IterationTypes {
+                    yield_type: self.any_type,
+                    return_type: self.any_type,
+                    next_type: self.any_type,
+                };
             }
-            let all_signatures = self.get_signatures_of_type(method_type, SignatureKind::CALL).to_vec();
-            let valid_signatures: Vec<SignatureId> =
-                all_signatures.iter().copied().filter(|&sig| self.get_min_argument_count(sig) == 0).collect();
+            let all_signatures = self
+                .get_signatures_of_type(method_type, SignatureKind::CALL)
+                .to_vec();
+            let valid_signatures: Vec<SignatureId> = all_signatures
+                .iter()
+                .copied()
+                .filter(|&sig| self.get_min_argument_count(sig) == 0)
+                .collect();
             if !valid_signatures.is_empty() {
-                let return_types: Vec<TypeId> =
-                    valid_signatures.iter().map(|&sig| self.get_return_type_of_signature(sig)).collect();
+                let return_types: Vec<TypeId> = valid_signatures
+                    .iter()
+                    .map(|&sig| self.get_return_type_of_signature(sig))
+                    .collect();
                 let iterator_type = self.get_intersection_type(&return_types);
-                return self.get_iteration_types_of_iterator_worker(iterator_type, r, error_node, diagnostic_output);
+                return self.get_iteration_types_of_iterator_worker(
+                    iterator_type,
+                    r,
+                    error_node,
+                    diagnostic_output,
+                );
             }
             if error_node.is_some() && !all_signatures.is_empty() {
                 let global_iterable_type_checked = (r.get_global_iterable_type_checked)(self);
-                self.check_type_assignable_to_ex(t, global_iterable_type_checked, error_node, None, diagnostic_output);
+                self.check_type_assignable_to_ex(
+                    t,
+                    global_iterable_type_checked,
+                    error_node,
+                    None,
+                    diagnostic_output,
+                );
             }
         }
         IterationTypes::default()
@@ -1030,7 +1369,11 @@ impl Checker {
         diagnostic_output: Option<&mut Vec<Diagnostic>>,
     ) -> IterationTypes {
         if self.is_type_any(t) {
-            return IterationTypes { yield_type: self.any_type, return_type: self.any_type, next_type: self.any_type };
+            return IterationTypes {
+                yield_type: self.any_type,
+                return_type: self.any_type,
+                next_type: self.any_type,
+            };
         }
         let iteration_types = self.get_iteration_types_of_iterator_fast(t, r);
         if iteration_types.has_types() {
@@ -1040,7 +1383,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:6483 getIterationTypesOfIteratorFast
-    pub fn get_iteration_types_of_iterator_fast(&mut self, t: TypeId, r: &IterationTypesResolver) -> IterationTypes {
+    pub fn get_iteration_types_of_iterator_fast(
+        &mut self,
+        t: TypeId,
+        r: &IterationTypesResolver,
+    ) -> IterationTypes {
         // As an optimization, if the type is an instantiation of the following global type, then
         // just grab its related type arguments:
         // - `Iterable<T, TReturn, TNext>` or `AsyncIterable<T, TReturn, TNext>`
@@ -1063,7 +1410,8 @@ impl Checker {
         }
         if matches {
             let type_arguments = self.get_type_arguments(t);
-            let (yield_type, return_type, next_type) = (type_arguments[0], type_arguments[1], type_arguments[2]);
+            let (yield_type, return_type, next_type) =
+                (type_arguments[0], type_arguments[1], type_arguments[2]);
             return r.get_resolved_iteration_types(self, yield_type, return_type, next_type);
         }
         // As an optimization, if the type is an instantiation of one of the following global types, then
@@ -1091,9 +1439,27 @@ impl Checker {
         error_node: Node,
         mut diagnostic_output: Option<&mut Vec<Diagnostic>>,
     ) -> IterationTypes {
-        let next = self.get_iteration_types_of_method(t, r, "next", error_node, diagnostic_output.as_deref_mut());
-        let return_ = self.get_iteration_types_of_method(t, r, "return", error_node, diagnostic_output.as_deref_mut());
-        let throw = self.get_iteration_types_of_method(t, r, "throw", error_node, diagnostic_output.as_deref_mut());
+        let next = self.get_iteration_types_of_method(
+            t,
+            r,
+            "next",
+            error_node,
+            diagnostic_output.as_deref_mut(),
+        );
+        let return_ = self.get_iteration_types_of_method(
+            t,
+            r,
+            "return",
+            error_node,
+            diagnostic_output.as_deref_mut(),
+        );
+        let throw = self.get_iteration_types_of_method(
+            t,
+            r,
+            "throw",
+            error_node,
+            diagnostic_output.as_deref_mut(),
+        );
         self.combine_iteration_types(&[next, return_, throw])
     }
 
@@ -1112,21 +1478,30 @@ impl Checker {
             return IterationTypes::default();
         }
         let mut method_type = TypeId::NIL;
-        if method.is_some() && !(method_name == "next" && self.sym(method).flags.intersects(SymbolFlags::OPTIONAL)) {
+        if method.is_some()
+            && !(method_name == "next" && self.sym(method).flags.intersects(SymbolFlags::OPTIONAL))
+        {
             if method_name == "next" {
                 method_type = self.get_type_of_symbol(method);
             } else {
                 let method_symbol_type = self.get_type_of_symbol(method);
-                method_type = self.get_type_with_facts(method_symbol_type, TypeFacts::NE_UNDEFINED_OR_NULL);
+                method_type =
+                    self.get_type_with_facts(method_symbol_type, TypeFacts::NE_UNDEFINED_OR_NULL);
             }
         }
         if self.is_type_any(method_type) {
-            return IterationTypes { yield_type: self.any_type, return_type: self.any_type, next_type: self.any_type };
+            return IterationTypes {
+                yield_type: self.any_type,
+                return_type: self.any_type,
+                next_type: self.any_type,
+            };
         }
         // Both async and non-async iterators *must* have a `next` method.
         let mut method_signatures: Vec<SignatureId> = Vec::new();
         if method_type.is_some() {
-            method_signatures = self.get_signatures_of_type(method_type, SignatureKind::CALL).to_vec();
+            method_signatures = self
+                .get_signatures_of_type(method_type, SignatureKind::CALL)
+                .to_vec();
         }
         if method_signatures.is_empty() {
             if error_node.is_some() {
@@ -1135,7 +1510,10 @@ impl Checker {
                 } else {
                     resolver.must_be_a_method_diagnostic
                 };
-                self.report_diagnostic(new_diagnostic_for_node(error_node, diagnostic, args![method_name]), diagnostic_output);
+                self.report_diagnostic(
+                    new_diagnostic_for_node(error_node, diagnostic, args![method_name]),
+                    diagnostic_output,
+                );
             }
             return IterationTypes::default();
         }
@@ -1152,14 +1530,28 @@ impl Checker {
             let method_type_symbol = self.ty(method_type).symbol;
             let global_generator_symbol = self.ty(global_generator_type).symbol;
             let is_generator_method = global_generator_symbol.is_some()
-                && self.symbols.get(self.sym(global_generator_symbol).members, method_name) == method_type_symbol;
+                && self
+                    .symbols
+                    .get(self.sym(global_generator_symbol).members, method_name)
+                    == method_type_symbol;
             let global_iterator_symbol = self.ty(global_iterator_type).symbol;
             let is_iterator_method = !is_generator_method
                 && global_iterator_symbol.is_some()
-                && self.symbols.get(self.sym(global_iterator_symbol).members, method_name) == method_type_symbol;
+                && self
+                    .symbols
+                    .get(self.sym(global_iterator_symbol).members, method_name)
+                    == method_type_symbol;
             if is_generator_method || is_iterator_method {
-                let global_type = if is_generator_method { global_generator_type } else { global_iterator_type };
-                let type_parameters = self.ty(global_type).as_interface_type().type_parameters().to_vec();
+                let global_type = if is_generator_method {
+                    global_generator_type
+                } else {
+                    global_iterator_type
+                };
+                let type_parameters = self
+                    .ty(global_type)
+                    .as_interface_type()
+                    .type_parameters()
+                    .to_vec();
                 let mapper = self.ty(method_type).mapper();
                 let mut next_type = TypeId::NIL;
                 if method_name == "next" {
@@ -1167,7 +1559,11 @@ impl Checker {
                 }
                 let yield_type = self.mapper_map(mapper, type_parameters[0]);
                 let return_type = self.mapper_map(mapper, type_parameters[1]);
-                return IterationTypes { yield_type, return_type, next_type };
+                return IterationTypes {
+                    yield_type,
+                    return_type,
+                    next_type,
+                };
             }
         }
         // Extract the first parameter and return type of each signature.
@@ -1198,8 +1594,13 @@ impl Checker {
                 next_type = method_parameter_type;
             } else if method_name == "return" {
                 // The value of `return(value)` *is* awaited by async generators
-                let resolved = (resolver.resolve_iteration_type)(self, method_parameter_type, error_node);
-                let resolved_method_parameter_type = if resolved.is_some() { resolved } else { self.any_type };
+                let resolved =
+                    (resolver.resolve_iteration_type)(self, method_parameter_type, error_node);
+                let resolved_method_parameter_type = if resolved.is_some() {
+                    resolved
+                } else {
+                    self.any_type
+                };
                 return_types.push(resolved_method_parameter_type);
             }
         }
@@ -1213,12 +1614,21 @@ impl Checker {
             self.never_type
         };
         let resolved = (resolver.resolve_iteration_type)(self, method_return_type, error_node);
-        let resolved_method_return_type = if resolved.is_some() { resolved } else { self.any_type };
-        let iteration_types = self.get_iteration_types_of_iterator_result(resolved_method_return_type);
+        let resolved_method_return_type = if resolved.is_some() {
+            resolved
+        } else {
+            self.any_type
+        };
+        let iteration_types =
+            self.get_iteration_types_of_iterator_result(resolved_method_return_type);
         if !iteration_types.has_types() {
             if error_node.is_some() {
                 self.report_diagnostic(
-                    new_diagnostic_for_node(error_node, resolver.must_have_a_value_diagnostic, args![method_name]),
+                    new_diagnostic_for_node(
+                        error_node,
+                        resolver.must_have_a_value_diagnostic,
+                        args![method_name],
+                    ),
                     diagnostic_output.as_deref_mut(),
                 );
             }
@@ -1229,6 +1639,10 @@ impl Checker {
             return_types.push(iteration_types.return_type);
         }
         let union_return_type = self.get_union_type(&return_types);
-        IterationTypes { yield_type, return_type: union_return_type, next_type }
+        IterationTypes {
+            yield_type,
+            return_type: union_return_type,
+            next_type,
+        }
     }
 }

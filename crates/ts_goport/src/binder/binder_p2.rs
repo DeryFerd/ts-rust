@@ -153,7 +153,11 @@ impl Binder {
         let name = node.name();
         match node.kind() {
             SyntaxKind::ClassDeclaration => {
-                self.bind_block_scoped_declaration(node, SymbolFlags::CLASS, SymbolFlags::CLASS_EXCLUDES);
+                self.bind_block_scoped_declaration(
+                    node,
+                    SymbolFlags::CLASS,
+                    SymbolFlags::CLASS_EXCLUDES,
+                );
             }
             SyntaxKind::ClassExpression => {
                 let mut name_text: String = INTERNAL_SYMBOL_NAME_CLASS.to_string();
@@ -175,7 +179,8 @@ impl Binder {
         // Note: we check for this here because this class may be merging into a module.  The
         // module might have an exported variable called 'prototype'.  We can't allow that as
         // that would clash with the built-in 'prototype' for the class.
-        let prototype_symbol = self.new_symbol(SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE, "prototype");
+        let prototype_symbol =
+            self.new_symbol(SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE, "prototype");
         let prototype_name = self.symbols.sym(prototype_symbol).name.clone();
         let exports = binder_get_exports(self, symbol);
         let symbol_export = self.symbols.get(exports, &prototype_name);
@@ -202,7 +207,9 @@ impl Binder {
         {
             self.emit_flags |= NodeFlags::HAS_ASYNC_FUNCTIONS;
         }
-        if self.current_flow.is_some() && is_object_literal_or_class_expression_method_or_accessor(node) {
+        if self.current_flow.is_some()
+            && is_object_literal_or_class_expression_method_or_accessor(node)
+        {
             let current_flow = self.current_flow;
             self.set_flow_node(node, current_flow);
         }
@@ -224,7 +231,8 @@ impl Binder {
         let declaration_name = self.get_declaration_name(node);
         let symbol = self.new_symbol(SymbolFlags::SIGNATURE, &declaration_name);
         self.add_declaration_to_symbol(symbol, node, SymbolFlags::SIGNATURE);
-        let type_literal_symbol = self.new_symbol(SymbolFlags::TYPE_LITERAL, INTERNAL_SYMBOL_NAME_TYPE);
+        let type_literal_symbol =
+            self.new_symbol(SymbolFlags::TYPE_LITERAL, INTERNAL_SYMBOL_NAME_TYPE);
         self.add_declaration_to_symbol(type_literal_symbol, node, SymbolFlags::TYPE_LITERAL);
         let members = self.symbols.new_table();
         self.symbols.sym_mut(type_literal_symbol).members = members;
@@ -233,24 +241,45 @@ impl Binder {
     }
 
     // Go: binder/binder.go:1006 addLateBoundAssignmentDeclarationToSymbol
-    pub fn add_late_bound_assignment_declaration_to_symbol(&mut self, node: Node, symbol: SymbolId) {
+    pub fn add_late_bound_assignment_declaration_to_symbol(
+        &mut self,
+        node: Node,
+        symbol: SymbolId,
+    ) {
         let exports = binder_get_exports(self, symbol);
-        let mut assignment_symbol = self.symbols.get(exports, INTERNAL_SYMBOL_NAME_ASSIGNMENT_DECLARATION);
+        let mut assignment_symbol = self
+            .symbols
+            .get(exports, INTERNAL_SYMBOL_NAME_ASSIGNMENT_DECLARATION);
         if assignment_symbol.is_nil() {
-            assignment_symbol = self.new_symbol(SymbolFlags::NONE, INTERNAL_SYMBOL_NAME_ASSIGNMENT_DECLARATION);
-            self.symbols.set(exports, INTERNAL_SYMBOL_NAME_ASSIGNMENT_DECLARATION, assignment_symbol);
+            assignment_symbol = self.new_symbol(
+                SymbolFlags::NONE,
+                INTERNAL_SYMBOL_NAME_ASSIGNMENT_DECLARATION,
+            );
+            self.symbols.set(
+                exports,
+                INTERNAL_SYMBOL_NAME_ASSIGNMENT_DECLARATION,
+                assignment_symbol,
+            );
         }
-        self.symbols.sym_mut(assignment_symbol).declarations.push(node);
+        self.symbols
+            .sym_mut(assignment_symbol)
+            .declarations
+            .push(node);
     }
 
     // Go: binder/binder.go:1016 bindModuleExportsAssignment
     pub fn bind_module_exports_assignment(&mut self, node: Node) {
         if self.set_common_js_module_indicator(node) {
             let container = self.file;
-            let flags = if expression_is_alias(node.right()) { SymbolFlags::ALIAS } else { SymbolFlags::PROPERTY };
+            let flags = if expression_is_alias(node.right()) {
+                SymbolFlags::ALIAS
+            } else {
+                SymbolFlags::PROPERTY
+            };
             let container_symbol = bound(self, container).symbol;
             let exports = binder_get_exports(self, container_symbol);
-            let symbol = self.declare_symbol(exports, container_symbol, node, flags, SymbolFlags::NONE);
+            let symbol =
+                self.declare_symbol(exports, container_symbol, node, flags, SymbolFlags::NONE);
             set_value_declaration(&mut self.symbols, symbol, node);
         }
     }
@@ -269,7 +298,8 @@ impl Binder {
         let count = self.expando_assignments.len();
         for i in 0..count {
             let info = &self.expando_assignments[i];
-            let (node, container, block_scope_container) = (info.node, info.container, info.block_scope_container);
+            let (node, container, block_scope_container) =
+                (info.node, info.container, info.block_scope_container);
             self.container = container;
             self.block_scope_container = block_scope_container;
             self.bind_deferred_expando_assignment(node);
@@ -282,7 +312,9 @@ impl Binder {
     // symbol as a namespace module.
     pub fn bind_common_js_type_exports(&mut self, module_symbol: SymbolId) {
         let module_exports = self.symbols.sym(module_symbol).exports;
-        let export_equals = self.symbols.get(module_exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS);
+        let export_equals = self
+            .symbols
+            .get(module_exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS);
         if export_equals.is_some() {
             for symbol in self.symbols.values(module_exports) {
                 let (name, flags) = {
@@ -323,7 +355,13 @@ impl Binder {
                 let exports = binder_get_exports(self, symbol);
                 let declaration_name = self.get_declaration_name(node);
                 let existing = self.symbols.get(exports, &declaration_name);
-                if existing.is_nil() || self.symbols.sym(existing).flags.intersects(SymbolFlags::ASSIGNMENT) {
+                if existing.is_nil()
+                    || self
+                        .symbols
+                        .sym(existing)
+                        .flags
+                        .intersects(SymbolFlags::ASSIGNMENT)
+                {
                     self.declare_symbol(
                         exports,
                         symbol,
@@ -382,10 +420,13 @@ pub fn get_initializer_symbol(b: &Binder, symbol: SymbolId) -> SymbolId {
     // declared const variable initialized with a function expression or arrow function, we add expando
     // property declarations to the function's symbol. This also applies to class expressions in JS files,
     // and empty object literals in JS files when the declaration doesn't have a type annotation.
-    if is_function_declaration(declaration) || is_in_js_file(declaration) && is_class_declaration(declaration) {
+    if is_function_declaration(declaration)
+        || is_in_js_file(declaration) && is_class_declaration(declaration)
+    {
         return symbol;
     } else if is_variable_declaration(declaration)
-        && (node_flags(b, declaration.parent()).intersects(NodeFlags::CONST) || is_in_js_file(declaration))
+        && (node_flags(b, declaration.parent()).intersects(NodeFlags::CONST)
+            || is_in_js_file(declaration))
     {
         let initializer = declaration.initializer();
         if is_expando_initializer(declaration, initializer) {
@@ -407,7 +448,9 @@ impl Binder {
             return;
         }
         let left = node.left();
-        if is_property_access_expression(left) && is_private_identifier(left.name()) || self.this_container.is_nil() {
+        if is_property_access_expression(left) && is_private_identifier(left.name())
+            || self.this_container.is_nil()
+        {
             return;
         }
         let (class_symbol, symbol_table) = self.get_this_class_and_symbol_table();
@@ -438,7 +481,10 @@ impl Binder {
             && self.this_container.kind() != SyntaxKind::FunctionExpression
         {
             // !!! constructor functions
-            panic!("Unhandled case in bindThisPropertyAssignment: {:?}", self.this_container.kind());
+            panic!(
+                "Unhandled case in bindThisPropertyAssignment: {:?}",
+                self.this_container.kind()
+            );
         }
     }
 
@@ -476,9 +522,17 @@ impl Binder {
     // Go: binder/binder.go:1162 bindEnumDeclaration
     pub fn bind_enum_declaration(&mut self, node: Node) {
         if is_enum_const(node) {
-            self.bind_block_scoped_declaration(node, SymbolFlags::CONST_ENUM, SymbolFlags::CONST_ENUM_EXCLUDES);
+            self.bind_block_scoped_declaration(
+                node,
+                SymbolFlags::CONST_ENUM,
+                SymbolFlags::CONST_ENUM_EXCLUDES,
+            );
         } else {
-            self.bind_block_scoped_declaration(node, SymbolFlags::REGULAR_ENUM, SymbolFlags::REGULAR_ENUM_EXCLUDES);
+            self.bind_block_scoped_declaration(
+                node,
+                SymbolFlags::REGULAR_ENUM,
+                SymbolFlags::REGULAR_ENUM_EXCLUDES,
+            );
         }
     }
 
@@ -488,7 +542,11 @@ impl Binder {
         let name = node.name();
         if name.is_some() && !is_binding_pattern(name) {
             if is_variable_declaration_initialized_to_require(node) {
-                self.declare_symbol_and_add_to_symbol_table(node, SymbolFlags::ALIAS, SymbolFlags::ALIAS_EXCLUDES);
+                self.declare_symbol_and_add_to_symbol_table(
+                    node,
+                    SymbolFlags::ALIAS,
+                    SymbolFlags::ALIAS_EXCLUDES,
+                );
             } else if is_block_or_catch_scoped(node) {
                 self.bind_block_scoped_declaration(
                     node,
@@ -535,7 +593,11 @@ impl Binder {
                 .iter()
                 .position(|p| p == node)
                 .map_or(-1, |i| i as i32);
-            self.bind_anonymous_declaration(node, SymbolFlags::FUNCTION_SCOPED_VARIABLE, &format!("__{index}"));
+            self.bind_anonymous_declaration(
+                node,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                &format!("__{index}"),
+            );
         } else {
             self.declare_symbol_and_add_to_symbol_table(
                 node,
@@ -548,10 +610,20 @@ impl Binder {
         if is_parameter_property_declaration(node, node.parent()) {
             let class_declaration = node.parent().parent();
             let flags = SymbolFlags::PROPERTY
-                | if node.question_token().is_some() { SymbolFlags::OPTIONAL } else { SymbolFlags::NONE };
+                | if node.question_token().is_some() {
+                    SymbolFlags::OPTIONAL
+                } else {
+                    SymbolFlags::NONE
+                };
             let class_symbol = bound(self, class_declaration).symbol;
             let members = binder_get_members(self, class_symbol);
-            self.declare_symbol(members, class_symbol, node, flags, SymbolFlags::PROPERTY_EXCLUDES);
+            self.declare_symbol(
+                members,
+                class_symbol,
+                node,
+                flags,
+                SymbolFlags::PROPERTY_EXCLUDES,
+            );
         }
     }
 
@@ -564,7 +636,11 @@ impl Binder {
             self.emit_flags |= NodeFlags::HAS_ASYNC_FUNCTIONS;
         }
         self.check_strict_mode_function_name(node);
-        self.bind_block_scoped_declaration(node, SymbolFlags::FUNCTION, SymbolFlags::FUNCTION_EXCLUDES);
+        self.bind_block_scoped_declaration(
+            node,
+            SymbolFlags::FUNCTION,
+            SymbolFlags::FUNCTION_EXCLUDES,
+        );
     }
 
     // Go: binder/binder.go:1225 getInferTypeContainer
@@ -587,7 +663,12 @@ impl Binder {
     }
 
     // Go: binder/binder.go:1236 bindAnonymousDeclaration
-    pub fn bind_anonymous_declaration(&mut self, node: Node, symbol_flags: SymbolFlags, name: &str) {
+    pub fn bind_anonymous_declaration(
+        &mut self,
+        node: Node,
+        symbol_flags: SymbolFlags,
+        name: &str,
+    ) {
         let symbol = self.new_symbol(symbol_flags, name);
         if symbol_flags.intersects(SymbolFlags::ENUM_MEMBER | SymbolFlags::CLASS_MEMBER) {
             let container = self.container;
@@ -598,7 +679,12 @@ impl Binder {
     }
 
     // Go: binder/binder.go:1244 bindBlockScopedDeclaration
-    pub fn bind_block_scoped_declaration(&mut self, node: Node, symbol_flags: SymbolFlags, symbol_excludes: SymbolFlags) {
+    pub fn bind_block_scoped_declaration(
+        &mut self,
+        node: Node,
+        symbol_flags: SymbolFlags,
+        symbol_excludes: SymbolFlags,
+    ) {
         match self.block_scope_container.kind() {
             SyntaxKind::ModuleDeclaration => {
                 self.declare_module_member(node, symbol_flags, symbol_excludes);
@@ -618,7 +704,13 @@ impl Binder {
         }
         let block_scope_container = self.block_scope_container;
         let locals = binder_get_locals(self, block_scope_container);
-        self.declare_symbol(locals, SymbolId::NIL /*parent*/, node, symbol_flags, symbol_excludes);
+        self.declare_symbol(
+            locals,
+            SymbolId::NIL, /*parent*/
+            node,
+            symbol_flags,
+            symbol_excludes,
+        );
     }
 
     // Go: binder/binder.go:1259 bindTypeParameter
@@ -636,7 +728,11 @@ impl Binder {
                 );
             } else {
                 let declaration_name = self.get_declaration_name(node);
-                self.bind_anonymous_declaration(node, SymbolFlags::TYPE_PARAMETER, &declaration_name);
+                self.bind_anonymous_declaration(
+                    node,
+                    SymbolFlags::TYPE_PARAMETER,
+                    &declaration_name,
+                );
             }
         } else {
             self.declare_symbol_and_add_to_symbol_table(
@@ -683,7 +779,11 @@ impl Binder {
             let local = self.symbols.get(locals, name);
             if local.is_some() {
                 let export_symbol = self.symbols.sym(local).export_symbol;
-                return if export_symbol.is_some() { export_symbol } else { local };
+                return if export_symbol.is_some() {
+                    export_symbol
+                } else {
+                    local
+                };
             }
         }
         let declaration_symbol = bound(self, container).symbol;
@@ -730,7 +830,9 @@ impl Binder {
                         args![declaration_name_to_string(node)],
                     );
                 }
-            } else if original_keyword_kind == SyntaxKind::YieldKeyword && flags.intersects(NodeFlags::YIELD_CONTEXT) {
+            } else if original_keyword_kind == SyntaxKind::YieldKeyword
+                && flags.intersects(NodeFlags::YIELD_CONTEXT)
+            {
                 self.error_on_node(
                     node,
                     diag::Identifier_expected_0_is_a_reserved_word_that_cannot_be_used_here,
@@ -745,19 +847,29 @@ impl Binder {
         if node.text() == "#constructor" {
             // Report error only if there are no parse errors in file
             if source_file_info(self.file).diagnostics.is_empty() {
-                self.error_on_node(node, diag::X_constructor_is_a_reserved_word, args![declaration_name_to_string(node)]);
+                self.error_on_node(
+                    node,
+                    diag::X_constructor_is_a_reserved_word,
+                    args![declaration_name_to_string(node)],
+                );
             }
         }
     }
 
     // Go: binder/binder.go:1338 getStrictModeIdentifierMessage
-    pub fn get_strict_mode_identifier_message(&self, node: Node) -> &'static ts_diagnostics::Message {
+    pub fn get_strict_mode_identifier_message(
+        &self,
+        node: Node,
+    ) -> &'static ts_diagnostics::Message {
         // Provide specialized messages to help the user understand why we think they're in
         // strict mode.
         if get_containing_class(node).is_some() {
             return diag::Identifier_expected_0_is_a_reserved_word_in_strict_mode_Class_definitions_are_automatically_in_strict_mode;
         }
-        if source_file_info(self.file).external_module_indicator.is_some() {
+        if source_file_info(self.file)
+            .external_module_indicator
+            .is_some()
+        {
             return diag::Identifier_expected_0_is_a_reserved_word_in_strict_mode_Modules_are_automatically_in_strict_mode;
         }
         diag::Identifier_expected_0_is_a_reserved_word_in_strict_mode
@@ -767,7 +879,11 @@ impl Binder {
 // Go: binder/binder.go:1351 isUseStrictPrologueDirective
 // Should be called only on prologue directives (ast.IsPrologueDirective(node) should be true)
 pub fn is_use_strict_prologue_directive(source_file: Node, node: Node) -> bool {
-    let node_text = get_source_text_of_node_from_source_file(source_file, node.expression(), false /*includeTrivia*/);
+    let node_text = get_source_text_of_node_from_source_file(
+        source_file,
+        node.expression(),
+        false, /*includeTrivia*/
+    );
     // Note: the node text must be exactly "use strict" or 'use strict'.  It is not ok for the
     // string to contain unicode escapes (as per ES5).
     node_text == "\"use strict\"" || node_text == "'use strict'"
@@ -797,12 +913,18 @@ impl Binder {
     }
 
     // Go: binder/binder.go:1379 getStrictModeBlockScopeFunctionDeclarationMessage
-    pub fn get_strict_mode_block_scope_function_declaration_message(&self, node: Node) -> &'static ts_diagnostics::Message {
+    pub fn get_strict_mode_block_scope_function_declaration_message(
+        &self,
+        node: Node,
+    ) -> &'static ts_diagnostics::Message {
         // Provide specialized messages to help the user understand why we think they're in strict mode.
         if get_containing_class(node).is_some() {
             return diag::Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5_Class_definitions_are_automatically_in_strict_mode;
         }
-        if source_file_info(self.file).external_module_indicator.is_some() {
+        if source_file_info(self.file)
+            .external_module_indicator
+            .is_some()
+        {
             return diag::Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5_Modules_are_automatically_in_strict_mode;
         }
         diag::Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5
@@ -811,7 +933,9 @@ impl Binder {
     // Go: binder/binder.go:1390 checkStrictModeBinaryExpression
     pub fn check_strict_mode_binary_expression(&mut self, node: Node) {
         let left = node.left();
-        if is_left_hand_side_expression(left) && is_assignment_operator(node.operator_token().kind()) {
+        if is_left_hand_side_expression(left)
+            && is_assignment_operator(node.operator_token().kind())
+        {
             // ECMA 262 (Annex C) The identifier eval or arguments may not appear as the LeftHandSideExpression of an
             // Assignment operator(11.13) or of a PostfixExpression(11.3)
             self.check_strict_mode_eval_or_arguments(node, left);
@@ -835,7 +959,11 @@ impl Binder {
         if expression.kind() == SyntaxKind::Identifier {
             // When a delete operator occurs within strict mode code, a SyntaxError is thrown if its
             // UnaryExpression is a direct reference to a variable, function argument, or function name
-            self.error_on_node(expression, diag::X_delete_cannot_be_called_on_an_identifier_in_strict_mode, args![]);
+            self.error_on_node(
+                expression,
+                diag::X_delete_cannot_be_called_on_an_identifier_in_strict_mode,
+                args![],
+            );
         }
     }
 
@@ -860,7 +988,11 @@ impl Binder {
     // Go: binder/binder.go:1434 checkStrictModeWithStatement
     pub fn check_strict_mode_with_statement(&mut self, node: Node) {
         // Grammar checking for withStatement
-        self.error_on_first_token(node, diag::X_with_statements_are_not_allowed_in_strict_mode, args![]);
+        self.error_on_first_token(
+            node,
+            diag::X_with_statements_are_not_allowed_in_strict_mode,
+            args![],
+        );
     }
 
     // Go: binder/binder.go:1439 checkStrictModeLabeledStatement
@@ -894,12 +1026,18 @@ impl Binder {
     }
 
     // Go: binder/binder.go:1463 getStrictModeEvalOrArgumentsMessage
-    pub fn get_strict_mode_eval_or_arguments_message(&self, node: Node) -> &'static ts_diagnostics::Message {
+    pub fn get_strict_mode_eval_or_arguments_message(
+        &self,
+        node: Node,
+    ) -> &'static ts_diagnostics::Message {
         // Provide specialized messages to help the user understand why we think they're in strict mode
         if get_containing_class(node).is_some() {
             return diag::Code_contained_in_a_class_is_evaluated_in_JavaScript_s_strict_mode_which_does_not_allow_this_use_of_0_For_more_information_see_https_Colon_Slash_Slashdeveloper_mozilla_org_Slashen_US_Slashdocs_SlashWeb_SlashJavaScript_SlashReference_SlashStrict_mode;
         }
-        if source_file_info(self.file).external_module_indicator.is_some() {
+        if source_file_info(self.file)
+            .external_module_indicator
+            .is_some()
+        {
             return diag::Invalid_use_of_0_Modules_are_automatically_in_strict_mode;
         }
         diag::Invalid_use_of_0_in_strict_mode
@@ -959,7 +1097,8 @@ impl Binder {
             let save_active_label_list = self.active_label_list.clone();
             let save_has_explicit_return = self.has_explicit_return;
             let save_seen_this_keyword = self.seen_this_keyword;
-            let is_immediately_invoked = (container_flags.intersects(ContainerFlags::IS_FUNCTION_EXPRESSION)
+            let is_immediately_invoked = (container_flags
+                .intersects(ContainerFlags::IS_FUNCTION_EXPRESSION)
                 && !has_syntactic_modifier(node, ModifierFlags::ASYNC)
                 && !is_generator_function_expression(node)
                 && get_immediately_invoked_function_expression(node).is_some())
@@ -997,7 +1136,9 @@ impl Binder {
                     .added_flags
                     .without(NodeFlags::REACHABILITY_AND_EMIT_FLAGS | NodeFlags::CONTAINS_THIS);
             }
-            if !flow_data(self, self.current_flow).flags.intersects(FlowFlags::UNREACHABLE)
+            if !flow_data(self, self.current_flow)
+                .flags
+                .intersects(FlowFlags::UNREACHABLE)
                 && container_flags.intersects(ContainerFlags::IS_FUNCTION_LIKE)
             {
                 if has_body_data(node) && node_is_present(node.body()) {
@@ -1027,7 +1168,9 @@ impl Binder {
                 let current_flow = self.current_flow;
                 self.add_antecedent(current_return_target, current_flow);
                 self.current_flow = self.finish_flow_label(current_return_target);
-                if node.kind() == SyntaxKind::Constructor || node.kind() == SyntaxKind::ClassStaticBlockDeclaration {
+                if node.kind() == SyntaxKind::Constructor
+                    || node.kind() == SyntaxKind::ClassStaticBlockDeclaration
+                {
                     let current_flow = self.current_flow;
                     self.set_return_flow_node(node, current_flow);
                 }
@@ -1081,7 +1224,9 @@ impl Binder {
         }
         // PORT: Go `ast.IsExternalOrCommonJSModule(node.AsSourceFile())`; a SourceFile node here
         // is always the file being bound.
-        if is_source_file(node) && binder_is_external_or_common_js_module(self) || is_ambient_module(node) {
+        if is_source_file(node) && binder_is_external_or_common_js_module(self)
+            || is_ambient_module(node)
+        {
             let node_symbol = bound(self, node).symbol;
             self.bind_common_js_type_exports(node_symbol);
         }
@@ -1095,7 +1240,10 @@ impl Binder {
         let file = self.file;
         let locals = binder_get_locals(self, file);
         if self.symbols.get(locals, name).is_nil() {
-            let symbol = self.new_symbol(SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::MODULE_EXPORTS, name);
+            let symbol = self.new_symbol(
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::MODULE_EXPORTS,
+                name,
+            );
             let declarations = self.new_single_declaration(file);
             let value_declaration = declarations[0];
             {
@@ -1104,7 +1252,10 @@ impl Binder {
                 s.value_declaration = value_declaration;
             }
             if name == "module" {
-                let exports_property = self.new_symbol(SymbolFlags::MODULE_EXPORTS | SymbolFlags::PROPERTY, "exports");
+                let exports_property = self.new_symbol(
+                    SymbolFlags::MODULE_EXPORTS | SymbolFlags::PROPERTY,
+                    "exports",
+                );
                 {
                     let p = self.symbols.sym_mut(exports_property);
                     p.declarations = declarations;
@@ -1138,7 +1289,9 @@ impl Binder {
             return;
         }
 
-        if (SyntaxKind::FIRST_STATEMENT as u16) <= (node.kind() as u16) && (node.kind() as u16) <= (SyntaxKind::LAST_STATEMENT as u16) {
+        if (SyntaxKind::FIRST_STATEMENT as u16) <= (node.kind() as u16)
+            && (node.kind() as u16) <= (SyntaxKind::LAST_STATEMENT as u16)
+        {
             // PORT: Go sets `FlowNodeData().FlowNode` when the node has flow data, which is `setFlowNode`.
             let current_flow = self.current_flow;
             self.set_flow_node(node, current_flow);
@@ -1148,7 +1301,9 @@ impl Binder {
             SyntaxKind::WhileStatement => self.bind_while_statement(node),
             SyntaxKind::DoStatement => self.bind_do_statement(node),
             SyntaxKind::ForStatement => self.bind_for_statement(node),
-            SyntaxKind::ForInStatement | SyntaxKind::ForOfStatement => self.bind_for_in_or_for_of_statement(node),
+            SyntaxKind::ForInStatement | SyntaxKind::ForOfStatement => {
+                self.bind_for_in_or_for_of_statement(node)
+            }
             SyntaxKind::IfStatement => self.bind_if_statement(node),
             SyntaxKind::ReturnStatement => self.bind_return_statement(node),
             SyntaxKind::ThrowStatement => self.bind_throw_statement(node),
@@ -1157,7 +1312,9 @@ impl Binder {
             SyntaxKind::TryStatement => self.bind_try_statement(node),
             SyntaxKind::SwitchStatement => self.bind_switch_statement(node),
             SyntaxKind::CaseBlock => self.bind_case_block(node),
-            SyntaxKind::CaseClause | SyntaxKind::DefaultClause => self.bind_case_or_default_clause(node),
+            SyntaxKind::CaseClause | SyntaxKind::DefaultClause => {
+                self.bind_case_or_default_clause(node)
+            }
             SyntaxKind::ExpressionStatement => self.bind_expression_statement(node),
             SyntaxKind::LabeledStatement => self.bind_labeled_statement(node),
             SyntaxKind::PrefixUnaryExpression => self.bind_prefix_unary_expression_flow(node),
@@ -1277,24 +1434,41 @@ impl Binder {
     }
 
     // Go: binder/binder.go:1799 bindCondition
-    pub fn bind_condition(&mut self, node: Node, true_target: FlowNodeId, false_target: FlowNodeId) {
-        self.do_with_conditional_branches(&mut |b: &mut Binder, n: Node| b.bind(n), node, true_target, false_target);
+    pub fn bind_condition(
+        &mut self,
+        node: Node,
+        true_target: FlowNodeId,
+        false_target: FlowNodeId,
+    ) {
+        self.do_with_conditional_branches(
+            &mut |b: &mut Binder, n: Node| b.bind(n),
+            node,
+            true_target,
+            false_target,
+        );
         if node.is_nil()
             || !is_logical_assignment_expression(node)
                 && !is_logical_expression(node)
                 && !(is_optional_chain(node) && is_outermost_optional_chain(node))
         {
             let current_flow = self.current_flow;
-            let true_flow = self.create_flow_condition(FlowFlags::TRUE_CONDITION, current_flow, node);
+            let true_flow =
+                self.create_flow_condition(FlowFlags::TRUE_CONDITION, current_flow, node);
             self.add_antecedent(true_target, true_flow);
             let current_flow = self.current_flow;
-            let false_flow = self.create_flow_condition(FlowFlags::FALSE_CONDITION, current_flow, node);
+            let false_flow =
+                self.create_flow_condition(FlowFlags::FALSE_CONDITION, current_flow, node);
             self.add_antecedent(false_target, false_flow);
         }
     }
 
     // Go: binder/binder.go:1807 bindIterativeStatement
-    pub fn bind_iterative_statement(&mut self, node: Node, break_target: FlowNodeId, continue_target: FlowNodeId) {
+    pub fn bind_iterative_statement(
+        &mut self,
+        node: Node,
+        break_target: FlowNodeId,
+        continue_target: FlowNodeId,
+    ) {
         let save_break_target = self.current_break_target;
         let save_continue_target = self.current_continue_target;
         self.current_break_target = break_target;

@@ -1,12 +1,12 @@
 //! `astdump -p <tsconfig> -o <outdir>`: writes the AST that the Go checker
-//! sees through the ts_goport adapter, one dump per program file, in the
+//! sees through the `ts_goport` adapter, one dump per program file, in the
 //! format of the Go tool `tools/tsgo-src/cmd/astdump`:
 //!
 //! `<depth> <Kind> <pos> <end> <flags hex> [lists]`
 //!
 //! Nodes are in pre-order (`for_each_child` order). `[lists]` holds the
 //! non-nil NodeList/ModifierList slots as `L<pos>-<end>:<count>[,tc]`
-//! (`M` for modifier lists). Eagerly parsed JSDoc is dumped under its host
+//! (`M` for modifier lists). Eagerly parsed `JSDoc` is dumped under its host
 //! as `@<depth> ...` lines. Compare both outputs with `diff` to find adapter
 //! mismatches.
 
@@ -32,7 +32,14 @@ fn dump(out: &mut String, file: Node, n: Node, depth: usize, marker: &str) {
         },
         &mut |l, is_mod| lists.push(list_str(if is_mod { "M" } else { "L" }, l)),
     );
-    let _ = write!(out, "{marker}{depth} {:?} {} {} {:x}", n.kind(), n.pos(), n.end(), n.flags().0);
+    let _ = write!(
+        out,
+        "{marker}{depth} {:?} {} {} {:x}",
+        n.kind(),
+        n.pos(),
+        n.end(),
+        n.flags().0
+    );
     if !lists.is_empty() {
         let _ = write!(out, " [{}]", lists.join(" "));
     }

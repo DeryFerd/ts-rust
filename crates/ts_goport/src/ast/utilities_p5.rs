@@ -3,7 +3,11 @@
 use crate::prelude::*;
 
 // Go: ast/utilities.go:3632 IsNewExpressionTarget
-pub fn is_new_expression_target(node: Node, include_element_access: bool, skip_past_outer_expressions: bool) -> bool {
+pub fn is_new_expression_target(
+    node: Node,
+    include_element_access: bool,
+    skip_past_outer_expressions: bool,
+) -> bool {
     is_callee_worker(
         node,
         is_new_expression,
@@ -14,7 +18,11 @@ pub fn is_new_expression_target(node: Node, include_element_access: bool, skip_p
 }
 
 // Go: ast/utilities.go:3636 IsCallOrNewExpressionTarget
-pub fn is_call_or_new_expression_target(node: Node, include_element_access: bool, skip_past_outer_expressions: bool) -> bool {
+pub fn is_call_or_new_expression_target(
+    node: Node,
+    include_element_access: bool,
+    skip_past_outer_expressions: bool,
+) -> bool {
     is_callee_worker(
         node,
         is_call_or_new_expression,
@@ -25,7 +33,11 @@ pub fn is_call_or_new_expression_target(node: Node, include_element_access: bool
 }
 
 // Go: ast/utilities.go:3640 IsTaggedTemplateTag
-pub fn is_tagged_template_tag(node: Node, include_element_access: bool, skip_past_outer_expressions: bool) -> bool {
+pub fn is_tagged_template_tag(
+    node: Node,
+    include_element_access: bool,
+    skip_past_outer_expressions: bool,
+) -> bool {
     is_callee_worker(
         node,
         is_tagged_template_expression,
@@ -36,7 +48,11 @@ pub fn is_tagged_template_tag(node: Node, include_element_access: bool, skip_pas
 }
 
 // Go: ast/utilities.go:3644 IsDecoratorTarget
-pub fn is_decorator_target(node: Node, include_element_access: bool, skip_past_outer_expressions: bool) -> bool {
+pub fn is_decorator_target(
+    node: Node,
+    include_element_access: bool,
+    skip_past_outer_expressions: bool,
+) -> bool {
     is_callee_worker(
         node,
         is_decorator,
@@ -47,7 +63,11 @@ pub fn is_decorator_target(node: Node, include_element_access: bool, skip_past_o
 }
 
 // Go: ast/utilities.go:3648 IsJsxOpeningLikeElementTagName
-pub fn is_jsx_opening_like_element_tag_name(node: Node, include_element_access: bool, skip_past_outer_expressions: bool) -> bool {
+pub fn is_jsx_opening_like_element_tag_name(
+    node: Node,
+    include_element_access: bool,
+    skip_past_outer_expressions: bool,
+) -> bool {
     is_callee_worker(
         node,
         is_jsx_opening_like_element,
@@ -86,7 +106,10 @@ pub fn is_callee_worker(
             target = skip_outer_expressions(target, oek_all);
         }
     }
-    target.is_some() && target.parent().is_some() && pred(target.parent()) && callee_selector(target.parent()) == target
+    target.is_some()
+        && target.parent().is_some()
+        && pred(target.parent())
+        && callee_selector(target.parent()) == target
 }
 
 // Go: ast/utilities.go:3674 IsRightSideOfQualifiedNameOrPropertyAccess
@@ -102,9 +125,15 @@ pub fn is_right_side_of_qualified_name_or_property_access(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:3687 ShouldTransformImportCall
-pub fn should_transform_import_call(file_name: &str, options: &CompilerOptions, implied_node_format_for_emit: ModuleKind) -> bool {
+pub fn should_transform_import_call(
+    file_name: &str,
+    options: &CompilerOptions,
+    implied_node_format_for_emit: ModuleKind,
+) -> bool {
     let module_kind = options.get_emit_module_kind();
-    if ModuleKind::NODE16 <= module_kind && module_kind <= ModuleKind::NODE_NEXT || module_kind == ModuleKind::PRESERVE {
+    if ModuleKind::NODE16 <= module_kind && module_kind <= ModuleKind::NODE_NEXT
+        || module_kind == ModuleKind::PRESERVE
+    {
         return false;
     }
     implied_node_format_for_emit < ModuleKind::ES2015
@@ -161,7 +190,8 @@ pub fn compare_node_positions(n1: Node, n2: Node) -> i32 {
 // Go: ast/utilities.go:3734 IsUnterminatedLiteral
 pub fn is_unterminated_literal(node: Node) -> bool {
     is_literal_kind(node.kind()) && node.token_flags().intersects(TokenFlags::UNTERMINATED)
-        || is_template_literal_kind(node.kind()) && node.template_flags().intersects(TokenFlags::UNTERMINATED)
+        || is_template_literal_kind(node.kind())
+            && node.template_flags().intersects(TokenFlags::UNTERMINATED)
 }
 
 // Gets a value indicating whether a class element is either a static or an instance property declaration with an initializer.
@@ -172,7 +202,8 @@ pub fn is_initialized_property(member: Node) -> bool {
 
 // Go: ast/utilities.go:3745 IsTrivia
 pub fn is_trivia(token: SyntaxKind) -> bool {
-    (SyntaxKind::FIRST_TRIVIA_TOKEN as u16) <= (token as u16) && (token as u16) <= (SyntaxKind::LAST_TRIVIA_TOKEN as u16)
+    (SyntaxKind::FIRST_TRIVIA_TOKEN as u16) <= (token as u16)
+        && (token as u16) <= (SyntaxKind::LAST_TRIVIA_TOKEN as u16)
 }
 
 // Go: ast/utilities.go:3749 HasDecorators
@@ -190,7 +221,10 @@ pub struct HasFileNameImpl {
 
 // Go: ast/utilities.go:3758 NewHasFileName
 pub fn new_has_file_name(file_name: &str, path: &str) -> HasFileNameImpl {
-    HasFileNameImpl { file_name: file_name.to_string(), path: path.to_string() }
+    HasFileNameImpl {
+        file_name: file_name.to_string(),
+        path: path.to_string(),
+    }
 }
 
 impl HasFileNameImpl {
@@ -251,13 +285,16 @@ pub fn has_comment(kind: SyntaxKind) -> bool {
 
 // Go: ast/utilities.go:3801 IsAssignmentPattern
 pub fn is_assignment_pattern(node: Node) -> bool {
-    node.kind() == SyntaxKind::ArrayLiteralExpression || node.kind() == SyntaxKind::ObjectLiteralExpression
+    node.kind() == SyntaxKind::ArrayLiteralExpression
+        || node.kind() == SyntaxKind::ObjectLiteralExpression
 }
 
 // Go: ast/utilities.go:3805 GetElementsOfBindingOrAssignmentPattern
 pub fn get_elements_of_binding_or_assignment_pattern(name: Node) -> Vec<Node> {
     match name.kind() {
-        SyntaxKind::ObjectBindingPattern | SyntaxKind::ArrayBindingPattern | SyntaxKind::ArrayLiteralExpression => {
+        SyntaxKind::ObjectBindingPattern
+        | SyntaxKind::ArrayBindingPattern
+        | SyntaxKind::ArrayLiteralExpression => {
             // `a` in `{a}`
             // `a` in `[a]`
             name.elements().to_vec()
@@ -364,7 +401,9 @@ pub fn try_get_property_name_of_binding_or_assignment_element(binding_element: N
             // `1` in `let { 1: b } = ...`
             if binding_element.property_name().is_some() {
                 let property_name = binding_element.property_name();
-                if is_computed_property_name(property_name) && is_string_or_numeric_literal_like(property_name.expression()) {
+                if is_computed_property_name(property_name)
+                    && is_string_or_numeric_literal_like(property_name.expression())
+                {
                     return property_name.expression();
                 }
                 return property_name;
@@ -377,7 +416,9 @@ pub fn try_get_property_name_of_binding_or_assignment_element(binding_element: N
             // `1` in `({ 1: b } = ...)`
             if binding_element.name().is_some() {
                 let property_name = binding_element.name();
-                if is_computed_property_name(property_name) && is_string_or_numeric_literal_like(property_name.expression()) {
+                if is_computed_property_name(property_name)
+                    && is_string_or_numeric_literal_like(property_name.expression())
+                {
                     return property_name.expression();
                 }
                 return property_name;
@@ -403,19 +444,31 @@ pub fn try_get_property_name_of_binding_or_assignment_element(binding_element: N
 /// AssignmentPattern at the time the nodes are parsed.
 // Go: ast/utilities.go:3953 ContainsObjectRestOrSpread
 pub fn contains_object_rest_or_spread(node: Node) -> bool {
-    if node.subtree_facts().intersects(SubtreeFacts::SUBTREE_CONTAINS_OBJECT_REST_OR_SPREAD) {
+    if node
+        .subtree_facts()
+        .intersects(SubtreeFacts::SUBTREE_CONTAINS_OBJECT_REST_OR_SPREAD)
+    {
         return true;
     }
-    if node.subtree_facts().intersects(SubtreeFacts::SUBTREE_CONTAINS_ES_OBJECT_REST_OR_SPREAD) {
+    if node
+        .subtree_facts()
+        .intersects(SubtreeFacts::SUBTREE_CONTAINS_ES_OBJECT_REST_OR_SPREAD)
+    {
         // check for nested spread assignments, otherwise '{ x: { a, ...b } = foo } = c'
         // will not be correctly interpreted by the rest/spread transformer
         for element in get_elements_of_binding_or_assignment_pattern(node) {
             let target = get_target_of_binding_or_assignment_element(element);
             if target.is_some() && is_assignment_pattern(target) {
-                if target.subtree_facts().intersects(SubtreeFacts::SUBTREE_CONTAINS_OBJECT_REST_OR_SPREAD) {
+                if target
+                    .subtree_facts()
+                    .intersects(SubtreeFacts::SUBTREE_CONTAINS_OBJECT_REST_OR_SPREAD)
+                {
                     return true;
                 }
-                if target.subtree_facts().intersects(SubtreeFacts::SUBTREE_CONTAINS_ES_OBJECT_REST_OR_SPREAD) {
+                if target
+                    .subtree_facts()
+                    .intersects(SubtreeFacts::SUBTREE_CONTAINS_ES_OBJECT_REST_OR_SPREAD)
+                {
                     if contains_object_rest_or_spread(target) {
                         return true;
                     }
@@ -449,7 +502,10 @@ pub fn get_rest_indicator_of_binding_or_assignment_element(binding_element: Node
 // Go: ast/utilities.go:3997 IsJSDocNameReferenceContext
 pub fn is_js_doc_name_reference_context(node: Node) -> bool {
     node.flags().intersects(NodeFlags::JS_DOC)
-        && find_ancestor(node, &|node: Node| is_js_doc_name_reference(node) || is_js_doc_link_like(node)).is_some()
+        && find_ancestor(node, &|node: Node| {
+            is_js_doc_name_reference(node) || is_js_doc_link_like(node)
+        })
+        .is_some()
 }
 
 // GetJSDocRoot returns the containing JSDoc node for a node inside a JSDoc comment.
@@ -477,7 +533,10 @@ pub fn get_host_signature_from_js_doc(node: Node) -> Node {
         return Node::NIL;
     }
     // !!! Strada's getEffectiveJSDocHost applies JS assignment pattern transforms (getSourceOfAssignment, getSourceOfDefaultedAssignment, etc.) not yet ported
-    if is_property_signature_declaration(host) && host.type_().is_some() && is_function_like(host.type_()) {
+    if is_property_signature_declaration(host)
+        && host.type_().is_some()
+        && is_function_like(host.type_())
+    {
         return host.type_();
     }
     if is_function_like(host) {
@@ -528,7 +587,8 @@ pub fn is_primitive_literal_value(node: Node, include_big_int: bool) -> bool {
         SyntaxKind::BigIntLiteral => include_big_int,
         SyntaxKind::PrefixUnaryExpression => {
             if node.operator() == SyntaxKind::MinusToken {
-                return is_numeric_literal(node.operand()) || (include_big_int && is_big_int_literal(node.operand()));
+                return is_numeric_literal(node.operand())
+                    || (include_big_int && is_big_int_literal(node.operand()));
             }
             if node.operator() == SyntaxKind::PlusToken {
                 return is_numeric_literal(node.operand());
@@ -562,7 +622,8 @@ pub fn has_inferred_type(node: Node) -> bool {
 
 // Go: ast/utilities.go:4104 IsKeyword
 pub fn is_keyword(token: SyntaxKind) -> bool {
-    (SyntaxKind::FIRST_KEYWORD as u16) <= (token as u16) && (token as u16) <= (SyntaxKind::LAST_KEYWORD as u16)
+    (SyntaxKind::FIRST_KEYWORD as u16) <= (token as u16)
+        && (token as u16) <= (SyntaxKind::LAST_KEYWORD as u16)
 }
 
 // Go: ast/utilities.go:4108 IsNonContextualKeyword
@@ -610,10 +671,17 @@ pub fn import_from_module_specifier(node: Node) -> Node {
 // Go: ast/utilities.go:4141 TryGetImportFromModuleSpecifier
 pub fn try_get_import_from_module_specifier(node: Node) -> Node {
     match node.parent().kind() {
-        SyntaxKind::ImportDeclaration | SyntaxKind::JsImportDeclaration | SyntaxKind::ExportDeclaration => node.parent(),
+        SyntaxKind::ImportDeclaration
+        | SyntaxKind::JsImportDeclaration
+        | SyntaxKind::ExportDeclaration => node.parent(),
         SyntaxKind::ExternalModuleReference => node.parent().parent(),
         SyntaxKind::CallExpression => {
-            if is_import_call(node.parent()) || is_require_call(node.parent(), false /*requireStringLiteralLikeArgument*/) {
+            if is_import_call(node.parent())
+                || is_require_call(
+                    node.parent(),
+                    false, /*requireStringLiteralLikeArgument*/
+                )
+            {
                 return node.parent();
             }
             Node::NIL
@@ -660,7 +728,11 @@ pub fn has_context_sensitive_parameters(node: Node) -> bool {
             // an implicit 'this' parameter which is subject to contextual typing.
             // Go: core.FirstOrNil(node.Parameters())
             let parameters = node.parameters();
-            let parameter = if parameters.is_empty() { Node::NIL } else { parameters.get(0) };
+            let parameter = if parameters.is_empty() {
+                Node::NIL
+            } else {
+                parameters.get(0)
+            };
             if parameter.is_nil() || !is_this_parameter(parameter) {
                 return node.flags().intersects(NodeFlags::CONTAINS_THIS);
             }
@@ -687,7 +759,9 @@ pub fn get_first_constructor_with_body(node: Node) -> Node {
 // Returns true for nodes that are considered executable for the purposes of unreachable code detection.
 // Go: ast/utilities.go:4209 IsPotentiallyExecutableNode
 pub fn is_potentially_executable_node(node: Node) -> bool {
-    if (SyntaxKind::FIRST_STATEMENT as u16) <= (node.kind() as u16) && (node.kind() as u16) <= (SyntaxKind::LAST_STATEMENT as u16) {
+    if (SyntaxKind::FIRST_STATEMENT as u16) <= (node.kind() as u16)
+        && (node.kind() as u16) <= (SyntaxKind::LAST_STATEMENT as u16)
+    {
         if is_variable_statement(node) {
             let declaration_list = node.declaration_list();
             if get_combined_node_flags(declaration_list).intersects(NodeFlags::BLOCK_SCOPED) {
@@ -712,7 +786,12 @@ pub fn has_ambient_modifier(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:4234 NodeCanBeDecorated
-pub fn node_can_be_decorated(use_legacy_decorators: bool, node: Node, parent: Node, grandparent: Node) -> bool {
+pub fn node_can_be_decorated(
+    use_legacy_decorators: bool,
+    node: Node,
+    parent: Node,
+    grandparent: Node,
+) -> bool {
     // private names cannot be used with decorators yet
     if use_legacy_decorators && node.name().is_some() && is_private_identifier(node.name()) {
         return false;
@@ -739,7 +818,8 @@ pub fn node_can_be_decorated(use_legacy_decorators: bool, node: Node, parent: No
             // if this method has a body and its parent is a class declaration, this is a valid target.
             return parent.is_some()
                 && node.body().is_some()
-                && (use_legacy_decorators && is_class_declaration(parent) || !use_legacy_decorators && is_class_like(parent));
+                && (use_legacy_decorators && is_class_declaration(parent)
+                    || !use_legacy_decorators && is_class_like(parent));
         }
         SyntaxKind::Parameter => {
             // TODO(rbuckton): ParameterDeclaration decorator support for ES decorators must wait until it is standardized
@@ -763,7 +843,10 @@ pub fn node_can_be_decorated(use_legacy_decorators: bool, node: Node, parent: No
 }
 
 // Go: ast/utilities.go:4268 ClassOrConstructorParameterIsDecorated
-pub fn class_or_constructor_parameter_is_decorated(use_legacy_decorators: bool, node: Node) -> bool {
+pub fn class_or_constructor_parameter_is_decorated(
+    use_legacy_decorators: bool,
+    node: Node,
+) -> bool {
     if node_is_decorated(use_legacy_decorators, node, Node::NIL, Node::NIL) {
         return true;
     }
@@ -772,7 +855,11 @@ pub fn class_or_constructor_parameter_is_decorated(use_legacy_decorators: bool, 
 }
 
 // Go: ast/utilities.go:4276 ClassElementOrClassElementParameterIsDecorated
-pub fn class_element_or_class_element_parameter_is_decorated(use_legacy_decorators: bool, node: Node, parent: Node) -> bool {
+pub fn class_element_or_class_element_parameter_is_decorated(
+    use_legacy_decorators: bool,
+    node: Node,
+    parent: Node,
+) -> bool {
     let mut parameters = NodeList::NIL;
     if is_accessor(node) {
         let decls = get_all_accessor_declarations(&parent.members().to_vec(), node);
@@ -808,13 +895,24 @@ pub fn class_element_or_class_element_parameter_is_decorated(use_legacy_decorato
 }
 
 // Go: ast/utilities.go:4311 NodeIsDecorated
-pub fn node_is_decorated(use_legacy_decorators: bool, node: Node, parent: Node, grandparent: Node) -> bool {
+pub fn node_is_decorated(
+    use_legacy_decorators: bool,
+    node: Node,
+    parent: Node,
+    grandparent: Node,
+) -> bool {
     has_decorators(node) && node_can_be_decorated(use_legacy_decorators, node, parent, grandparent)
 }
 
 // Go: ast/utilities.go:4315 NodeOrChildIsDecorated
-pub fn node_or_child_is_decorated(use_legacy_decorators: bool, node: Node, parent: Node, grandparent: Node) -> bool {
-    node_is_decorated(use_legacy_decorators, node, parent, grandparent) || child_is_decorated(use_legacy_decorators, node, parent)
+pub fn node_or_child_is_decorated(
+    use_legacy_decorators: bool,
+    node: Node,
+    parent: Node,
+    grandparent: Node,
+) -> bool {
+    node_is_decorated(use_legacy_decorators, node, parent, grandparent)
+        || child_is_decorated(use_legacy_decorators, node, parent)
 }
 
 // Go: ast/utilities.go:4319 ChildIsDecorated
@@ -843,7 +941,10 @@ pub struct AllAccessorDeclarations {
 }
 
 // Go: ast/utilities.go:4343 GetAllAccessorDeclarationsForDeclaration
-pub fn get_all_accessor_declarations_for_declaration(accessor: Node, declarations_of_symbol: &[Node]) -> AllAccessorDeclarations {
+pub fn get_all_accessor_declarations_for_declaration(
+    accessor: Node,
+    declarations_of_symbol: &[Node],
+) -> AllAccessorDeclarations {
     let other_kind = if accessor.kind() == SyntaxKind::SetAccessor {
         SyntaxKind::GetAccessor
     } else if accessor.kind() == SyntaxKind::GetAccessor {
@@ -884,11 +985,19 @@ pub fn get_all_accessor_declarations_for_declaration(accessor: Node, declaration
         }
     }
 
-    AllAccessorDeclarations { first_accessor, second_accessor, set_accessor, get_accessor }
+    AllAccessorDeclarations {
+        first_accessor,
+        second_accessor,
+        set_accessor,
+        get_accessor,
+    }
 }
 
 // Go: ast/utilities.go:4393 GetAllAccessorDeclarations
-pub fn get_all_accessor_declarations(parent_declarations: &[Node], accessor: Node) -> AllAccessorDeclarations {
+pub fn get_all_accessor_declarations(
+    parent_declarations: &[Node],
+    accessor: Node,
+) -> AllAccessorDeclarations {
     if has_dynamic_name(accessor) {
         // dynamic names can only be match up via checker symbol lookup, just return an object with just this accessor
         return get_all_accessor_declarations_for_declaration(accessor, &[accessor]);
@@ -917,7 +1026,9 @@ pub fn is_async_function(node: Node) -> bool {
         | SyntaxKind::ArrowFunction
         | SyntaxKind::MethodDeclaration => {
             // PORT: Go `node.BodyData()` fields Body and AsteriskToken.
-            node.body().is_some() && node.asterisk_token().is_nil() && has_syntactic_modifier(node, ModifierFlags::ASYNC)
+            node.body().is_some()
+                && node.asterisk_token().is_nil()
+                && has_syntactic_modifier(node, ModifierFlags::ASYNC)
         }
         _ => false,
     }
@@ -938,7 +1049,11 @@ pub fn get_rest_parameter_element_type(node: Node) -> Node {
     if node.kind() == SyntaxKind::TypeReference && !node.type_argument_list().is_nil() {
         // Go: core.FirstOrNil(TypeArguments.Nodes)
         let type_arguments = node.type_argument_list().nodes();
-        return if type_arguments.is_empty() { Node::NIL } else { type_arguments.get(0) };
+        return if type_arguments.is_empty() {
+            Node::NIL
+        } else {
+            type_arguments.get(0)
+        };
     }
     Node::NIL
 }
@@ -952,10 +1067,12 @@ pub fn tag_names_are_equivalent(lhs: Node, rhs: Node) -> bool {
         SyntaxKind::Identifier => return lhs.text() == rhs.text(),
         SyntaxKind::ThisKeyword => return true,
         SyntaxKind::JsxNamespacedName => {
-            return lhs.namespace().text() == rhs.namespace().text() && lhs.name().text() == rhs.name().text();
+            return lhs.namespace().text() == rhs.namespace().text()
+                && lhs.name().text() == rhs.name().text();
         }
         SyntaxKind::PropertyAccessExpression => {
-            return lhs.name().text() == rhs.name().text() && tag_names_are_equivalent(lhs.expression(), rhs.expression());
+            return lhs.name().text() == rhs.name().text()
+                && tag_names_are_equivalent(lhs.expression(), rhs.expression());
         }
         _ => {}
     }
@@ -991,13 +1108,17 @@ pub fn is_argument_of_element_access_expression(node: Node) -> bool {
 // return the corresponding reparsed clone in the subtree. Otherwise, just return the node.
 // Go: ast/utilities.go:4486 GetReparsedNodeForNode
 pub fn get_reparsed_node_for_node(node: Node) -> Node {
-    if node.is_some() && node.flags().intersects(NodeFlags::JS_DOC) && !node.flags().intersects(NodeFlags::REPARSED) {
+    if node.is_some()
+        && node.flags().intersects(NodeFlags::JS_DOC)
+        && !node.flags().intersects(NodeFlags::REPARSED)
+    {
         let file = get_source_file_of_node(node);
         if file.is_some() && source_file_info(file).reparsed_clones.len() != 0 {
             let reparsed_clones = &source_file_info(file).reparsed_clones;
             // PORT: Go slices.BinarySearchFunc: first position whose element compares >= node.
             let mut pos = reparsed_clones.partition_point(|c| compare_node_positions(*c, node) < 0);
-            let found = pos < reparsed_clones.len() && compare_node_positions(reparsed_clones[pos], node) == 0;
+            let found = pos < reparsed_clones.len()
+                && compare_node_positions(reparsed_clones[pos], node) == 0;
             if !found && pos > 0 {
                 pos -= 1;
             }
@@ -1022,7 +1143,10 @@ fn text_range_contained_by(t: TextRange, t2: TextRange) -> bool {
 // Go: ast/utilities.go:4504 findCloneInNode
 fn find_clone_in_node(mut node: Node, original: Node) -> Node {
     loop {
-        if node.kind() == original.kind() && node.pos() == original.pos() && node.end() == original.end() {
+        if node.kind() == original.kind()
+            && node.pos() == original.pos()
+            && node.end() == original.end()
+        {
             return node;
         }
         let current = node;
@@ -1058,13 +1182,21 @@ pub fn is_super_property(node: Node) -> bool {
 pub fn is_named_evaluation_source(node: Node) -> bool {
     match node.kind() {
         SyntaxKind::PropertyAssignment => return !is_proto_setter(node.name()),
-        SyntaxKind::ShorthandPropertyAssignment => return node.object_assignment_initializer().is_some(),
-        SyntaxKind::VariableDeclaration => return is_identifier(node.name()) && node.initializer().is_some(),
+        SyntaxKind::ShorthandPropertyAssignment => {
+            return node.object_assignment_initializer().is_some();
+        }
+        SyntaxKind::VariableDeclaration => {
+            return is_identifier(node.name()) && node.initializer().is_some();
+        }
         SyntaxKind::Parameter => {
-            return is_identifier(node.name()) && node.initializer().is_some() && node.dot_dot_dot_token().is_nil();
+            return is_identifier(node.name())
+                && node.initializer().is_some()
+                && node.dot_dot_dot_token().is_nil();
         }
         SyntaxKind::BindingElement => {
-            return is_identifier(node.name()) && node.initializer().is_some() && node.dot_dot_dot_token().is_nil();
+            return is_identifier(node.name())
+                && node.initializer().is_some()
+                && node.dot_dot_dot_token().is_nil();
         }
         SyntaxKind::PropertyDeclaration => return node.initializer().is_some(),
         SyntaxKind::BinaryExpression => match node.operator_token().kind() {

@@ -27,7 +27,12 @@ pub fn new_result(
     resolved_other_files: bool,
     has_external_references: bool,
 ) -> EvaluatorResult {
-    EvaluatorResult { value, is_syntactically_string, resolved_other_files, has_external_references }
+    EvaluatorResult {
+        value,
+        is_syntactically_string,
+        resolved_other_files,
+        has_external_references,
+    }
 }
 
 // PORT: Go `Evaluator func(expr, location) Result` is a stored closure. The
@@ -38,11 +43,20 @@ pub fn new_result(
 pub type Evaluator = Rc<dyn Fn(&mut Checker, Node, Node) -> EvaluatorResult>;
 
 // Go: evaluator/evaluator.go:24 NewEvaluator
-pub fn new_evaluator(evaluate_entity: Evaluator, outer_expressions_to_skip: OuterExpressionKinds) -> Evaluator {
+pub fn new_evaluator(
+    evaluate_entity: Evaluator,
+    outer_expressions_to_skip: OuterExpressionKinds,
+) -> Evaluator {
     // PORT: Go builds a self-referencing closure. Here the recursion goes
     // through `evaluate_expression`, which receives the same captured state.
     Rc::new(move |checker: &mut Checker, expr: Node, location: Node| {
-        evaluate_expression(checker, &evaluate_entity, outer_expressions_to_skip, expr, location)
+        evaluate_expression(
+            checker,
+            &evaluate_entity,
+            outer_expressions_to_skip,
+            expr,
+            location,
+        )
     })
 }
 
@@ -70,7 +84,10 @@ fn evaluate_expression(
     // evaluation (but not esbuild's), and the isolatedModules errors we give depend on
     // our evaluation results, so we're currently being conservative so as to issue errors
     // on code that might break Babel.
-    let expr = skip_outer_expressions(expr, outer_expressions_to_skip | OuterExpressionKinds::OEK_PARENTHESES);
+    let expr = skip_outer_expressions(
+        expr,
+        outer_expressions_to_skip | OuterExpressionKinds::OEK_PARENTHESES,
+    );
     let mut evaluate = |checker: &mut Checker, e: Node, l: Node| {
         evaluate_expression(checker, evaluate_entity, outer_expressions_to_skip, e, l)
     };
@@ -113,7 +130,8 @@ fn evaluate_expression(
             let left = evaluate(checker, expr.left(), location);
             let right = evaluate(checker, expr.right(), location);
             let operator = expr.operator_token().kind();
-            is_syntactically_string = (left.is_syntactically_string || right.is_syntactically_string)
+            is_syntactically_string = (left.is_syntactically_string
+                || right.is_syntactically_string)
                 && expr.operator_token().kind() == SyntaxKind::PlusToken;
             resolved_other_files = left.resolved_other_files || right.resolved_other_files;
             has_external_references = left.has_external_references || right.has_external_references;
@@ -129,7 +147,9 @@ fn evaluate_expression(
                 let value = match operator {
                     SyntaxKind::BarToken => Some(left_num.bitwise_or(right_num)),
                     SyntaxKind::AmpersandToken => Some(left_num.bitwise_and(right_num)),
-                    SyntaxKind::GreaterThanGreaterThanToken => Some(left_num.signed_right_shift(right_num)),
+                    SyntaxKind::GreaterThanGreaterThanToken => {
+                        Some(left_num.signed_right_shift(right_num))
+                    }
                     SyntaxKind::GreaterThanGreaterThanGreaterThanToken => {
                         Some(left_num.unsigned_right_shift(right_num))
                     }
@@ -160,7 +180,10 @@ fn evaluate_expression(
                 Some(LiteralValue::String(s)) => (s.clone(), true),
                 _ => (String::new(), false),
             };
-            if (left_is_str || left_is_num) && (right_is_str || right_is_num) && operator == SyntaxKind::PlusToken {
+            if (left_is_str || left_is_num)
+                && (right_is_str || right_is_num)
+                && operator == SyntaxKind::PlusToken
+            {
                 if left_is_num {
                     left_str = left_num.to_string();
                 }
@@ -187,7 +210,12 @@ fn evaluate_expression(
             return evaluate_template_expression(checker, expr, location, &mut evaluate);
         }
         SyntaxKind::NumericLiteral => {
-            return new_result(Some(LiteralValue::Number(ts_jsnum::from_string(expr.text()))), false, false, false);
+            return new_result(
+                Some(LiteralValue::Number(ts_jsnum::from_string(expr.text()))),
+                false,
+                false,
+                false,
+            );
         }
         SyntaxKind::Identifier => {
             return (evaluate_entity.as_ref())(checker, expr, location);
@@ -199,7 +227,12 @@ fn evaluate_expression(
         }
         _ => {}
     }
-    new_result(None, is_syntactically_string, resolved_other_files, has_external_references)
+    new_result(
+        None,
+        is_syntactically_string,
+        resolved_other_files,
+        has_external_references,
+    )
 }
 
 // Go: evaluator/evaluator.go:124 evaluateTemplateExpression
@@ -223,7 +256,12 @@ fn evaluate_template_expression(
         resolved_other_files = resolved_other_files || span_result.resolved_other_files;
         has_external_references = has_external_references || span_result.has_external_references;
     }
-    new_result(Some(LiteralValue::String(sb)), true, resolved_other_files, has_external_references)
+    new_result(
+        Some(LiteralValue::String(sb)),
+        true,
+        resolved_other_files,
+        has_external_references,
+    )
 }
 
 // PORT: Go takes `any`; a nil value panics in Go ("Unhandled case"). Callers

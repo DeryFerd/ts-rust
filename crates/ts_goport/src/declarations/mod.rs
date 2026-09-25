@@ -11,6 +11,8 @@ pub mod util;
 
 pub use diagnostics::*;
 pub use tracker::*;
+// The crate prelude also exports the checker `SymbolTrackerImpl`.
+pub use tracker::SymbolTrackerImpl;
 pub use transform::*;
 
 use crate::prelude::*;

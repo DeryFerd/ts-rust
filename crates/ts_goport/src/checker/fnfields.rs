@@ -15,14 +15,46 @@ impl Checker {
         f(self, a, b)
     }
 
-    pub fn resolve_name(&mut self, location: Node, name: &str, meaning: SymbolFlags, name_not_found_message: Option<&'static Message>, is_use: bool, exclude_globals: bool) -> SymbolId {
+    pub fn resolve_name(
+        &mut self,
+        location: Node,
+        name: &str,
+        meaning: SymbolFlags,
+        name_not_found_message: Option<&'static Message>,
+        is_use: bool,
+        exclude_globals: bool,
+    ) -> SymbolId {
         let f = self.resolve_name.clone();
-        f(self, location, name, meaning, name_not_found_message, is_use, exclude_globals)
+        f(
+            self,
+            location,
+            name,
+            meaning,
+            name_not_found_message,
+            is_use,
+            exclude_globals,
+        )
     }
 
-    pub fn resolve_name_for_symbol_suggestion(&mut self, location: Node, name: &str, meaning: SymbolFlags, name_not_found_message: Option<&'static Message>, is_use: bool, exclude_globals: bool) -> SymbolId {
+    pub fn resolve_name_for_symbol_suggestion(
+        &mut self,
+        location: Node,
+        name: &str,
+        meaning: SymbolFlags,
+        name_not_found_message: Option<&'static Message>,
+        is_use: bool,
+        exclude_globals: bool,
+    ) -> SymbolId {
         let f = self.resolve_name_for_symbol_suggestion.clone();
-        f(self, location, name, meaning, name_not_found_message, is_use, exclude_globals)
+        f(
+            self,
+            location,
+            name,
+            meaning,
+            name_not_found_message,
+            is_use,
+            exclude_globals,
+        )
     }
 
     pub fn get_global_es_symbol_type(&mut self) -> TypeId {
@@ -101,7 +133,9 @@ impl Checker {
     }
 
     pub fn get_global_es_symbol_constructor_type_symbol_or_nil(&mut self) -> SymbolId {
-        let f = self.get_global_es_symbol_constructor_type_symbol_or_nil.clone();
+        let f = self
+            .get_global_es_symbol_constructor_type_symbol_or_nil
+            .clone();
         f(self)
     }
 
@@ -261,7 +295,9 @@ impl Checker {
     }
 
     pub fn get_global_class_accessor_decorator_context_type(&mut self) -> TypeId {
-        let f = self.get_global_class_accessor_decorator_context_type.clone();
+        let f = self
+            .get_global_class_accessor_decorator_context_type
+            .clone();
         f(self)
     }
 
@@ -304,5 +340,4 @@ impl Checker {
         let f = self.mark_node_assignments.clone();
         f(self, node)
     }
-
 }

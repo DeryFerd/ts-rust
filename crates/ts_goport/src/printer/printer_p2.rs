@@ -20,21 +20,36 @@ use crate::printer::*;
 
 impl Printer {
     // Go: printer/printer.go:1348 emitModifierList
-    pub(crate) fn emit_modifier_list(&mut self, parent_node: Node, modifiers: ModifierList, allow_decorators: bool) -> i32 {
+    pub(crate) fn emit_modifier_list(
+        &mut self,
+        parent_node: Node,
+        modifiers: ModifierList,
+        allow_decorators: bool,
+    ) -> i32 {
         if modifiers.is_nil() || modifiers.nodes().is_empty() {
             return parent_node.pos();
         }
 
         if modifiers.nodes().iter().all(is_modifier) {
             // if all modifier-likes are `Modifier`, simply emit the list as modifiers.
-            self.emit_list(Printer::emit_keyword_node, parent_node, modifiers.node_list(), ListFormat::MODIFIERS);
+            self.emit_list(
+                Printer::emit_keyword_node,
+                parent_node,
+                modifiers.node_list(),
+                ListFormat::MODIFIERS,
+            );
         } else if modifiers.nodes().iter().all(is_decorator) {
             if !allow_decorators {
                 return parent_node.pos();
             }
 
             // if all modifier-likes are `Decorator`, simply emit the list as decorators.
-            self.emit_list(Printer::emit_modifier_like, parent_node, modifiers.node_list(), ListFormat::DECORATORS);
+            self.emit_list(
+                Printer::emit_modifier_like,
+                parent_node,
+                modifiers.node_list(),
+                ListFormat::DECORATORS,
+            );
         } else {
             if let Some(f) = self.print_handlers.on_before_emit_node_list.as_mut() {
                 f(modifiers.node_list());
@@ -86,7 +101,11 @@ impl Printer {
                         Printer::emit_modifier_like,
                         parent_node,
                         &nodes[start..pos],
-                        if last_mode == Mode::Modifiers { ListFormat::MODIFIERS } else { ListFormat::DECORATORS },
+                        if last_mode == Mode::Modifiers {
+                            ListFormat::MODIFIERS
+                        } else {
+                            ListFormat::DECORATORS
+                        },
                         false, /*hasTrailingComma*/
                         text_range,
                     );
@@ -101,7 +120,10 @@ impl Printer {
             }
         }
 
-        greatest_end(parent_node.pos(), &[&modifiers.nodes().last().unwrap_or(Node::NIL)])
+        greatest_end(
+            parent_node.pos(),
+            &[&modifiers.nodes().last().unwrap_or(Node::NIL)],
+        )
     }
 
     // Go: printer/printer.go:1429 emitTypeParameter
@@ -157,7 +179,12 @@ impl Printer {
         // out, the parser can make parameter declarations with _just_ an initializer.
         let equal_token_pos = greatest_end(
             node.pos(),
-            &[&node.type_(), &node.question_token(), &node.name(), &node.modifiers()],
+            &[
+                &node.type_(),
+                &node.question_token(),
+                &node.name(),
+                &node.modifiers(),
+            ],
         );
         self.emit_initializer(node.initializer(), equal_token_pos, node);
         self.exit_node(node, state);
@@ -194,12 +221,19 @@ impl Printer {
         }
         // TODO: preserve trailing comma after Strada migration
         let format = ListFormat::TYPE_PARAMETERS
-            | if is_arrow_function(parent_node) /*p.shouldAllowTrailingComma(parentNode, nodes)*/ {
+            | if is_arrow_function(parent_node)
+            /*p.shouldAllowTrailingComma(parentNode, nodes)*/
+            {
                 ListFormat::ALLOW_TRAILING_COMMA
             } else {
                 ListFormat::NONE
             };
-        self.emit_list(Printer::emit_type_parameter_declaration_node, parent_node, nodes, format);
+        self.emit_list(
+            Printer::emit_type_parameter_declaration_node,
+            parent_node,
+            nodes,
+            format,
+        );
     }
 
     // Go: printer/printer.go:1509 emitTypeAnnotation
@@ -214,13 +248,23 @@ impl Printer {
     }
 
     // Go: printer/printer.go:1519 emitInitializer
-    pub(crate) fn emit_initializer(&mut self, node: Node, equal_token_pos: i32, context_node: Node) {
+    pub(crate) fn emit_initializer(
+        &mut self,
+        node: Node,
+        equal_token_pos: i32,
+        context_node: Node,
+    ) {
         if node.is_nil() {
             return;
         }
 
         self.write_space();
-        self.emit_token(SyntaxKind::EqualsToken, equal_token_pos, WriteKind::OPERATOR, context_node);
+        self.emit_token(
+            SyntaxKind::EqualsToken,
+            equal_token_pos,
+            WriteKind::OPERATOR,
+            context_node,
+        );
         self.write_space();
         self.emit_expression(node, OperatorPrecedence::DISALLOW_COMMA);
     }
@@ -263,19 +307,37 @@ pub(crate) fn can_emit_simple_arrow_head(parent_node: Node, parameters: NodeList
 
 impl Printer {
     // Go: printer/printer.go:1557 emitParametersForArrow
-    pub(crate) fn emit_parameters_for_arrow(&mut self, parent_node: Node /*FunctionType | ConstructorType | ArrowFunction*/, parameters: NodeList) {
+    pub(crate) fn emit_parameters_for_arrow(
+        &mut self,
+        parent_node: Node, /*FunctionType | ConstructorType | ArrowFunction*/
+        parameters: NodeList,
+    ) {
         if can_emit_simple_arrow_head(parent_node, parameters) {
             self.generate_all_names(parameters);
-            self.emit_list(Printer::emit_parameter_declaration_node, parent_node, parameters, ListFormat::SINGLE_ARROW_PARAMETER);
+            self.emit_list(
+                Printer::emit_parameter_declaration_node,
+                parent_node,
+                parameters,
+                ListFormat::SINGLE_ARROW_PARAMETER,
+            );
         } else {
             self.emit_parameters(parent_node, parameters);
         }
     }
 
     // Go: printer/printer.go:1566 emitParametersForIndexSignature
-    pub(crate) fn emit_parameters_for_index_signature(&mut self, parent_node: Node, parameters: NodeList) {
+    pub(crate) fn emit_parameters_for_index_signature(
+        &mut self,
+        parent_node: Node,
+        parameters: NodeList,
+    ) {
         self.generate_all_names(parameters);
-        self.emit_list(Printer::emit_parameter_declaration_node, parent_node, parameters, ListFormat::INDEX_SIGNATURE_PARAMETERS);
+        self.emit_list(
+            Printer::emit_parameter_declaration_node,
+            parent_node,
+            parameters,
+            ListFormat::INDEX_SIGNATURE_PARAMETERS,
+        );
     }
 
     // Go: printer/printer.go:1571 emitSignature
@@ -297,7 +359,8 @@ impl Printer {
 
     // Go: printer/printer.go:1585 emitFunctionBody
     pub(crate) fn emit_function_body(&mut self, body: Node) {
-        self.emit_context.add_emit_flags(body, EmitFlags::NO_SOURCE_MAP);
+        self.emit_context
+            .add_emit_flags(body, EmitFlags::NO_SOURCE_MAP);
 
         // Use only notification hooks for the body block, not the full comment pipeline.
         // Without this, trailing comments from the original method declaration
@@ -315,17 +378,35 @@ impl Printer {
 
         self.increase_indent();
         let statements = body.statement_list();
-        let detached_state = self.emit_detached_comments_before_statement_list(body, statements.loc());
+        let detached_state =
+            self.emit_detached_comments_before_statement_list(body, statements.loc());
         let statement_offset = self.emit_prologue_directives(statements);
         let pos = self.writer().get_text_pos();
         self.emit_helpers(body);
 
-        if self.should_emit_block_function_body_on_single_line(body) && statement_offset == 0 && pos == self.writer().get_text_pos() {
+        if self.should_emit_block_function_body_on_single_line(body)
+            && statement_offset == 0
+            && pos == self.writer().get_text_pos()
+        {
             self.decrease_indent();
-            self.emit_list_range(Printer::emit_statement, body, statements, ListFormat::SINGLE_LINE_FUNCTION_BODY_STATEMENTS, statement_offset, -1);
+            self.emit_list_range(
+                Printer::emit_statement,
+                body,
+                statements,
+                ListFormat::SINGLE_LINE_FUNCTION_BODY_STATEMENTS,
+                statement_offset,
+                -1,
+            );
             self.increase_indent();
         } else {
-            self.emit_list_range(Printer::emit_statement, body, statements, ListFormat::MULTI_LINE_FUNCTION_BODY_STATEMENTS, statement_offset, -1);
+            self.emit_list_range(
+                Printer::emit_statement,
+                body,
+                statements,
+                ListFormat::MULTI_LINE_FUNCTION_BODY_STATEMENTS,
+                statement_offset,
+                -1,
+            );
         }
 
         self.emit_detached_comments_after_statement_list(body, statements.loc(), detached_state);
@@ -333,7 +414,13 @@ impl Printer {
 
         // !!! Emit comment after Strada migration
         ////p.emitTokenEx(ast.KindCloseBraceToken, body.Statements.End(), WriteKindPunctuation, body.AsNode(), tefNone)
-        self.emit_token_ex(SyntaxKind::CloseBraceToken, statements.end(), WriteKind::PUNCTUATION, body, TokenEmitFlags::NO_COMMENTS);
+        self.emit_token_ex(
+            SyntaxKind::CloseBraceToken,
+            statements.end(),
+            WriteKind::PUNCTUATION,
+            body,
+            TokenEmitFlags::NO_COMMENTS,
+        );
 
         if let Some(f) = self.print_handlers.on_after_emit_node.as_mut() {
             f(body);
@@ -373,7 +460,8 @@ impl Printer {
         self.emit_property_name(node.name());
         self.emit_token_node(node.postfix_token());
         self.emit_type_annotation(node.type_());
-        let equal_token_pos = greatest_end(node.name().end(), &[&node.type_(), &node.postfix_token()]);
+        let equal_token_pos =
+            greatest_end(node.name().end(), &[&node.type_(), &node.postfix_token()]);
         self.emit_initializer(node.initializer(), equal_token_pos, node);
         self.write_trailing_semicolon();
         self.exit_node(node, state);
@@ -512,7 +600,9 @@ impl Printer {
         match node.kind() {
             SyntaxKind::PropertyDeclaration => self.emit_property_declaration(node),
             SyntaxKind::MethodDeclaration => self.emit_method_declaration(node),
-            SyntaxKind::ClassStaticBlockDeclaration => self.emit_class_static_block_declaration(node),
+            SyntaxKind::ClassStaticBlockDeclaration => {
+                self.emit_class_static_block_declaration(node)
+            }
             SyntaxKind::Constructor => self.emit_constructor(node),
             SyntaxKind::GetAccessor => self.emit_get_accessor_declaration(node),
             SyntaxKind::SetAccessor => self.emit_set_accessor_declaration(node),
@@ -543,7 +633,9 @@ impl Printer {
     pub(crate) fn emit_object_literal_element(&mut self, node: Node) {
         match node.kind() {
             SyntaxKind::PropertyAssignment => self.emit_property_assignment(node),
-            SyntaxKind::ShorthandPropertyAssignment => self.emit_shorthand_property_assignment(node),
+            SyntaxKind::ShorthandPropertyAssignment => {
+                self.emit_shorthand_property_assignment(node)
+            }
             SyntaxKind::SpreadAssignment => self.emit_spread_assignment(node),
             SyntaxKind::MethodDeclaration => self.emit_method_declaration(node),
             SyntaxKind::GetAccessor => self.emit_get_accessor_declaration(node),
@@ -622,7 +714,10 @@ impl Printer {
         }
         self.write_punctuation("=>");
         self.write_space();
-        if self.in_extends && node.kind() == SyntaxKind::InferType && node.type_parameter().constraint().is_some() {
+        if self.in_extends
+            && node.kind() == SyntaxKind::InferType
+            && node.type_parameter().constraint().is_some()
+        {
             // if the parent FunctionTypeNode or ConstructorTypeNode is in the `extends` clause of a ConditionalTypeNode,
             // we must parenthesize `infer ... extends ...` so as not to result in an ambiguous parse.
             //
@@ -690,7 +785,12 @@ impl Printer {
         } else {
             ListFormat::MULTI_LINE_TYPE_LITERAL_MEMBERS
         };
-        self.emit_list(Printer::emit_type_element, node, node.member_list(), flags | ListFormat::NO_SPACE_IF_EMPTY);
+        self.emit_list(
+            Printer::emit_type_element,
+            node,
+            node.member_list(),
+            flags | ListFormat::NO_SPACE_IF_EMPTY,
+        );
         self.write_punctuation("}");
         self.pop_name_generation_scope(node);
         self.exit_node(node, state);
@@ -729,14 +829,29 @@ impl Printer {
     // Go: printer/printer.go:2003 emitTupleType
     pub(crate) fn emit_tuple_type(&mut self, node: Node) {
         let state = self.enter_node(node);
-        self.emit_token(SyntaxKind::OpenBracketToken, node.pos(), WriteKind::PUNCTUATION, node);
+        self.emit_token(
+            SyntaxKind::OpenBracketToken,
+            node.pos(),
+            WriteKind::PUNCTUATION,
+            node,
+        );
         let flags = if self.should_emit_on_single_line(node) {
             ListFormat::SINGLE_LINE_TUPLE_TYPE_ELEMENTS
         } else {
             ListFormat::MULTI_LINE_TUPLE_TYPE_ELEMENTS
         };
-        self.emit_list(Printer::emit_tuple_element_type, node, node.element_list(), flags | ListFormat::NO_SPACE_IF_EMPTY);
-        self.emit_token(SyntaxKind::CloseBracketToken, node.element_list().end(), WriteKind::PUNCTUATION, node);
+        self.emit_list(
+            Printer::emit_tuple_element_type,
+            node,
+            node.element_list(),
+            flags | ListFormat::NO_SPACE_IF_EMPTY,
+        );
+        self.emit_token(
+            SyntaxKind::CloseBracketToken,
+            node.element_list().end(),
+            WriteKind::PUNCTUATION,
+            node,
+        );
         self.exit_node(node, state);
     }
 
@@ -764,7 +879,12 @@ impl Printer {
         self.emit_identifier_name(node.name());
         self.emit_punctuation_node(node.question_token());
         let colon_pos = greatest_end(node.name().end(), &[&node.question_token()]);
-        self.emit_token(SyntaxKind::ColonToken, colon_pos, WriteKind::PUNCTUATION, node);
+        self.emit_token(
+            SyntaxKind::ColonToken,
+            colon_pos,
+            WriteKind::PUNCTUATION,
+            node,
+        );
         self.write_space();
         self.emit_type_node_outside_extends(node.type_());
         self.exit_node(node, state);
@@ -778,7 +898,12 @@ impl Printer {
     // Go: printer/printer.go:2042 emitUnionType
     pub(crate) fn emit_union_type(&mut self, node: Node) {
         let state = self.enter_node(node);
-        self.emit_list(Printer::emit_union_type_constituent, node, node.types(), ListFormat::UNION_TYPE_CONSTITUENTS);
+        self.emit_list(
+            Printer::emit_union_type_constituent,
+            node,
+            node.types(),
+            ListFormat::UNION_TYPE_CONSTITUENTS,
+        );
         self.exit_node(node, state);
     }
 
@@ -937,7 +1062,12 @@ impl Printer {
             } else {
                 self.write_line();
             }
-            self.emit_list(Printer::emit_type_element, node, members, ListFormat::PRESERVE_LINES);
+            self.emit_list(
+                Printer::emit_type_element,
+                node,
+                members,
+                ListFormat::PRESERVE_LINES,
+            );
         }
         if single_line {
             self.write_space();
@@ -973,7 +1103,12 @@ impl Printer {
     pub(crate) fn emit_template_type(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_template_head(node.head());
-        self.emit_list(Printer::emit_template_type_span_node, node, node.template_spans(), ListFormat::TEMPLATE_EXPRESSION_SPANS);
+        self.emit_list(
+            Printer::emit_template_type_span_node,
+            node,
+            node.template_spans(),
+            ListFormat::TEMPLATE_EXPRESSION_SPANS,
+        );
         self.exit_node(node, state);
     }
 
@@ -982,13 +1117,22 @@ impl Printer {
         let state = self.enter_node(node);
         self.write_punctuation("{");
         self.write_space();
-        self.write_keyword(if node.token() == SyntaxKind::AssertKeyword { "assert" } else { "with" });
+        self.write_keyword(if node.token() == SyntaxKind::AssertKeyword {
+            "assert"
+        } else {
+            "with"
+        });
         self.write_punctuation(":");
         self.write_space();
         // PORT: Go `node.AsImportAttributes().Attributes` is the NodeList
         // accessor `attribute_list` (the Go method `Attributes()` wins the
         // `attributes` name).
-        self.emit_list(Printer::emit_import_attribute_node, node, node.attribute_list(), ListFormat::IMPORT_ATTRIBUTES);
+        self.emit_list(
+            Printer::emit_import_attribute_node,
+            node,
+            node.attribute_list(),
+            ListFormat::IMPORT_ATTRIBUTES,
+        );
         self.write_space();
         self.write_punctuation("}");
         self.exit_node(node, state);
@@ -1038,7 +1182,11 @@ impl Printer {
 
     // emits a Type node preserving whether or not we are currently in the `extends` clause of a ConditionalType or InferType
     // Go: printer/printer.go:2270 emitTypeNodePreservingExtends
-    pub(crate) fn emit_type_node_preserving_extends(&mut self, node: Node, precedence: TypePrecedence) {
+    pub(crate) fn emit_type_node_preserving_extends(
+        &mut self,
+        node: Node,
+        precedence: TypePrecedence,
+    ) {
         self.emit_type_node(node, precedence);
     }
 
@@ -1130,7 +1278,12 @@ impl Printer {
     pub(crate) fn emit_object_binding_pattern(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.write_punctuation("{");
-        self.emit_list(Printer::emit_binding_element_node, node, node.element_list(), ListFormat::OBJECT_BINDING_PATTERN_ELEMENTS);
+        self.emit_list(
+            Printer::emit_binding_element_node,
+            node,
+            node.element_list(),
+            ListFormat::OBJECT_BINDING_PATTERN_ELEMENTS,
+        );
         self.write_punctuation("}");
         self.exit_node(node, state);
     }
@@ -1139,7 +1292,12 @@ impl Printer {
     pub(crate) fn emit_array_binding_pattern(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.write_punctuation("[");
-        self.emit_list(Printer::emit_binding_element_node, node, node.element_list(), ListFormat::ARRAY_BINDING_PATTERN_ELEMENTS);
+        self.emit_list(
+            Printer::emit_binding_element_node,
+            node,
+            node.element_list(),
+            ListFormat::ARRAY_BINDING_PATTERN_ELEMENTS,
+        );
         self.write_punctuation("]");
         self.exit_node(node, state);
     }

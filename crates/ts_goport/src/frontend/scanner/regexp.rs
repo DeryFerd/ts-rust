@@ -13,11 +13,11 @@
 //! (a raw byte, or -1 at the end). `match rune(ch)` stands in for a Go
 //! `switch ch` over ASCII cases.
 
-use crate::frontend::prelude::*;
 use crate::flags_macros::{go_enum, go_flags};
+use crate::frontend::prelude::*;
 
 use super::scanner_p1::{
-    rune_to_string, utf8_decode_rune_in_string, EscapeSequenceScanningFlags, Scanner, RUNE_ERROR,
+    EscapeSequenceScanningFlags, RUNE_ERROR, Scanner, rune_to_string, utf8_decode_rune_in_string,
 };
 use super::unicode_properties::*;
 
@@ -53,7 +53,9 @@ pub fn char_code_to_reg_exp_flag(ch: i32) -> Option<RegularExpressionFlags> {
 
 // Go: scanner/regexp.go:44 regExpFlagToFirstAvailableLanguageVersion
 // PORT: Go map lookup as `Option`.
-pub fn reg_exp_flag_to_first_available_language_version(flag: RegularExpressionFlags) -> Option<ScriptTarget> {
+pub fn reg_exp_flag_to_first_available_language_version(
+    flag: RegularExpressionFlags,
+) -> Option<ScriptTarget> {
     match flag {
         RegularExpressionFlags::HAS_INDICES => Some(ScriptTarget::ES2022),
         RegularExpressionFlags::DOT_ALL => Some(ScriptTarget::ES2018),
@@ -64,7 +66,12 @@ pub fn reg_exp_flag_to_first_available_language_version(flag: RegularExpressionF
 
 impl Scanner {
     // Go: scanner/regexp.go:50 checkRegularExpressionFlagAvailability
-    pub fn check_regular_expression_flag_availability(&mut self, flag: RegularExpressionFlags, pos: i32, size: i32) {
+    pub fn check_regular_expression_flag_availability(
+        &mut self,
+        flag: RegularExpressionFlags,
+        pos: i32,
+        size: i32,
+    ) {
         if let Some(available_from) = reg_exp_flag_to_first_available_language_version(flag) {
             if self.language_version() < available_from {
                 self.error_at(
@@ -193,7 +200,13 @@ impl<'a> RegExpParser<'a> {
     }
 
     // Go: scanner/regexp.go:128 error
-    fn error(&mut self, msg: &'static ts_diagnostics::Message, pos: i32, length: i32, args: Vec<String>) {
+    fn error(
+        &mut self,
+        msg: &'static ts_diagnostics::Message,
+        pos: i32,
+        length: i32,
+        args: Vec<String>,
+    ) {
         self.scanner.error_at(msg, pos, length, args);
     }
 
@@ -323,7 +336,8 @@ impl<'a> RegExpParser<'a> {
                             Some('=' | '!') => {
                                 self.inc_pos(1);
                                 // In Annex B, `(?=Disjunction)` and `(?!Disjunction)` are quantifiable
-                                is_previous_term_quantifiable = !self.any_unicode_mode_or_non_annex_b;
+                                is_previous_term_quantifiable =
+                                    !self.any_unicode_mode_or_non_annex_b;
                             }
                             Some('<') => {
                                 let group_name_start = self.pos();
@@ -352,7 +366,8 @@ impl<'a> RegExpParser<'a> {
                             }
                             _ => {
                                 let flags_start = self.pos();
-                                let set_flags = self.scan_pattern_modifiers(RegularExpressionFlags::NONE);
+                                let set_flags =
+                                    self.scan_pattern_modifiers(RegularExpressionFlags::NONE);
                                 if self.char() == '-' as i32 {
                                     self.inc_pos(1);
                                     self.scan_pattern_modifiers(set_flags);
@@ -396,7 +411,12 @@ impl<'a> RegExpParser<'a> {
                             let max_str = self.scanner.token_value().to_string();
                             if min_str.is_empty() {
                                 if !max_str.is_empty() || self.char() == '}' as i32 {
-                                    self.error(diag::Incomplete_quantifier_Digit_expected, digits_start, 0, vec![]);
+                                    self.error(
+                                        diag::Incomplete_quantifier_Digit_expected,
+                                        digits_start,
+                                        0,
+                                        vec![],
+                                    );
                                 } else {
                                     self.error(
                                         diag::Unexpected_0_Did_you_mean_to_escape_it_with_backslash,
@@ -409,10 +429,16 @@ impl<'a> RegExpParser<'a> {
                                 }
                             } else if !max_str.is_empty() {
                                 if compare_decimal_strings(&min_str, &max_str) > 0
-                                    && (self.any_unicode_mode_or_non_annex_b || self.char() == '}' as i32)
+                                    && (self.any_unicode_mode_or_non_annex_b
+                                        || self.char() == '}' as i32)
                                 {
                                     let len = self.pos() - digits_start;
-                                    self.error(diag::Numbers_out_of_order_in_quantifier, digits_start, len, vec![]);
+                                    self.error(
+                                        diag::Numbers_out_of_order_in_quantifier,
+                                        digits_start,
+                                        len,
+                                        vec![],
+                                    );
                                 }
                             }
                         } else if min_str.is_empty() {
@@ -445,7 +471,12 @@ impl<'a> RegExpParser<'a> {
                     }
                     if !is_previous_term_quantifiable {
                         let len = self.pos() - start;
-                        self.error(diag::There_is_nothing_available_for_repetition, start, len, vec![]);
+                        self.error(
+                            diag::There_is_nothing_available_for_repetition,
+                            start,
+                            len,
+                            vec![],
+                        );
                     }
                     is_previous_term_quantifiable = false;
                 }
@@ -494,7 +525,10 @@ impl<'a> RegExpParser<'a> {
     }
 
     // Go: scanner/regexp.go:354 scanPatternModifiers
-    fn scan_pattern_modifiers(&mut self, mut curr_flags: RegularExpressionFlags) -> RegularExpressionFlags {
+    fn scan_pattern_modifiers(
+        &mut self,
+        mut curr_flags: RegularExpressionFlags,
+    ) -> RegularExpressionFlags {
         while self.pos() < self.end {
             let (ch, size) = self.decode_rune_at_pos();
             if ch == RUNE_ERROR || !rune(ch).is_some_and(is_identifier_part) {
@@ -518,7 +552,8 @@ impl<'a> RegExpParser<'a> {
                 }
                 Some(flag) => {
                     curr_flags |= flag;
-                    self.scanner.check_regular_expression_flag_availability(flag, pos, size);
+                    self.scanner
+                        .check_regular_expression_flag_availability(flag, pos, size);
                 }
             }
             self.inc_pos(size);
@@ -558,7 +593,12 @@ impl<'a> RegExpParser<'a> {
         if ch == 'q' as i32 && self.unicode_sets_mode {
             self.inc_pos(1);
             let pos = self.pos() - 2;
-            self.error(diag::X_q_is_only_available_inside_character_class, pos, 2, vec![]);
+            self.error(
+                diag::X_q_is_only_available_inside_character_class,
+                pos,
+                2,
+                vec![],
+            );
             return;
         }
         if !self.scan_character_class_escape() && !self.scan_decimal_escape() {
@@ -582,9 +622,17 @@ impl<'a> RegExpParser<'a> {
             // uses `math.MaxInt`. Go `int` is `i32` in this crate, so the
             // overflow limit is `i32::MAX`. The only use is `value >
             // numberOfCapturingGroups`, which gives the same result.
-            let val = self.scanner.token_value().parse::<i32>().unwrap_or(i32::MAX);
+            let val = self
+                .scanner
+                .token_value()
+                .parse::<i32>()
+                .unwrap_or(i32::MAX);
             let end = self.pos();
-            self.decimal_escapes.push(DecimalEscapeValue { pos: start, end, value: val });
+            self.decimal_escapes.push(DecimalEscapeValue {
+                pos: start,
+                end,
+                value: val,
+            });
             return true;
         }
         false
@@ -619,14 +667,22 @@ impl<'a> RegExpParser<'a> {
                 }
                 if self.any_unicode_mode_or_non_annex_b {
                     let pos = self.pos() - 2;
-                    self.error(diag::X_c_must_be_followed_by_an_ASCII_letter, pos, 2, vec![]);
+                    self.error(
+                        diag::X_c_must_be_followed_by_an_ASCII_letter,
+                        pos,
+                        2,
+                        vec![],
+                    );
                 } else if atom_escape {
                     self.inc_pos(-1);
                     return b"\\".to_vec();
                 }
                 rune_to_bytes(ch)
             }
-            Some('^' | '$' | '/' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|') => {
+            Some(
+                '^' | '$' | '/' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}'
+                | '|',
+            ) => {
                 self.inc_pos(1);
                 rune_to_bytes(ch)
             }
@@ -660,7 +716,11 @@ impl<'a> RegExpParser<'a> {
         } else if is_reference {
             let end = self.pos();
             let name = self.scanner.token_value().to_string();
-            self.group_name_references.push(GroupNameReference { pos: token_start, end, name });
+            self.group_name_references.push(GroupNameReference {
+                pos: token_start,
+                end,
+                name,
+            });
         } else if self.named_capturing_groups_contains(self.scanner.token_value()) {
             let len = self.pos() - token_start;
             self.error(
@@ -745,7 +805,12 @@ impl<'a> RegExpParser<'a> {
                     && min_character_value > max_character_value
                 {
                     let len = self.pos() - min_start;
-                    self.error(diag::Range_out_of_order_in_character_class, min_start, len, vec![]);
+                    self.error(
+                        diag::Range_out_of_order_in_character_class,
+                        min_start,
+                        len,
+                        vec![],
+                    );
                 }
             }
         }
@@ -809,7 +874,8 @@ impl<'a> RegExpParser<'a> {
                     }
                     expression_may_contain_strings = self.may_contain_strings;
                     self.scan_class_set_sub_expression(ClassSetExpressionType::CLASS_SUBTRACTION);
-                    self.may_contain_strings = !is_character_complement && expression_may_contain_strings;
+                    self.may_contain_strings =
+                        !is_character_complement && expression_may_contain_strings;
                     return;
                 }
             }
@@ -826,7 +892,8 @@ impl<'a> RegExpParser<'a> {
                         );
                     }
                     expression_may_contain_strings = self.may_contain_strings;
-                    self.may_contain_strings = !is_character_complement && expression_may_contain_strings;
+                    self.may_contain_strings =
+                        !is_character_complement && expression_may_contain_strings;
                     return;
                 } else {
                     // PORT: Go reports `string(ch)`, where `ch` is the
@@ -860,7 +927,8 @@ impl<'a> RegExpParser<'a> {
                     self.inc_pos(1);
                     ch = self.char();
                     if self.is_class_content_exit(ch) {
-                        self.may_contain_strings = !is_character_complement && expression_may_contain_strings;
+                        self.may_contain_strings =
+                            !is_character_complement && expression_may_contain_strings;
                         return;
                     }
                     if ch == '-' as i32 {
@@ -896,7 +964,8 @@ impl<'a> RegExpParser<'a> {
                                 vec![],
                             );
                         }
-                        expression_may_contain_strings = expression_may_contain_strings || self.may_contain_strings;
+                        expression_may_contain_strings =
+                            expression_may_contain_strings || self.may_contain_strings;
                         if second_operand.is_empty() {
                             let len = self.pos() - second_start;
                             self.error(
@@ -906,14 +975,21 @@ impl<'a> RegExpParser<'a> {
                                 vec![],
                             );
                         } else if !operand.is_empty() {
-                            let (min_character_value, min_size) = decode_js_string_rune_bytes(&operand);
-                            let (max_character_value, max_size) = decode_js_string_rune_bytes(&second_operand);
+                            let (min_character_value, min_size) =
+                                decode_js_string_rune_bytes(&operand);
+                            let (max_character_value, max_size) =
+                                decode_js_string_rune_bytes(&second_operand);
                             if operand.len() == min_size
                                 && second_operand.len() == max_size
                                 && min_character_value > max_character_value
                             {
                                 let len = self.pos() - start;
-                                self.error(diag::Range_out_of_order_in_character_class, start, len, vec![]);
+                                self.error(
+                                    diag::Range_out_of_order_in_character_class,
+                                    start,
+                                    len,
+                                    vec![],
+                                );
                             }
                         }
                     }
@@ -1067,7 +1143,8 @@ impl<'a> RegExpParser<'a> {
             }
             self.scan_class_set_operand();
             if expression_type == ClassSetExpressionType::CLASS_INTERSECTION {
-                expression_may_contain_strings = expression_may_contain_strings && self.may_contain_strings;
+                expression_may_contain_strings =
+                    expression_may_contain_strings && self.may_contain_strings;
             }
         }
         self.may_contain_strings = expression_may_contain_strings;
@@ -1163,7 +1240,10 @@ impl<'a> RegExpParser<'a> {
                     self.inc_pos(1);
                     return b"\x08".to_vec();
                 }
-                Some('&' | '-' | '!' | '#' | '%' | ',' | ':' | ';' | '<' | '=' | '>' | '@' | '`' | '~') => {
+                Some(
+                    '&' | '-' | '!' | '#' | '%' | ',' | ':' | ';' | '<' | '=' | '>' | '@' | '`'
+                    | '~',
+                ) => {
                     self.inc_pos(1);
                     return rune_to_bytes(inner_ch);
                 }
@@ -1174,8 +1254,8 @@ impl<'a> RegExpParser<'a> {
         } else if self.pos() + 1 < self.end && ch == self.char_at(self.pos() + 1) {
             match rune(ch) {
                 Some(
-                    '&' | '!' | '#' | '%' | '*' | '+' | ',' | '.' | ':' | ';' | '<' | '=' | '>' | '?' | '@' | '`'
-                    | '~',
+                    '&' | '!' | '#' | '%' | '*' | '+' | ',' | '.' | ':' | ';' | '<' | '=' | '>'
+                    | '?' | '@' | '`' | '~',
                 ) => {
                     let pos = self.pos();
                     self.error(
@@ -1276,10 +1356,23 @@ impl<'a> RegExpParser<'a> {
                             self.error(diag::Expected_a_Unicode_property_name, pos, 0, vec![]);
                         } else if property_name.is_empty() {
                             let len = self.pos() - property_name_or_value_start;
-                            self.error(diag::Unknown_Unicode_property_name, property_name_or_value_start, len, vec![]);
-                            let suggestion = self.get_spelling_suggestion_for_unicode_property_name(&property_name_or_value);
+                            self.error(
+                                diag::Unknown_Unicode_property_name,
+                                property_name_or_value_start,
+                                len,
+                                vec![],
+                            );
+                            let suggestion = self
+                                .get_spelling_suggestion_for_unicode_property_name(
+                                    &property_name_or_value,
+                                );
                             if !suggestion.is_empty() {
-                                self.error(diag::Did_you_mean_0, property_name_or_value_start, len, args![suggestion]);
+                                self.error(
+                                    diag::Did_you_mean_0,
+                                    property_name_or_value_start,
+                                    len,
+                                    args![suggestion],
+                                );
                             }
                         }
                         self.inc_pos(1);
@@ -1293,11 +1386,24 @@ impl<'a> RegExpParser<'a> {
                             if let Some(values) = values {
                                 if !values.contains(&property_value.as_str()) {
                                     let len = self.pos() - property_value_start;
-                                    self.error(diag::Unknown_Unicode_property_value, property_value_start, len, vec![]);
-                                    let suggestion =
-                                        self.get_spelling_suggestion_for_unicode_property_value(property_name, &property_value);
+                                    self.error(
+                                        diag::Unknown_Unicode_property_value,
+                                        property_value_start,
+                                        len,
+                                        vec![],
+                                    );
+                                    let suggestion = self
+                                        .get_spelling_suggestion_for_unicode_property_value(
+                                            property_name,
+                                            &property_value,
+                                        );
                                     if !suggestion.is_empty() {
-                                        self.error(diag::Did_you_mean_0, property_value_start, len, args![suggestion]);
+                                        self.error(
+                                            diag::Did_you_mean_0,
+                                            property_value_start,
+                                            len,
+                                            args![suggestion],
+                                        );
                                     }
                                 }
                             }
@@ -1306,8 +1412,15 @@ impl<'a> RegExpParser<'a> {
                         let len = self.pos() - property_name_or_value_start;
                         if self.pos() == property_name_or_value_start {
                             let pos = self.pos();
-                            self.error(diag::Expected_a_Unicode_property_name_or_value, pos, 0, vec![]);
-                        } else if BINARY_UNICODE_PROPERTIES_OF_STRINGS.contains(&property_name_or_value.as_str()) {
+                            self.error(
+                                diag::Expected_a_Unicode_property_name_or_value,
+                                pos,
+                                0,
+                                vec![],
+                            );
+                        } else if BINARY_UNICODE_PROPERTIES_OF_STRINGS
+                            .contains(&property_name_or_value.as_str())
+                        {
                             if !self.unicode_sets_mode {
                                 self.error(
                                     diag::Any_Unicode_property_that_would_possibly_match_more_than_a_single_character_is_only_available_when_the_Unicode_Sets_v_flag_is_set,
@@ -1325,7 +1438,8 @@ impl<'a> RegExpParser<'a> {
                             } else {
                                 self.may_contain_strings = true;
                             }
-                        } else if !GENERAL_CATEGORY_VALUES.contains(&property_name_or_value.as_str())
+                        } else if !GENERAL_CATEGORY_VALUES
+                            .contains(&property_name_or_value.as_str())
                             && !BINARY_UNICODE_PROPERTIES.contains(&property_name_or_value.as_str())
                         {
                             self.error(
@@ -1334,10 +1448,17 @@ impl<'a> RegExpParser<'a> {
                                 len,
                                 vec![],
                             );
-                            let suggestion =
-                                self.get_spelling_suggestion_for_unicode_property_name_or_value(&property_name_or_value);
+                            let suggestion = self
+                                .get_spelling_suggestion_for_unicode_property_name_or_value(
+                                    &property_name_or_value,
+                                );
                             if !suggestion.is_empty() {
-                                self.error(diag::Did_you_mean_0, property_name_or_value_start, len, args![suggestion]);
+                                self.error(
+                                    diag::Did_you_mean_0,
+                                    property_name_or_value_start,
+                                    len,
+                                    args![suggestion],
+                                );
                             }
                         }
                     }
@@ -1373,12 +1494,18 @@ impl<'a> RegExpParser<'a> {
     fn get_spelling_suggestion_for_unicode_property_name(&self, name: &str) -> String {
         get_spelling_suggestion_for_strings(
             name,
-            NON_BINARY_UNICODE_PROPERTIES.iter().map(|(alias, _)| alias.to_string()),
+            NON_BINARY_UNICODE_PROPERTIES
+                .iter()
+                .map(|(alias, _)| alias.to_string()),
         )
     }
 
     // Go: scanner/regexp.go:959 getSpellingSuggestionForUnicodePropertyValue
-    fn get_spelling_suggestion_for_unicode_property_value(&self, property_name: &str, value: &str) -> String {
+    fn get_spelling_suggestion_for_unicode_property_value(
+        &self,
+        property_name: &str,
+        value: &str,
+    ) -> String {
         let Some(values) = values_of_non_binary_unicode_properties(property_name) else {
             return String::new();
         };
@@ -1489,7 +1616,12 @@ impl<'a> RegExpParser<'a> {
 
         let references = self.group_name_references.clone();
         for reference in &references {
-            if !self.group_specifiers.get(&reference.name).copied().unwrap_or(false) {
+            if !self
+                .group_specifiers
+                .get(&reference.name)
+                .copied()
+                .unwrap_or(false)
+            {
                 self.error(
                     diag::There_is_no_capturing_group_named_0_in_this_regular_expression,
                     reference.pos,
@@ -1500,8 +1632,10 @@ impl<'a> RegExpParser<'a> {
                     // PORT: Go iterates the map keys in random order. The
                     // result does not depend on order: ties are broken by
                     // `strings.Compare`.
-                    let suggestion =
-                        get_spelling_suggestion_for_strings(&reference.name, self.group_specifiers.keys().cloned());
+                    let suggestion = get_spelling_suggestion_for_strings(
+                        &reference.name,
+                        self.group_specifiers.keys().cloned(),
+                    );
                     if !suggestion.is_empty() {
                         self.error(
                             diag::Did_you_mean_0,
@@ -1588,7 +1722,11 @@ fn code_point_to_surrogate_pair_i32(ch: i32) -> (i32, i32) {
 // cannot keep the lone-surrogate sentinel in a Rust `String`.
 fn encode_js_string_rune_bytes(ch: i32) -> Vec<u8> {
     if (0xD800..0xE000).contains(&ch) {
-        return vec![0xED, (0x80 | ((ch >> 6) & 0x3F)) as u8, (0x80 | (ch & 0x3F)) as u8];
+        return vec![
+            0xED,
+            (0x80 | ((ch >> 6) & 0x3F)) as u8,
+            (0x80 | (ch & 0x3F)) as u8,
+        ];
     }
     rune_to_bytes(ch)
 }
@@ -1597,8 +1735,15 @@ fn encode_js_string_rune_bytes(ch: i32) -> Vec<u8> {
 // PORT: byte-string copy of `scanner_util::decode_js_string_rune`, which
 // cannot see the lone-surrogate sentinel in a Rust `&str`.
 fn decode_js_string_rune_bytes(s: &[u8]) -> (i32, usize) {
-    if s.len() >= 3 && s[0] == 0xED && (0xA0..=0xBF).contains(&s[1]) && (0x80..=0xBF).contains(&s[2]) {
-        return (0xD000 | (i32::from(s[1] & 0x3F) << 6) | i32::from(s[2] & 0x3F), 3);
+    if s.len() >= 3
+        && s[0] == 0xED
+        && (0xA0..=0xBF).contains(&s[1])
+        && (0x80..=0xBF).contains(&s[2])
+    {
+        return (
+            0xD000 | (i32::from(s[1] & 0x3F) << 6) | i32::from(s[2] & 0x3F),
+            3,
+        );
     }
     let (ch, size) = decode_rune_in_bytes(s);
     (ch, size as usize)

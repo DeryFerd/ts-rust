@@ -3,7 +3,9 @@
 
 use crate::prelude::*;
 
-use super::emit_context::{next_auto_generate_id, AutoGenerateInfo, AutoGenerateOptions, EmitContext};
+use super::emit_context::{
+    AutoGenerateInfo, AutoGenerateOptions, EmitContext, next_auto_generate_id,
+};
 use super::helpers::*;
 use super::types::{EmitFlags, GeneratedIdentifierFlags};
 use super::utilities::format_generated_name;
@@ -68,7 +70,13 @@ impl NodeFactory {
     }
 
     // Go: printer/factory.go:29 newGeneratedIdentifier
-    fn new_generated_identifier(&self, kind: GeneratedIdentifierFlags, text: &str, node: Node, options: AutoGenerateOptions) -> Node {
+    fn new_generated_identifier(
+        &self,
+        kind: GeneratedIdentifierFlags,
+        text: &str,
+        node: Node,
+        options: AutoGenerateOptions,
+    ) -> Node {
         let id = next_auto_generate_id();
 
         let mut text = text.to_string();
@@ -78,9 +86,20 @@ impl NodeFactory {
             } else if is_member_name(node) {
                 text = node.text().to_string();
             } else {
-                text = format!("(generated@{})", get_node_id(self.emit_context.get_node_for_generated_name_worker(node, id)));
+                text = format!(
+                    "(generated@{})",
+                    get_node_id(
+                        self.emit_context
+                            .get_node_for_generated_name_worker(node, id)
+                    )
+                );
             }
-            text = format_generated_name(false /*privateName*/, &options.prefix, &text, &options.suffix);
+            text = format_generated_name(
+                false, /*privateName*/
+                &options.prefix,
+                &text,
+                &options.suffix,
+            );
         }
 
         let name = self.new_identifier(text);
@@ -92,7 +111,10 @@ impl NodeFactory {
             node,
         };
         // PORT: Go allocates the nil map here; the Rust map always exists.
-        self.emit_context.auto_generate.borrow_mut().insert(name, auto_generate);
+        self.emit_context
+            .auto_generate
+            .borrow_mut()
+            .insert(name, auto_generate);
         name
     }
 
@@ -109,7 +131,12 @@ impl NodeFactory {
     /// `AddVariableDeclaration` or `AddLexicalDeclaration` to ensure it is properly tracked, if you are not otherwise handling
     /// it yourself.
     pub fn new_temp_variable_ex(&self, options: AutoGenerateOptions) -> Node {
-        self.new_generated_identifier(GeneratedIdentifierFlags::AUTO, "", Node::NIL /*node*/, options)
+        self.new_generated_identifier(
+            GeneratedIdentifierFlags::AUTO,
+            "",
+            Node::NIL, /*node*/
+            options,
+        )
     }
 
     // Go: printer/factory.go:74 NewLoopVariable
@@ -121,7 +148,12 @@ impl NodeFactory {
     // Go: printer/factory.go:79 NewLoopVariableEx
     /// Allocates a new loop variable name.
     pub fn new_loop_variable_ex(&self, options: AutoGenerateOptions) -> Node {
-        self.new_generated_identifier(GeneratedIdentifierFlags::LOOP, "", Node::NIL /*node*/, options)
+        self.new_generated_identifier(
+            GeneratedIdentifierFlags::LOOP,
+            "",
+            Node::NIL, /*node*/
+            options,
+        )
     }
 
     // Go: printer/factory.go:84 NewUniqueName
@@ -133,7 +165,12 @@ impl NodeFactory {
     // Go: printer/factory.go:89 NewUniqueNameEx
     /// Allocates a new unique name based on the provided text.
     pub fn new_unique_name_ex(&self, text: &str, options: AutoGenerateOptions) -> Node {
-        self.new_generated_identifier(GeneratedIdentifierFlags::UNIQUE, text, Node::NIL /*node*/, options)
+        self.new_generated_identifier(
+            GeneratedIdentifierFlags::UNIQUE,
+            text,
+            Node::NIL, /*node*/
+            options,
+        )
     }
 
     // Go: printer/factory.go:94 NewGeneratedNameForNode
@@ -144,7 +181,11 @@ impl NodeFactory {
 
     // Go: printer/factory.go:99 NewGeneratedNameForNodeEx
     /// Allocates a new unique name based on the provided node.
-    pub fn new_generated_name_for_node_ex(&self, node: Node, mut options: AutoGenerateOptions) -> Node {
+    pub fn new_generated_name_for_node_ex(
+        &self,
+        node: Node,
+        mut options: AutoGenerateOptions,
+    ) -> Node {
         if !options.prefix.is_empty() || !options.suffix.is_empty() {
             options.flags |= GeneratedIdentifierFlags::OPTIMISTIC;
         }
@@ -153,7 +194,13 @@ impl NodeFactory {
     }
 
     // Go: printer/factory.go:107 newGeneratedPrivateIdentifier
-    fn new_generated_private_identifier(&self, kind: GeneratedIdentifierFlags, text: &str, node: Node, options: AutoGenerateOptions) -> Node {
+    fn new_generated_private_identifier(
+        &self,
+        kind: GeneratedIdentifierFlags,
+        text: &str,
+        node: Node,
+        options: AutoGenerateOptions,
+    ) -> Node {
         let id = next_auto_generate_id();
 
         let mut text = text.to_string();
@@ -163,9 +210,20 @@ impl NodeFactory {
             } else if is_member_name(node) {
                 text = node.text().to_string();
             } else {
-                text = format!("(generated@{})", get_node_id(self.emit_context.get_node_for_generated_name_worker(node, id)));
+                text = format!(
+                    "(generated@{})",
+                    get_node_id(
+                        self.emit_context
+                            .get_node_for_generated_name_worker(node, id)
+                    )
+                );
             }
-            text = format_generated_name(true /*privateName*/, &options.prefix, &text, &options.suffix);
+            text = format_generated_name(
+                true, /*privateName*/
+                &options.prefix,
+                &text,
+                &options.suffix,
+            );
         } else if !text.starts_with('#') {
             panic!("First character of private identifier must be #: {text}");
         }
@@ -179,7 +237,10 @@ impl NodeFactory {
             node,
         };
         // PORT: Go allocates the nil map here; the Rust map always exists.
-        self.emit_context.auto_generate.borrow_mut().insert(name, auto_generate);
+        self.emit_context
+            .auto_generate
+            .borrow_mut()
+            .insert(name, auto_generate);
         name
     }
 
@@ -192,7 +253,12 @@ impl NodeFactory {
     // Go: printer/factory.go:145 NewUniquePrivateNameEx
     /// Allocates a new unique private name based on the provided text.
     pub fn new_unique_private_name_ex(&self, text: &str, options: AutoGenerateOptions) -> Node {
-        self.new_generated_private_identifier(GeneratedIdentifierFlags::UNIQUE, text, Node::NIL /*node*/, options)
+        self.new_generated_private_identifier(
+            GeneratedIdentifierFlags::UNIQUE,
+            text,
+            Node::NIL, /*node*/
+            options,
+        )
     }
 
     // Go: printer/factory.go:150 NewGeneratedPrivateNameForNode
@@ -203,7 +269,11 @@ impl NodeFactory {
 
     // Go: printer/factory.go:155 NewGeneratedPrivateNameForNodeEx
     /// Allocates a new unique private name based on the provided node.
-    pub fn new_generated_private_name_for_node_ex(&self, node: Node, mut options: AutoGenerateOptions) -> Node {
+    pub fn new_generated_private_name_for_node_ex(
+        &self,
+        node: Node,
+        mut options: AutoGenerateOptions,
+    ) -> Node {
         if !options.prefix.is_empty() || !options.suffix.is_empty() {
             options.flags |= GeneratedIdentifierFlags::OPTIMISTIC;
         }
@@ -234,7 +304,10 @@ impl NodeFactory {
         }
         let node = self.new_string_literal(text, TokenFlags::NONE);
         // PORT: Go allocates the nil map here; the Rust map always exists.
-        self.emit_context.text_source.borrow_mut().insert(node, text_source_node);
+        self.emit_context
+            .text_source
+            .borrow_mut()
+            .insert(node, text_source_node);
         node
     }
 
@@ -263,17 +336,35 @@ impl NodeFactory {
 
     // Go: printer/factory.go:209 NewCommaExpression
     pub fn new_comma_expression(&self, left: Node, right: Node) -> Node {
-        self.new_binary_expression(ModifierList::NIL /*modifiers*/, left, Node::NIL /*typeNode*/, self.new_token(SyntaxKind::CommaToken), right)
+        self.new_binary_expression(
+            ModifierList::NIL, /*modifiers*/
+            left,
+            Node::NIL, /*typeNode*/
+            self.new_token(SyntaxKind::CommaToken),
+            right,
+        )
     }
 
     // Go: printer/factory.go:213 NewAssignmentExpression
     pub fn new_assignment_expression(&self, left: Node, right: Node) -> Node {
-        self.new_binary_expression(ModifierList::NIL /*modifiers*/, left, Node::NIL /*typeNode*/, self.new_token(SyntaxKind::EqualsToken), right)
+        self.new_binary_expression(
+            ModifierList::NIL, /*modifiers*/
+            left,
+            Node::NIL, /*typeNode*/
+            self.new_token(SyntaxKind::EqualsToken),
+            right,
+        )
     }
 
     // Go: printer/factory.go:217 NewLogicalORExpression
     pub fn new_logical_or_expression(&self, left: Node, right: Node) -> Node {
-        self.new_binary_expression(ModifierList::NIL /*modifiers*/, left, Node::NIL /*typeNode*/, self.new_token(SyntaxKind::BarBarToken), right)
+        self.new_binary_expression(
+            ModifierList::NIL, /*modifiers*/
+            left,
+            Node::NIL, /*typeNode*/
+            self.new_token(SyntaxKind::BarBarToken),
+            right,
+        )
     }
 
     // Go: printer/factory.go:221 NewLogicalANDExpression
@@ -326,7 +417,10 @@ impl NodeFactory {
 
 // Go: printer/factory.go:245 flattenCommaElement
 fn flatten_comma_element(node: Node, expressions: &mut Vec<Node>) {
-    if is_binary_expression(node) && node_is_synthesized(node) && node.operator_token().kind() == SyntaxKind::CommaToken {
+    if is_binary_expression(node)
+        && node_is_synthesized(node)
+        && node.operator_token().kind() == SyntaxKind::CommaToken
+    {
         flatten_comma_element(node.left(), expressions);
         flatten_comma_element(node.right(), expressions);
     } else {
@@ -373,7 +467,8 @@ impl NodeFactory {
             set_node_loc(right, node.right().loc());
             // TODO(rbuckton): Does this need to be parented?
             set_node_parent(right, node.right().parent());
-            let prop_access = self.new_property_access_expression(left, Node::NIL, right, NodeFlags::NONE);
+            let prop_access =
+                self.new_property_access_expression(left, Node::NIL, right, NodeFlags::NONE);
             set_node_loc(prop_access, node.loc());
             return prop_access;
         }
@@ -391,9 +486,14 @@ impl NodeFactory {
         }
         let mut inner_label = node;
         if is_labeled_statement(outermost_labeled_statement.statement()) {
-            inner_label = self.restore_enclosing_label(node, outermost_labeled_statement.statement());
+            inner_label =
+                self.restore_enclosing_label(node, outermost_labeled_statement.statement());
         }
-        self.update_labeled_statement(outermost_labeled_statement, outermost_labeled_statement.label(), inner_label)
+        self.update_labeled_statement(
+            outermost_labeled_statement,
+            outermost_labeled_statement.label(),
+            inner_label,
+        )
     }
 
     // Go: printer/factory.go:317 CreateForOfBindingStatement
@@ -410,7 +510,11 @@ impl NodeFactory {
             );
             let statement = self.new_variable_statement(
                 ModifierList::NIL,
-                self.update_variable_declaration_list(node, self.new_node_list(&[updated_declaration]), node.flags()),
+                self.update_variable_declaration_list(
+                    node,
+                    self.new_node_list(&[updated_declaration]),
+                    node.flags(),
+                ),
             );
             set_node_loc(statement, node.loc());
             return statement;
@@ -425,20 +529,36 @@ impl NodeFactory {
     // Go: printer/factory.go:345 NewTypeCheck
     pub fn new_type_check(&self, value: Node, tag: &str) -> Node {
         if tag == "null" {
-            self.new_strict_equality_expression(value, self.new_keyword_expression(SyntaxKind::NullKeyword))
+            self.new_strict_equality_expression(
+                value,
+                self.new_keyword_expression(SyntaxKind::NullKeyword),
+            )
         } else if tag == "undefined" {
             self.new_strict_equality_expression(value, self.new_void_zero_expression())
         } else {
-            self.new_strict_equality_expression(self.new_type_of_expression(value), self.new_string_literal(tag, TokenFlags::NONE))
+            self.new_strict_equality_expression(
+                self.new_type_of_expression(value),
+                self.new_string_literal(tag, TokenFlags::NONE),
+            )
         }
     }
 
     // Go: printer/factory.go:355 NewMethodCall
-    pub fn new_method_call(&self, object: Node, method_name: Node, arguments_list: &[Node]) -> Node {
+    pub fn new_method_call(
+        &self,
+        object: Node,
+        method_name: Node,
+        arguments_list: &[Node],
+    ) -> Node {
         // Preserve the optionality of `object`.
         if is_call_expression(object) && object.flags().intersects(NodeFlags::OPTIONAL_CHAIN) {
             return self.new_call_expression(
-                self.new_property_access_expression(object, Node::NIL, method_name, NodeFlags::NONE),
+                self.new_property_access_expression(
+                    object,
+                    Node::NIL,
+                    method_name,
+                    NodeFlags::NONE,
+                ),
                 Node::NIL,
                 NodeList::NIL,
                 self.new_node_list(arguments_list),
@@ -455,12 +575,26 @@ impl NodeFactory {
     }
 
     // Go: printer/factory.go:375 NewGlobalMethodCall
-    pub fn new_global_method_call(&self, global_object_name: &str, method_name: &str, arguments_list: &[Node]) -> Node {
-        self.new_method_call(self.new_identifier(global_object_name), self.new_identifier(method_name), arguments_list)
+    pub fn new_global_method_call(
+        &self,
+        global_object_name: &str,
+        method_name: &str,
+        arguments_list: &[Node],
+    ) -> Node {
+        self.new_method_call(
+            self.new_identifier(global_object_name),
+            self.new_identifier(method_name),
+            arguments_list,
+        )
     }
 
     // Go: printer/factory.go:379 NewFunctionCallCall
-    pub fn new_function_call_call(&self, target: Node, this_arg: Node, arguments_list: &[Node]) -> Node {
+    pub fn new_function_call_call(
+        &self,
+        target: Node,
+        this_arg: Node,
+        arguments_list: &[Node],
+    ) -> Node {
         if this_arg.is_nil() {
             panic!("Attempted to construct function call call without this argument expression");
         }
@@ -501,33 +635,61 @@ impl NodeFactory {
     }
 
     // Go: printer/factory.go:416 updateOuterExpression
-    fn update_outer_expression(&self, outer_expression: Node /*OuterExpression*/, expression: Node) -> Node {
+    fn update_outer_expression(
+        &self,
+        outer_expression: Node, /*OuterExpression*/
+        expression: Node,
+    ) -> Node {
         match outer_expression.kind() {
-            SyntaxKind::ParenthesizedExpression => self.update_parenthesized_expression(outer_expression, expression),
+            SyntaxKind::ParenthesizedExpression => {
+                self.update_parenthesized_expression(outer_expression, expression)
+            }
             SyntaxKind::TypeAssertionExpression => {
                 self.update_type_assertion(outer_expression, outer_expression.type_(), expression)
             }
-            SyntaxKind::AsExpression => self.update_as_expression(outer_expression, expression, outer_expression.type_()),
-            SyntaxKind::SatisfiesExpression => {
-                self.update_satisfies_expression(outer_expression, expression, outer_expression.type_())
+            SyntaxKind::AsExpression => {
+                self.update_as_expression(outer_expression, expression, outer_expression.type_())
             }
-            SyntaxKind::NonNullExpression => {
-                self.update_non_null_expression(outer_expression, expression, outer_expression.flags())
+            SyntaxKind::SatisfiesExpression => self.update_satisfies_expression(
+                outer_expression,
+                expression,
+                outer_expression.type_(),
+            ),
+            SyntaxKind::NonNullExpression => self.update_non_null_expression(
+                outer_expression,
+                expression,
+                outer_expression.flags(),
+            ),
+            SyntaxKind::ExpressionWithTypeArguments => self.update_expression_with_type_arguments(
+                outer_expression,
+                expression,
+                outer_expression.type_argument_list(),
+            ),
+            SyntaxKind::PartiallyEmittedExpression => {
+                self.update_partially_emitted_expression(outer_expression, expression)
             }
-            SyntaxKind::ExpressionWithTypeArguments => {
-                self.update_expression_with_type_arguments(outer_expression, expression, outer_expression.type_argument_list())
-            }
-            SyntaxKind::PartiallyEmittedExpression => self.update_partially_emitted_expression(outer_expression, expression),
             kind => panic!("Unexpected outer expression kind: {kind:?}"),
         }
     }
 
     // Go: printer/factory.go:437 RestoreOuterExpressions
-    pub fn restore_outer_expressions(&self, outer_expression: Node, inner_expression: Node, kinds: OuterExpressionKinds) -> Node {
-        if outer_expression.is_some() && is_outer_expression(outer_expression, kinds) && !self.is_ignorable_paren(outer_expression) {
+    pub fn restore_outer_expressions(
+        &self,
+        outer_expression: Node,
+        inner_expression: Node,
+        kinds: OuterExpressionKinds,
+    ) -> Node {
+        if outer_expression.is_some()
+            && is_outer_expression(outer_expression, kinds)
+            && !self.is_ignorable_paren(outer_expression)
+        {
             return self.update_outer_expression(
                 outer_expression,
-                self.restore_outer_expressions(outer_expression.expression(), inner_expression, OuterExpressionKinds::OEK_ALL),
+                self.restore_outer_expressions(
+                    outer_expression.expression(),
+                    inner_expression,
+                    OuterExpressionKinds::OEK_ALL,
+                ),
             );
         }
         inner_expression
@@ -543,7 +705,8 @@ impl NodeFactory {
                 break;
             }
         }
-        let use_strict_prologue = self.new_expression_statement(self.new_string_literal("use strict", TokenFlags::NONE));
+        let use_strict_prologue =
+            self.new_expression_statement(self.new_string_literal("use strict", TokenFlags::NONE));
         let mut result = Vec::with_capacity(statements.len() + 1);
         result.push(use_strict_prologue);
         result.extend_from_slice(statements);
@@ -571,7 +734,12 @@ impl NodeFactory {
     #[must_use]
     pub fn split_custom_prologue<'a>(&self, source: &'a [Node]) -> (&'a [Node], &'a [Node]) {
         for (i, &statement) in source.iter().enumerate() {
-            if is_prologue_directive(statement) || !self.emit_context.emit_flags(statement).intersects(EmitFlags::CUSTOM_PROLOGUE) {
+            if is_prologue_directive(statement)
+                || !self
+                    .emit_context
+                    .emit_flags(statement)
+                    .intersects(EmitFlags::CUSTOM_PROLOGUE)
+            {
                 return (&source[..i], &source[i..]);
             }
         }
@@ -676,7 +844,11 @@ impl NodeFactory {
         self.get_name(
             node,
             EmitFlags::NONE,
-            AssignedNameOptions { allow_comments: opts.allow_comments, allow_source_maps: opts.allow_source_maps, ..Default::default() },
+            AssignedNameOptions {
+                allow_comments: opts.allow_comments,
+                allow_source_maps: opts.allow_source_maps,
+                ..Default::default()
+            },
         )
     }
 
@@ -685,13 +857,21 @@ impl NodeFactory {
         if !self.emit_context.has_auto_generate_info(name) {
             name = self.as_node_factory().clone_node(name);
         }
-        let qualified_name = self.new_property_access_expression(ns, Node::NIL /*questionDotToken*/, name, NodeFlags::NONE);
-        self.emit_context.assign_comment_and_source_map_ranges(qualified_name, name);
+        let qualified_name = self.new_property_access_expression(
+            ns,
+            Node::NIL, /*questionDotToken*/
+            name,
+            NodeFlags::NONE,
+        );
+        self.emit_context
+            .assign_comment_and_source_map_ranges(qualified_name, name);
         if !opts.allow_comments {
-            self.emit_context.add_emit_flags(qualified_name, EmitFlags::NO_COMMENTS);
+            self.emit_context
+                .add_emit_flags(qualified_name, EmitFlags::NO_COMMENTS);
         }
         if !opts.allow_source_maps {
-            self.emit_context.add_emit_flags(qualified_name, EmitFlags::NO_SOURCE_MAP);
+            self.emit_context
+                .add_emit_flags(qualified_name, EmitFlags::NO_SOURCE_MAP);
         }
         qualified_name
     }
@@ -701,12 +881,32 @@ impl NodeFactory {
     ///
     /// An export name will *always* be prefixed with a module or namespace export modifier like
     /// `"exports."` when emitted as an expression if the name points to an exported symbol.
-    pub fn get_external_module_or_namespace_export_name(&self, ns: Node, node: Node, allow_comments: bool, allow_source_maps: bool) -> Node {
+    pub fn get_external_module_or_namespace_export_name(
+        &self,
+        ns: Node,
+        node: Node,
+        allow_comments: bool,
+        allow_source_maps: bool,
+    ) -> Node {
         if ns.is_some() && has_syntactic_modifier(node, ModifierFlags::EXPORT) {
-            let name_opts = NameOptions { allow_comments, allow_source_maps };
-            return self.get_namespace_member_name(ns, self.get_declaration_name_ex(node, name_opts), name_opts);
+            let name_opts = NameOptions {
+                allow_comments,
+                allow_source_maps,
+            };
+            return self.get_namespace_member_name(
+                ns,
+                self.get_declaration_name_ex(node, name_opts),
+                name_opts,
+            );
         }
-        self.get_export_name_ex(node, AssignedNameOptions { allow_comments, allow_source_maps, ..Default::default() })
+        self.get_export_name_ex(
+            node,
+            AssignedNameOptions {
+                allow_comments,
+                allow_source_maps,
+                ..Default::default()
+            },
+        )
     }
 
     //
@@ -717,18 +917,27 @@ impl NodeFactory {
     /// Allocates a new Identifier representing a reference to a helper function.
     pub fn new_unscoped_helper_name(&self, name: &str) -> Node {
         let node = self.new_identifier(name);
-        self.emit_context.set_emit_flags(node, EmitFlags::HELPER_NAME);
+        self.emit_context
+            .set_emit_flags(node, EmitFlags::HELPER_NAME);
         node
     }
 
     // TypeScript Helpers
 
     // Go: printer/factory.go:601 NewDecorateHelper
-    pub fn new_decorate_helper(&self, decorator_expressions: &[Node], target: Node, member_name: Node, descriptor: Node) -> Node {
+    pub fn new_decorate_helper(
+        &self,
+        decorator_expressions: &[Node],
+        target: Node,
+        member_name: Node,
+        descriptor: Node,
+    ) -> Node {
         self.emit_context.request_emit_helper(&DECORATE_HELPER);
 
         let mut arguments_array: Vec<Node> = Vec::new();
-        arguments_array.push(self.new_array_literal_expression(self.new_node_list(decorator_expressions), true));
+        arguments_array.push(
+            self.new_array_literal_expression(self.new_node_list(decorator_expressions), true),
+        );
         arguments_array.push(target);
         if member_name.is_some() {
             arguments_array.push(member_name);
@@ -754,19 +963,30 @@ impl NodeFactory {
             self.new_unscoped_helper_name("__metadata"),
             Node::NIL,     /*questionDotToken*/
             NodeList::NIL, /*typeArguments*/
-            self.new_node_list(&[self.new_string_literal(metadata_key, TokenFlags::NONE), metadata_value]),
+            self.new_node_list(&[
+                self.new_string_literal(metadata_key, TokenFlags::NONE),
+                metadata_value,
+            ]),
             NodeFlags::NONE,
         )
     }
 
     // Go: printer/factory.go:638 NewParamHelper
-    pub fn new_param_helper(&self, expression: Node, parameter_offset: i32, location: TextRange) -> Node {
+    pub fn new_param_helper(
+        &self,
+        expression: Node,
+        parameter_offset: i32,
+        location: TextRange,
+    ) -> Node {
         self.emit_context.request_emit_helper(&PARAM_HELPER);
         let helper = self.new_call_expression(
             self.new_unscoped_helper_name("__param"),
             Node::NIL,     /*questionDotToken*/
             NodeList::NIL, /*typeArguments*/
-            self.new_node_list(&[self.new_numeric_literal(parameter_offset.to_string(), TokenFlags::NONE), expression]),
+            self.new_node_list(&[
+                self.new_numeric_literal(parameter_offset.to_string(), TokenFlags::NONE),
+                expression,
+            ]),
             NodeFlags::NONE,
         );
         set_node_loc(helper, location);
@@ -776,8 +996,14 @@ impl NodeFactory {
     // ESNext Helpers
 
     // Go: printer/factory.go:653 NewAddDisposableResourceHelper
-    pub fn new_add_disposable_resource_helper(&self, env_binding: Node, value: Node, async_: bool) -> Node {
-        self.emit_context.request_emit_helper(&ADD_DISPOSABLE_RESOURCE_HELPER);
+    pub fn new_add_disposable_resource_helper(
+        &self,
+        env_binding: Node,
+        value: Node,
+        async_: bool,
+    ) -> Node {
+        self.emit_context
+            .request_emit_helper(&ADD_DISPOSABLE_RESOURCE_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__addDisposableResource"),
             Node::NIL,     /*questionDotToken*/
@@ -785,7 +1011,11 @@ impl NodeFactory {
             self.new_node_list(&[
                 env_binding,
                 value,
-                self.new_keyword_expression(if async_ { SyntaxKind::TrueKeyword } else { SyntaxKind::FalseKeyword }),
+                self.new_keyword_expression(if async_ {
+                    SyntaxKind::TrueKeyword
+                } else {
+                    SyntaxKind::FalseKeyword
+                }),
             ]),
             NodeFlags::NONE,
         )
@@ -793,7 +1023,8 @@ impl NodeFactory {
 
     // Go: printer/factory.go:664 NewDisposeResourcesHelper
     pub fn new_dispose_resources_helper(&self, env_binding: Node) -> Node {
-        self.emit_context.request_emit_helper(&DISPOSE_RESOURCES_HELPER);
+        self.emit_context
+            .request_emit_helper(&DISPOSE_RESOURCES_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__disposeResources"),
             Node::NIL,     /*questionDotToken*/
@@ -820,12 +1051,28 @@ impl PrivateIdentifierKind {
 
 impl NodeFactory {
     // Go: printer/factory.go:686 NewClassPrivateFieldGetHelper
-    pub fn new_class_private_field_get_helper(&self, receiver: Node, state: Node, kind: PrivateIdentifierKind, fn_: Node) -> Node {
-        self.emit_context.request_emit_helper(&CLASS_PRIVATE_FIELD_GET_HELPER);
+    pub fn new_class_private_field_get_helper(
+        &self,
+        receiver: Node,
+        state: Node,
+        kind: PrivateIdentifierKind,
+        fn_: Node,
+    ) -> Node {
+        self.emit_context
+            .request_emit_helper(&CLASS_PRIVATE_FIELD_GET_HELPER);
         let args: Vec<Node> = if fn_.is_nil() {
-            vec![receiver, state, self.new_string_literal(kind.0, TokenFlags::NONE)]
+            vec![
+                receiver,
+                state,
+                self.new_string_literal(kind.0, TokenFlags::NONE),
+            ]
         } else {
-            vec![receiver, state, self.new_string_literal(kind.0, TokenFlags::NONE), fn_]
+            vec![
+                receiver,
+                state,
+                self.new_string_literal(kind.0, TokenFlags::NONE),
+                fn_,
+            ]
         };
         self.new_call_expression(
             self.new_unscoped_helper_name("__classPrivateFieldGet"),
@@ -845,11 +1092,23 @@ impl NodeFactory {
         kind: PrivateIdentifierKind,
         fn_: Node,
     ) -> Node {
-        self.emit_context.request_emit_helper(&CLASS_PRIVATE_FIELD_SET_HELPER);
+        self.emit_context
+            .request_emit_helper(&CLASS_PRIVATE_FIELD_SET_HELPER);
         let args: Vec<Node> = if fn_.is_nil() {
-            vec![receiver, state, value, self.new_string_literal(kind.0, TokenFlags::NONE)]
+            vec![
+                receiver,
+                state,
+                value,
+                self.new_string_literal(kind.0, TokenFlags::NONE),
+            ]
         } else {
-            vec![receiver, state, value, self.new_string_literal(kind.0, TokenFlags::NONE), fn_]
+            vec![
+                receiver,
+                state,
+                value,
+                self.new_string_literal(kind.0, TokenFlags::NONE),
+                fn_,
+            ]
         };
         self.new_call_expression(
             self.new_unscoped_helper_name("__classPrivateFieldSet"),
@@ -862,7 +1121,8 @@ impl NodeFactory {
 
     // Go: printer/factory.go:720 NewClassPrivateFieldInHelper
     pub fn new_class_private_field_in_helper(&self, state: Node, receiver: Node) -> Node {
-        self.emit_context.request_emit_helper(&CLASS_PRIVATE_FIELD_IN_HELPER);
+        self.emit_context
+            .request_emit_helper(&CLASS_PRIVATE_FIELD_IN_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__classPrivateFieldIn"),
             Node::NIL,     /*questionDotToken*/
@@ -874,9 +1134,19 @@ impl NodeFactory {
 
     // Go: printer/factory.go:732 NewObjectDefinePropertyCall
     /// Creates `Object.defineProperty(target, name, descriptor)`.
-    pub fn new_object_define_property_call(&self, target: Node, name: Node, descriptor: Node) -> Node {
+    pub fn new_object_define_property_call(
+        &self,
+        target: Node,
+        name: Node,
+        descriptor: Node,
+    ) -> Node {
         self.new_call_expression(
-            self.new_property_access_expression(self.new_identifier("Object"), Node::NIL, self.new_identifier("defineProperty"), NodeFlags::NONE),
+            self.new_property_access_expression(
+                self.new_identifier("Object"),
+                Node::NIL,
+                self.new_identifier("defineProperty"),
+                NodeFlags::NONE,
+            ),
             Node::NIL,     /*questionDotToken*/
             NodeList::NIL, /*typeArguments*/
             self.new_node_list(&[target, name, descriptor]),
@@ -888,7 +1158,12 @@ impl NodeFactory {
     /// Creates `Reflect.get(target, propertyKey, receiver)`.
     pub fn new_reflect_get_call(&self, target: Node, property_key: Node, receiver: Node) -> Node {
         self.new_call_expression(
-            self.new_property_access_expression(self.new_identifier("Reflect"), Node::NIL, self.new_identifier("get"), NodeFlags::NONE),
+            self.new_property_access_expression(
+                self.new_identifier("Reflect"),
+                Node::NIL,
+                self.new_identifier("get"),
+                NodeFlags::NONE,
+            ),
             Node::NIL,     /*questionDotToken*/
             NodeList::NIL, /*typeArguments*/
             self.new_node_list(&[target, property_key, receiver]),
@@ -898,9 +1173,20 @@ impl NodeFactory {
 
     // Go: printer/factory.go:764 NewReflectSetCall
     /// Creates `Reflect.set(target, propertyKey, value, receiver)`.
-    pub fn new_reflect_set_call(&self, target: Node, property_key: Node, value: Node, receiver: Node) -> Node {
+    pub fn new_reflect_set_call(
+        &self,
+        target: Node,
+        property_key: Node,
+        value: Node,
+        receiver: Node,
+    ) -> Node {
         self.new_call_expression(
-            self.new_property_access_expression(self.new_identifier("Reflect"), Node::NIL, self.new_identifier("set"), NodeFlags::NONE),
+            self.new_property_access_expression(
+                self.new_identifier("Reflect"),
+                Node::NIL,
+                self.new_identifier("set"),
+                NodeFlags::NONE,
+            ),
             Node::NIL,     /*questionDotToken*/
             NodeList::NIL, /*typeArguments*/
             self.new_node_list(&[target, property_key, value, receiver]),
@@ -910,7 +1196,12 @@ impl NodeFactory {
 
     // Go: printer/factory.go:780 NewFunctionBindCall
     /// Creates `target.bind(thisArg, ...args)`.
-    pub fn new_function_bind_call(&self, target: Node, this_arg: Node, arguments_list: &[Node]) -> Node {
+    pub fn new_function_bind_call(
+        &self,
+        target: Node,
+        this_arg: Node,
+        arguments_list: &[Node],
+    ) -> Node {
         let mut args: Vec<Node> = Vec::with_capacity(1 + arguments_list.len());
         args.push(this_arg);
         args.extend_from_slice(arguments_list);
@@ -921,11 +1212,11 @@ impl NodeFactory {
     /// Creates `(() => { ...statements })()` — an immediately invoked arrow function.
     pub fn new_immediately_invoked_arrow_function(&self, statements: &[Node]) -> Node {
         let arrow = self.new_arrow_function(
-            ModifierList::NIL,       /*modifiers*/
-            NodeList::NIL,           /*typeParameters*/
-            self.new_node_list(&[]), /*parameters*/
-            Node::NIL,               /*returnType*/
-            Node::NIL,               /*fullSignature*/
+            ModifierList::NIL,                                  /*modifiers*/
+            NodeList::NIL,                                      /*typeParameters*/
+            self.new_node_list(&[]),                            /*parameters*/
+            Node::NIL,                                          /*returnType*/
+            Node::NIL,                                          /*fullSignature*/
             self.new_token(SyntaxKind::EqualsGreaterThanToken), /*equalsGreaterThanToken*/
             self.new_block(self.new_node_list(statements), true),
         );
@@ -949,16 +1240,31 @@ impl NodeFactory {
     pub fn new_external_module_export(&self, name: Node) -> Node {
         let specifier = self.new_export_specifier(false, Node::NIL, name);
         let named_exports = self.new_named_exports(self.new_node_list(&[specifier]));
-        self.new_export_declaration(ModifierList::NIL, false, named_exports, Node::NIL, Node::NIL)
+        self.new_export_declaration(
+            ModifierList::NIL,
+            false,
+            named_exports,
+            Node::NIL,
+            Node::NIL,
+        )
     }
 
     // ES2018 Helpers
 
     // Go: printer/factory.go:821 NewAssignHelper
     /// Chains a sequence of expressions using the __assign helper or Object.assign if available in the target
-    pub fn new_assign_helper(&self, attributes_segments: &[Node], _script_target: ScriptTarget) -> Node {
+    pub fn new_assign_helper(
+        &self,
+        attributes_segments: &[Node],
+        _script_target: ScriptTarget,
+    ) -> Node {
         self.new_call_expression(
-            self.new_property_access_expression(self.new_identifier("Object"), Node::NIL, self.new_identifier("assign"), NodeFlags::NONE),
+            self.new_property_access_expression(
+                self.new_identifier("Object"),
+                Node::NIL,
+                self.new_identifier("assign"),
+                NodeFlags::NONE,
+            ),
             Node::NIL,
             NodeList::NIL,
             self.new_node_list(attributes_segments),
@@ -970,7 +1276,13 @@ impl NodeFactory {
 
     // Go: printer/factory.go:827 NewRestHelper
     // PORT: Go `computedTempVariables == nil` is `None`.
-    pub fn new_rest_helper(&self, value: Node, elements: &[Node], computed_temp_variables: Option<&[Node]>, location: TextRange) -> Node {
+    pub fn new_rest_helper(
+        &self,
+        value: Node,
+        elements: &[Node],
+        computed_temp_variables: Option<&[Node]>,
+        location: TextRange,
+    ) -> Node {
         self.emit_context.request_emit_helper(&REST_HELPER);
         let mut property_names: Vec<Node> = Vec::new();
         let mut computed_temp_variable_offset = 0usize;
@@ -985,7 +1297,8 @@ impl NodeFactory {
                         computed_temp_variables.is_some(),
                         "Encountered computed property name but 'computedTempVariables' argument was not provided."
                     );
-                    let temp = computed_temp_variables.unwrap_or(&[])[computed_temp_variable_offset];
+                    let temp =
+                        computed_temp_variables.unwrap_or(&[])[computed_temp_variable_offset];
                     computed_temp_variable_offset += 1;
                     // typeof _tmp === "symbol" ? _tmp : _tmp + ""
                     property_names.push(self.new_conditional_expression(
@@ -1006,7 +1319,8 @@ impl NodeFactory {
                 }
             }
         }
-        let prop_names = self.new_array_literal_expression(self.new_node_list(&property_names), false);
+        let prop_names =
+            self.new_array_literal_expression(self.new_node_list(&property_names), false);
         set_node_loc(prop_names, location);
         self.new_call_expression(
             self.new_unscoped_helper_name("__rest"),
@@ -1036,13 +1350,20 @@ impl NodeFactory {
     /// Allocates a new Call expression to the `__asyncGenerator` helper.
     pub fn new_async_generator_helper(&self, generator_func: Node, has_lexical_this: bool) -> Node {
         self.emit_context.request_emit_helper(&AWAIT_HELPER);
-        self.emit_context.request_emit_helper(&ASYNC_GENERATOR_HELPER);
+        self.emit_context
+            .request_emit_helper(&ASYNC_GENERATOR_HELPER);
 
         // Mark this node as originally an async function body
-        self.emit_context.add_emit_flags(generator_func, EmitFlags::ASYNC_FUNCTION_BODY | EmitFlags::REUSE_TEMP_VARIABLE_SCOPE);
+        self.emit_context.add_emit_flags(
+            generator_func,
+            EmitFlags::ASYNC_FUNCTION_BODY | EmitFlags::REUSE_TEMP_VARIABLE_SCOPE,
+        );
 
-        let this_arg =
-            if has_lexical_this { self.new_keyword_expression(SyntaxKind::ThisKeyword) } else { self.new_void_zero_expression() };
+        let this_arg = if has_lexical_this {
+            self.new_keyword_expression(SyntaxKind::ThisKeyword)
+        } else {
+            self.new_void_zero_expression()
+        };
 
         self.new_call_expression(
             self.new_unscoped_helper_name("__asyncGenerator"),
@@ -1057,7 +1378,8 @@ impl NodeFactory {
     /// Allocates a new Call expression to the `__asyncDelegator` helper.
     pub fn new_async_delegator_helper(&self, expression: Node) -> Node {
         self.emit_context.request_emit_helper(&AWAIT_HELPER);
-        self.emit_context.request_emit_helper(&ASYNC_DELEGATOR_HELPER);
+        self.emit_context
+            .request_emit_helper(&ASYNC_DELEGATOR_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__asyncDelegator"),
             Node::NIL,     /*questionDotToken*/
@@ -1084,10 +1406,20 @@ impl NodeFactory {
 
     // Go: printer/factory.go:941 NewAwaiterHelper
     /// Allocates a new Call expression to the `__awaiter` helper.
-    pub fn new_awaiter_helper(&self, has_lexical_this: bool, arguments_expression: Node, parameters: NodeList, body: Node) -> Node {
+    pub fn new_awaiter_helper(
+        &self,
+        has_lexical_this: bool,
+        arguments_expression: Node,
+        parameters: NodeList,
+        body: Node,
+    ) -> Node {
         self.emit_context.request_emit_helper(&AWAITER_HELPER);
 
-        let params = if parameters.is_nil() { self.new_node_list(&[]) } else { parameters };
+        let params = if parameters.is_nil() {
+            self.new_node_list(&[])
+        } else {
+            parameters
+        };
 
         let generator_func = self.new_function_expression(
             ModifierList::NIL, /*modifiers*/
@@ -1101,18 +1433,33 @@ impl NodeFactory {
         );
 
         // Mark this node as originally an async function body
-        self.emit_context.add_emit_flags(generator_func, EmitFlags::ASYNC_FUNCTION_BODY | EmitFlags::REUSE_TEMP_VARIABLE_SCOPE);
+        self.emit_context.add_emit_flags(
+            generator_func,
+            EmitFlags::ASYNC_FUNCTION_BODY | EmitFlags::REUSE_TEMP_VARIABLE_SCOPE,
+        );
 
-        let this_arg =
-            if has_lexical_this { self.new_keyword_expression(SyntaxKind::ThisKeyword) } else { self.new_void_zero_expression() };
+        let this_arg = if has_lexical_this {
+            self.new_keyword_expression(SyntaxKind::ThisKeyword)
+        } else {
+            self.new_void_zero_expression()
+        };
 
-        let args_arg = if arguments_expression.is_some() { arguments_expression } else { self.new_void_zero_expression() };
+        let args_arg = if arguments_expression.is_some() {
+            arguments_expression
+        } else {
+            self.new_void_zero_expression()
+        };
 
         self.new_call_expression(
             self.new_unscoped_helper_name("__awaiter"),
             Node::NIL,     /*questionDotToken*/
             NodeList::NIL, /*typeArguments*/
-            self.new_node_list(&[this_arg, args_arg, self.new_void_zero_expression(), generator_func]),
+            self.new_node_list(&[
+                this_arg,
+                args_arg,
+                self.new_void_zero_expression(),
+                generator_func,
+            ]),
             NodeFlags::NONE,
         )
     }
@@ -1129,22 +1476,54 @@ impl NodeFactory {
                 Node::NIL,
                 self.new_string_literal("class", TokenFlags::NONE),
             ),
-            self.new_property_assignment(ModifierList::NIL, self.new_identifier("name"), Node::NIL, Node::NIL, name_expr),
-            self.new_property_assignment(ModifierList::NIL, self.new_identifier("metadata"), Node::NIL, Node::NIL, metadata),
+            self.new_property_assignment(
+                ModifierList::NIL,
+                self.new_identifier("name"),
+                Node::NIL,
+                Node::NIL,
+                name_expr,
+            ),
+            self.new_property_assignment(
+                ModifierList::NIL,
+                self.new_identifier("metadata"),
+                Node::NIL,
+                Node::NIL,
+                metadata,
+            ),
         ];
         self.new_object_literal_expression(self.new_node_list(&props), false)
     }
 
     // Go: printer/factory.go:1009 NewESDecorateClassElementAccessGetMethod
-    pub fn new_es_decorate_class_element_access_get_method(&self, name_computed: bool, name_expr: Node) -> Node {
+    pub fn new_es_decorate_class_element_access_get_method(
+        &self,
+        name_computed: bool,
+        name_expr: Node,
+    ) -> Node {
         let accessor = if name_computed {
-            self.new_element_access_expression(self.new_identifier("obj"), Node::NIL, name_expr, NodeFlags::NONE)
+            self.new_element_access_expression(
+                self.new_identifier("obj"),
+                Node::NIL,
+                name_expr,
+                NodeFlags::NONE,
+            )
         } else {
-            self.new_property_access_expression(self.new_identifier("obj"), Node::NIL, name_expr, NodeFlags::NONE)
+            self.new_property_access_expression(
+                self.new_identifier("obj"),
+                Node::NIL,
+                name_expr,
+                NodeFlags::NONE,
+            )
         };
 
-        let obj_param =
-            self.new_parameter_declaration(ModifierList::NIL, Node::NIL, self.new_identifier("obj"), Node::NIL, Node::NIL, Node::NIL);
+        let obj_param = self.new_parameter_declaration(
+            ModifierList::NIL,
+            Node::NIL,
+            self.new_identifier("obj"),
+            Node::NIL,
+            Node::NIL,
+            Node::NIL,
+        );
 
         let arrow = self.new_arrow_function(
             ModifierList::NIL,
@@ -1156,25 +1535,57 @@ impl NodeFactory {
             accessor,
         );
 
-        self.new_property_assignment(ModifierList::NIL, self.new_identifier("get"), Node::NIL, Node::NIL, arrow)
+        self.new_property_assignment(
+            ModifierList::NIL,
+            self.new_identifier("get"),
+            Node::NIL,
+            Node::NIL,
+            arrow,
+        )
     }
 
     // Go: printer/factory.go:1033 NewESDecorateClassElementAccessSetMethod
-    pub fn new_es_decorate_class_element_access_set_method(&self, name_computed: bool, name_expr: Node) -> Node {
+    pub fn new_es_decorate_class_element_access_set_method(
+        &self,
+        name_computed: bool,
+        name_expr: Node,
+    ) -> Node {
         let accessor = if name_computed {
-            self.new_element_access_expression(self.new_identifier("obj"), Node::NIL, name_expr, NodeFlags::NONE)
+            self.new_element_access_expression(
+                self.new_identifier("obj"),
+                Node::NIL,
+                name_expr,
+                NodeFlags::NONE,
+            )
         } else {
-            self.new_property_access_expression(self.new_identifier("obj"), Node::NIL, name_expr, NodeFlags::NONE)
+            self.new_property_access_expression(
+                self.new_identifier("obj"),
+                Node::NIL,
+                name_expr,
+                NodeFlags::NONE,
+            )
         };
 
         let assignment = self.new_assignment_expression(accessor, self.new_identifier("value"));
         let stmt = self.new_expression_statement(assignment);
         let body = self.new_block(self.new_node_list(&[stmt]), false);
 
-        let obj_param =
-            self.new_parameter_declaration(ModifierList::NIL, Node::NIL, self.new_identifier("obj"), Node::NIL, Node::NIL, Node::NIL);
-        let value_param =
-            self.new_parameter_declaration(ModifierList::NIL, Node::NIL, self.new_identifier("value"), Node::NIL, Node::NIL, Node::NIL);
+        let obj_param = self.new_parameter_declaration(
+            ModifierList::NIL,
+            Node::NIL,
+            self.new_identifier("obj"),
+            Node::NIL,
+            Node::NIL,
+            Node::NIL,
+        );
+        let value_param = self.new_parameter_declaration(
+            ModifierList::NIL,
+            Node::NIL,
+            self.new_identifier("value"),
+            Node::NIL,
+            Node::NIL,
+            Node::NIL,
+        );
 
         let arrow = self.new_arrow_function(
             ModifierList::NIL,
@@ -1186,11 +1597,21 @@ impl NodeFactory {
             body,
         );
 
-        self.new_property_assignment(ModifierList::NIL, self.new_identifier("set"), Node::NIL, Node::NIL, arrow)
+        self.new_property_assignment(
+            ModifierList::NIL,
+            self.new_identifier("set"),
+            Node::NIL,
+            Node::NIL,
+            arrow,
+        )
     }
 
     // Go: printer/factory.go:1062 NewESDecorateClassElementAccessHasMethod
-    pub fn new_es_decorate_class_element_access_has_method(&self, name_computed: bool, name_expr: Node) -> Node {
+    pub fn new_es_decorate_class_element_access_has_method(
+        &self,
+        name_computed: bool,
+        name_expr: Node,
+    ) -> Node {
         // The property name for the "in" expression
         let property_name = if !name_computed && name_expr.is_some() && is_identifier(name_expr) {
             self.new_string_literal_from_node(name_expr)
@@ -1198,8 +1619,14 @@ impl NodeFactory {
             name_expr
         };
 
-        let obj_param =
-            self.new_parameter_declaration(ModifierList::NIL, Node::NIL, self.new_identifier("obj"), Node::NIL, Node::NIL, Node::NIL);
+        let obj_param = self.new_parameter_declaration(
+            ModifierList::NIL,
+            Node::NIL,
+            self.new_identifier("obj"),
+            Node::NIL,
+            Node::NIL,
+            Node::NIL,
+        );
         let in_expr = self.new_binary_expression(
             ModifierList::NIL,
             property_name,
@@ -1218,7 +1645,13 @@ impl NodeFactory {
             in_expr,
         );
 
-        self.new_property_assignment(ModifierList::NIL, self.new_identifier("has"), Node::NIL, Node::NIL, arrow)
+        self.new_property_assignment(
+            ModifierList::NIL,
+            self.new_identifier("has"),
+            Node::NIL,
+            Node::NIL,
+            arrow,
+        )
     }
 
     // Go: printer/factory.go:1098 NewESDecorateClassElementAccessObject
@@ -1232,20 +1665,31 @@ impl NodeFactory {
     ///  3. If _kind_ is ~field~, ~accessor~, or ~setter~, then
     ///     a. Let _setAccess_ be a new Abstract Closure with parameters (_object_, _value_) that captures _kind_ and _name_ ...
     ///     b. Perform ! CreateDataPropertyOrThrow(_access_, "set", _setAccess_).
-    pub fn new_es_decorate_class_element_access_object(&self, name_computed: bool, name_expr: Node, has_get: bool, has_set: bool) -> Node {
+    pub fn new_es_decorate_class_element_access_object(
+        &self,
+        name_computed: bool,
+        name_expr: Node,
+        has_get: bool,
+        has_set: bool,
+    ) -> Node {
         let mut access_props: Vec<Node> = Vec::new();
 
         // "has" method: obj => name in obj
-        access_props.push(self.new_es_decorate_class_element_access_has_method(name_computed, name_expr));
+        access_props
+            .push(self.new_es_decorate_class_element_access_has_method(name_computed, name_expr));
 
         // "get" method: obj => obj.name or obj => obj[name]
         if has_get {
-            access_props.push(self.new_es_decorate_class_element_access_get_method(name_computed, name_expr));
+            access_props.push(
+                self.new_es_decorate_class_element_access_get_method(name_computed, name_expr),
+            );
         }
 
         // "set" method: (obj, value) => { obj.name = value; } or (obj, value) => { obj[name] = value; }
         if has_set {
-            access_props.push(self.new_es_decorate_class_element_access_set_method(name_computed, name_expr));
+            access_props.push(
+                self.new_es_decorate_class_element_access_set_method(name_computed, name_expr),
+            );
         }
 
         self.new_object_literal_expression(self.new_node_list(&access_props), false)
@@ -1265,18 +1709,34 @@ impl NodeFactory {
         metadata: Node,
     ) -> Node {
         // Build the name value for the context's "name" property
-        let name_value = if !name_computed && name_expr.is_some() && (is_private_identifier(name_expr) || is_identifier(name_expr)) {
+        let name_value = if !name_computed
+            && name_expr.is_some()
+            && (is_private_identifier(name_expr) || is_identifier(name_expr))
+        {
             self.new_string_literal_from_node(name_expr)
         } else {
             name_expr
         };
 
         // Build the access object with has/get/set arrow functions
-        let access_obj = self.new_es_decorate_class_element_access_object(name_computed, name_expr, has_get, has_set);
+        let access_obj = self.new_es_decorate_class_element_access_object(
+            name_computed,
+            name_expr,
+            has_get,
+            has_set,
+        );
 
-        let static_expr = if is_static { self.new_true_expression() } else { self.new_false_expression() };
+        let static_expr = if is_static {
+            self.new_true_expression()
+        } else {
+            self.new_false_expression()
+        };
 
-        let private_expr = if is_private { self.new_true_expression() } else { self.new_false_expression() };
+        let private_expr = if is_private {
+            self.new_true_expression()
+        } else {
+            self.new_false_expression()
+        };
 
         let props = [
             self.new_property_assignment(
@@ -1286,11 +1746,41 @@ impl NodeFactory {
                 Node::NIL,
                 self.new_string_literal(kind, TokenFlags::NONE),
             ),
-            self.new_property_assignment(ModifierList::NIL, self.new_identifier("name"), Node::NIL, Node::NIL, name_value),
-            self.new_property_assignment(ModifierList::NIL, self.new_identifier("static"), Node::NIL, Node::NIL, static_expr),
-            self.new_property_assignment(ModifierList::NIL, self.new_identifier("private"), Node::NIL, Node::NIL, private_expr),
-            self.new_property_assignment(ModifierList::NIL, self.new_identifier("access"), Node::NIL, Node::NIL, access_obj),
-            self.new_property_assignment(ModifierList::NIL, self.new_identifier("metadata"), Node::NIL, Node::NIL, metadata),
+            self.new_property_assignment(
+                ModifierList::NIL,
+                self.new_identifier("name"),
+                Node::NIL,
+                Node::NIL,
+                name_value,
+            ),
+            self.new_property_assignment(
+                ModifierList::NIL,
+                self.new_identifier("static"),
+                Node::NIL,
+                Node::NIL,
+                static_expr,
+            ),
+            self.new_property_assignment(
+                ModifierList::NIL,
+                self.new_identifier("private"),
+                Node::NIL,
+                Node::NIL,
+                private_expr,
+            ),
+            self.new_property_assignment(
+                ModifierList::NIL,
+                self.new_identifier("access"),
+                Node::NIL,
+                Node::NIL,
+                access_obj,
+            ),
+            self.new_property_assignment(
+                ModifierList::NIL,
+                self.new_identifier("metadata"),
+                Node::NIL,
+                Node::NIL,
+                metadata,
+            ),
         ];
         self.new_object_literal_expression(self.new_node_list(&props), false)
     }
@@ -1310,15 +1800,32 @@ impl NodeFactory {
             self.new_unscoped_helper_name("__esDecorate"),
             Node::NIL,     /*questionDotToken*/
             NodeList::NIL, /*typeArguments*/
-            self.new_node_list(&[ctor, descriptor_in, decorators, context_in, initializers, extra_initializers]),
+            self.new_node_list(&[
+                ctor,
+                descriptor_in,
+                decorators,
+                context_in,
+                initializers,
+                extra_initializers,
+            ]),
             NodeFlags::NONE,
         )
     }
 
     // Go: printer/factory.go:1179 NewRunInitializersHelper
-    pub fn new_run_initializers_helper(&self, this_arg: Node, initializers: Node, value: Node) -> Node {
-        self.emit_context.request_emit_helper(&RUN_INITIALIZERS_HELPER);
-        let arguments: Vec<Node> = if value.is_some() { vec![this_arg, initializers, value] } else { vec![this_arg, initializers] };
+    pub fn new_run_initializers_helper(
+        &self,
+        this_arg: Node,
+        initializers: Node,
+        value: Node,
+    ) -> Node {
+        self.emit_context
+            .request_emit_helper(&RUN_INITIALIZERS_HELPER);
+        let arguments: Vec<Node> = if value.is_some() {
+            vec![this_arg, initializers, value]
+        } else {
+            vec![this_arg, initializers]
+        };
         self.new_call_expression(
             self.new_unscoped_helper_name("__runInitializers"),
             Node::NIL,     /*questionDotToken*/
@@ -1332,7 +1839,8 @@ impl NodeFactory {
 
     // Go: printer/factory.go:1198 NewTemplateObjectHelper
     pub fn new_template_object_helper(&self, cooked_array: Node, raw_array: Node) -> Node {
-        self.emit_context.request_emit_helper(&MAKE_TEMPLATE_OBJECT_HELPER);
+        self.emit_context
+            .request_emit_helper(&MAKE_TEMPLATE_OBJECT_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__makeTemplateObject"),
             Node::NIL,     /*questionDotToken*/
@@ -1356,7 +1864,8 @@ impl NodeFactory {
 
     // Go: printer/factory.go:1220 NewSetFunctionNameHelper
     pub fn new_set_function_name_helper(&self, fn_: Node, name: Node, prefix: &str) -> Node {
-        self.emit_context.request_emit_helper(&SET_FUNCTION_NAME_HELPER);
+        self.emit_context
+            .request_emit_helper(&SET_FUNCTION_NAME_HELPER);
         let arguments: Vec<Node> = if !prefix.is_empty() {
             vec![fn_, name, self.new_string_literal(prefix, TokenFlags::NONE)]
         } else {
@@ -1376,7 +1885,8 @@ impl NodeFactory {
     // Go: printer/factory.go:1240 NewImportDefaultHelper
     /// Allocates a new Call expression to the `__importDefault` helper.
     pub fn new_import_default_helper(&self, expression: Node) -> Node {
-        self.emit_context.request_emit_helper(&IMPORT_DEFAULT_HELPER);
+        self.emit_context
+            .request_emit_helper(&IMPORT_DEFAULT_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__importDefault"),
             Node::NIL,     /*questionDotToken*/
@@ -1401,7 +1911,11 @@ impl NodeFactory {
 
     // Go: printer/factory.go:1264 NewExportStarHelper
     /// Allocates a new Call expression to the `__exportStar` helper.
-    pub fn new_export_star_helper(&self, module_expression: Node, exports_expression: Node) -> Node {
+    pub fn new_export_star_helper(
+        &self,
+        module_expression: Node,
+        exports_expression: Node,
+    ) -> Node {
         self.emit_context.request_emit_helper(&EXPORT_STAR_HELPER);
         self.new_call_expression(
             self.new_unscoped_helper_name("__exportStar"),
@@ -1428,9 +1942,13 @@ impl NodeFactory {
             )]),
             Node::NIL, /*returnType*/
             Node::NIL, /*fullSignature*/
-            self.new_block(self.new_node_list(&[self.new_expression_statement(expression)]), false),
+            self.new_block(
+                self.new_node_list(&[self.new_expression_statement(expression)]),
+                false,
+            ),
         );
-        let obj_literal = self.new_object_literal_expression(self.new_node_list(&[set_accessor]), false);
+        let obj_literal =
+            self.new_object_literal_expression(self.new_node_list(&[set_accessor]), false);
         // Explicit parens required because of v8 regression (https://bugs.chromium.org/p/v8/issues/detail?id=9560)
         self.new_property_access_expression(
             self.new_parenthesized_expression(obj_literal),
@@ -1442,10 +1960,18 @@ impl NodeFactory {
 
     // Go: printer/factory.go:1300 NewRewriteRelativeImportExtensionsHelper
     /// Allocates a new Call expression to the `__rewriteRelativeImportExtension` helper.
-    pub fn new_rewrite_relative_import_extensions_helper(&self, first_argument: Node, preserve_jsx: bool) -> Node {
-        self.emit_context.request_emit_helper(&REWRITE_RELATIVE_IMPORT_EXTENSIONS_HELPER);
-        let arguments: Vec<Node> =
-            if preserve_jsx { vec![first_argument, self.new_token(SyntaxKind::TrueKeyword)] } else { vec![first_argument] };
+    pub fn new_rewrite_relative_import_extensions_helper(
+        &self,
+        first_argument: Node,
+        preserve_jsx: bool,
+    ) -> Node {
+        self.emit_context
+            .request_emit_helper(&REWRITE_RELATIVE_IMPORT_EXTENSIONS_HELPER);
+        let arguments: Vec<Node> = if preserve_jsx {
+            vec![first_argument, self.new_token(SyntaxKind::TrueKeyword)]
+        } else {
+            vec![first_argument]
+        };
         self.new_call_expression(
             self.new_unscoped_helper_name("__rewriteRelativeImportExtension"),
             Node::NIL,     /*questionDotToken*/

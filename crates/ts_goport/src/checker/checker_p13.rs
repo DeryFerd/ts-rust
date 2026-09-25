@@ -22,7 +22,11 @@ impl Checker {
 
     // Go: checker/checker.go:11181 removeOptionalityFromDeclaredType
     // Remove undefined from the annotated type of a parameter when there is an initializer (that doesn't include undefined)
-    pub fn remove_optionality_from_declared_type(&mut self, declared_type: TypeId, declaration: Node) -> TypeId {
+    pub fn remove_optionality_from_declared_type(
+        &mut self,
+        declared_type: TypeId,
+        declaration: Node,
+    ) -> TypeId {
         let remove_undefined = self.strict_null_checks
             && is_parameter_declaration(declaration)
             && declaration.initializer().is_some()
@@ -36,43 +40,77 @@ impl Checker {
 
     // Go: checker/checker.go:11189 parameterInitializerContainsUndefined
     pub fn parameter_initializer_contains_undefined(&mut self, declaration: Node) -> bool {
-        if !self.node_links.get(declaration).flags.intersects(NodeCheckFlags::INITIALIZER_IS_UNDEFINED_COMPUTED) {
-            if !self.push_type_resolution(TypeSystemEntity::Node(declaration), TypeSystemPropertyName::INITIALIZER_IS_UNDEFINED) {
+        if !self
+            .node_links
+            .get(declaration)
+            .flags
+            .intersects(NodeCheckFlags::INITIALIZER_IS_UNDEFINED_COMPUTED)
+        {
+            if !self.push_type_resolution(
+                TypeSystemEntity::Node(declaration),
+                TypeSystemPropertyName::INITIALIZER_IS_UNDEFINED,
+            ) {
                 self.report_circularity_error(declaration.symbol());
                 return true;
             }
-            let initializer_type = self.check_declaration_initializer(declaration, CheckMode::NORMAL, TypeId::NIL);
+            let initializer_type =
+                self.check_declaration_initializer(declaration, CheckMode::NORMAL, TypeId::NIL);
             let contains_undefined = self.has_type_facts(initializer_type, TypeFacts::IS_UNDEFINED);
             if !self.pop_type_resolution() {
                 self.report_circularity_error(declaration.symbol());
                 return true;
             }
             let links = self.node_links.get(declaration);
-            if !links.flags.intersects(NodeCheckFlags::INITIALIZER_IS_UNDEFINED_COMPUTED) {
+            if !links
+                .flags
+                .intersects(NodeCheckFlags::INITIALIZER_IS_UNDEFINED_COMPUTED)
+            {
                 links.flags |= NodeCheckFlags::INITIALIZER_IS_UNDEFINED_COMPUTED
-                    | if contains_undefined { NodeCheckFlags::INITIALIZER_IS_UNDEFINED } else { NodeCheckFlags::NONE };
+                    | if contains_undefined {
+                        NodeCheckFlags::INITIALIZER_IS_UNDEFINED
+                    } else {
+                        NodeCheckFlags::NONE
+                    };
             }
         }
-        self.node_links.get(declaration).flags.intersects(NodeCheckFlags::INITIALIZER_IS_UNDEFINED)
+        self.node_links
+            .get(declaration)
+            .flags
+            .intersects(NodeCheckFlags::INITIALIZER_IS_UNDEFINED)
     }
 
     // Go: checker/checker.go:11208 isInAmbientOrTypeNode
     pub fn is_in_ambient_or_type_node(&mut self, node: Node) -> bool {
         node.flags().intersects(NodeFlags::AMBIENT)
             || find_ancestor(node, |n| {
-                is_interface_declaration(n) || is_type_alias_declaration(n) || is_js_type_alias_declaration(n) || is_type_literal_node(n)
+                is_interface_declaration(n)
+                    || is_type_alias_declaration(n)
+                    || is_js_type_alias_declaration(n)
+                    || is_type_literal_node(n)
             })
             .is_some()
     }
 
     // Go: checker/checker.go:11214 checkPropertyAccessExpression
-    pub fn check_property_access_expression(&mut self, node: Node, check_mode: CheckMode, write_only: bool) -> TypeId {
+    pub fn check_property_access_expression(
+        &mut self,
+        node: Node,
+        check_mode: CheckMode,
+        write_only: bool,
+    ) -> TypeId {
         if node.flags().intersects(NodeFlags::OPTIONAL_CHAIN) {
             return self.check_property_access_chain(node, check_mode);
         }
         let expr = node.expression();
         let left_type = self.check_non_null_expression(expr);
-        self.check_property_access_expression_or_qualified_name(node, expr, left_type, node.name(), check_mode, write_only)
+        self.check_property_access_expression_or_qualified_name(
+            node,
+            expr,
+            left_type,
+            node.name(),
+            check_mode,
+            write_only,
+        )
     }
 
     // Go: checker/checker.go:11222 checkPropertyAccessChain
@@ -108,24 +146,37 @@ impl Checker {
             widened_type = self.get_widened_type(left_type);
         }
         let apparent_type = self.get_apparent_type(widened_type);
-        let is_any_like = self.is_type_any(apparent_type) || apparent_type == self.silent_never_type;
+        let is_any_like =
+            self.is_type_any(apparent_type) || apparent_type == self.silent_never_type;
         let mut prop = SymbolId::NIL;
         if is_private_identifier(right) {
-            if self.language_version < LANGUAGE_FEATURE_MINIMUM_TARGET.private_names_and_class_static_blocks
-                || self.language_version < LANGUAGE_FEATURE_MINIMUM_TARGET.class_and_class_element_decorators
+            if self.language_version
+                < LANGUAGE_FEATURE_MINIMUM_TARGET.private_names_and_class_static_blocks
+                || self.language_version
+                    < LANGUAGE_FEATURE_MINIMUM_TARGET.class_and_class_element_decorators
                 || !self.compiler_options.get_use_define_for_class_fields()
             {
                 if assignment_kind != AssignmentKind::NONE {
-                    self.check_external_emit_helpers(node, ExternalEmitHelpers::CLASS_PRIVATE_FIELD_SET);
+                    self.check_external_emit_helpers(
+                        node,
+                        ExternalEmitHelpers::CLASS_PRIVATE_FIELD_SET,
+                    );
                 }
                 if assignment_kind != AssignmentKind::DEFINITE {
-                    self.check_external_emit_helpers(node, ExternalEmitHelpers::CLASS_PRIVATE_FIELD_GET);
+                    self.check_external_emit_helpers(
+                        node,
+                        ExternalEmitHelpers::CLASS_PRIVATE_FIELD_GET,
+                    );
                 }
             }
-            let lexically_scoped_symbol = self.lookup_symbol_for_private_identifier_declaration(right.text(), right);
+            let lexically_scoped_symbol =
+                self.lookup_symbol_for_private_identifier_declaration(right.text(), right);
             if assignment_kind != AssignmentKind::NONE
                 && lexically_scoped_symbol.is_some()
-                && self.sym(lexically_scoped_symbol).value_declaration.is_some()
+                && self
+                    .sym(lexically_scoped_symbol)
+                    .value_declaration
+                    .is_some()
                 && is_method_declaration(self.sym(lexically_scoped_symbol).value_declaration)
             {
                 self.grammar_error_on_node(
@@ -142,21 +193,33 @@ impl Checker {
                     return apparent_type;
                 }
                 if get_containing_class_excluding_class_decorators(right).is_nil() {
-                    self.grammar_error_on_node(right, diag::Private_identifiers_are_not_allowed_outside_class_bodies, args![]);
+                    self.grammar_error_on_node(
+                        right,
+                        diag::Private_identifiers_are_not_allowed_outside_class_bodies,
+                        args![],
+                    );
                     return self.any_type;
                 }
             }
             if lexically_scoped_symbol.is_some() {
-                prop = self.get_private_identifier_property_of_type(left_type, lexically_scoped_symbol);
+                prop = self
+                    .get_private_identifier_property_of_type(left_type, lexically_scoped_symbol);
             }
             if prop.is_nil() {
                 // Check for private-identifier-specific shadowing and lexical-scoping errors.
-                if self.check_private_identifier_property_access(left_type, right, lexically_scoped_symbol) {
+                if self.check_private_identifier_property_access(
+                    left_type,
+                    right,
+                    lexically_scoped_symbol,
+                ) {
                     return self.error_type;
                 }
                 let containing_class = get_containing_class_excluding_class_decorators(right);
                 if containing_class.is_some()
-                    && is_plain_js_file(get_source_file_of_node(containing_class), self.compiler_options.check_js)
+                    && is_plain_js_file(
+                        get_source_file_of_node(containing_class),
+                        self.compiler_options.check_js,
+                    )
                 {
                     self.grammar_error_on_node(
                         right,
@@ -166,23 +229,33 @@ impl Checker {
                 }
             } else {
                 let prop_flags = self.sym(prop).flags;
-                let is_setonly_accessor =
-                    prop_flags.intersects(SymbolFlags::SET_ACCESSOR) && !prop_flags.intersects(SymbolFlags::GET_ACCESSOR);
+                let is_setonly_accessor = prop_flags.intersects(SymbolFlags::SET_ACCESSOR)
+                    && !prop_flags.intersects(SymbolFlags::GET_ACCESSOR);
                 if is_setonly_accessor && assignment_kind != AssignmentKind::DEFINITE {
-                    self.error(node, diag::Private_accessor_was_defined_without_a_getter, args![]);
+                    self.error(
+                        node,
+                        diag::Private_accessor_was_defined_without_a_getter,
+                        args![],
+                    );
                 }
             }
         } else {
             if is_any_like {
                 if is_identifier(left) && parent_symbol.is_some() {
-                    self.mark_linked_references(node, ReferenceHint::PROPERTY, SymbolId::NIL /*propSymbol*/, left_type);
+                    self.mark_linked_references(
+                        node,
+                        ReferenceHint::PROPERTY,
+                        SymbolId::NIL, /*propSymbol*/
+                        left_type,
+                    );
                 }
                 if self.is_error_type(apparent_type) {
                     return self.error_type;
                 }
                 return apparent_type;
             }
-            let skip_object_function_property_augment = self.is_const_enum_object_type(apparent_type);
+            let skip_object_function_property_augment =
+                self.is_const_enum_object_type(apparent_type);
             prop = self.get_property_of_type_ex(
                 apparent_type,
                 right.text(),
@@ -203,16 +276,29 @@ impl Checker {
             }
             if index_info.is_nil() {
                 let left_symbol = self.ty(left_type).symbol;
-                let is_unchecked_js = self.is_unchecked_js_suggestion(node, left_symbol, true /*excludeClasses*/);
+                let is_unchecked_js = self.is_unchecked_js_suggestion(
+                    node,
+                    left_symbol,
+                    true, /*excludeClasses*/
+                );
                 if !is_unchecked_js && self.is_js_literal_type(left_type) {
                     return self.any_type;
                 }
                 if left_symbol == self.global_this_symbol {
                     let global_exports = self.sym(self.global_this_symbol).exports;
                     let global_symbol = self.symbols.get(global_exports, right.text());
-                    if global_symbol.is_some() && self.sym(global_symbol).flags.intersects(SymbolFlags::BLOCK_SCOPED) {
+                    if global_symbol.is_some()
+                        && self
+                            .sym(global_symbol)
+                            .flags
+                            .intersects(SymbolFlags::BLOCK_SCOPED)
+                    {
                         let type_string = self.type_to_string(left_type);
-                        self.error(right, diag::Property_0_does_not_exist_on_type_1, args![right.text(), type_string]);
+                        self.error(
+                            right,
+                            diag::Property_0_does_not_exist_on_type_1,
+                            args![right.text(), type_string],
+                        );
                     } else if self.no_implicit_any {
                         let type_string = self.type_to_string(left_type);
                         self.error(
@@ -223,8 +309,14 @@ impl Checker {
                     }
                     return self.any_type;
                 }
-                if !right.text().is_empty() && !self.check_and_report_error_for_extending_interface(node) {
-                    let containing_type = if self.is_this_type_parameter(left_type) { apparent_type } else { left_type };
+                if !right.text().is_empty()
+                    && !self.check_and_report_error_for_extending_interface(node)
+                {
+                    let containing_type = if self.is_this_type_parameter(left_type) {
+                        apparent_type
+                    } else {
+                        left_type
+                    };
                     self.report_nonexistent_property(right, containing_type, is_unchecked_js);
                 }
                 return self.error_type;
@@ -232,7 +324,11 @@ impl Checker {
             let info_is_readonly = self.index_info(index_info).is_readonly;
             if info_is_readonly && (is_assignment_target(node) || is_delete_target(node)) {
                 let type_string = self.type_to_string(apparent_type);
-                self.error(node, diag::Index_signature_in_type_0_only_permits_reading, args![type_string]);
+                self.error(
+                    node,
+                    diag::Index_signature_in_type_0_only_permits_reading,
+                    args![type_string],
+                );
             }
             let mut t = self.index_info(index_info).value_type;
             if self.compiler_options.no_unchecked_indexed_access == Tristate::True
@@ -241,7 +337,12 @@ impl Checker {
                 let missing_type = self.missing_type;
                 t = self.get_union_type(&[t, missing_type]);
             }
-            if self.compiler_options.no_property_access_from_index_signature == Tristate::True && is_property_access_expression(node) {
+            if self
+                .compiler_options
+                .no_property_access_from_index_signature
+                == Tristate::True
+                && is_property_access_expression(node)
+            {
                 self.error(
                     right,
                     diag::Property_0_comes_from_an_index_signature_so_it_must_be_accessed_with_0,
@@ -276,7 +377,11 @@ impl Checker {
                 prop,
             );
             if self.is_assignment_to_readonly_entity(node, prop, assignment_kind) {
-                self.error(right, diag::Cannot_assign_to_0_because_it_is_a_read_only_property, args![right.text()]);
+                self.error(
+                    right,
+                    diag::Cannot_assign_to_0_because_it_is_a_read_only_property,
+                    args![right.text()],
+                );
                 return self.error_type;
             }
             prop_type = if self.is_this_property_access_in_constructor(node, prop) {
@@ -304,13 +409,16 @@ impl Checker {
         // accessor, or optional method.
         let assignment_kind = get_assignment_target_kind(node);
         if assignment_kind == AssignmentKind::DEFINITE {
-            let is_optional = prop.is_some() && self.sym(prop).flags.intersects(SymbolFlags::OPTIONAL);
+            let is_optional =
+                prop.is_some() && self.sym(prop).flags.intersects(SymbolFlags::OPTIONAL);
             return self.remove_missing_type(prop_type, is_optional);
         }
         if prop.is_some() {
             let prop_flags = self.sym(prop).flags;
-            if !prop_flags.intersects(SymbolFlags::VARIABLE | SymbolFlags::PROPERTY | SymbolFlags::ACCESSOR)
-                && !(prop_flags.intersects(SymbolFlags::METHOD) && self.ty(prop_type).flags.intersects(TypeFlags::UNION))
+            if !prop_flags
+                .intersects(SymbolFlags::VARIABLE | SymbolFlags::PROPERTY | SymbolFlags::ACCESSOR)
+                && !(prop_flags.intersects(SymbolFlags::METHOD)
+                    && self.ty(prop_type).flags.intersects(TypeFlags::UNION))
             {
                 return prop_type;
             }
@@ -342,17 +450,32 @@ impl Checker {
                     }
                 } else if is_binary_expression(declaration)
                     && is_property_access_expression(declaration.left())
-                    && self.get_control_flow_container(node) == self.get_control_flow_container(declaration)
+                    && self.get_control_flow_container(node)
+                        == self.get_control_flow_container(declaration)
                 {
                     assume_uninitialized = true;
                 }
             }
         }
-        let initial_type = self.add_optionality_ex(prop_type, false /*isProperty*/, assume_uninitialized);
-        let flow_type = self.get_flow_type_of_reference_ex(node, prop_type, initial_type, Node::NIL, FlowNodeId::NIL);
-        if assume_uninitialized && !self.contains_undefined_type(prop_type) && self.contains_undefined_type(flow_type) {
+        let initial_type =
+            self.add_optionality_ex(prop_type, false /*isProperty*/, assume_uninitialized);
+        let flow_type = self.get_flow_type_of_reference_ex(
+            node,
+            prop_type,
+            initial_type,
+            Node::NIL,
+            FlowNodeId::NIL,
+        );
+        if assume_uninitialized
+            && !self.contains_undefined_type(prop_type)
+            && self.contains_undefined_type(flow_type)
+        {
             let prop_string = self.symbol_to_string(prop);
-            self.error(error_node, diag::Property_0_is_used_before_being_assigned, args![prop_string]);
+            self.error(
+                error_node,
+                diag::Property_0_is_used_before_being_assigned,
+                args![prop_string],
+            );
             // Return the declared type to reduce follow-on errors
             return prop_type;
         }
@@ -377,7 +500,11 @@ impl Checker {
         let mut initial_type = self.undefined_type;
         if prop.is_some() && self.sym(prop).value_declaration.is_some() {
             let value_declaration = self.sym(prop).value_declaration;
-            if !self.is_auto_typed_property(prop) || value_declaration.modifier_flags().intersects(ModifierFlags::AMBIENT) {
+            if !self.is_auto_typed_property(prop)
+                || value_declaration
+                    .modifier_flags()
+                    .intersects(ModifierFlags::AMBIENT)
+            {
                 let base_type = self.get_type_of_property_in_base_class(prop);
                 if base_type.is_some() {
                     initial_type = base_type;
@@ -385,7 +512,13 @@ impl Checker {
             }
         }
         let auto_type = self.auto_type;
-        self.get_flow_type_of_reference_ex(reference, auto_type, initial_type, Node::NIL, FlowNodeId::NIL)
+        self.get_flow_type_of_reference_ex(
+            reference,
+            auto_type,
+            initial_type,
+            Node::NIL,
+            FlowNodeId::NIL,
+        )
     }
 
     // Go: checker/checker.go:11422 getTypeOfPropertyInBaseClass
@@ -413,7 +546,11 @@ impl Checker {
 
     // Go: checker/checker.go:11441 lookupSymbolForPrivateIdentifierDeclaration
     // Lookup the private identifier lexically.
-    pub fn lookup_symbol_for_private_identifier_declaration(&mut self, prop_name: &str, location: Node) -> SymbolId {
+    pub fn lookup_symbol_for_private_identifier_declaration(
+        &mut self,
+        prop_name: &str,
+        location: Node,
+    ) -> SymbolId {
         let mut containing_class = get_containing_class_excluding_class_decorators(location);
         while containing_class.is_some() {
             let symbol = containing_class.symbol();
@@ -434,7 +571,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:11457 getPrivateIdentifierPropertyOfType
-    pub fn get_private_identifier_property_of_type(&mut self, left_type: TypeId, lexically_scoped_identifier: SymbolId) -> SymbolId {
+    pub fn get_private_identifier_property_of_type(
+        &mut self,
+        left_type: TypeId,
+        lexically_scoped_identifier: SymbolId,
+    ) -> SymbolId {
         let name = self.sym(lexically_scoped_identifier).name.clone();
         self.get_property_of_type(left_type, &name)
     }
@@ -452,7 +593,11 @@ impl Checker {
         let mut property_on_type = SymbolId::NIL;
         for &symbol in properties.iter() {
             let decl = self.sym(symbol).value_declaration;
-            if decl.is_some() && decl.name().is_some() && is_private_identifier(decl.name()) && decl.name().text() == right.text() {
+            if decl.is_some()
+                && decl.name().is_some()
+                && is_private_identifier(decl.name())
+                && decl.name().text() == right.text()
+            {
                 property_on_type = symbol;
                 break;
             }
@@ -465,7 +610,12 @@ impl Checker {
             // Either:
             // - There is a lexically scoped private identifier AND it shadows the one we found on the type.
             // - It is an attempt to access the private identifier outside of the class.
-            if lexically_scoped_identifier.is_some() && self.sym(lexically_scoped_identifier).value_declaration.is_some() {
+            if lexically_scoped_identifier.is_some()
+                && self
+                    .sym(lexically_scoped_identifier)
+                    .value_declaration
+                    .is_some()
+            {
                 let lexical_value_decl = self.sym(lexically_scoped_identifier).value_declaration;
                 let lexical_class = get_containing_class(lexical_value_decl);
                 if find_ancestor(lexical_class, |n| type_class == n).is_some() {
@@ -501,8 +651,17 @@ impl Checker {
     }
 
     // Go: checker/checker.go:11497 reportNonexistentProperty
-    pub fn report_nonexistent_property(&mut self, prop_node: Node, containing_type: TypeId, is_unchecked_js: bool) {
-        let key = NonExistentPropertyKey { prop_node, containing_type, is_unchecked_js };
+    pub fn report_nonexistent_property(
+        &mut self,
+        prop_node: Node,
+        containing_type: TypeId,
+        is_unchecked_js: bool,
+    ) {
+        let key = NonExistentPropertyKey {
+            prop_node,
+            containing_type,
+            is_unchecked_js,
+        };
         if self.non_existent_properties.contains(&key) {
             return;
         }
@@ -524,8 +683,12 @@ impl Checker {
         {
             let types = self.ty(containing_type).types().to_vec();
             for subtype in types {
-                if self.get_property_of_type(subtype, prop_node.text()).is_nil()
-                    && self.get_applicable_index_info_for_name(subtype, prop_node.text()).is_nil()
+                if self
+                    .get_property_of_type(subtype, prop_node.text())
+                    .is_nil()
+                    && self
+                        .get_applicable_index_info_for_name(subtype, prop_node.text())
+                        .is_nil()
                 {
                     let prop_name = declaration_name_to_string(prop_node).to_string();
                     let type_string = self.type_to_string(subtype);
@@ -551,7 +714,11 @@ impl Checker {
             ));
         } else {
             let promised_type = self.get_promised_type_of_promise(containing_type);
-            if promised_type.is_some() && self.get_property_of_type(promised_type, prop_node.text()).is_some() {
+            if promised_type.is_some()
+                && self
+                    .get_property_of_type(promised_type, prop_node.text())
+                    .is_some()
+            {
                 let prop_name = declaration_name_to_string(prop_node).to_string();
                 let type_string = self.type_to_string(containing_type);
                 let mut d = new_diagnostic_chain_for_node(
@@ -560,12 +727,19 @@ impl Checker {
                     diag::Property_0_does_not_exist_on_type_1,
                     args![prop_name, type_string],
                 );
-                d.add_related_info(Some(new_diagnostic_for_node(prop_node, diag::Did_you_forget_to_use_await, args![])));
+                d.add_related_info(Some(new_diagnostic_for_node(
+                    prop_node,
+                    diag::Did_you_forget_to_use_await,
+                    args![],
+                )));
                 diagnostic = Some(d);
             } else {
                 let missing_property = declaration_name_to_string(prop_node).to_string();
                 let container = self.type_to_string(containing_type);
-                let lib_suggestion = self.get_suggested_lib_for_non_existent_property(&missing_property, containing_type);
+                let lib_suggestion = self.get_suggested_lib_for_non_existent_property(
+                    &missing_property,
+                    containing_type,
+                );
                 if !lib_suggestion.is_empty() {
                     diagnostic = Some(new_diagnostic_chain_for_node(
                         diagnostic.take(),
@@ -574,7 +748,8 @@ impl Checker {
                         args![missing_property, container, lib_suggestion],
                     ));
                 } else {
-                    let suggestion = self.get_suggested_symbol_for_nonexistent_property(prop_node, containing_type);
+                    let suggestion = self
+                        .get_suggested_symbol_for_nonexistent_property(prop_node, containing_type);
                     if suggestion.is_some() {
                         let suggested_name = symbol_name(&self.symbols, suggestion);
                         let message = if is_unchecked_js {
@@ -598,8 +773,14 @@ impl Checker {
                         }
                         diagnostic = Some(d);
                     } else {
-                        diagnostic = self.elaborate_never_intersection(diagnostic.take(), prop_node, containing_type);
-                        let message: &'static ts_diagnostics::Message = if self.container_seems_to_be_empty_dom_element(containing_type) {
+                        diagnostic = self.elaborate_never_intersection(
+                            diagnostic.take(),
+                            prop_node,
+                            containing_type,
+                        );
+                        let message: &'static ts_diagnostics::Message = if self
+                            .container_seems_to_be_empty_dom_element(containing_type)
+                        {
                             diag::Property_0_does_not_exist_on_type_1_Try_changing_the_lib_compiler_option_to_include_dom
                         } else {
                             diag::Property_0_does_not_exist_on_type_1
@@ -616,12 +797,17 @@ impl Checker {
         }
         let diagnostic = diagnostic.expect("reportNonexistentProperty: diagnostic is always set");
         let is_error = !is_unchecked_js
-            || diagnostic.code() != diag::Property_0_may_not_exist_on_type_1_Did_you_mean_2.code() as i32;
+            || diagnostic.code()
+                != diag::Property_0_may_not_exist_on_type_1_Did_you_mean_2.code() as i32;
         self.add_error_or_suggestion(is_error, diagnostic);
     }
 
     // Go: checker/checker.go:11560 getSuggestedLibForNonExistentProperty
-    pub fn get_suggested_lib_for_non_existent_property(&mut self, missing_property: &str, containing_type: TypeId) -> String {
+    pub fn get_suggested_lib_for_non_existent_property(
+        &mut self,
+        missing_property: &str,
+        containing_type: TypeId,
+    ) -> String {
         let apparent_type = self.get_apparent_type(containing_type);
         let container = self.ty(apparent_type).symbol;
         if container.is_some() {
@@ -638,7 +824,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:11575 getSuggestedSymbolForNonexistentProperty
-    pub fn get_suggested_symbol_for_nonexistent_property(&mut self, name: Node, containing_type: TypeId) -> SymbolId {
+    pub fn get_suggested_symbol_for_nonexistent_property(
+        &mut self,
+        name: Node,
+        containing_type: TypeId,
+    ) -> SymbolId {
         let mut props = self.get_properties_of_type(containing_type).to_vec();
         let parent = name.parent();
         if is_property_access_expression(parent) {
@@ -662,8 +852,14 @@ impl Checker {
     // computing whether this is a `super` property access.
     // @param type the type whose property we are checking.
     // @param property the accessed property's symbol.
-    pub fn is_valid_property_access_for_completions(&mut self, node: Node, t: TypeId, property: SymbolId) -> bool {
-        let is_super = is_property_access_expression(node) && node.expression().kind() == SyntaxKind::SuperKeyword;
+    pub fn is_valid_property_access_for_completions(
+        &mut self,
+        node: Node,
+        t: TypeId,
+        property: SymbolId,
+    ) -> bool {
+        let is_super = is_property_access_expression(node)
+            && node.expression().kind() == SyntaxKind::SuperKeyword;
         self.is_property_accessible(node, is_super, false /*isWrite*/, t, property)
         // Previously we validated the 'this' type of methods but this adversely affected performance. See #31377 for more context.
     }
@@ -692,17 +888,32 @@ impl Checker {
         // A #private property access in an optional chain is an error dealt with by the parser.
         // The checker does not check for it, so we need to do our own check here.
         let value_declaration = self.sym(property).value_declaration;
-        if value_declaration.is_some() && is_private_identifier_class_element_declaration(value_declaration) {
+        if value_declaration.is_some()
+            && is_private_identifier_class_element_declaration(value_declaration)
+        {
             let decl_class = get_containing_class(value_declaration);
             return !is_optional_chain(node) && is_node_descendant_of(node, decl_class);
         }
-        self.check_property_accessibility_at_location(node, is_super, is_write, containing_type, property, Node::NIL)
+        self.check_property_accessibility_at_location(
+            node,
+            is_super,
+            is_write,
+            containing_type,
+            property,
+            Node::NIL,
+        )
     }
 
     // Go: checker/checker.go:11621 containerSeemsToBeEmptyDomElement
     pub fn container_seems_to_be_empty_dom_element(&mut self, containing_type: TypeId) -> bool {
-        !self.compiler_options.lib.iter().any(|lib| lib == "lib.dom.d.ts")
-            && self.every_contained_type(containing_type, &mut |c: &mut Checker, t: TypeId| c.has_common_dom_type_name(t))
+        !self
+            .compiler_options
+            .lib
+            .iter()
+            .any(|lib| lib == "lib.dom.d.ts")
+            && self.every_contained_type(containing_type, &mut |c: &mut Checker, t: TypeId| {
+                c.has_common_dom_type_name(t)
+            })
             && self.is_empty_object_type(containing_type)
     }
 
@@ -713,7 +924,10 @@ impl Checker {
             return false;
         }
         let name = self.sym(symbol).name.as_str();
-        name == "EventTarget" || name == "Node" || name == "Element" || name.starts_with("HTML") && name.ends_with("Element")
+        name == "EventTarget"
+            || name == "Node"
+            || name == "Element"
+            || name.starts_with("HTML") && name.ends_with("Element")
     }
 
     // Go: checker/checker.go:11633 checkAndReportErrorForExtendingInterface
@@ -721,7 +935,13 @@ impl Checker {
         let expression = self.get_entity_name_for_extending_interface(error_location);
         if expression.is_some()
             && self
-                .resolve_entity_name(expression, SymbolFlags::INTERFACE, true /*ignoreErrors*/, false, Node::NIL)
+                .resolve_entity_name(
+                    expression,
+                    SymbolFlags::INTERFACE,
+                    true, /*ignoreErrors*/
+                    false,
+                    Node::NIL,
+                )
                 .is_some()
         {
             self.error(
@@ -756,13 +976,19 @@ impl Checker {
 
     // Go: checker/checker.go:11660 isUncalledFunctionReference
     pub fn is_uncalled_function_reference(&mut self, node: Node, symbol: SymbolId) -> bool {
-        if self.sym(symbol).flags.intersects(SymbolFlags::FUNCTION | SymbolFlags::METHOD) {
+        if self
+            .sym(symbol)
+            .flags
+            .intersects(SymbolFlags::FUNCTION | SymbolFlags::METHOD)
+        {
             let mut parent = find_ancestor(node.parent(), |n| !is_access_expression(n));
             if parent.is_nil() {
                 parent = node.parent();
             }
             if is_call_like_expression(parent) {
-                return is_call_or_new_expression(parent) && is_identifier(node) && self.has_matching_argument(parent, node);
+                return is_call_or_new_expression(parent)
+                    && is_identifier(node)
+                    && self.has_matching_argument(parent, node);
             }
             let declarations = self.sym(symbol).declarations.clone();
             for d in declarations {
@@ -776,28 +1002,47 @@ impl Checker {
     }
 
     // Go: checker/checker.go:11676 checkPropertyNotUsedBeforeDeclaration
-    pub fn check_property_not_used_before_declaration(&mut self, prop: SymbolId, node: Node, right: Node) {
+    pub fn check_property_not_used_before_declaration(
+        &mut self,
+        prop: SymbolId,
+        node: Node,
+        right: Node,
+    ) {
         let value_declaration = self.sym(prop).value_declaration;
-        if value_declaration.is_nil() || source_file_info(get_source_file_of_node(node)).is_declaration_file {
+        if value_declaration.is_nil()
+            || source_file_info(get_source_file_of_node(node)).is_declaration_file
+        {
             return;
         }
         let mut diagnostic: Option<Diagnostic> = None;
         let declaration_name = right.text();
-        if self.is_in_property_initializer_or_class_static_block(node, false /*ignoreArrowFunctions*/)
-            && !self.is_optional_property_declaration(value_declaration)
+        if self.is_in_property_initializer_or_class_static_block(
+            node, false, /*ignoreArrowFunctions*/
+        ) && !self.is_optional_property_declaration(value_declaration)
             && !(is_access_expression(node) && is_access_expression(node.expression()))
             && !self.is_block_scoped_name_declared_before_use(value_declaration, right)
             && !(is_method_declaration(value_declaration)
-                && self.get_combined_modifier_flags_cached(value_declaration).intersects(ModifierFlags::STATIC))
-            && (self.compiler_options.get_use_define_for_class_fields() || !self.is_property_declared_in_ancestor_class(prop))
+                && self
+                    .get_combined_modifier_flags_cached(value_declaration)
+                    .intersects(ModifierFlags::STATIC))
+            && (self.compiler_options.get_use_define_for_class_fields()
+                || !self.is_property_declared_in_ancestor_class(prop))
         {
-            diagnostic = Some(new_diagnostic_for_node(right, diag::Property_0_is_used_before_its_initialization, args![declaration_name]));
+            diagnostic = Some(new_diagnostic_for_node(
+                right,
+                diag::Property_0_is_used_before_its_initialization,
+                args![declaration_name],
+            ));
         } else if is_class_declaration(value_declaration)
             && !is_type_reference_node(node.parent())
             && !value_declaration.flags().intersects(NodeFlags::AMBIENT)
             && !self.is_block_scoped_name_declared_before_use(value_declaration, right)
         {
-            diagnostic = Some(new_diagnostic_for_node(right, diag::Class_0_used_before_its_declaration, args![declaration_name]));
+            diagnostic = Some(new_diagnostic_for_node(
+                right,
+                diag::Class_0_used_before_its_declaration,
+                args![declaration_name],
+            ));
         }
         if let Some(mut diagnostic) = diagnostic {
             diagnostic.add_related_info(Some(new_diagnostic_for_node(
@@ -811,7 +1056,9 @@ impl Checker {
 
     // Go: checker/checker.go:11698 isOptionalPropertyDeclaration
     pub fn is_optional_property_declaration(&mut self, node: Node) -> bool {
-        is_property_declaration(node) && !has_accessor_modifier(node) && is_question_token(node.postfix_token())
+        is_property_declaration(node)
+            && !has_accessor_modifier(node)
+            && is_question_token(node.postfix_token())
     }
 
     // Go: checker/checker.go:11702 isPropertyDeclaredInAncestorClass
@@ -823,7 +1070,8 @@ impl Checker {
             if !base_types.is_empty() {
                 let name = self.sym(prop).name.clone();
                 let super_property = self.get_property_of_type(base_types[0], &name);
-                return super_property.is_some() && self.sym(super_property).value_declaration.is_some();
+                return super_property.is_some()
+                    && self.sym(super_property).value_declaration.is_some();
             }
         }
         false
@@ -836,8 +1084,17 @@ impl Checker {
     // @param isSuper True if the access is from `super.`.
     // @param type The type of the object whose property is being accessed. (Not the type of the property.)
     // @param prop The symbol for the property being accessed.
-    pub fn check_property_accessibility(&mut self, node: Node, is_super: bool, writing: bool, t: TypeId, prop: SymbolId) -> bool {
-        self.check_property_accessibility_ex(node, is_super, writing, t, prop, true /*reportError*/)
+    pub fn check_property_accessibility(
+        &mut self,
+        node: Node,
+        is_super: bool,
+        writing: bool,
+        t: TypeId,
+        prop: SymbolId,
+    ) -> bool {
+        self.check_property_accessibility_ex(
+            node, is_super, writing, t, prop, true, /*reportError*/
+        )
     }
 
     // Go: checker/checker.go:11724 checkPropertyAccessibilityEx
@@ -910,7 +1167,13 @@ impl Checker {
             }
             // A class field cannot be accessed via super.* from a derived class.
             // This is true for both [[Set]] (old) and [[Define]] (ES spec) semantics.
-            if !flags.intersects(ModifierFlags::STATIC) && self.sym(prop).declarations.iter().any(|&d| is_class_instance_property(d)) {
+            if !flags.intersects(ModifierFlags::STATIC)
+                && self
+                    .sym(prop)
+                    .declarations
+                    .iter()
+                    .any(|&d| is_class_instance_property(d))
+            {
                 if error_node.is_some() {
                     let prop_string = self.symbol_to_string(prop);
                     self.error(
@@ -927,7 +1190,8 @@ impl Checker {
             && self.symbol_has_non_method_declaration(prop)
             && (is_this_property(location)
                 || is_this_initialized_object_binding_expression(location)
-                || is_object_binding_pattern(location.parent()) && is_this_initialized_declaration(location.parent().parent()))
+                || is_object_binding_pattern(location.parent())
+                    && is_this_initialized_declaration(location.parent().parent()))
         {
             let parent_symbol = self.get_parent_of_symbol(prop);
             if parent_symbol.is_some()
@@ -954,7 +1218,8 @@ impl Checker {
         // Private property is accessible if the property is within the declaring class
         if flags.intersects(ModifierFlags::PRIVATE) {
             let parent_of_prop = self.get_parent_of_symbol(prop);
-            let declaring_class_declaration = get_class_like_declaration_of_symbol(&self.symbols, parent_of_prop);
+            let declaring_class_declaration =
+                get_class_like_declaration_of_symbol(&self.symbols, parent_of_prop);
             if !self.is_node_within_class(location, declaring_class_declaration) {
                 if error_node.is_some() {
                     let prop_string = self.symbol_to_string(prop);
@@ -993,7 +1258,8 @@ impl Checker {
             // allow PropertyAccessibility if context is in function with this parameter
             // static member access is disallowed
             let class = self.get_enclosing_class_from_this_parameter(location);
-            if class.is_some() && self.is_class_derived_from_declaring_classes(class, prop, writing) {
+            if class.is_some() && self.is_class_derived_from_declaring_classes(class, prop, writing)
+            {
                 enclosing_class = class;
             }
             if flags.intersects(ModifierFlags::STATIC) || enclosing_class.is_nil() {
@@ -1017,7 +1283,11 @@ impl Checker {
         if flags.intersects(ModifierFlags::STATIC) {
             return true;
         }
-        if self.ty(containing_type).flags.intersects(TypeFlags::TYPE_PARAMETER) {
+        if self
+            .ty(containing_type)
+            .flags
+            .intersects(TypeFlags::TYPE_PARAMETER)
+        {
             // get the original type -- represented as the type constraint of the 'this' type
             if self.ty(containing_type).as_type_parameter().is_this_type {
                 containing_type = self.get_constraint_of_type_parameter(containing_type);
@@ -1043,13 +1313,19 @@ impl Checker {
 
     // Go: checker/checker.go:11867 symbolHasNonMethodDeclaration
     pub fn symbol_has_non_method_declaration(&mut self, symbol: SymbolId) -> bool {
-        self.for_each_property(symbol, &mut |c: &mut Checker, prop: SymbolId| !c.sym(prop).flags.intersects(SymbolFlags::METHOD))
+        self.for_each_property(symbol, &mut |c: &mut Checker, prop: SymbolId| {
+            !c.sym(prop).flags.intersects(SymbolFlags::METHOD)
+        })
     }
 
     // Go: checker/checker.go:11873 forEachProperty
     // Invoke the callback for each underlying property symbol of the given symbol and return the first
     // value that isn't undefined.
-    pub fn for_each_property(&mut self, prop: SymbolId, callback: &mut dyn FnMut(&mut Checker, SymbolId) -> bool) -> bool {
+    pub fn for_each_property(
+        &mut self,
+        prop: SymbolId,
+        callback: &mut dyn FnMut(&mut Checker, SymbolId) -> bool,
+    ) -> bool {
         if !self.sym(prop).check_flags.intersects(CheckFlags::SYNTHETIC) {
             return callback(self, prop);
         }
@@ -1080,7 +1356,9 @@ impl Checker {
     // Return true if source property is a valid override of protected parts of target property.
     pub fn is_valid_override_of(&mut self, source_prop: SymbolId, target_prop: SymbolId) -> bool {
         !self.for_each_property(target_prop, &mut |c: &mut Checker, tp: SymbolId| {
-            if c.get_declaration_modifier_flags_from_symbol(tp).intersects(ModifierFlags::PROTECTED) {
+            if c.get_declaration_modifier_flags_from_symbol(tp)
+                .intersects(ModifierFlags::PROTECTED)
+            {
                 let declaring_class = c.get_declaring_class(tp);
                 return !c.is_property_in_class_derived_from(source_prop, declaring_class);
             }
@@ -1091,7 +1369,11 @@ impl Checker {
     // Go: checker/checker.go:11906 isPropertyInClassDerivedFrom
     // Return true if some underlying source property is declared in a class that derives
     // from the given base class.
-    pub fn is_property_in_class_derived_from(&mut self, prop: SymbolId, base_class: TypeId) -> bool {
+    pub fn is_property_in_class_derived_from(
+        &mut self,
+        prop: SymbolId,
+        base_class: TypeId,
+    ) -> bool {
         self.for_each_property(prop, &mut |c: &mut Checker, sp: SymbolId| {
             let source_class = c.get_declaring_class(sp);
             if source_class.is_some() {
@@ -1104,7 +1386,9 @@ impl Checker {
     // Go: checker/checker.go:11916 isNodeUsedDuringClassInitialization
     pub fn is_node_used_during_class_initialization(&mut self, node: Node) -> bool {
         find_ancestor_or_quit(node, |element| {
-            if is_constructor_declaration(element) && node_is_present(element.body()) || is_property_declaration(element) {
+            if is_constructor_declaration(element) && node_is_present(element.body())
+                || is_property_declaration(element)
+            {
                 FindAncestorResult::FIND_ANCESTOR_TRUE
             } else if is_class_like(element) || is_function_like_declaration(element) {
                 FindAncestorResult::FIND_ANCESTOR_QUIT
@@ -1117,11 +1401,17 @@ impl Checker {
 
     // Go: checker/checker.go:11927 isNodeWithinClass
     pub fn is_node_within_class(&mut self, node: Node, class_declaration: Node) -> bool {
-        self.for_each_enclosing_class(node, &mut |_c: &mut Checker, n: Node| n == class_declaration)
+        self.for_each_enclosing_class(node, &mut |_c: &mut Checker, n: Node| {
+            n == class_declaration
+        })
     }
 
     // Go: checker/checker.go:11931 forEachEnclosingClass
-    pub fn for_each_enclosing_class(&mut self, node: Node, callback: &mut dyn FnMut(&mut Checker, Node) -> bool) -> bool {
+    pub fn for_each_enclosing_class(
+        &mut self,
+        node: Node,
+        callback: &mut dyn FnMut(&mut Checker, Node) -> bool,
+    ) -> bool {
         let mut containing_class = get_containing_class(node);
         while containing_class.is_some() {
             let result = callback(self, containing_class);
@@ -1136,9 +1426,16 @@ impl Checker {
     // Go: checker/checker.go:11945 isClassDerivedFromDeclaringClasses
     // Return true if the given class derives from each of the declaring classes of the protected
     // constituents of the given property.
-    pub fn is_class_derived_from_declaring_classes(&mut self, check_class: TypeId, prop: SymbolId, writing: bool) -> bool {
+    pub fn is_class_derived_from_declaring_classes(
+        &mut self,
+        check_class: TypeId,
+        prop: SymbolId,
+        writing: bool,
+    ) -> bool {
         !self.for_each_property(prop, &mut |c: &mut Checker, p: SymbolId| {
-            if c.get_declaration_modifier_flags_from_symbol_ex(p, writing).intersects(ModifierFlags::PROTECTED) {
+            if c.get_declaration_modifier_flags_from_symbol_ex(p, writing)
+                .intersects(ModifierFlags::PROTECTED)
+            {
                 let declaring_class = c.get_declaring_class(p);
                 return !c.has_base_type(check_class, declaring_class);
             }
@@ -1157,17 +1454,29 @@ impl Checker {
         }
         if this_type.is_some() {
             // 2. The constraint of a type parameter used for an explicit 'this' parameter
-            if self.ty(this_type).flags.intersects(TypeFlags::TYPE_PARAMETER) {
+            if self
+                .ty(this_type)
+                .flags
+                .intersects(TypeFlags::TYPE_PARAMETER)
+            {
                 this_type = self.get_constraint_of_type_parameter(this_type);
             }
         } else {
             // 3. The 'this' parameter of a contextual type
-            let this_container = get_this_container(node, false /*includeArrowFunctions*/, false /*includeClassComputedPropertyName*/);
+            let this_container = get_this_container(
+                node, false, /*includeArrowFunctions*/
+                false, /*includeClassComputedPropertyName*/
+            );
             if this_container.is_some() && is_function_like(this_container) {
                 this_type = self.get_contextual_this_parameter_type(this_container);
             }
         }
-        if this_type.is_some() && self.ty(this_type).object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE) {
+        if this_type.is_some()
+            && self
+                .ty(this_type)
+                .object_flags
+                .intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE)
+        {
             return self.get_target_type(this_type);
         }
         TypeId::NIL
@@ -1176,7 +1485,10 @@ impl Checker {
 
 // Go: checker/checker.go:11980 getThisParameterFromNodeContext
 pub fn get_this_parameter_from_node_context(node: Node) -> Node {
-    let this_container = get_this_container(node, false /*includeArrowFunctions*/, false /*includeClassComputedPropertyName*/);
+    let this_container = get_this_container(
+        node, false, /*includeArrowFunctions*/
+        false, /*includeClassComputedPropertyName*/
+    );
     if this_container.is_some() && is_function_like(this_container) {
         return get_this_parameter(this_container);
     }
@@ -1205,8 +1517,12 @@ impl Checker {
                 // We have an object literal method. Check if the containing object literal has a contextual type
                 // that includes a ThisType<T>. If so, T is the contextual type for 'this'. We continue looking in
                 // any directly enclosing object literals.
-                let contextual_type = self.get_apparent_type_of_contextual_type(containing_literal, ContextFlags::NONE);
-                let mut this_type = self.get_this_type_of_object_literal_from_contextual_type(containing_literal, contextual_type);
+                let contextual_type = self
+                    .get_apparent_type_of_contextual_type(containing_literal, ContextFlags::NONE);
+                let mut this_type = self.get_this_type_of_object_literal_from_contextual_type(
+                    containing_literal,
+                    contextual_type,
+                );
                 if this_type.is_some() {
                     let inference_context = self.get_inference_context(containing_literal);
                     let mapper = self.get_mapper_from_context(inference_context);
@@ -1232,9 +1548,16 @@ impl Checker {
                     // Don't contextually type `this` as `exports` in `exports.Point = function(x, y) { this.x = x; this.y = y; }`
                     if in_js && is_identifier(expression) {
                         let source_file = get_source_file_of_node(parent);
-                        if source_file_info(source_file).common_js_module_indicator.is_some() {
+                        if source_file_info(source_file)
+                            .common_js_module_indicator
+                            .is_some()
+                        {
                             let resolved = self.get_resolved_symbol(expression);
-                            if self.sym(resolved).flags.intersects(SymbolFlags::MODULE_EXPORTS) {
+                            if self
+                                .sym(resolved)
+                                .flags
+                                .intersects(SymbolFlags::MODULE_EXPORTS)
+                            {
                                 return TypeId::NIL;
                             }
                         }
@@ -1251,7 +1574,10 @@ impl Checker {
     pub fn check_this_expression(&mut self, node: Node) -> TypeId {
         // Stop at the first arrow function so that we can
         // tell whether 'this' needs to be captured.
-        let mut container = get_this_container(node, true /*includeArrowFunctions*/, true /*includeClassComputedPropertyName*/);
+        let mut container = get_this_container(
+            node, true, /*includeArrowFunctions*/
+            true, /*includeClassComputedPropertyName*/
+        );
         let mut captured_by_arrow_function = false;
         let mut this_in_computed_property_name = false;
         if is_constructor_declaration(container) {
@@ -1264,11 +1590,19 @@ impl Checker {
         loop {
             // Now skip arrow functions to get the "real" owner of 'this'.
             if is_arrow_function(container) {
-                container = get_this_container(container, false /*includeArrowFunctions*/, !this_in_computed_property_name);
+                container = get_this_container(
+                    container,
+                    false, /*includeArrowFunctions*/
+                    !this_in_computed_property_name,
+                );
                 captured_by_arrow_function = true;
             }
             if is_computed_property_name(container) {
-                container = get_this_container(container, !captured_by_arrow_function, false /*includeClassComputedPropertyName*/);
+                container = get_this_container(
+                    container,
+                    !captured_by_arrow_function,
+                    false, /*includeClassComputedPropertyName*/
+                );
                 this_in_computed_property_name = true;
                 continue;
             }
@@ -1276,15 +1610,27 @@ impl Checker {
         }
         self.check_this_in_static_class_field_initializer_in_decorated_class(node, container);
         if this_in_computed_property_name {
-            self.error(node, diag::X_this_cannot_be_referenced_in_a_computed_property_name, args![]);
+            self.error(
+                node,
+                diag::X_this_cannot_be_referenced_in_a_computed_property_name,
+                args![],
+            );
         } else {
             match container.kind() {
                 SyntaxKind::ModuleDeclaration => {
-                    self.error(node, diag::X_this_cannot_be_referenced_in_a_module_or_namespace_body, args![]);
+                    self.error(
+                        node,
+                        diag::X_this_cannot_be_referenced_in_a_module_or_namespace_body,
+                        args![],
+                    );
                     // do not return here so in case if lexical this is captured - it will be reflected in flags on NodeLinks
                 }
                 SyntaxKind::EnumDeclaration => {
-                    self.error(node, diag::X_this_cannot_be_referenced_in_current_location, args![]);
+                    self.error(
+                        node,
+                        diag::X_this_cannot_be_referenced_in_current_location,
+                        args![],
+                    );
                     // do not return here so in case if lexical this is captured - it will be reflected in flags on NodeLinks
                 }
                 _ => {}
@@ -1294,7 +1640,11 @@ impl Checker {
         if self.no_implicit_this {
             let global_this_type = self.get_type_of_symbol(self.global_this_symbol);
             if t == global_this_type && captured_by_arrow_function {
-                self.error(node, diag::The_containing_arrow_function_captures_the_global_value_of_this, args![]);
+                self.error(
+                    node,
+                    diag::The_containing_arrow_function_captures_the_global_value_of_this,
+                    args![],
+                );
             } else if t.is_nil() {
                 // With noImplicitThis, functions may not reference 'this' if it has type 'any'
                 // PORT: Go mutates the diagnostic returned by c.error. Here the diagnostic is built

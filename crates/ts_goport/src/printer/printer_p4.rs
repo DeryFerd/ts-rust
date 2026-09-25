@@ -108,7 +108,12 @@ impl Printer {
         self.write_punctuation("{");
         self.push_name_generation_scope(node);
         self.generate_all_member_names(node.member_list());
-        self.emit_list(Printer::emit_class_element, node, node.member_list(), ListFormat::CLASS_MEMBERS);
+        self.emit_list(
+            Printer::emit_class_element,
+            node,
+            node.member_list(),
+            ListFormat::CLASS_MEMBERS,
+        );
         self.pop_name_generation_scope(node);
         self.write_punctuation("}");
         self.decrease_indent_if(indented);
@@ -133,7 +138,12 @@ impl Printer {
         self.write_punctuation("{");
         self.push_name_generation_scope(node);
         self.generate_all_member_names(node.member_list());
-        self.emit_list(Printer::emit_type_element, node, node.member_list(), ListFormat::INTERFACE_MEMBERS);
+        self.emit_list(
+            Printer::emit_type_element,
+            node,
+            node.member_list(),
+            ListFormat::INTERFACE_MEMBERS,
+        );
         self.pop_name_generation_scope(node);
         self.write_punctuation("}");
         self.exit_node(node, state);
@@ -164,7 +174,12 @@ impl Printer {
         self.emit_binding_identifier(node.name());
         self.write_space();
         self.write_punctuation("{");
-        self.emit_list(Printer::emit_enum_member_node, node, node.member_list(), ListFormat::ENUM_MEMBERS);
+        self.emit_list(
+            Printer::emit_enum_member_node,
+            node,
+            node.member_list(),
+            ListFormat::ENUM_MEMBERS,
+        );
         self.write_punctuation("}");
         self.exit_node(node, state);
     }
@@ -202,8 +217,15 @@ impl Printer {
     pub(crate) fn emit_module_block(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.generate_names(node);
-        self.emit_token(SyntaxKind::OpenBraceToken, node.pos(), WriteKind::PUNCTUATION, node);
-        let format = if self.is_empty_block(node, node.statement_list()) || self.should_emit_on_single_line(node) {
+        self.emit_token(
+            SyntaxKind::OpenBraceToken,
+            node.pos(),
+            WriteKind::PUNCTUATION,
+            node,
+        );
+        let format = if self.is_empty_block(node, node.statement_list())
+            || self.should_emit_on_single_line(node)
+        {
             ListFormat::SINGLE_LINE_BLOCK_STATEMENTS
         } else {
             ListFormat::MULTI_LINE_BLOCK_STATEMENTS
@@ -226,7 +248,12 @@ impl Printer {
     // Go: printer.go:3853 emitCaseBlock
     pub(crate) fn emit_case_block(&mut self, node: Node) {
         let state = self.enter_node(node);
-        self.emit_token(SyntaxKind::OpenBraceToken, node.pos(), WriteKind::PUNCTUATION, node);
+        self.emit_token(
+            SyntaxKind::OpenBraceToken,
+            node.pos(),
+            WriteKind::PUNCTUATION,
+            node,
+        );
         self.emit_list(
             Printer::emit_case_or_default_clause_node,
             node,
@@ -260,7 +287,12 @@ impl Printer {
         }
         self.emit_binding_identifier(node.name());
         self.write_space();
-        self.emit_token(SyntaxKind::EqualsToken, node.name().end(), WriteKind::PUNCTUATION, node);
+        self.emit_token(
+            SyntaxKind::EqualsToken,
+            node.name().end(),
+            WriteKind::PUNCTUATION,
+            node,
+        );
         self.write_space();
         self.emit_module_reference(node.module_reference());
         self.write_trailing_semicolon();
@@ -291,7 +323,12 @@ impl Printer {
         if node.import_clause() != Node::NIL {
             self.emit_import_clause(node.import_clause());
             self.write_space();
-            self.emit_token(SyntaxKind::FromKeyword, node.import_clause().end(), WriteKind::KEYWORD, node);
+            self.emit_token(
+                SyntaxKind::FromKeyword,
+                node.import_clause().end(),
+                WriteKind::KEYWORD,
+                node,
+            );
             self.write_space();
         }
         self.emit_expression(node.module_specifier(), OperatorPrecedence::LOWEST);
@@ -314,7 +351,12 @@ impl Printer {
         if name != Node::NIL {
             self.emit_binding_identifier(node.name());
             if node.named_bindings() != Node::NIL {
-                self.emit_token(SyntaxKind::CommaToken, name.end(), WriteKind::PUNCTUATION, node);
+                self.emit_token(
+                    SyntaxKind::CommaToken,
+                    name.end(),
+                    WriteKind::PUNCTUATION,
+                    node,
+                );
                 self.write_space();
             }
         }
@@ -325,7 +367,12 @@ impl Printer {
     // Go: printer.go:3929 emitNamespaceImport
     pub(crate) fn emit_namespace_import(&mut self, node: Node) {
         let state = self.enter_node(node);
-        let pos = self.emit_token(SyntaxKind::AsteriskToken, node.pos(), WriteKind::PUNCTUATION, node);
+        let pos = self.emit_token(
+            SyntaxKind::AsteriskToken,
+            node.pos(),
+            WriteKind::PUNCTUATION,
+            node,
+        );
         self.write_space();
         self.emit_token(SyntaxKind::AsKeyword, pos, WriteKind::KEYWORD, node);
         self.write_space();
@@ -369,7 +416,12 @@ impl Printer {
         if node.property_name() != Node::NIL {
             self.emit_module_export_name(node.property_name());
             self.write_space();
-            self.emit_token(SyntaxKind::AsKeyword, node.property_name().end(), WriteKind::KEYWORD, node);
+            self.emit_token(
+                SyntaxKind::AsKeyword,
+                node.property_name().end(),
+                WriteKind::KEYWORD,
+                node,
+            );
             self.write_space();
         }
         self.emit_binding_identifier(node.name());
@@ -384,19 +436,30 @@ impl Printer {
     // Go: printer.go:3981 emitExportAssignment
     pub(crate) fn emit_export_assignment(&mut self, node: Node) {
         let state = self.enter_node(node);
-        let next_pos = self.emit_token(SyntaxKind::ExportKeyword, node.pos(), WriteKind::KEYWORD, node);
+        let next_pos = self.emit_token(
+            SyntaxKind::ExportKeyword,
+            node.pos(),
+            WriteKind::KEYWORD,
+            node,
+        );
         self.write_space();
         if node.is_export_equals() {
             self.emit_token(SyntaxKind::EqualsToken, next_pos, WriteKind::OPERATOR, node);
         } else {
-            self.emit_token(SyntaxKind::DefaultKeyword, next_pos, WriteKind::KEYWORD, node);
+            self.emit_token(
+                SyntaxKind::DefaultKeyword,
+                next_pos,
+                WriteKind::KEYWORD,
+                node,
+            );
         }
         self.write_space();
         if node.is_export_equals() {
             self.emit_expression(node.expression(), OperatorPrecedence::ASSIGNMENT);
         } else {
             // parenthesize `class` and `function` expressions so as not to conflict with exported `class` and `function` declarations
-            let expr = get_leftmost_expression(node.expression(), false /*stopAtCallExpressions*/);
+            let expr =
+                get_leftmost_expression(node.expression(), false /*stopAtCallExpressions*/);
             if is_class_expression(expr) || is_function_expression(expr) {
                 self.emit_expression(node.expression(), OperatorPrecedence::PARENTHESES);
             } else {
@@ -411,7 +474,12 @@ impl Printer {
     pub(crate) fn emit_export_declaration(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_modifier_list(node, node.modifiers(), false /*allowDecorators*/);
-        let mut pos = self.emit_token(SyntaxKind::ExportKeyword, node.pos(), WriteKind::KEYWORD, node);
+        let mut pos = self.emit_token(
+            SyntaxKind::ExportKeyword,
+            node.pos(),
+            WriteKind::KEYWORD,
+            node,
+        );
         self.write_space();
         if node.is_type_only() {
             pos = self.emit_token(SyntaxKind::TypeKeyword, pos, WriteKind::KEYWORD, node);
@@ -464,7 +532,11 @@ impl Printer {
         self.write_punctuation(":");
         self.write_space();
         let value = node.value();
-        if !self.emit_context.emit_flags(node.value()).intersects(EmitFlags::NO_LEADING_COMMENTS) {
+        if !self
+            .emit_context
+            .emit_flags(node.value())
+            .intersects(EmitFlags::NO_LEADING_COMMENTS)
+        {
             let comment_range = self.emit_context.comment_range(value);
             self.emit_trailing_comments(comment_range.pos(), CommentSeparator::AFTER);
         }
@@ -480,7 +552,12 @@ impl Printer {
     // Go: printer.go:4060 emitNamespaceExportDeclaration
     pub(crate) fn emit_namespace_export_declaration(&mut self, node: Node) {
         let state = self.enter_node(node);
-        let mut pos = self.emit_token(SyntaxKind::ExportKeyword, node.pos(), WriteKind::KEYWORD, node);
+        let mut pos = self.emit_token(
+            SyntaxKind::ExportKeyword,
+            node.pos(),
+            WriteKind::KEYWORD,
+            node,
+        );
         self.write_space();
         pos = self.emit_token(SyntaxKind::AsKeyword, pos, WriteKind::KEYWORD, node);
         self.write_space();
@@ -494,7 +571,12 @@ impl Printer {
     // Go: printer.go:4073 emitNamespaceExport
     pub(crate) fn emit_namespace_export(&mut self, node: Node) {
         let state = self.enter_node(node);
-        let pos = self.emit_token(SyntaxKind::AsteriskToken, node.pos(), WriteKind::PUNCTUATION, node);
+        let pos = self.emit_token(
+            SyntaxKind::AsteriskToken,
+            node.pos(),
+            WriteKind::PUNCTUATION,
+            node,
+        );
         self.write_space();
         self.emit_token(SyntaxKind::AsKeyword, pos, WriteKind::KEYWORD, node);
         self.write_space();
@@ -535,7 +617,12 @@ impl Printer {
         if node.property_name() != Node::NIL {
             self.emit_module_export_name(node.property_name());
             self.write_space();
-            self.emit_token(SyntaxKind::AsKeyword, node.property_name().end(), WriteKind::KEYWORD, node);
+            self.emit_token(
+                SyntaxKind::AsKeyword,
+                node.property_name().end(),
+                WriteKind::KEYWORD,
+                node,
+            );
             self.write_space();
         }
         self.emit_module_export_name(node.name());
@@ -573,7 +660,9 @@ impl Printer {
         match node.kind() {
             // Statements
             SyntaxKind::Block => self.emit_block(node),
-            SyntaxKind::EmptyStatement => self.emit_empty_statement(node, false /*isEmbeddedStatement*/),
+            SyntaxKind::EmptyStatement => {
+                self.emit_empty_statement(node, false /*isEmbeddedStatement*/)
+            }
             SyntaxKind::VariableStatement => self.emit_variable_statement(node),
             SyntaxKind::ExpressionStatement => self.emit_expression_statement(node),
             SyntaxKind::IfStatement => self.emit_if_statement(node),
@@ -772,14 +861,22 @@ impl Printer {
     pub(crate) fn emit_jsx_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         if node.expression() != Node::NIL
-            || !self.comments_disabled && !node_is_synthesized(node) && self.has_comments_at_position(node.pos())
+            || !self.comments_disabled
+                && !node_is_synthesized(node)
+                && self.has_comments_at_position(node.pos())
         {
             // preserve empty expressions if they contain comments!
             let indented = self.current_source_file != Node::NIL
                 && !node_is_synthesized(node)
-                && get_lines_between_positions(self.current_source_file, node.pos(), node.end()) != 0;
+                && get_lines_between_positions(self.current_source_file, node.pos(), node.end())
+                    != 0;
             self.increase_indent_if(indented);
-            let end = self.emit_token(SyntaxKind::OpenBraceToken, node.pos(), WriteKind::PUNCTUATION, node);
+            let end = self.emit_token(
+                SyntaxKind::OpenBraceToken,
+                node.pos(),
+                WriteKind::PUNCTUATION,
+                node,
+            );
             self.emit_token_node(node.dot_dot_dot_token());
             if node.expression() != Node::NIL {
                 self.emit_expression(node.expression(), OperatorPrecedence::DISALLOW_COMMA);
@@ -876,7 +973,12 @@ impl Printer {
             self.write_space();
             format = format.without(ListFormat::MULTI_LINE | ListFormat::INDENTED);
         } else {
-            self.emit_token(SyntaxKind::ColonToken, colon_pos, WriteKind::PUNCTUATION, node);
+            self.emit_token(
+                SyntaxKind::ColonToken,
+                colon_pos,
+                WriteKind::PUNCTUATION,
+                node,
+            );
         }
 
         self.emit_list(Printer::emit_statement, node, statements, format);
@@ -885,7 +987,12 @@ impl Printer {
     // Go: printer.go:4451 emitCaseClause
     pub(crate) fn emit_case_clause(&mut self, node: Node) {
         let state = self.enter_node(node);
-        self.emit_token(SyntaxKind::CaseKeyword, node.pos(), WriteKind::KEYWORD, node);
+        self.emit_token(
+            SyntaxKind::CaseKeyword,
+            node.pos(),
+            WriteKind::KEYWORD,
+            node,
+        );
         self.write_space();
         self.emit_expression(node.expression(), OperatorPrecedence::LOWEST);
         self.emit_case_or_default_clause_statements(node, node.expression().end());
@@ -895,7 +1002,12 @@ impl Printer {
     // Go: printer.go:4460 emitDefaultClause
     pub(crate) fn emit_default_clause(&mut self, node: Node) {
         let state = self.enter_node(node);
-        let pos = self.emit_token(SyntaxKind::DefaultKeyword, node.pos(), WriteKind::KEYWORD, node);
+        let pos = self.emit_token(
+            SyntaxKind::DefaultKeyword,
+            node.pos(),
+            WriteKind::KEYWORD,
+            node,
+        );
         self.emit_case_or_default_clause_statements(node, pos);
         self.exit_node(node, state);
     }
@@ -932,11 +1044,21 @@ impl Printer {
     // Go: printer.go:4491 emitCatchClause
     pub(crate) fn emit_catch_clause(&mut self, node: Node) {
         let state = self.enter_node(node);
-        let open_paren_pos = self.emit_token(SyntaxKind::CatchKeyword, node.pos(), WriteKind::KEYWORD, node);
+        let open_paren_pos = self.emit_token(
+            SyntaxKind::CatchKeyword,
+            node.pos(),
+            WriteKind::KEYWORD,
+            node,
+        );
         self.write_space();
 
         if node.variable_declaration() != Node::NIL {
-            self.emit_token(SyntaxKind::OpenParenToken, open_paren_pos, WriteKind::PUNCTUATION, node);
+            self.emit_token(
+                SyntaxKind::OpenParenToken,
+                open_paren_pos,
+                WriteKind::PUNCTUATION,
+                node,
+            );
             self.emit_variable_declaration(node.variable_declaration());
             self.emit_token(
                 SyntaxKind::CloseParenToken,
@@ -971,7 +1093,11 @@ impl Printer {
         // "comment1" is not considered to be leading comment for node.initializer
         // but rather a trailing comment on the previous node.
         let initializer = node.initializer();
-        if !self.emit_context.emit_flags(initializer).intersects(EmitFlags::NO_LEADING_COMMENTS) {
+        if !self
+            .emit_context
+            .emit_flags(initializer)
+            .intersects(EmitFlags::NO_LEADING_COMMENTS)
+        {
             let comment_range = self.emit_context.comment_range(initializer);
             self.emit_trailing_comments(comment_range.pos(), CommentSeparator::AFTER);
         }
@@ -987,7 +1113,10 @@ impl Printer {
             self.write_space();
             self.write_punctuation("=");
             self.write_space();
-            self.emit_expression(node.object_assignment_initializer(), OperatorPrecedence::DISALLOW_COMMA);
+            self.emit_expression(
+                node.object_assignment_initializer(),
+                OperatorPrecedence::DISALLOW_COMMA,
+            );
         }
         self.exit_node(node, state);
     }
@@ -996,7 +1125,12 @@ impl Printer {
     pub(crate) fn emit_spread_assignment(&mut self, node: Node) {
         let state = self.enter_node(node);
         if node.expression() != Node::NIL {
-            self.emit_token(SyntaxKind::DotDotDotToken, node.pos(), WriteKind::PUNCTUATION, node);
+            self.emit_token(
+                SyntaxKind::DotDotDotToken,
+                node.pos(),
+                WriteKind::PUNCTUATION,
+                node,
+            );
             self.emit_expression(node.expression(), OperatorPrecedence::DISALLOW_COMMA);
         }
         self.exit_node(node, state);
@@ -1069,7 +1203,8 @@ impl Printer {
         let mut helpers_emitted = false;
         let source_file = self.current_source_file;
         let should_skip = self.options.no_emit_helpers
-            || (source_file != Node::NIL && self.emit_context.has_recorded_external_helpers(source_file));
+            || (source_file != Node::NIL
+                && self.emit_context.has_recorded_external_helpers(source_file));
         let mut helpers = self.emit_context.get_emit_helpers(node).to_vec();
         if !helpers.is_empty() {
             // PORT: Go `slices.SortStableFunc`; `sort_by` is stable.
@@ -1086,7 +1221,9 @@ impl Printer {
                 if let Some(text_callback) = &helper.text_callback {
                     // PORT: Go passes the `p.makeFileLevelOptimisticUniqueName`
                     // func value. Here a closure calls the Printer method.
-                    let text = text_callback(&mut |name: &str| self.make_file_level_optimistic_unique_name(name));
+                    let text = text_callback(&mut |name: &str| {
+                        self.make_file_level_optimistic_unique_name(name)
+                    });
                     self.write_lines(&text);
                 } else {
                     self.write_lines(&helper.text);
@@ -1159,7 +1296,11 @@ impl Printer {
             if ref_.resolution_mode != ResolutionMode::NONE {
                 resolution_mode = format!(
                     "resolution-mode=\"{}\" ",
-                    if ref_.resolution_mode == ResolutionMode::ESM { "import" } else { "require" }
+                    if ref_.resolution_mode == ResolutionMode::ESM {
+                        "import"
+                    } else {
+                        "require"
+                    }
                 );
             }
             self.write_comment(&format!(
@@ -1167,7 +1308,11 @@ impl Printer {
                 kind,
                 ref_.file_name,
                 resolution_mode,
-                if ref_.preserve { "preserve=\"true\" " } else { "" }
+                if ref_.preserve {
+                    "preserve=\"true\" "
+                } else {
+                    ""
+                }
             ));
             self.write_line();
         }

@@ -22,9 +22,11 @@ pub fn is_valid_big_int_string(s: &str, round_trip_only: bool) -> bool {
     scanner.set_skip_trivia(false);
     let success = Rc::new(Cell::new(true));
     let success_in_callback = success.clone();
-    scanner.set_on_error(Some(Box::new(move |_diagnostic: &'static ts_diagnostics::Message, _start: i32, _length: i32| {
-        success_in_callback.set(false);
-    })));
+    scanner.set_on_error(Some(Box::new(
+        move |_diagnostic: &'static ts_diagnostics::Message, _start: i32, _length: i32| {
+            success_in_callback.set(false);
+        },
+    )));
     scanner.set_text(format!("{s}n"));
     let mut result = scanner.scan();
     let negative = result == SyntaxKind::MinusToken;
@@ -51,7 +53,9 @@ pub fn is_valid_big_int_string(s: &str, round_trip_only: bool) -> bool {
 // Go: checker/utilities.go:938 isValidESSymbolDeclaration
 pub fn is_valid_es_symbol_declaration(node: Node) -> bool {
     if is_variable_declaration(node) {
-        return is_var_const(node) && is_identifier(node.name()) && is_variable_declaration_in_variable_statement(node);
+        return is_var_const(node)
+            && is_identifier(node.name())
+            && is_variable_declaration_in_variable_statement(node);
     }
     if is_property_declaration(node) {
         return has_readonly_modifier(node) && has_static_modifier(node);
@@ -75,7 +79,9 @@ impl Checker {
         if symbol.is_nil() {
             return false;
         }
-        self.sym(symbol).name.starts_with(&format!("{INTERNAL_SYMBOL_NAME_PREFIX}#"))
+        self.sym(symbol)
+            .name
+            .starts_with(&format!("{INTERNAL_SYMBOL_NAME_PREFIX}#"))
     }
 }
 
@@ -93,7 +99,9 @@ pub fn is_late_bound_name(name: &str) -> bool {
 impl Checker {
     // Go: checker/utilities.go:967 isObjectOrArrayLiteralType
     pub fn is_object_or_array_literal_type(&self, t: TypeId) -> bool {
-        self.ty(t).object_flags.intersects(ObjectFlags::OBJECT_LITERAL | ObjectFlags::ARRAY_LITERAL)
+        self.ty(t)
+            .object_flags
+            .intersects(ObjectFlags::OBJECT_LITERAL | ObjectFlags::ARRAY_LITERAL)
     }
 }
 
@@ -133,7 +141,10 @@ pub fn is_class_instance_property(node: Node) -> bool {
             || !is_prototype_access(left.expression()))
             && !is_bindable_static_name_expression(left, true /*excludeThisKeyword*/);
     }
-    node.parent().is_some() && is_class_like(node.parent()) && is_property_declaration(node) && !has_accessor_modifier(node)
+    node.parent().is_some()
+        && is_class_like(node.parent())
+        && is_property_declaration(node)
+        && !has_accessor_modifier(node)
 }
 
 // Go: checker/utilities.go:1003 isThisInitializedObjectBindingExpression
@@ -162,7 +173,9 @@ impl Checker {
     // Go: checker/utilities.go:1017 isConstantVariable
     pub fn is_constant_variable(&mut self, symbol: SymbolId) -> bool {
         self.sym(symbol).flags.intersects(SymbolFlags::VARIABLE)
-            && self.get_declaration_node_flags_from_symbol(symbol).intersects(NodeFlags::CONSTANT)
+            && self
+                .get_declaration_node_flags_from_symbol(symbol)
+                .intersects(NodeFlags::CONSTANT)
     }
 
     // Go: checker/utilities.go:1021 isParameterOrMutableLocalVariable
@@ -174,7 +187,8 @@ impl Checker {
             return declaration.is_some()
                 && (is_parameter_declaration(declaration)
                     || is_variable_declaration(declaration)
-                        && (is_catch_clause(declaration.parent()) || self.is_mutable_local_variable_declaration(declaration)));
+                        && (is_catch_clause(declaration.parent())
+                            || self.is_mutable_local_variable_declaration(declaration)));
         }
         false
     }
@@ -193,7 +207,9 @@ impl Checker {
 pub fn is_in_ambient_or_type_node(node: Node) -> bool {
     node.flags().intersects(NodeFlags::AMBIENT)
         || find_ancestor(node, |n: Node| {
-            is_interface_declaration(n) || is_type_or_js_type_alias_declaration(n) || is_type_literal_node(n)
+            is_interface_declaration(n)
+                || is_type_or_js_type_alias_declaration(n)
+                || is_type_literal_node(n)
         })
         .is_some()
 }
@@ -296,7 +312,9 @@ pub fn is_call_chain(node: Node) -> bool {
 impl Checker {
     // Go: checker/utilities.go:1066 callLikeExpressionMayHaveTypeArguments
     pub fn call_like_expression_may_have_type_arguments(&self, node: Node) -> bool {
-        is_call_or_new_expression(node) || is_tagged_template_expression(node) || is_jsx_opening_like_element(node)
+        is_call_or_new_expression(node)
+            || is_tagged_template_expression(node)
+            || is_jsx_opening_like_element(node)
     }
 }
 
@@ -328,22 +346,29 @@ pub fn is_in_right_side_of_import_or_export_assignment(mut node: Node) -> bool {
         node = node.parent();
     }
 
-    node.parent().kind() == SyntaxKind::ImportEqualsDeclaration && node.parent().module_reference() == node
-        || node.parent().kind() == SyntaxKind::ExportAssignment && node.parent().expression() == node
+    node.parent().kind() == SyntaxKind::ImportEqualsDeclaration
+        && node.parent().module_reference() == node
+        || node.parent().kind() == SyntaxKind::ExportAssignment
+            && node.parent().expression() == node
 }
 
 // Go: checker/utilities.go:1093 isJsxIntrinsicTagName
 pub fn is_jsx_intrinsic_tag_name(tag_name: Node) -> bool {
-    is_identifier(tag_name) && is_intrinsic_jsx_name(&tag_name.text()) || is_jsx_namespaced_name(tag_name)
+    is_identifier(tag_name) && is_intrinsic_jsx_name(&tag_name.text())
+        || is_jsx_namespaced_name(tag_name)
 }
 
 // Go: checker/utilities.go:1097 getContainingObjectLiteral
 pub fn get_containing_object_literal(f: Node) -> Node {
-    if (f.kind() == SyntaxKind::MethodDeclaration || f.kind() == SyntaxKind::GetAccessor || f.kind() == SyntaxKind::SetAccessor)
+    if (f.kind() == SyntaxKind::MethodDeclaration
+        || f.kind() == SyntaxKind::GetAccessor
+        || f.kind() == SyntaxKind::SetAccessor)
         && f.parent().kind() == SyntaxKind::ObjectLiteralExpression
     {
         return f.parent();
-    } else if f.kind() == SyntaxKind::FunctionExpression && f.parent().kind() == SyntaxKind::PropertyAssignment {
+    } else if f.kind() == SyntaxKind::FunctionExpression
+        && f.parent().kind() == SyntaxKind::PropertyAssignment
+    {
         return f.parent().parent();
     }
     Node::NIL
@@ -394,11 +419,13 @@ pub fn expression_result_is_unused(mut node: Node) -> bool {
         // result is unused in an expression statement, `void` expression, or the initializer or incrementer of a `for` loop
         if is_expression_statement(parent)
             || is_void_expression(parent)
-            || is_for_statement(parent) && (parent.initializer() == node || parent.incrementor() == node)
+            || is_for_statement(parent)
+                && (parent.initializer() == node || parent.incrementor() == node)
         {
             return true;
         }
-        if is_binary_expression(parent) && parent.operator_token().kind() == SyntaxKind::CommaToken {
+        if is_binary_expression(parent) && parent.operator_token().kind() == SyntaxKind::CommaToken
+        {
             // left side of comma is always unused
             if node == parent.left() {
                 return true;
@@ -432,7 +459,9 @@ fn get_super_container(mut node: Node, stop_on_functions: bool) -> Node {
             SyntaxKind::ComputedPropertyName => {
                 node = node.parent();
             }
-            SyntaxKind::FunctionDeclaration | SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction => {
+            SyntaxKind::FunctionDeclaration
+            | SyntaxKind::FunctionExpression
+            | SyntaxKind::ArrowFunction => {
                 if !stop_on_functions {
                     continue;
                 }
@@ -451,7 +480,9 @@ fn get_super_container(mut node: Node, stop_on_functions: bool) -> Node {
             }
             SyntaxKind::Decorator => {
                 // Decorators are always applied outside of the body of a class or method.
-                if is_parameter_declaration(node.parent()) && is_class_element(node.parent().parent()) {
+                if is_parameter_declaration(node.parent())
+                    && is_class_element(node.parent().parent())
+                {
                     // If the decorator's parent is a Parameter, we resolve the this container from
                     // the grandparent class declaration.
                     node = node.parent().parent();
@@ -508,13 +539,20 @@ pub fn for_each_yield_expression(body: Node, visitor: &mut dyn FnMut(Node) -> bo
 
 // Go: checker/utilities.go:1231 getEnclosingContainer
 pub fn get_enclosing_container(node: Node) -> Node {
-    find_ancestor(node.parent(), |n: Node| get_container_flags(n).intersects(ContainerFlags::IS_CONTAINER))
+    find_ancestor(node.parent(), |n: Node| {
+        get_container_flags(n).intersects(ContainerFlags::IS_CONTAINER)
+    })
 }
 
 impl Checker {
     // Go: checker/utilities.go:1237 getDeclarationsOfKind
     pub fn get_declarations_of_kind(&self, symbol: SymbolId, kind: SyntaxKind) -> Vec<Node> {
-        self.sym(symbol).declarations.iter().copied().filter(|d| d.kind() == kind).collect()
+        self.sym(symbol)
+            .declarations
+            .iter()
+            .copied()
+            .filter(|d| d.kind() == kind)
+            .collect()
     }
 }
 
@@ -526,7 +564,12 @@ pub fn has_type(node: Node) -> bool {
 impl Checker {
     // Go: checker/utilities.go:1245 getNonRestParameterCount
     pub fn get_non_rest_parameter_count(&self, sig: SignatureId) -> i32 {
-        self.sig(sig).parameters.len() as i32 - if self.signature_has_rest_parameter(sig) { 1 } else { 0 }
+        self.sig(sig).parameters.len() as i32
+            - if self.signature_has_rest_parameter(sig) {
+                1
+            } else {
+                0
+            }
     }
 }
 
@@ -558,384 +601,516 @@ pub struct FeatureMapEntry {
 // PORT: Go `sync.OnceValue` becomes a `OnceLock`. The map keys and entry
 // order are copied from Go.
 pub fn get_feature_map() -> &'static FxHashMap<&'static str, Vec<FeatureMapEntry>> {
-    static FEATURE_MAP: std::sync::OnceLock<FxHashMap<&'static str, Vec<FeatureMapEntry>>> = std::sync::OnceLock::new();
+    static FEATURE_MAP: std::sync::OnceLock<FxHashMap<&'static str, Vec<FeatureMapEntry>>> =
+        std::sync::OnceLock::new();
     FEATURE_MAP.get_or_init(|| {
         fn entry(lib: &'static str, props: &[&'static str]) -> FeatureMapEntry {
-            FeatureMapEntry { lib, props: props.to_vec() }
+            FeatureMapEntry {
+                lib,
+                props: props.to_vec(),
+            }
         }
         let entries: Vec<(&'static str, Vec<FeatureMapEntry>)> = vec![
-        (
-            "Array",
-            vec![
-                entry("es2015", &["find", "findIndex", "fill", "copyWithin", "entries", "keys", "values"]),
-                entry("es2016", &["includes"]),
-                entry("es2019", &["flat", "flatMap"]),
-                entry("es2022", &["at"]),
-                entry("es2023", &["findLastIndex", "findLast", "toReversed", "toSorted", "toSpliced", "with"]),
-            ],
-        ),
-        (
-            "Iterator",
-            vec![
-                entry("es2015", &[]),
-            ],
-        ),
-        (
-            "AsyncIterator",
-            vec![
-                entry("es2015", &[]),
-            ],
-        ),
-        (
-            "ArrayBuffer",
-            vec![
-                entry("es2024", &["maxByteLength", "resizable", "resize", "detached", "transfer", "transferToFixedLength"]),
-            ],
-        ),
-        (
-            "Atomics",
-            vec![
-                entry("es2017", &["add", "and", "compareExchange", "exchange", "isLockFree", "load", "or", "store", "sub", "wait", "notify", "xor"]),
-                entry("es2024", &["waitAsync"]),
-            ],
-        ),
-        (
-            "SharedArrayBuffer",
-            vec![
-                entry("es2017", &["byteLength", "slice"]),
-                entry("es2024", &["growable", "maxByteLength", "grow"]),
-            ],
-        ),
-        (
-            "AsyncIterable",
-            vec![
-                entry("es2018", &[]),
-            ],
-        ),
-        (
-            "AsyncIterableIterator",
-            vec![
-                entry("es2018", &[]),
-            ],
-        ),
-        (
-            "AsyncGenerator",
-            vec![
-                entry("es2018", &[]),
-            ],
-        ),
-        (
-            "AsyncGeneratorFunction",
-            vec![
-                entry("es2018", &[]),
-            ],
-        ),
-        (
-            "RegExp",
-            vec![
-                entry("es2015", &["flags", "sticky", "unicode"]),
-                entry("es2018", &["dotAll"]),
-                entry("es2024", &["unicodeSets"]),
-            ],
-        ),
-        (
-            "RegExpConstructor",
-            vec![
-                entry("es2025", &["escape"]),
-            ],
-        ),
-        (
-            "Reflect",
-            vec![
-                entry("es2015", &["apply", "construct", "defineProperty", "deleteProperty", "get", "getOwnPropertyDescriptor", "getPrototypeOf", "has", "isExtensible", "ownKeys", "preventExtensions", "set", "setPrototypeOf"]),
-            ],
-        ),
-        (
-            "ArrayConstructor",
-            vec![
-                entry("es2015", &["from", "of"]),
-                entry("esnext", &["fromAsync"]),
-            ],
-        ),
-        (
-            "ObjectConstructor",
-            vec![
-                entry("es2015", &["assign", "getOwnPropertySymbols", "keys", "is", "setPrototypeOf"]),
-                entry("es2017", &["values", "entries", "getOwnPropertyDescriptors"]),
-                entry("es2019", &["fromEntries"]),
-                entry("es2022", &["hasOwn"]),
-                entry("es2024", &["groupBy"]),
-            ],
-        ),
-        (
-            "NumberConstructor",
-            vec![
-                entry("es2015", &["isFinite", "isInteger", "isNaN", "isSafeInteger", "parseFloat", "parseInt"]),
-            ],
-        ),
-        (
-            "Math",
-            vec![
-                entry("es2015", &["clz32", "imul", "sign", "log10", "log2", "log1p", "expm1", "cosh", "sinh", "tanh", "acosh", "asinh", "atanh", "hypot", "trunc", "fround", "cbrt"]),
-                entry("es2025", &["f16round"]),
-            ],
-        ),
-        (
-            "Map",
-            vec![
-                entry("es2015", &["entries", "keys", "values"]),
-                entry("esnext", &["getOrInsert", "getOrInsertComputed"]),
-            ],
-        ),
-        (
-            "MapConstructor",
-            vec![
-                entry("es2024", &["groupBy"]),
-            ],
-        ),
-        (
-            "Set",
-            vec![
-                entry("es2015", &["entries", "keys", "values"]),
-                entry("es2025", &["union", "intersection", "difference", "symmetricDifference", "isSubsetOf", "isSupersetOf", "isDisjointFrom"]),
-            ],
-        ),
-        (
-            "PromiseConstructor",
-            vec![
-                entry("es2015", &["all", "race", "reject", "resolve"]),
-                entry("es2020", &["allSettled"]),
-                entry("es2021", &["any"]),
-                entry("es2024", &["withResolvers"]),
-                entry("es2025", &["try"]),
-            ],
-        ),
-        (
-            "Symbol",
-            vec![
-                entry("es2015", &["for", "keyFor"]),
-                entry("es2019", &["description"]),
-            ],
-        ),
-        (
-            "WeakMap",
-            vec![
-                entry("es2015", &[]),
-                entry("esnext", &["getOrInsert", "getOrInsertComputed"]),
-            ],
-        ),
-        (
-            "WeakSet",
-            vec![
-                entry("es2015", &[]),
-            ],
-        ),
-        (
-            "String",
-            vec![
-                entry("es2015", &["codePointAt", "includes", "endsWith", "normalize", "repeat", "startsWith", "anchor", "big", "blink", "bold", "fixed", "fontcolor", "fontsize", "italics", "link", "small", "strike", "sub", "sup"]),
-                entry("es2017", &["padStart", "padEnd"]),
-                entry("es2019", &["trimStart", "trimEnd", "trimLeft", "trimRight"]),
-                entry("es2020", &["matchAll"]),
-                entry("es2021", &["replaceAll"]),
-                entry("es2022", &["at"]),
-                entry("es2024", &["isWellFormed", "toWellFormed"]),
-            ],
-        ),
-        (
-            "StringConstructor",
-            vec![
-                entry("es2015", &["fromCodePoint", "raw"]),
-            ],
-        ),
-        (
-            "DateTimeFormat",
-            vec![
-                entry("es2017", &["formatToParts"]),
-            ],
-        ),
-        (
-            "Promise",
-            vec![
-                entry("es2015", &[]),
-                entry("es2018", &["finally"]),
-            ],
-        ),
-        (
-            "RegExpMatchArray",
-            vec![
-                entry("es2018", &["groups"]),
-            ],
-        ),
-        (
-            "RegExpExecArray",
-            vec![
-                entry("es2018", &["groups"]),
-            ],
-        ),
-        (
-            "Intl",
-            vec![
-                entry("es2018", &["PluralRules"]),
-                entry("es2020", &["RelativeTimeFormat", "Locale", "DisplayNames"]),
-                entry("es2021", &["ListFormat", "DateTimeFormat"]),
-                entry("es2022", &["Segmenter"]),
-                entry("es2025", &["DurationFormat"]),
-            ],
-        ),
-        (
-            "NumberFormat",
-            vec![
-                entry("es2018", &["formatToParts"]),
-            ],
-        ),
-        (
-            "SymbolConstructor",
-            vec![
-                entry("es2020", &["matchAll"]),
-                entry("esnext", &["metadata", "dispose", "asyncDispose"]),
-            ],
-        ),
-        (
-            "DataView",
-            vec![
-                entry("es2020", &["setBigInt64", "setBigUint64", "getBigInt64", "getBigUint64"]),
-                entry("es2025", &["setFloat16", "getFloat16"]),
-            ],
-        ),
-        (
-            "BigInt",
-            vec![
-                entry("es2020", &[]),
-            ],
-        ),
-        (
-            "RelativeTimeFormat",
-            vec![
-                entry("es2020", &["format", "formatToParts", "resolvedOptions"]),
-            ],
-        ),
-        (
-            "Int8Array",
-            vec![
-                entry("es2022", &["at"]),
-                entry("es2023", &["findLastIndex", "findLast", "toReversed", "toSorted", "toSpliced", "with"]),
-            ],
-        ),
-        (
-            "Uint8Array",
-            vec![
-                entry("es2022", &["at"]),
-                entry("es2023", &["findLastIndex", "findLast", "toReversed", "toSorted", "toSpliced", "with"]),
-            ],
-        ),
-        (
-            "Uint8ClampedArray",
-            vec![
-                entry("es2022", &["at"]),
-                entry("es2023", &["findLastIndex", "findLast", "toReversed", "toSorted", "toSpliced", "with"]),
-            ],
-        ),
-        (
-            "Int16Array",
-            vec![
-                entry("es2022", &["at"]),
-                entry("es2023", &["findLastIndex", "findLast", "toReversed", "toSorted", "toSpliced", "with"]),
-            ],
-        ),
-        (
-            "Uint16Array",
-            vec![
-                entry("es2022", &["at"]),
-                entry("es2023", &["findLastIndex", "findLast", "toReversed", "toSorted", "toSpliced", "with"]),
-            ],
-        ),
-        (
-            "Int32Array",
-            vec![
-                entry("es2022", &["at"]),
-                entry("es2023", &["findLastIndex", "findLast", "toReversed", "toSorted", "toSpliced", "with"]),
-            ],
-        ),
-        (
-            "Uint32Array",
-            vec![
-                entry("es2022", &["at"]),
-                entry("es2023", &["findLastIndex", "findLast", "toReversed", "toSorted", "toSpliced", "with"]),
-            ],
-        ),
-        (
-            "Float16Array",
-            vec![
-                entry("es2025", &[]),
-            ],
-        ),
-        (
-            "Float32Array",
-            vec![
-                entry("es2022", &["at"]),
-                entry("es2023", &["findLastIndex", "findLast", "toReversed", "toSorted", "toSpliced", "with"]),
-            ],
-        ),
-        (
-            "Float64Array",
-            vec![
-                entry("es2022", &["at"]),
-                entry("es2023", &["findLastIndex", "findLast", "toReversed", "toSorted", "toSpliced", "with"]),
-            ],
-        ),
-        (
-            "BigInt64Array",
-            vec![
-                entry("es2020", &[]),
-                entry("es2022", &["at"]),
-                entry("es2023", &["findLastIndex", "findLast", "toReversed", "toSorted", "toSpliced", "with"]),
-            ],
-        ),
-        (
-            "BigUint64Array",
-            vec![
-                entry("es2020", &[]),
-                entry("es2022", &["at"]),
-                entry("es2023", &["findLastIndex", "findLast", "toReversed", "toSorted", "toSpliced", "with"]),
-            ],
-        ),
-        (
-            "Error",
-            vec![
-                entry("es2022", &["cause"]),
-            ],
-        ),
-        (
-            "ErrorConstructor",
-            vec![
-                entry("esnext", &["isError"]),
-            ],
-        ),
-        (
-            "Uint8ArrayConstructor",
-            vec![
-                entry("esnext", &["fromBase64", "fromHex"]),
-            ],
-        ),
-        (
-            "DisposableStack",
-            vec![
-                entry("esnext", &[]),
-            ],
-        ),
-        (
-            "AsyncDisposableStack",
-            vec![
-                entry("esnext", &[]),
-            ],
-        ),
-        (
-            "Date",
-            vec![
-                entry("esnext", &["toTemporalInstant"]),
-            ],
-        ),
+            (
+                "Array",
+                vec![
+                    entry(
+                        "es2015",
+                        &[
+                            "find",
+                            "findIndex",
+                            "fill",
+                            "copyWithin",
+                            "entries",
+                            "keys",
+                            "values",
+                        ],
+                    ),
+                    entry("es2016", &["includes"]),
+                    entry("es2019", &["flat", "flatMap"]),
+                    entry("es2022", &["at"]),
+                    entry(
+                        "es2023",
+                        &[
+                            "findLastIndex",
+                            "findLast",
+                            "toReversed",
+                            "toSorted",
+                            "toSpliced",
+                            "with",
+                        ],
+                    ),
+                ],
+            ),
+            ("Iterator", vec![entry("es2015", &[])]),
+            ("AsyncIterator", vec![entry("es2015", &[])]),
+            (
+                "ArrayBuffer",
+                vec![entry(
+                    "es2024",
+                    &[
+                        "maxByteLength",
+                        "resizable",
+                        "resize",
+                        "detached",
+                        "transfer",
+                        "transferToFixedLength",
+                    ],
+                )],
+            ),
+            (
+                "Atomics",
+                vec![
+                    entry(
+                        "es2017",
+                        &[
+                            "add",
+                            "and",
+                            "compareExchange",
+                            "exchange",
+                            "isLockFree",
+                            "load",
+                            "or",
+                            "store",
+                            "sub",
+                            "wait",
+                            "notify",
+                            "xor",
+                        ],
+                    ),
+                    entry("es2024", &["waitAsync"]),
+                ],
+            ),
+            (
+                "SharedArrayBuffer",
+                vec![
+                    entry("es2017", &["byteLength", "slice"]),
+                    entry("es2024", &["growable", "maxByteLength", "grow"]),
+                ],
+            ),
+            ("AsyncIterable", vec![entry("es2018", &[])]),
+            ("AsyncIterableIterator", vec![entry("es2018", &[])]),
+            ("AsyncGenerator", vec![entry("es2018", &[])]),
+            ("AsyncGeneratorFunction", vec![entry("es2018", &[])]),
+            (
+                "RegExp",
+                vec![
+                    entry("es2015", &["flags", "sticky", "unicode"]),
+                    entry("es2018", &["dotAll"]),
+                    entry("es2024", &["unicodeSets"]),
+                ],
+            ),
+            ("RegExpConstructor", vec![entry("es2025", &["escape"])]),
+            (
+                "Reflect",
+                vec![entry(
+                    "es2015",
+                    &[
+                        "apply",
+                        "construct",
+                        "defineProperty",
+                        "deleteProperty",
+                        "get",
+                        "getOwnPropertyDescriptor",
+                        "getPrototypeOf",
+                        "has",
+                        "isExtensible",
+                        "ownKeys",
+                        "preventExtensions",
+                        "set",
+                        "setPrototypeOf",
+                    ],
+                )],
+            ),
+            (
+                "ArrayConstructor",
+                vec![
+                    entry("es2015", &["from", "of"]),
+                    entry("esnext", &["fromAsync"]),
+                ],
+            ),
+            (
+                "ObjectConstructor",
+                vec![
+                    entry(
+                        "es2015",
+                        &[
+                            "assign",
+                            "getOwnPropertySymbols",
+                            "keys",
+                            "is",
+                            "setPrototypeOf",
+                        ],
+                    ),
+                    entry(
+                        "es2017",
+                        &["values", "entries", "getOwnPropertyDescriptors"],
+                    ),
+                    entry("es2019", &["fromEntries"]),
+                    entry("es2022", &["hasOwn"]),
+                    entry("es2024", &["groupBy"]),
+                ],
+            ),
+            (
+                "NumberConstructor",
+                vec![entry(
+                    "es2015",
+                    &[
+                        "isFinite",
+                        "isInteger",
+                        "isNaN",
+                        "isSafeInteger",
+                        "parseFloat",
+                        "parseInt",
+                    ],
+                )],
+            ),
+            (
+                "Math",
+                vec![
+                    entry(
+                        "es2015",
+                        &[
+                            "clz32", "imul", "sign", "log10", "log2", "log1p", "expm1", "cosh",
+                            "sinh", "tanh", "acosh", "asinh", "atanh", "hypot", "trunc", "fround",
+                            "cbrt",
+                        ],
+                    ),
+                    entry("es2025", &["f16round"]),
+                ],
+            ),
+            (
+                "Map",
+                vec![
+                    entry("es2015", &["entries", "keys", "values"]),
+                    entry("esnext", &["getOrInsert", "getOrInsertComputed"]),
+                ],
+            ),
+            ("MapConstructor", vec![entry("es2024", &["groupBy"])]),
+            (
+                "Set",
+                vec![
+                    entry("es2015", &["entries", "keys", "values"]),
+                    entry(
+                        "es2025",
+                        &[
+                            "union",
+                            "intersection",
+                            "difference",
+                            "symmetricDifference",
+                            "isSubsetOf",
+                            "isSupersetOf",
+                            "isDisjointFrom",
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "PromiseConstructor",
+                vec![
+                    entry("es2015", &["all", "race", "reject", "resolve"]),
+                    entry("es2020", &["allSettled"]),
+                    entry("es2021", &["any"]),
+                    entry("es2024", &["withResolvers"]),
+                    entry("es2025", &["try"]),
+                ],
+            ),
+            (
+                "Symbol",
+                vec![
+                    entry("es2015", &["for", "keyFor"]),
+                    entry("es2019", &["description"]),
+                ],
+            ),
+            (
+                "WeakMap",
+                vec![
+                    entry("es2015", &[]),
+                    entry("esnext", &["getOrInsert", "getOrInsertComputed"]),
+                ],
+            ),
+            ("WeakSet", vec![entry("es2015", &[])]),
+            (
+                "String",
+                vec![
+                    entry(
+                        "es2015",
+                        &[
+                            "codePointAt",
+                            "includes",
+                            "endsWith",
+                            "normalize",
+                            "repeat",
+                            "startsWith",
+                            "anchor",
+                            "big",
+                            "blink",
+                            "bold",
+                            "fixed",
+                            "fontcolor",
+                            "fontsize",
+                            "italics",
+                            "link",
+                            "small",
+                            "strike",
+                            "sub",
+                            "sup",
+                        ],
+                    ),
+                    entry("es2017", &["padStart", "padEnd"]),
+                    entry("es2019", &["trimStart", "trimEnd", "trimLeft", "trimRight"]),
+                    entry("es2020", &["matchAll"]),
+                    entry("es2021", &["replaceAll"]),
+                    entry("es2022", &["at"]),
+                    entry("es2024", &["isWellFormed", "toWellFormed"]),
+                ],
+            ),
+            (
+                "StringConstructor",
+                vec![entry("es2015", &["fromCodePoint", "raw"])],
+            ),
+            ("DateTimeFormat", vec![entry("es2017", &["formatToParts"])]),
+            (
+                "Promise",
+                vec![entry("es2015", &[]), entry("es2018", &["finally"])],
+            ),
+            ("RegExpMatchArray", vec![entry("es2018", &["groups"])]),
+            ("RegExpExecArray", vec![entry("es2018", &["groups"])]),
+            (
+                "Intl",
+                vec![
+                    entry("es2018", &["PluralRules"]),
+                    entry("es2020", &["RelativeTimeFormat", "Locale", "DisplayNames"]),
+                    entry("es2021", &["ListFormat", "DateTimeFormat"]),
+                    entry("es2022", &["Segmenter"]),
+                    entry("es2025", &["DurationFormat"]),
+                ],
+            ),
+            ("NumberFormat", vec![entry("es2018", &["formatToParts"])]),
+            (
+                "SymbolConstructor",
+                vec![
+                    entry("es2020", &["matchAll"]),
+                    entry("esnext", &["metadata", "dispose", "asyncDispose"]),
+                ],
+            ),
+            (
+                "DataView",
+                vec![
+                    entry(
+                        "es2020",
+                        &["setBigInt64", "setBigUint64", "getBigInt64", "getBigUint64"],
+                    ),
+                    entry("es2025", &["setFloat16", "getFloat16"]),
+                ],
+            ),
+            ("BigInt", vec![entry("es2020", &[])]),
+            (
+                "RelativeTimeFormat",
+                vec![entry(
+                    "es2020",
+                    &["format", "formatToParts", "resolvedOptions"],
+                )],
+            ),
+            (
+                "Int8Array",
+                vec![
+                    entry("es2022", &["at"]),
+                    entry(
+                        "es2023",
+                        &[
+                            "findLastIndex",
+                            "findLast",
+                            "toReversed",
+                            "toSorted",
+                            "toSpliced",
+                            "with",
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "Uint8Array",
+                vec![
+                    entry("es2022", &["at"]),
+                    entry(
+                        "es2023",
+                        &[
+                            "findLastIndex",
+                            "findLast",
+                            "toReversed",
+                            "toSorted",
+                            "toSpliced",
+                            "with",
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "Uint8ClampedArray",
+                vec![
+                    entry("es2022", &["at"]),
+                    entry(
+                        "es2023",
+                        &[
+                            "findLastIndex",
+                            "findLast",
+                            "toReversed",
+                            "toSorted",
+                            "toSpliced",
+                            "with",
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "Int16Array",
+                vec![
+                    entry("es2022", &["at"]),
+                    entry(
+                        "es2023",
+                        &[
+                            "findLastIndex",
+                            "findLast",
+                            "toReversed",
+                            "toSorted",
+                            "toSpliced",
+                            "with",
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "Uint16Array",
+                vec![
+                    entry("es2022", &["at"]),
+                    entry(
+                        "es2023",
+                        &[
+                            "findLastIndex",
+                            "findLast",
+                            "toReversed",
+                            "toSorted",
+                            "toSpliced",
+                            "with",
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "Int32Array",
+                vec![
+                    entry("es2022", &["at"]),
+                    entry(
+                        "es2023",
+                        &[
+                            "findLastIndex",
+                            "findLast",
+                            "toReversed",
+                            "toSorted",
+                            "toSpliced",
+                            "with",
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "Uint32Array",
+                vec![
+                    entry("es2022", &["at"]),
+                    entry(
+                        "es2023",
+                        &[
+                            "findLastIndex",
+                            "findLast",
+                            "toReversed",
+                            "toSorted",
+                            "toSpliced",
+                            "with",
+                        ],
+                    ),
+                ],
+            ),
+            ("Float16Array", vec![entry("es2025", &[])]),
+            (
+                "Float32Array",
+                vec![
+                    entry("es2022", &["at"]),
+                    entry(
+                        "es2023",
+                        &[
+                            "findLastIndex",
+                            "findLast",
+                            "toReversed",
+                            "toSorted",
+                            "toSpliced",
+                            "with",
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "Float64Array",
+                vec![
+                    entry("es2022", &["at"]),
+                    entry(
+                        "es2023",
+                        &[
+                            "findLastIndex",
+                            "findLast",
+                            "toReversed",
+                            "toSorted",
+                            "toSpliced",
+                            "with",
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "BigInt64Array",
+                vec![
+                    entry("es2020", &[]),
+                    entry("es2022", &["at"]),
+                    entry(
+                        "es2023",
+                        &[
+                            "findLastIndex",
+                            "findLast",
+                            "toReversed",
+                            "toSorted",
+                            "toSpliced",
+                            "with",
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "BigUint64Array",
+                vec![
+                    entry("es2020", &[]),
+                    entry("es2022", &["at"]),
+                    entry(
+                        "es2023",
+                        &[
+                            "findLastIndex",
+                            "findLast",
+                            "toReversed",
+                            "toSorted",
+                            "toSpliced",
+                            "with",
+                        ],
+                    ),
+                ],
+            ),
+            ("Error", vec![entry("es2022", &["cause"])]),
+            ("ErrorConstructor", vec![entry("esnext", &["isError"])]),
+            (
+                "Uint8ArrayConstructor",
+                vec![entry("esnext", &["fromBase64", "fromHex"])],
+            ),
+            ("DisposableStack", vec![entry("esnext", &[])]),
+            ("AsyncDisposableStack", vec![entry("esnext", &[])]),
+            ("Date", vec![entry("esnext", &["toTemporalInstant"])]),
         ];
         entries.into_iter().collect()
     })
@@ -958,12 +1133,16 @@ pub fn try_get_property_access_or_identifier_to_string(expr: Node) -> String {
     if is_property_access_expression(expr) {
         let base_str = try_get_property_access_or_identifier_to_string(expr.expression());
         if !base_str.is_empty() {
-            return base_str + "." + &crate::ast::entity_name_to_string(expr.name(), Some(&get_text_of_node));
+            return base_str
+                + "."
+                + &crate::ast::entity_name_to_string(expr.name(), Some(&get_text_of_node));
         }
     } else if is_element_access_expression(expr) {
         let base_str = try_get_property_access_or_identifier_to_string(expr.expression());
         if !base_str.is_empty() && is_property_name(expr.argument_expression()) {
-            return base_str + "." + &get_property_name_for_property_name_node(expr.argument_expression());
+            return base_str
+                + "."
+                + &get_property_name_for_property_name_node(expr.argument_expression());
         }
     } else if is_identifier(expr) {
         return expr.text().to_string();
@@ -992,7 +1171,11 @@ impl Checker {
 
     // Go: checker/utilities.go:1569 containsNonMissingUndefinedType
     pub fn contains_non_missing_undefined_type(&self, t: TypeId) -> bool {
-        let candidate = if self.ty(t).flags.intersects(TypeFlags::UNION) { self.ty(t).types()[0] } else { t };
+        let candidate = if self.ty(t).flags.intersects(TypeFlags::UNION) {
+            self.ty(t).types()[0]
+        } else {
+            t
+        };
         self.ty(candidate).flags.intersects(TypeFlags::UNDEFINED) && candidate != self.missing_type
     }
 }
@@ -1142,7 +1325,7 @@ fn escape_string(s: &str, quote_char: char) -> String {
             '"' => "\\\"",
             '\'' => "\\'",
             '`' => "\\`",
-            '$' => "\\$", // when quoteChar == '`'
+            '$' => "\\$",            // when quoteChar == '`'
             '\u{2028}' => "\\u2028", // lineSeparator
             '\u{2029}' => "\\u2029", // paragraphSeparator
             '\u{0085}' => "\\u0085", // nextLine
@@ -1176,7 +1359,10 @@ fn escape_string(s: &str, quote_char: char) -> String {
             } else if (ch as u32) > 0xffff {
                 // encode as surrogate pair
                 let code = ch as u32 - 0x10000;
-                encode_utf16_escape_sequence(&mut b, ((code & 0b11111111110000000000) >> 10) + 0xD800);
+                encode_utf16_escape_sequence(
+                    &mut b,
+                    ((code & 0b11111111110000000000) >> 10) + 0xD800,
+                );
                 encode_utf16_escape_sequence(&mut b, (code & 0b00000000001111111111) + 0xDC00);
             } else if ch == '\0' {
                 if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
@@ -1214,7 +1400,10 @@ fn compute_packages_map() -> FxHashMap<String, bool> {
             if !module.package_id.name.is_empty() {
                 let name = module.package_id.name.to_string();
                 let previous = packages_map.get(&name).copied().unwrap_or(false);
-                packages_map.insert(name, previous || module.extension == tspath_up2::EXTENSION_DTS);
+                packages_map.insert(
+                    name,
+                    previous || module.extension == tspath_up2::EXTENSION_DTS,
+                );
             }
         }
     }
@@ -1244,7 +1433,12 @@ impl Checker {
     // It does not suggest when the suggestion:
     // - Is from a global file that is different from the reference file, or
     // - (optionally) Is a class, or is a this.x property access expression
-    pub fn is_unchecked_js_suggestion(&self, node: Node, suggestion: SymbolId, exclude_classes: bool) -> bool {
+    pub fn is_unchecked_js_suggestion(
+        &self,
+        node: Node,
+        suggestion: SymbolId,
+        exclude_classes: bool,
+    ) -> bool {
         let file = get_source_file_of_node(node);
         if file.is_some() {
             let info = source_file_info(file);
@@ -1267,7 +1461,9 @@ impl Checker {
                         || !get_extends_heritage_clause_elements(value_declaration).is_empty()
                         || class_or_constructor_parameter_is_decorated(false, value_declaration)
                 };
-                return !(file != declaration_file && declaration_file.is_some() && is_global_source_file(declaration_file))
+                return !(file != declaration_file
+                    && declaration_file.is_some()
+                    && is_global_source_file(declaration_file))
                     && !(exclude_classes
                         && suggestion.is_some()
                         && self.sym(suggestion).flags.intersects(SymbolFlags::CLASS)
@@ -1343,9 +1539,18 @@ pub fn create_module_not_found_chain(
     let mut package_name = package_name.to_string();
     let resolved_module = get_resolved_module(file, module_reference, mode);
 
-    if let Some(resolved_module) = resolved_module.as_ref().filter(|m| !m.alternate_result.is_empty()) {
-        if resolved_module.alternate_result.contains("/node_modules/@types/") {
-            package_name = format!("@types/{}", tspath_up2::mangle_scoped_package_name(&package_name));
+    if let Some(resolved_module) = resolved_module
+        .as_ref()
+        .filter(|m| !m.alternate_result.is_empty())
+    {
+        if resolved_module
+            .alternate_result
+            .contains("/node_modules/@types/")
+        {
+            package_name = format!(
+                "@types/{}",
+                tspath_up2::mangle_scoped_package_name(&package_name)
+            );
         }
         return DiagnosticDetails {
             message: diag::There_are_types_at_0_but_this_result_could_not_be_resolved_when_respecting_package_json_exports_The_1_library_may_need_to_update_its_package_json_or_typings,

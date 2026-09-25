@@ -44,7 +44,8 @@ impl KnownSymlinks {
 
     // Go: symlinks/knownsymlinks.go:31 HasDirectory
     pub fn has_directory(&self, symlink_path: &Path) -> bool {
-        self.directories.contains_key(&symlink_path.ensure_trailing_directory_separator())
+        self.directories
+            .contains_key(&symlink_path.ensure_trailing_directory_separator())
     }
 
     // Go: symlinks/knownsymlinks.go:37 Directories
@@ -71,7 +72,12 @@ impl KnownSymlinks {
     }
 
     // Go: symlinks/knownsymlinks.go:55 SetDirectory
-    pub fn set_directory(&mut self, symlink: &str, symlink_path: Path, real_directory: Option<KnownDirectoryLink>) {
+    pub fn set_directory(
+        &mut self,
+        symlink: &str,
+        symlink_path: Path,
+        real_directory: Option<KnownDirectoryLink>,
+    ) {
         if let Some(real_directory) = &real_directory {
             if !self.directories.contains_key(&symlink_path) {
                 self.directories_by_realpath
@@ -86,8 +92,12 @@ impl KnownSymlinks {
     // Go: symlinks/knownsymlinks.go:65 SetFile
     pub fn set_file(&mut self, symlink: &str, symlink_path: Path, realpath: &str) {
         if !self.files.contains_key(&symlink_path) {
-            let realpath_path = tspath::to_path(realpath, &self.cwd, self.use_case_sensitive_file_names);
-            self.files_by_realpath.entry(realpath_path).or_default().insert(symlink.to_string());
+            let realpath_path =
+                tspath::to_path(realpath, &self.cwd, self.use_case_sensitive_file_names);
+            self.files_by_realpath
+                .entry(realpath_path)
+                .or_default()
+                .insert(symlink.to_string());
         }
         self.files.insert(symlink_path, realpath.to_string());
     }
@@ -99,8 +109,13 @@ impl KnownSymlinks {
         }
         let cwd = self.cwd.clone();
         let case = self.use_case_sensitive_file_names;
-        self.set_file(original_path, tspath::to_path(original_path, &cwd, case), resolved_file_name);
-        let (common_resolved, common_original) = self.guess_directory_symlink(resolved_file_name, original_path, &cwd);
+        self.set_file(
+            original_path,
+            tspath::to_path(original_path, &cwd, case),
+            resolved_file_name,
+        );
+        let (common_resolved, common_original) =
+            self.guess_directory_symlink(resolved_file_name, original_path, &cwd);
         if !common_resolved.is_empty() && !common_original.is_empty() {
             let symlink_path = tspath::to_path(&common_original, &cwd, case);
             if !tspath::contains_ignored_path(&symlink_path) {
@@ -109,7 +124,8 @@ impl KnownSymlinks {
                     symlink_path.ensure_trailing_directory_separator(),
                     Some(KnownDirectoryLink {
                         real: tspath::ensure_trailing_directory_separator(&common_resolved),
-                        real_path: tspath::to_path(&common_resolved, &cwd, case).ensure_trailing_directory_separator(),
+                        real_path: tspath::to_path(&common_resolved, &cwd, case)
+                            .ensure_trailing_directory_separator(),
                     }),
                 );
             }
@@ -118,22 +134,32 @@ impl KnownSymlinks {
 
     // Go: symlinks/knownsymlinks.go:119 guessDirectorySymlink
     fn guess_directory_symlink(&self, a: &str, b: &str, cwd: &str) -> (String, String) {
-        let mut a_parts = tspath::get_path_components(&tspath::get_normalized_absolute_path(a, cwd), "");
-        let mut b_parts = tspath::get_path_components(&tspath::get_normalized_absolute_path(b, cwd), "");
+        let mut a_parts =
+            tspath::get_path_components(&tspath::get_normalized_absolute_path(a, cwd), "");
+        let mut b_parts =
+            tspath::get_path_components(&tspath::get_normalized_absolute_path(b, cwd), "");
         let mut is_directory = false;
         while a_parts.len() >= 2
             && b_parts.len() >= 2
             && !self.is_node_modules_or_scoped_package_directory(&a_parts[a_parts.len() - 2])
             && !self.is_node_modules_or_scoped_package_directory(&b_parts[b_parts.len() - 2])
-            && tspath::get_canonical_file_name(&a_parts[a_parts.len() - 1], self.use_case_sensitive_file_names)
-                == tspath::get_canonical_file_name(&b_parts[b_parts.len() - 1], self.use_case_sensitive_file_names)
+            && tspath::get_canonical_file_name(
+                &a_parts[a_parts.len() - 1],
+                self.use_case_sensitive_file_names,
+            ) == tspath::get_canonical_file_name(
+                &b_parts[b_parts.len() - 1],
+                self.use_case_sensitive_file_names,
+            )
         {
             a_parts.pop();
             b_parts.pop();
             is_directory = true;
         }
         if is_directory {
-            return (tspath::get_path_from_path_components(&a_parts), tspath::get_path_from_path_components(&b_parts));
+            return (
+                tspath::get_path_from_path_components(&a_parts),
+                tspath::get_path_from_path_components(&b_parts),
+            );
         }
         (String::new(), String::new())
     }
@@ -141,7 +167,8 @@ impl KnownSymlinks {
     // Go: symlinks/knownsymlinks.go:137 isNodeModulesOrScopedPackageDirectory
     fn is_node_modules_or_scoped_package_directory(&self, s: &str) -> bool {
         !s.is_empty()
-            && (tspath::get_canonical_file_name(s, self.use_case_sensitive_file_names) == "node_modules"
+            && (tspath::get_canonical_file_name(s, self.use_case_sensitive_file_names)
+                == "node_modules"
                 || s.starts_with('@'))
     }
 }

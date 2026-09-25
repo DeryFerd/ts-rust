@@ -10,11 +10,11 @@
 //! runes with `utf8_decode_rune_in_string`, which follows Go
 //! `utf8.DecodeRuneInString` also at a non-boundary position.
 
-use crate::frontend::prelude::*;
 use crate::flags_macros::go_flags;
+use crate::frontend::prelude::*;
 use std::borrow::Cow;
 
-use super::regexp::{char_code_to_reg_exp_flag, RegExpParser, RegularExpressionFlags};
+use super::regexp::{RegExpParser, RegularExpressionFlags, char_code_to_reg_exp_flag};
 
 go_flags!(EscapeSequenceScanningFlags, i32 {
     STRING = 1 << 0; // EscapeSequenceScanningFlagsString
@@ -63,7 +63,10 @@ pub(crate) fn utf8_decode_rune_in_string(text: &str, pos: usize) -> (i32, i32) {
     if pos + width > bytes.len() {
         return (RUNE_ERROR, 1);
     }
-    match std::str::from_utf8(&bytes[pos..pos + width]).ok().and_then(|s| s.chars().next()) {
+    match std::str::from_utf8(&bytes[pos..pos + width])
+        .ok()
+        .and_then(|s| s.chars().next())
+    {
         Some(ch) => (ch as i32, width as i32),
         None => (RUNE_ERROR, 1),
     }
@@ -113,7 +116,10 @@ fn decode_rune_in_bytes(bytes: &[u8]) -> (i32, i32) {
     if width > bytes.len() {
         return (RUNE_ERROR, 1);
     }
-    match std::str::from_utf8(&bytes[..width]).ok().and_then(|s| s.chars().next()) {
+    match std::str::from_utf8(&bytes[..width])
+        .ok()
+        .and_then(|s| s.chars().next())
+    {
         Some(ch) => (ch as i32, width as i32),
         None => (RUNE_ERROR, 1),
     }
@@ -133,7 +139,10 @@ pub(crate) fn utf8_decode_last_rune(s: &str) -> (i32, i32) {
 // PORT: Go passes the rune through. A value that is not a Unicode scalar
 // (-1, a surrogate) becomes U+FFFD, which no predicate accepts, as Go.
 pub(crate) fn rune_to_char(r: i32) -> char {
-    u32::try_from(r).ok().and_then(char::from_u32).unwrap_or(char::REPLACEMENT_CHARACTER)
+    u32::try_from(r)
+        .ok()
+        .and_then(char::from_u32)
+        .unwrap_or(char::REPLACEMENT_CHARACTER)
 }
 
 /// Go `string(r)` for a rune: invalid runes become "�".
@@ -311,7 +320,10 @@ pub(crate) static TEXT_TO_PUNCTUATION: &[(&str, SyntaxKind)] = &[
     ("%=", SyntaxKind::PercentEqualsToken),
     ("<<=", SyntaxKind::LessThanLessThanEqualsToken),
     (">>=", SyntaxKind::GreaterThanGreaterThanEqualsToken),
-    (">>>=", SyntaxKind::GreaterThanGreaterThanGreaterThanEqualsToken),
+    (
+        ">>>=",
+        SyntaxKind::GreaterThanGreaterThanGreaterThanEqualsToken,
+    ),
     ("&=", SyntaxKind::AmpersandEqualsToken),
     ("|=", SyntaxKind::BarEqualsToken),
     ("^=", SyntaxKind::CaretEqualsToken),
@@ -326,7 +338,8 @@ pub(crate) static TEXT_TO_PUNCTUATION: &[(&str, SyntaxKind)] = &[
 /// Go `textToKeyword[text]`. Returns `SyntaxKind::Unknown` (the Go zero
 /// value) on a miss.
 pub(crate) fn text_to_keyword(text: &str) -> SyntaxKind {
-    static MAP: std::sync::OnceLock<FxHashMap<&'static str, SyntaxKind>> = std::sync::OnceLock::new();
+    static MAP: std::sync::OnceLock<FxHashMap<&'static str, SyntaxKind>> =
+        std::sync::OnceLock::new();
     MAP.get_or_init(|| TEXT_TO_KEYWORD.iter().copied().collect())
         .get(text)
         .copied()
@@ -335,9 +348,11 @@ pub(crate) fn text_to_keyword(text: &str) -> SyntaxKind {
 
 /// Go `kind, ok := textToToken[text]`.
 pub(crate) fn text_to_token(text: &str) -> Option<SyntaxKind> {
-    static MAP: std::sync::OnceLock<FxHashMap<&'static str, SyntaxKind>> = std::sync::OnceLock::new();
+    static MAP: std::sync::OnceLock<FxHashMap<&'static str, SyntaxKind>> =
+        std::sync::OnceLock::new();
     MAP.get_or_init(|| {
-        let mut m: FxHashMap<&'static str, SyntaxKind> = TEXT_TO_PUNCTUATION.iter().copied().collect();
+        let mut m: FxHashMap<&'static str, SyntaxKind> =
+            TEXT_TO_PUNCTUATION.iter().copied().collect();
         // Go: maps.Copy(m, textToKeyword)
         m.extend(TEXT_TO_KEYWORD.iter().copied());
         m
@@ -557,7 +572,9 @@ impl Scanner {
 
     // Go: scanner/scanner.go:321 HasUnicodeEscape
     pub fn has_unicode_escape(&self) -> bool {
-        self.scanner_state.token_flags.intersects(TokenFlags::UNICODE_ESCAPE)
+        self.scanner_state
+            .token_flags
+            .intersects(TokenFlags::UNICODE_ESCAPE)
     }
 
     // Go: scanner/scanner.go:328 ContainsNonASCII
@@ -570,32 +587,44 @@ impl Scanner {
 
     // Go: scanner/scanner.go:332 HasExtendedUnicodeEscape
     pub fn has_extended_unicode_escape(&self) -> bool {
-        self.scanner_state.token_flags.intersects(TokenFlags::EXTENDED_UNICODE_ESCAPE)
+        self.scanner_state
+            .token_flags
+            .intersects(TokenFlags::EXTENDED_UNICODE_ESCAPE)
     }
 
     // Go: scanner/scanner.go:336 HasPrecedingLineBreak
     pub fn has_preceding_line_break(&self) -> bool {
-        self.scanner_state.token_flags.intersects(TokenFlags::PRECEDING_LINE_BREAK)
+        self.scanner_state
+            .token_flags
+            .intersects(TokenFlags::PRECEDING_LINE_BREAK)
     }
 
     // Go: scanner/scanner.go:340 HasPrecedingJSDocComment
     pub fn has_preceding_js_doc_comment(&self) -> bool {
-        self.scanner_state.token_flags.intersects(TokenFlags::PRECEDING_JS_DOC_COMMENT)
+        self.scanner_state
+            .token_flags
+            .intersects(TokenFlags::PRECEDING_JS_DOC_COMMENT)
     }
 
     // Go: scanner/scanner.go:344 HasPrecedingJSDocLeadingAsterisks
     pub fn has_preceding_js_doc_leading_asterisks(&self) -> bool {
-        self.scanner_state.token_flags.intersects(TokenFlags::PRECEDING_JS_DOC_LEADING_ASTERISKS)
+        self.scanner_state
+            .token_flags
+            .intersects(TokenFlags::PRECEDING_JS_DOC_LEADING_ASTERISKS)
     }
 
     // Go: scanner/scanner.go:348 HasPrecedingJSDocWithDeprecatedTag
     pub fn has_preceding_js_doc_with_deprecated_tag(&self) -> bool {
-        self.scanner_state.token_flags.intersects(TokenFlags::PRECEDING_JS_DOC_WITH_DEPRECATED)
+        self.scanner_state
+            .token_flags
+            .intersects(TokenFlags::PRECEDING_JS_DOC_WITH_DEPRECATED)
     }
 
     // Go: scanner/scanner.go:352 HasPrecedingJSDocWithSeeOrLink
     pub fn has_preceding_js_doc_with_see_or_link(&self) -> bool {
-        self.scanner_state.token_flags.intersects(TokenFlags::PRECEDING_JS_DOC_WITH_SEE_OR_LINK)
+        self.scanner_state
+            .token_flags
+            .intersects(TokenFlags::PRECEDING_JS_DOC_WITH_SEE_OR_LINK)
     }
 
     // Go: scanner/scanner.go:358 scanJSDocCommentForTags
@@ -621,8 +650,11 @@ impl Scanner {
             {
                 *flags |= TokenFlags::PRECEDING_JS_DOC_WITH_SEE_OR_LINK;
             }
-            if (*flags & (TokenFlags::PRECEDING_JS_DOC_WITH_DEPRECATED | TokenFlags::PRECEDING_JS_DOC_WITH_SEE_OR_LINK))
-                == (TokenFlags::PRECEDING_JS_DOC_WITH_DEPRECATED | TokenFlags::PRECEDING_JS_DOC_WITH_SEE_OR_LINK)
+            if (*flags
+                & (TokenFlags::PRECEDING_JS_DOC_WITH_DEPRECATED
+                    | TokenFlags::PRECEDING_JS_DOC_WITH_SEE_OR_LINK))
+                == (TokenFlags::PRECEDING_JS_DOC_WITH_DEPRECATED
+                    | TokenFlags::PRECEDING_JS_DOC_WITH_SEE_OR_LINK)
             {
                 return;
             }
@@ -686,7 +718,13 @@ impl Scanner {
     }
 
     // Go: scanner/scanner.go:425 errorAt
-    pub(crate) fn error_at(&mut self, diagnostic: &'static ts_diagnostics::Message, pos: i32, length: i32, args: Vec<String>) {
+    pub(crate) fn error_at(
+        &mut self,
+        diagnostic: &'static ts_diagnostics::Message,
+        pos: i32,
+        length: i32,
+        args: Vec<String>,
+    ) {
         if let Some(on_error) = self.on_error.as_mut() {
             on_error(diagnostic, pos, length, args);
         }
@@ -824,7 +862,9 @@ impl Scanner {
                         self.scanner_state.token = SyntaxKind::StringLiteral;
                     }
                     Some(b'`') => {
-                        self.scanner_state.token = self.scan_template_and_set_token_value(false /*shouldEmitInvalidEscapeError*/);
+                        self.scanner_state.token = self.scan_template_and_set_token_value(
+                            false, /*shouldEmitInvalidEscapeError*/
+                        );
                     }
                     Some(b'%') => {
                         if self.char_at(1) == i32::from(b'=') {
@@ -840,7 +880,8 @@ impl Scanner {
                         if next == i32::from(b'&') {
                             if self.char_at(2) == i32::from(b'=') {
                                 self.scanner_state.pos += 3;
-                                self.scanner_state.token = SyntaxKind::AmpersandAmpersandEqualsToken;
+                                self.scanner_state.token =
+                                    SyntaxKind::AmpersandAmpersandEqualsToken;
                             } else {
                                 self.scanner_state.pos += 2;
                                 self.scanner_state.token = SyntaxKind::AmpersandAmpersandToken;
@@ -877,10 +918,17 @@ impl Scanner {
                         } else {
                             self.scanner_state.pos += 1;
                             if self.scanner_state.skip_js_doc_leading_asterisks != 0
-                                && !self.scanner_state.token_flags.intersects(TokenFlags::PRECEDING_JS_DOC_LEADING_ASTERISKS)
-                                && self.scanner_state.token_flags.intersects(TokenFlags::PRECEDING_LINE_BREAK)
+                                && !self
+                                    .scanner_state
+                                    .token_flags
+                                    .intersects(TokenFlags::PRECEDING_JS_DOC_LEADING_ASTERISKS)
+                                && self
+                                    .scanner_state
+                                    .token_flags
+                                    .intersects(TokenFlags::PRECEDING_LINE_BREAK)
                             {
-                                self.scanner_state.token_flags |= TokenFlags::PRECEDING_JS_DOC_LEADING_ASTERISKS;
+                                self.scanner_state.token_flags |=
+                                    TokenFlags::PRECEDING_JS_DOC_LEADING_ASTERISKS;
                                 continue 'scan;
                             }
                             self.scanner_state.token = SyntaxKind::AsteriskToken;
@@ -942,7 +990,11 @@ impl Scanner {
                                 self.scanner_state.pos += size;
                             }
 
-                            self.process_comment_directive(self.scanner_state.token_start, self.scanner_state.pos, false);
+                            self.process_comment_directive(
+                                self.scanner_state.token_start,
+                                self.scanner_state.pos,
+                                false,
+                            );
 
                             if self.skip_trivia {
                                 continue 'scan;
@@ -953,7 +1005,8 @@ impl Scanner {
                         // Multi-line comment
                         if self.char_at(1) == i32::from(b'*') {
                             self.scanner_state.pos += 2;
-                            let is_js_doc = self.char() == i32::from(b'*') && self.char_at(1) != i32::from(b'/');
+                            let is_js_doc = self.char() == i32::from(b'*')
+                                && self.char_at(1) != i32::from(b'/');
 
                             let mut comment_closed = false;
                             let mut last_line_start = self.scanner_state.token_start;
@@ -974,16 +1027,25 @@ impl Scanner {
 
                                 if is_line_break(rune_to_char(ch1)) {
                                     last_line_start = self.scanner_state.pos;
-                                    self.scanner_state.token_flags |= TokenFlags::PRECEDING_LINE_BREAK;
+                                    self.scanner_state.token_flags |=
+                                        TokenFlags::PRECEDING_LINE_BREAK;
                                 }
                             }
 
                             if is_js_doc {
-                                self.scanner_state.token_flags |= TokenFlags::PRECEDING_JS_DOC_COMMENT;
-                                self.scan_js_doc_comment_for_tags(self.scanner_state.token_start, self.scanner_state.pos);
+                                self.scanner_state.token_flags |=
+                                    TokenFlags::PRECEDING_JS_DOC_COMMENT;
+                                self.scan_js_doc_comment_for_tags(
+                                    self.scanner_state.token_start,
+                                    self.scanner_state.pos,
+                                );
                             }
 
-                            self.process_comment_directive(last_line_start, self.scanner_state.pos, true);
+                            self.process_comment_directive(
+                                last_line_start,
+                                self.scanner_state.pos,
+                                true,
+                            );
 
                             if !comment_closed {
                                 self.error(diag::Asterisk_Slash_expected);
@@ -1009,7 +1071,9 @@ impl Scanner {
                     }
                     Some(b'0'..=b'9') => {
                         if ch == i32::from(b'0') {
-                            if self.char_at(1) == i32::from(b'X') || self.char_at(1) == i32::from(b'x') {
+                            if self.char_at(1) == i32::from(b'X')
+                                || self.char_at(1) == i32::from(b'x')
+                            {
                                 let start = self.scanner_state.pos;
                                 self.scanner_state.pos += 2;
                                 let mut digits = self.scan_hex_digits(1, true, true);
@@ -1018,14 +1082,17 @@ impl Scanner {
                                     digits = "0".to_string();
                                 }
                                 if let Some(cached_value) = self.hex_number_cache.get(&digits) {
-                                    self.scanner_state.token_value = intern_token_value(cached_value);
+                                    self.scanner_state.token_value =
+                                        intern_token_value(cached_value);
                                 } else {
-                                    let raw_text = &self.text[start as usize..self.scanner_state.pos as usize];
-                                    let value = if raw_text.starts_with("0x") && raw_text[2..] == digits {
-                                        raw_text.to_string()
-                                    } else {
-                                        format!("0x{digits}")
-                                    };
+                                    let raw_text =
+                                        &self.text[start as usize..self.scanner_state.pos as usize];
+                                    let value =
+                                        if raw_text.starts_with("0x") && raw_text[2..] == digits {
+                                            raw_text.to_string()
+                                        } else {
+                                            format!("0x{digits}")
+                                        };
                                     self.scanner_state.token_value = intern_token_value(&value);
                                     self.hex_number_cache.insert(digits, value);
                                 }
@@ -1033,7 +1100,9 @@ impl Scanner {
                                 self.scanner_state.token = self.scan_big_int_suffix();
                                 break 'sw;
                             }
-                            if self.char_at(1) == i32::from(b'B') || self.char_at(1) == i32::from(b'b') {
+                            if self.char_at(1) == i32::from(b'B')
+                                || self.char_at(1) == i32::from(b'b')
+                            {
                                 self.scanner_state.pos += 2;
                                 let mut digits = self.scan_binary_or_octal_digits(2);
                                 if digits.is_empty() {
@@ -1045,7 +1114,9 @@ impl Scanner {
                                 self.scanner_state.token = self.scan_big_int_suffix();
                                 break 'sw;
                             }
-                            if self.char_at(1) == i32::from(b'O') || self.char_at(1) == i32::from(b'o') {
+                            if self.char_at(1) == i32::from(b'O')
+                                || self.char_at(1) == i32::from(b'o')
+                            {
                                 self.scanner_state.pos += 2;
                                 let mut digits = self.scan_binary_or_octal_digits(8);
                                 if digits.is_empty() {
@@ -1070,7 +1141,12 @@ impl Scanner {
                         self.scanner_state.token = SyntaxKind::SemicolonToken;
                     }
                     Some(b'<') => {
-                        if self.char_at(1) == i32::from(b'<') && is_conflict_marker_trivia(&self.text, self.scanner_state.pos as usize) {
+                        if self.char_at(1) == i32::from(b'<')
+                            && is_conflict_marker_trivia(
+                                &self.text,
+                                self.scanner_state.pos as usize,
+                            )
+                        {
                             self.scanner_state.pos = self.scan_conflict_marker_trivia_at_pos();
                             if self.skip_trivia {
                                 continue 'scan;
@@ -1102,7 +1178,12 @@ impl Scanner {
                         }
                     }
                     Some(b'=') => {
-                        if self.char_at(1) == i32::from(b'=') && is_conflict_marker_trivia(&self.text, self.scanner_state.pos as usize) {
+                        if self.char_at(1) == i32::from(b'=')
+                            && is_conflict_marker_trivia(
+                                &self.text,
+                                self.scanner_state.pos as usize,
+                            )
+                        {
                             self.scanner_state.pos = self.scan_conflict_marker_trivia_at_pos();
                             if self.skip_trivia {
                                 continue 'scan;
@@ -1128,7 +1209,12 @@ impl Scanner {
                         }
                     }
                     Some(b'>') => {
-                        if self.char_at(1) == i32::from(b'>') && is_conflict_marker_trivia(&self.text, self.scanner_state.pos as usize) {
+                        if self.char_at(1) == i32::from(b'>')
+                            && is_conflict_marker_trivia(
+                                &self.text,
+                                self.scanner_state.pos as usize,
+                            )
+                        {
                             self.scanner_state.pos = self.scan_conflict_marker_trivia_at_pos();
                             if self.skip_trivia {
                                 continue 'scan;
@@ -1141,7 +1227,9 @@ impl Scanner {
                         self.scanner_state.token = SyntaxKind::GreaterThanToken;
                     }
                     Some(b'?') => {
-                        if self.char_at(1) == i32::from(b'.') && !is_digit(rune_to_char(self.char_at(2))) {
+                        if self.char_at(1) == i32::from(b'.')
+                            && !is_digit(rune_to_char(self.char_at(2)))
+                        {
                             self.scanner_state.pos += 2;
                             self.scanner_state.token = SyntaxKind::QuestionDotToken;
                         } else if self.char_at(1) == i32::from(b'?') {
@@ -1179,7 +1267,12 @@ impl Scanner {
                         self.scanner_state.token = SyntaxKind::OpenBraceToken;
                     }
                     Some(b'|') => {
-                        if self.char_at(1) == i32::from(b'|') && is_conflict_marker_trivia(&self.text, self.scanner_state.pos as usize) {
+                        if self.char_at(1) == i32::from(b'|')
+                            && is_conflict_marker_trivia(
+                                &self.text,
+                                self.scanner_state.pos as usize,
+                            )
+                        {
                             self.scanner_state.pos = self.scan_conflict_marker_trivia_at_pos();
                             if self.skip_trivia {
                                 continue 'scan;
@@ -1222,7 +1315,8 @@ impl Scanner {
                             let escaped = rune_to_string(self.scan_unicode_escape(true));
                             let parts = self.scan_identifier_parts();
                             self.set_token_value(&(escaped + &parts));
-                            self.scanner_state.token = get_identifier_token(self.scanner_state.token_value);
+                            self.scanner_state.token =
+                                get_identifier_token(self.scanner_state.token_value);
                         } else {
                             self.scan_invalid_character();
                         }
@@ -1238,7 +1332,12 @@ impl Scanner {
                                 }
                                 continue 'scan;
                             }
-                            self.error_at(diag::X_can_only_be_used_at_the_start_of_a_file, self.scanner_state.pos, 2, Vec::new());
+                            self.error_at(
+                                diag::X_can_only_be_used_at_the_start_of_a_file,
+                                self.scanner_state.pos,
+                                2,
+                                Vec::new(),
+                            );
                             self.scanner_state.pos += 1;
                             self.scanner_state.token = SyntaxKind::Unknown;
                             break 'sw;
@@ -1256,7 +1355,12 @@ impl Scanner {
                             self.scanner_state.pos -= 1;
                         }
                         if !self.scan_identifier(1) {
-                            self.error_at(diag::Invalid_character, self.scanner_state.pos - 1, 1, Vec::new());
+                            self.error_at(
+                                diag::Invalid_character,
+                                self.scanner_state.pos - 1,
+                                1,
+                                Vec::new(),
+                            );
                             self.scanner_state.token_value = "#";
                         }
                         self.scanner_state.token = SyntaxKind::PrivateIdentifier;
@@ -1267,7 +1371,8 @@ impl Scanner {
                             break 'sw;
                         }
                         if self.scan_identifier(0) {
-                            self.scanner_state.token = get_identifier_token(self.scanner_state.token_value);
+                            self.scanner_state.token =
+                                get_identifier_token(self.scanner_state.token_value);
                             break 'sw;
                         }
                         let (mut ch, mut size) = self.char_and_size();
@@ -1353,7 +1458,10 @@ impl Scanner {
         // Go: append(s.commentDirectives, ...) on the state's slice header.
         let len = self.scanner_state.comment_directives_len;
         self.comment_directives.truncate(len);
-        self.comment_directives.push(CommentDirective { loc: TextRange::new(start, end), kind });
+        self.comment_directives.push(CommentDirective {
+            loc: TextRange::new(start, end),
+            kind,
+        });
         self.scanner_state.comment_directives_len = len + 1;
     }
 
@@ -1381,7 +1489,8 @@ impl Scanner {
             if self.char_at(1) == i32::from(b'>') {
                 if self.char_at(2) == i32::from(b'=') {
                     self.scanner_state.pos += 3;
-                    self.scanner_state.token = SyntaxKind::GreaterThanGreaterThanGreaterThanEqualsToken;
+                    self.scanner_state.token =
+                        SyntaxKind::GreaterThanGreaterThanGreaterThanEqualsToken;
                 } else {
                     self.scanner_state.pos += 2;
                     self.scanner_state.token = SyntaxKind::GreaterThanGreaterThanGreaterThanToken;
@@ -1420,7 +1529,9 @@ impl Scanner {
     // PORT: Go takes `reportErrors ...bool` and reads only the first value.
     pub fn re_scan_slash_token(&mut self, report_errors: bool) -> SyntaxKind {
         let should_report_errors = report_errors;
-        if self.scanner_state.token == SyntaxKind::SlashToken || self.scanner_state.token == SyntaxKind::SlashEqualsToken {
+        if self.scanner_state.token == SyntaxKind::SlashToken
+            || self.scanner_state.token == SyntaxKind::SlashEqualsToken
+        {
             // Quickly get to the end of regex such that we know the flags
             let start_of_reg_exp_body = self.scanner_state.token_start + 1;
             let mut p = start_of_reg_exp_body;
@@ -1470,7 +1581,8 @@ impl Scanner {
                         && text[(p + 1) as usize] == b'?'
                         && p + 2 < end
                         && text[(p + 2) as usize] == b'<'
-                        && (p + 3 >= end || (text[(p + 3) as usize] != b'=' && text[(p + 3) as usize] != b'!'))
+                        && (p + 3 >= end
+                            || (text[(p + 3) as usize] != b'=' && text[(p + 3) as usize] != b'!'))
                     {
                         named_capture_groups = true;
                     }
@@ -1479,7 +1591,11 @@ impl Scanner {
             }
 
             let end_of_reg_exp_body = p;
-            if self.scanner_state.token_flags.intersects(TokenFlags::UNTERMINATED) {
+            if self
+                .scanner_state
+                .token_flags
+                .intersects(TokenFlags::UNTERMINATED)
+            {
                 // Search for the nearest unbalanced bracket for better recovery. Since the expression is
                 // invalid anyways, we take nested square brackets into consideration for the best guess.
                 p = start_of_reg_exp_body;
@@ -1545,12 +1661,24 @@ impl Scanner {
                     if should_report_errors {
                         match char_code_to_reg_exp_flag(ch) {
                             None => {
-                                self.error_at(diag::Unknown_regular_expression_flag, p, size, Vec::new());
+                                self.error_at(
+                                    diag::Unknown_regular_expression_flag,
+                                    p,
+                                    size,
+                                    Vec::new(),
+                                );
                             }
                             Some(flag) => {
                                 if reg_exp_flags.intersects(flag) {
-                                    self.error_at(diag::Duplicate_regular_expression_flag, p, size, Vec::new());
-                                } else if (reg_exp_flags | flag).contains(RegularExpressionFlags::ANY_UNICODE_MODE) {
+                                    self.error_at(
+                                        diag::Duplicate_regular_expression_flag,
+                                        p,
+                                        size,
+                                        Vec::new(),
+                                    );
+                                } else if (reg_exp_flags | flag)
+                                    .contains(RegularExpressionFlags::ANY_UNICODE_MODE)
+                                {
                                     self.error_at(
                                         diag::The_Unicode_u_flag_and_the_Unicode_Sets_v_flag_cannot_be_set_simultaneously,
                                         p,
@@ -1576,8 +1704,10 @@ impl Scanner {
                         scanner: &mut *self,
                         end: end_of_reg_exp_body,
                         reg_exp_flags,
-                        any_unicode_mode: reg_exp_flags.intersects(RegularExpressionFlags::ANY_UNICODE_MODE),
-                        unicode_sets_mode: reg_exp_flags.intersects(RegularExpressionFlags::UNICODE_SETS),
+                        any_unicode_mode: reg_exp_flags
+                            .intersects(RegularExpressionFlags::ANY_UNICODE_MODE),
+                        unicode_sets_mode: reg_exp_flags
+                            .intersects(RegularExpressionFlags::UNICODE_SETS),
                         annex_b: true,
                         any_unicode_mode_or_non_annex_b: false,
                         named_capture_groups,
@@ -1600,7 +1730,10 @@ impl Scanner {
             }
 
             self.scanner_state.pos = p;
-            let value = intern_token_value(&self.text[self.scanner_state.token_start as usize..self.scanner_state.pos as usize]);
+            let value = intern_token_value(
+                &self.text
+                    [self.scanner_state.token_start as usize..self.scanner_state.pos as usize],
+            );
             self.scanner_state.token_value = value;
             self.scanner_state.token = SyntaxKind::RegularExpressionLiteral;
         }

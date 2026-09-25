@@ -132,7 +132,9 @@ impl EmitContext {
         if is_identifier(updated) || is_private_identifier(updated) {
             let auto_generate = self.auto_generate.borrow().get(&original).cloned();
             if let Some(auto_generate_copy) = auto_generate {
-                self.auto_generate.borrow_mut().insert(updated, auto_generate_copy);
+                self.auto_generate
+                    .borrow_mut()
+                    .insert(updated, auto_generate_copy);
             }
         }
     }
@@ -151,15 +153,29 @@ impl EmitContext {
             visit,
             Some(&self.factory().ast),
             NodeVisitorHooks {
-                visit_parameters: Some(Rc::new(move |nodes: NodeList, v: &mut NodeVisitor<'a, C>| self.visit_parameters(nodes, v))),
-                visit_function_body: Some(Rc::new(move |node: Node, v: &mut NodeVisitor<'a, C>| self.visit_function_body(node, v))),
-                visit_iteration_body: Some(Rc::new(move |node: Node, v: &mut NodeVisitor<'a, C>| self.visit_iteration_body(node, v))),
-                visit_top_level_statements: Some(Rc::new(move |nodes: NodeList, v: &mut NodeVisitor<'a, C>| {
-                    self.visit_variable_environment(nodes, v)
-                })),
-                visit_embedded_statement: Some(Rc::new(move |node: Node, v: &mut NodeVisitor<'a, C>| {
-                    self.visit_embedded_statement(node, v)
-                })),
+                visit_parameters: Some(Rc::new(
+                    move |nodes: NodeList, v: &mut NodeVisitor<'a, C>| {
+                        self.visit_parameters(nodes, v)
+                    },
+                )),
+                visit_function_body: Some(Rc::new(
+                    move |node: Node, v: &mut NodeVisitor<'a, C>| self.visit_function_body(node, v),
+                )),
+                visit_iteration_body: Some(Rc::new(
+                    move |node: Node, v: &mut NodeVisitor<'a, C>| {
+                        self.visit_iteration_body(node, v)
+                    },
+                )),
+                visit_top_level_statements: Some(Rc::new(
+                    move |nodes: NodeList, v: &mut NodeVisitor<'a, C>| {
+                        self.visit_variable_environment(nodes, v)
+                    },
+                )),
+                visit_embedded_statement: Some(Rc::new(
+                    move |node: Node, v: &mut NodeVisitor<'a, C>| {
+                        self.visit_embedded_statement(node, v)
+                    },
+                )),
                 ..NodeVisitorHooks::default()
             },
             ctx,
@@ -175,7 +191,9 @@ impl EmitContext {
     //
     // NOTE: This is the equivalent of `transformContext.startLexicalEnvironment` in Strada.
     pub fn start_variable_environment(&self) {
-        self.var_scope_stack.borrow_mut().push(Rc::new(RefCell::new(VarScope::default())));
+        self.var_scope_stack
+            .borrow_mut()
+            .push(Rc::new(RefCell::new(VarScope::default())));
         self.start_lexical_environment();
     }
 
@@ -184,10 +202,18 @@ impl EmitContext {
     //
     // NOTE: This is the equivalent of `transformContext.endLexicalEnvironment` in Strada.
     pub fn end_variable_environment(&self) -> Vec<Node> {
-        let scope = self.var_scope_stack.borrow_mut().pop().expect("stack is empty");
+        let scope = self
+            .var_scope_stack
+            .borrow_mut()
+            .pop()
+            .expect("stack is empty");
         let (functions, variables, initialization_statements) = {
             let s = scope.borrow();
-            (s.functions.clone(), s.variables.clone(), s.initialization_statements.clone())
+            (
+                s.functions.clone(),
+                s.variables.clone(),
+                s.initialization_statements.clone(),
+            )
         };
         let mut statements: Vec<Node> = Vec::new();
         if !functions.is_empty() {
@@ -195,8 +221,10 @@ impl EmitContext {
         }
         if !variables.is_empty() {
             let f = self.factory();
-            let var_decl_list = f.new_variable_declaration_list(f.new_node_list(&variables), NodeFlags::NONE);
-            let var_statement = f.new_variable_statement(ModifierList::NIL /*modifiers*/, var_decl_list);
+            let var_decl_list =
+                f.new_variable_declaration_list(f.new_node_list(&variables), NodeFlags::NONE);
+            let var_statement =
+                f.new_variable_statement(ModifierList::NIL /*modifiers*/, var_decl_list);
             self.set_emit_flags(var_statement, EmitFlags::CUSTOM_PROLOGUE);
             statements.push(var_statement);
         }
@@ -210,7 +238,11 @@ impl EmitContext {
     // Go: printer/emitcontext.go:136 EndAndMergeVariableEnvironmentList
     // Invokes c.EndVariableEnvironment() and merges the results into `statements`
     pub fn end_and_merge_variable_environment_list(&self, statements: NodeList) -> NodeList {
-        let nodes: Vec<Node> = if statements.is_some() { statements.nodes().to_vec() } else { Vec::new() };
+        let nodes: Vec<Node> = if statements.is_some() {
+            statements.nodes().to_vec()
+        } else {
+            Vec::new()
+        };
 
         let (result, changed) = self.end_and_merge_variable_environment_(&nodes);
         if changed {
@@ -247,7 +279,12 @@ impl EmitContext {
             Node::NIL, /*initializer*/
         );
         self.set_emit_flags(var_decl, EmitFlags::NO_NESTED_SOURCE_MAPS);
-        let scope = self.var_scope_stack.borrow().last().cloned().expect("stack is empty");
+        let scope = self
+            .var_scope_stack
+            .borrow()
+            .last()
+            .cloned()
+            .expect("stack is empty");
         let mut scope = scope.borrow_mut();
         scope.variables.push(var_decl);
         if scope.flags & ENVIRONMENT_FLAGS_IN_PARAMETERS != 0 {
@@ -261,7 +298,12 @@ impl EmitContext {
     // NOTE: This is the equivalent of `transformContext.hoistFunctionDeclaration` in Strada.
     pub fn add_hoisted_function_declaration(&self, node: Node) {
         self.set_emit_flags(node, EmitFlags::CUSTOM_PROLOGUE);
-        let scope = self.var_scope_stack.borrow().last().cloned().expect("stack is empty");
+        let scope = self
+            .var_scope_stack
+            .borrow()
+            .last()
+            .cloned()
+            .expect("stack is empty");
         scope.borrow_mut().functions.push(node);
     }
 
@@ -271,7 +313,9 @@ impl EmitContext {
     // NOTE: This is the equivalent of `transformContext.startBlockScope` in Strada.
     // NOTE: This is *not* the same as `startLexicalEnvironment` in Strada as that method is incorrectly named.
     pub fn start_lexical_environment(&self) {
-        self.let_scope_stack.borrow_mut().push(Rc::new(RefCell::new(VarScope::default())));
+        self.let_scope_stack
+            .borrow_mut()
+            .push(Rc::new(RefCell::new(VarScope::default())));
     }
 
     // Go: printer/emitcontext.go:197 EndLexicalEnvironment
@@ -280,13 +324,19 @@ impl EmitContext {
     // NOTE: This is the equivalent of `transformContext.endLexicalEnvironment` in Strada.
     // NOTE: This is *not* the same as `endLexicalEnvironment` in Strada as that method is incorrectly named.
     pub fn end_lexical_environment(&self) -> Vec<Node> {
-        let scope = self.let_scope_stack.borrow_mut().pop().expect("stack is empty");
+        let scope = self
+            .let_scope_stack
+            .borrow_mut()
+            .pop()
+            .expect("stack is empty");
         let variables = scope.borrow().variables.clone();
         let mut statements: Vec<Node> = Vec::new();
         if !variables.is_empty() {
             let f = self.factory();
-            let var_decl_list = f.new_variable_declaration_list(f.new_node_list(&variables), NodeFlags::LET);
-            let var_statement = f.new_variable_statement(ModifierList::NIL /*modifiers*/, var_decl_list);
+            let var_decl_list =
+                f.new_variable_declaration_list(f.new_node_list(&variables), NodeFlags::LET);
+            let var_statement =
+                f.new_variable_statement(ModifierList::NIL /*modifiers*/, var_decl_list);
             self.set_emit_flags(var_statement, EmitFlags::CUSTOM_PROLOGUE);
             statements.push(var_statement);
         }
@@ -296,7 +346,11 @@ impl EmitContext {
     // Go: printer/emitcontext.go:210 EndAndMergeLexicalEnvironmentList
     // Invokes c.EndLexicalEnvironment() and merges the results into `statements`
     pub fn end_and_merge_lexical_environment_list(&self, statements: NodeList) -> NodeList {
-        let nodes: Vec<Node> = if statements.is_some() { statements.nodes().to_vec() } else { Vec::new() };
+        let nodes: Vec<Node> = if statements.is_some() {
+            statements.nodes().to_vec()
+        } else {
+            Vec::new()
+        };
 
         let (result, changed) = self.end_and_merge_lexical_environment_(&nodes);
         if changed {
@@ -331,7 +385,12 @@ impl EmitContext {
             Node::NIL, /*initializer*/
         );
         self.set_emit_flags(var_decl, EmitFlags::NO_NESTED_SOURCE_MAPS);
-        let scope = self.let_scope_stack.borrow().last().cloned().expect("stack is empty");
+        let scope = self
+            .let_scope_stack
+            .borrow()
+            .last()
+            .cloned()
+            .expect("stack is empty");
         scope.borrow_mut().variables.push(var_decl);
     }
 
@@ -392,23 +451,39 @@ impl EmitContext {
 
         // find standard prologues on left in the following order: standard directives, hoisted functions, hoisted variables, other custom
         let left_standard_prologue_end = find_span_end(statements, is_prologue_directive, 0);
-        let left_hoisted_functions_end =
-            find_span_end_with_emit_context(self, statements, EmitContext::is_hoisted_function, left_standard_prologue_end);
-        let left_hoisted_variables_end =
-            find_span_end_with_emit_context(self, statements, EmitContext::is_hoisted_variable_statement, left_hoisted_functions_end);
+        let left_hoisted_functions_end = find_span_end_with_emit_context(
+            self,
+            statements,
+            EmitContext::is_hoisted_function,
+            left_standard_prologue_end,
+        );
+        let left_hoisted_variables_end = find_span_end_with_emit_context(
+            self,
+            statements,
+            EmitContext::is_hoisted_variable_statement,
+            left_hoisted_functions_end,
+        );
 
         // find standard prologues on right in the following order: standard directives, hoisted functions, hoisted variables, other custom
         let right_standard_prologue_end = find_span_end(declarations, is_prologue_directive, 0);
-        let right_hoisted_functions_end =
-            find_span_end_with_emit_context(self, declarations, EmitContext::is_hoisted_function, right_standard_prologue_end);
+        let right_hoisted_functions_end = find_span_end_with_emit_context(
+            self,
+            declarations,
+            EmitContext::is_hoisted_function,
+            right_standard_prologue_end,
+        );
         let right_hoisted_variables_end = find_span_end_with_emit_context(
             self,
             declarations,
             EmitContext::is_hoisted_variable_statement,
             right_hoisted_functions_end,
         );
-        let right_custom_prologue_end =
-            find_span_end_with_emit_context(self, declarations, EmitContext::is_custom_prologue, right_hoisted_variables_end);
+        let right_custom_prologue_end = find_span_end_with_emit_context(
+            self,
+            declarations,
+            EmitContext::is_custom_prologue,
+            right_hoisted_variables_end,
+        );
         if right_custom_prologue_end as usize != declarations.len() {
             panic!("Expected declarations to be valid standard or custom prologues");
         }
@@ -426,7 +501,8 @@ impl EmitContext {
             splice(
                 &mut left,
                 left_hoisted_variables_end,
-                &declarations[right_hoisted_variables_end as usize..right_custom_prologue_end as usize],
+                &declarations
+                    [right_hoisted_variables_end as usize..right_custom_prologue_end as usize],
             );
             changed = true;
         }
@@ -436,7 +512,8 @@ impl EmitContext {
             splice(
                 &mut left,
                 left_hoisted_functions_end,
-                &declarations[right_hoisted_functions_end as usize..right_hoisted_variables_end as usize],
+                &declarations
+                    [right_hoisted_functions_end as usize..right_hoisted_variables_end as usize],
             );
             changed = true;
         }
@@ -446,7 +523,8 @@ impl EmitContext {
             splice(
                 &mut left,
                 left_standard_prologue_end,
-                &declarations[right_standard_prologue_end as usize..right_hoisted_functions_end as usize],
+                &declarations
+                    [right_standard_prologue_end as usize..right_hoisted_functions_end as usize],
             );
             changed = true;
         }
@@ -454,7 +532,11 @@ impl EmitContext {
         // splice standard prologues from right into left (that are not already in left)
         if right_standard_prologue_end > 0 {
             if left_standard_prologue_end == 0 {
-                splice(&mut left, 0, &declarations[..right_standard_prologue_end as usize]);
+                splice(
+                    &mut left,
+                    0,
+                    &declarations[..right_standard_prologue_end as usize],
+                );
                 changed = true;
             } else {
                 let mut left_prologues: FxHashSet<String> = FxHashSet::default();
@@ -489,7 +571,12 @@ impl EmitContext {
     fn is_hoisted_variable_statement(&self, node: Node) -> bool {
         self.is_custom_prologue(node)
             && is_variable_statement(node)
-            && node.declaration_list().declarations().nodes().iter().all(is_hoisted_variable)
+            && node
+                .declaration_list()
+                .declarations()
+                .nodes()
+                .iter()
+                .all(is_hoisted_variable)
     }
 
     //
@@ -524,14 +611,19 @@ impl EmitContext {
         let auto_generate = self.auto_generate.borrow().get(&name).cloned();
         if let Some(auto_generate) = auto_generate {
             if auto_generate.flags.is_node() {
-                return self.get_node_for_generated_name_worker(auto_generate.node, auto_generate.id);
+                return self
+                    .get_node_for_generated_name_worker(auto_generate.node, auto_generate.id);
             }
         }
         name
     }
 
     // Go: printer/emitcontext.go:401 getNodeForGeneratedNameWorker
-    pub(crate) fn get_node_for_generated_name_worker(&self, mut node: Node, auto_generate_id: AutoGenerateId) -> Node {
+    pub(crate) fn get_node_for_generated_name_worker(
+        &self,
+        mut node: Node,
+        auto_generate_id: AutoGenerateId,
+    ) -> Node {
         let mut original = self.original(node);
         while original.is_some() {
             node = original;
@@ -603,7 +695,11 @@ impl EmitContext {
     // NOTE: This is the equivalent to reading `node.original` in Strada.
     #[must_use]
     pub fn original(&self, node: Node) -> Node {
-        self.original.borrow().get(&node).copied().unwrap_or(Node::NIL)
+        self.original
+            .borrow()
+            .get(&node)
+            .copied()
+            .unwrap_or(Node::NIL)
     }
 
     // Go: printer/emitcontext.go:487 MostOriginal
@@ -668,10 +764,10 @@ pub struct AutoGenerateId(pub u32);
 #[derive(Clone, Debug, Default)]
 pub struct AutoGenerateInfo {
     pub flags: GeneratedIdentifierFlags, // Specifies whether to auto-generate the text for an identifier.
-    pub id: AutoGenerateId,              // Ensures unique generated identifiers get unique names, but clones get the same name.
-    pub prefix: String,                  // Optional prefix to apply to the start of the generated name
-    pub suffix: String,                  // Optional suffix to apply to the end of the generated name
-    pub node: Node,                      // For a GeneratedIdentifierFlagsNode, the node from which to generate an identifier
+    pub id: AutoGenerateId, // Ensures unique generated identifiers get unique names, but clones get the same name.
+    pub prefix: String,     // Optional prefix to apply to the start of the generated name
+    pub suffix: String,     // Optional suffix to apply to the end of the generated name
+    pub node: Node, // For a GeneratedIdentifierFlagsNode, the node from which to generate an identifier
 }
 
 //
@@ -840,19 +936,30 @@ impl EmitContext {
     pub fn set_token_source_map_range(&self, node: Node, kind: SyntaxKind, loc: TextRange) {
         let mut emit_nodes = self.emit_nodes.borrow_mut();
         let emit_node = emit_nodes.get(node);
-        emit_node.token_source_map_ranges.get_or_insert_with(FxHashMap::default).insert(kind, loc);
+        emit_node
+            .token_source_map_ranges
+            .get_or_insert_with(FxHashMap::default)
+            .insert(kind, loc);
     }
 
     // Go: printer/emitcontext.go:636 AssignedName
     #[must_use]
     pub fn assigned_name(&self, node: Node) -> Node {
-        self.assigned_name.borrow().get(&node).copied().unwrap_or(Node::NIL)
+        self.assigned_name
+            .borrow()
+            .get(&node)
+            .copied()
+            .unwrap_or(Node::NIL)
     }
 
     // Go: printer/emitcontext.go:640 TextSource
     #[must_use]
     pub fn text_source(&self, node: Node) -> Node {
-        self.text_source.borrow().get(&node).copied().unwrap_or(Node::NIL)
+        self.text_source
+            .borrow()
+            .get(&node)
+            .copied()
+            .unwrap_or(Node::NIL)
     }
 
     // Go: printer/emitcontext.go:644 SetAssignedName
@@ -863,7 +970,11 @@ impl EmitContext {
     // Go: printer/emitcontext.go:651 ClassThis
     #[must_use]
     pub fn class_this(&self, node: Node) -> Node {
-        self.class_this.borrow().get(&node).copied().unwrap_or(Node::NIL)
+        self.class_this
+            .borrow()
+            .get(&node)
+            .copied()
+            .unwrap_or(Node::NIL)
     }
 
     // Go: printer/emitcontext.go:655 SetClassThis
@@ -897,7 +1008,12 @@ impl EmitContext {
     }
 
     // Go: printer/emitcontext.go:685 MoveEmitHelpers
-    pub fn move_emit_helpers(&self, source: Node, target: Node, predicate: &mut dyn FnMut(EmitHelperRef) -> bool) {
+    pub fn move_emit_helpers(
+        &self,
+        source: Node,
+        target: Node,
+        predicate: &mut dyn FnMut(EmitHelperRef) -> bool,
+    ) {
         let source_emit_helpers = match self.emit_nodes.borrow().try_get(source) {
             None => return,
             Some(source_emit_node) => source_emit_node.helpers.clone(),
@@ -952,10 +1068,15 @@ impl EmitContext {
     pub fn set_external_helpers_module_name(&self, node: Node, name: Node) {
         let parse_node = self.parse_node(node);
         if parse_node.is_nil() {
-            panic!("Node must be a parse tree node or have an Original pointer to a parse tree node.");
+            panic!(
+                "Node must be a parse tree node or have an Original pointer to a parse tree node."
+            );
         }
 
-        self.emit_nodes.borrow_mut().get(parse_node).external_helpers_module_name = name;
+        self.emit_nodes
+            .borrow_mut()
+            .get(parse_node)
+            .external_helpers_module_name = name;
     }
 
     // Go: printer/emitcontext.go:740 HasRecordedExternalHelpers
@@ -979,7 +1100,9 @@ impl EmitContext {
     pub fn is_call_to_helper(&self, first_segment: Node, helper_name: &str) -> bool {
         is_call_expression(first_segment)
             && is_identifier(first_segment.expression())
-            && self.emit_flags(first_segment.expression()).intersects(EmitFlags::HELPER_NAME)
+            && self
+                .emit_flags(first_segment.expression())
+                .intersects(EmitFlags::HELPER_NAME)
             && first_segment.expression().text() == helper_name
     }
 
@@ -988,16 +1111,29 @@ impl EmitContext {
     //
 
     // Go: printer/emitcontext.go:759 VisitVariableEnvironment
-    pub fn visit_variable_environment<C>(&self, nodes: NodeList, visitor: &mut NodeVisitor<'_, C>) -> NodeList {
+    pub fn visit_variable_environment<C>(
+        &self,
+        nodes: NodeList,
+        visitor: &mut NodeVisitor<'_, C>,
+    ) -> NodeList {
         self.start_variable_environment();
         let visited = visitor.visit_nodes(nodes);
         self.end_and_merge_variable_environment_list(visited)
     }
 
     // Go: printer/emitcontext.go:764 VisitParameters
-    pub fn visit_parameters<C>(&self, nodes: NodeList, visitor: &mut NodeVisitor<'_, C>) -> NodeList {
+    pub fn visit_parameters<C>(
+        &self,
+        nodes: NodeList,
+        visitor: &mut NodeVisitor<'_, C>,
+    ) -> NodeList {
         self.start_variable_environment();
-        let scope = self.var_scope_stack.borrow().last().cloned().expect("stack is empty");
+        let scope = self
+            .var_scope_stack
+            .borrow()
+            .last()
+            .cloned()
+            .expect("stack is empty");
         let old_flags = scope.borrow().flags;
         scope.borrow_mut().flags |= ENVIRONMENT_FLAGS_IN_PARAMETERS;
         let mut nodes = visitor.visit_nodes(nodes);
@@ -1046,7 +1182,11 @@ impl EmitContext {
         } else if is_binding_pattern(parameter.name()) {
             return self.add_default_value_assignment_for_binding_pattern(parameter);
         } else if parameter.initializer().is_some() {
-            return self.add_default_value_assignment_for_initializer(parameter, parameter.name(), parameter.initializer());
+            return self.add_default_value_assignment_for_initializer(
+                parameter,
+                parameter.name(),
+                parameter.initializer(),
+            );
         }
         parameter
     }
@@ -1056,7 +1196,10 @@ impl EmitContext {
         let f = self.factory();
         let init_node = if parameter.initializer().is_some() {
             f.new_conditional_expression(
-                f.new_strict_equality_expression(f.new_generated_name_for_node(parameter), f.new_void_zero_expression()),
+                f.new_strict_equality_expression(
+                    f.new_generated_name_for_node(parameter),
+                    f.new_void_zero_expression(),
+                ),
                 f.new_token(SyntaxKind::QuestionToken),
                 parameter.initializer(),
                 f.new_token(SyntaxKind::ColonToken),
@@ -1068,7 +1211,12 @@ impl EmitContext {
         self.add_initialization_statement(f.new_variable_statement(
             ModifierList::NIL,
             f.new_variable_declaration_list(
-                f.new_node_list(&[f.new_variable_declaration(parameter.name(), Node::NIL, parameter.type_(), init_node)]),
+                f.new_node_list(&[f.new_variable_declaration(
+                    parameter.name(),
+                    Node::NIL,
+                    parameter.type_(),
+                    init_node,
+                )]),
                 NodeFlags::NONE,
             ),
         ));
@@ -1084,19 +1232,33 @@ impl EmitContext {
     }
 
     // Go: printer/emitcontext.go:857 addDefaultValueAssignmentForInitializer
-    fn add_default_value_assignment_for_initializer(&self, parameter: Node, name: Node, initializer: Node) -> Node {
+    fn add_default_value_assignment_for_initializer(
+        &self,
+        parameter: Node,
+        name: Node,
+        initializer: Node,
+    ) -> Node {
         let f = self.factory();
-        self.add_emit_flags(initializer, EmitFlags::NO_SOURCE_MAP | EmitFlags::NO_COMMENTS);
+        self.add_emit_flags(
+            initializer,
+            EmitFlags::NO_SOURCE_MAP | EmitFlags::NO_COMMENTS,
+        );
         let name_clone = f.clone_node(name);
         self.add_emit_flags(name_clone, EmitFlags::NO_SOURCE_MAP);
         let init_assignment = f.new_assignment_expression(name_clone, initializer);
         set_node_loc(init_assignment, parameter.loc());
         self.add_emit_flags(init_assignment, EmitFlags::NO_COMMENTS);
-        let init_block = f.new_block(f.new_node_list(&[f.new_expression_statement(init_assignment)]), false);
+        let init_block = f.new_block(
+            f.new_node_list(&[f.new_expression_statement(init_assignment)]),
+            false,
+        );
         set_node_loc(init_block, parameter.loc());
         self.add_emit_flags(
             init_block,
-            EmitFlags::SINGLE_LINE | EmitFlags::NO_TRAILING_SOURCE_MAP | EmitFlags::NO_TOKEN_SOURCE_MAPS | EmitFlags::NO_COMMENTS,
+            EmitFlags::SINGLE_LINE
+                | EmitFlags::NO_TRAILING_SOURCE_MAP
+                | EmitFlags::NO_TOKEN_SOURCE_MAPS
+                | EmitFlags::NO_COMMENTS,
         );
         self.add_initialization_statement(f.new_if_statement(
             f.new_type_check(f.clone_node(name), "undefined"),
@@ -1117,7 +1279,12 @@ impl EmitContext {
     // Go: printer/emitcontext.go:886 AddInitializationStatement
     pub fn add_initialization_statement(&self, node: Node) {
         // PORT: Go `Peek` panics on an empty stack before the nil check.
-        let scope = self.var_scope_stack.borrow().last().cloned().expect("stack is empty");
+        let scope = self
+            .var_scope_stack
+            .borrow()
+            .last()
+            .cloned()
+            .expect("stack is empty");
         self.add_emit_flags(node, EmitFlags::CUSTOM_PROLOGUE);
         scope.borrow_mut().initialization_statements.push(node);
     }
@@ -1137,11 +1304,16 @@ impl EmitContext {
         }
 
         if !is_block(updated) {
-            let statements = self.merge_environment(&[f.new_return_statement(updated)], &declarations);
+            let statements =
+                self.merge_environment(&[f.new_return_statement(updated)], &declarations);
             return f.new_block(f.new_node_list(&statements), false /*multiLine*/);
         }
 
-        f.update_block(updated, self.merge_environment_list(updated.statement_list(), &declarations), updated.multi_line())
+        f.update_block(
+            updated,
+            self.merge_environment_list(updated.statement_list(), &declarations),
+            updated.multi_line(),
+        )
     }
 
     // Go: printer/emitcontext.go:919 VisitIterationBody
@@ -1161,7 +1333,8 @@ impl EmitContext {
             let f = self.factory();
             if is_block(updated) {
                 statements.extend(updated.statements().iter());
-                let statements_list = new_synthetic_node_list(&statements, updated.statement_list().loc());
+                let statements_list =
+                    new_synthetic_node_list(&statements, updated.statement_list().loc());
                 return f.update_block(updated, statements_list, updated.multi_line());
             }
             statements.push(updated);
@@ -1172,7 +1345,11 @@ impl EmitContext {
     }
 
     // Go: printer/emitcontext.go:945 VisitEmbeddedStatement
-    pub fn visit_embedded_statement<C>(&self, node: Node, visitor: &mut NodeVisitor<'_, C>) -> Node {
+    pub fn visit_embedded_statement<C>(
+        &self,
+        node: Node,
+        visitor: &mut NodeVisitor<'_, C>,
+    ) -> Node {
         if node.is_nil() {
             return Node::NIL;
         }
@@ -1188,20 +1365,34 @@ impl EmitContext {
     }
 
     // Go: printer/emitcontext.go:960 SetSyntheticLeadingComments
-    pub fn set_synthetic_leading_comments(&self, node: Node, comments: Vec<SynthesizedComment>) -> Node {
+    pub fn set_synthetic_leading_comments(
+        &self,
+        node: Node,
+        comments: Vec<SynthesizedComment>,
+    ) -> Node {
         self.emit_nodes.borrow_mut().get(node).leading_comments = comments;
         node
     }
 
     // Go: printer/emitcontext.go:965 AddSyntheticLeadingComment
-    pub fn add_synthetic_leading_comment(&self, node: Node, kind: SyntaxKind, text: &str, has_trailing_new_line: bool) -> Node {
-        self.emit_nodes.borrow_mut().get(node).leading_comments.push(SynthesizedComment {
-            kind,
-            loc: TextRange::new(-1, -1),
-            has_leading_new_line: false,
-            has_trailing_new_line,
-            text: text.to_string(),
-        });
+    pub fn add_synthetic_leading_comment(
+        &self,
+        node: Node,
+        kind: SyntaxKind,
+        text: &str,
+        has_trailing_new_line: bool,
+    ) -> Node {
+        self.emit_nodes
+            .borrow_mut()
+            .get(node)
+            .leading_comments
+            .push(SynthesizedComment {
+                kind,
+                loc: TextRange::new(-1, -1),
+                has_leading_new_line: false,
+                has_trailing_new_line,
+                text: text.to_string(),
+            });
         node
     }
 
@@ -1215,20 +1406,34 @@ impl EmitContext {
     }
 
     // Go: printer/emitcontext.go:977 SetSyntheticTrailingComments
-    pub fn set_synthetic_trailing_comments(&self, node: Node, comments: Vec<SynthesizedComment>) -> Node {
+    pub fn set_synthetic_trailing_comments(
+        &self,
+        node: Node,
+        comments: Vec<SynthesizedComment>,
+    ) -> Node {
         self.emit_nodes.borrow_mut().get(node).trailing_comments = comments;
         node
     }
 
     // Go: printer/emitcontext.go:982 AddSyntheticTrailingComment
-    pub fn add_synthetic_trailing_comment(&self, node: Node, kind: SyntaxKind, text: &str, has_trailing_new_line: bool) -> Node {
-        self.emit_nodes.borrow_mut().get(node).trailing_comments.push(SynthesizedComment {
-            kind,
-            loc: TextRange::new(-1, -1),
-            has_leading_new_line: false,
-            has_trailing_new_line,
-            text: text.to_string(),
-        });
+    pub fn add_synthetic_trailing_comment(
+        &self,
+        node: Node,
+        kind: SyntaxKind,
+        text: &str,
+        has_trailing_new_line: bool,
+    ) -> Node {
+        self.emit_nodes
+            .borrow_mut()
+            .get(node)
+            .trailing_comments
+            .push(SynthesizedComment {
+                kind,
+                loc: TextRange::new(-1, -1),
+                has_leading_new_line: false,
+                has_trailing_new_line,
+                text: text.to_string(),
+            });
         node
     }
 

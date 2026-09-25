@@ -16,28 +16,52 @@ use ts_diagnostics::Message;
 impl Checker {
     // Go: checker/checker.go:12101 tryGetThisTypeAt
     pub fn try_get_this_type_at(&mut self, node: Node) -> TypeId {
-        self.try_get_this_type_at_ex(node, true /*includeGlobalThis*/, Node::NIL /*container*/)
+        self.try_get_this_type_at_ex(
+            node,
+            true,      /*includeGlobalThis*/
+            Node::NIL, /*container*/
+        )
     }
 
     // Go: checker/checker.go:12105 TryGetThisTypeAtEx
     // PORT: exported and unexported Go methods share the snake name
     // `try_get_this_type_at_ex`, so the exported one gets `_exported`.
-    pub fn try_get_this_type_at_ex_exported(&mut self, node: Node, include_global_this: bool, container: Node) -> TypeId {
+    pub fn try_get_this_type_at_ex_exported(
+        &mut self,
+        node: Node,
+        include_global_this: bool,
+        container: Node,
+    ) -> TypeId {
         let reparsed = get_reparsed_node_for_node(node);
-        if reparsed.flags().intersects(NodeFlags::JS_DOC) && !reparsed.flags().intersects(NodeFlags::REPARSED) {
+        if reparsed.flags().intersects(NodeFlags::JS_DOC)
+            && !reparsed.flags().intersects(NodeFlags::REPARSED)
+        {
             return TypeId::NIL; // Binder doesn't process non-reparsed JSDoc nodes
         }
-        self.try_get_this_type_at_ex(reparsed, include_global_this, get_reparsed_node_for_node(container))
+        self.try_get_this_type_at_ex(
+            reparsed,
+            include_global_this,
+            get_reparsed_node_for_node(container),
+        )
     }
 
     // Go: checker/checker.go:12113 tryGetThisTypeAtEx
-    pub fn try_get_this_type_at_ex(&mut self, node: Node, include_global_this: bool, container: Node) -> TypeId {
+    pub fn try_get_this_type_at_ex(
+        &mut self,
+        node: Node,
+        include_global_this: bool,
+        container: Node,
+    ) -> TypeId {
         let mut container = container;
         if container.is_nil() {
-            container = self.get_this_container(node, false /*includeArrowFunctions*/, false /*includeClassComputedPropertyName*/);
+            container = self.get_this_container(
+                node, false, /*includeArrowFunctions*/
+                false, /*includeClassComputedPropertyName*/
+            );
         }
         if is_function_like(container)
-            && (!self.is_in_parameter_initializer_before_containing_function(node) || get_this_parameter(container).is_some())
+            && (!self.is_in_parameter_initializer_before_containing_function(node)
+                || get_this_parameter(container).is_some())
         {
             let mut sig = self.get_signature_of_full_signature_type(container);
             if sig.is_nil() {
@@ -66,7 +90,10 @@ impl Checker {
         }
         if is_source_file(container) {
             // look up in the source file's locals or exports
-            if source_file_info(container).external_module_indicator.is_some() {
+            if source_file_info(container)
+                .external_module_indicator
+                .is_some()
+            {
                 // TODO: Maybe issue a better error than 'object is possibly undefined'
                 return self.undefined_type;
             }
@@ -78,7 +105,12 @@ impl Checker {
     }
 
     // Go: checker/checker.go:12155 getThisContainer
-    pub fn get_this_container(&self, node: Node, include_arrow_functions: bool, include_class_computed_property_name: bool) -> Node {
+    pub fn get_this_container(
+        &self,
+        node: Node,
+        include_arrow_functions: bool,
+        include_class_computed_property_name: bool,
+    ) -> Node {
         let mut node = node;
         loop {
             node = node.parent();
@@ -92,7 +124,8 @@ impl Checker {
                     // then the computed property is not a 'this' container.
                     // A computed property name in a class needs to be a this container
                     // so that we can error on it.
-                    if include_class_computed_property_name && is_class_like(node.parent().parent()) {
+                    if include_class_computed_property_name && is_class_like(node.parent().parent())
+                    {
                         return node;
                     }
                     // If this is a computed property, then the parent should not
@@ -104,7 +137,9 @@ impl Checker {
                 }
                 SyntaxKind::Decorator => {
                     // Decorators are always applied outside of the body of a class or method.
-                    if node.parent().kind() == SyntaxKind::Parameter && is_class_element(node.parent().parent()) {
+                    if node.parent().kind() == SyntaxKind::Parameter
+                        && is_class_element(node.parent().parent())
+                    {
                         // If the decorator's parent is a Parameter, we resolve the this container from
                         // the grandparent class declaration.
                         node = node.parent().parent();
@@ -166,24 +201,45 @@ impl Checker {
     }
 
     // Go: checker/checker.go:12221 checkThisInStaticClassFieldInitializerInDecoratedClass
-    pub fn check_this_in_static_class_field_initializer_in_decorated_class(&mut self, this_expression: Node, container: Node) {
-        if is_property_declaration(container) && has_static_modifier(container) && self.legacy_decorators {
+    pub fn check_this_in_static_class_field_initializer_in_decorated_class(
+        &mut self,
+        this_expression: Node,
+        container: Node,
+    ) {
+        if is_property_declaration(container)
+            && has_static_modifier(container)
+            && self.legacy_decorators
+        {
             let initializer = container.initializer();
-            if initializer.is_some() && initializer.loc().contains_inclusive(this_expression.pos()) && has_decorators(container.parent()) {
-                self.error(this_expression, diag::Cannot_use_this_in_a_static_property_initializer_of_a_decorated_class, args![]);
+            if initializer.is_some()
+                && initializer.loc().contains_inclusive(this_expression.pos())
+                && has_decorators(container.parent())
+            {
+                self.error(
+                    this_expression,
+                    diag::Cannot_use_this_in_a_static_property_initializer_of_a_decorated_class,
+                    args![],
+                );
             }
         }
     }
 
     // Go: checker/checker.go:12230 checkThisBeforeSuper
-    pub fn check_this_before_super(&mut self, node: Node, container: Node, diagnostic_message: &'static Message) {
+    pub fn check_this_before_super(
+        &mut self,
+        node: Node,
+        container: Node,
+        diagnostic_message: &'static Message,
+    ) {
         let containing_class_decl = container.parent();
         let base_type_node = get_extends_heritage_clause_element(containing_class_decl);
         // If a containing class does not have extends clause or the class extends null
         // skip checking whether super statement is called before "this" accessing.
         if base_type_node.is_some() && !self.class_declaration_extends_null(containing_class_decl) {
             // PORT: Go `node.FlowNodeData() != nil` is `canHaveFlowNode(node)`.
-            if can_have_flow_node(node) && !self.is_post_super_flow_node(node.flow_node(), false /*noCacheCheck*/) {
+            if can_have_flow_node(node)
+                && !self.is_post_super_flow_node(node.flow_node(), false /*noCacheCheck*/)
+            {
                 self.error(node, diagnostic_message, args![]);
             }
         }
@@ -207,7 +263,10 @@ impl Checker {
                 let sf = get_source_file_of_node(node);
                 self.add_diagnostic(new_diagnostic(
                     sf,
-                    TextRange::new(skip_trivia(source_file_text(sf), node.pos()), node.expression().pos()),
+                    TextRange::new(
+                        skip_trivia(source_file_text(sf), node.pos()),
+                        node.expression().pos(),
+                    ),
                     diag::This_syntax_is_not_allowed_when_erasableSyntaxOnly_is_enabled,
                     args![],
                 ));
@@ -257,7 +316,13 @@ impl Checker {
 
     // Go: checker/checker.go:12291 checkBinaryExpression
     pub fn check_binary_expression(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
-        self.check_binary_like_expression(node.left(), node.operator_token(), node.right(), check_mode, node)
+        self.check_binary_like_expression(
+            node.left(),
+            node.operator_token(),
+            node.right(),
+            check_mode,
+            node,
+        )
     }
 
     // Go: checker/checker.go:12296 checkBinaryLikeExpression
@@ -271,16 +336,24 @@ impl Checker {
     ) -> TypeId {
         let operator = operator_token.kind();
         if operator == SyntaxKind::EqualsToken
-            && (left.kind() == SyntaxKind::ObjectLiteralExpression || left.kind() == SyntaxKind::ArrayLiteralExpression)
+            && (left.kind() == SyntaxKind::ObjectLiteralExpression
+                || left.kind() == SyntaxKind::ArrayLiteralExpression)
         {
             let right_checked = self.check_expression_ex(right, check_mode);
-            return self.check_destructuring_assignment(left, right_checked, check_mode, right.kind() == SyntaxKind::ThisKeyword);
+            return self.check_destructuring_assignment(
+                left,
+                right_checked,
+                check_mode,
+                right.kind() == SyntaxKind::ThisKeyword,
+            );
         }
         let mut left_type = self.check_expression_ex(left, check_mode);
         let mut right_type = self.check_expression_ex(right, check_mode);
         if is_logical_or_coalescing_binary_operator(operator) {
             let mut parent = left.parent().parent();
-            while is_parenthesized_expression(parent) || is_logical_or_coalescing_binary_expression(parent) {
+            while is_parenthesized_expression(parent)
+                || is_logical_or_coalescing_binary_expression(parent)
+            {
                 parent = parent.parent();
             }
             if operator == SyntaxKind::AmpersandAmpersandToken || is_if_statement(parent) {
@@ -288,7 +361,9 @@ impl Checker {
                 if is_if_statement(parent) {
                     body = parent.then_statement();
                 }
-                self.check_testing_known_truthy_callable_or_awaitable_or_enum_member_type(left, left_type, body);
+                self.check_testing_known_truthy_callable_or_awaitable_or_enum_member_type(
+                    left, left_type, body,
+                );
             }
             if is_logical_binary_operator(operator) {
                 self.check_truthiness_of_type(left_type, left);
@@ -325,7 +400,10 @@ impl Checker {
                 // if a user tries to apply a bitwise operator to 2 boolean operands
                 // try and return them a helpful suggestion
                 if self.ty(left_type).flags.intersects(TypeFlags::BOOLEAN_LIKE)
-                    && self.ty(right_type).flags.intersects(TypeFlags::BOOLEAN_LIKE)
+                    && self
+                        .ty(right_type)
+                        .flags
+                        .intersects(TypeFlags::BOOLEAN_LIKE)
                 {
                     let suggested_operator = self.get_suggested_boolean_operator(operator);
                     if suggested_operator != SyntaxKind::Unknown {
@@ -362,9 +440,12 @@ impl Checker {
                     match operator {
                         SyntaxKind::GreaterThanGreaterThanGreaterThanToken
                         | SyntaxKind::GreaterThanGreaterThanGreaterThanEqualsToken => {
-                            self.report_operator_error(left_type, operator, right_type, error_node, None);
+                            self.report_operator_error(
+                                left_type, operator, right_type, error_node, None,
+                            );
                         }
-                        SyntaxKind::AsteriskAsteriskToken | SyntaxKind::AsteriskAsteriskEqualsToken => {
+                        SyntaxKind::AsteriskAsteriskToken
+                        | SyntaxKind::AsteriskAsteriskEqualsToken => {
                             if self.language_version < ScriptTarget::ES2016 {
                                 self.error(
                                     error_node,
@@ -382,7 +463,9 @@ impl Checker {
                         operator,
                         right_type,
                         error_node,
-                        Some(&mut |c: &mut Checker, l: TypeId, r: TypeId| c.both_are_big_int_like(l, r)),
+                        Some(&mut |c: &mut Checker, l: TypeId, r: TypeId| {
+                            c.both_are_big_int_like(l, r)
+                        }),
                     );
                     result_type = self.error_type;
                 }
@@ -428,20 +511,38 @@ impl Checker {
                     right_type = self.check_non_null_type(right_type, right);
                 }
                 let mut result_type = TypeId::NIL;
-                if self.is_type_assignable_to_kind_ex(left_type, TypeFlags::NUMBER_LIKE, true /*strict*/)
-                    && self.is_type_assignable_to_kind_ex(right_type, TypeFlags::NUMBER_LIKE, true /*strict*/)
-                {
+                if self.is_type_assignable_to_kind_ex(
+                    left_type,
+                    TypeFlags::NUMBER_LIKE,
+                    true, /*strict*/
+                ) && self.is_type_assignable_to_kind_ex(
+                    right_type,
+                    TypeFlags::NUMBER_LIKE,
+                    true, /*strict*/
+                ) {
                     // Operands of an enum type are treated as having the primitive type Number.
                     // If both operands are of the Number primitive type, the result is of the Number primitive type.
                     result_type = self.number_type;
-                } else if self.is_type_assignable_to_kind_ex(left_type, TypeFlags::BIG_INT_LIKE, true /*strict*/)
-                    && self.is_type_assignable_to_kind_ex(right_type, TypeFlags::BIG_INT_LIKE, true /*strict*/)
-                {
+                } else if self.is_type_assignable_to_kind_ex(
+                    left_type,
+                    TypeFlags::BIG_INT_LIKE,
+                    true, /*strict*/
+                ) && self.is_type_assignable_to_kind_ex(
+                    right_type,
+                    TypeFlags::BIG_INT_LIKE,
+                    true, /*strict*/
+                ) {
                     // If both operands are of the BigInt primitive type, the result is of the BigInt primitive type.
                     result_type = self.bigint_type;
-                } else if self.is_type_assignable_to_kind_ex(left_type, TypeFlags::STRING_LIKE, true /*strict*/)
-                    || self.is_type_assignable_to_kind_ex(right_type, TypeFlags::STRING_LIKE, true /*strict*/)
-                {
+                } else if self.is_type_assignable_to_kind_ex(
+                    left_type,
+                    TypeFlags::STRING_LIKE,
+                    true, /*strict*/
+                ) || self.is_type_assignable_to_kind_ex(
+                    right_type,
+                    TypeFlags::STRING_LIKE,
+                    true, /*strict*/
+                ) {
                     // If one or both operands are of the String primitive type, the result is of the String primitive type.
                     result_type = self.string_type;
                 } else if self.is_type_any(left_type) || self.is_type_any(right_type) {
@@ -454,7 +555,11 @@ impl Checker {
                     }
                 }
                 // Symbols are not allowed at all in arithmetic expressions
-                if result_type.is_some() && !self.check_for_disallowed_es_symbol_operand(left, right, left_type, right_type, operator) {
+                if result_type.is_some()
+                    && !self.check_for_disallowed_es_symbol_operand(
+                        left, right, left_type, right_type, operator,
+                    )
+                {
                     return result_type;
                 }
                 if result_type.is_nil() {
@@ -462,15 +567,18 @@ impl Checker {
                     // If both types have an awaited type of one of these, we'll assume the user
                     // might be missing an await without doing an exhaustive check that inserting
                     // await(s) will actually be a completely valid binary expression.
-                    let close_enough_kind =
-                        TypeFlags::NUMBER_LIKE | TypeFlags::BIG_INT_LIKE | TypeFlags::STRING_LIKE | TypeFlags::ANY_OR_UNKNOWN;
+                    let close_enough_kind = TypeFlags::NUMBER_LIKE
+                        | TypeFlags::BIG_INT_LIKE
+                        | TypeFlags::STRING_LIKE
+                        | TypeFlags::ANY_OR_UNKNOWN;
                     self.report_operator_error(
                         left_type,
                         operator,
                         right_type,
                         error_node,
                         Some(&mut move |c: &mut Checker, l: TypeId, r: TypeId| {
-                            c.is_type_assignable_to_kind(l, close_enough_kind) && c.is_type_assignable_to_kind(r, close_enough_kind)
+                            c.is_type_assignable_to_kind(l, close_enough_kind)
+                                && c.is_type_assignable_to_kind(r, close_enough_kind)
                         }),
                     );
                     return self.any_type;
@@ -484,7 +592,9 @@ impl Checker {
             | SyntaxKind::GreaterThanToken
             | SyntaxKind::LessThanEqualsToken
             | SyntaxKind::GreaterThanEqualsToken => {
-                if self.check_for_disallowed_es_symbol_operand(left, right, left_type, right_type, operator) {
+                if self.check_for_disallowed_es_symbol_operand(
+                    left, right, left_type, right_type, operator,
+                ) {
                     let l = self.check_non_null_type(left_type, left);
                     left_type = self.get_base_type_of_literal_type_for_comparison(l);
                     let r = self.check_non_null_type(right_type, right);
@@ -499,10 +609,14 @@ impl Checker {
                                 return true;
                             }
                             let number_or_big_int_type = c.number_or_big_int_type;
-                            let left_assignable_to_number = c.is_type_assignable_to(left, number_or_big_int_type);
-                            let right_assignable_to_number = c.is_type_assignable_to(right, number_or_big_int_type);
+                            let left_assignable_to_number =
+                                c.is_type_assignable_to(left, number_or_big_int_type);
+                            let right_assignable_to_number =
+                                c.is_type_assignable_to(right, number_or_big_int_type);
                             left_assignable_to_number && right_assignable_to_number
-                                || !left_assignable_to_number && !right_assignable_to_number && c.are_types_comparable(left, right)
+                                || !left_assignable_to_number
+                                    && !right_assignable_to_number
+                                    && c.are_types_comparable(left, right)
                         },
                     );
                 }
@@ -521,7 +635,8 @@ impl Checker {
                         && (!is_in_js_file(left)
                             || (operator == SyntaxKind::EqualsEqualsEqualsToken || operator == SyntaxKind::ExclamationEqualsEqualsToken))
                     {
-                        let eq_type = operator == SyntaxKind::EqualsEqualsToken || operator == SyntaxKind::EqualsEqualsEqualsToken;
+                        let eq_type = operator == SyntaxKind::EqualsEqualsToken
+                            || operator == SyntaxKind::EqualsEqualsEqualsToken;
                         self.error(
                             error_node,
                             diag::This_condition_will_always_return_0_since_JavaScript_compares_objects_by_reference_not_value,
@@ -535,13 +650,16 @@ impl Checker {
                         right_type,
                         error_node,
                         &mut |c: &mut Checker, left: TypeId, right: TypeId| {
-                            c.is_type_equality_comparable_to(left, right) || c.is_type_equality_comparable_to(right, left)
+                            c.is_type_equality_comparable_to(left, right)
+                                || c.is_type_equality_comparable_to(right, left)
                         },
                     );
                 }
                 self.boolean_type
             }
-            SyntaxKind::InstanceOfKeyword => self.check_instance_of_expression(left, right, left_type, right_type, check_mode),
+            SyntaxKind::InstanceOfKeyword => {
+                self.check_instance_of_expression(left, right, left_type, right_type, check_mode)
+            }
             SyntaxKind::InKeyword => self.check_in_expression(left, right, left_type, right_type),
             SyntaxKind::AmpersandAmpersandToken | SyntaxKind::AmpersandAmpersandEqualsToken => {
                 let mut result_type = left_type;
@@ -563,7 +681,12 @@ impl Checker {
                 if self.has_type_facts(left_type, TypeFacts::FALSY) {
                     let removed = self.remove_definitely_falsy_types(left_type);
                     let non_nullable = self.get_non_nullable_type(removed);
-                    result_type = self.get_union_type_ex(&[non_nullable, right_type], UnionReduction::SUBTYPE, None, TypeId::NIL);
+                    result_type = self.get_union_type_ex(
+                        &[non_nullable, right_type],
+                        UnionReduction::SUBTYPE,
+                        None,
+                        TypeId::NIL,
+                    );
                 }
                 if operator == SyntaxKind::BarBarEqualsToken {
                     self.check_assignment_operator(left, operator, right, left_type, right_type);
@@ -577,7 +700,12 @@ impl Checker {
                 let mut result_type = left_type;
                 if self.has_type_facts(left_type, TypeFacts::EQ_UNDEFINED_OR_NULL) {
                     let non_nullable = self.get_non_nullable_type(left_type);
-                    result_type = self.get_union_type_ex(&[non_nullable, right_type], UnionReduction::SUBTYPE, None, TypeId::NIL);
+                    result_type = self.get_union_type_ex(
+                        &[non_nullable, right_type],
+                        UnionReduction::SUBTYPE,
+                        None,
+                        TypeId::NIL,
+                    );
                 }
                 if operator == SyntaxKind::QuestionQuestionEqualsToken {
                     self.check_assignment_operator(left, operator, right, left_type, right_type);
@@ -598,13 +726,19 @@ impl Checker {
                     // PORT: Go `sf.Diagnostics()` is the parser diagnostics
                     // field, read here from `source_file_info(sf).diagnostics`.
                     let is_in_diag2657 = source_file_info(sf).diagnostics.iter().any(|d| {
-                        if d.code() != diag::JSX_expressions_must_have_one_parent_element.code() as i32 {
+                        if d.code()
+                            != diag::JSX_expressions_must_have_one_parent_element.code() as i32
+                        {
                             return false;
                         }
                         d.loc().contains(start)
                     });
                     if !is_in_diag2657 {
-                        self.error(left, diag::Left_side_of_comma_operator_is_unused_and_has_no_side_effects, args![]);
+                        self.error(
+                            left,
+                            diag::Left_side_of_comma_operator_is_unused_and_has_no_side_effects,
+                            args![],
+                        );
                     }
                 }
                 right_type
@@ -614,7 +748,13 @@ impl Checker {
     }
 
     // Go: checker/checker.go:12512 checkDestructuringAssignment
-    pub fn check_destructuring_assignment(&mut self, node: Node, source_type: TypeId, check_mode: CheckMode, right_is_this: bool) -> TypeId {
+    pub fn check_destructuring_assignment(
+        &mut self,
+        node: Node,
+        source_type: TypeId,
+        check_mode: CheckMode,
+        right_is_this: bool,
+    ) -> TypeId {
         let mut source_type = source_type;
         let mut target;
         if is_shorthand_property_assignment(node) {
@@ -625,16 +765,24 @@ impl Checker {
                 if self.strict_null_checks {
                     let init_type = self.check_expression(initializer);
                     if !self.has_type_facts(init_type, TypeFacts::IS_UNDEFINED) {
-                        source_type = self.get_type_with_facts(source_type, TypeFacts::NE_UNDEFINED);
+                        source_type =
+                            self.get_type_with_facts(source_type, TypeFacts::NE_UNDEFINED);
                     }
                 }
-                self.check_binary_like_expression(node.name(), node.equals_token(), initializer, check_mode, Node::NIL);
+                self.check_binary_like_expression(
+                    node.name(),
+                    node.equals_token(),
+                    initializer,
+                    check_mode,
+                    Node::NIL,
+                );
             }
             target = node.name();
         } else {
             target = node;
         }
-        if is_binary_expression(target) && target.operator_token().kind() == SyntaxKind::EqualsToken {
+        if is_binary_expression(target) && target.operator_token().kind() == SyntaxKind::EqualsToken
+        {
             self.check_binary_expression(target, check_mode);
             target = target.left();
             // A default value is specified, so remove undefined from the final type.
@@ -652,13 +800,24 @@ impl Checker {
     }
 
     // Go: checker/checker.go:12545 checkObjectLiteralAssignment
-    pub fn check_object_literal_assignment(&mut self, node: Node, source_type: TypeId, right_is_this: bool) -> TypeId {
+    pub fn check_object_literal_assignment(
+        &mut self,
+        node: Node,
+        source_type: TypeId,
+        right_is_this: bool,
+    ) -> TypeId {
         let properties = node.property_list();
         if self.strict_null_checks && properties.nodes().len() == 0 {
             return self.check_non_null_type(source_type, node);
         }
         for i in 0..properties.nodes().len() {
-            self.check_object_literal_destructuring_property_assignment(node, source_type, i as i32, properties, right_is_this);
+            self.check_object_literal_destructuring_property_assignment(
+                node,
+                source_type,
+                i as i32,
+                properties,
+                right_is_this,
+            );
         }
         source_type
     }
@@ -683,12 +842,28 @@ impl Checker {
                 let prop = self.get_property_of_type(object_literal_type, &text);
                 if prop.is_some() {
                     self.mark_property_as_referenced(prop, property, right_is_this);
-                    self.check_property_accessibility(property, false /*isSuper*/, true /*writing*/, object_literal_type, prop);
+                    self.check_property_accessibility(
+                        property,
+                        false, /*isSuper*/
+                        true,  /*writing*/
+                        object_literal_type,
+                        prop,
+                    );
                 }
             }
             let access_flags = AccessFlags::EXPRESSION_POSITION
-                | if self.has_default_value(property) { AccessFlags::ALLOW_MISSING } else { AccessFlags::NONE };
-            let element_type = self.get_indexed_access_type_ex(object_literal_type, expr_type, access_flags, name, None);
+                | if self.has_default_value(property) {
+                    AccessFlags::ALLOW_MISSING
+                } else {
+                    AccessFlags::NONE
+                };
+            let element_type = self.get_indexed_access_type_ex(
+                object_literal_type,
+                expr_type,
+                access_flags,
+                name,
+                None,
+            );
             let t = self.get_flow_type_of_destructuring(property, element_type);
             let mut expr = property;
             if is_property_assignment(property) {
@@ -698,7 +873,11 @@ impl Checker {
         }
         if is_spread_assignment(property) {
             if (property_index as usize) < properties.len() - 1 {
-                self.error(property, diag::A_rest_element_must_be_last_in_a_destructuring_pattern, args![]);
+                self.error(
+                    property,
+                    diag::A_rest_element_must_be_last_in_a_destructuring_pattern,
+                    args![],
+                );
                 return TypeId::NIL;
             }
             if self.language_version < LANGUAGE_FEATURE_MINIMUM_TARGET.object_spread_rest {
@@ -718,14 +897,24 @@ impl Checker {
                 all_properties,
                 diag::A_rest_parameter_or_binding_pattern_may_not_have_a_trailing_comma,
             );
-            return self.check_destructuring_assignment(property.expression(), t, CheckMode::NORMAL, false);
+            return self.check_destructuring_assignment(
+                property.expression(),
+                t,
+                CheckMode::NORMAL,
+                false,
+            );
         }
         self.error(property, diag::Property_assignment_expected, args![]);
         TypeId::NIL
     }
 
     // Go: checker/checker.go:12603 checkArrayLiteralAssignment
-    pub fn check_array_literal_assignment(&mut self, node: Node, source_type: TypeId, check_mode: CheckMode) -> TypeId {
+    pub fn check_array_literal_assignment(
+        &mut self,
+        node: Node,
+        source_type: TypeId,
+        check_mode: CheckMode,
+    ) -> TypeId {
         let elements = node.elements();
         // This elementType will be used if the specific property corresponding to this index is not
         // present (aka the tuple element property). This call also checks that the parentType is in
@@ -737,19 +926,42 @@ impl Checker {
             undefined_type,
             node,
         );
-        let possibly_out_of_bounds_type = if checked.is_some() { checked } else { self.error_type };
+        let possibly_out_of_bounds_type = if checked.is_some() {
+            checked
+        } else {
+            self.error_type
+        };
         let mut in_bounds_type =
-            if self.compiler_options.no_unchecked_indexed_access == Tristate::True { TypeId::NIL } else { possibly_out_of_bounds_type };
+            if self.compiler_options.no_unchecked_indexed_access == Tristate::True {
+                TypeId::NIL
+            } else {
+                possibly_out_of_bounds_type
+            };
         for i in 0..elements.len() {
             let mut t = possibly_out_of_bounds_type;
             if elements.get(i).kind() == SyntaxKind::SpreadElement {
                 if in_bounds_type.is_nil() {
-                    let checked = self.check_iterated_type_or_element_type(IterationUse::DESTRUCTURING, source_type, undefined_type, node);
-                    in_bounds_type = if checked.is_some() { checked } else { self.error_type };
+                    let checked = self.check_iterated_type_or_element_type(
+                        IterationUse::DESTRUCTURING,
+                        source_type,
+                        undefined_type,
+                        node,
+                    );
+                    in_bounds_type = if checked.is_some() {
+                        checked
+                    } else {
+                        self.error_type
+                    };
                 }
                 t = in_bounds_type;
             }
-            self.check_array_literal_destructuring_element_assignment(node, source_type, i as i32, t, check_mode);
+            self.check_array_literal_destructuring_element_assignment(
+                node,
+                source_type,
+                i as i32,
+                t,
+                check_mode,
+            );
         }
         source_type
     }
@@ -767,42 +979,83 @@ impl Checker {
         let element = elements.nodes().get(element_index as usize);
         if !is_omitted_expression(element) {
             if !is_spread_element(element) {
-                let index_type = self.get_number_literal_type(ts_jsnum::Number::new(element_index as f64));
+                let index_type =
+                    self.get_number_literal_type(ts_jsnum::Number::new(element_index as f64));
                 if self.is_array_like_type(source_type) {
                     // We create a synthetic expression so that getIndexedAccessType doesn't get confused
                     // when the element is a SyntaxKind.ElementAccessExpression.
                     let access_flags = AccessFlags::EXPRESSION_POSITION
-                        | if self.has_default_value(element) { AccessFlags::ALLOW_MISSING } else { AccessFlags::NONE };
-                    let synthetic = self.create_synthetic_expression(element, index_type, false, Node::NIL);
-                    let indexed = self.get_indexed_access_type_or_undefined(source_type, index_type, access_flags, synthetic, None);
-                    let element_type = if indexed.is_some() { indexed } else { self.error_type };
+                        | if self.has_default_value(element) {
+                            AccessFlags::ALLOW_MISSING
+                        } else {
+                            AccessFlags::NONE
+                        };
+                    let synthetic =
+                        self.create_synthetic_expression(element, index_type, false, Node::NIL);
+                    let indexed = self.get_indexed_access_type_or_undefined(
+                        source_type,
+                        index_type,
+                        access_flags,
+                        synthetic,
+                        None,
+                    );
+                    let element_type = if indexed.is_some() {
+                        indexed
+                    } else {
+                        self.error_type
+                    };
                     let mut assigned_type = element_type;
                     if self.has_default_value(element) {
-                        assigned_type = self.get_type_with_facts(element_type, TypeFacts::NE_UNDEFINED);
+                        assigned_type =
+                            self.get_type_with_facts(element_type, TypeFacts::NE_UNDEFINED);
                     }
                     let t = self.get_flow_type_of_destructuring(element, assigned_type);
                     return self.check_destructuring_assignment(element, t, check_mode, false);
                 }
-                return self.check_destructuring_assignment(element, element_type, check_mode, false);
+                return self.check_destructuring_assignment(
+                    element,
+                    element_type,
+                    check_mode,
+                    false,
+                );
             }
             if (element_index as usize) < elements.nodes().len() - 1 {
-                self.error(element, diag::A_rest_element_must_be_last_in_a_destructuring_pattern, args![]);
+                self.error(
+                    element,
+                    diag::A_rest_element_must_be_last_in_a_destructuring_pattern,
+                    args![],
+                );
             } else {
                 let rest_expression = element.expression();
-                if is_binary_expression(rest_expression) && rest_expression.operator_token().kind() == SyntaxKind::EqualsToken {
-                    self.error(rest_expression.operator_token(), diag::A_rest_element_cannot_have_an_initializer, args![]);
+                if is_binary_expression(rest_expression)
+                    && rest_expression.operator_token().kind() == SyntaxKind::EqualsToken
+                {
+                    self.error(
+                        rest_expression.operator_token(),
+                        diag::A_rest_element_cannot_have_an_initializer,
+                        args![],
+                    );
                 } else {
                     self.check_grammar_for_disallowed_trailing_comma(
                         elements,
                         diag::A_rest_parameter_or_binding_pattern_may_not_have_a_trailing_comma,
                     );
                     let t;
-                    if self.every_type(source_type, &mut |c: &mut Checker, t: TypeId| c.is_tuple_type(t)) {
-                        t = self.map_type(source_type, &mut |c: &mut Checker, t: TypeId| c.slice_tuple_type(t, element_index, 0));
+                    if self.every_type(source_type, &mut |c: &mut Checker, t: TypeId| {
+                        c.is_tuple_type(t)
+                    }) {
+                        t = self.map_type(source_type, &mut |c: &mut Checker, t: TypeId| {
+                            c.slice_tuple_type(t, element_index, 0)
+                        });
                     } else {
                         t = self.create_array_type(element_type);
                     }
-                    return self.check_destructuring_assignment(rest_expression, t, check_mode, false);
+                    return self.check_destructuring_assignment(
+                        rest_expression,
+                        t,
+                        check_mode,
+                        false,
+                    );
                 }
             }
         }
@@ -810,7 +1063,12 @@ impl Checker {
     }
 
     // Go: checker/checker.go:12664 checkReferenceAssignment
-    pub fn check_reference_assignment(&mut self, target: Node, source_type: TypeId, check_mode: CheckMode) -> TypeId {
+    pub fn check_reference_assignment(
+        &mut self,
+        target: Node,
+        source_type: TypeId,
+        check_mode: CheckMode,
+    ) -> TypeId {
         let target_type = self.check_expression_ex(target, check_mode);
         let message = if is_spread_assignment(target.parent()) {
             diag::The_target_of_an_object_rest_assignment_must_be_a_variable_or_a_property_access
@@ -823,7 +1081,14 @@ impl Checker {
             diag::The_left_hand_side_of_an_assignment_expression_may_not_be_an_optional_property_access
         };
         if self.check_reference_expression(target, message, optional_message) {
-            self.check_type_assignable_to_and_optionally_elaborate(source_type, target_type, target, target, None, None);
+            self.check_type_assignable_to_and_optionally_elaborate(
+                source_type,
+                target_type,
+                target,
+                target,
+                None,
+                None,
+            );
         }
         source_type
     }
@@ -841,7 +1106,8 @@ impl Checker {
         if let Some(is_related) = is_related.as_deref_mut() {
             let awaited_left_type = self.get_awaited_type_no_alias(left_type);
             let awaited_right_type = self.get_awaited_type_no_alias(right_type);
-            would_work_with_await = !(awaited_left_type == left_type && awaited_right_type == right_type)
+            would_work_with_await = !(awaited_left_type == left_type
+                && awaited_right_type == right_type)
                 && awaited_left_type.is_some()
                 && awaited_right_type.is_some()
                 && is_related(self, awaited_left_type, awaited_right_type);
@@ -850,10 +1116,12 @@ impl Checker {
         let mut effective_right = right_type;
         if !would_work_with_await {
             if let Some(is_related) = is_related.as_deref_mut() {
-                (effective_left, effective_right) = self.get_base_types_if_unrelated(left_type, right_type, is_related);
+                (effective_left, effective_right) =
+                    self.get_base_types_if_unrelated(left_type, right_type, is_related);
             }
         }
-        let (left_str, right_str) = self.get_type_names_for_error_display(effective_left, effective_right);
+        let (left_str, right_str) =
+            self.get_type_names_for_error_display(effective_left, effective_right);
         match operator {
             SyntaxKind::EqualsEqualsEqualsToken
             | SyntaxKind::EqualsEqualsToken
@@ -887,7 +1155,13 @@ impl Checker {
         types_are_compatible: &mut dyn FnMut(&mut Checker, TypeId, TypeId) -> bool,
     ) {
         if !types_are_compatible(self, left_type, right_type) {
-            self.report_operator_error(left_type, operator, right_type, error_node, Some(types_are_compatible));
+            self.report_operator_error(
+                left_type,
+                operator,
+                right_type,
+                error_node,
+                Some(types_are_compatible),
+            );
         }
     }
 
@@ -910,11 +1184,21 @@ impl Checker {
     }
 
     // Go: checker/checker.go:12717 checkAssignmentOperator
-    pub fn check_assignment_operator(&mut self, left: Node, operator: SyntaxKind, right: Node, left_type: TypeId, right_type: TypeId) {
+    pub fn check_assignment_operator(
+        &mut self,
+        left: Node,
+        operator: SyntaxKind,
+        right: Node,
+        left_type: TypeId,
+        right_type: TypeId,
+    ) {
         let mut left_type = left_type;
         if is_assignment_operator(operator) {
             // We ignore assignments of undefined to CommonJS exports when there are multiple assignment declarations
-            if is_declaration_node(left.parent()) && get_assignment_declaration_kind(left.parent()) == JSDeclarationKind::EXPORTS_PROPERTY {
+            if is_declaration_node(left.parent())
+                && get_assignment_declaration_kind(left.parent())
+                    == JSDeclarationKind::EXPORTS_PROPERTY
+            {
                 let symbol = self.symbol_node_links.get(left).resolved_symbol;
                 if symbol.is_some()
                     && self.sym(symbol).declarations.len() > 1
@@ -925,7 +1209,11 @@ impl Checker {
             }
             // getters can be a subtype of setters, so to check for assignability we use the setter's type instead
             if is_compound_assignment(operator) && is_property_access_expression(left) {
-                left_type = self.check_property_access_expression(left, CheckMode::NORMAL, true /*writeOnly*/);
+                left_type = self.check_property_access_expression(
+                    left,
+                    CheckMode::NORMAL,
+                    true, /*writeOnly*/
+                );
             }
             if self.check_reference_expression(
                 left,
@@ -951,28 +1239,40 @@ impl Checker {
 
     // Go: checker/checker.go:12743 bothAreBigIntLike
     pub fn both_are_big_int_like(&mut self, left: TypeId, right: TypeId) -> bool {
-        self.is_type_assignable_to_kind(left, TypeFlags::BIG_INT_LIKE) && self.is_type_assignable_to_kind(right, TypeFlags::BIG_INT_LIKE)
+        self.is_type_assignable_to_kind(left, TypeFlags::BIG_INT_LIKE)
+            && self.is_type_assignable_to_kind(right, TypeFlags::BIG_INT_LIKE)
     }
 
     // Go: checker/checker.go:12747 getSuggestedBooleanOperator
     pub fn get_suggested_boolean_operator(&self, operator: SyntaxKind) -> SyntaxKind {
         match operator {
             SyntaxKind::BarToken | SyntaxKind::BarEqualsToken => SyntaxKind::BarBarToken,
-            SyntaxKind::CaretToken | SyntaxKind::CaretEqualsToken => SyntaxKind::ExclamationEqualsEqualsToken,
-            SyntaxKind::AmpersandToken | SyntaxKind::AmpersandEqualsToken => SyntaxKind::AmpersandAmpersandToken,
+            SyntaxKind::CaretToken | SyntaxKind::CaretEqualsToken => {
+                SyntaxKind::ExclamationEqualsEqualsToken
+            }
+            SyntaxKind::AmpersandToken | SyntaxKind::AmpersandEqualsToken => {
+                SyntaxKind::AmpersandAmpersandToken
+            }
             _ => SyntaxKind::Unknown,
         }
     }
 
     // Go: checker/checker.go:12759 checkArithmeticOperandType
-    pub fn check_arithmetic_operand_type(&mut self, operand: Node, t: TypeId, diagnostic: &'static Message, is_await_valid: bool) -> bool {
+    pub fn check_arithmetic_operand_type(
+        &mut self,
+        operand: Node,
+        t: TypeId,
+        diagnostic: &'static Message,
+        is_await_valid: bool,
+    ) -> bool {
         let number_or_big_int_type = self.number_or_big_int_type;
         if !self.is_type_assignable_to(t, number_or_big_int_type) {
             let mut awaited_type = TypeId::NIL;
             if is_await_valid {
                 awaited_type = self.get_awaited_type_of_promise(t);
             }
-            let maybe_missing_await = awaited_type.is_some() && self.is_type_assignable_to(awaited_type, number_or_big_int_type);
+            let maybe_missing_await = awaited_type.is_some()
+                && self.is_type_assignable_to(awaited_type, number_or_big_int_type);
             self.error_and_maybe_suggest_await(operand, maybe_missing_await, diagnostic, args![]);
             return false;
         }
@@ -990,9 +1290,12 @@ impl Checker {
         operator: SyntaxKind,
     ) -> bool {
         let mut offending_symbol_operand = Node::NIL;
-        if self.maybe_type_of_kind_considering_base_constraint(left_type, TypeFlags::ES_SYMBOL_LIKE) {
+        if self.maybe_type_of_kind_considering_base_constraint(left_type, TypeFlags::ES_SYMBOL_LIKE)
+        {
             offending_symbol_operand = left;
-        } else if self.maybe_type_of_kind_considering_base_constraint(right_type, TypeFlags::ES_SYMBOL_LIKE) {
+        } else if self
+            .maybe_type_of_kind_considering_base_constraint(right_type, TypeFlags::ES_SYMBOL_LIKE)
+        {
             offending_symbol_operand = right;
         }
         if offending_symbol_operand.is_some() {
@@ -1007,24 +1310,38 @@ impl Checker {
     }
 
     // Go: checker/checker.go:12787 checkNaNEquality
-    pub fn check_na_n_equality(&mut self, error_node: Node, operator: SyntaxKind, left: Node, right: Node) {
+    pub fn check_na_n_equality(
+        &mut self,
+        error_node: Node,
+        operator: SyntaxKind,
+        left: Node,
+        right: Node,
+    ) {
         let is_left_na_n = self.is_global_na_n(skip_parentheses(left));
         let is_right_na_n = self.is_global_na_n(skip_parentheses(right));
         if is_left_na_n || is_right_na_n {
-            let token = if operator == SyntaxKind::EqualsEqualsEqualsToken || operator == SyntaxKind::EqualsEqualsToken {
+            let token = if operator == SyntaxKind::EqualsEqualsEqualsToken
+                || operator == SyntaxKind::EqualsEqualsToken
+            {
                 SyntaxKind::FalseKeyword
             } else {
                 SyntaxKind::TrueKeyword
             };
             // PORT: Go `c.error` adds the diagnostic, then mutates it below.
             // Build it, finish it, then add it (the same steps as `c.error`).
-            let mut err = new_diagnostic_for_node(error_node, diag::This_condition_will_always_return_0, args![token_to_string(token)]);
+            let mut err = new_diagnostic_for_node(
+                error_node,
+                diag::This_condition_will_always_return_0,
+                args![token_to_string(token)],
+            );
             if is_left_na_n && is_right_na_n {
                 self.add_diagnostic(err);
                 return;
             }
             let mut operator_string = String::new();
-            if operator == SyntaxKind::ExclamationEqualsEqualsToken || operator == SyntaxKind::ExclamationEqualsToken {
+            if operator == SyntaxKind::ExclamationEqualsEqualsToken
+                || operator == SyntaxKind::ExclamationEqualsToken
+            {
                 operator_string = token_to_string(SyntaxKind::ExclamationToken).to_string();
             }
             let mut location = left;
@@ -1036,10 +1353,15 @@ impl Checker {
             if is_entity_name_expression(expression) {
                 // PORT: checker `entityNameToString(name)` is
                 // `ast.EntityNameToString(name, scanner.GetTextOfNode)`.
-                entity_name = crate::ast::entity_name_to_string(expression, Some(&get_text_of_node));
+                entity_name =
+                    crate::ast::entity_name_to_string(expression, Some(&get_text_of_node));
             }
             let suggestion = operator_string + "Number.isNaN(" + &entity_name + ")";
-            err.add_related_info(Some(create_diagnostic_for_node(location, diag::Did_you_mean_0, args![suggestion])));
+            err.add_related_info(Some(create_diagnostic_for_node(
+                location,
+                diag::Did_you_mean_0,
+                args![suggestion],
+            )));
             self.add_diagnostic(err);
         }
     }
@@ -1048,20 +1370,26 @@ impl Checker {
     pub fn is_global_na_n(&mut self, expr: Node) -> bool {
         if is_identifier(expr) && expr.text() == "NaN" {
             let global_na_n_symbol = (self.get_global_na_n_symbol_or_nil.clone())(self);
-            return global_na_n_symbol.is_some() && global_na_n_symbol == self.get_resolved_symbol(expr);
+            return global_na_n_symbol.is_some()
+                && global_na_n_symbol == self.get_resolved_symbol(expr);
         }
         false
     }
 
     // Go: checker/checker.go:12821 isTypeEqualityComparableTo
     pub fn is_type_equality_comparable_to(&mut self, source: TypeId, target: TypeId) -> bool {
-        self.ty(target).flags.intersects(TypeFlags::NULLABLE) || self.is_type_comparable_to(source, target)
+        self.ty(target).flags.intersects(TypeFlags::NULLABLE)
+            || self.is_type_comparable_to(source, target)
     }
 
     // Go: checker/checker.go:12825 checkTruthinessOfType
     pub fn check_truthiness_of_type(&mut self, t: TypeId, node: Node) -> TypeId {
         if self.ty(t).flags.intersects(TypeFlags::VOID) {
-            self.error(node, diag::An_expression_of_type_void_cannot_be_tested_for_truthiness, args![]);
+            self.error(
+                node,
+                diag::An_expression_of_type_void_cannot_be_tested_for_truthiness,
+                args![],
+            );
             return t;
         }
         let semantics = self.get_syntactic_truthy_semantics(node);
@@ -1113,7 +1441,8 @@ impl Checker {
                 return PredicateSemantics::NEVER;
             }
             SyntaxKind::ConditionalExpression => {
-                return self.get_syntactic_truthy_semantics(node.when_true()) | self.get_syntactic_truthy_semantics(node.when_false());
+                return self.get_syntactic_truthy_semantics(node.when_true())
+                    | self.get_syntactic_truthy_semantics(node.when_false());
             }
             SyntaxKind::Identifier => {
                 if self.get_resolved_symbol(node) == self.undefined_symbol {
@@ -1130,20 +1459,30 @@ impl Checker {
         if is_binary_expression(left.parent().parent()) {
             let grandparent_left = left.parent().parent().left();
             let grandparent_operator_token = left.parent().parent().operator_token();
-            if is_binary_expression(grandparent_left) && grandparent_operator_token.kind() == SyntaxKind::BarBarToken {
+            if is_binary_expression(grandparent_left)
+                && grandparent_operator_token.kind() == SyntaxKind::BarBarToken
+            {
                 self.grammar_error_on_node(
                     grandparent_left,
                     diag::X_0_and_1_operations_cannot_be_mixed_without_parentheses,
-                    args![token_to_string(SyntaxKind::QuestionQuestionToken), token_to_string(grandparent_operator_token.kind())],
+                    args![
+                        token_to_string(SyntaxKind::QuestionQuestionToken),
+                        token_to_string(grandparent_operator_token.kind())
+                    ],
                 );
             }
         } else if is_binary_expression(left) {
             let operator_token = left.operator_token();
-            if operator_token.kind() == SyntaxKind::BarBarToken || operator_token.kind() == SyntaxKind::AmpersandAmpersandToken {
+            if operator_token.kind() == SyntaxKind::BarBarToken
+                || operator_token.kind() == SyntaxKind::AmpersandAmpersandToken
+            {
                 self.grammar_error_on_node(
                     left,
                     diag::X_0_and_1_operations_cannot_be_mixed_without_parentheses,
-                    args![token_to_string(operator_token.kind()), token_to_string(SyntaxKind::QuestionQuestionToken)],
+                    args![
+                        token_to_string(operator_token.kind()),
+                        token_to_string(SyntaxKind::QuestionQuestionToken)
+                    ],
                 );
             }
         } else if is_binary_expression(right) {
@@ -1152,7 +1491,10 @@ impl Checker {
                 self.grammar_error_on_node(
                     right,
                     diag::X_0_and_1_operations_cannot_be_mixed_without_parentheses,
-                    args![token_to_string(SyntaxKind::QuestionQuestionToken), token_to_string(operator_token.kind())],
+                    args![
+                        token_to_string(SyntaxKind::QuestionQuestionToken),
+                        token_to_string(operator_token.kind())
+                    ],
                 );
             }
         }
@@ -1165,9 +1507,17 @@ impl Checker {
         let nullish_semantics = self.get_syntactic_nullishness_semantics(left_target);
         if nullish_semantics != PredicateSemantics::SOMETIMES {
             if nullish_semantics == PredicateSemantics::ALWAYS {
-                self.error(left_target, diag::This_expression_is_always_nullish, args![]);
+                self.error(
+                    left_target,
+                    diag::This_expression_is_always_nullish,
+                    args![],
+                );
             } else {
-                self.error(left_target, diag::Right_operand_of_is_unreachable_because_the_left_operand_is_never_nullish, args![]);
+                self.error(
+                    left_target,
+                    diag::Right_operand_of_is_unreachable_because_the_left_operand_is_never_nullish,
+                    args![],
+                );
             }
         }
     }
@@ -1197,12 +1547,15 @@ impl Checker {
                     SyntaxKind::CommaToken
                     | SyntaxKind::EqualsToken
                     | SyntaxKind::QuestionQuestionToken
-                    | SyntaxKind::QuestionQuestionEqualsToken => self.get_syntactic_nullishness_semantics(node.right()),
+                    | SyntaxKind::QuestionQuestionEqualsToken => {
+                        self.get_syntactic_nullishness_semantics(node.right())
+                    }
                     _ => PredicateSemantics::NEVER,
                 }
             }
             SyntaxKind::ConditionalExpression => {
-                self.get_syntactic_nullishness_semantics(node.when_true()) | self.get_syntactic_nullishness_semantics(node.when_false())
+                self.get_syntactic_nullishness_semantics(node.when_true())
+                    | self.get_syntactic_nullishness_semantics(node.when_false())
             }
             SyntaxKind::NullKeyword => PredicateSemantics::ALWAYS,
             SyntaxKind::Identifier => {
@@ -1246,7 +1599,10 @@ impl Checker {
             | SyntaxKind::NonNullExpression
             | SyntaxKind::JsxSelfClosingElement
             | SyntaxKind::JsxElement => true,
-            SyntaxKind::ConditionalExpression => self.is_side_effect_free(node.when_true()) && self.is_side_effect_free(node.when_false()),
+            SyntaxKind::ConditionalExpression => {
+                self.is_side_effect_free(node.when_true())
+                    && self.is_side_effect_free(node.when_false())
+            }
             SyntaxKind::BinaryExpression => {
                 if is_assignment_operator(node.operator_token().kind()) {
                     return false;
@@ -1257,7 +1613,10 @@ impl Checker {
                 // Unary operators ~, !, +, and - have no side effects.
                 // The rest do.
                 match node.operator() {
-                    SyntaxKind::ExclamationToken | SyntaxKind::PlusToken | SyntaxKind::MinusToken | SyntaxKind::TildeToken => true,
+                    SyntaxKind::ExclamationToken
+                    | SyntaxKind::PlusToken
+                    | SyntaxKind::MinusToken
+                    | SyntaxKind::TildeToken => true,
                     _ => false,
                 }
             }
@@ -1273,7 +1632,8 @@ impl Checker {
         is_parenthesized_expression(node.parent())
             && is_numeric_literal(left)
             && left.text() == "0"
-            && (is_call_expression(node.parent().parent()) && node.parent().parent().expression() == node.parent()
+            && (is_call_expression(node.parent().parent())
+                && node.parent().parent().expression() == node.parent()
                 || is_tagged_template_expression(node.parent().parent()))
             && (is_access_expression(right) || is_identifier(right) && right.text() == "eval")
     }
@@ -1295,14 +1655,20 @@ impl Checker {
         // and the right operand to be of type Any, a subtype of the 'Function' interface type, or have a call or construct signature.
         // The result is always of the Boolean primitive type.
         // NOTE: do not raise error if leftType is unknown as related error was already reported
-        if !self.is_type_any(left_type) && self.all_types_assignable_to_kind(left_type, TypeFlags::PRIMITIVE) {
+        if !self.is_type_any(left_type)
+            && self.all_types_assignable_to_kind(left_type, TypeFlags::PRIMITIVE)
+        {
             self.error(
                 left,
                 diag::The_left_hand_side_of_an_instanceof_expression_must_be_of_type_any_an_object_type_or_a_type_parameter,
                 args![],
             );
         }
-        let signature = self.get_resolved_signature(left.parent(), None /*candidatesOutArray*/, check_mode);
+        let signature = self.get_resolved_signature(
+            left.parent(),
+            None, /*candidatesOutArray*/
+            check_mode,
+        );
         if signature == self.resolving_signature {
             // CheckMode.SkipGenericFunctions is enabled and this is a call to a generic function that
             // returns a function type. We defer checking and return silentNeverType.

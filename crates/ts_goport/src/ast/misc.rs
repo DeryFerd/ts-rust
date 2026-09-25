@@ -14,7 +14,9 @@ impl Symbol {
     // Go: ast/symbol.go:23 IsExternalModule
     #[must_use]
     pub fn is_external_module(&self) -> bool {
-        self.flags.intersects(SymbolFlags::MODULE) && !self.name.is_empty() && self.name.as_bytes()[0] == b'"'
+        self.flags.intersects(SymbolFlags::MODULE)
+            && !self.name.is_empty()
+            && self.name.as_bytes()[0] == b'"'
     }
 
     // Go: ast/symbol.go:27 IsStatic
@@ -73,7 +75,9 @@ pub const INTERNAL_SYMBOL_NAME_MODULE_EXPORTS: &str = "module.exports";
 #[must_use]
 pub fn symbol_name(symbols: &SymbolArena, symbol: SymbolId) -> String {
     let s = symbols.sym(symbol);
-    if s.value_declaration.is_some() && is_private_identifier_class_element_declaration(s.value_declaration) {
+    if s.value_declaration.is_some()
+        && is_private_identifier_class_element_declaration(s.value_declaration)
+    {
         return s.value_declaration.name().text().to_string();
     }
     s.name.clone()
@@ -363,7 +367,9 @@ pub fn new_diagnostic_chain(
     if let Some(chain) = chain {
         let related_information = chain.related_information.clone();
         let mut result = new_diagnostic(chain.file, chain.loc(), message, args);
-        result.add_message_chain(Some(chain)).set_related_info(related_information);
+        result
+            .add_message_chain(Some(chain))
+            .set_related_info(related_information);
         return result;
     }
     new_diagnostic(Node::NIL, TextRange::new(0, 0), message, args)
@@ -372,7 +378,10 @@ pub fn new_diagnostic_chain(
 // Go: ast/diagnostic.go:159 NewCompilerDiagnostic
 // PORT: Go `core.UndefinedTextRange()` is `TextRange{-1, -1}`.
 #[must_use]
-pub fn new_compiler_diagnostic(message: &'static ts_diagnostics::Message, args: Vec<String>) -> Diagnostic {
+pub fn new_compiler_diagnostic(
+    message: &'static ts_diagnostics::Message,
+    args: Vec<String>,
+) -> Diagnostic {
     new_diagnostic(Node::NIL, TextRange::new(-1, -1), message, args)
 }
 
@@ -395,7 +404,10 @@ impl DiagnosticsCollection {
 
         if diagnostic.file().is_some() {
             let file_name = source_file_file_name(diagnostic.file()).to_string();
-            self.file_diagnostics.entry(file_name.clone()).or_default().push(diagnostic);
+            self.file_diagnostics
+                .entry(file_name.clone())
+                .or_default()
+                .push(diagnostic);
             self.file_diagnostics_sorted.remove(&file_name);
         } else {
             self.non_file_diagnostics.push(diagnostic);
@@ -427,7 +439,8 @@ impl DiagnosticsCollection {
     // Go: ast/diagnostic.go:214 getGlobalDiagnosticsLocked
     fn get_global_diagnostics_locked(&mut self) -> Vec<Diagnostic> {
         if !self.non_file_diagnostics_sorted {
-            self.non_file_diagnostics.sort_by(|a, b| compare_diagnostics(a, b).cmp(&0));
+            self.non_file_diagnostics
+                .sort_by(|a, b| compare_diagnostics(a, b).cmp(&0));
             self.non_file_diagnostics_sorted = true;
         }
         self.non_file_diagnostics.clone()
@@ -446,7 +459,10 @@ impl DiagnosticsCollection {
             }
             self.file_diagnostics_sorted.insert(file_name.to_string());
         }
-        self.file_diagnostics.get(file_name).cloned().unwrap_or_default()
+        self.file_diagnostics
+            .get(file_name)
+            .cloned()
+            .unwrap_or_default()
     }
 
     // Go: ast/diagnostic.go:237 GetDiagnostics
@@ -500,7 +516,11 @@ pub fn equal_diagnostics_no_related_info(d1: &Diagnostic, d2: &Diagnostic) -> bo
         && d1.code() == d2.code()
         && d1.message_args() == d2.message_args()
         && d1.message_chain().len() == d2.message_chain().len()
-        && d1.message_chain().iter().zip(d2.message_chain()).all(|(a, b)| equal_message_chain(a, b))
+        && d1
+            .message_chain()
+            .iter()
+            .zip(d2.message_chain())
+            .all(|(a, b)| equal_message_chain(a, b))
 }
 
 // Go: ast/diagnostic.go:276 equalMessageChain
@@ -511,7 +531,11 @@ fn equal_message_chain(c1: &Diagnostic, c2: &Diagnostic) -> bool {
     c1.code() == c2.code()
         && c1.message_args() == c2.message_args()
         && c1.message_chain().len() == c2.message_chain().len()
-        && c1.message_chain().iter().zip(c2.message_chain()).all(|(a, b)| equal_message_chain(a, b))
+        && c1
+            .message_chain()
+            .iter()
+            .zip(c2.message_chain())
+            .all(|(a, b)| equal_message_chain(a, b))
 }
 
 // Go `slices.Compare` / `strings.Compare` as -1, 0, 1.
@@ -709,11 +733,13 @@ pub fn get_operator_precedence(
         }
 
         // !!! By necessity, this differs from the old compiler to better align with ParenthesizerRules. consider backporting
-        SyntaxKind::TaggedTemplateExpression | SyntaxKind::MetaProperty | SyntaxKind::ExpressionWithTypeArguments => {
-            OperatorPrecedence::MEMBER
-        }
+        SyntaxKind::TaggedTemplateExpression
+        | SyntaxKind::MetaProperty
+        | SyntaxKind::ExpressionWithTypeArguments => OperatorPrecedence::MEMBER,
 
-        SyntaxKind::AsExpression | SyntaxKind::SatisfiesExpression => OperatorPrecedence::RELATIONAL,
+        SyntaxKind::AsExpression | SyntaxKind::SatisfiesExpression => {
+            OperatorPrecedence::RELATIONAL
+        }
 
         SyntaxKind::ThisKeyword
         | SyntaxKind::SuperKeyword
@@ -912,8 +938,16 @@ pub struct FlowSwitchClauseData {
 // Go: ast/flow.go:52 NewFlowSwitchClauseData
 // PORT: returns the data value instead of a synthetic `*Node` (see the struct).
 #[must_use]
-pub fn new_flow_switch_clause_data(switch_statement: Node, clause_start: i32, clause_end: i32) -> FlowSwitchClauseData {
-    FlowSwitchClauseData { switch_statement, clause_start, clause_end }
+pub fn new_flow_switch_clause_data(
+    switch_statement: Node,
+    clause_start: i32,
+    clause_end: i32,
+) -> FlowSwitchClauseData {
+    FlowSwitchClauseData {
+        switch_statement,
+        clause_start,
+        clause_end,
+    }
 }
 
 impl FlowSwitchClauseData {
@@ -930,15 +964,21 @@ impl FlowSwitchClauseData {
 /// `Vec<FlowNodeId>` in the same order.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FlowReduceLabelData {
-    pub target: FlowNodeId,            // Target label
+    pub target: FlowNodeId,           // Target label
     pub antecedents: Vec<FlowNodeId>, // Temporary antecedent list
 }
 
 // Go: ast/flow.go:72 NewFlowReduceLabelData
 // PORT: returns the data value instead of a synthetic `*Node` (see the struct).
 #[must_use]
-pub fn new_flow_reduce_label_data(target: FlowNodeId, antecedents: Vec<FlowNodeId>) -> FlowReduceLabelData {
-    FlowReduceLabelData { target, antecedents }
+pub fn new_flow_reduce_label_data(
+    target: FlowNodeId,
+    antecedents: Vec<FlowNodeId>,
+) -> FlowReduceLabelData {
+    FlowReduceLabelData {
+        target,
+        antecedents,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,7 +1078,10 @@ pub fn compute_position_map(text: &str) -> PositionMap {
         }
         let utf16_size: i32 = if (r as u32) >= 0x10000 { 2 } else { 1 };
         delta += size - utf16_size;
-        pm.entries.push(PositionMapEntry { utf8_pos: i as i32 + size, delta });
+        pm.entries.push(PositionMapEntry {
+            utf8_pos: i as i32 + size,
+            delta,
+        });
     }
     pm.ascii_only = pm.entries.is_empty();
     pm

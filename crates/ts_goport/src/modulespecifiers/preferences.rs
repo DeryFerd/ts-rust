@@ -8,7 +8,10 @@ use super::types::*;
 // Go: modulespecifiers/preferences.go:14 shouldAllowImportingTsExtension
 // Program errors validate that `noEmit` or `emitDeclarationOnly` is also set,
 // so this function doesn't check them to avoid propagating errors.
-pub(crate) fn should_allow_importing_ts_extension(compiler_options: &CompilerOptions, from_file_name: &str) -> bool {
+pub(crate) fn should_allow_importing_ts_extension(
+    compiler_options: &CompilerOptions,
+    from_file_name: &str,
+) -> bool {
     compiler_options.get_allow_importing_ts_extensions()
         || !from_file_name.is_empty() && tspath::is_declaration_file_name(from_file_name)
 }
@@ -18,7 +21,10 @@ fn uses_extensions_on_imports(file: &dyn SourceFileForSpecifierGeneration) -> bo
     for r in file.imports() {
         let text = r.text();
         if tspath::path_is_relative(text)
-            && !tspath::file_extension_is_one_of(text, tspath::EXTENSIONS_NOT_SUPPORTING_EXTENSIONLESS_RESOLUTION)
+            && !tspath::file_extension_is_one_of(
+                text,
+                tspath::EXTENSIONS_NOT_SUPPORTING_EXTENSIONLESS_RESOLUTION,
+            )
         {
             return tspath::has_ts_file_extension(text) || tspath::has_js_file_extension(text);
         }
@@ -51,7 +57,10 @@ fn infer_preference(
                 // We're trying to decide a preference for a CommonJS module specifier, but looking at an ESM import.
                 continue;
             }
-            if tspath::file_extension_is_one_of(path, tspath::EXTENSIONS_NOT_SUPPORTING_EXTENSIONLESS_RESOLUTION) {
+            if tspath::file_extension_is_one_of(
+                path,
+                tspath::EXTENSIONS_NOT_SUPPORTING_EXTENSIONLESS_RESOLUTION,
+            ) {
                 // These extensions are not optional, so do not indicate a preference.
                 continue;
             }
@@ -78,8 +87,8 @@ fn get_module_specifier_ending_preference(
     source_file: Option<&dyn SourceFileForSpecifierGeneration>,
 ) -> ModuleSpecifierEnding {
     let module_resolution = compiler_options.get_module_resolution_kind();
-    let module_resolution_is_node_next =
-        ModuleResolutionKind::NODE16 <= module_resolution && module_resolution <= ModuleResolutionKind::NODE_NEXT;
+    let module_resolution_is_node_next = ModuleResolutionKind::NODE16 <= module_resolution
+        && module_resolution <= ModuleResolutionKind::NODE_NEXT;
 
     if pref == ImportModuleSpecifierEndingPreference::Js
         || resolution_mode == RESOLUTION_MODE_ESM && module_resolution_is_node_next
@@ -154,7 +163,8 @@ fn get_preferred_ending(
 // The Rust closure borrows them for `'a`.
 pub struct ModuleSpecifierPreferences<'a> {
     pub relative_preference: RelativePreferenceKind,
-    pub get_allowed_endings_in_preferred_order: Box<dyn Fn(ResolutionMode) -> Vec<ModuleSpecifierEnding> + 'a>,
+    pub get_allowed_endings_in_preferred_order:
+        Box<dyn Fn(ResolutionMode) -> Vec<ModuleSpecifierEnding> + 'a>,
     pub exclude_regexes: Vec<String>,
 }
 
@@ -188,8 +198,8 @@ pub fn get_allowed_endings_in_preferred_order(
         );
     }
     let module_resolution = compiler_options.get_module_resolution_kind();
-    let module_resolution_is_node_next =
-        ModuleResolutionKind::NODE16 <= module_resolution && module_resolution <= ModuleResolutionKind::NODE_NEXT;
+    let module_resolution_is_node_next = ModuleResolutionKind::NODE16 <= module_resolution
+        && module_resolution <= ModuleResolutionKind::NODE_NEXT;
     let allow_importing_ts_extension =
         should_allow_importing_ts_extension(compiler_options, &importing_source_file.file_name());
     if syntax_implied_node_format == RESOLUTION_MODE_ESM && module_resolution_is_node_next {
@@ -239,8 +249,12 @@ pub(crate) fn get_module_specifier_preferences<'a>(
         }
     } else {
         match prefs.import_module_specifier_preference {
-            ImportModuleSpecifierPreference::Relative => relative_preference = RelativePreferenceKind::Relative,
-            ImportModuleSpecifierPreference::NonRelative => relative_preference = RelativePreferenceKind::NonRelative,
+            ImportModuleSpecifierPreference::Relative => {
+                relative_preference = RelativePreferenceKind::Relative
+            }
+            ImportModuleSpecifierPreference::NonRelative => {
+                relative_preference = RelativePreferenceKind::NonRelative
+            }
             ImportModuleSpecifierPreference::ProjectRelative => {
                 relative_preference = RelativePreferenceKind::ExternalNonRelative
             }
@@ -249,16 +263,17 @@ pub(crate) fn get_module_specifier_preferences<'a>(
         }
     }
 
-    let get_allowed_endings_in_preferred_order = move |syntax_implied_node_format: ResolutionMode| {
-        get_allowed_endings_in_preferred_order(
-            prefs,
-            host,
-            compiler_options,
-            importing_source_file,
-            old_import_specifier,
-            syntax_implied_node_format,
-        )
-    };
+    let get_allowed_endings_in_preferred_order =
+        move |syntax_implied_node_format: ResolutionMode| {
+            get_allowed_endings_in_preferred_order(
+                prefs,
+                host,
+                compiler_options,
+                importing_source_file,
+                old_import_specifier,
+                syntax_implied_node_format,
+            )
+        };
 
     ModuleSpecifierPreferences {
         exclude_regexes: excludes,

@@ -8,7 +8,11 @@ use ts_jsnum::Number;
 
 impl Checker {
     // Go: checker/checker.go:29672 getContextualTypeForObjectLiteralElement
-    pub fn get_contextual_type_for_object_literal_element(&mut self, element: Node, context_flags: ContextFlags) -> TypeId {
+    pub fn get_contextual_type_for_object_literal_element(
+        &mut self,
+        element: Node,
+        context_flags: ContextFlags,
+    ) -> TypeId {
         let t = element.type_();
         if t.is_some() && !is_object_literal_method(element) {
             return self.get_type_from_type_node(t);
@@ -62,7 +66,11 @@ impl Checker {
     // the matching property in T, if one exists. Otherwise, it is the type of the numeric index signature in T, if one
     // exists. Otherwise, it is the type of the string index signature in T, if one exists.
     // Go: checker/checker.go:29716 getContextualTypeForObjectLiteralMethod
-    pub fn get_contextual_type_for_object_literal_method(&mut self, node: Node, context_flags: ContextFlags) -> TypeId {
+    pub fn get_contextual_type_for_object_literal_method(
+        &mut self,
+        node: Node,
+        context_flags: ContextFlags,
+    ) -> TypeId {
         if node.flags().intersects(NodeFlags::IN_WITH_STATEMENT) {
             // We cannot answer semantic questions within a with block, do not proceed any further
             return TypeId::NIL;
@@ -88,10 +96,13 @@ impl Checker {
                 if c.is_tuple_type(t) {
                     // If index is before any spread element and within the fixed part of the contextual tuple type, return
                     // the type of the contextual tuple element.
-                    if (first_spread_index < 0 || index < first_spread_index) && index < c.target_tuple_type(t).fixed_length {
+                    if (first_spread_index < 0 || index < first_spread_index)
+                        && index < c.target_tuple_type(t).fixed_length
+                    {
                         let type_arg = c.get_type_arguments(t)[index as usize];
-                        let is_optional =
-                            c.target_tuple_type(t).element_infos[index as usize].flags.intersects(ElementFlags::OPTIONAL);
+                        let is_optional = c.target_tuple_type(t).element_infos[index as usize]
+                            .flags
+                            .intersects(ElementFlags::OPTIONAL);
                         return c.remove_missing_type(type_arg, is_optional);
                     }
                     // When the length is known and the index is after all spread elements we compute the offset from the element
@@ -101,8 +112,13 @@ impl Checker {
                         offset = length - index;
                     }
                     let mut fixed_end_length = 0;
-                    if offset > 0 && c.target_tuple_type(t).combined_flags.intersects(ElementFlags::VARIABLE) {
-                        fixed_end_length = get_end_element_count(c.target_tuple_type(t), ElementFlags::FIXED);
+                    if offset > 0
+                        && c.target_tuple_type(t)
+                            .combined_flags
+                            .intersects(ElementFlags::VARIABLE)
+                    {
+                        fixed_end_length =
+                            get_end_element_count(c.target_tuple_type(t), ElementFlags::FIXED);
                     }
                     // If the offset is within the ending fixed part of the contextual tuple type, return the type of the contextual
                     // tuple element.
@@ -130,7 +146,8 @@ impl Checker {
                 // If element index is known and a contextual property with that name exists, return it. Otherwise return the
                 // iterated or element type of the contextual type.
                 if first_spread_index < 0 || index < first_spread_index {
-                    let prop_type = c.get_type_of_property_of_contextual_type(t, &index.to_string());
+                    let prop_type =
+                        c.get_type_of_property_of_contextual_type(t, &index.to_string());
                     if prop_type.is_some() {
                         return prop_type;
                     }
@@ -150,7 +167,11 @@ impl Checker {
 
     // In a contextually typed conditional expression, the true/false expressions are contextually typed by the same type.
     // Go: checker/checker.go:29774 getContextualTypeForConditionalOperand
-    pub fn get_contextual_type_for_conditional_operand(&mut self, node: Node, context_flags: ContextFlags) -> TypeId {
+    pub fn get_contextual_type_for_conditional_operand(
+        &mut self,
+        node: Node,
+        context_flags: ContextFlags,
+    ) -> TypeId {
         let conditional = node.parent();
         if node == conditional.when_true() || node == conditional.when_false() {
             return self.get_contextual_type(node.parent(), context_flags);
@@ -159,9 +180,14 @@ impl Checker {
     }
 
     // Go: checker/checker.go:29782 getContextualTypeForSubstitutionExpression
-    pub fn get_contextual_type_for_substitution_expression(&mut self, template: Node, substitution_expression: Node) -> TypeId {
+    pub fn get_contextual_type_for_substitution_expression(
+        &mut self,
+        template: Node,
+        substitution_expression: Node,
+    ) -> TypeId {
         if is_tagged_template_expression(template.parent()) {
-            return self.get_contextual_type_for_argument(template.parent(), substitution_expression);
+            return self
+                .get_contextual_type_for_argument(template.parent(), substitution_expression);
         }
         TypeId::NIL
     }
@@ -179,12 +205,23 @@ impl Checker {
         if is_jsx_opening_fragment(node) {
             // This attributes Type does not include a children property yet, the same way a fragment created with <React.Fragment> does not at this stage
             let empty_fresh_jsx_object_type = self.empty_fresh_jsx_object_type;
-            return vec![self.create_synthetic_expression(node, empty_fresh_jsx_object_type, false, Node::NIL)];
+            return vec![self.create_synthetic_expression(
+                node,
+                empty_fresh_jsx_object_type,
+                false,
+                Node::NIL,
+            )];
         } else if is_tagged_template_expression(node) {
             let template = node.template();
-            let get_global_template_strings_array_type = self.get_global_template_strings_array_type.clone();
+            let get_global_template_strings_array_type =
+                self.get_global_template_strings_array_type.clone();
             let template_strings_array_type = get_global_template_strings_array_type(self);
-            let first_arg = self.create_synthetic_expression(template, template_strings_array_type, false, Node::NIL);
+            let first_arg = self.create_synthetic_expression(
+                template,
+                template_strings_array_type,
+                false,
+                Node::NIL,
+            );
             if !is_template_expression(template) {
                 return vec![first_arg];
             }
@@ -228,7 +265,9 @@ impl Checker {
                     let element_types = self.get_element_types(spread_type);
                     for (i, t) in element_types.into_iter().enumerate() {
                         let flags = self.target_tuple_type(spread_type).element_infos[i].flags;
-                        let labeled_declaration = self.target_tuple_type(spread_type).element_infos[i].labeled_declaration;
+                        let labeled_declaration = self.target_tuple_type(spread_type).element_infos
+                            [i]
+                            .labeled_declaration;
                         let mut synthetic_type = t;
                         if flags.intersects(ElementFlags::REST) {
                             synthetic_type = self.create_array_type(t);
@@ -266,8 +305,16 @@ pub fn is_spread_argument(arg: Node) -> bool {
 
 impl Checker {
     // Go: checker/checker.go:29868 createSyntheticExpression
-    pub fn create_synthetic_expression(&mut self, parent: Node, t: TypeId, is_spread: bool, tuple_name_source: Node) -> Node {
-        let result = self.factory.new_synthetic_expression(t, is_spread, tuple_name_source);
+    pub fn create_synthetic_expression(
+        &mut self,
+        parent: Node,
+        t: TypeId,
+        is_spread: bool,
+        tuple_name_source: Node,
+    ) -> Node {
+        let result = self
+            .factory
+            .new_synthetic_expression(t, is_spread, tuple_name_source);
         set_node_loc(result, parent.loc());
         set_node_parent(result, parent);
         result
@@ -334,21 +381,33 @@ impl Checker {
                     let target_param = self.new_parameter("target", target_type);
                     let void_type = self.void_type;
                     let return_type = self.get_union_type(&[target_type, void_type]);
-                    let sig = self.new_call_signature(&[], SymbolId::NIL, &[target_param], return_type);
+                    let sig =
+                        self.new_call_signature(&[], SymbolId::NIL, &[target_param], return_type);
                     self.signature_links.get(node).decorator_signature = sig;
                 }
                 SyntaxKind::Parameter => 'arm: {
                     if !is_constructor_declaration(node.parent())
                         && !(is_method_declaration(node.parent())
-                            || is_set_accessor_declaration(node.parent()) && is_class_like(node.parent().parent()))
+                            || is_set_accessor_declaration(node.parent())
+                                && is_class_like(node.parent().parent()))
                     {
                         break 'arm;
                     }
                     if get_this_parameter(node.parent()) == node {
                         break 'arm;
                     }
-                    let position = node.parent().parameters().iter().position(|p| p == node).map_or(-1, |i| i as i32);
-                    let index = position - if get_this_parameter(node.parent()).is_some() { 1 } else { 0 };
+                    let position = node
+                        .parent()
+                        .parameters()
+                        .iter()
+                        .position(|p| p == node)
+                        .map_or(-1, |i| i as i32);
+                    let index = position
+                        - if get_this_parameter(node.parent()).is_some() {
+                            1
+                        } else {
+                            0
+                        };
                     debug_assert!(index >= 0);
                     // A parameter declaration decorator will have three arguments (see `ParameterDecorator` in
                     // core.d.ts).
@@ -367,7 +426,12 @@ impl Checker {
                     let key_param = self.new_parameter("propertyKey", key_type);
                     let index_param = self.new_parameter("parameterIndex", index_type);
                     let void_type = self.void_type;
-                    let sig = self.new_call_signature(&[], SymbolId::NIL, &[target_param, key_param, index_param], void_type);
+                    let sig = self.new_call_signature(
+                        &[],
+                        SymbolId::NIL,
+                        &[target_param, key_param, index_param],
+                        void_type,
+                    );
                     self.signature_links.get(node).decorator_signature = sig;
                 }
                 SyntaxKind::MethodDeclaration
@@ -388,18 +452,29 @@ impl Checker {
                         let node_type = self.get_type_of_node(node);
                         return_type = self.new_typed_property_descriptor_type(node_type);
                     }
-                    let has_prop_desc = !is_property_declaration(node) || has_accessor_modifier(node);
+                    let has_prop_desc =
+                        !is_property_declaration(node) || has_accessor_modifier(node);
                     let void_type = self.void_type;
                     if has_prop_desc {
                         let node_type = self.get_type_of_node(node);
                         let descriptor_type = self.new_typed_property_descriptor_type(node_type);
                         let descriptor_param = self.new_parameter("descriptor", descriptor_type);
                         let union = self.get_union_type(&[return_type, void_type]);
-                        let sig = self.new_call_signature(&[], SymbolId::NIL, &[target_param, key_param, descriptor_param], union);
+                        let sig = self.new_call_signature(
+                            &[],
+                            SymbolId::NIL,
+                            &[target_param, key_param, descriptor_param],
+                            union,
+                        );
                         self.signature_links.get(node).decorator_signature = sig;
                     } else {
                         let union = self.get_union_type(&[return_type, void_type]);
-                        let sig = self.new_call_signature(&[], SymbolId::NIL, &[target_param, key_param], union);
+                        let sig = self.new_call_signature(
+                            &[],
+                            SymbolId::NIL,
+                            &[target_param, key_param],
+                            union,
+                        );
                         self.signature_links.get(node).decorator_signature = sig;
                     }
                 }
@@ -506,10 +581,16 @@ impl Checker {
                     let symbol = self.get_symbol_of_declaration(node);
                     let target_type = self.get_type_of_symbol(symbol);
                     let context_type = self.new_class_decorator_context_type(target_type);
-                    let sig = self.new_es_decorator_call_signature(target_type, context_type, target_type);
+                    let sig = self.new_es_decorator_call_signature(
+                        target_type,
+                        context_type,
+                        target_type,
+                    );
                     self.signature_links.get(node).decorator_signature = sig;
                 }
-                SyntaxKind::MethodDeclaration | SyntaxKind::GetAccessor | SyntaxKind::SetAccessor => 'arm: {
+                SyntaxKind::MethodDeclaration
+                | SyntaxKind::GetAccessor
+                | SyntaxKind::SetAccessor => 'arm: {
                     if !is_class_like(node.parent()) {
                         break 'arm;
                     }
@@ -547,8 +628,14 @@ impl Checker {
                     } else {
                         value_type
                     };
-                    let context_type = self.new_class_member_decorator_context_type_for_node(node, this_type, value_type);
-                    let sig = self.new_es_decorator_call_signature(target_type, context_type, target_type);
+                    let context_type = self.new_class_member_decorator_context_type_for_node(
+                        node, this_type, value_type,
+                    );
+                    let sig = self.new_es_decorator_call_signature(
+                        target_type,
+                        context_type,
+                        target_type,
+                    );
                     self.signature_links.get(node).decorator_signature = sig;
                 }
                 SyntaxKind::PropertyDeclaration => 'arm: {
@@ -583,10 +670,18 @@ impl Checker {
                     let return_type = if has_accessor_modifier(node) {
                         self.new_class_accessor_decorator_result_type(this_type, value_type)
                     } else {
-                        self.new_class_field_decorator_initializer_mutator_type(this_type, value_type)
+                        self.new_class_field_decorator_initializer_mutator_type(
+                            this_type, value_type,
+                        )
                     };
-                    let context_type = self.new_class_member_decorator_context_type_for_node(node, this_type, value_type);
-                    let sig = self.new_es_decorator_call_signature(target_type, context_type, return_type);
+                    let context_type = self.new_class_member_decorator_context_type_for_node(
+                        node, this_type, value_type,
+                    );
+                    let sig = self.new_es_decorator_call_signature(
+                        target_type,
+                        context_type,
+                        return_type,
+                    );
                     self.signature_links.get(node).decorator_signature = sig;
                 }
                 _ => {}
@@ -607,35 +702,57 @@ impl Checker {
     }
 
     // Go: checker/checker.go:30163 newClassMethodDecoratorContextType
-    pub fn new_class_method_decorator_context_type(&mut self, class_type: TypeId, value_type: TypeId) -> TypeId {
+    pub fn new_class_method_decorator_context_type(
+        &mut self,
+        class_type: TypeId,
+        value_type: TypeId,
+    ) -> TypeId {
         let f = self.get_global_class_method_decorator_context_type.clone();
         let target = f(self);
         self.try_create_type_reference(target, &[class_type, value_type])
     }
 
     // Go: checker/checker.go:30167 newClassGetterDecoratorContextType
-    pub fn new_class_getter_decorator_context_type(&mut self, class_type: TypeId, value_type: TypeId) -> TypeId {
+    pub fn new_class_getter_decorator_context_type(
+        &mut self,
+        class_type: TypeId,
+        value_type: TypeId,
+    ) -> TypeId {
         let f = self.get_global_class_getter_decorator_context_type.clone();
         let target = f(self);
         self.try_create_type_reference(target, &[class_type, value_type])
     }
 
     // Go: checker/checker.go:30171 newClassSetterDecoratorContextType
-    pub fn new_class_setter_decorator_context_type(&mut self, class_type: TypeId, value_type: TypeId) -> TypeId {
+    pub fn new_class_setter_decorator_context_type(
+        &mut self,
+        class_type: TypeId,
+        value_type: TypeId,
+    ) -> TypeId {
         let f = self.get_global_class_setter_decorator_context_type.clone();
         let target = f(self);
         self.try_create_type_reference(target, &[class_type, value_type])
     }
 
     // Go: checker/checker.go:30175 newClassAccessorDecoratorContextType
-    pub fn new_class_accessor_decorator_context_type(&mut self, this_type: TypeId, value_type: TypeId) -> TypeId {
-        let f = self.get_global_class_accessor_decorator_context_type.clone();
+    pub fn new_class_accessor_decorator_context_type(
+        &mut self,
+        this_type: TypeId,
+        value_type: TypeId,
+    ) -> TypeId {
+        let f = self
+            .get_global_class_accessor_decorator_context_type
+            .clone();
         let target = f(self);
         self.try_create_type_reference(target, &[this_type, value_type])
     }
 
     // Go: checker/checker.go:30179 newClassFieldDecoratorContextType
-    pub fn new_class_field_decorator_context_type(&mut self, this_type: TypeId, value_type: TypeId) -> TypeId {
+    pub fn new_class_field_decorator_context_type(
+        &mut self,
+        this_type: TypeId,
+        value_type: TypeId,
+    ) -> TypeId {
         let f = self.get_global_class_field_decorator_context_type.clone();
         let target = f(self);
         self.try_create_type_reference(target, &[this_type, value_type])
@@ -644,15 +761,27 @@ impl Checker {
     // Gets a type like `{ name: "foo", private: false, static: true }` that is used to provided member-specific
     // details that will be intersected with a decorator context type.
     // Go: checker/checker.go:30185 getClassMemberDecoratorContextOverrideType
-    pub fn get_class_member_decorator_context_override_type(&mut self, name_type: TypeId, is_private: bool, is_static: bool) -> TypeId {
+    pub fn get_class_member_decorator_context_override_type(
+        &mut self,
+        name_type: TypeId,
+        is_private: bool,
+        is_static: bool,
+    ) -> TypeId {
         let kind = if is_private {
-            if is_static { CachedTypeKind::DECORATOR_CONTEXT_PRIVATE_STATIC } else { CachedTypeKind::DECORATOR_CONTEXT_PRIVATE }
+            if is_static {
+                CachedTypeKind::DECORATOR_CONTEXT_PRIVATE_STATIC
+            } else {
+                CachedTypeKind::DECORATOR_CONTEXT_PRIVATE
+            }
         } else if is_static {
             CachedTypeKind::DECORATOR_CONTEXT_STATIC
         } else {
             CachedTypeKind::DECORATOR_CONTEXT
         };
-        let key = CachedTypeKey { kind, type_id: self.ty(name_type).id };
+        let key = CachedTypeKey {
+            kind,
+            type_id: self.ty(name_type).id,
+        };
         if let Some(&override_type) = self.cached_types.get(&key) {
             if override_type.is_some() {
                 return override_type;
@@ -661,10 +790,18 @@ impl Checker {
         let members = self.symbols.new_table();
         let name_prop = self.new_property("name", name_type);
         self.symbols.set(members, "name", name_prop);
-        let private_type = if is_private { self.true_type } else { self.false_type };
+        let private_type = if is_private {
+            self.true_type
+        } else {
+            self.false_type
+        };
         let private_prop = self.new_property("private", private_type);
         self.symbols.set(members, "private", private_prop);
-        let static_type = if is_static { self.true_type } else { self.false_type };
+        let static_type = if is_static {
+            self.true_type
+        } else {
+            self.false_type
+        };
         let static_prop = self.new_property("static", static_type);
         self.symbols.set(members, "static", static_prop);
         let override_type = self.new_anonymous_type(SymbolId::NIL, members, &[], &[], &[]);
@@ -673,7 +810,12 @@ impl Checker {
     }
 
     // Go: checker/checker.go:30204 newClassMemberDecoratorContextTypeForNode
-    pub fn new_class_member_decorator_context_type_for_node(&mut self, node: Node, this_type: TypeId, value_type: TypeId) -> TypeId {
+    pub fn new_class_member_decorator_context_type_for_node(
+        &mut self,
+        node: Node,
+        this_type: TypeId,
+        value_type: TypeId,
+    ) -> TypeId {
         let is_static = has_static_modifier(node);
         let is_private = is_private_identifier(node.name());
         let name_type = if is_private {
@@ -694,26 +836,39 @@ impl Checker {
         } else {
             panic!("Unhandled case in createClassMemberDecoratorContextTypeForNode")
         };
-        let override_type = self.get_class_member_decorator_context_override_type(name_type, is_private, is_static);
+        let override_type =
+            self.get_class_member_decorator_context_override_type(name_type, is_private, is_static);
         self.get_intersection_type(&[context_type, override_type])
     }
 
     // Go: checker/checker.go:30232 newClassAccessorDecoratorTargetType
-    pub fn new_class_accessor_decorator_target_type(&mut self, this_type: TypeId, value_type: TypeId) -> TypeId {
+    pub fn new_class_accessor_decorator_target_type(
+        &mut self,
+        this_type: TypeId,
+        value_type: TypeId,
+    ) -> TypeId {
         let f = self.get_global_class_accessor_decorator_target_type.clone();
         let target = f(self);
         self.try_create_type_reference(target, &[this_type, value_type])
     }
 
     // Go: checker/checker.go:30236 newClassAccessorDecoratorResultType
-    pub fn new_class_accessor_decorator_result_type(&mut self, this_type: TypeId, value_type: TypeId) -> TypeId {
+    pub fn new_class_accessor_decorator_result_type(
+        &mut self,
+        this_type: TypeId,
+        value_type: TypeId,
+    ) -> TypeId {
         let f = self.get_global_class_accessor_decorator_result_type.clone();
         let target = f(self);
         self.try_create_type_reference(target, &[this_type, value_type])
     }
 
     // Go: checker/checker.go:30240 newClassFieldDecoratorInitializerMutatorType
-    pub fn new_class_field_decorator_initializer_mutator_type(&mut self, this_type: TypeId, value_type: TypeId) -> TypeId {
+    pub fn new_class_field_decorator_initializer_mutator_type(
+        &mut self,
+        this_type: TypeId,
+        value_type: TypeId,
+    ) -> TypeId {
         let this_param = self.new_parameter("this", this_type);
         let value_param = self.new_parameter("value", value_type);
         self.new_function_type(&[], this_param, &[value_param], value_type)
@@ -732,7 +887,12 @@ impl Checker {
         let context_param = self.new_parameter("context", context_type);
         let void_type = self.void_type;
         let return_type = self.get_union_type(&[non_optional_return_type, void_type]);
-        self.new_call_signature(&[], SymbolId::NIL /*thisParameter*/, &[target_param, context_param], return_type)
+        self.new_call_signature(
+            &[],
+            SymbolId::NIL, /*thisParameter*/
+            &[target_param, context_param],
+            return_type,
+        )
     }
 
     // Creates a synthetic `FunctionType`
@@ -744,7 +904,8 @@ impl Checker {
         parameters: &[SymbolId],
         return_type: TypeId,
     ) -> TypeId {
-        let signature = self.new_call_signature(type_parameters, this_parameter, parameters, return_type);
+        let signature =
+            self.new_call_signature(type_parameters, this_parameter, parameters, return_type);
         self.get_or_create_type_from_signature(signature)
     }
 
@@ -757,7 +918,12 @@ impl Checker {
     pub fn new_setter_function_type(&mut self, t: TypeId) -> TypeId {
         let value_param = self.new_parameter("value", t);
         let void_type = self.void_type;
-        self.new_function_type(&[], SymbolId::NIL /*thisParameter*/, &[value_param], void_type)
+        self.new_function_type(
+            &[],
+            SymbolId::NIL, /*thisParameter*/
+            &[value_param],
+            void_type,
+        )
     }
 
     // Creates a synthetic `Signature` corresponding to a call signature.
@@ -770,7 +936,9 @@ impl Checker {
         return_type: TypeId,
     ) -> SignatureId {
         let any_keyword = self.factory.new_keyword_type_node(SyntaxKind::AnyKeyword);
-        let decl = self.factory.new_function_type_node(NodeList::NIL, NodeList::NIL, any_keyword);
+        let decl = self
+            .factory
+            .new_function_type_node(NodeList::NIL, NodeList::NIL, any_keyword);
         self.new_signature(
             SignatureFlags::NONE,
             decl,
@@ -824,7 +992,12 @@ impl Checker {
     }
 
     // Go: checker/checker.go:30307 getTypeOfPropertyOfContextualTypeEx
-    pub fn get_type_of_property_of_contextual_type_ex(&mut self, t: TypeId, name: &str, name_type: TypeId) -> TypeId {
+    pub fn get_type_of_property_of_contextual_type_ex(
+        &mut self,
+        t: TypeId,
+        name: &str,
+        name_type: TypeId,
+    ) -> TypeId {
         self.map_type_ex(
             t,
             &mut |c: &mut Checker, t: TypeId| -> TypeId {
@@ -838,14 +1011,25 @@ impl Checker {
                             continue;
                         }
                         if c.is_generic_mapped_type(constituent_type)
-                            && c.get_mapped_type_name_type_kind(constituent_type) != MappedTypeNameTypeKind::REMAPPING
+                            && c.get_mapped_type_name_type_kind(constituent_type)
+                                != MappedTypeNameTypeKind::REMAPPING
                         {
-                            let substituted_type =
-                                c.get_indexed_mapped_type_substituted_type_of_contextual_type(constituent_type, name, name_type);
-                            types = c.append_contextual_property_type_constituent(types, substituted_type);
+                            let substituted_type = c
+                                .get_indexed_mapped_type_substituted_type_of_contextual_type(
+                                    constituent_type,
+                                    name,
+                                    name_type,
+                                );
+                            types = c.append_contextual_property_type_constituent(
+                                types,
+                                substituted_type,
+                            );
                             continue;
                         }
-                        let property_type = c.get_type_of_concrete_property_of_contextual_type(constituent_type, name);
+                        let property_type = c.get_type_of_concrete_property_of_contextual_type(
+                            constituent_type,
+                            name,
+                        );
                         if property_type.is_nil() {
                             if !ignore_index_infos {
                                 index_info_candidates.push(constituent_type);
@@ -857,8 +1041,11 @@ impl Checker {
                         types = c.append_contextual_property_type_constituent(types, property_type);
                     }
                     for candidate in index_info_candidates {
-                        let index_info_type = c.get_type_from_index_infos_of_contextual_type(candidate, name, name_type);
-                        types = c.append_contextual_property_type_constituent(types, index_info_type);
+                        let index_info_type = c.get_type_from_index_infos_of_contextual_type(
+                            candidate, name, name_type,
+                        );
+                        types =
+                            c.append_contextual_property_type_constituent(types, index_info_type);
                     }
                     if types.is_empty() {
                         return TypeId::NIL;
@@ -871,8 +1058,12 @@ impl Checker {
                 if !c.ty(t).flags.intersects(TypeFlags::OBJECT) {
                     return TypeId::NIL;
                 }
-                if c.is_generic_mapped_type(t) && c.get_mapped_type_name_type_kind(t) != MappedTypeNameTypeKind::REMAPPING {
-                    return c.get_indexed_mapped_type_substituted_type_of_contextual_type(t, name, name_type);
+                if c.is_generic_mapped_type(t)
+                    && c.get_mapped_type_name_type_kind(t) != MappedTypeNameTypeKind::REMAPPING
+                {
+                    return c.get_indexed_mapped_type_substituted_type_of_contextual_type(
+                        t, name, name_type,
+                    );
                 }
                 let result = c.get_type_of_concrete_property_of_contextual_type(t, name);
                 if result.is_some() {
@@ -885,7 +1076,12 @@ impl Checker {
     }
 
     // Go: checker/checker.go:30359 getIndexedMappedTypeSubstitutedTypeOfContextualType
-    pub fn get_indexed_mapped_type_substituted_type_of_contextual_type(&mut self, t: TypeId, name: &str, name_type: TypeId) -> TypeId {
+    pub fn get_indexed_mapped_type_substituted_type_of_contextual_type(
+        &mut self,
+        t: TypeId,
+        name: &str,
+        name_type: TypeId,
+    ) -> TypeId {
         let mut property_name_type = name_type;
         if property_name_type.is_nil() {
             property_name_type = self.get_string_literal_type(name);
@@ -893,7 +1089,8 @@ impl Checker {
         let constraint = self.get_constraint_type_from_mapped_type(t);
         // special case for conditional types pretending to be negated types
         let mapped_name_type = self.ty(t).as_mapped_type().name_type;
-        if mapped_name_type.is_some() && self.is_excluded_mapped_property_name(mapped_name_type, property_name_type)
+        if mapped_name_type.is_some()
+            && self.is_excluded_mapped_property_name(mapped_name_type, property_name_type)
             || self.is_excluded_mapped_property_name(constraint, property_name_type)
         {
             return TypeId::NIL;
@@ -906,16 +1103,26 @@ impl Checker {
     }
 
     // Go: checker/checker.go:30376 isExcludedMappedPropertyName
-    pub fn is_excluded_mapped_property_name(&mut self, t: TypeId, property_name_type: TypeId) -> bool {
+    pub fn is_excluded_mapped_property_name(
+        &mut self,
+        t: TypeId,
+        property_name_type: TypeId,
+    ) -> bool {
         if self.ty(t).flags.intersects(TypeFlags::CONDITIONAL) {
             let true_type = self.get_true_type_from_conditional_type(t);
             let reduced_true_type = self.get_reduced_type(true_type);
-            if !self.ty(reduced_true_type).flags.intersects(TypeFlags::NEVER) {
+            if !self
+                .ty(reduced_true_type)
+                .flags
+                .intersects(TypeFlags::NEVER)
+            {
                 return false;
             }
             let false_type = self.get_false_type_from_conditional_type(t);
             let check_type = self.ty(t).as_conditional_type().check_type;
-            if self.get_actual_type_variable(false_type) != self.get_actual_type_variable(check_type) {
+            if self.get_actual_type_variable(false_type)
+                != self.get_actual_type_variable(check_type)
+            {
                 return false;
             }
             let extends_type = self.ty(t).as_conditional_type().extends_type;
@@ -934,7 +1141,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:30390 getTypeOfConcretePropertyOfContextualType
-    pub fn get_type_of_concrete_property_of_contextual_type(&mut self, t: TypeId, name: &str) -> TypeId {
+    pub fn get_type_of_concrete_property_of_contextual_type(
+        &mut self,
+        t: TypeId,
+        name: &str,
+    ) -> TypeId {
         let prop = self.get_property_of_type(t, name);
         if prop.is_nil() || self.is_circular_mapped_property(prop) {
             return TypeId::NIL;
@@ -945,8 +1156,16 @@ impl Checker {
     }
 
     // Go: checker/checker.go:30398 getTypeFromIndexInfosOfContextualType
-    pub fn get_type_from_index_infos_of_contextual_type(&mut self, t: TypeId, name: &str, name_type: TypeId) -> TypeId {
-        if self.is_tuple_type(t) && is_numeric_literal_name(name) && ts_jsnum::from_string(name) >= Number::new(0.0) {
+    pub fn get_type_from_index_infos_of_contextual_type(
+        &mut self,
+        t: TypeId,
+        name: &str,
+        name_type: TypeId,
+    ) -> TypeId {
+        if self.is_tuple_type(t)
+            && is_numeric_literal_name(name)
+            && ts_jsnum::from_string(name) >= Number::new(0.0)
+        {
             let fixed_length = self.target_tuple_type(t).fixed_length;
             let rest_type = self.get_element_type_of_slice_of_tuple_type(
                 t,
@@ -976,13 +1195,20 @@ impl Checker {
         if self.sym(symbol).check_flags.intersects(CheckFlags::MAPPED) {
             let resolved_type = self.value_symbol_links.get(symbol).resolved_type;
             return resolved_type.is_nil()
-                && self.find_resolution_cycle_start_index(TypeSystemEntity::Symbol(symbol), TypeSystemPropertyName::TYPE) >= 0;
+                && self.find_resolution_cycle_start_index(
+                    TypeSystemEntity::Symbol(symbol),
+                    TypeSystemPropertyName::TYPE,
+                ) >= 0;
         }
         false
     }
 
     // Go: checker/checker.go:30423 appendContextualPropertyTypeConstituent
-    pub fn append_contextual_property_type_constituent(&self, mut types: Vec<TypeId>, t: TypeId) -> Vec<TypeId> {
+    pub fn append_contextual_property_type_constituent(
+        &self,
+        mut types: Vec<TypeId>,
+        t: TypeId,
+    ) -> Vec<TypeId> {
         // any doesn't provide any contextual information but could spoil the overall result by nullifying contextual information
         // provided by other intersection constituents so it gets replaced with `unknown` as `T & unknown` is just `T` and all
         // types computed based on the contextual information provided by other constituens are still assignable to any
@@ -1000,16 +1226,24 @@ impl Checker {
     // Return the contextual type for a given expression node. During overload resolution, a contextual type may temporarily
     // be "pushed" onto a node using the contextualType property.
     // Go: checker/checker.go:30438 getApparentTypeOfContextualType
-    pub fn get_apparent_type_of_contextual_type(&mut self, node: Node, context_flags: ContextFlags) -> TypeId {
+    pub fn get_apparent_type_of_contextual_type(
+        &mut self,
+        node: Node,
+        context_flags: ContextFlags,
+    ) -> TypeId {
         let contextual_type = if is_object_literal_method(node) {
             self.get_contextual_type_for_object_literal_method(node, context_flags)
         } else {
             self.get_contextual_type(node, context_flags)
         };
-        let instantiated_type = self.instantiate_contextual_type(contextual_type, node, context_flags);
+        let instantiated_type =
+            self.instantiate_contextual_type(contextual_type, node, context_flags);
         if instantiated_type.is_some()
             && !(context_flags.intersects(ContextFlags::NO_CONSTRAINTS)
-                && self.ty(instantiated_type).flags.intersects(TypeFlags::TYPE_VARIABLE))
+                && self
+                    .ty(instantiated_type)
+                    .flags
+                    .intersects(TypeFlags::TYPE_VARIABLE))
         {
             let apparent_type = self.map_type_ex(
                 instantiated_type,
@@ -1021,9 +1255,13 @@ impl Checker {
                 },
                 true,
             );
-            if self.ty(apparent_type).flags.intersects(TypeFlags::UNION) && is_object_literal_expression(node) {
+            if self.ty(apparent_type).flags.intersects(TypeFlags::UNION)
+                && is_object_literal_expression(node)
+            {
                 return self.discriminate_contextual_type_by_object_members(node, apparent_type);
-            } else if self.ty(apparent_type).flags.intersects(TypeFlags::UNION) && is_jsx_attributes(node) {
+            } else if self.ty(apparent_type).flags.intersects(TypeFlags::UNION)
+                && is_jsx_attributes(node)
+            {
                 return self.discriminate_contextual_type_by_jsx_attributes(node, apparent_type);
             } else {
                 return apparent_type;
@@ -1087,14 +1325,22 @@ impl Discriminator for ObjectLiteralDiscriminator {
 
 impl Checker {
     // Go: checker/checker.go:30507 discriminateContextualTypeByObjectMembers
-    pub fn discriminate_contextual_type_by_object_members(&mut self, node: Node, contextual_type: TypeId) -> TypeId {
-        let key = DiscriminatedContextualTypeKey { node_id: node, type_id: self.ty(contextual_type).id };
+    pub fn discriminate_contextual_type_by_object_members(
+        &mut self,
+        node: Node,
+        contextual_type: TypeId,
+    ) -> TypeId {
+        let key = DiscriminatedContextualTypeKey {
+            node_id: node,
+            type_id: self.ty(contextual_type).id,
+        };
         if let Some(&discriminated) = self.discriminated_contextual_types.get(&key) {
             if discriminated.is_some() {
                 return discriminated;
             }
         }
-        let mut discriminated = self.get_matching_union_constituent_for_object_literal(contextual_type, node);
+        let mut discriminated =
+            self.get_matching_union_constituent_for_object_literal(contextual_type, node);
         if discriminated.is_nil() {
             let mut discriminant_properties: Vec<Node> = Vec::new();
             for p in node.properties().iter() {
@@ -1103,7 +1349,8 @@ impl Checker {
                     false
                 } else if is_property_assignment(p) {
                     let name = self.sym(symbol).name.clone();
-                    self.is_possibly_discriminant_value(p.initializer()) && self.is_discriminant_property(contextual_type, &name)
+                    self.is_possibly_discriminant_value(p.initializer())
+                        && self.is_discriminant_property(contextual_type, &name)
                 } else if is_shorthand_property_assignment(p) {
                     let name = self.sym(symbol).name.clone();
                     self.is_discriminant_property(contextual_type, &name)
@@ -1125,15 +1372,24 @@ impl Checker {
                     discriminant_members.push(s);
                 }
             }
-            let mut discriminator = ObjectLiteralDiscriminator { props: discriminant_properties, members: discriminant_members };
-            discriminated = self.discriminate_type_by_discriminable_items(contextual_type, &mut discriminator);
+            let mut discriminator = ObjectLiteralDiscriminator {
+                props: discriminant_properties,
+                members: discriminant_members,
+            };
+            discriminated =
+                self.discriminate_type_by_discriminable_items(contextual_type, &mut discriminator);
         }
-        self.discriminated_contextual_types.insert(key, discriminated);
+        self.discriminated_contextual_types
+            .insert(key, discriminated);
         discriminated
     }
 
     // Go: checker/checker.go:30537 getMatchingUnionConstituentForObjectLiteral
-    pub fn get_matching_union_constituent_for_object_literal(&mut self, union_type: TypeId, node: Node) -> TypeId {
+    pub fn get_matching_union_constituent_for_object_literal(
+        &mut self,
+        union_type: TypeId,
+        node: Node,
+    ) -> TypeId {
         let key_property_name = self.get_key_property_name(union_type);
         if !key_property_name.is_empty() {
             let mut prop_node = Node::NIL;
@@ -1175,7 +1431,8 @@ impl Checker {
                 return self.is_possibly_discriminant_value(node.expression());
             }
             SyntaxKind::JsxExpression => {
-                return node.expression().is_nil() || self.is_possibly_discriminant_value(node.expression());
+                return node.expression().is_nil()
+                    || self.is_possibly_discriminant_value(node.expression());
             }
             _ => {}
         }
@@ -1185,15 +1442,23 @@ impl Checker {
     // If the given contextual type contains instantiable types and if a mapper representing
     // return type inferences is available, instantiate those types using that mapper.
     // Go: checker/checker.go:30569 instantiateContextualType
-    pub fn instantiate_contextual_type(&mut self, contextual_type: TypeId, node: Node, context_flags: ContextFlags) -> TypeId {
-        if contextual_type.is_some() && self.maybe_type_of_kind(contextual_type, TypeFlags::INSTANTIABLE) {
+    pub fn instantiate_contextual_type(
+        &mut self,
+        contextual_type: TypeId,
+        node: Node,
+        context_flags: ContextFlags,
+    ) -> TypeId {
+        if contextual_type.is_some()
+            && self.maybe_type_of_kind(contextual_type, TypeFlags::INSTANTIABLE)
+        {
             let inference_context = self.get_inference_context(node);
             // If no inferences have been made, and none of the type parameters for which we are inferring
             // specify default types, nothing is gained from instantiating as type parameters would just be
             // replaced with their constraints similar to the apparent type.
             if inference_context.is_some() {
                 if context_flags.intersects(ContextFlags::SIGNATURE) {
-                    let inference_count = self.inference_context(inference_context).inferences.len();
+                    let inference_count =
+                        self.inference_context(inference_context).inferences.len();
                     let mut has_candidates_or_default = false;
                     for i in 0..inference_count {
                         if self.has_inference_candidates_or_default(inference_context, i) {
@@ -1204,8 +1469,10 @@ impl Checker {
                     if has_candidates_or_default {
                         // For contextual signatures we incorporate all inferences made so far, e.g. from return
                         // types as well as arguments to the left in a function call.
-                        let non_fixing_mapper = self.inference_context(inference_context).non_fixing_mapper;
-                        let t = self.instantiate_instantiable_types(contextual_type, non_fixing_mapper);
+                        let non_fixing_mapper =
+                            self.inference_context(inference_context).non_fixing_mapper;
+                        let t =
+                            self.instantiate_instantiable_types(contextual_type, non_fixing_mapper);
                         if !self.ty(t).flags.intersects(TypeFlags::ANY_OR_UNKNOWN) {
                             return t;
                         }
@@ -1221,8 +1488,11 @@ impl Checker {
                     if !self.ty(t).flags.intersects(TypeFlags::ANY_OR_UNKNOWN) {
                         if self.ty(t).flags.intersects(TypeFlags::UNION) {
                             let types = self.ty(t).types().to_vec();
-                            let (regular_false_type, regular_true_type) = (self.regular_false_type, self.regular_true_type);
-                            if self.contains_type(&types, regular_false_type) && self.contains_type(&types, regular_true_type) {
+                            let (regular_false_type, regular_true_type) =
+                                (self.regular_false_type, self.regular_true_type);
+                            if self.contains_type(&types, regular_false_type)
+                                && self.contains_type(&types, regular_true_type)
+                            {
                                 return self.filter_type(t, &mut |c: &mut Checker, t: TypeId| {
                                     t != c.regular_false_type && t != c.regular_true_type
                                 });

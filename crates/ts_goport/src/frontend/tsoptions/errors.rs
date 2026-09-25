@@ -7,9 +7,16 @@ use ts_diagnostics::Message;
 // ---------------------------------------------------------------------------
 
 // Go: tsoptions/errors.go:14 createDiagnosticForInvalidEnumType
-pub fn create_diagnostic_for_invalid_enum_type(opt: &CommandLineOption, source_file: Node, node: Node) -> Diagnostic {
+pub fn create_diagnostic_for_invalid_enum_type(
+    opt: &CommandLineOption,
+    source_file: Node,
+    node: Node,
+) -> Diagnostic {
     // PORT: Go `opt.EnumMap()` is non-nil here (the caller found the enum map).
-    let names_of_type: Vec<String> = opt.enum_map().map(|m| m.keys().cloned().collect()).unwrap_or_default();
+    let names_of_type: Vec<String> = opt
+        .enum_map()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
     let string_names = format_enum_type_keys(opt, names_of_type);
     let opt_name = format!("--{}", opt.name);
     create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
@@ -34,8 +41,13 @@ pub fn get_compiler_option_value_type_string(option: &CommandLineOption) -> Stri
         CommandLineOptionKind::LIST_OR_ELEMENT => {
             // PORT: Go formats a nil `Elements()` with `%v` as `<nil>`. Every
             // listOrElement option has an element declaration.
-            let elements = option.elements().expect("listOrElement option has elements");
-            format!("{} or Array", get_compiler_option_value_type_string(elements))
+            let elements = option
+                .elements()
+                .expect("listOrElement option has elements");
+            format!(
+                "{} or Array",
+                get_compiler_option_value_type_string(elements)
+            )
         }
         CommandLineOptionKind::LIST => "Array".to_string(),
         _ => option.kind.0.to_string(),
@@ -66,9 +78,9 @@ impl CommandLineParser {
 pub fn create_unknown_option_error(
     unknown_option: &str,
     unknown_option_diagnostic: &'static Message,
-    unknown_option_error_text: &str, // optional
-    node: Node,                      // optional
-    source_file: Node,               // optional
+    unknown_option_error_text: &str,                   // optional
+    node: Node,                                        // optional
+    source_file: Node,                                 // optional
     alternate_mode: Option<&AlternateModeDiagnostics>, // optional
 ) -> Diagnostic {
     if let Some(alternate_mode) = alternate_mode
@@ -111,7 +123,10 @@ pub fn create_diagnostic_for_node_in_source_file(
 ) -> Diagnostic {
     new_diagnostic(
         source_file,
-        TextRange::new(skip_trivia(source_file_text(source_file), node.loc().pos()), node.end()),
+        TextRange::new(
+            skip_trivia(source_file_text(source_file), node.loc().pos()),
+            node.end(),
+        ),
         message,
         args,
     )

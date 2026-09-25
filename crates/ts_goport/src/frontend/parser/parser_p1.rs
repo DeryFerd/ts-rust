@@ -10,7 +10,9 @@
 use crate::frontend::prelude::*;
 // PORT: explicit imports. `scanner_util` (in the prelude) still has the old
 // `Scanner` and `new_scanner`. An explicit import wins over the glob.
-use crate::frontend::scanner::scanner_p1::{new_scanner, ErrorCallback, Scanner, ScannerState, TEXT_TO_KEYWORD};
+use crate::frontend::scanner::scanner_p1::{
+    ErrorCallback, Scanner, ScannerState, TEXT_TO_KEYWORD, new_scanner,
+};
 use std::sync::LazyLock;
 
 // Go: parser.go:19 ParsingContext
@@ -18,33 +20,33 @@ use std::sync::LazyLock;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(i32)]
 pub enum ParsingContext {
-    SourceElements,          // Elements in source file
-    BlockStatements,         // Statements in block
-    SwitchClauses,           // Clauses in switch statement
-    SwitchClauseStatements,  // Statements in switch clause
-    TypeMembers,             // Members in interface or type literal
-    ClassMembers,            // Members in class declaration
-    EnumMembers,             // Members in enum declaration
-    HeritageClauseElement,   // Elements in a heritage clause
-    VariableDeclarations,    // Variable declarations in variable statement
-    ObjectBindingElements,   // Binding elements in object binding list
-    ArrayBindingElements,    // Binding elements in array binding list
-    ArgumentExpressions,     // Expressions in argument list
-    ObjectLiteralMembers,    // Members in object literal
-    JsxAttributes,           // Attributes in jsx element
-    JsxChildren,             // Things between opening and closing JSX tags
-    ArrayLiteralMembers,     // Members in array literal
-    Parameters,              // Parameters in parameter list
-    JsDocParameters,         // JSDoc parameters in parameter list of JSDoc function type
-    RestProperties,          // Property names in a rest type list
-    TypeParameters,          // Type parameters in type parameter list
-    TypeArguments,           // Type arguments in type argument list
-    TupleElementTypes,       // Element types in tuple element type list
-    HeritageClauses,         // Heritage clauses for a class or interface declaration.
+    SourceElements,           // Elements in source file
+    BlockStatements,          // Statements in block
+    SwitchClauses,            // Clauses in switch statement
+    SwitchClauseStatements,   // Statements in switch clause
+    TypeMembers,              // Members in interface or type literal
+    ClassMembers,             // Members in class declaration
+    EnumMembers,              // Members in enum declaration
+    HeritageClauseElement,    // Elements in a heritage clause
+    VariableDeclarations,     // Variable declarations in variable statement
+    ObjectBindingElements,    // Binding elements in object binding list
+    ArrayBindingElements,     // Binding elements in array binding list
+    ArgumentExpressions,      // Expressions in argument list
+    ObjectLiteralMembers,     // Members in object literal
+    JsxAttributes,            // Attributes in jsx element
+    JsxChildren,              // Things between opening and closing JSX tags
+    ArrayLiteralMembers,      // Members in array literal
+    Parameters,               // Parameters in parameter list
+    JsDocParameters,          // JSDoc parameters in parameter list of JSDoc function type
+    RestProperties,           // Property names in a rest type list
+    TypeParameters,           // Type parameters in type parameter list
+    TypeArguments,            // Type arguments in type argument list
+    TupleElementTypes,        // Element types in tuple element type list
+    HeritageClauses,          // Heritage clauses for a class or interface declaration.
     ImportOrExportSpecifiers, // Named import clause's import specifier list
-    ImportAttributes,        // Import attributes
-    JsDocComment,            // Parsing via JSDocParser
-    Count,                   // Number of parsing contexts
+    ImportAttributes,         // Import attributes
+    JsDocComment,             // Parsing via JSDocParser
+    Count,                    // Number of parsing contexts
 }
 
 impl ParsingContext {
@@ -121,8 +123,13 @@ impl ParseDiagnostics {
     ) -> Option<usize> {
         // Don't report another error if it would just be at the same location as the last error
         let mut result = None;
-        if self.diagnostics.last().is_none_or(|last| last.pos != loc.pos()) {
-            self.diagnostics.push(new_diagnostic(Node::NIL, loc, message, args));
+        if self
+            .diagnostics
+            .last()
+            .is_none_or(|last| last.pos != loc.pos())
+        {
+            self.diagnostics
+                .push(new_diagnostic(Node::NIL, loc, message, args));
             result = Some(self.diagnostics.len() - 1);
         }
         self.has_parse_error = true;
@@ -219,7 +226,11 @@ pub fn new_parser() -> Parser {
 // which ranges over the `textToKeyword` map. Go map order is random. Here the
 // order is the keyword table order.
 static VIABLE_KEYWORD_SUGGESTIONS: LazyLock<Vec<String>> = LazyLock::new(|| {
-    TEXT_TO_KEYWORD.iter().filter(|(text, _)| text.len() > 2).map(|(text, _)| (*text).to_string()).collect()
+    TEXT_TO_KEYWORD
+        .iter()
+        .filter(|(text, _)| text.len() > 2)
+        .map(|(text, _)| (*text).to_string())
+        .collect()
 });
 
 /// Go `viableKeywordSuggestions`.
@@ -236,7 +247,10 @@ pub fn viable_keyword_suggestions() -> &'static [String] {
 // list ends) and an empty list cannot have a trailing comma.
 #[must_use]
 pub fn is_missing_node_list(list: NodeList) -> bool {
-    !list.is_nil() && list.list.is_some_and(|l| l.nodes.is_empty() && l.has_trailing_comma)
+    !list.is_nil()
+        && list
+            .list
+            .is_some_and(|l| l.nodes.is_empty() && l.has_trailing_comma)
 }
 
 // Go: parser.go:137 ParseSourceFile
@@ -244,14 +258,22 @@ pub fn is_missing_node_list(list: NodeList) -> bool {
 // store for the file first and freezes it at the end. The store keeps the
 // file name as `&'static str`, so the name is leaked once per file.
 #[must_use]
-pub fn parse_source_file(opts: &SourceFileParseOptions, source_text: &'static str, script_kind: ScriptKind) -> ParsedSourceFile {
+pub fn parse_source_file(
+    opts: &SourceFileParseOptions,
+    source_text: &'static str,
+    script_kind: ScriptKind,
+) -> ParsedSourceFile {
     let mut p = new_parser();
     p.initialize_state(opts, source_text, script_kind);
     let file_name: &'static str = Box::leak(opts.file_name.clone().into_boxed_str());
     p.store = new_file_store(file_name, source_text);
     p.factory = NodeFactory::for_file(p.store);
     p.next_token();
-    let result = if p.script_kind == ScriptKind::JSON { p.parse_json_text() } else { p.parse_source_file_worker() };
+    let result = if p.script_kind == ScriptKind::JSON {
+        p.parse_json_text()
+    } else {
+        p.parse_source_file_worker()
+    };
     freeze_file_store(p.store);
     set_source_file_diagnostics(result.root, result.diagnostics.clone());
     result
@@ -288,10 +310,13 @@ impl Parser {
             while self.token != SyntaxKind::EndOfFile {
                 let expression = match { self.token } {
                     SyntaxKind::OpenBracketToken => self.parse_array_literal_expression(),
-                    SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword | SyntaxKind::NullKeyword => self.parse_token_node(),
+                    SyntaxKind::TrueKeyword
+                    | SyntaxKind::FalseKeyword
+                    | SyntaxKind::NullKeyword => self.parse_token_node(),
                     SyntaxKind::MinusToken => {
                         if self.look_ahead(|p: &mut Parser| {
-                            p.next_token() == SyntaxKind::NumericLiteral && p.next_token() != SyntaxKind::ColonToken
+                            p.next_token() == SyntaxKind::NumericLiteral
+                                && p.next_token() != SyntaxKind::ColonToken
                         }) {
                             self.parse_prefix_unary_expression()
                         } else {
@@ -299,7 +324,9 @@ impl Parser {
                         }
                     }
                     SyntaxKind::NumericLiteral | SyntaxKind::StringLiteral
-                        if self.look_ahead(|p: &mut Parser| p.next_token() != SyntaxKind::ColonToken) =>
+                        if self.look_ahead(|p: &mut Parser| {
+                            p.next_token() != SyntaxKind::ColonToken
+                        }) =>
                     {
                         self.parse_literal_expression(false /*intern*/)
                     }
@@ -328,9 +355,12 @@ impl Parser {
             statements = self.new_node_list(TextRange::new(pos, end), &[statement]);
             eof = self.parse_expected_token(SyntaxKind::EndOfFile);
         }
-        let node = self.factory.new_parsed_source_file(&self.opts, self.source_text, statements, eof);
+        let node =
+            self.factory
+                .new_parsed_source_file(&self.opts, self.source_text, statements, eof);
         let node = self.finish_node(node, pos);
-        let mut result = ParsedSourceFile::new(self.store, node, self.opts.clone(), self.source_text, eof);
+        let mut result =
+            ParsedSourceFile::new(self.store, node, self.opts.clone(), self.source_text, eof);
         let first = result.statements().nodes();
         if !first.is_empty() {
             self.validate_json_value(&result, first.get(0).expression());
@@ -345,7 +375,10 @@ impl Parser {
             return;
         }
         match value_expression.kind() {
-            SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword | SyntaxKind::NullKeyword | SyntaxKind::NumericLiteral => {
+            SyntaxKind::TrueKeyword
+            | SyntaxKind::FalseKeyword
+            | SyntaxKind::NullKeyword
+            | SyntaxKind::NumericLiteral => {
                 return;
             }
             SyntaxKind::StringLiteral => {
@@ -418,9 +451,17 @@ impl Parser {
     }
 
     // Go: parser.go:290 initializeState
-    pub fn initialize_state(&mut self, opts: &SourceFileParseOptions, source_text: &'static str, script_kind: ScriptKind) {
+    pub fn initialize_state(
+        &mut self,
+        opts: &SourceFileParseOptions,
+        source_text: &'static str,
+        script_kind: ScriptKind,
+    ) {
         if script_kind == ScriptKind::UNKNOWN {
-            panic!("ScriptKind must be specified when parsing source file: {}", opts.file_name);
+            panic!(
+                "ScriptKind must be specified when parsing source file: {}",
+                opts.file_name
+            );
         }
 
         // PORT: `new_parser` always makes the scanner, so Go `NewScanner`
@@ -457,7 +498,11 @@ impl Parser {
     }
 
     // Go: parser.go:325 parseErrorAtCurrentToken
-    pub fn parse_error_at_current_token(&mut self, message: &'static ts_diagnostics::Message, args: Vec<String>) -> Option<usize> {
+    pub fn parse_error_at_current_token(
+        &mut self,
+        message: &'static ts_diagnostics::Message,
+        args: Vec<String>,
+    ) -> Option<usize> {
         let range = self.scanner.token_range();
         self.parse_error_at_range(range, message, args)
     }
@@ -470,7 +515,9 @@ impl Parser {
         message: &'static ts_diagnostics::Message,
         args: Vec<String>,
     ) -> Option<usize> {
-        self.diagnostics.borrow_mut().parse_error_at_range(loc, message, args)
+        self.diagnostics
+            .borrow_mut()
+            .parse_error_at_range(loc, message, args)
     }
 
     /// Go `p.hasParseError`.
@@ -529,9 +576,14 @@ impl Parser {
     // Go: parser.go:383 nextToken
     pub fn next_token(&mut self) -> SyntaxKind {
         // if the keyword had an escape
-        if is_keyword(self.token) && (self.scanner.has_unicode_escape() || self.scanner.has_extended_unicode_escape()) {
+        if is_keyword(self.token)
+            && (self.scanner.has_unicode_escape() || self.scanner.has_extended_unicode_escape())
+        {
             // issue a parse error for the escape
-            self.parse_error_at_current_token(diag::Keywords_cannot_contain_escape_characters, args![]);
+            self.parse_error_at_current_token(
+                diag::Keywords_cannot_contain_escape_characters,
+                args![],
+            );
         }
         self.token = self.scanner.scan();
         self.token
@@ -590,7 +642,10 @@ impl Parser {
             self.context_flags |= NodeFlags::AMBIENT;
         }
         let pos = self.node_pos();
-        let mut statements = self.parse_list_index(ParsingContext::SourceElements, Parser::parse_toplevel_statement);
+        let mut statements = self.parse_list_index(
+            ParsingContext::SourceElements,
+            Parser::parse_toplevel_statement,
+        );
         let end = self.node_pos();
         let end_js_doc = self.jsdoc_scanner_info();
         let eof = self.parse_token_node();
@@ -602,21 +657,34 @@ impl Parser {
             statements.append(&mut self.reparse_list);
         }
         let list = self.new_node_list(TextRange::new(pos, end), &statements);
-        let node = self.factory.new_parsed_source_file(&self.opts, self.source_text, list, eof);
+        let node = self
+            .factory
+            .new_parsed_source_file(&self.opts, self.source_text, list, eof);
         let node = self.finish_node(node, pos);
-        let mut result = ParsedSourceFile::new(self.store, node, self.opts.clone(), self.source_text, eof);
+        let mut result =
+            ParsedSourceFile::new(self.store, node, self.opts.clone(), self.source_text, eof);
         self.finish_source_file(&mut result, is_declaration_file);
-        if !result.is_declaration_file && !result.external_module_indicator.is_nil() && !self.possible_await_spans.is_empty() {
+        if !result.is_declaration_file
+            && !result.external_module_indicator.is_nil()
+            && !self.possible_await_spans.is_empty()
+        {
             let reparse = self.reparse_top_level_await(&result);
             let reparse = self.finish_node(reparse, pos);
             if node != reparse {
-                result = ParsedSourceFile::new(self.store, reparse, self.opts.clone(), self.source_text, result.end_of_file_token);
+                result = ParsedSourceFile::new(
+                    self.store,
+                    reparse,
+                    self.opts.clone(),
+                    self.source_text,
+                    result.end_of_file_token,
+                );
                 self.finish_source_file(&mut result, is_declaration_file);
             }
         }
         collect_external_module_references(&mut result);
         if is_in_js_file(node) {
-            result.js_diagnostics = attach_file_to_diagnostics(self.js_diagnostics.clone(), result.root);
+            result.js_diagnostics =
+                attach_file_to_diagnostics(self.js_diagnostics.clone(), result.root);
         }
         result
     }
@@ -628,7 +696,8 @@ impl Parser {
         self.process_pragmas_into_fields(result);
         let diagnostics = self.diagnostics.borrow().diagnostics.clone();
         result.diagnostics = attach_file_to_diagnostics(diagnostics, result.root);
-        result.jsdoc_diagnostics = attach_file_to_diagnostics(self.jsdoc_diagnostics.clone(), result.root);
+        result.jsdoc_diagnostics =
+            attach_file_to_diagnostics(self.jsdoc_diagnostics.clone(), result.root);
         result.common_js_module_indicator = self.common_js_module_indicator;
         result.is_declaration_file = is_declaration_file;
         result.contains_non_ascii = self.scanner.contains_non_ascii();
@@ -644,7 +713,8 @@ impl Parser {
         if !self.is_javascript() {
             result.has_lazy_js_doc = true;
         }
-        self.reparsed_clones.sort_by(|a, b| compare_node_positions(*a, *b).cmp(&0));
+        self.reparsed_clones
+            .sort_by(|a, b| compare_node_positions(*a, *b).cmp(&0));
         result.reparsed_clones = self.reparsed_clones.clone();
         set_external_module_indicator(result, self.opts.external_module_indicator_options);
     }
@@ -672,7 +742,9 @@ impl Parser {
         // into the statement list before this statement, so account for them when recording the
         // statement's index for possibleAwaitSpans.
         let i = i + self.reparse_list.len() as i32;
-        if self.statement_has_await_identifier && !statement.flags().intersects(NodeFlags::AWAIT_CONTEXT) {
+        if self.statement_has_await_identifier
+            && !statement.flags().intersects(NodeFlags::AWAIT_CONTEXT)
+        {
             if self.possible_await_spans.last() != Some(&i) {
                 self.possible_await_spans.push(i);
                 self.possible_await_spans.push(i + 1);
@@ -690,7 +762,8 @@ impl Parser {
         }
         let source_statements = source_file.statements().nodes().to_vec();
         let mut statements: Vec<Node> = Vec::new();
-        let saved_parse_diagnostics = std::mem::take(&mut self.diagnostics.borrow_mut().diagnostics);
+        let saved_parse_diagnostics =
+            std::mem::take(&mut self.diagnostics.borrow_mut().diagnostics);
 
         let mut after_await_statement: usize = 0;
         let mut i = 0;
@@ -699,18 +772,28 @@ impl Parser {
             // append all non-await statements between afterAwaitStatement and nextAwaitStatement
             let prev_statement = source_statements[after_await_statement];
             let next_statement = source_statements[next_await_statement];
-            statements.extend_from_slice(&source_statements[after_await_statement..next_await_statement]);
+            statements
+                .extend_from_slice(&source_statements[after_await_statement..next_await_statement]);
 
             // append all diagnostics associated with the copied range
-            let diagnostic_start = saved_parse_diagnostics.iter().position(|d| d.pos >= prev_statement.pos());
+            let diagnostic_start = saved_parse_diagnostics
+                .iter()
+                .position(|d| d.pos >= prev_statement.pos());
             if let Some(diagnostic_start) = diagnostic_start {
-                let diagnostic_end =
-                    saved_parse_diagnostics[diagnostic_start..].iter().position(|d| d.pos >= next_statement.pos());
+                let diagnostic_end = saved_parse_diagnostics[diagnostic_start..]
+                    .iter()
+                    .position(|d| d.pos >= next_statement.pos());
                 let slice = match diagnostic_end {
-                    Some(diagnostic_end) => &saved_parse_diagnostics[diagnostic_start..diagnostic_start + diagnostic_end],
+                    Some(diagnostic_end) => {
+                        &saved_parse_diagnostics
+                            [diagnostic_start..diagnostic_start + diagnostic_end]
+                    }
                     None => &saved_parse_diagnostics[diagnostic_start..],
                 };
-                self.diagnostics.borrow_mut().diagnostics.extend_from_slice(slice);
+                self.diagnostics
+                    .borrow_mut()
+                    .diagnostics
+                    .extend_from_slice(slice);
             }
 
             let mut state = self.mark();
@@ -757,15 +840,25 @@ impl Parser {
             statements.extend_from_slice(&source_statements[after_await_statement..]);
 
             // append all diagnostics associated with the copied range
-            let diagnostic_start = saved_parse_diagnostics.iter().position(|d| d.pos >= prev_statement.pos());
+            let diagnostic_start = saved_parse_diagnostics
+                .iter()
+                .position(|d| d.pos >= prev_statement.pos());
             if let Some(diagnostic_start) = diagnostic_start {
-                self.diagnostics.borrow_mut().diagnostics.extend_from_slice(&saved_parse_diagnostics[diagnostic_start..]);
+                self.diagnostics
+                    .borrow_mut()
+                    .diagnostics
+                    .extend_from_slice(&saved_parse_diagnostics[diagnostic_start..]);
             }
         }
 
         let loc = source_file.statements().loc();
         let list = self.new_node_list(loc, &statements);
-        let result = self.factory.new_parsed_source_file(source_file.parse_options(), self.source_text, list, source_file.end_of_file_token);
+        let result = self.factory.new_parsed_source_file(
+            source_file.parse_options(),
+            self.source_text,
+            list,
+            source_file.end_of_file_token,
+        );
         for s in statements {
             set_node_parent(s, result); // force (re)set parent to reparsed source file
         }
@@ -773,7 +866,11 @@ impl Parser {
     }
 
     // Go: parser.go:615 parseListIndex
-    pub fn parse_list_index(&mut self, kind: ParsingContext, mut parse_element: impl FnMut(&mut Parser, i32) -> Node) -> Vec<Node> {
+    pub fn parse_list_index(
+        &mut self,
+        kind: ParsingContext,
+        mut parse_element: impl FnMut(&mut Parser, i32) -> Node,
+    ) -> Vec<Node> {
         let save_parsing_contexts = self.parsing_contexts;
         self.parsing_contexts |= 1 << (kind as i32);
         let mut outer_reparse_list = std::mem::take(&mut self.reparse_list);
@@ -807,7 +904,11 @@ impl Parser {
     }
 
     // Go: parser.go:647 parseList
-    pub fn parse_list(&mut self, kind: ParsingContext, mut parse_element: impl FnMut(&mut Parser) -> Node) -> NodeList {
+    pub fn parse_list(
+        &mut self,
+        kind: ParsingContext,
+        mut parse_element: impl FnMut(&mut Parser) -> Node,
+    ) -> NodeList {
         let pos = self.node_pos();
         let nodes = self.parse_list_index(kind, |p: &mut Parser, _: i32| parse_element(p));
         let end = self.node_pos();
@@ -816,7 +917,11 @@ impl Parser {
 
     // Go: parser.go:654 parseDelimitedList
     /// Return a non-nil (but possibly empty) list if parsing was successful, or nil if parseElement returned nil
-    pub fn parse_delimited_list(&mut self, kind: ParsingContext, mut parse_element: impl FnMut(&mut Parser) -> Node) -> NodeList {
+    pub fn parse_delimited_list(
+        &mut self,
+        kind: ParsingContext,
+        mut parse_element: impl FnMut(&mut Parser) -> Node,
+    ) -> NodeList {
         let pos = self.node_pos();
         let save_parsing_contexts = self.parsing_contexts;
         self.parsing_contexts |= 1 << (kind as i32);
@@ -841,7 +946,10 @@ impl Parser {
                 // We didn't get a comma, and the list wasn't terminated, explicitly parse
                 // out a comma so we give a good error message.
                 if self.token != SyntaxKind::CommaToken && kind == ParsingContext::EnumMembers {
-                    self.parse_error_at_current_token(diag::An_enum_member_name_must_be_followed_by_a_or, args![]);
+                    self.parse_error_at_current_token(
+                        diag::An_enum_member_name_must_be_followed_by_a_or,
+                        args![],
+                    );
                 } else {
                     self.parse_expected(SyntaxKind::CommaToken);
                 }
@@ -850,7 +958,8 @@ impl Parser {
                 // parse errors.  For example, this can happen when people do things like use
                 // a semicolon to delimit object literal members.   Note: we'll have already
                 // reported an error when we called parseExpected above.
-                if (kind == ParsingContext::ObjectLiteralMembers || kind == ParsingContext::ImportAttributes)
+                if (kind == ParsingContext::ObjectLiteralMembers
+                    || kind == ParsingContext::ImportAttributes)
                     && self.token == SyntaxKind::SemicolonToken
                     && !self.has_preceding_line_break()
                 {
@@ -908,9 +1017,15 @@ impl Parser {
         let result = self.parse_empty_node_list();
         match result.list {
             Some(l) => {
-                let marked: &'static ts_ast::NodeList =
-                    Box::leak(Box::new(ts_ast::NodeList { range: l.range, nodes: Vec::new(), has_trailing_comma: true }));
-                NodeList { file: result.file, list: Some(marked) }
+                let marked: &'static ts_ast::NodeList = Box::leak(Box::new(ts_ast::NodeList {
+                    range: l.range,
+                    nodes: Vec::new(),
+                    has_trailing_comma: true,
+                }));
+                NodeList {
+                    file: result.file,
+                    list: Some(marked),
+                }
             }
             None => result,
         }
@@ -935,7 +1050,8 @@ impl Parser {
         assert!(self.parsing_contexts != 0, "Missing parsing context");
         for kind in ParsingContext::ALL {
             if self.parsing_contexts & (1 << (kind as i32)) != 0
-                && (self.is_list_element(kind, true /*inErrorRecovery*/) || self.is_list_terminator(kind))
+                && (self.is_list_element(kind, true /*inErrorRecovery*/)
+                    || self.is_list_terminator(kind))
             {
                 return true;
             }
@@ -951,7 +1067,10 @@ impl Parser {
                 if self.token == SyntaxKind::DefaultKeyword {
                     self.parse_error_at_current_token(diag::X_0_expected, args!["export"]);
                 } else {
-                    self.parse_error_at_current_token(diag::Declaration_or_statement_expected, args![]);
+                    self.parse_error_at_current_token(
+                        diag::Declaration_or_statement_expected,
+                        args![],
+                    );
                 }
             }
             PC::BlockStatements => {
@@ -989,10 +1108,16 @@ impl Parser {
                 }
             }
             PC::ObjectBindingElements => {
-                self.parse_error_at_current_token(diag::Property_destructuring_pattern_expected, args![]);
+                self.parse_error_at_current_token(
+                    diag::Property_destructuring_pattern_expected,
+                    args![],
+                );
             }
             PC::ArrayBindingElements => {
-                self.parse_error_at_current_token(diag::Array_element_destructuring_pattern_expected, args![]);
+                self.parse_error_at_current_token(
+                    diag::Array_element_destructuring_pattern_expected,
+                    args![],
+                );
             }
             PC::ArgumentExpressions => {
                 self.parse_error_at_current_token(diag::Argument_expression_expected, args![]);
@@ -1013,11 +1138,17 @@ impl Parser {
                         args![token_to_string(self.token)],
                     );
                 } else {
-                    self.parse_error_at_current_token(diag::Parameter_declaration_expected, args![]);
+                    self.parse_error_at_current_token(
+                        diag::Parameter_declaration_expected,
+                        args![],
+                    );
                 }
             }
             PC::TypeParameters => {
-                self.parse_error_at_current_token(diag::Type_parameter_declaration_expected, args![]);
+                self.parse_error_at_current_token(
+                    diag::Type_parameter_declaration_expected,
+                    args![],
+                );
             }
             PC::TypeArguments => {
                 self.parse_error_at_current_token(diag::Type_argument_expected, args![]);
@@ -1039,14 +1170,21 @@ impl Parser {
                 self.parse_error_at_current_token(diag::Identifier_expected, args![]);
             }
             PC::ImportAttributes => {
-                self.parse_error_at_current_token(diag::Identifier_or_string_literal_expected, args![]);
+                self.parse_error_at_current_token(
+                    diag::Identifier_or_string_literal_expected,
+                    args![],
+                );
             }
             PC::Count => panic!("Unhandled case in parsingContextErrors"),
         }
     }
 
     // Go: parser.go:826 isListElement
-    pub fn is_list_element(&mut self, parsing_context: ParsingContext, in_error_recovery: bool) -> bool {
+    pub fn is_list_element(
+        &mut self,
+        parsing_context: ParsingContext,
+        in_error_recovery: bool,
+    ) -> bool {
         use ParsingContext as PC;
         match parsing_context {
             PC::SourceElements | PC::BlockStatements | PC::SwitchClauseStatements => {
@@ -1056,9 +1194,12 @@ impl Parser {
                 // we're parsing.  For example, if we have a semicolon in the middle of a class, then
                 // we really don't want to assume the class is over and we're on a statement in the
                 // outer module.  We just want to consume and move on.
-                !(self.token == SyntaxKind::SemicolonToken && in_error_recovery) && self.is_start_of_statement()
+                !(self.token == SyntaxKind::SemicolonToken && in_error_recovery)
+                    && self.is_start_of_statement()
             }
-            PC::SwitchClauses => self.token == SyntaxKind::CaseKeyword || self.token == SyntaxKind::DefaultKeyword,
+            PC::SwitchClauses => {
+                self.token == SyntaxKind::CaseKeyword || self.token == SyntaxKind::DefaultKeyword
+            }
             PC::TypeMembers => self.look_ahead(Parser::scan_type_member_start),
             PC::ClassMembers => {
                 // We allow semicolons as class elements (as specified by ES6) as long as we're
@@ -1103,14 +1244,18 @@ impl Parser {
                 // element during recovery.
                 self.is_identifier() && !self.is_heritage_clause_extends_or_implements_keyword()
             }
-            PC::VariableDeclarations => self.is_binding_identifier_or_private_identifier_or_pattern(),
+            PC::VariableDeclarations => {
+                self.is_binding_identifier_or_private_identifier_or_pattern()
+            }
             PC::ArrayBindingElements => {
                 self.token == SyntaxKind::CommaToken
                     || self.token == SyntaxKind::DotDotDotToken
                     || self.is_binding_identifier_or_private_identifier_or_pattern()
             }
             PC::TypeParameters => {
-                self.token == SyntaxKind::InKeyword || self.token == SyntaxKind::ConstKeyword || self.is_identifier()
+                self.token == SyntaxKind::InKeyword
+                    || self.token == SyntaxKind::ConstKeyword
+                    || self.is_identifier()
             }
             PC::ArrayLiteralMembers | PC::ArgumentExpressions => {
                 // Not an array literal member, but don't want to close the array (see `tests/cases/fourslash/completionsDotInArrayLiteralInObjectLiteral.ts`)
@@ -1125,13 +1270,16 @@ impl Parser {
             PC::Parameters => self.is_start_of_parameter(false /*isJSDocParameter*/),
             PC::JsDocParameters => self.is_start_of_parameter(true /*isJSDocParameter*/),
             PC::TypeArguments | PC::TupleElementTypes => {
-                self.token == SyntaxKind::CommaToken || self.is_start_of_type(false /*inStartOfParameter*/)
+                self.token == SyntaxKind::CommaToken
+                    || self.is_start_of_type(false /*inStartOfParameter*/)
             }
             PC::HeritageClauses => self.is_heritage_clause(),
             PC::ImportOrExportSpecifiers => {
                 // bail out if the next token is [FromKeyword StringLiteral].
                 // That means we're in something like `import { from "mod"`. Stop here can give better error message.
-                if self.token == SyntaxKind::FromKeyword && self.look_ahead(Parser::next_token_is_token_string_literal) {
+                if self.token == SyntaxKind::FromKeyword
+                    && self.look_ahead(Parser::next_token_is_token_string_literal)
+                {
                     return false;
                 }
                 if self.token == SyntaxKind::StringLiteral {
@@ -1139,7 +1287,10 @@ impl Parser {
                 }
                 token_is_identifier_or_keyword(self.token)
             }
-            PC::JsxAttributes => token_is_identifier_or_keyword(self.token) || self.token == SyntaxKind::OpenBraceToken,
+            PC::JsxAttributes => {
+                token_is_identifier_or_keyword(self.token)
+                    || self.token == SyntaxKind::OpenBraceToken
+            }
             PC::JsxChildren => true,
             PC::JsDocComment => true,
             PC::Count => panic!("Unhandled case in isListElement"),
@@ -1196,22 +1347,32 @@ impl Parser {
             }
             PC::ArgumentExpressions => {
                 // Tokens other than ')' are here for better error recovery
-                self.token == SyntaxKind::CloseParenToken || self.token == SyntaxKind::SemicolonToken
+                self.token == SyntaxKind::CloseParenToken
+                    || self.token == SyntaxKind::SemicolonToken
             }
             PC::ArrayLiteralMembers | PC::TupleElementTypes | PC::ArrayBindingElements => {
                 self.token == SyntaxKind::CloseBracketToken
             }
             PC::JsDocParameters | PC::Parameters | PC::RestProperties => {
                 // Tokens other than ')' and ']' (the latter for index signatures) are here for better error recovery
-                self.token == SyntaxKind::CloseParenToken || self.token == SyntaxKind::CloseBracketToken /*|| token == ast.KindOpenBraceToken*/
+                self.token == SyntaxKind::CloseParenToken
+                    || self.token == SyntaxKind::CloseBracketToken /*|| token == ast.KindOpenBraceToken*/
             }
             PC::TypeArguments => {
                 // All other tokens should cause the type-argument to terminate except comma token
                 self.token != SyntaxKind::CommaToken
             }
-            PC::HeritageClauses => self.token == SyntaxKind::OpenBraceToken || self.token == SyntaxKind::CloseBraceToken,
-            PC::JsxAttributes => self.token == SyntaxKind::GreaterThanToken || self.token == SyntaxKind::SlashToken,
-            PC::JsxChildren => self.token == SyntaxKind::LessThanToken && self.look_ahead(Parser::next_token_is_slash),
+            PC::HeritageClauses => {
+                self.token == SyntaxKind::OpenBraceToken
+                    || self.token == SyntaxKind::CloseBraceToken
+            }
+            PC::JsxAttributes => {
+                self.token == SyntaxKind::GreaterThanToken || self.token == SyntaxKind::SlashToken
+            }
+            PC::JsxChildren => {
+                self.token == SyntaxKind::LessThanToken
+                    && self.look_ahead(Parser::next_token_is_slash)
+            }
             _ => false,
         }
     }
@@ -1241,7 +1402,8 @@ impl Parser {
             self.next_token();
             return;
         }
-        let last_error = self.parse_error_at_current_token(diag::X_0_expected, args![token_to_string(close_kind)]);
+        let last_error = self
+            .parse_error_at_current_token(diag::X_0_expected, args![token_to_string(close_kind)]);
         if !open_parsed {
             return;
         }
@@ -1356,36 +1518,62 @@ impl Parser {
     pub fn parse_statement(&mut self) -> Node {
         match self.token {
             SyntaxKind::SemicolonToken => return self.parse_empty_statement(),
-            SyntaxKind::OpenBraceToken => return self.parse_block(false /*ignoreMissingOpenBrace*/, None),
+            SyntaxKind::OpenBraceToken => {
+                return self.parse_block(false /*ignoreMissingOpenBrace*/, None);
+            }
             SyntaxKind::VarKeyword => {
                 let (pos, jsdoc) = (self.node_pos(), self.jsdoc_scanner_info());
-                return self.parse_variable_statement(pos, jsdoc, ModifierList::NIL /*modifiers*/);
+                return self.parse_variable_statement(
+                    pos,
+                    jsdoc,
+                    ModifierList::NIL, /*modifiers*/
+                );
             }
             SyntaxKind::LetKeyword => {
                 if self.is_let_declaration() {
                     let (pos, jsdoc) = (self.node_pos(), self.jsdoc_scanner_info());
-                    return self.parse_variable_statement(pos, jsdoc, ModifierList::NIL /*modifiers*/);
+                    return self.parse_variable_statement(
+                        pos,
+                        jsdoc,
+                        ModifierList::NIL, /*modifiers*/
+                    );
                 }
             }
             SyntaxKind::AwaitKeyword => {
                 if self.is_await_using_declaration() {
                     let (pos, jsdoc) = (self.node_pos(), self.jsdoc_scanner_info());
-                    return self.parse_variable_statement(pos, jsdoc, ModifierList::NIL /*modifiers*/);
+                    return self.parse_variable_statement(
+                        pos,
+                        jsdoc,
+                        ModifierList::NIL, /*modifiers*/
+                    );
                 }
             }
             SyntaxKind::UsingKeyword => {
                 if self.is_using_declaration() {
                     let (pos, jsdoc) = (self.node_pos(), self.jsdoc_scanner_info());
-                    return self.parse_variable_statement(pos, jsdoc, ModifierList::NIL /*modifiers*/);
+                    return self.parse_variable_statement(
+                        pos,
+                        jsdoc,
+                        ModifierList::NIL, /*modifiers*/
+                    );
                 }
             }
             SyntaxKind::FunctionKeyword => {
                 let (pos, jsdoc) = (self.node_pos(), self.jsdoc_scanner_info());
-                return self.parse_function_declaration(pos, jsdoc, ModifierList::NIL /*modifiers*/);
+                return self.parse_function_declaration(
+                    pos,
+                    jsdoc,
+                    ModifierList::NIL, /*modifiers*/
+                );
             }
             SyntaxKind::ClassKeyword => {
                 let (pos, jsdoc) = (self.node_pos(), self.jsdoc_scanner_info());
-                return self.parse_class_declaration(pos, jsdoc, ModifierList::NIL /*modifiers*/);
+                return self.parse_class_declaration(
+                    pos,
+                    jsdoc,
+                    ModifierList::NIL, /*modifiers*/
+                );
             }
             SyntaxKind::IfKeyword => return self.parse_if_statement(),
             SyntaxKind::DoKeyword => return self.parse_do_statement(),
@@ -1437,7 +1625,7 @@ impl Parser {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
         let modifiers = self.parse_modifiers_ex(
-            true, /*allowDecorators*/
+            true,  /*allowDecorators*/
             false, /*permitConstAsModifier*/
             false, /*stopOnStartOfClassStaticBlock*/
         );
@@ -1462,9 +1650,17 @@ impl Parser {
     }
 
     // Go: parser.go:1153 parseDeclarationWorker
-    pub fn parse_declaration_worker(&mut self, pos: i32, jsdoc: JsdocScannerInfo, modifiers: ModifierList) -> Node {
+    pub fn parse_declaration_worker(
+        &mut self,
+        pos: i32,
+        jsdoc: JsdocScannerInfo,
+        modifiers: ModifierList,
+    ) -> Node {
         match self.token {
-            SyntaxKind::VarKeyword | SyntaxKind::LetKeyword | SyntaxKind::ConstKeyword | SyntaxKind::UsingKeyword => {
+            SyntaxKind::VarKeyword
+            | SyntaxKind::LetKeyword
+            | SyntaxKind::ConstKeyword
+            | SyntaxKind::UsingKeyword => {
                 return self.parse_variable_statement(pos, jsdoc, modifiers);
             }
             SyntaxKind::AwaitKeyword => {
@@ -1472,16 +1668,25 @@ impl Parser {
                     return self.parse_variable_statement(pos, jsdoc, modifiers);
                 }
             }
-            SyntaxKind::FunctionKeyword => return self.parse_function_declaration(pos, jsdoc, modifiers),
+            SyntaxKind::FunctionKeyword => {
+                return self.parse_function_declaration(pos, jsdoc, modifiers);
+            }
             SyntaxKind::ClassKeyword => return self.parse_class_declaration(pos, jsdoc, modifiers),
-            SyntaxKind::InterfaceKeyword => return self.parse_interface_declaration(pos, jsdoc, modifiers),
-            SyntaxKind::TypeKeyword => return self.parse_type_alias_declaration(pos, jsdoc, modifiers),
+            SyntaxKind::InterfaceKeyword => {
+                return self.parse_interface_declaration(pos, jsdoc, modifiers);
+            }
+            SyntaxKind::TypeKeyword => {
+                return self.parse_type_alias_declaration(pos, jsdoc, modifiers);
+            }
             SyntaxKind::EnumKeyword => return self.parse_enum_declaration(pos, jsdoc, modifiers),
-            SyntaxKind::GlobalKeyword | SyntaxKind::ModuleKeyword | SyntaxKind::NamespaceKeyword => {
+            SyntaxKind::GlobalKeyword
+            | SyntaxKind::ModuleKeyword
+            | SyntaxKind::NamespaceKeyword => {
                 return self.parse_module_declaration(pos, jsdoc, modifiers);
             }
             SyntaxKind::ImportKeyword => {
-                return self.parse_import_declaration_or_import_equals_declaration(pos, jsdoc, modifiers);
+                return self
+                    .parse_import_declaration_or_import_equals_declaration(pos, jsdoc, modifiers);
             }
             SyntaxKind::ExportKeyword => {
                 self.next_token();
@@ -1489,7 +1694,9 @@ impl Parser {
                     SyntaxKind::DefaultKeyword | SyntaxKind::EqualsToken => {
                         self.parse_export_assignment(pos, jsdoc, modifiers)
                     }
-                    SyntaxKind::AsKeyword => self.parse_namespace_export_declaration(pos, jsdoc, modifiers),
+                    SyntaxKind::AsKeyword => {
+                        self.parse_namespace_export_declaration(pos, jsdoc, modifiers)
+                    }
                     _ => self.parse_export_declaration(pos, jsdoc, modifiers),
                 };
             }
@@ -1516,7 +1723,9 @@ impl Parser {
     // Go: parser.go:1205 nextTokenIsBindingIdentifierOrStartOfDestructuring
     pub fn next_token_is_binding_identifier_or_start_of_destructuring(&mut self) -> bool {
         self.next_token();
-        self.is_binding_identifier() || self.token == SyntaxKind::OpenBraceToken || self.token == SyntaxKind::OpenBracketToken
+        self.is_binding_identifier()
+            || self.token == SyntaxKind::OpenBraceToken
+            || self.token == SyntaxKind::OpenBracketToken
     }
 
     // Go: parser.go:1210 parseBlock
@@ -1528,12 +1737,16 @@ impl Parser {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
         let open_brace_position = self.scanner.token_start();
-        let open_brace_parsed =
-            self.parse_expected_with_diagnostic(SyntaxKind::OpenBraceToken, diagnostic_message, true /*shouldAdvance*/);
+        let open_brace_parsed = self.parse_expected_with_diagnostic(
+            SyntaxKind::OpenBraceToken,
+            diagnostic_message,
+            true, /*shouldAdvance*/
+        );
         let mut multiline = false;
         if open_brace_parsed || ignore_missing_open_brace {
             multiline = self.has_preceding_line_break();
-            let statements = self.parse_list(ParsingContext::BlockStatements, Parser::parse_statement);
+            let statements =
+                self.parse_list(ParsingContext::BlockStatements, Parser::parse_statement);
             self.parse_expected_matching_brackets(
                 SyntaxKind::OpenBraceToken,
                 SyntaxKind::CloseBraceToken,
@@ -1586,7 +1799,9 @@ impl Parser {
         if self.parse_optional(SyntaxKind::ElseKeyword) {
             else_statement = self.parse_statement();
         }
-        let statement = self.factory.new_if_statement(expression, then_statement, else_statement);
+        let statement = self
+            .factory
+            .new_if_statement(expression, then_statement, else_statement);
         let result = self.finish_node(statement, pos);
         self.with_js_doc(result, jsdoc);
         result
@@ -1667,8 +1882,12 @@ impl Parser {
         if await_token.is_some() && self.parse_expected(SyntaxKind::OfKeyword)
             || await_token.is_nil() && self.parse_optional(SyntaxKind::OfKeyword)
         {
-            let expression =
-                do_in_context(self, NodeFlags::DISALLOW_IN_CONTEXT, false, Parser::parse_assignment_expression_or_higher);
+            let expression = do_in_context(
+                self,
+                NodeFlags::DISALLOW_IN_CONTEXT,
+                false,
+                Parser::parse_assignment_expression_or_higher,
+            );
             self.parse_expected(SyntaxKind::CloseParenToken);
             let statement = self.parse_statement();
             result = self.factory.new_for_in_or_of_statement(
@@ -1692,7 +1911,8 @@ impl Parser {
         } else {
             self.parse_expected(SyntaxKind::SemicolonToken);
             let mut condition = Node::NIL;
-            if self.token != SyntaxKind::SemicolonToken && self.token != SyntaxKind::CloseParenToken {
+            if self.token != SyntaxKind::SemicolonToken && self.token != SyntaxKind::CloseParenToken
+            {
                 condition = self.parse_expression_allow_in();
             }
             self.parse_expected(SyntaxKind::SemicolonToken);
@@ -1702,7 +1922,9 @@ impl Parser {
             }
             self.parse_expected(SyntaxKind::CloseParenToken);
             let statement = self.parse_statement();
-            result = self.factory.new_for_statement(initializer, condition, incrementor, statement);
+            result = self
+                .factory
+                .new_for_statement(initializer, condition, incrementor, statement);
         }
         let result = self.finish_node(result, pos);
         self.with_js_doc(result, jsdoc);
@@ -1773,7 +1995,12 @@ impl Parser {
             open_paren_parsed,
             open_paren_position,
         );
-        let statement = do_in_context(self, NodeFlags::IN_WITH_STATEMENT, true, Parser::parse_statement);
+        let statement = do_in_context(
+            self,
+            NodeFlags::IN_WITH_STATEMENT,
+            true,
+            Parser::parse_statement,
+        );
         let node = self.factory.new_with_statement(expression, statement);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
@@ -1787,8 +2014,13 @@ impl Parser {
         self.parse_expected(SyntaxKind::CaseKeyword);
         let expression = self.parse_expression_allow_in();
         self.parse_expected(SyntaxKind::ColonToken);
-        let statements = self.parse_list(ParsingContext::SwitchClauseStatements, Parser::parse_statement);
-        let node = self.factory.new_case_or_default_clause(SyntaxKind::CaseClause, expression, statements);
+        let statements = self.parse_list(
+            ParsingContext::SwitchClauseStatements,
+            Parser::parse_statement,
+        );
+        let node =
+            self.factory
+                .new_case_or_default_clause(SyntaxKind::CaseClause, expression, statements);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         result
@@ -1805,7 +2037,9 @@ fn scan_error(
     length: i32,
     args: Vec<String>,
 ) {
-    diagnostics.borrow_mut().parse_error_at_range(TextRange::new(pos, pos + length), message, args);
+    diagnostics
+        .borrow_mut()
+        .parse_error_at_range(TextRange::new(pos, pos + length), message, args);
 }
 
 // Go: parser.go:229 getErrorSpanForNode

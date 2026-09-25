@@ -63,9 +63,15 @@ pub static LIB_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
         ("dom.iterable", "lib.dom.iterable.d.ts"),
         ("dom.asynciterable", "lib.dom.asynciterable.d.ts"),
         ("webworker", "lib.webworker.d.ts"),
-        ("webworker.importscripts", "lib.webworker.importscripts.d.ts"),
+        (
+            "webworker.importscripts",
+            "lib.webworker.importscripts.d.ts",
+        ),
         ("webworker.iterable", "lib.webworker.iterable.d.ts"),
-        ("webworker.asynciterable", "lib.webworker.asynciterable.d.ts"),
+        (
+            "webworker.asynciterable",
+            "lib.webworker.asynciterable.d.ts",
+        ),
         ("scripthost", "lib.scripthost.d.ts"),
         // ES2015 and later By-feature options
         ("es2015.core", "lib.es2015.core.d.ts"),
@@ -76,7 +82,10 @@ pub static LIB_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
         ("es2015.proxy", "lib.es2015.proxy.d.ts"),
         ("es2015.reflect", "lib.es2015.reflect.d.ts"),
         ("es2015.symbol", "lib.es2015.symbol.d.ts"),
-        ("es2015.symbol.wellknown", "lib.es2015.symbol.wellknown.d.ts"),
+        (
+            "es2015.symbol.wellknown",
+            "lib.es2015.symbol.wellknown.d.ts",
+        ),
         ("es2016.array.include", "lib.es2016.array.include.d.ts"),
         ("es2016.intl", "lib.es2016.intl.d.ts"),
         ("es2017.arraybuffer", "lib.es2017.arraybuffer.d.ts"),
@@ -101,7 +110,10 @@ pub static LIB_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
         ("es2020.promise", "lib.es2020.promise.d.ts"),
         ("es2020.sharedmemory", "lib.es2020.sharedmemory.d.ts"),
         ("es2020.string", "lib.es2020.string.d.ts"),
-        ("es2020.symbol.wellknown", "lib.es2020.symbol.wellknown.d.ts"),
+        (
+            "es2020.symbol.wellknown",
+            "lib.es2020.symbol.wellknown.d.ts",
+        ),
         ("es2020.intl", "lib.es2020.intl.d.ts"),
         ("es2020.number", "lib.es2020.number.d.ts"),
         ("es2021.promise", "lib.es2021.promise.d.ts"),
@@ -195,7 +207,10 @@ pub fn get_lib_file_name(lib_name: &str) -> (String, bool) {
 
 /// Builds an enum map from `(key, value)` pairs in Go order.
 fn enum_map(entries: Vec<(&str, CompilerOptionsValue)>) -> CommandLineOptionEnumMap {
-    entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    entries
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
 }
 
 // Go: tsoptions/enummaps.go:145 moduleResolutionOptionMap
@@ -278,7 +293,10 @@ pub static JSX_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(||
 // Go: tsoptions/enummaps.go:202 newLineOptionMap
 pub static NEW_LINE_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
     use CompilerOptionsValue::NewLineKind as V;
-    enum_map(vec![("crlf", V(NewLineKind::CRLF)), ("lf", V(NewLineKind::LF))])
+    enum_map(vec![
+        ("crlf", V(NewLineKind::CRLF)),
+        ("lf", V(NewLineKind::LF)),
+    ])
 });
 
 // Go: tsoptions/enummaps.go:207 targetToLibMap
@@ -297,7 +315,10 @@ pub static TARGET_TO_LIB_MAP: LazyLock<FxHashMap<ScriptTarget, String>> = LazyLo
         (ScriptTarget::ES2016, "lib.es2016.full.d.ts"),
         (ScriptTarget::ES2015, "lib.es6.d.ts"), // We don't use lib.es2015.full.d.ts due to breaking change.
     ];
-    entries.into_iter().map(|(t, s)| (t, s.to_string())).collect()
+    entries
+        .into_iter()
+        .map(|(t, s)| (t, s.to_string()))
+        .collect()
 });
 
 // Go: tsoptions/enummaps.go:222 TargetToLibMap
@@ -319,12 +340,27 @@ pub fn get_default_lib_file_name(options: &CompilerOptions) -> String {
 pub static WATCH_FILE_ENUM_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
     use CompilerOptionsValue::WatchFileKind as V;
     enum_map(vec![
-        ("fixedpollinginterval", V(WatchFileKind::FIXED_POLLING_INTERVAL)),
-        ("prioritypollinginterval", V(WatchFileKind::PRIORITY_POLLING_INTERVAL)),
-        ("dynamicprioritypolling", V(WatchFileKind::DYNAMIC_PRIORITY_POLLING)),
-        ("fixedchunksizepolling", V(WatchFileKind::FIXED_CHUNK_SIZE_POLLING)),
+        (
+            "fixedpollinginterval",
+            V(WatchFileKind::FIXED_POLLING_INTERVAL),
+        ),
+        (
+            "prioritypollinginterval",
+            V(WatchFileKind::PRIORITY_POLLING_INTERVAL),
+        ),
+        (
+            "dynamicprioritypolling",
+            V(WatchFileKind::DYNAMIC_PRIORITY_POLLING),
+        ),
+        (
+            "fixedchunksizepolling",
+            V(WatchFileKind::FIXED_CHUNK_SIZE_POLLING),
+        ),
         ("usefsevents", V(WatchFileKind::USE_FS_EVENTS)),
-        ("usefseventsonparentdirectory", V(WatchFileKind::USE_FS_EVENTS_ON_PARENT_DIRECTORY)),
+        (
+            "usefseventsonparentdirectory",
+            V(WatchFileKind::USE_FS_EVENTS_ON_PARENT_DIRECTORY),
+        ),
     ])
 });
 
@@ -333,9 +369,18 @@ pub static WATCH_DIRECTORY_ENUM_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLo
     use CompilerOptionsValue::WatchDirectoryKind as V;
     enum_map(vec![
         ("usefsevents", V(WatchDirectoryKind::USE_FS_EVENTS)),
-        ("fixedpollinginterval", V(WatchDirectoryKind::FIXED_POLLING_INTERVAL)),
-        ("dynamicprioritypolling", V(WatchDirectoryKind::DYNAMIC_PRIORITY_POLLING)),
-        ("fixedchunksizepolling", V(WatchDirectoryKind::FIXED_CHUNK_SIZE_POLLING)),
+        (
+            "fixedpollinginterval",
+            V(WatchDirectoryKind::FIXED_POLLING_INTERVAL),
+        ),
+        (
+            "dynamicprioritypolling",
+            V(WatchDirectoryKind::DYNAMIC_PRIORITY_POLLING),
+        ),
+        (
+            "fixedchunksizepolling",
+            V(WatchDirectoryKind::FIXED_CHUNK_SIZE_POLLING),
+        ),
     ])
 });
 

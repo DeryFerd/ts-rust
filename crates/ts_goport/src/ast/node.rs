@@ -67,17 +67,26 @@ fn req(file: usize, id: ts_ast::NodeId) -> Node {
 
 /// A required list.
 fn list(file: usize, l: &'static ts_ast::NodeList) -> NodeList {
-    NodeList { file: file as u32, list: Some(l) }
+    NodeList {
+        file: file as u32,
+        list: Some(l),
+    }
 }
 
 /// An optional list. `None` is Go `nil`.
 fn opt_list(file: usize, l: &'static Option<ts_ast::NodeList>) -> NodeList {
-    NodeList { file: file as u32, list: l.as_ref() }
+    NodeList {
+        file: file as u32,
+        list: l.as_ref(),
+    }
 }
 
 /// An optional modifier list. `None` is Go `nil`.
 fn mods(file: usize, m: &'static Option<ts_ast::ModifierList>) -> ModifierList {
-    ModifierList { file: file as u32, list: m.as_ref() }
+    ModifierList {
+        file: file as u32,
+        list: m.as_ref(),
+    }
 }
 
 /// Matches `n`'s data against the listed `NodeData` variants. Each variant
@@ -286,13 +295,20 @@ fn go_kind(file: usize, id: ts_ast::NodeId, n: &ts_ast::Node) -> SyntaxKind {
             let is_expression = match &parent.data {
                 NodeData::ExpressionWithTypeArguments(d) => d.expression == id,
                 NodeData::QualifiedName(d) => {
-                    d.left == id && go_kind(file, parent_id, parent) == SyntaxKind::PropertyAccessExpression
+                    d.left == id
+                        && go_kind(file, parent_id, parent) == SyntaxKind::PropertyAccessExpression
                 }
                 _ => false,
             };
-            if is_expression { SyntaxKind::PropertyAccessExpression } else { n.kind }
+            if is_expression {
+                SyntaxKind::PropertyAccessExpression
+            } else {
+                n.kind
+            }
         }
-        SyntaxKind::OmittedExpression if parent.kind == SyntaxKind::ArrayBindingPattern => SyntaxKind::BindingElement,
+        SyntaxKind::OmittedExpression if parent.kind == SyntaxKind::ArrayBindingPattern => {
+            SyntaxKind::BindingElement
+        }
         k => k,
     }
 }
@@ -312,18 +328,30 @@ pub struct NodeSlice {
 
 impl NodeSlice {
     /// Go `nil`.
-    pub const NIL: Self = Self { file: 0, ids: &[], nodes: &[] };
+    pub const NIL: Self = Self {
+        file: 0,
+        ids: &[],
+        nodes: &[],
+    };
 
     /// A slice over ts_ast ids in `file`.
     #[must_use]
     pub fn from_ids(file: usize, ids: &'static [ts_ast::NodeId]) -> Self {
-        Self { file: file as u32, ids, nodes: &[] }
+        Self {
+            file: file as u32,
+            ids,
+            nodes: &[],
+        }
     }
 
     /// A slice over nodes that live for the program.
     #[must_use]
     pub fn from_nodes(nodes: &'static [Node]) -> Self {
-        Self { file: 0, ids: &[], nodes }
+        Self {
+            file: 0,
+            ids: &[],
+            nodes,
+        }
     }
 
     #[must_use]
@@ -348,17 +376,29 @@ impl NodeSlice {
 
     #[must_use]
     pub fn first(self) -> Option<Node> {
-        if self.is_empty() { None } else { Some(self.get(0)) }
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.get(0))
+        }
     }
 
     #[must_use]
     pub fn last(self) -> Option<Node> {
-        if self.is_empty() { None } else { Some(self.get(self.len() - 1)) }
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.get(self.len() - 1))
+        }
     }
 
     #[must_use]
     pub fn iter(self) -> NodeSliceIter {
-        NodeSliceIter { slice: self, front: 0, back: self.len() }
+        NodeSliceIter {
+            slice: self,
+            front: 0,
+            back: self.len(),
+        }
     }
 
     #[must_use]
@@ -449,7 +489,10 @@ impl Eq for NodeList {}
 
 impl NodeList {
     /// Go `nil`.
-    pub const NIL: Self = Self { file: 0, list: None };
+    pub const NIL: Self = Self {
+        file: 0,
+        list: None,
+    };
 
     /// Go `list == nil`. A required ts_ast list field of a store node holds
     /// Go `nil` as a marker list (`store::NIL_LIST_POS`).
@@ -493,9 +536,14 @@ impl NodeList {
         let arena = &file.legacy_source().parse.arena;
         let text = file.legacy_source().source_text.as_bytes();
         let span = |id: &ts_ast::NodeId| {
-            arena.get(*id).map(|n| crate::ast::go_view::go_node_range(&file.info.trivia, text, arena, n))
+            arena
+                .get(*id)
+                .map(|n| crate::ast::go_view::go_node_range(&file.info.trivia, text, arena, n))
         };
-        let elements = match (l.nodes.first().and_then(span), l.nodes.last().and_then(span)) {
+        let elements = match (
+            l.nodes.first().and_then(span),
+            l.nodes.last().and_then(span),
+        ) {
             (Some(first), Some(last)) => Some((first, last)),
             _ => None,
         };
@@ -556,7 +604,10 @@ impl Eq for ModifierList {}
 
 impl ModifierList {
     /// Go `nil`.
-    pub const NIL: Self = Self { file: 0, list: None };
+    pub const NIL: Self = Self {
+        file: 0,
+        list: None,
+    };
 
     #[must_use]
     pub const fn is_nil(self) -> bool {
@@ -571,7 +622,10 @@ impl ModifierList {
     /// Go `modifiers.NodeList`.
     #[must_use]
     pub fn node_list(self) -> NodeList {
-        NodeList { file: self.file, list: self.list.map(|m| &m.list) }
+        NodeList {
+            file: self.file,
+            list: self.list.map(|m| &m.list),
+        }
     }
 
     /// Go `modifiers.Nodes`. Empty when nil.
@@ -673,9 +727,9 @@ impl Node {
             return r.kind;
         }
         match r.kind {
-            SyntaxKind::PropertyDeclaration | SyntaxKind::QualifiedName | SyntaxKind::OmittedExpression => {
-                go_kind(self.file_index(), nid(self), r)
-            }
+            SyntaxKind::PropertyDeclaration
+            | SyntaxKind::QualifiedName
+            | SyntaxKind::OmittedExpression => go_kind(self.file_index(), nid(self), r),
             k => k,
         }
     }
@@ -772,33 +826,105 @@ impl Node {
         {
             return req(self.file_index(), d.right);
         }
-        by_data!(self, |f, d| opt(f, d.name), [
-            BindingElement, ClassDeclaration, ClassExpression, FunctionDeclaration, FunctionExpression,
-            ImportClause, JsDocCallbackTag, JsDocLink, JsDocLinkCode, JsDocLinkPlain, JsDocTypedefTag,
-        ], by_data!(self, |f, d| req(f, d.name), [
-            EnumDeclaration, EnumMember, ExportSpecifier, GetAccessorDeclaration, SetAccessorDeclaration,
-            ImportAttribute, ImportEqualsDeclaration, ImportSpecifier, InterfaceDeclaration,
-            JsDocNameReference, JsDocParameterOrPropertyTag, JsxAttribute, JsxNamespacedName, MetaProperty,
-            MethodDeclaration, MethodSignatureDeclaration, ModuleDeclaration, NamedTupleMember,
-            NamespaceExport, NamespaceExportDeclaration, NamespaceImport, ParameterDeclaration,
-            PropertyAccessExpression, PropertyAssignment, PropertyDeclaration, PropertySignatureDeclaration,
-            ShorthandPropertyAssignment, TypeAliasDeclaration, TypeParameterDeclaration, VariableDeclaration,
-        ], Node::NIL))
+        by_data!(
+            self,
+            |f, d| opt(f, d.name),
+            [
+                BindingElement,
+                ClassDeclaration,
+                ClassExpression,
+                FunctionDeclaration,
+                FunctionExpression,
+                ImportClause,
+                JsDocCallbackTag,
+                JsDocLink,
+                JsDocLinkCode,
+                JsDocLinkPlain,
+                JsDocTypedefTag,
+            ],
+            by_data!(
+                self,
+                |f, d| req(f, d.name),
+                [
+                    EnumDeclaration,
+                    EnumMember,
+                    ExportSpecifier,
+                    GetAccessorDeclaration,
+                    SetAccessorDeclaration,
+                    ImportAttribute,
+                    ImportEqualsDeclaration,
+                    ImportSpecifier,
+                    InterfaceDeclaration,
+                    JsDocNameReference,
+                    JsDocParameterOrPropertyTag,
+                    JsxAttribute,
+                    JsxNamespacedName,
+                    MetaProperty,
+                    MethodDeclaration,
+                    MethodSignatureDeclaration,
+                    ModuleDeclaration,
+                    NamedTupleMember,
+                    NamespaceExport,
+                    NamespaceExportDeclaration,
+                    NamespaceImport,
+                    ParameterDeclaration,
+                    PropertyAccessExpression,
+                    PropertyAssignment,
+                    PropertyDeclaration,
+                    PropertySignatureDeclaration,
+                    ShorthandPropertyAssignment,
+                    TypeAliasDeclaration,
+                    TypeParameterDeclaration,
+                    VariableDeclaration,
+                ],
+                Node::NIL
+            )
+        )
     }
 
     // Go: ast.go:199 Modifiers
     #[must_use]
     pub fn modifiers(self) -> ModifierList {
-        by_data!(self, |f, d| mods(f, &d.modifiers), [
-            ArrowFunction, BinaryExpression, ClassDeclaration, ClassExpression, ClassStaticBlockDeclaration,
-            ConstructorDeclaration, ConstructorTypeNode, EnumDeclaration, EnumMember, ExportAssignment,
-            ExportDeclaration, FunctionDeclaration, FunctionExpression, FunctionTypeNode,
-            GetAccessorDeclaration, SetAccessorDeclaration, ImportDeclaration, ImportEqualsDeclaration,
-            IndexSignatureDeclaration, InterfaceDeclaration, MethodDeclaration, MethodSignatureDeclaration,
-            MissingDeclaration, ModuleDeclaration, NamespaceExportDeclaration, ParameterDeclaration,
-            PropertyAssignment, PropertyDeclaration, PropertySignatureDeclaration,
-            ShorthandPropertyAssignment, TypeAliasDeclaration, TypeParameterDeclaration, VariableStatement,
-        ], ModifierList::NIL)
+        by_data!(
+            self,
+            |f, d| mods(f, &d.modifiers),
+            [
+                ArrowFunction,
+                BinaryExpression,
+                ClassDeclaration,
+                ClassExpression,
+                ClassStaticBlockDeclaration,
+                ConstructorDeclaration,
+                ConstructorTypeNode,
+                EnumDeclaration,
+                EnumMember,
+                ExportAssignment,
+                ExportDeclaration,
+                FunctionDeclaration,
+                FunctionExpression,
+                FunctionTypeNode,
+                GetAccessorDeclaration,
+                SetAccessorDeclaration,
+                ImportDeclaration,
+                ImportEqualsDeclaration,
+                IndexSignatureDeclaration,
+                InterfaceDeclaration,
+                MethodDeclaration,
+                MethodSignatureDeclaration,
+                MissingDeclaration,
+                ModuleDeclaration,
+                NamespaceExportDeclaration,
+                ParameterDeclaration,
+                PropertyAssignment,
+                PropertyDeclaration,
+                PropertySignatureDeclaration,
+                ShorthandPropertyAssignment,
+                TypeAliasDeclaration,
+                TypeParameterDeclaration,
+                VariableStatement,
+            ],
+            ModifierList::NIL
+        )
     }
 
     // Go: ast.go:205 ParameterList
@@ -806,12 +932,27 @@ impl Node {
     // PORT: Go dereferences a nil FunctionLikeData here; we return nil.
     #[must_use]
     pub fn parameter_list(self) -> NodeList {
-        by_data!(self, |f, d| list(f, &d.parameters), [
-            ArrowFunction, CallSignatureDeclaration, ConstructSignatureDeclaration, ConstructorDeclaration,
-            FunctionDeclaration, FunctionExpression, GetAccessorDeclaration, SetAccessorDeclaration,
-            IndexSignatureDeclaration, JsDocSignature, MethodDeclaration, MethodSignatureDeclaration,
-            FunctionTypeNode, ConstructorTypeNode,
-        ], NodeList::NIL)
+        by_data!(
+            self,
+            |f, d| list(f, &d.parameters),
+            [
+                ArrowFunction,
+                CallSignatureDeclaration,
+                ConstructSignatureDeclaration,
+                ConstructorDeclaration,
+                FunctionDeclaration,
+                FunctionExpression,
+                GetAccessorDeclaration,
+                SetAccessorDeclaration,
+                IndexSignatureDeclaration,
+                JsDocSignature,
+                MethodDeclaration,
+                MethodSignatureDeclaration,
+                FunctionTypeNode,
+                ConstructorTypeNode,
+            ],
+            NodeList::NIL
+        )
     }
 
     // Go: ast.go:206 Parameters
@@ -842,7 +983,11 @@ impl Node {
         if let Some(cached) = DECORATORS.with(|c| c.borrow().get(&self).copied()) {
             return NodeSlice::from_nodes(cached);
         }
-        let filtered: Vec<Node> = modifiers.nodes().iter().filter(|&m| is_decorator(m)).collect();
+        let filtered: Vec<Node> = modifiers
+            .nodes()
+            .iter()
+            .filter(|&m| is_decorator(m))
+            .collect();
         let leaked: &'static [Node] = Box::leak(filtered.into_boxed_slice());
         DECORATORS.with(|c| c.borrow_mut().insert(self, leaked));
         NodeSlice::from_nodes(leaked)
@@ -902,8 +1047,10 @@ impl FlowNodeId {
         if self.file_index() == crate::checker::SYNTHETIC_FLOW_FILE {
             return crate::checker::synthetic_flow(self);
         }
-        &prog().files[self.file_index()].flow_nodes.get().expect("flow nodes are not built for this file")
-            [self.local_index()]
+        &prog().files[self.file_index()]
+            .flow_nodes
+            .get()
+            .expect("flow nodes are not built for this file")[self.local_index()]
     }
 }
 
@@ -916,7 +1063,10 @@ pub fn source_file_info(file: Node) -> &'static crate::program::SourceFileInfo {
 /// Go `file.AsSourceFile()` fields that the binder sets.
 #[must_use]
 pub fn file_bind_data(file: Node) -> &'static FileBindData {
-    file.go_file().file_bind.get().expect("source file is not bound")
+    file.go_file()
+        .file_bind
+        .get()
+        .expect("source file is not bound")
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -927,7 +1077,11 @@ pub fn file_bind_data(file: Node) -> &'static FileBindData {
 // PORT: ts_ast stores a required expression id on both clause kinds. Go
 // leaves it nil for `default:`, so the kind decides.
 fn case_expression(n: Node, file: usize, id: ts_ast::NodeId) -> Node {
-    if n.kind() == SyntaxKind::CaseClause { req(file, id) } else { Node::NIL }
+    if n.kind() == SyntaxKind::CaseClause {
+        req(file, id)
+    } else {
+        Node::NIL
+    }
 }
 
 /// Caches a string that Go builds on each call, so `text()` can return
@@ -947,12 +1101,28 @@ impl Node {
     // has no generated accessor.
     #[must_use]
     pub fn body(self) -> Node {
-        by_data!(self, |f, d| opt(f, d.body), [
-            FunctionDeclaration, MethodDeclaration, GetAccessorDeclaration, SetAccessorDeclaration,
-            ConstructorDeclaration, ModuleDeclaration,
-        ], by_data!(self, |f, d| req(f, d.body), [
-            FunctionExpression, ArrowFunction, ClassStaticBlockDeclaration,
-        ], Node::NIL))
+        by_data!(
+            self,
+            |f, d| opt(f, d.body),
+            [
+                FunctionDeclaration,
+                MethodDeclaration,
+                GetAccessorDeclaration,
+                SetAccessorDeclaration,
+                ConstructorDeclaration,
+                ModuleDeclaration,
+            ],
+            by_data!(
+                self,
+                |f, d| req(f, d.body),
+                [
+                    FunctionExpression,
+                    ArrowFunction,
+                    ClassStaticBlockDeclaration,
+                ],
+                Node::NIL
+            )
+        )
     }
 
     // Go: ast.go:261 Text
@@ -974,7 +1144,11 @@ impl Node {
             NodeData::JsxNamespacedName(d) => {
                 let file = self.file_index();
                 joined_text(self, || {
-                    format!("{}:{}", req(file, d.namespace).text(), req(file, d.name).text())
+                    format!(
+                        "{}:{}",
+                        req(file, d.namespace).text(),
+                        req(file, d.name).text()
+                    )
                 })
             }
             NodeData::RegularExpressionLiteral(d) => &d.text,
@@ -1002,18 +1176,55 @@ impl Node {
         {
             return req(self.file_index(), d.left);
         }
-        by_data!(self, |f, d| req(f, d.expression), [
-            PropertyAccessExpression, ElementAccessExpression, ParenthesizedExpression, CallExpression,
-            NewExpression, ExpressionWithTypeArguments, ComputedPropertyName, NonNullExpression,
-            TypeAssertion, AsExpression, SatisfiesExpression, TypeOfExpression, SpreadAssignment,
-            SpreadElement, TemplateSpan, DeleteExpression, VoidExpression, AwaitExpression,
-            PartiallyEmittedExpression, IfStatement, DoStatement, WhileStatement, WithStatement,
-            ForInOrOfStatement, SwitchStatement, ExpressionStatement, ThrowStatement,
-            ExternalModuleReference, ExportAssignment, Decorator, JsxSpreadAttribute,
-            SyntheticReferenceExpression,
-        ], by_data!(self, |f, d| opt(f, d.expression), [
-            YieldExpression, ReturnStatement, JsxExpression, TypeParameterDeclaration,
-        ], Node::NIL))
+        by_data!(
+            self,
+            |f, d| req(f, d.expression),
+            [
+                PropertyAccessExpression,
+                ElementAccessExpression,
+                ParenthesizedExpression,
+                CallExpression,
+                NewExpression,
+                ExpressionWithTypeArguments,
+                ComputedPropertyName,
+                NonNullExpression,
+                TypeAssertion,
+                AsExpression,
+                SatisfiesExpression,
+                TypeOfExpression,
+                SpreadAssignment,
+                SpreadElement,
+                TemplateSpan,
+                DeleteExpression,
+                VoidExpression,
+                AwaitExpression,
+                PartiallyEmittedExpression,
+                IfStatement,
+                DoStatement,
+                WhileStatement,
+                WithStatement,
+                ForInOrOfStatement,
+                SwitchStatement,
+                ExpressionStatement,
+                ThrowStatement,
+                ExternalModuleReference,
+                ExportAssignment,
+                Decorator,
+                JsxSpreadAttribute,
+                SyntheticReferenceExpression,
+            ],
+            by_data!(
+                self,
+                |f, d| opt(f, d.expression),
+                [
+                    YieldExpression,
+                    ReturnStatement,
+                    JsxExpression,
+                    TypeParameterDeclaration,
+                ],
+                Node::NIL
+            )
+        )
     }
 
     // Go: ast.go:375 RawText
@@ -1050,11 +1261,22 @@ impl Node {
     // Go: ast.go:483 TypeArgumentList
     #[must_use]
     pub fn type_argument_list(self) -> NodeList {
-        by_data!(self, |f, d| opt_list(f, &d.type_arguments), [
-            CallExpression, NewExpression, TaggedTemplateExpression, TypeReferenceNode,
-            ExpressionWithTypeArguments, ImportTypeNode, TypeQueryNode, JsxOpeningElement,
-            JsxSelfClosingElement,
-        ], NodeList::NIL)
+        by_data!(
+            self,
+            |f, d| opt_list(f, &d.type_arguments),
+            [
+                CallExpression,
+                NewExpression,
+                TaggedTemplateExpression,
+                TypeReferenceNode,
+                ExpressionWithTypeArguments,
+                ImportTypeNode,
+                TypeQueryNode,
+                JsxOpeningElement,
+                JsxSelfClosingElement,
+            ],
+            NodeList::NIL
+        )
     }
 
     // Go: ast.go:507 TypeArguments
@@ -1069,13 +1291,31 @@ impl Node {
         if let NodeData::JsDocTemplateTag(d) = data(self) {
             return list(self.file_index(), &d.type_parameters);
         }
-        by_data!(self, |f, d| opt_list(f, &d.type_parameters), [
-            ClassDeclaration, ClassExpression, InterfaceDeclaration, TypeAliasDeclaration,
-            ArrowFunction, CallSignatureDeclaration, ConstructSignatureDeclaration, ConstructorDeclaration,
-            FunctionDeclaration, FunctionExpression, GetAccessorDeclaration, SetAccessorDeclaration,
-            IndexSignatureDeclaration, JsDocSignature, MethodDeclaration, MethodSignatureDeclaration,
-            FunctionTypeNode, ConstructorTypeNode,
-        ], NodeList::NIL)
+        by_data!(
+            self,
+            |f, d| opt_list(f, &d.type_parameters),
+            [
+                ClassDeclaration,
+                ClassExpression,
+                InterfaceDeclaration,
+                TypeAliasDeclaration,
+                ArrowFunction,
+                CallSignatureDeclaration,
+                ConstructSignatureDeclaration,
+                ConstructorDeclaration,
+                FunctionDeclaration,
+                FunctionExpression,
+                GetAccessorDeclaration,
+                SetAccessorDeclaration,
+                IndexSignatureDeclaration,
+                JsDocSignature,
+                MethodDeclaration,
+                MethodSignatureDeclaration,
+                FunctionTypeNode,
+                ConstructorTypeNode,
+            ],
+            NodeList::NIL
+        )
     }
 
     // Go: ast.go:536 TypeParameters
@@ -1090,9 +1330,18 @@ impl Node {
         if let NodeData::MappedTypeNode(_) = data(self) {
             return mapped_type_members(self);
         }
-        by_data!(self, |f, d| list(f, &d.members), [
-            ClassDeclaration, ClassExpression, InterfaceDeclaration, EnumDeclaration, TypeLiteralNode,
-        ], NodeList::NIL)
+        by_data!(
+            self,
+            |f, d| list(f, &d.members),
+            [
+                ClassDeclaration,
+                ClassExpression,
+                InterfaceDeclaration,
+                EnumDeclaration,
+                TypeLiteralNode,
+            ],
+            NodeList::NIL
+        )
     }
 
     // Go: ast.go:562 Members
@@ -1104,9 +1353,12 @@ impl Node {
     // Go: ast.go:570 StatementList
     #[must_use]
     pub fn statement_list(self) -> NodeList {
-        by_data!(self, |f, d| list(f, &d.statements), [
-            SourceFile, Block, ModuleBlock, CaseOrDefaultClause,
-        ], NodeList::NIL)
+        by_data!(
+            self,
+            |f, d| list(f, &d.statements),
+            [SourceFile, Block, ModuleBlock, CaseOrDefaultClause,],
+            NodeList::NIL
+        )
     }
 
     // Go: ast.go:584 Statements
@@ -1151,51 +1403,132 @@ impl Node {
             NodeData::IndexSignatureDeclaration(d) => return req(f, d.type_),
             _ => {}
         }
-        by_data!(self, |f, d| opt(f, d.type_), [
-            VariableDeclaration, ParameterDeclaration, PropertyDeclaration, PropertyAssignment,
-            ShorthandPropertyAssignment, TypePredicateNode, MappedTypeNode, ExportAssignment,
-            BinaryExpression,
-            ArrowFunction, CallSignatureDeclaration, ConstructSignatureDeclaration, ConstructorDeclaration,
-            FunctionDeclaration, FunctionExpression, GetAccessorDeclaration, SetAccessorDeclaration,
-            JsDocSignature, MethodDeclaration, MethodSignatureDeclaration, FunctionTypeNode,
-            ConstructorTypeNode,
-        ], by_data!(self, |f, d| req(f, d.type_), [
-            PropertySignatureDeclaration, ParenthesizedTypeNode, TypeOperatorNode, TypeAssertion,
-            AsExpression, SatisfiesExpression, TypeAliasDeclaration, NamedTupleMember, OptionalTypeNode,
-            RestTypeNode, TemplateLiteralTypeSpan, JsDocTypeExpression, JsDocNullableType,
-            JsDocNonNullableType, JsDocOptionalType, JsDocVariadicType,
-        ], Node::NIL))
+        by_data!(
+            self,
+            |f, d| opt(f, d.type_),
+            [
+                VariableDeclaration,
+                ParameterDeclaration,
+                PropertyDeclaration,
+                PropertyAssignment,
+                ShorthandPropertyAssignment,
+                TypePredicateNode,
+                MappedTypeNode,
+                ExportAssignment,
+                BinaryExpression,
+                ArrowFunction,
+                CallSignatureDeclaration,
+                ConstructSignatureDeclaration,
+                ConstructorDeclaration,
+                FunctionDeclaration,
+                FunctionExpression,
+                GetAccessorDeclaration,
+                SetAccessorDeclaration,
+                JsDocSignature,
+                MethodDeclaration,
+                MethodSignatureDeclaration,
+                FunctionTypeNode,
+                ConstructorTypeNode,
+            ],
+            by_data!(
+                self,
+                |f, d| req(f, d.type_),
+                [
+                    PropertySignatureDeclaration,
+                    ParenthesizedTypeNode,
+                    TypeOperatorNode,
+                    TypeAssertion,
+                    AsExpression,
+                    SatisfiesExpression,
+                    TypeAliasDeclaration,
+                    NamedTupleMember,
+                    OptionalTypeNode,
+                    RestTypeNode,
+                    TemplateLiteralTypeSpan,
+                    JsDocTypeExpression,
+                    JsDocNullableType,
+                    JsDocNonNullableType,
+                    JsDocOptionalType,
+                    JsDocVariadicType,
+                ],
+                Node::NIL
+            )
+        )
     }
 
     // Go: ast.go:739 Initializer
     #[must_use]
     pub fn initializer(self) -> Node {
-        by_data!(self, |f, d| opt(f, d.initializer), [
-            VariableDeclaration, ParameterDeclaration, BindingElement, PropertyDeclaration, EnumMember,
-            ForStatement, JsxAttribute,
-        ], by_data!(self, |f, d| req(f, d.initializer), [
-            PropertySignatureDeclaration, PropertyAssignment, ForInOrOfStatement,
-        ], Node::NIL))
+        by_data!(
+            self,
+            |f, d| opt(f, d.initializer),
+            [
+                VariableDeclaration,
+                ParameterDeclaration,
+                BindingElement,
+                PropertyDeclaration,
+                EnumMember,
+                ForStatement,
+                JsxAttribute,
+            ],
+            by_data!(
+                self,
+                |f, d| req(f, d.initializer),
+                [
+                    PropertySignatureDeclaration,
+                    PropertyAssignment,
+                    ForInOrOfStatement,
+                ],
+                Node::NIL
+            )
+        )
     }
 
     // Go: ast.go:793 TagName
     #[must_use]
     pub fn tag_name(self) -> Node {
-        by_data!(self, |f, d| req(f, d.tag_name), [
-            JsxOpeningElement, JsxClosingElement, JsxSelfClosingElement, JsDocUnknownTag,
-            JsDocAugmentsTag, JsDocImplementsTag, JsDocDeprecatedTag, JsDocPublicTag, JsDocPrivateTag,
-            JsDocProtectedTag, JsDocReadonlyTag, JsDocOverrideTag, JsDocCallbackTag, JsDocOverloadTag,
-            JsDocParameterOrPropertyTag, JsDocReturnTag, JsDocThisTag, JsDocTypeTag, JsDocTemplateTag,
-            JsDocTypedefTag, JsDocSeeTag, JsDocSatisfiesTag, JsDocThrowsTag, JsDocImportTag,
-        ], Node::NIL)
+        by_data!(
+            self,
+            |f, d| req(f, d.tag_name),
+            [
+                JsxOpeningElement,
+                JsxClosingElement,
+                JsxSelfClosingElement,
+                JsDocUnknownTag,
+                JsDocAugmentsTag,
+                JsDocImplementsTag,
+                JsDocDeprecatedTag,
+                JsDocPublicTag,
+                JsDocPrivateTag,
+                JsDocProtectedTag,
+                JsDocReadonlyTag,
+                JsDocOverrideTag,
+                JsDocCallbackTag,
+                JsDocOverloadTag,
+                JsDocParameterOrPropertyTag,
+                JsDocReturnTag,
+                JsDocThisTag,
+                JsDocTypeTag,
+                JsDocTemplateTag,
+                JsDocTypedefTag,
+                JsDocSeeTag,
+                JsDocSatisfiesTag,
+                JsDocThrowsTag,
+                JsDocImportTag,
+            ],
+            Node::NIL
+        )
     }
 
     // Go: ast.go:847 PropertyName
     #[must_use]
     pub fn property_name(self) -> Node {
-        by_data!(self, |f, d| opt(f, d.property_name), [
-            ImportSpecifier, ExportSpecifier, BindingElement,
-        ], Node::NIL)
+        by_data!(
+            self,
+            |f, d| opt(f, d.property_name),
+            [ImportSpecifier, ExportSpecifier, BindingElement,],
+            Node::NIL
+        )
     }
 
     // Go: ast.go:859 PropertyNameOrName
@@ -1227,13 +1560,34 @@ impl Node {
         if let NodeData::JsDoc(d) = data(self) {
             return list(self.file_index(), &d.comment);
         }
-        by_data!(self, |f, d| opt_list(f, &d.comment), [
-            JsDocUnknownTag, JsDocAugmentsTag, JsDocImplementsTag, JsDocDeprecatedTag, JsDocPublicTag,
-            JsDocPrivateTag, JsDocProtectedTag, JsDocReadonlyTag, JsDocOverrideTag, JsDocCallbackTag,
-            JsDocOverloadTag, JsDocParameterOrPropertyTag, JsDocReturnTag, JsDocThisTag, JsDocTypeTag,
-            JsDocTemplateTag, JsDocTypedefTag, JsDocSeeTag, JsDocSatisfiesTag, JsDocThrowsTag,
-            JsDocImportTag,
-        ], NodeList::NIL)
+        by_data!(
+            self,
+            |f, d| opt_list(f, &d.comment),
+            [
+                JsDocUnknownTag,
+                JsDocAugmentsTag,
+                JsDocImplementsTag,
+                JsDocDeprecatedTag,
+                JsDocPublicTag,
+                JsDocPrivateTag,
+                JsDocProtectedTag,
+                JsDocReadonlyTag,
+                JsDocOverrideTag,
+                JsDocCallbackTag,
+                JsDocOverloadTag,
+                JsDocParameterOrPropertyTag,
+                JsDocReturnTag,
+                JsDocThisTag,
+                JsDocTypeTag,
+                JsDocTemplateTag,
+                JsDocTypedefTag,
+                JsDocSeeTag,
+                JsDocSatisfiesTag,
+                JsDocThrowsTag,
+                JsDocImportTag,
+            ],
+            NodeList::NIL
+        )
     }
 
     // Go: ast.go:934 Comments
@@ -1260,17 +1614,33 @@ impl Node {
     // generated accessor.
     #[must_use]
     pub fn attributes(self) -> Node {
-        by_data!(self, |f, d| req(f, d.attributes), [
-            JsxOpeningElement, JsxSelfClosingElement,
-        ], by_data!(self, |f, d| opt(f, d.attributes), [
-            ImportDeclaration, ExportDeclaration, ImportTypeNode, JsDocImportTag,
-        ], Node::NIL))
+        by_data!(
+            self,
+            |f, d| req(f, d.attributes),
+            [JsxOpeningElement, JsxSelfClosingElement,],
+            by_data!(
+                self,
+                |f, d| opt(f, d.attributes),
+                [
+                    ImportDeclaration,
+                    ExportDeclaration,
+                    ImportTypeNode,
+                    JsDocImportTag,
+                ],
+                Node::NIL
+            )
+        )
     }
 
     // Go: ast.go:964 Children
     #[must_use]
     pub fn children(self) -> NodeList {
-        by_data!(self, |f, d| list(f, &d.children), [JsxElement, JsxFragment], NodeList::NIL)
+        by_data!(
+            self,
+            |f, d| list(f, &d.children),
+            [JsxElement, JsxFragment],
+            NodeList::NIL
+        )
     }
 
     // Go: ast.go:974 ModuleSpecifier
@@ -1288,27 +1658,52 @@ impl Node {
     // Go: ast.go:986 ImportClause
     #[must_use]
     pub fn import_clause(self) -> Node {
-        by_data!(self, |f, d| opt(f, d.import_clause), [ImportDeclaration, JsDocImportTag], Node::NIL)
+        by_data!(
+            self,
+            |f, d| opt(f, d.import_clause),
+            [ImportDeclaration, JsDocImportTag],
+            Node::NIL
+        )
     }
 
     // Go: ast.go:996 Statement
     #[must_use]
     pub fn statement(self) -> Node {
-        by_data!(self, |f, d| req(f, d.statement), [
-            DoStatement, WhileStatement, ForStatement, ForInOrOfStatement, WithStatement, LabeledStatement,
-        ], Node::NIL)
+        by_data!(
+            self,
+            |f, d| req(f, d.statement),
+            [
+                DoStatement,
+                WhileStatement,
+                ForStatement,
+                ForInOrOfStatement,
+                WithStatement,
+                LabeledStatement,
+            ],
+            Node::NIL
+        )
     }
 
     // Go: ast.go:1014 PropertyList
     #[must_use]
     pub fn property_list(self) -> NodeList {
-        by_data!(self, |f, d| list(f, &d.properties), [ObjectLiteralExpression, JsxAttributes], NodeList::NIL)
+        by_data!(
+            self,
+            |f, d| list(f, &d.properties),
+            [ObjectLiteralExpression, JsxAttributes],
+            NodeList::NIL
+        )
     }
 
     // Go: ast_generated.go ImportAttributes.Attributes
     #[must_use]
     pub fn attribute_list(self) -> NodeList {
-        by_data!(self, |f, d| list(f, &d.attributes), [ImportAttributes], NodeList::NIL)
+        by_data!(
+            self,
+            |f, d| list(f, &d.attributes),
+            [ImportAttributes],
+            NodeList::NIL
+        )
     }
 
     // Go: ast.go:1024 Properties
@@ -1320,9 +1715,18 @@ impl Node {
     // Go: ast.go:1032 ElementList
     #[must_use]
     pub fn element_list(self) -> NodeList {
-        by_data!(self, |f, d| list(f, &d.elements), [
-            NamedImports, NamedExports, BindingPattern, ArrayLiteralExpression, TupleTypeNode,
-        ], NodeList::NIL)
+        by_data!(
+            self,
+            |f, d| list(f, &d.elements),
+            [
+                NamedImports,
+                NamedExports,
+                BindingPattern,
+                ArrayLiteralExpression,
+                TupleTypeNode,
+            ],
+            NodeList::NIL
+        )
     }
 
     // Go: ast.go:1048 Elements
@@ -1334,11 +1738,22 @@ impl Node {
     // Go: ast.go:1056 PostfixToken
     #[must_use]
     pub fn postfix_token(self) -> Node {
-        by_data!(self, |f, d| opt(f, d.postfix_token), [
-            MethodDeclaration, ShorthandPropertyAssignment, MethodSignatureDeclaration,
-            PropertySignatureDeclaration, PropertyAssignment, PropertyDeclaration, EnumMember,
-            GetAccessorDeclaration, SetAccessorDeclaration,
-        ], Node::NIL)
+        by_data!(
+            self,
+            |f, d| opt(f, d.postfix_token),
+            [
+                MethodDeclaration,
+                ShorthandPropertyAssignment,
+                MethodSignatureDeclaration,
+                PropertySignatureDeclaration,
+                PropertyAssignment,
+                PropertyDeclaration,
+                EnumMember,
+                GetAccessorDeclaration,
+                SetAccessorDeclaration,
+            ],
+            Node::NIL
+        )
     }
 
     // Go: ast.go:1080 QuestionToken
@@ -1362,9 +1777,17 @@ impl Node {
     // Go: ast.go:1098 QuestionDotToken
     #[must_use]
     pub fn question_dot_token(self) -> Node {
-        by_data!(self, |f, d| opt(f, d.question_dot_token), [
-            ElementAccessExpression, PropertyAccessExpression, CallExpression, TaggedTemplateExpression,
-        ], Node::NIL)
+        by_data!(
+            self,
+            |f, d| opt(f, d.question_dot_token),
+            [
+                ElementAccessExpression,
+                PropertyAccessExpression,
+                CallExpression,
+                TaggedTemplateExpression,
+            ],
+            Node::NIL
+        )
     }
 
     // Go: ast.go:1112 TypeExpression
@@ -1372,17 +1795,39 @@ impl Node {
     // `TypeExpression` fields have no generated accessor.
     #[must_use]
     pub fn type_expression(self) -> Node {
-        by_data!(self, |f, d| opt(f, d.type_expression), [
-            JsDocParameterOrPropertyTag, JsDocReturnTag, JsDocTypedefTag, JsDocThrowsTag,
-        ], by_data!(self, |f, d| req(f, d.type_expression), [
-            JsDocTypeTag, JsDocCallbackTag, JsDocSatisfiesTag, JsDocThisTag, JsDocOverloadTag,
-        ], Node::NIL))
+        by_data!(
+            self,
+            |f, d| opt(f, d.type_expression),
+            [
+                JsDocParameterOrPropertyTag,
+                JsDocReturnTag,
+                JsDocTypedefTag,
+                JsDocThrowsTag,
+            ],
+            by_data!(
+                self,
+                |f, d| req(f, d.type_expression),
+                [
+                    JsDocTypeTag,
+                    JsDocCallbackTag,
+                    JsDocSatisfiesTag,
+                    JsDocThisTag,
+                    JsDocOverloadTag,
+                ],
+                Node::NIL
+            )
+        )
     }
 
     // Go: ast.go:1132 ClassName
     #[must_use]
     pub fn class_name(self) -> Node {
-        by_data!(self, |f, d| req(f, d.class_name), [JsDocAugmentsTag, JsDocImplementsTag], Node::NIL)
+        by_data!(
+            self,
+            |f, d| req(f, d.class_name),
+            [JsDocAugmentsTag, JsDocImplementsTag],
+            Node::NIL
+        )
     }
 
     // Go: ast.go:1144 Contains
@@ -1444,12 +1889,20 @@ impl Node {
     /// `for_each_child` that also reports each non-nil NodeList and
     /// ModifierList slot to `lists` before its nodes are visited. Used by the
     /// `astdump` parity tool.
-    pub fn for_each_child_and_lists(self, v: &mut dyn FnMut(Node) -> bool, lists: ListHook) -> bool {
+    pub fn for_each_child_and_lists(
+        self,
+        v: &mut dyn FnMut(Node) -> bool,
+        lists: ListHook,
+    ) -> bool {
         for_each_child_impl(self, v, Some(lists))
     }
 }
 
-fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, mut lists: Option<ListHook>) -> bool {
+fn for_each_child_impl(
+    n: Node,
+    v: &mut dyn FnMut(Node) -> bool,
+    mut lists: Option<ListHook>,
+) -> bool {
     let f = n.file_index();
     let mut report = |l: NodeList, is_mod: bool| {
         if let Some(h) = lists.as_mut() {
@@ -1493,10 +1946,14 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, mut lists: Opti
         NodeData::QualifiedName(d) => n!(d.left) || n!(d.right),
         NodeData::ComputedPropertyName(d) => n!(d.expression),
         NodeData::Decorator(d) => n!(d.expression),
-        NodeData::IfStatement(d) => n!(d.expression) || n!(d.then_statement) || o!(d.else_statement),
+        NodeData::IfStatement(d) => {
+            n!(d.expression) || n!(d.then_statement) || o!(d.else_statement)
+        }
         NodeData::DoStatement(d) => n!(d.statement) || n!(d.expression),
         NodeData::WhileStatement(d) => n!(d.expression) || n!(d.statement),
-        NodeData::ForStatement(d) => o!(d.initializer) || o!(d.condition) || o!(d.incrementor) || n!(d.statement),
+        NodeData::ForStatement(d) => {
+            o!(d.initializer) || o!(d.condition) || o!(d.incrementor) || n!(d.statement)
+        }
         NodeData::ForInOrOfStatement(d) => {
             o!(d.await_modifier) || n!(d.initializer) || n!(d.expression) || n!(d.statement)
         }
@@ -1506,7 +1963,9 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, mut lists: Opti
         NodeData::WithStatement(d) => n!(d.expression) || n!(d.statement),
         NodeData::SwitchStatement(d) => n!(d.expression) || n!(d.case_block),
         NodeData::CaseBlock(d) => l!(d.clauses),
-        NodeData::CaseOrDefaultClause(d) => visit(v, case_expression(n, f, d.expression)) || l!(d.statements),
+        NodeData::CaseOrDefaultClause(d) => {
+            visit(v, case_expression(n, f, d.expression)) || l!(d.statements)
+        }
         NodeData::ThrowStatement(d) => n!(d.expression),
         NodeData::TryStatement(d) => n!(d.try_block) || o!(d.catch_clause) || o!(d.finally_block),
         NodeData::CatchClause(d) => o!(d.variable_declaration) || n!(d.block),
@@ -1542,13 +2001,25 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, mut lists: Opti
                 || o!(d.body)
         }
         NodeData::ClassDeclaration(d) => {
-            m!(d.modifiers) || o!(d.name) || ol!(d.type_parameters) || ol!(d.heritage_clauses) || l!(d.members)
+            m!(d.modifiers)
+                || o!(d.name)
+                || ol!(d.type_parameters)
+                || ol!(d.heritage_clauses)
+                || l!(d.members)
         }
         NodeData::ClassExpression(d) => {
-            m!(d.modifiers) || o!(d.name) || ol!(d.type_parameters) || ol!(d.heritage_clauses) || l!(d.members)
+            m!(d.modifiers)
+                || o!(d.name)
+                || ol!(d.type_parameters)
+                || ol!(d.heritage_clauses)
+                || l!(d.members)
         }
         NodeData::InterfaceDeclaration(d) => {
-            m!(d.modifiers) || n!(d.name) || ol!(d.type_parameters) || ol!(d.heritage_clauses) || l!(d.members)
+            m!(d.modifiers)
+                || n!(d.name)
+                || ol!(d.type_parameters)
+                || ol!(d.heritage_clauses)
+                || l!(d.members)
         }
         NodeData::HeritageClause(d) => l!(d.types),
         NodeData::TypeAliasDeclaration(d) => {
@@ -1568,7 +2039,9 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, mut lists: Opti
         NodeData::NamespaceExport(d) => n!(d.name),
         NodeData::NamedExports(d) => l!(d.elements),
         NodeData::ExportSpecifier(d) => o!(d.property_name) || n!(d.name),
-        NodeData::CallSignatureDeclaration(d) => ol!(d.type_parameters) || l!(d.parameters) || o!(d.type_),
+        NodeData::CallSignatureDeclaration(d) => {
+            ol!(d.type_parameters) || l!(d.parameters) || o!(d.type_)
+        }
         NodeData::ConstructSignatureDeclaration(d) => {
             ol!(d.type_parameters) || l!(d.parameters) || o!(d.type_)
         }
@@ -1598,7 +2071,9 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, mut lists: Opti
                 || o!(d.full_signature)
                 || o!(d.body)
         }
-        NodeData::IndexSignatureDeclaration(d) => m!(d.modifiers) || l!(d.parameters) || n!(d.type_),
+        NodeData::IndexSignatureDeclaration(d) => {
+            m!(d.modifiers) || l!(d.parameters) || n!(d.type_)
+        }
         NodeData::MethodSignatureDeclaration(d) => {
             m!(d.modifiers)
                 || n!(d.name)
@@ -1653,9 +2128,15 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, mut lists: Opti
         NodeData::AsExpression(d) => n!(d.expression) || n!(d.type_),
         NodeData::SatisfiesExpression(d) => n!(d.expression) || n!(d.type_),
         NodeData::ConditionalExpression(d) => {
-            n!(d.condition) || n!(d.question_token) || n!(d.when_true) || n!(d.colon_token) || n!(d.when_false)
+            n!(d.condition)
+                || n!(d.question_token)
+                || n!(d.when_true)
+                || n!(d.colon_token)
+                || n!(d.when_false)
         }
-        NodeData::PropertyAccessExpression(d) => n!(d.expression) || o!(d.question_dot_token) || n!(d.name),
+        NodeData::PropertyAccessExpression(d) => {
+            n!(d.expression) || o!(d.question_dot_token) || n!(d.name)
+        }
         NodeData::ElementAccessExpression(d) => {
             n!(d.expression) || o!(d.question_dot_token) || n!(d.argument_expression)
         }
@@ -1703,7 +2184,9 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, mut lists: Opti
         NodeData::TypeReferenceNode(d) => n!(d.type_name) || ol!(d.type_arguments),
         NodeData::ExpressionWithTypeArguments(d) => n!(d.expression) || ol!(d.type_arguments),
         NodeData::LiteralTypeNode(d) => n!(d.literal),
-        NodeData::TypePredicateNode(d) => o!(d.asserts_modifier) || n!(d.parameter_name) || o!(d.type_),
+        NodeData::TypePredicateNode(d) => {
+            o!(d.asserts_modifier) || n!(d.parameter_name) || o!(d.type_)
+        }
         NodeData::ImportAttribute(d) => n!(d.name) || n!(d.value),
         NodeData::ImportAttributes(d) => l!(d.attributes),
         NodeData::TypeQueryNode(d) => n!(d.expr_name) || ol!(d.type_arguments),
@@ -1738,9 +2221,15 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, mut lists: Opti
         NodeData::JsxElement(d) => n!(d.opening_element) || l!(d.children) || n!(d.closing_element),
         NodeData::JsxAttributes(d) => l!(d.properties),
         NodeData::JsxNamespacedName(d) => n!(d.namespace) || n!(d.name),
-        NodeData::JsxOpeningElement(d) => n!(d.tag_name) || ol!(d.type_arguments) || n!(d.attributes),
-        NodeData::JsxSelfClosingElement(d) => n!(d.tag_name) || ol!(d.type_arguments) || n!(d.attributes),
-        NodeData::JsxFragment(d) => n!(d.opening_fragment) || l!(d.children) || n!(d.closing_fragment),
+        NodeData::JsxOpeningElement(d) => {
+            n!(d.tag_name) || ol!(d.type_arguments) || n!(d.attributes)
+        }
+        NodeData::JsxSelfClosingElement(d) => {
+            n!(d.tag_name) || ol!(d.type_arguments) || n!(d.attributes)
+        }
+        NodeData::JsxFragment(d) => {
+            n!(d.opening_fragment) || l!(d.children) || n!(d.closing_fragment)
+        }
         NodeData::JsxAttribute(d) => n!(d.name) || o!(d.initializer),
         NodeData::JsxSpreadAttribute(d) => n!(d.expression),
         NodeData::JsxClosingElement(d) => n!(d.tag_name),
@@ -1772,7 +2261,11 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, mut lists: Opti
         NodeData::JsDocImplementsTag(d) => n!(d.tag_name) || n!(d.class_name) || ol!(d.comment),
         NodeData::JsDocAugmentsTag(d) => n!(d.tag_name) || n!(d.class_name) || ol!(d.comment),
         NodeData::JsDocImportTag(d) => {
-            n!(d.tag_name) || o!(d.import_clause) || n!(d.module_specifier) || o!(d.attributes) || ol!(d.comment)
+            n!(d.tag_name)
+                || o!(d.import_clause)
+                || n!(d.module_specifier)
+                || o!(d.attributes)
+                || ol!(d.comment)
         }
         NodeData::JsDocCallbackTag(d) => {
             n!(d.tag_name) || n!(d.type_expression) || o!(d.name) || ol!(d.comment)
@@ -1790,7 +2283,9 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, mut lists: Opti
                 || ol!(d.comment)
         }
         NodeData::ModuleDeclaration(d) => m!(d.modifiers) || n!(d.name) || o!(d.body),
-        NodeData::ImportEqualsDeclaration(d) => m!(d.modifiers) || n!(d.name) || n!(d.module_reference),
+        NodeData::ImportEqualsDeclaration(d) => {
+            m!(d.modifiers) || n!(d.name) || n!(d.module_reference)
+        }
         NodeData::ExportDeclaration(d) => {
             m!(d.modifiers) || o!(d.export_clause) || o!(d.module_specifier) || o!(d.attributes)
         }
@@ -1803,7 +2298,11 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, mut lists: Opti
         NodeData::JsDocLinkCode(d) => o!(d.name),
         NodeData::JsDocLinkPlain(d) => o!(d.name),
         NodeData::TypeParameterDeclaration(d) => {
-            m!(d.modifiers) || n!(d.name) || o!(d.constraint) || o!(d.expression) || o!(d.default_type)
+            m!(d.modifiers)
+                || n!(d.name)
+                || o!(d.constraint)
+                || o!(d.expression)
+                || o!(d.default_type)
         }
         NodeData::SyntheticReferenceExpression(d) => n!(d.expression) || n!(d.this_arg),
         NodeData::JsDocTypeLiteral(d) => match &d.js_doc_property_tags {
@@ -1836,10 +2335,12 @@ const EXCL_PROPERTY: SubtreeFacts = EXCL_NODE
     .union(SubtreeFacts::SUBTREE_CONTAINS_LEXICAL_THIS)
     .union(SubtreeFacts::SUBTREE_CONTAINS_LEXICAL_SUPER);
 const EXCL_MODULE: SubtreeFacts = EXCL_PROPERTY;
-const EXCL_OBJECT_LITERAL: SubtreeFacts = EXCL_NODE.union(SubtreeFacts::SUBTREE_CONTAINS_OBJECT_REST_OR_SPREAD);
+const EXCL_OBJECT_LITERAL: SubtreeFacts =
+    EXCL_NODE.union(SubtreeFacts::SUBTREE_CONTAINS_OBJECT_REST_OR_SPREAD);
 const EXCL_VARIABLE_DECLARATION_LIST: SubtreeFacts = EXCL_OBJECT_LITERAL;
 const EXCL_CATCH_CLAUSE: SubtreeFacts = EXCL_OBJECT_LITERAL;
-const EXCL_BINDING_PATTERN: SubtreeFacts = EXCL_NODE.union(SubtreeFacts::SUBTREE_CONTAINS_REST_OR_SPREAD);
+const EXCL_BINDING_PATTERN: SubtreeFacts =
+    EXCL_NODE.union(SubtreeFacts::SUBTREE_CONTAINS_REST_OR_SPREAD);
 
 const TS: SubtreeFacts = SubtreeFacts::SUBTREE_CONTAINS_TYPE_SCRIPT;
 const NONE_FACTS: SubtreeFacts = SubtreeFacts::NONE;
@@ -1905,7 +2406,9 @@ fn propagate_modifier_list(children: ModifierList) -> SubtreeFacts {
 /// True for Go node types that embed `TypeSyntaxBase`.
 fn is_type_syntax_data(n: Node) -> bool {
     // PORT: a PropertyDeclaration that Go parses as a PropertySignature.
-    if matches!(data(n), NodeData::PropertyDeclaration(_)) && n.kind() == SyntaxKind::PropertySignature {
+    if matches!(data(n), NodeData::PropertyDeclaration(_))
+        && n.kind() == SyntaxKind::PropertySignature
+    {
         return true;
     }
     matches!(
@@ -1969,14 +2472,20 @@ fn propagate_node_facts(n: Node) -> SubtreeFacts {
         NodeData::CatchClause(_) => facts.without(EXCL_CATCH_CLAUSE),
         NodeData::VariableDeclarationList(_) => facts.without(EXCL_VARIABLE_DECLARATION_LIST),
         NodeData::BindingPattern(_) => facts.without(EXCL_BINDING_PATTERN),
-        NodeData::FunctionDeclaration(_) | NodeData::FunctionExpression(_) => facts.without(EXCL_FUNCTION),
+        NodeData::FunctionDeclaration(_) | NodeData::FunctionExpression(_) => {
+            facts.without(EXCL_FUNCTION)
+        }
         NodeData::ModuleDeclaration(_) => facts.without(EXCL_MODULE),
         NodeData::ConstructorDeclaration(_) => facts.without(EXCL_CONSTRUCTOR),
         NodeData::GetAccessorDeclaration(_) | NodeData::SetAccessorDeclaration(_) => {
             facts.without(EXCL_ACCESSOR) | propagate_subtree_facts(n.name())
         }
-        NodeData::MethodDeclaration(_) => facts.without(EXCL_METHOD) | propagate_subtree_facts(n.name()),
-        NodeData::PropertyDeclaration(_) => facts.without(EXCL_PROPERTY) | propagate_subtree_facts(n.name()),
+        NodeData::MethodDeclaration(_) => {
+            facts.without(EXCL_METHOD) | propagate_subtree_facts(n.name())
+        }
+        NodeData::PropertyDeclaration(_) => {
+            facts.without(EXCL_PROPERTY) | propagate_subtree_facts(n.name())
+        }
         NodeData::ArrowFunction(_) => facts.without(EXCL_ARROW_FUNCTION),
         NodeData::ObjectLiteralExpression(_) => facts.without(EXCL_OBJECT_LITERAL),
         // Parameter, Class, OuterExpression, PropertyAccess, ElementAccess,
@@ -2031,7 +2540,9 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
         };
     }
     let ambient = |m: &'static Option<ts_ast::ModifierList>| {
-        mods(f, m).modifier_flags().intersects(ModifierFlags::AMBIENT)
+        mods(f, m)
+            .modifier_flags()
+            .intersects(ModifierFlags::AMBIENT)
     };
     let jsx = SubtreeFacts::SUBTREE_CONTAINS_JSX;
     match data(n) {
@@ -2071,7 +2582,9 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
             SyntaxKind::QuestionDotToken => SubtreeFacts::SUBTREE_CONTAINS_OPTIONAL_CHAINING,
             SyntaxKind::QuestionQuestionEqualsToken
             | SyntaxKind::BarBarEqualsToken
-            | SyntaxKind::AmpersandAmpersandEqualsToken => SubtreeFacts::SUBTREE_CONTAINS_LOGICAL_ASSIGNMENTS,
+            | SyntaxKind::AmpersandAmpersandEqualsToken => {
+                SubtreeFacts::SUBTREE_CONTAINS_LOGICAL_ASSIGNMENTS
+            }
             _ => NONE_FACTS,
         },
         // Go: ast.go:1670 (*PrivateIdentifier).computeSubtreeFacts
@@ -2083,15 +2596,23 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
             p!(d.initializer)
                 | p!(d.expression)
                 | p!(d.statement)
-                | facts_if(d.await_modifier.is_some(), SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR)
+                | facts_if(
+                    d.await_modifier.is_some(),
+                    SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR,
+                )
         }
         // Go: ast.go:1691 (*ReturnStatement).computeSubtreeFacts
-        NodeData::ReturnStatement(d) => po!(d.expression) | SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR,
+        NodeData::ReturnStatement(d) => {
+            po!(d.expression) | SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR
+        }
         // Go: ast.go:1696 (*CatchClause).computeSubtreeFacts
         NodeData::CatchClause(d) => {
             po!(d.variable_declaration)
                 | p!(d.block)
-                | facts_if(d.variable_declaration.is_none(), SubtreeFacts::SUBTREE_CONTAINS_MISSING_CATCH_CLAUSE_VARIABLE)
+                | facts_if(
+                    d.variable_declaration.is_none(),
+                    SubtreeFacts::SUBTREE_CONTAINS_MISSING_CATCH_CLAUSE_VARIABLE,
+                )
         }
         // Go: ast.go:1709 (*VariableStatement).computeSubtreeFacts
         NodeData::VariableStatement(d) => {
@@ -2107,12 +2628,20 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
         }
         // Go: ast.go:1725 (*VariableDeclarationList).computeSubtreeFacts
         NodeData::VariableDeclarationList(d) => {
-            pl!(d.declarations) | facts_if(n.flags().intersects(NodeFlags::USING), SubtreeFacts::SUBTREE_CONTAINS_USING)
+            pl!(d.declarations)
+                | facts_if(
+                    n.flags().intersects(NodeFlags::USING),
+                    SubtreeFacts::SUBTREE_CONTAINS_USING,
+                )
         }
         // Go: ast.go:1734 (*BindingPattern).computeSubtreeFacts
         NodeData::BindingPattern(d) => match n.kind() {
-            SyntaxKind::ObjectBindingPattern => propagate_node_list(list(f, &d.elements), propagate_object_binding_element),
-            SyntaxKind::ArrayBindingPattern => propagate_node_list(list(f, &d.elements), propagate_binding_element),
+            SyntaxKind::ObjectBindingPattern => {
+                propagate_node_list(list(f, &d.elements), propagate_object_binding_element)
+            }
+            SyntaxKind::ArrayBindingPattern => {
+                propagate_node_list(list(f, &d.elements), propagate_binding_element)
+            }
             _ => NONE_FACTS,
         },
         // Go: ast.go:1749 (*ParameterDeclaration).computeSubtreeFacts
@@ -2133,7 +2662,10 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
             po!(d.property_name)
                 | po!(d.name)
                 | po!(d.initializer)
-                | facts_if(d.dot_dot_dot_token.is_some(), SubtreeFacts::SUBTREE_CONTAINS_REST_OR_SPREAD)
+                | facts_if(
+                    d.dot_dot_dot_token.is_some(),
+                    SubtreeFacts::SUBTREE_CONTAINS_REST_OR_SPREAD,
+                )
         }
         // Go: ast.go:1772 (*FunctionDeclaration).computeSubtreeFacts
         NodeData::FunctionDeclaration(d) => {
@@ -2151,8 +2683,14 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
                     | e!(d.type_)
                     | e!(d.full_signature)
                     | po!(d.body)
-                    | facts_if(is_async && is_generator, SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR)
-                    | facts_if(is_async && !is_generator, SubtreeFacts::SUBTREE_CONTAINS_ANY_AWAIT)
+                    | facts_if(
+                        is_async && is_generator,
+                        SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR,
+                    )
+                    | facts_if(
+                        is_async && !is_generator,
+                        SubtreeFacts::SUBTREE_CONTAINS_ANY_AWAIT,
+                    )
             }
         }
         // Go: ast.go:1801 (*ClassLikeBase).computeSubtreeFacts
@@ -2160,14 +2698,22 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
             if ambient(&d.modifiers) {
                 TS
             } else {
-                pm!(d.modifiers) | po!(d.name) | el!(d.type_parameters) | pol!(d.heritage_clauses) | pl!(d.members)
+                pm!(d.modifiers)
+                    | po!(d.name)
+                    | el!(d.type_parameters)
+                    | pol!(d.heritage_clauses)
+                    | pl!(d.members)
             }
         }
         NodeData::ClassExpression(d) => {
             if ambient(&d.modifiers) {
                 TS
             } else {
-                pm!(d.modifiers) | po!(d.name) | el!(d.type_parameters) | pol!(d.heritage_clauses) | pl!(d.members)
+                pm!(d.modifiers)
+                    | po!(d.name)
+                    | el!(d.type_parameters)
+                    | pol!(d.heritage_clauses)
+                    | pl!(d.members)
             }
         }
         // Go: ast.go:1821 (*HeritageClause).computeSubtreeFacts
@@ -2294,8 +2840,14 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
                     | po!(d.body)
                     | e!(d.type_)
                     | e!(d.full_signature)
-                    | facts_if(is_async && is_generator, SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR)
-                    | facts_if(is_async && !is_generator, SubtreeFacts::SUBTREE_CONTAINS_ANY_AWAIT)
+                    | facts_if(
+                        is_async && is_generator,
+                        SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR,
+                    )
+                    | facts_if(
+                        is_async && !is_generator,
+                        SubtreeFacts::SUBTREE_CONTAINS_ANY_AWAIT,
+                    )
             }
         }
         // Go: ast.go:1995 (*PropertyDeclaration).computeSubtreeFacts
@@ -2323,7 +2875,8 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
         NodeData::Identifier(_) => SubtreeFacts::SUBTREE_CONTAINS_IDENTIFIER,
         // Go: ast.go:2037 (*NoSubstitutionTemplateLiteral).computeSubtreeFacts
         NodeData::NoSubstitutionTemplateLiteral(_) => facts_if(
-            n.template_flags().intersects(TokenFlags::CONTAINS_INVALID_ESCAPE),
+            n.template_flags()
+                .intersects(TokenFlags::CONTAINS_INVALID_ESCAPE),
             SubtreeFacts::SUBTREE_CONTAINS_INVALID_TEMPLATE_ESCAPE,
         ),
         // Go: ast.go:2044 (*BinaryExpression).computeSubtreeFacts
@@ -2349,7 +2902,9 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
             facts
         }
         // Go: ast.go:2061 (*YieldExpression).computeSubtreeFacts
-        NodeData::YieldExpression(d) => po!(d.expression) | SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR,
+        NodeData::YieldExpression(d) => {
+            po!(d.expression) | SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR
+        }
         // Go: ast.go:2065 (*ArrowFunction).computeSubtreeFacts
         NodeData::ArrowFunction(d) => {
             pm!(d.modifiers)
@@ -2358,7 +2913,10 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
                 | e!(d.type_)
                 | e!(d.full_signature)
                 | p!(d.body)
-                | facts_if(n.modifier_flags().intersects(ModifierFlags::ASYNC), SubtreeFacts::SUBTREE_CONTAINS_ANY_AWAIT)
+                | facts_if(
+                    n.modifier_flags().intersects(ModifierFlags::ASYNC),
+                    SubtreeFacts::SUBTREE_CONTAINS_ANY_AWAIT,
+                )
         }
         // Go: ast.go:2079 (*FunctionExpression).computeSubtreeFacts
         NodeData::FunctionExpression(d) => {
@@ -2372,8 +2930,14 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
                 | e!(d.type_)
                 | e!(d.full_signature)
                 | p!(d.body)
-                | facts_if(is_async && is_generator, SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR)
-                | facts_if(is_async && !is_generator, SubtreeFacts::SUBTREE_CONTAINS_ANY_AWAIT)
+                | facts_if(
+                    is_async && is_generator,
+                    SubtreeFacts::SUBTREE_CONTAINS_FOR_AWAIT_OR_ASYNC_GENERATOR,
+                )
+                | facts_if(
+                    is_async && !is_generator,
+                    SubtreeFacts::SUBTREE_CONTAINS_ANY_AWAIT,
+                )
         }
         // Go: ast.go:2098 (*AsExpression).computeSubtreeFacts
         NodeData::AsExpression(d) => p!(d.expression) | TS,
@@ -2385,7 +2949,10 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
             p!(d.expression)
                 | po!(d.question_dot_token)
                 | propagate_subtree_facts(name)
-                | facts_if(!is_identifier(name), SubtreeFacts::SUBTREE_CONTAINS_PRIVATE_IDENTIFIER_IN_EXPRESSION)
+                | facts_if(
+                    !is_identifier(name),
+                    SubtreeFacts::SUBTREE_CONTAINS_PRIVATE_IDENTIFIER_IN_EXPRESSION,
+                )
         }
         // Go: ast.go:2132 (*CallExpression).computeSubtreeFacts
         NodeData::CallExpression(d) => {
@@ -2405,7 +2972,9 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
         // Go: ast.go:2158 (*NonNullExpression).computeSubtreeFacts
         NodeData::NonNullExpression(d) => p!(d.expression) | TS,
         // Go: ast.go:2162 (*SpreadElement).computeSubtreeFacts
-        NodeData::SpreadElement(d) => p!(d.expression) | SubtreeFacts::SUBTREE_CONTAINS_REST_OR_SPREAD,
+        NodeData::SpreadElement(d) => {
+            p!(d.expression) | SubtreeFacts::SUBTREE_CONTAINS_REST_OR_SPREAD
+        }
         // Go: ast.go:2166 (*TaggedTemplateExpression).computeSubtreeFacts
         NodeData::TaggedTemplateExpression(d) => {
             p!(d.tag) | po!(d.question_dot_token) | el!(d.type_arguments) | p!(d.template)
@@ -2435,29 +3004,38 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
         NodeData::ExpressionWithTypeArguments(d) => p!(d.expression) | el!(d.type_arguments),
         // Go: ast.go:2279 (*TemplateHead).computeSubtreeFacts
         NodeData::TemplateHead(_) => facts_if(
-            n.template_flags().intersects(TokenFlags::CONTAINS_INVALID_ESCAPE),
+            n.template_flags()
+                .intersects(TokenFlags::CONTAINS_INVALID_ESCAPE),
             SubtreeFacts::SUBTREE_CONTAINS_INVALID_TEMPLATE_ESCAPE,
         ),
         // Go: ast.go:2286 (*TemplateMiddle).computeSubtreeFacts
         NodeData::TemplateMiddle(_) => facts_if(
-            n.template_flags().intersects(TokenFlags::CONTAINS_INVALID_ESCAPE),
+            n.template_flags()
+                .intersects(TokenFlags::CONTAINS_INVALID_ESCAPE),
             SubtreeFacts::SUBTREE_CONTAINS_INVALID_TEMPLATE_ESCAPE,
         ),
         // Go: ast.go:2293 (*TemplateTail).computeSubtreeFacts
         NodeData::TemplateTail(_) => facts_if(
-            n.template_flags().intersects(TokenFlags::CONTAINS_INVALID_ESCAPE),
+            n.template_flags()
+                .intersects(TokenFlags::CONTAINS_INVALID_ESCAPE),
             SubtreeFacts::SUBTREE_CONTAINS_INVALID_TEMPLATE_ESCAPE,
         ),
         // Go: ast.go:2300 (*JsxElement).computeSubtreeFacts
-        NodeData::JsxElement(d) => p!(d.opening_element) | pl!(d.children) | p!(d.closing_element) | jsx,
+        NodeData::JsxElement(d) => {
+            p!(d.opening_element) | pl!(d.children) | p!(d.closing_element) | jsx
+        }
         // Go: ast.go:2307 (*JsxAttributes).computeSubtreeFacts
         NodeData::JsxAttributes(d) => pl!(d.properties) | jsx,
         // Go: ast.go:2312 (*JsxNamespacedName).computeSubtreeFacts
         NodeData::JsxNamespacedName(d) => p!(d.namespace) | p!(d.name) | jsx,
         // Go: ast.go:2318 (*JsxOpeningElement).computeSubtreeFacts
-        NodeData::JsxOpeningElement(d) => p!(d.tag_name) | el!(d.type_arguments) | p!(d.attributes) | jsx,
+        NodeData::JsxOpeningElement(d) => {
+            p!(d.tag_name) | el!(d.type_arguments) | p!(d.attributes) | jsx
+        }
         // Go: ast.go:2325 (*JsxSelfClosingElement).computeSubtreeFacts
-        NodeData::JsxSelfClosingElement(d) => p!(d.tag_name) | el!(d.type_arguments) | p!(d.attributes) | jsx,
+        NodeData::JsxSelfClosingElement(d) => {
+            p!(d.tag_name) | el!(d.type_arguments) | p!(d.attributes) | jsx
+        }
         // Go: ast.go:2332 (*JsxFragment).computeSubtreeFacts
         NodeData::JsxFragment(d) => pl!(d.children) | jsx,
         // Go: ast.go:2337 and ast.go:2341 Jsx fragment tokens
@@ -2480,11 +3058,15 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
         NodeData::IfStatement(d) => p!(d.expression) | p!(d.then_statement) | po!(d.else_statement),
         NodeData::DoStatement(d) => p!(d.statement) | p!(d.expression),
         NodeData::WhileStatement(d) => p!(d.expression) | p!(d.statement),
-        NodeData::ForStatement(d) => po!(d.initializer) | po!(d.condition) | po!(d.incrementor) | p!(d.statement),
+        NodeData::ForStatement(d) => {
+            po!(d.initializer) | po!(d.condition) | po!(d.incrementor) | p!(d.statement)
+        }
         NodeData::WithStatement(d) => p!(d.expression) | p!(d.statement),
         NodeData::SwitchStatement(d) => p!(d.expression) | p!(d.case_block),
         NodeData::CaseBlock(d) => pl!(d.clauses),
-        NodeData::CaseOrDefaultClause(d) => propagate_subtree_facts(case_expression(n, f, d.expression)) | pl!(d.statements),
+        NodeData::CaseOrDefaultClause(d) => {
+            propagate_subtree_facts(case_expression(n, f, d.expression)) | pl!(d.statements)
+        }
         NodeData::ThrowStatement(d) => p!(d.expression),
         NodeData::TryStatement(d) => p!(d.try_block) | po!(d.catch_clause) | po!(d.finally_block),
         NodeData::LabeledStatement(d) => p!(d.label) | p!(d.statement),
@@ -2502,7 +3084,11 @@ fn compute_subtree_facts(n: Node) -> SubtreeFacts {
         NodeData::PrefixUnaryExpression(d) => p!(d.operand),
         NodeData::PostfixUnaryExpression(d) => p!(d.operand),
         NodeData::ConditionalExpression(d) => {
-            p!(d.condition) | p!(d.question_token) | p!(d.when_true) | p!(d.colon_token) | p!(d.when_false)
+            p!(d.condition)
+                | p!(d.question_token)
+                | p!(d.when_true)
+                | p!(d.colon_token)
+                | p!(d.when_false)
         }
         NodeData::ElementAccessExpression(d) => {
             p!(d.expression) | po!(d.question_dot_token) | p!(d.argument_expression)
@@ -2586,11 +3172,15 @@ pub fn get_declaration_from_name(name: Node) -> Node {
                 return Node::NIL;
             }
             let bin_exp = parent.parent();
-            if is_binary_expression(bin_exp) && get_assignment_declaration_kind(bin_exp) != JSDeclarationKind::NONE {
+            if is_binary_expression(bin_exp)
+                && get_assignment_declaration_kind(bin_exp) != JSDeclarationKind::NONE
+            {
                 // (binExp.left as BindableStaticNameExpression).symbol || binExp.symbol
                 let left = bin_exp.left();
                 let left_has_symbol = left.is_some() && left.symbol().is_some();
-                if (left_has_symbol || bin_exp.symbol().is_some()) && get_name_of_declaration(bin_exp) == name {
+                if (left_has_symbol || bin_exp.symbol().is_some())
+                    && get_name_of_declaration(bin_exp) == name
+                {
                     return bin_exp;
                 }
             }
@@ -2640,7 +3230,9 @@ fn declaration_is_write_access(decl: Node) -> bool {
         | SyntaxKind::JsTypeAliasDeclaration
         | SyntaxKind::TypeParameter => true,
         // In `({ x: y } = 0);`, `x` is not a write access.
-        SyntaxKind::PropertyAssignment => !is_array_literal_or_object_literal_destructuring_pattern(decl.parent()),
+        SyntaxKind::PropertyAssignment => {
+            !is_array_literal_or_object_literal_destructuring_pattern(decl.parent())
+        }
         // Functions are writes if they provide a value (have a body).
         SyntaxKind::FunctionDeclaration
         | SyntaxKind::FunctionExpression
@@ -2694,7 +3286,9 @@ fn access_kind(node: Node) -> AccessKind {
         return AccessKind::READ;
     }
     match parent.kind() {
-        SyntaxKind::ParenthesizedExpression | SyntaxKind::ArrayLiteralExpression => access_kind(parent),
+        SyntaxKind::ParenthesizedExpression | SyntaxKind::ArrayLiteralExpression => {
+            access_kind(parent)
+        }
         SyntaxKind::PrefixUnaryExpression | SyntaxKind::PostfixUnaryExpression => {
             let operator = parent.operator();
             if operator == SyntaxKind::PlusPlusToken || operator == SyntaxKind::MinusMinusToken {
@@ -2874,7 +3468,11 @@ impl Node {
         if !self.flags().intersects(NodeFlags::HAS_JS_DOC) {
             return NodeSlice::NIL;
         }
-        let file = if file.is_nil() { get_source_file_of_node(self) } else { file };
+        let file = if file.is_nil() {
+            get_source_file_of_node(self)
+        } else {
+            file
+        };
         if file.is_nil() {
             return NodeSlice::NIL;
         }
@@ -2896,18 +3494,26 @@ impl Node {
         if !self.flags().intersects(NodeFlags::HAS_JS_DOC) {
             return NodeSlice::NIL;
         }
-        let file = if file.is_nil() { get_source_file_of_node(self) } else { file };
+        let file = if file.is_nil() {
+            get_source_file_of_node(self)
+        } else {
+            file
+        };
         if file.is_nil() {
             return NodeSlice::NIL;
         }
-        source_file_info(file).jsdoc_cache.get(&self).map_or(NodeSlice::NIL, |jsdocs| NodeSlice::from_nodes(jsdocs))
+        source_file_info(file)
+            .jsdoc_cache
+            .get(&self)
+            .map_or(NodeSlice::NIL, |jsdocs| NodeSlice::from_nodes(jsdocs))
     }
 }
 
 // Go: ast.go:1832 IsTypeOrJSTypeAliasDeclaration
 #[must_use]
 pub fn is_type_or_js_type_alias_declaration(node: Node) -> bool {
-    node.kind() == SyntaxKind::TypeAliasDeclaration || node.kind() == SyntaxKind::JsTypeAliasDeclaration
+    node.kind() == SyntaxKind::TypeAliasDeclaration
+        || node.kind() == SyntaxKind::JsTypeAliasDeclaration
 }
 
 // Go: ast.go:1878 IsImportDeclarationOrJSImportDeclaration
@@ -2979,7 +3585,9 @@ thread_local! {
 // Go: ast.go:2566 (*SourceFile).Text
 #[must_use]
 pub fn source_file_text(file: Node) -> &'static str {
-    if is_synthetic_node(file) { return synthetic_source_file_text(file); }
+    if is_synthetic_node(file) {
+        return synthetic_source_file_text(file);
+    }
     if has_file_store(file.file_index()) {
         return file_store_text(file.file_index());
     }
@@ -2989,7 +3597,9 @@ pub fn source_file_text(file: Node) -> &'static str {
 // Go: ast.go:2570 (*SourceFile).FileName
 #[must_use]
 pub fn source_file_file_name(file: Node) -> &'static str {
-    if is_synthetic_node(file) { return synthetic_source_file_file_name(file); }
+    if is_synthetic_node(file) {
+        return synthetic_source_file_file_name(file);
+    }
     if has_file_store(file.file_index()) {
         return file_store_file_name(file.file_index());
     }
@@ -3093,7 +3703,10 @@ pub fn source_file_get_position_map(file: Node) -> &'static PositionMap {
     }
     let text = source_file_text(file);
     let map = if text.is_ascii() {
-        PositionMap { ascii_only: true, ..PositionMap::default() }
+        PositionMap {
+            ascii_only: true,
+            ..PositionMap::default()
+        }
     } else {
         compute_position_map(text)
     };
@@ -3108,7 +3721,8 @@ pub fn source_file_get_declaration_map(file: Node) -> &'static FxHashMap<String,
     if let Some(map) = DECLARATION_MAPS.with(|c| c.borrow().get(&file).copied()) {
         return map;
     }
-    let map: &'static FxHashMap<String, Vec<Node>> = Box::leak(Box::new(compute_declaration_map(file)));
+    let map: &'static FxHashMap<String, Vec<Node>> =
+        Box::leak(Box::new(compute_declaration_map(file)));
     DECLARATION_MAPS.with(|c| c.borrow_mut().insert(file, map));
     map
 }
@@ -3167,7 +3781,9 @@ fn compute_declaration_map(file: Node) -> FxHashMap<String, Vec<Node>> {
                     add_declaration(result, node);
                 }
             }
-            SyntaxKind::Parameter | SyntaxKind::VariableDeclaration | SyntaxKind::BindingElement => {
+            SyntaxKind::Parameter
+            | SyntaxKind::VariableDeclaration
+            | SyntaxKind::BindingElement => {
                 // Only consider parameter properties.
                 if node.kind() == SyntaxKind::Parameter
                     && !has_syntactic_modifier(node, ModifierFlags::PARAMETER_PROPERTY_MODIFIER)
@@ -3186,7 +3802,9 @@ fn compute_declaration_map(file: Node) -> FxHashMap<String, Vec<Node>> {
                     }
                 }
             }
-            SyntaxKind::EnumMember | SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature => {
+            SyntaxKind::EnumMember
+            | SyntaxKind::PropertyDeclaration
+            | SyntaxKind::PropertySignature => {
                 add_declaration(result, node);
             }
             SyntaxKind::ExportDeclaration => {

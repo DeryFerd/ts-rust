@@ -68,7 +68,8 @@ pub fn unresolved() -> Option<Resolved> {
 // Go: module/resolver.go:44 resolutionKindSpecificLoader
 // PORT: Go closures capture `r`. Here the loader gets the state as its first
 // argument, so the caller can keep `&mut self`.
-pub type ResolutionKindSpecificLoader<'s> = dyn FnMut(&mut ResolutionState<'s>, Extensions, &str) -> Option<Resolved>;
+pub type ResolutionKindSpecificLoader<'s> =
+    dyn FnMut(&mut ResolutionState<'s>, Extensions, &str) -> Option<Resolved>;
 
 // Go: module/resolver.go:46 tracer
 #[derive(Clone, Debug, Default)]
@@ -89,7 +90,10 @@ impl Tracer {
     // Go: module/resolver.go:55 tracer.write
     // PORT: the Go nil check is on the caller side (`trace_write!`).
     pub fn write(&mut self, diag: &'static ts_diagnostics::Message, args: Vec<String>) {
-        self.traces.push(DiagAndArgs { message: diag, args });
+        self.traces.push(DiagAndArgs {
+            message: diag,
+            args,
+        });
     }
 
     // Go: module/resolver.go:61 tracer.getTraces
@@ -177,8 +181,10 @@ pub fn new_resolution_state<'a>(
     resolver: &'a Resolver,
     trace_builder: Option<Rc<RefCell<Tracer>>>,
 ) -> ResolutionState<'a> {
-    let mut state =
-        ResolutionState::zero(resolver, get_compiler_options_with_redirect(compiler_options, redirected_reference));
+    let mut state = ResolutionState::zero(
+        resolver,
+        get_compiler_options_with_redirect(compiler_options, redirected_reference),
+    );
     state.name = name.to_string();
     state.containing_directory = containing_directory.to_string();
     state.tracer = trace_builder;
@@ -188,7 +194,8 @@ pub fn new_resolution_state<'a>(
     } else if compiler_options.no_dts_resolution == Tristate::True {
         state.extensions = Extensions::IMPLEMENTATION_FILES;
     } else {
-        state.extensions = Extensions::TYPE_SCRIPT | Extensions::JAVA_SCRIPT | Extensions::DECLARATION;
+        state.extensions =
+            Extensions::TYPE_SCRIPT | Extensions::JAVA_SCRIPT | Extensions::DECLARATION;
     }
 
     if !is_type_reference_directive && compiler_options.get_resolve_json_module() {
@@ -251,7 +258,11 @@ pub fn new_resolver(
     typings_location: &str,
     project_name: &str,
 ) -> Resolver {
-    let caches = new_caches(host.get_current_directory(), host.fs().use_case_sensitive_file_names(), &options);
+    let caches = new_caches(
+        host.get_current_directory(),
+        host.fs().use_case_sensitive_file_names(),
+        &options,
+    );
     Resolver {
         host,
         caches,
@@ -273,7 +284,11 @@ pub fn new_resolver_with_options(
     // PORT: Go sets the fields one by one on a zero `caches`.
     let caches = match opts.package_json_cache {
         Some(package_json_cache) => Caches::with_package_json_info_cache(package_json_cache),
-        None => new_caches(host.get_current_directory(), host.fs().use_case_sensitive_file_names(), &compiler_options),
+        None => new_caches(
+            host.get_current_directory(),
+            host.fs().use_case_sensitive_file_names(),
+            &compiler_options,
+        ),
     };
     Resolver {
         caches,
@@ -296,7 +311,8 @@ impl Resolver {
 
     // Go: module/resolver.go:211 GetPackageScopeForPath
     pub fn get_package_scope_for_path(&self, directory: &str) -> Option<Rc<InfoCacheEntry>> {
-        ResolutionState::zero(self, self.compiler_options.clone()).get_package_scope_for_path(directory)
+        ResolutionState::zero(self, self.compiler_options.clone())
+            .get_package_scope_for_path(directory)
     }
 }
 
@@ -329,7 +345,8 @@ impl Resolver {
         let containing_directory = get_directory_path(containing_file);
         let trace_builder = self.new_trace_builder();
 
-        let from_inferred_types_containing_file = containing_file.ends_with(INFERRED_TYPES_CONTAINING_FILE);
+        let from_inferred_types_containing_file =
+            containing_file.ends_with(INFERRED_TYPES_CONTAINING_FILE);
 
         let cache_key = TypeRefDirectiveResolutionCacheKey {
             containing_directory: containing_directory.clone(),
@@ -340,19 +357,29 @@ impl Resolver {
         };
 
         if trace_builder.is_none() {
-            if let Some(cached) = self.caches.type_ref_directive_resolution_cache.get(&cache_key) {
+            if let Some(cached) = self
+                .caches
+                .type_ref_directive_resolution_cache
+                .get(&cache_key)
+            {
                 return (cached, Vec::new());
             }
         }
 
-        let compiler_options = get_compiler_options_with_redirect(&self.compiler_options, redirected_reference);
+        let compiler_options =
+            get_compiler_options_with_redirect(&self.compiler_options, redirected_reference);
 
-        let (type_roots, from_config) = compiler_options.get_effective_type_roots(self.host.get_current_directory());
+        let (type_roots, from_config) =
+            compiler_options.get_effective_type_roots(self.host.get_current_directory());
         if let Some(trace_builder) = &trace_builder {
             let mut trace_builder = trace_builder.borrow_mut();
             trace_builder.write(
                 diag::Resolving_type_reference_directive_0_containing_file_1_root_directory_2,
-                args![type_reference_directive_name, containing_file, type_roots.join(",")],
+                args![
+                    type_reference_directive_name,
+                    containing_file,
+                    type_roots.join(",")
+                ],
             );
             trace_builder.trace_resolution_using_project_reference(redirected_reference);
         }
@@ -374,10 +401,14 @@ impl Resolver {
         ));
 
         if let Some(trace_builder) = &trace_builder {
-            trace_builder.borrow_mut().trace_type_reference_directive_result(type_reference_directive_name, &result);
+            trace_builder
+                .borrow_mut()
+                .trace_type_reference_directive_result(type_reference_directive_name, &result);
         }
 
-        self.caches.type_ref_directive_resolution_cache.set(cache_key, result.clone());
+        self.caches
+            .type_ref_directive_resolution_cache
+            .set(cache_key, result.clone());
 
         (result, traces_of(&trace_builder))
     }
@@ -406,10 +437,14 @@ impl Resolver {
             }
         }
 
-        let compiler_options = get_compiler_options_with_redirect(&self.compiler_options, redirected_reference);
+        let compiler_options =
+            get_compiler_options_with_redirect(&self.compiler_options, redirected_reference);
         if let Some(trace_builder) = &trace_builder {
             let mut trace_builder = trace_builder.borrow_mut();
-            trace_builder.write(diag::Resolving_module_0_from_1, args![module_name, containing_file]);
+            trace_builder.write(
+                diag::Resolving_module_0_from_1,
+                args![module_name, containing_file],
+            );
             trace_builder.trace_resolution_using_project_reference(redirected_reference);
         }
 
@@ -453,7 +488,11 @@ impl Resolver {
                 if !result.package_id.name.is_empty() {
                     trace_builder.write(
                         diag::Module_name_0_was_successfully_resolved_to_1_with_Package_ID_2,
-                        args![module_name, result.resolved_file_name, result.package_id.string()],
+                        args![
+                            module_name,
+                            result.resolved_file_name,
+                            result.package_id.string()
+                        ],
                     );
                 } else {
                     trace_builder.write(
@@ -466,9 +505,15 @@ impl Resolver {
             }
         }
 
-        let final_result =
-            Rc::new(self.try_resolve_from_typings_location(module_name, &containing_directory, result, &trace_builder));
-        self.caches.module_resolution_cache.set(cache_key, final_result.clone());
+        let final_result = Rc::new(self.try_resolve_from_typings_location(
+            module_name,
+            &containing_directory,
+            result,
+            &trace_builder,
+        ));
+        self.caches
+            .module_resolution_cache
+            .set(cache_key, final_result.clone());
 
         (final_result, traces_of(&trace_builder))
     }
@@ -482,7 +527,8 @@ impl Resolver {
         resolution_mode: ResolutionMode,
         redirected_reference: Option<&dyn ModuleResolvedProjectReference>,
     ) -> Option<ResolvedModule> {
-        let compiler_options = get_compiler_options_with_redirect(&self.compiler_options, redirected_reference);
+        let compiler_options =
+            get_compiler_options_with_redirect(&self.compiler_options, redirected_reference);
         let containing_directory = get_directory_path(containing_file);
         let mut state = new_resolution_state(
             module_name,
@@ -495,7 +541,8 @@ impl Resolver {
             None,
         );
         state.resolve_package_directory_only = true;
-        let result = state.load_module_from_nearest_node_modules_directory(false /*typesScopeOnly*/);
+        let result =
+            state.load_module_from_nearest_node_modules_directory(false /*typesScopeOnly*/);
         if resolved_is_resolved(&result) {
             return Some(state.create_resolved_module_handling_symlink(result));
         }
@@ -514,7 +561,10 @@ impl Resolver {
         if self.typings_location.is_empty()
             || is_external_module_name_relative(module_name)
             || (!original_result.resolved_file_name.is_empty()
-                && extension_is_one_of(&original_result.extension, SUPPORTED_TS_EXTENSIONS_WITH_JSON_FLAT))
+                && extension_is_one_of(
+                    &original_result.extension,
+                    SUPPORTED_TS_EXTENSIONS_WITH_JSON_FLAT,
+                ))
         {
             return original_result;
         }
@@ -522,7 +572,7 @@ impl Resolver {
         let mut state = new_resolution_state(
             module_name,
             containing_directory,
-            false,           /*isTypeReferenceDirective*/
+            false,            /*isTypeReferenceDirective*/
             ModuleKind::NONE, // resolutionMode,
             &self.compiler_options,
             None, // redirectedReference,
@@ -535,8 +585,11 @@ impl Resolver {
                 args![self.project_name, module_name, self.typings_location],
             );
         }
-        let global_resolved =
-            state.load_module_from_immediate_node_modules_directory(Extensions::DECLARATION, &self.typings_location, false);
+        let global_resolved = state.load_module_from_immediate_node_modules_directory(
+            Extensions::DECLARATION,
+            &self.typings_location,
+            false,
+        );
         if global_resolved.is_none() {
             return original_result;
         }
@@ -574,7 +627,10 @@ impl Tracer {
         result: &ResolvedTypeReferenceDirective,
     ) {
         if !result.is_resolved() {
-            self.write(diag::Type_reference_directive_0_was_not_resolved, args![type_reference_directive_name]);
+            self.write(
+                diag::Type_reference_directive_0_was_not_resolved,
+                args![type_reference_directive_name],
+            );
         } else if !result.package_id.name.is_empty() {
             self.write(
                 diag::Type_reference_directive_0_was_successfully_resolved_to_1_with_Package_ID_2_primary_Colon_3,
@@ -588,7 +644,11 @@ impl Tracer {
         } else {
             self.write(
                 diag::Type_reference_directive_0_was_successfully_resolved_to_1_primary_Colon_2,
-                args![type_reference_directive_name, result.resolved_file_name, result.primary],
+                args![
+                    type_reference_directive_name,
+                    result.resolved_file_name,
+                    result.primary
+                ],
             );
         }
     }
@@ -604,46 +664,78 @@ impl ResolutionState<'_> {
     ) -> ResolvedTypeReferenceDirective {
         // Primary lookup
         if !type_roots.is_empty() {
-            trace_write!(self, diag::Resolving_with_primary_search_path_0, type_roots.join(", "));
+            trace_write!(
+                self,
+                diag::Resolving_with_primary_search_path_0,
+                type_roots.join(", ")
+            );
             for type_root in type_roots {
                 let candidate = self.get_candidate_from_type_root(type_root);
                 let directory_exists = self.resolver.host.fs().directory_exists(type_root);
                 if !directory_exists {
-                    trace_write!(self, diag::Directory_0_does_not_exist_skipping_all_lookups_in_it, type_root);
+                    trace_write!(
+                        self,
+                        diag::Directory_0_does_not_exist_skipping_all_lookups_in_it,
+                        type_root
+                    );
                     continue;
                 }
                 if from_config {
                     // Custom typeRoots resolve as file or directory just like we do modules
-                    let resolved_from_file = self.load_module_from_file(Extensions::DECLARATION, &candidate);
+                    let resolved_from_file =
+                        self.load_module_from_file(Extensions::DECLARATION, &candidate);
                     if let Some(mut resolved_from_file) = resolved_from_file {
-                        let package_directory = parse_node_module_from_path(&resolved_from_file.path, false);
+                        let package_directory =
+                            parse_node_module_from_path(&resolved_from_file.path, false);
                         if !package_directory.is_empty() {
                             let package_info = self.get_package_json_info(&package_directory);
-                            resolved_from_file.package_id = self.get_package_id(&resolved_from_file.path, &package_info);
+                            resolved_from_file.package_id =
+                                self.get_package_id(&resolved_from_file.path, &package_info);
                         }
-                        return self.create_resolved_type_reference_directive(Some(resolved_from_file), true /*primary*/);
+                        return self.create_resolved_type_reference_directive(
+                            Some(resolved_from_file),
+                            true, /*primary*/
+                        );
                     }
                 }
-                let resolved_from_directory =
-                    self.load_node_module_from_directory(Extensions::DECLARATION, &candidate, true /*considerPackageJson*/);
+                let resolved_from_directory = self.load_node_module_from_directory(
+                    Extensions::DECLARATION,
+                    &candidate,
+                    true, /*considerPackageJson*/
+                );
                 if resolved_from_directory.is_some() {
-                    return self.create_resolved_type_reference_directive(resolved_from_directory, true /*primary*/);
+                    return self.create_resolved_type_reference_directive(
+                        resolved_from_directory,
+                        true, /*primary*/
+                    );
                 }
             }
         } else {
-            trace_write!(self, diag::Root_directory_cannot_be_determined_skipping_primary_search_paths);
+            trace_write!(
+                self,
+                diag::Root_directory_cannot_be_determined_skipping_primary_search_paths
+            );
         }
 
         // Secondary lookup
         let mut resolved: Option<Resolved> = None;
         if !from_config || !from_inferred_types_containing_file {
-            trace_write!(self, diag::Looking_up_in_node_modules_folder_initial_location_0, self.containing_directory);
+            trace_write!(
+                self,
+                diag::Looking_up_in_node_modules_folder_initial_location_0,
+                self.containing_directory
+            );
             if !is_external_module_name_relative(&self.name) {
-                resolved = self.load_module_from_nearest_node_modules_directory(false /*typesScopeOnly*/);
+                resolved = self
+                    .load_module_from_nearest_node_modules_directory(false /*typesScopeOnly*/);
             } else {
-                let candidate = normalize_path_for_cjs_resolution(&self.containing_directory, &self.name);
-                resolved =
-                    self.node_load_module_by_relative_name(Extensions::DECLARATION, &candidate, true /*considerPackageJson*/);
+                let candidate =
+                    normalize_path_for_cjs_resolution(&self.containing_directory, &self.name);
+                resolved = self.node_load_module_by_relative_name(
+                    Extensions::DECLARATION,
+                    &candidate,
+                    true, /*considerPackageJson*/
+                );
             }
         } else {
             trace_write!(
@@ -657,7 +749,9 @@ impl ResolutionState<'_> {
     // Go: module/resolver.go:447 getCandidateFromTypeRoot
     pub fn get_candidate_from_type_root(&mut self, type_root: &str) -> String {
         let mut name_for_lookup = self.name.clone();
-        if type_root.ends_with("/node_modules/@types") || type_root.ends_with("/node_modules/@types/") {
+        if type_root.ends_with("/node_modules/@types")
+            || type_root.ends_with("/node_modules/@types/")
+        {
             let name = self.name.clone();
             name_for_lookup = self.mangle_scoped_package_name(&name);
         }
@@ -685,20 +779,30 @@ impl ResolutionState<'_> {
             let candidate = self.get_candidate_from_type_root(type_root);
             let directory_exists = self.resolver.host.fs().directory_exists(type_root);
             if !directory_exists {
-                trace_write!(self, diag::Directory_0_does_not_exist_skipping_all_lookups_in_it, type_root);
+                trace_write!(
+                    self,
+                    diag::Directory_0_does_not_exist_skipping_all_lookups_in_it,
+                    type_root
+                );
                 continue;
             }
-            let resolved_from_file = self.load_module_from_file(Extensions::DECLARATION, &candidate);
+            let resolved_from_file =
+                self.load_module_from_file(Extensions::DECLARATION, &candidate);
             if let Some(mut resolved_from_file) = resolved_from_file {
-                let package_directory = parse_node_module_from_path(&resolved_from_file.path, false);
+                let package_directory =
+                    parse_node_module_from_path(&resolved_from_file.path, false);
                 if !package_directory.is_empty() {
                     let package_info = self.get_package_json_info(&package_directory);
-                    resolved_from_file.package_id = self.get_package_id(&resolved_from_file.path, &package_info);
+                    resolved_from_file.package_id =
+                        self.get_package_id(&resolved_from_file.path, &package_info);
                 }
                 return Some(resolved_from_file);
             }
-            let resolved =
-                self.load_node_module_from_directory(Extensions::DECLARATION, &candidate, true /*considerPackageJson*/);
+            let resolved = self.load_node_module_from_directory(
+                Extensions::DECLARATION,
+                &candidate,
+                true, /*considerPackageJson*/
+            );
             if resolved.is_some() {
                 return resolved;
             }
@@ -725,22 +829,42 @@ impl ResolutionState<'_> {
     // Go: module/resolver.go:507 resolveNodeLike
     pub fn resolve_node_like(&mut self) -> ResolvedModule {
         if self.tracer.is_some() {
-            let conditions = self.conditions.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ");
+            let conditions = self
+                .conditions
+                .iter()
+                .map(|c| format!("'{c}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
             if self.esm_mode {
-                trace_write!(self, diag::Resolving_in_0_mode_with_conditions_1, "ESM", conditions);
+                trace_write!(
+                    self,
+                    diag::Resolving_in_0_mode_with_conditions_1,
+                    "ESM",
+                    conditions
+                );
             } else {
-                trace_write!(self, diag::Resolving_in_0_mode_with_conditions_1, "CJS", conditions);
+                trace_write!(
+                    self,
+                    diag::Resolving_in_0_mode_with_conditions_1,
+                    "CJS",
+                    conditions
+                );
             }
         }
         let mut result = self.resolve_node_like_worker();
         if self.resolved_package_directory
             && !self.is_config_lookup
             && self.features.intersects(NodeResolutionFeatures::EXPORTS)
-            && self.extensions.intersects(Extensions::TYPE_SCRIPT | Extensions::DECLARATION)
+            && self
+                .extensions
+                .intersects(Extensions::TYPE_SCRIPT | Extensions::DECLARATION)
             && !is_external_module_name_relative(&self.name)
             && result.is_resolved()
             && result.is_external_library_import
-            && !extension_is_ok(Extensions::TYPE_SCRIPT | Extensions::DECLARATION, &result.extension)
+            && !extension_is_ok(
+                Extensions::TYPE_SCRIPT | Extensions::DECLARATION,
+                &result.extension,
+            )
             && self.conditions.iter().any(|c| c == "import")
         {
             trace_write!(
@@ -767,7 +891,9 @@ impl ResolutionState<'_> {
         }
 
         if !is_external_module_name_relative(&self.name) {
-            if self.features.intersects(NodeResolutionFeatures::IMPORTS) && self.name.starts_with('#') {
+            if self.features.intersects(NodeResolutionFeatures::IMPORTS)
+                && self.name.starts_with('#')
+            {
                 let resolved = self.load_module_from_imports();
                 if resolved.is_some() {
                     return self.create_resolved_module_handling_symlink(resolved);
@@ -794,7 +920,8 @@ impl ResolutionState<'_> {
                 self.name,
                 self.extensions.string()
             );
-            let resolved = self.load_module_from_nearest_node_modules_directory(false /*typesScopeOnly*/);
+            let resolved =
+                self.load_module_from_nearest_node_modules_directory(false /*typesScopeOnly*/);
             if resolved.is_some() {
                 return self.create_resolved_module_handling_symlink(resolved);
             }
@@ -805,10 +932,13 @@ impl ResolutionState<'_> {
                 }
             }
         } else {
-            let candidate = normalize_path_for_cjs_resolution(&self.containing_directory, &self.name);
+            let candidate =
+                normalize_path_for_cjs_resolution(&self.containing_directory, &self.name);
             let extensions = self.extensions;
             let resolved = self.node_load_module_by_relative_name(extensions, &candidate, true);
-            let is_external_library_import = resolved.as_ref().is_some_and(|r| r.path.contains("/node_modules/"));
+            let is_external_library_import = resolved
+                .as_ref()
+                .is_some_and(|r| r.path.contains("/node_modules/"));
             return self.create_resolved_module(resolved, is_external_library_import);
         }
         self.create_resolved_module(None, false)
@@ -816,11 +946,23 @@ impl ResolutionState<'_> {
 
     // Go: module/resolver.go:584 loadModuleFromSelfNameReference
     pub fn load_module_from_self_name_reference(&mut self) -> Option<Resolved> {
-        let directory_path =
-            get_normalized_absolute_path(&self.containing_directory, self.resolver.host.get_current_directory());
+        let directory_path = get_normalized_absolute_path(
+            &self.containing_directory,
+            self.resolver.host.get_current_directory(),
+        );
         let scope = self.get_package_scope_for_path(&directory_path);
         if !entry_exists(&scope)
-            || scope.as_ref().unwrap().contents.as_ref().unwrap().fields.path_fields.exports.json_value.is_falsy()
+            || scope
+                .as_ref()
+                .unwrap()
+                .contents
+                .as_ref()
+                .unwrap()
+                .fields
+                .path_fields
+                .exports
+                .json_value
+                .is_falsy()
         {
             // !!! falsy check seems wrong?
             return continue_searching();
@@ -835,7 +977,10 @@ impl ResolutionState<'_> {
         if parts.len() < name_parts.len() || name_parts[..] != parts[..name_parts.len()] {
             return continue_searching();
         }
-        let trailing_parts: Vec<&str> = parts[name_parts.len()..].iter().map(String::as_str).collect();
+        let trailing_parts: Vec<&str> = parts[name_parts.len()..]
+            .iter()
+            .map(String::as_str)
+            .collect();
         let subpath = if !trailing_parts.is_empty() {
             combine_paths(".", &trailing_parts)
         } else {
@@ -854,12 +999,17 @@ impl ResolutionState<'_> {
         // to ensure that self-name imports of their own package can resolve back to their
         // input JS files via `tryLoadInputFileForPath` at a higher priority than their output
         // declaration files, so we need to do a single pass with all extensions for that case.
-        if self.compiler_options.get_allow_js() && !self.containing_directory.contains("/node_modules/") {
+        if self.compiler_options.get_allow_js()
+            && !self.containing_directory.contains("/node_modules/")
+        {
             let extensions = self.extensions;
             return self.load_module_from_exports(&scope, extensions, &subpath);
         }
-        let priority_extensions = self.extensions & (Extensions::TYPE_SCRIPT | Extensions::DECLARATION);
-        let secondary_extensions = self.extensions.without(Extensions::TYPE_SCRIPT | Extensions::DECLARATION);
+        let priority_extensions =
+            self.extensions & (Extensions::TYPE_SCRIPT | Extensions::DECLARATION);
+        let secondary_extensions = self
+            .extensions
+            .without(Extensions::TYPE_SCRIPT | Extensions::DECLARATION);
         let resolved = self.load_module_from_exports(&scope, priority_extensions, &subpath);
         if resolved.is_some() {
             return resolved;
@@ -870,13 +1020,22 @@ impl ResolutionState<'_> {
     // Go: module/resolver.go:631 loadModuleFromImports
     pub fn load_module_from_imports(&mut self) -> Option<Resolved> {
         if self.name == "#"
-            || (self.name.starts_with("#/") && !self.features.intersects(NodeResolutionFeatures::IMPORTS_PATTERN_ROOT))
+            || (self.name.starts_with("#/")
+                && !self
+                    .features
+                    .intersects(NodeResolutionFeatures::IMPORTS_PATTERN_ROOT))
         {
-            trace_write!(self, diag::Invalid_import_specifier_0_has_no_possible_resolutions, self.name);
+            trace_write!(
+                self,
+                diag::Invalid_import_specifier_0_has_no_possible_resolutions,
+                self.name
+            );
             return continue_searching();
         }
-        let directory_path =
-            get_normalized_absolute_path(&self.containing_directory, self.resolver.host.get_current_directory());
+        let directory_path = get_normalized_absolute_path(
+            &self.containing_directory,
+            self.resolver.host.get_current_directory(),
+        );
         let scope = self.get_package_scope_for_path(&directory_path);
         if !entry_exists(&scope) {
             trace_write!(
@@ -892,7 +1051,11 @@ impl ResolutionState<'_> {
         if imports.json_value.type_ != JSONValueType::OBJECT {
             // !!! Old compiler only checks for undefined, but then assumes `imports` is an object if present.
             // Maybe should have a new diagnostic for imports of an invalid type. Also, array should be handled?
-            trace_write!(self, diag::X_package_json_scope_0_has_no_imports_defined, scope.package_directory);
+            trace_write!(
+                self,
+                diag::X_package_json_scope_0_has_no_imports_defined,
+                scope.package_directory
+            );
             return continue_searching();
         }
 
@@ -927,7 +1090,17 @@ impl ResolutionState<'_> {
     ) -> Option<Resolved> {
         // !!! This is ported exactly, but the falsy check seems wrong
         if !entry_exists(package_info)
-            || package_info.as_ref().unwrap().contents.as_ref().unwrap().fields.path_fields.exports.json_value.is_falsy()
+            || package_info
+                .as_ref()
+                .unwrap()
+                .contents
+                .as_ref()
+                .unwrap()
+                .fields
+                .path_fields
+                .exports
+                .json_value
+                .is_falsy()
         {
             return continue_searching();
         }
@@ -1019,12 +1192,15 @@ impl ResolutionState<'_> {
         expanding_keys.sort_by(|a, b| compare_pattern_keys(a, b).cmp(&0));
 
         for potential_target in expanding_keys {
-            if self.features.intersects(NodeResolutionFeatures::EXPORTS_PATTERN_TRAILERS)
+            if self
+                .features
+                .intersects(NodeResolutionFeatures::EXPORTS_PATTERN_TRAILERS)
                 && matches_pattern_with_trailer(potential_target, module_name)
             {
                 let target = &lookup_table[potential_target];
                 let star_pos = potential_target.find('*').unwrap();
-                let subpath = &module_name[star_pos..module_name.len() - (potential_target.len() - 1 - star_pos)];
+                let subpath = &module_name
+                    [star_pos..module_name.len() - (potential_target.len() - 1 - star_pos)];
                 return self.load_module_from_target_export_or_import(
                     extensions,
                     module_name,
@@ -1105,13 +1281,27 @@ impl ResolutionState<'_> {
                         } else {
                             format!("{target_string}{subpath}")
                         };
-                        let scope_containing_directory = ensure_trailing_directory_separator(&scope.package_directory);
-                        trace_write!(self, diag::Using_0_subpath_1_with_target_2, "imports", key, combined_lookup);
-                        trace_write!(self, diag::Resolving_module_0_from_1, combined_lookup, scope_containing_directory);
+                        let scope_containing_directory =
+                            ensure_trailing_directory_separator(&scope.package_directory);
+                        trace_write!(
+                            self,
+                            diag::Using_0_subpath_1_with_target_2,
+                            "imports",
+                            key,
+                            combined_lookup
+                        );
+                        trace_write!(
+                            self,
+                            diag::Resolving_module_0_from_1,
+                            combined_lookup,
+                            scope_containing_directory
+                        );
                         // PORT: Go restores `name` and `containingDirectory` with `defer`.
                         let name = std::mem::replace(&mut self.name, combined_lookup);
-                        let containing_directory =
-                            std::mem::replace(&mut self.containing_directory, scope_containing_directory);
+                        let containing_directory = std::mem::replace(
+                            &mut self.containing_directory,
+                            scope_containing_directory,
+                        );
                         let result = self.resolve_node_like();
                         self.name = name;
                         self.containing_directory = containing_directory;
@@ -1140,7 +1330,10 @@ impl ResolutionState<'_> {
                     get_path_components(&target_string, "")
                 };
                 let parts_after_first = &parts[1..];
-                if parts_after_first.iter().any(|p| p == ".." || p == "." || p == "node_modules") {
+                if parts_after_first
+                    .iter()
+                    .any(|p| p == ".." || p == "." || p == "node_modules")
+                {
                     trace_write!(
                         self,
                         diag::X_package_json_scope_0_has_invalid_type_for_target_of_specifier_1,
@@ -1153,7 +1346,10 @@ impl ResolutionState<'_> {
                 // TODO: Assert that `resolvedTarget` is actually within the package directory? That's what the spec says.... but I'm not sure we need
                 // to be in the business of validating everyone's import and export map correctness.
                 let subpath_parts = get_path_components(subpath, "");
-                if subpath_parts.iter().any(|p| p == ".." || p == "." || p == "node_modules") {
+                if subpath_parts
+                    .iter()
+                    .any(|p| p == ".." || p == "." || p == "node_modules")
+                {
                     trace_write!(
                         self,
                         diag::X_package_json_scope_0_has_invalid_type_for_target_of_specifier_1,
@@ -1199,7 +1395,11 @@ impl ResolutionState<'_> {
                     input_link.package_id = self.get_package_id(&input_link.path, &scope_info);
                     return Some(input_link);
                 }
-                let result = self.load_file_name_from_package_json_field(extensions, &final_path, &target_string);
+                let result = self.load_file_name_from_package_json_field(
+                    extensions,
+                    &final_path,
+                    &target_string,
+                );
                 if let Some(mut result) = result {
                     result.package_id = self.get_package_id(&result.path, &scope_info);
                     return Some(result);
@@ -1233,7 +1433,11 @@ impl ResolutionState<'_> {
                             trace_write!(self, diag::Exiting_conditional_exports);
                             return result;
                         } else {
-                            trace_write!(self, diag::Failed_to_resolve_under_condition_0, condition);
+                            trace_write!(
+                                self,
+                                diag::Failed_to_resolve_under_condition_0,
+                                condition
+                            );
                         }
                     } else {
                         trace_write!(self, diag::Saw_non_matching_condition_0, condition);
@@ -1307,7 +1511,11 @@ impl ResolutionState<'_> {
             && (!options.declaration_dir.is_empty() || !options.out_dir.is_empty())
             && !final_path.contains("/node_modules/")
             && (options.config_file_path.is_empty()
-                || contains_path(&get_directory_path(package_path), &options.config_file_path, &compare_paths_options))
+                || contains_path(
+                    &get_directory_path(package_path),
+                    &options.config_file_path,
+                    &compare_paths_options,
+                ))
         {
             // Note: this differs from Strada's tryLoadInputFileForPath in that it
             // does not attempt to perform "guesses", instead requring a clear root indicator.
@@ -1355,14 +1563,21 @@ impl ResolutionState<'_> {
                     ];
                     for ext in js_and_dts_extensions {
                         if file_extension_is(&possible_input_base, ext) {
-                            let input_exts = get_possible_original_input_extension_for_extension(&possible_input_base);
+                            let input_exts = get_possible_original_input_extension_for_extension(
+                                &possible_input_base,
+                            );
                             for possible_ext in &input_exts {
                                 if !extension_is_ok(self.extensions, possible_ext) {
                                     continue;
                                 }
                                 let possible_input_with_input_extension =
                                     change_extension(&possible_input_base, possible_ext);
-                                if self.resolver.host.fs().file_exists(&possible_input_with_input_extension) {
+                                if self
+                                    .resolver
+                                    .host
+                                    .fs()
+                                    .file_exists(&possible_input_with_input_extension)
+                                {
                                     let extensions = self.extensions;
                                     let resolved = self.load_file_name_from_package_json_field(
                                         extensions,
@@ -1384,12 +1599,18 @@ impl ResolutionState<'_> {
 
     // Go: module/resolver.go:963 getOutputDirectoriesForBaseDirectory
     #[must_use]
-    pub fn get_output_directories_for_base_directory(&self, common_source_dir_guess: &str) -> Vec<String> {
+    pub fn get_output_directories_for_base_directory(
+        &self,
+        common_source_dir_guess: &str,
+    ) -> Vec<String> {
         // Config file output paths are processed to be relative to the host's current directory, while
         // otherwise the paths are resolved relative to the common source dir the compiler puts together
         let current_directory = self.resolver.host.get_current_directory();
-        let current_dir =
-            if !self.compiler_options.config_file_path.is_empty() { current_directory } else { common_source_dir_guess };
+        let current_dir = if !self.compiler_options.config_file_path.is_empty() {
+            current_directory
+        } else {
+            common_source_dir_guess
+        };
         let mut candidate_directories: Vec<String> = Vec::new();
         if !self.compiler_options.declaration_dir.is_empty() {
             candidate_directories.push(get_normalized_absolute_path(
@@ -1409,7 +1630,10 @@ impl ResolutionState<'_> {
     }
 
     // Go: module/resolver.go:977 loadModuleFromNearestNodeModulesDirectory
-    pub fn load_module_from_nearest_node_modules_directory(&mut self, types_scope_only: bool) -> Option<Resolved> {
+    pub fn load_module_from_nearest_node_modules_directory(
+        &mut self,
+        types_scope_only: bool,
+    ) -> Option<Resolved> {
         let mut mode = RESOLUTION_MODE_COMMON_JS;
         if self.esm_mode || self.condition_matches("import") {
             mode = RESOLUTION_MODE_ESM;
@@ -1420,8 +1644,11 @@ impl ResolutionState<'_> {
         //      ii. DTS files in the @types package
         //   2. For each ancestor node_modules directory, try to find:
         //      i.  JS files in the implementation package
-        let priority_extensions = self.extensions & (Extensions::TYPE_SCRIPT | Extensions::DECLARATION);
-        let secondary_extensions = self.extensions.without(Extensions::TYPE_SCRIPT | Extensions::DECLARATION);
+        let priority_extensions =
+            self.extensions & (Extensions::TYPE_SCRIPT | Extensions::DECLARATION);
+        let secondary_extensions = self
+            .extensions
+            .without(Extensions::TYPE_SCRIPT | Extensions::DECLARATION);
         // (1)
         if priority_extensions != Extensions::default() {
             trace_write!(
@@ -1429,7 +1656,11 @@ impl ResolutionState<'_> {
                 diag::Searching_all_ancestor_node_modules_directories_for_preferred_extensions_Colon_0,
                 priority_extensions.string()
             );
-            let result = self.load_module_from_nearest_node_modules_directory_worker(priority_extensions, mode, types_scope_only);
+            let result = self.load_module_from_nearest_node_modules_directory_worker(
+                priority_extensions,
+                mode,
+                types_scope_only,
+            );
             if result.is_some() {
                 return result;
             }
@@ -1441,7 +1672,11 @@ impl ResolutionState<'_> {
                 diag::Searching_all_ancestor_node_modules_directories_for_fallback_extensions_Colon_0,
                 secondary_extensions.string()
             );
-            return self.load_module_from_nearest_node_modules_directory_worker(secondary_extensions, mode, types_scope_only);
+            return self.load_module_from_nearest_node_modules_directory_worker(
+                secondary_extensions,
+                mode,
+                types_scope_only,
+            );
         }
         continue_searching()
     }
@@ -1455,15 +1690,22 @@ impl ResolutionState<'_> {
         types_scope_only: bool,
     ) -> Option<Resolved> {
         let containing_directory = self.containing_directory.clone();
-        let (result, _) = for_each_ancestor_directory(&containing_directory, |directory: &str| -> (Option<Resolved>, bool) {
-            // !!! stop at global cache
-            if get_base_file_name(directory) != "node_modules" {
-                let result = self.load_module_from_immediate_node_modules_directory(ext, directory, types_scope_only);
-                let stop = result.is_some();
-                return (result, stop);
-            }
-            (continue_searching(), false)
-        });
+        let (result, _) = for_each_ancestor_directory(
+            &containing_directory,
+            |directory: &str| -> (Option<Resolved>, bool) {
+                // !!! stop at global cache
+                if get_base_file_name(directory) != "node_modules" {
+                    let result = self.load_module_from_immediate_node_modules_directory(
+                        ext,
+                        directory,
+                        types_scope_only,
+                    );
+                    let stop = result.is_some();
+                    return (result, stop);
+                }
+                (continue_searching(), false)
+            },
+        );
         result
     }
 
@@ -1475,14 +1717,27 @@ impl ResolutionState<'_> {
         types_scope_only: bool,
     ) -> Option<Resolved> {
         let node_modules_folder = combine_paths(directory, &["node_modules"]);
-        if !self.resolver.host.fs().directory_exists(&node_modules_folder) {
-            trace_write!(self, diag::Directory_0_does_not_exist_skipping_all_lookups_in_it, node_modules_folder);
+        if !self
+            .resolver
+            .host
+            .fs()
+            .directory_exists(&node_modules_folder)
+        {
+            trace_write!(
+                self,
+                diag::Directory_0_does_not_exist_skipping_all_lookups_in_it,
+                node_modules_folder
+            );
             return continue_searching();
         }
 
         if !types_scope_only {
             let name = self.name.clone();
-            let package_result = self.load_module_from_specific_node_modules_directory(extensions, &name, &node_modules_folder);
+            let package_result = self.load_module_from_specific_node_modules_directory(
+                extensions,
+                &name,
+                &node_modules_folder,
+            );
             if package_result.is_some() {
                 return package_result;
             }
@@ -1490,8 +1745,17 @@ impl ResolutionState<'_> {
 
         if extensions.intersects(Extensions::DECLARATION) {
             let node_modules_at_types = combine_paths(&node_modules_folder, &["@types"]);
-            if !self.resolver.host.fs().directory_exists(&node_modules_at_types) {
-                trace_write!(self, diag::Directory_0_does_not_exist_skipping_all_lookups_in_it, node_modules_at_types);
+            if !self
+                .resolver
+                .host
+                .fs()
+                .directory_exists(&node_modules_at_types)
+            {
+                trace_write!(
+                    self,
+                    diag::Directory_0_does_not_exist_skipping_all_lookups_in_it,
+                    node_modules_at_types
+                );
                 return continue_searching();
             }
             let name = self.name.clone();
@@ -1521,9 +1785,11 @@ impl ResolutionState<'_> {
         // causing `loadNodeModuleFromDirectoryWorker`'s `ComparePaths(candidate, ...)`
         // check to fail and skip loading the package's `main`/`types` entry.
         // https://github.com/microsoft/typescript-go/issues/3526
-        let candidate =
-            remove_trailing_directory_separator(&normalize_path(&combine_paths(node_modules_directory, &[module_name])))
-                .to_string();
+        let candidate = remove_trailing_directory_separator(&normalize_path(&combine_paths(
+            node_modules_directory,
+            &[module_name],
+        )))
+        .to_string();
         let (package_name, rest) = parse_package_name(module_name);
         let mut package_directory = combine_paths(node_modules_directory, &[&package_name]);
         if package_name.is_empty() {
@@ -1532,7 +1798,10 @@ impl ResolutionState<'_> {
 
         if self.resolve_package_directory_only {
             if self.resolver.host.fs().directory_exists(&package_directory) {
-                return Some(Resolved { path: package_directory, ..Default::default() });
+                return Some(Resolved {
+                    path: package_directory,
+                    ..Default::default()
+                });
             }
             return continue_searching();
         }
@@ -1546,7 +1815,17 @@ impl ResolutionState<'_> {
                 root_package_info = self.get_package_json_info(&package_directory);
             }
             if !entry_exists(&root_package_info)
-                || root_package_info.as_ref().unwrap().contents.as_ref().unwrap().fields.path_fields.exports.json_value.type_
+                || root_package_info
+                    .as_ref()
+                    .unwrap()
+                    .contents
+                    .as_ref()
+                    .unwrap()
+                    .fields
+                    .path_fields
+                    .exports
+                    .json_value
+                    .type_
                     == JSONValueType::NOT_PRESENT
             {
                 let from_file = self.load_module_from_file(ext, &candidate);
@@ -1554,9 +1833,11 @@ impl ResolutionState<'_> {
                     return from_file;
                 }
 
-                let from_directory = self.load_node_module_from_directory_worker(ext, &candidate, &package_info);
+                let from_directory =
+                    self.load_node_module_from_directory_worker(ext, &candidate, &package_info);
                 if let Some(mut from_directory) = from_directory {
-                    from_directory.package_id = self.get_package_id(&from_directory.path, &package_info);
+                    from_directory.package_id =
+                        self.get_package_id(&from_directory.path, &package_info);
                     return Some(from_directory);
                 }
             }
@@ -1573,7 +1854,10 @@ impl ResolutionState<'_> {
             }
         }
 
-        let mut loader = |state: &mut Self, extensions: Extensions, candidate: &str| -> Option<Resolved> {
+        let mut loader = |state: &mut Self,
+                          extensions: Extensions,
+                          candidate: &str|
+         -> Option<Resolved> {
             if !rest.is_empty() || !state.esm_mode {
                 let from_file = state.load_module_from_file(extensions, candidate);
                 if let Some(mut from_file) = from_file {
@@ -1581,22 +1865,39 @@ impl ResolutionState<'_> {
                     return Some(from_file);
                 }
             }
-            let from_directory = state.load_node_module_from_directory_worker(extensions, candidate, &package_info);
+            let from_directory =
+                state.load_node_module_from_directory_worker(extensions, candidate, &package_info);
             if let Some(mut from_directory) = from_directory {
-                from_directory.package_id = state.get_package_id(&from_directory.path, &package_info);
+                from_directory.package_id =
+                    state.get_package_id(&from_directory.path, &package_info);
                 return Some(from_directory);
             }
-            if rest.is_empty() && entry_exists(&package_info) && {
-                let exports_type =
-                    package_info.as_ref().unwrap().contents.as_ref().unwrap().fields.path_fields.exports.json_value.type_;
-                exports_type == JSONValueType::NOT_PRESENT || exports_type == JSONValueType::NULL
-            } && state.esm_mode
+            if rest.is_empty()
+                && entry_exists(&package_info)
+                && {
+                    let exports_type = package_info
+                        .as_ref()
+                        .unwrap()
+                        .contents
+                        .as_ref()
+                        .unwrap()
+                        .fields
+                        .path_fields
+                        .exports
+                        .json_value
+                        .type_;
+                    exports_type == JSONValueType::NOT_PRESENT
+                        || exports_type == JSONValueType::NULL
+                }
+                && state.esm_mode
             {
                 // EsmMode disables index lookup in `loadNodeModuleFromDirectoryWorker` generally, however non-relative package resolutions still assume
                 // a default `index.js` entrypoint if no `main` or `exports` are present
-                let index_result = state.load_module_from_file(extensions, &combine_paths(candidate, &["index.js"]));
+                let index_result = state
+                    .load_module_from_file(extensions, &combine_paths(candidate, &["index.js"]));
                 if let Some(mut index_result) = index_result {
-                    index_result.package_id = state.get_package_id(&index_result.path, &package_info);
+                    index_result.package_id =
+                        state.get_package_id(&index_result.path, &package_info);
                     return Some(index_result);
                 }
             }
@@ -1607,12 +1908,26 @@ impl ResolutionState<'_> {
             self.resolved_package_directory = true;
             if self.features.intersects(NodeResolutionFeatures::EXPORTS)
                 && entry_exists(&package_info)
-                && !package_info.as_ref().unwrap().contents.as_ref().unwrap().fields.path_fields.exports.json_value.is_falsy()
+                && !package_info
+                    .as_ref()
+                    .unwrap()
+                    .contents
+                    .as_ref()
+                    .unwrap()
+                    .fields
+                    .path_fields
+                    .exports
+                    .json_value
+                    .is_falsy()
             {
                 // package exports are higher priority than file/directory/typesVersions lookups and (and, if there's exports present*, blocks them)
                 // *Well, weirdly enough a top-level `"exports": null` does NOT block fallback resolution.
                 // https://github.com/microsoft/TypeScript/pull/49327
-                return self.load_module_from_exports(&package_info, ext, &combine_paths(".", &[&rest]));
+                return self.load_module_from_exports(
+                    &package_info,
+                    ext,
+                    &combine_paths(".", &[&rest]),
+                );
             }
             if !rest.is_empty() && entry_exists(&package_info) {
                 let contents = package_info.as_ref().unwrap().contents.clone().unwrap();

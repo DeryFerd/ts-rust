@@ -2,13 +2,13 @@
 
 use std::cell::Cell;
 
-use super::diagnostics::{
-    create_diagnostic_for_node, create_get_isolated_declaration_errors, GetIsolatedDeclarationError,
-    GetSymbolAccessibilityDiagnostic,
-};
 use super::DeclarationEmitHost;
-use crate::checker::nodebuilder_types::SymbolTracker;
+use super::diagnostics::{
+    GetIsolatedDeclarationError, GetSymbolAccessibilityDiagnostic, create_diagnostic_for_node,
+    create_get_isolated_declaration_errors,
+};
 use crate::checker::Checker;
+use crate::checker::nodebuilder_types::SymbolTracker;
 use crate::prelude::*;
 use crate::printer::{EmitResolver, SymbolAccessibility, SymbolAccessibilityResult};
 
@@ -52,7 +52,10 @@ impl SymbolTrackerImpl {
             let resolver = self.resolver.clone();
             SymbolTrackerSharedState::report_expando_function_errors(&self.state, node, &mut |n| {
                 let props = resolver.get_properties_of_container_function(n);
-                props.into_iter().map(|p| resolver.symbol_value_declaration(p)).collect()
+                props
+                    .into_iter()
+                    .map(|p| resolver.symbol_value_declaration(p))
+                    .collect()
             });
         }
     }
@@ -61,7 +64,10 @@ impl SymbolTrackerImpl {
     // PORT: the trait method needs a checker. The transformer pushes and pops
     // outside of any checker call, so the body is here and the trait forwards.
     pub fn pop_error_fallback_node(&self) {
-        self.fallback_stack.borrow_mut().pop().expect("slice bounds out of range");
+        self.fallback_stack
+            .borrow_mut()
+            .pop()
+            .expect("slice bounds out of range");
     }
 
     // Go: transformers/declarations/tracker.go:32 SymbolTrackerImpl.PushErrorFallbackNode
@@ -75,7 +81,11 @@ impl SymbolTrackerImpl {
 
     // Go: transformers/declarations/tracker.go:129 SymbolTrackerImpl.errorFallbackNode
     fn error_fallback_node(&self) -> Node {
-        self.fallback_stack.borrow().last().copied().unwrap_or(Node::NIL)
+        self.fallback_stack
+            .borrow()
+            .last()
+            .copied()
+            .unwrap_or(Node::NIL)
     }
 
     // Go: transformers/declarations/tracker.go:136 SymbolTrackerImpl.errorLocation
@@ -107,10 +117,16 @@ impl SymbolTrackerImpl {
     }
 
     // Go: transformers/declarations/tracker.go:176 SymbolTrackerImpl.handleSymbolAccessibilityError
-    pub(crate) fn handle_symbol_accessibility_error(&self, symbol_accessibility_result: SymbolAccessibilityResult) -> bool {
+    pub(crate) fn handle_symbol_accessibility_error(
+        &self,
+        symbol_accessibility_result: SymbolAccessibilityResult,
+    ) -> bool {
         if symbol_accessibility_result.accessibility == SymbolAccessibility::ACCESSIBLE {
             // Add aliases back onto the possible imports list if they're not there so we can try them again with updated visibility info
-            if !symbol_accessibility_result.aliases_to_make_visible.is_empty() {
+            if !symbol_accessibility_result
+                .aliases_to_make_visible
+                .is_empty()
+            {
                 let mut state = self.state.borrow_mut();
                 for &r#ref in &symbol_accessibility_result.aliases_to_make_visible {
                     if !state.late_marked_statements.contains(&r#ref) {
@@ -149,7 +165,10 @@ impl SymbolTrackerImpl {
                     self.add_diagnostic(create_diagnostic_for_node(
                         diag_node,
                         info.diagnostic_message,
-                        args![symbol_accessibility_result.error_symbol_name, symbol_accessibility_result.error_module_name],
+                        args![
+                            symbol_accessibility_result.error_symbol_name,
+                            symbol_accessibility_result.error_module_name
+                        ],
                     ));
                 }
                 return true;
@@ -222,18 +241,30 @@ impl SymbolTracker for SymbolTrackerImpl {
         // `GetPropertiesOfContainerFunction` without the lock. The trait path
         // would borrow the checker again, so this uses the worker with the
         // checker in hand.
-        if c.get_emit_resolver().is_expando_function_declaration_unsafe_worker(c, node) {
+        if c.get_emit_resolver()
+            .is_expando_function_declaration_unsafe_worker(c, node)
+        {
             // within a node builder call that should already lock the checker, use the unsafe call
             SymbolTrackerSharedState::report_expando_function_errors(&self.state, node, &mut |n| {
-                let props = c.get_emit_resolver().get_properties_of_container_function_worker(c, n);
-                props.into_iter().map(|p| c.sym(p).value_declaration).collect()
+                let props = c
+                    .get_emit_resolver()
+                    .get_properties_of_container_function_worker(c, n);
+                props
+                    .into_iter()
+                    .map(|p| c.sym(p).value_declaration)
+                    .collect()
             });
         }
         self.add_diagnostic((self.get_isolated_declaration_error)(node));
     }
 
     // Go: transformers/declarations/tracker.go:75 SymbolTrackerImpl.ReportLikelyUnsafeImportRequiredError
-    fn report_likely_unsafe_import_required_error(&self, _c: &mut Checker, specifier: &str, symbol_name: &str) {
+    fn report_likely_unsafe_import_required_error(
+        &self,
+        _c: &mut Checker,
+        specifier: &str,
+        symbol_name: &str,
+    ) {
         let location = self.error_location();
         if location.is_some() {
             if !symbol_name.is_empty() {
@@ -338,7 +369,13 @@ impl SymbolTracker for SymbolTrackerImpl {
     }
 
     // Go: transformers/declarations/tracker.go:161 SymbolTrackerImpl.TrackSymbol
-    fn track_symbol(&self, c: &mut Checker, symbol: SymbolId, enclosing_declaration: Node, meaning: SymbolFlags) -> bool {
+    fn track_symbol(
+        &self,
+        c: &mut Checker,
+        symbol: SymbolId,
+        enclosing_declaration: Node,
+        meaning: SymbolFlags,
+    ) -> bool {
         if c.sym(symbol).flags.intersects(SymbolFlags::TYPE_PARAMETER) {
             return false;
         }
@@ -352,7 +389,12 @@ impl SymbolTracker for SymbolTrackerImpl {
         }
         // PORT: Go calls `s.resolver.IsSymbolAccessible`, which forwards to the
         // checker without a lock. The checker is already borrowed here, so call it directly.
-        let result = c.is_symbol_accessible(symbol, enclosing_declaration, meaning, true /*shouldComputeAliasToMarkVisible*/);
+        let result = c.is_symbol_accessible(
+            symbol,
+            enclosing_declaration,
+            meaning,
+            true, /*shouldComputeAliasToMarkVisible*/
+        );
         self.handle_symbol_accessibility_error(result)
     }
 }

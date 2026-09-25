@@ -214,7 +214,11 @@ impl Fields {
 
 // Go: packagejson/packagejson.go:116 Parse
 pub fn parse(data: &str) -> Result<Fields, String> {
-    let value = JsonParser { s: data.as_bytes(), pos: 0 }.parse_document()?;
+    let value = JsonParser {
+        s: data.as_bytes(),
+        pos: 0,
+    }
+    .parse_document()?;
     let mut f = Fields::default();
     let JSONValue::Object(obj) = value else {
         return Err("package.json must be an object".to_string());
@@ -244,8 +248,16 @@ pub fn parse(data: &str) -> Result<Fields, String> {
 // Go: packagejson/expected.go:16 UnmarshalJSON
 fn expected_string(v: JSONValue) -> Expected<String> {
     match v {
-        JSONValue::Null => Expected { null: true, valid: false, value: String::new() },
-        JSONValue::String(s) => Expected { null: false, valid: true, value: s },
+        JSONValue::Null => Expected {
+            null: true,
+            valid: false,
+            value: String::new(),
+        },
+        JSONValue::String(s) => Expected {
+            null: false,
+            valid: true,
+            value: s,
+        },
         _ => Expected::default(),
     }
 }
@@ -256,7 +268,11 @@ fn expected_string(v: JSONValue) -> Expected<String> {
 // first non-string value too.
 fn expected_string_map(v: JSONValue) -> Expected<IndexMap<String, String>> {
     match v {
-        JSONValue::Null => Expected { null: true, valid: false, value: IndexMap::default() },
+        JSONValue::Null => Expected {
+            null: true,
+            valid: false,
+            value: IndexMap::default(),
+        },
         JSONValue::Object(obj) => {
             let mut map = IndexMap::default();
             for (k, v) in obj {
@@ -264,10 +280,20 @@ fn expected_string_map(v: JSONValue) -> Expected<IndexMap<String, String>> {
                     JSONValue::String(s) => {
                         map.insert(k, s);
                     }
-                    _ => return Expected { null: false, valid: false, value: map },
+                    _ => {
+                        return Expected {
+                            null: false,
+                            valid: false,
+                            value: map,
+                        };
+                    }
                 }
             }
-            Expected { null: false, valid: true, value: map }
+            Expected {
+                null: false,
+                valid: true,
+                value: map,
+            }
         }
         _ => Expected::default(),
     }
@@ -283,7 +309,11 @@ pub struct PackageJson {
 
 impl PackageJson {
     pub fn new(fields: Fields, parseable: bool) -> PackageJson {
-        PackageJson { fields, parseable, version_paths: std::cell::OnceCell::new() }
+        PackageJson {
+            fields,
+            parseable,
+            version_paths: std::cell::OnceCell::new(),
+        }
     }
 
     // Go: packagejson/cache.go:28 GetVersionPaths
@@ -302,7 +332,10 @@ impl PackageJson {
                 }
                 if key_range.test(&type_script_version) {
                     if let JSONValue::Object(paths) = value {
-                        result = VersionPaths { version: key.clone(), paths_json: Some(paths.clone()) };
+                        result = VersionPaths {
+                            version: key.clone(),
+                            paths_json: Some(paths.clone()),
+                        };
                     }
                     return result;
                 }
@@ -492,7 +525,10 @@ impl JsonParser<'_> {
     }
 
     fn parse_hex4(&mut self) -> Result<u32, String> {
-        let hex = self.s.get(self.pos..self.pos + 4).ok_or_else(|| self.err("short unicode escape"))?;
+        let hex = self
+            .s
+            .get(self.pos..self.pos + 4)
+            .ok_or_else(|| self.err("short unicode escape"))?;
         let text = std::str::from_utf8(hex).map_err(|_| self.err("invalid unicode escape"))?;
         let v = u32::from_str_radix(text, 16).map_err(|_| self.err("invalid unicode escape"))?;
         self.pos += 4;
@@ -594,7 +630,10 @@ impl JsonParser<'_> {
                 self.pos += 1;
             }
         }
-        let text = std::str::from_utf8(&self.s[start..self.pos]).map_err(|_| self.err("invalid number"))?;
-        text.parse::<f64>().map(JSONValue::Number).map_err(|_| self.err("invalid number"))
+        let text = std::str::from_utf8(&self.s[start..self.pos])
+            .map_err(|_| self.err("invalid number"))?;
+        text.parse::<f64>()
+            .map(JSONValue::Number)
+            .map_err(|_| self.err("invalid number"))
     }
 }

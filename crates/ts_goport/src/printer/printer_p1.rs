@@ -4,8 +4,8 @@
 //!
 //! Other parts (printer_p2 to printer_p5) add more `impl Printer` blocks.
 
-use crate::prelude::*;
 use crate::flags_macros::go_enum;
+use crate::prelude::*;
 use std::cell::{Cell, RefMut};
 
 // Go: printer/printer.go:35 PrinterOptions
@@ -115,18 +115,18 @@ pub(crate) struct DetachedCommentsInfo {
 // Go: printer/printer.go:151 commentState
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CommentState {
-    pub(crate) emit_flags: EmitFlags,          // holds the emit flags for the current node
-    pub(crate) comment_range: TextRange,       // holds the comment range calculated for the current node
-    pub(crate) container_pos: i32,             // captures the value of containerPos prior to entering an node
-    pub(crate) container_end: i32,             // captures the value of containerEnd prior to entering an node
+    pub(crate) emit_flags: EmitFlags, // holds the emit flags for the current node
+    pub(crate) comment_range: TextRange, // holds the comment range calculated for the current node
+    pub(crate) container_pos: i32, // captures the value of containerPos prior to entering an node
+    pub(crate) container_end: i32, // captures the value of containerEnd prior to entering an node
     pub(crate) declaration_list_container_end: i32, // captures the value of declarationListContainerEnd prior to entering an node
 }
 
 // Go: printer/printer.go:159 sourceMapState
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SourceMapState {
-    pub(crate) emit_flags: EmitFlags,            // holds the emit flags for the current node
-    pub(crate) source_map_range: TextRange,      // holds the source map range calculated for the current node
+    pub(crate) emit_flags: EmitFlags, // holds the emit flags for the current node
+    pub(crate) source_map_range: TextRange, // holds the source map range calculated for the current node
     pub(crate) has_token_source_map_range: bool, // captures whether the source map range was set for the current node
 }
 
@@ -163,7 +163,11 @@ impl CommentRange {
 }
 
 // Go: printer/printer.go:170 NewPrinter
-pub fn new_printer(options: PrinterOptions, handlers: PrintHandlers, emit_context: Option<Rc<EmitContext>>) -> Printer {
+pub fn new_printer(
+    options: PrinterOptions,
+    handlers: PrintHandlers,
+    emit_context: Option<Rc<EmitContext>>,
+) -> Printer {
     // PORT: Go assigns the fields, then fills a nil emitContext. The Rust
     // struct needs the context at construction, so the nil check runs first.
     // wire up name generator
@@ -211,15 +215,25 @@ pub fn new_printer(options: PrinterOptions, handlers: PrintHandlers, emit_contex
         let source_file = Rc::clone(&printer.name_generator_source_file);
         let emit_context = Rc::clone(&emit_context);
         let target = printer.options.target;
-        printer.name_generator.get_text_of_node = Some(Rc::new(move |generator: &mut NameGenerator, node: Node| {
-            get_text_of_node_worker(generator, &emit_context, source_file.get(), target, node, false)
-        }));
+        printer.name_generator.get_text_of_node =
+            Some(Rc::new(move |generator: &mut NameGenerator, node: Node| {
+                get_text_of_node_worker(
+                    generator,
+                    &emit_context,
+                    source_file.get(),
+                    target,
+                    node,
+                    false,
+                )
+            }));
     }
     {
         let source_file = Rc::clone(&printer.name_generator_source_file);
         let has_global_name = printer.print_handlers.has_global_name.clone();
         // Go: printer/printer.go:6082 isFileLevelUniqueNameInCurrentFile
-        printer.name_generator.is_file_level_unique_name_in_current_file =
+        printer
+            .name_generator
+            .is_file_level_unique_name_in_current_file =
             Some(Rc::new(move |name: &str, _private_name: bool| {
                 let current_source_file = source_file.get();
                 if current_source_file.is_some() {
@@ -240,29 +254,47 @@ impl Printer {
     /// Borrows the current writer for one call. Go reads `p.writer` directly.
     /// Panics when no writer is set, as a Go nil interface call would.
     pub(crate) fn writer(&self) -> RefMut<'_, dyn EmitTextWriter> {
-        self.writer.as_ref().expect("printer writer is nil").borrow_mut()
+        self.writer
+            .as_ref()
+            .expect("printer writer is nil")
+            .borrow_mut()
     }
 
     // Go: printer/printer.go:183 (closure) makeFileLevelOptimisticUniqueName
     // PORT: the Go closure field becomes a method.
     pub(crate) fn make_file_level_optimistic_unique_name(&mut self, name: &str) -> String {
-        self.sync_name_generator().make_file_level_optimistic_unique_name(name)
+        self.sync_name_generator()
+            .make_file_level_optimistic_unique_name(name)
     }
 
     /// Returns the name generator after its callbacks see the current
     /// source file. Use it for every call into the name generator.
     // PORT: no Go counterpart. See `name_generator_source_file`.
     pub(crate) fn sync_name_generator(&mut self) -> &mut NameGenerator {
-        self.name_generator_source_file.set(self.current_source_file);
+        self.name_generator_source_file
+            .set(self.current_source_file);
         &mut self.name_generator
     }
 
     // Go: printer/printer.go:193 getLiteralTextOfNode
-    pub(crate) fn get_literal_text_of_node(&mut self, node: Node, source_file: Node, flags: GetLiteralTextFlags) -> String {
+    pub(crate) fn get_literal_text_of_node(
+        &mut self,
+        node: Node,
+        source_file: Node,
+        flags: GetLiteralTextFlags,
+    ) -> String {
         let current_source_file = self.current_source_file;
         let target = self.options.target;
         let emit_context = Rc::clone(&self.emit_context);
-        get_literal_text_of_node_worker(self.sync_name_generator(), &emit_context, current_source_file, target, node, source_file, flags)
+        get_literal_text_of_node_worker(
+            self.sync_name_generator(),
+            &emit_context,
+            current_source_file,
+            target,
+            node,
+            source_file,
+            flags,
+        )
     }
 
     // Go: printer/printer.go:226 getTextOfNode
@@ -271,7 +303,14 @@ impl Printer {
         let current_source_file = self.current_source_file;
         let target = self.options.target;
         let emit_context = Rc::clone(&self.emit_context);
-        get_text_of_node_worker(self.sync_name_generator(), &emit_context, current_source_file, target, node, include_trivia)
+        get_text_of_node_worker(
+            self.sync_name_generator(),
+            &emit_context,
+            current_source_file,
+            target,
+            node,
+            include_trivia,
+        )
     }
 }
 
@@ -298,8 +337,17 @@ fn get_literal_text_of_node_worker(
                 SyntaxKind::NumericLiteral => {
                     text = text_source_node.text().to_string();
                 }
-                SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier | SyntaxKind::JsxNamespacedName => {
-                    text = get_text_of_node_worker(generator, emit_context, current_source_file, target, text_source_node, false);
+                SyntaxKind::Identifier
+                | SyntaxKind::PrivateIdentifier
+                | SyntaxKind::JsxNamespacedName => {
+                    text = get_text_of_node_worker(
+                        generator,
+                        emit_context,
+                        current_source_file,
+                        target,
+                        text_source_node,
+                        false,
+                    );
                 }
                 _ => {
                     return get_literal_text_of_node_worker(
@@ -315,25 +363,40 @@ fn get_literal_text_of_node_worker(
             }
 
             if flags.intersects(GetLiteralTextFlags::JSX_ATTRIBUTE_ESCAPE) {
-                return format!("\"{}\"", escape_jsx_attribute_string(&text, QuoteChar::DOUBLE_QUOTE));
+                return format!(
+                    "\"{}\"",
+                    escape_jsx_attribute_string(&text, QuoteChar::DOUBLE_QUOTE)
+                );
             } else if flags.intersects(GetLiteralTextFlags::NEVER_ASCII_ESCAPE)
-                || emit_context.emit_flags(node).intersects(EmitFlags::NO_ASCII_ESCAPING)
+                || emit_context
+                    .emit_flags(node)
+                    .intersects(EmitFlags::NO_ASCII_ESCAPING)
             {
                 return format!("\"{}\"", escape_string(&text, QuoteChar::DOUBLE_QUOTE));
             } else {
-                return format!("\"{}\"", escape_non_ascii_string(&text, QuoteChar::DOUBLE_QUOTE));
+                return format!(
+                    "\"{}\"",
+                    escape_non_ascii_string(&text, QuoteChar::DOUBLE_QUOTE)
+                );
             }
         }
     }
     // !!! Printer option to control whether to terminate unterminated literals
-    if emit_context.emit_flags(node).intersects(EmitFlags::NO_ASCII_ESCAPING) {
+    if emit_context
+        .emit_flags(node)
+        .intersects(EmitFlags::NO_ASCII_ESCAPING)
+    {
         flags |= GetLiteralTextFlags::NEVER_ASCII_ESCAPE;
     }
     if target >= ScriptTarget::ES2021 {
         flags |= GetLiteralTextFlags::ALLOW_NUMERIC_SEPARATOR;
     }
     // Go: core.Coalesce(sourceFile, p.currentSourceFile)
-    let source_file = if source_file.is_some() { source_file } else { current_source_file };
+    let source_file = if source_file.is_some() {
+        source_file
+    } else {
+        current_source_file
+    };
     get_literal_text(node, source_file, flags)
 }
 
@@ -353,17 +416,32 @@ fn get_text_of_node_worker(
     }
 
     if is_string_literal(node) {
-        let text_source_node = emit_context.text_source.borrow().get(&node).copied().unwrap_or(Node::NIL);
+        let text_source_node = emit_context
+            .text_source
+            .borrow()
+            .get(&node)
+            .copied()
+            .unwrap_or(Node::NIL);
         if text_source_node.is_some() {
-            return get_text_of_node_worker(generator, emit_context, current_source_file, target, text_source_node, include_trivia);
+            return get_text_of_node_worker(
+                generator,
+                emit_context,
+                current_source_file,
+                target,
+                text_source_node,
+                include_trivia,
+            );
         }
     }
 
-    let can_use_source_file = current_source_file.is_some() && node.parent().is_some() && !node_is_synthesized(node);
+    let can_use_source_file =
+        current_source_file.is_some() && node.parent().is_some() && !node_is_synthesized(node);
 
     match node.kind() {
         SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier | SyntaxKind::JsxNamespacedName => {
-            if !can_use_source_file || get_source_file_of_node(node) != emit_context.most_original(current_source_file) {
+            if !can_use_source_file
+                || get_source_file_of_node(node) != emit_context.most_original(current_source_file)
+            {
                 return node.text().to_string();
             }
         }
@@ -542,7 +620,12 @@ impl Printer {
     }
 
     // Go: printer/printer.go:402 writeLineOrSpace
-    pub(crate) fn write_line_or_space(&mut self, parent_node: Node, prev_child_node: Node, next_child_node: Node) {
+    pub(crate) fn write_line_or_space(
+        &mut self,
+        parent_node: Node,
+        prev_child_node: Node,
+        next_child_node: Node,
+    ) {
         if self.should_emit_on_single_line(parent_node) {
             self.write_space();
         } else if self.options.preserve_source_newlines {
@@ -558,7 +641,11 @@ impl Printer {
     }
 
     // Go: printer/printer.go:417 writeLinesAndIndent
-    pub(crate) fn write_lines_and_indent(&mut self, line_count: i32, write_space_if_not_indenting: bool) {
+    pub(crate) fn write_lines_and_indent(
+        &mut self,
+        line_count: i32,
+        write_space_if_not_indenting: bool,
+    ) {
         if line_count > 0 {
             self.increase_indent();
             self.write_line_repeat(line_count);
@@ -568,11 +655,19 @@ impl Printer {
     }
 
     // Go: printer/printer.go:426 writeLineSeparatorsAndIndentBefore
-    pub(crate) fn write_line_separators_and_indent_before(&mut self, node: Node, parent: Node) -> bool {
+    pub(crate) fn write_line_separators_and_indent_before(
+        &mut self,
+        node: Node,
+        parent: Node,
+    ) -> bool {
         if self.options.preserve_source_newlines {
-            let leading_newlines = self.get_leading_line_terminator_count(parent, node, ListFormat::NONE);
+            let leading_newlines =
+                self.get_leading_line_terminator_count(parent, node, ListFormat::NONE);
             if leading_newlines > 0 {
-                self.write_lines_and_indent(leading_newlines, false /*writeSpaceIfNotIndenting*/);
+                self.write_lines_and_indent(
+                    leading_newlines,
+                    false, /*writeSpaceIfNotIndenting*/
+                );
                 return true;
             }
         }
@@ -582,8 +677,12 @@ impl Printer {
     // Go: printer/printer.go:437 writeLineSeparatorsAfter
     pub(crate) fn write_line_separators_after(&mut self, node: Node, parent: Node) {
         if self.options.preserve_source_newlines {
-            let trailing_newlines =
-                self.get_closing_line_terminator_count(parent, node, ListFormat::NONE, TextRange::new(-1, -1) /*childrenTextRange*/);
+            let trailing_newlines = self.get_closing_line_terminator_count(
+                parent,
+                node,
+                ListFormat::NONE,
+                TextRange::new(-1, -1), /*childrenTextRange*/
+            );
             if trailing_newlines > 0 {
                 self.write_line_repeat(trailing_newlines);
             }
@@ -613,10 +712,23 @@ impl Printer {
             let current_source_file = self.current_source_file;
             if self.options.preserve_source_newlines {
                 return self.get_effective_lines(&|include_comments| {
-                    get_lines_between_range_end_and_range_start(node1.loc(), node2.loc(), current_source_file, include_comments)
+                    get_lines_between_range_end_and_range_start(
+                        node1.loc(),
+                        node2.loc(),
+                        current_source_file,
+                        include_comments,
+                    )
                 });
             }
-            return if range_end_is_on_same_line_as_range_start(node1.loc(), node2.loc(), current_source_file) { 0 } else { 1 };
+            return if range_end_is_on_same_line_as_range_start(
+                node1.loc(),
+                node2.loc(),
+                current_source_file,
+            ) {
+                0
+            } else {
+                1
+            };
         }
 
         0
@@ -650,7 +762,12 @@ impl Printer {
     }
 
     // Go: printer/printer.go:504 getLeadingLineTerminatorCount
-    pub(crate) fn get_leading_line_terminator_count(&self, parent_node: Node, first_child: Node, format: ListFormat) -> i32 {
+    pub(crate) fn get_leading_line_terminator_count(
+        &self,
+        parent_node: Node,
+        first_child: Node,
+        format: ListFormat,
+    ) -> i32 {
         if format.intersects(ListFormat::PRESERVE_LINES) || self.options.preserve_source_newlines {
             if format.intersects(ListFormat::PREFER_NEW_LINE) {
                 return 1;
@@ -658,7 +775,8 @@ impl Printer {
 
             if first_child.is_nil() {
                 return if parent_node.is_nil()
-                    || self.current_source_file.is_some() && range_is_on_single_line(parent_node.loc(), self.current_source_file)
+                    || self.current_source_file.is_some()
+                        && range_is_on_single_line(parent_node.loc(), self.current_source_file)
                 {
                     0
                 } else {
@@ -691,7 +809,7 @@ impl Printer {
                 && parent_node.is_some()
                 && !position_is_synthesized(parent_node.pos())
                 && !node_is_synthesized(first_child)
-                && (first_child.parent().is_nil() /*|| getOriginalNode(firstChild.Parent) == getOriginalNode(parentNode)*/)
+                && (first_child.parent().is_nil()/*|| getOriginalNode(firstChild.Parent) == getOriginalNode(parentNode)*/)
             {
                 let current_source_file = self.current_source_file;
                 if self.options.preserve_source_newlines {
@@ -704,7 +822,11 @@ impl Printer {
                         )
                     });
                 }
-                return if range_start_positions_are_on_same_line(parent_node.loc(), first_child.loc(), current_source_file) {
+                return if range_start_positions_are_on_same_line(
+                    parent_node.loc(),
+                    first_child.loc(),
+                    current_source_file,
+                ) {
                     0
                 } else {
                     1
@@ -714,11 +836,20 @@ impl Printer {
                 return 1;
             }
         }
-        if format.intersects(ListFormat::MULTI_LINE) { 1 } else { 0 }
+        if format.intersects(ListFormat::MULTI_LINE) {
+            1
+        } else {
+            0
+        }
     }
 
     // Go: printer/printer.go:560 getSeparatingLineTerminatorCount
-    pub(crate) fn get_separating_line_terminator_count(&self, previous_node: Node, next_node: Node, format: ListFormat) -> i32 {
+    pub(crate) fn get_separating_line_terminator_count(
+        &self,
+        previous_node: Node,
+        next_node: Node,
+        format: ListFormat,
+    ) -> i32 {
         if format.intersects(ListFormat::PRESERVE_LINES) || self.options.preserve_source_newlines {
             if previous_node.is_nil() || next_node.is_nil() {
                 return 0;
@@ -726,10 +857,17 @@ impl Printer {
             if next_node.kind() == SyntaxKind::JsxText {
                 // JsxText will be written with its leading whitespace, so don't add more manually.
                 return 0;
-            } else if self.current_source_file.is_some() && !node_is_synthesized(previous_node) && !node_is_synthesized(next_node) {
+            } else if self.current_source_file.is_some()
+                && !node_is_synthesized(previous_node)
+                && !node_is_synthesized(next_node)
+            {
                 let current_source_file = self.current_source_file;
                 if self.options.preserve_source_newlines
-                    && sibling_node_positions_are_comparable(&self.emit_context, previous_node, next_node)
+                    && sibling_node_positions_are_comparable(
+                        &self.emit_context,
+                        previous_node,
+                        next_node,
+                    )
                 {
                     return self.get_effective_lines(&|include_comments| {
                         get_lines_between_range_end_and_range_start(
@@ -747,7 +885,11 @@ impl Printer {
                     // same node parent. If so, we intend to preserve a single line terminator. This is less precise and
                     // expensive than checking with `preserveSourceNewlines` as above, but the goal is not to preserve the
                     // effective source lines between two sibling nodes.
-                    return if range_end_is_on_same_line_as_range_start(previous_node.loc(), next_node.loc(), current_source_file) {
+                    return if range_end_is_on_same_line_as_range_start(
+                        previous_node.loc(),
+                        next_node.loc(),
+                        current_source_file,
+                    ) {
                         0
                     } else {
                         1
@@ -755,14 +897,24 @@ impl Printer {
                 }
                 // If the two nodes are not comparable, add a line terminator based on the format that can indicate
                 // whether new lines are preferred or not.
-                return if format.intersects(ListFormat::PREFER_NEW_LINE) { 1 } else { 0 };
-            } else if self.should_emit_on_new_line(previous_node, format) || self.should_emit_on_new_line(next_node, format) {
+                return if format.intersects(ListFormat::PREFER_NEW_LINE) {
+                    1
+                } else {
+                    0
+                };
+            } else if self.should_emit_on_new_line(previous_node, format)
+                || self.should_emit_on_new_line(next_node, format)
+            {
                 return 1;
             }
         } else if self.should_emit_on_new_line(next_node, ListFormat::NONE) {
             return 1;
         }
-        if format.intersects(ListFormat::MULTI_LINE) { 1 } else { 0 }
+        if format.intersects(ListFormat::MULTI_LINE) {
+            1
+        } else {
+            0
+        }
     }
 
     // Go: printer/printer.go:603 getClosingLineTerminatorCount
@@ -779,7 +931,8 @@ impl Printer {
             }
             if last_child.is_nil() {
                 return if parent_node.is_nil()
-                    || self.current_source_file.is_some() && range_is_on_single_line(parent_node.loc(), self.current_source_file)
+                    || self.current_source_file.is_some()
+                        && range_is_on_single_line(parent_node.loc(), self.current_source_file)
                 {
                     0
                 } else {
@@ -804,7 +957,11 @@ impl Printer {
                         )
                     });
                 }
-                return if range_end_positions_are_on_same_line(parent_node.loc(), last_child.loc(), current_source_file) {
+                return if range_end_positions_are_on_same_line(
+                    parent_node.loc(),
+                    last_child.loc(),
+                    current_source_file,
+                ) {
                     0
                 } else {
                     1
@@ -814,7 +971,9 @@ impl Printer {
                 return 1;
             }
         }
-        if format.intersects(ListFormat::MULTI_LINE) && !format.intersects(ListFormat::NO_TRAILING_NEW_LINE) {
+        if format.intersects(ListFormat::MULTI_LINE)
+            && !format.intersects(ListFormat::NO_TRAILING_NEW_LINE)
+        {
             return 1;
         }
         0
@@ -832,7 +991,13 @@ impl Printer {
     }
 
     // Go: printer/printer.go:648 writeCommentRangeWorker
-    pub(crate) fn write_comment_range_worker(&mut self, text: &str, line_map: &[i32], kind: SyntaxKind, loc: TextRange) {
+    pub(crate) fn write_comment_range_worker(
+        &mut self,
+        text: &str,
+        line_map: &[i32],
+        kind: SyntaxKind,
+        loc: TextRange,
+    ) {
         if kind == SyntaxKind::MultiLineCommentTrivia {
             let indent_size = get_default_indent_size();
             let first_line = compute_line_of_position(line_map, loc.pos());
@@ -850,7 +1015,8 @@ impl Printer {
                 if pos != loc.pos() {
                     // If we are not emitting first line, we need to write the spaces to adjust the alignment
                     if first_comment_line_indent == -1 {
-                        first_comment_line_indent = calculate_indent(text, line_map[first_line as usize], loc.pos());
+                        first_comment_line_indent =
+                            calculate_indent(text, line_map[first_line as usize], loc.pos());
                     }
 
                     // These are number of spaces writer is going to write at current indent
@@ -870,12 +1036,14 @@ impl Printer {
                     //            More right indented comment */                  --4 = 8 - 4 + 11
                     //     class c { }
                     // }
-                    let spaces_to_emit =
-                        current_writer_indent_spacing - first_comment_line_indent + calculate_indent(text, pos, next_line_start);
+                    let spaces_to_emit = current_writer_indent_spacing - first_comment_line_indent
+                        + calculate_indent(text, pos, next_line_start);
                     if spaces_to_emit > 0 {
                         let mut number_of_single_spaces_to_emit = spaces_to_emit % indent_size;
-                        let indent_size_space_string =
-                            get_indent_string((spaces_to_emit - number_of_single_spaces_to_emit) / indent_size, indent_size);
+                        let indent_size_space_string = get_indent_string(
+                            (spaces_to_emit - number_of_single_spaces_to_emit) / indent_size,
+                            indent_size,
+                        );
 
                         // Write indent size string ( in eg 1: = "", 2: "" , 3: string with 8 spaces 4: string with 12 spaces
                         self.writer().raw_write(&indent_size_space_string);
@@ -938,28 +1106,38 @@ impl Printer {
     // Go: printer/printer.go:743 shouldWriteComment
     pub(crate) fn should_write_comment(&self, comment: CommentRange) -> bool {
         !self.options.only_print_js_doc_style
-            || self.current_source_file.is_some() && is_js_doc_like_text(source_file_text(self.current_source_file), comment)
-            || self.current_source_file.is_some() && is_pinned_comment(source_file_text(self.current_source_file), comment)
+            || self.current_source_file.is_some()
+                && is_js_doc_like_text(source_file_text(self.current_source_file), comment)
+            || self.current_source_file.is_some()
+                && is_pinned_comment(source_file_text(self.current_source_file), comment)
     }
 
     // Go: printer/printer.go:749 shouldEmitIndented
     pub(crate) fn should_emit_indented(&self, node: Node) -> bool {
-        self.emit_context.emit_flags(node).intersects(EmitFlags::INDENTED)
+        self.emit_context
+            .emit_flags(node)
+            .intersects(EmitFlags::INDENTED)
     }
 
     // Go: printer/printer.go:753 shouldElideIndentation
     pub(crate) fn should_elide_indentation(&self, node: Node) -> bool {
-        self.emit_context.emit_flags(node).intersects(EmitFlags::NO_INDENTATION)
+        self.emit_context
+            .emit_flags(node)
+            .intersects(EmitFlags::NO_INDENTATION)
     }
 
     // Go: printer/printer.go:757 shouldEmitOnSingleLine
     pub(crate) fn should_emit_on_single_line(&self, node: Node) -> bool {
-        self.emit_context.emit_flags(node).intersects(EmitFlags::SINGLE_LINE)
+        self.emit_context
+            .emit_flags(node)
+            .intersects(EmitFlags::SINGLE_LINE)
     }
 
     // Go: printer/printer.go:761 shouldEmitOnMultipleLines
     pub(crate) fn should_emit_on_multiple_lines(&self, node: Node) -> bool {
-        self.emit_context.emit_flags(node).intersects(EmitFlags::MULTI_LINE)
+        self.emit_context
+            .emit_flags(node)
+            .intersects(EmitFlags::MULTI_LINE)
     }
 
     // Go: printer/printer.go:765 shouldEmitBlockFunctionBodyOnSingleLine
@@ -988,7 +1166,11 @@ impl Printer {
         }
 
         let statements = body.statements();
-        if self.get_leading_line_terminator_count(body, statements.first().unwrap_or(Node::NIL), ListFormat::PRESERVE_LINES) > 0
+        if self.get_leading_line_terminator_count(
+            body,
+            statements.first().unwrap_or(Node::NIL),
+            ListFormat::PRESERVE_LINES,
+        ) > 0
             || self.get_closing_line_terminator_count(
                 body,
                 statements.last().unwrap_or(Node::NIL),
@@ -1001,7 +1183,12 @@ impl Printer {
 
         let mut previous_statement = Node::NIL;
         for statement in statements.iter() {
-            if self.get_separating_line_terminator_count(previous_statement, statement, ListFormat::PRESERVE_LINES) > 0 {
+            if self.get_separating_line_terminator_count(
+                previous_statement,
+                statement,
+                ListFormat::PRESERVE_LINES,
+            ) > 0
+            {
                 return false;
             }
 
@@ -1013,7 +1200,11 @@ impl Printer {
 
     // Go: printer/printer.go:805 shouldEmitOnNewLine
     pub(crate) fn should_emit_on_new_line(&self, node: Node, format: ListFormat) -> bool {
-        if self.emit_context.emit_flags(node).intersects(EmitFlags::START_ON_NEW_LINE) {
+        if self
+            .emit_context
+            .emit_flags(node)
+            .intersects(EmitFlags::START_ON_NEW_LINE)
+        {
             return true;
         }
         format.intersects(ListFormat::PREFER_NEW_LINE)
@@ -1021,11 +1212,20 @@ impl Printer {
 
     // Go: printer/printer.go:812 shouldEmitSourceMaps
     pub(crate) fn should_emit_source_maps(&self, node: Node) -> bool {
-        !self.source_maps_disabled && self.source_map_source.is_some() && !is_source_file(node) && !is_in_json_file(node)
+        !self.source_maps_disabled
+            && self.source_map_source.is_some()
+            && !is_source_file(node)
+            && !is_in_json_file(node)
     }
 
     // Go: printer/printer.go:819 shouldEmitTokenSourceMaps
-    pub(crate) fn should_emit_token_source_maps(&self, token: SyntaxKind, pos: i32, context_node: Node, flags: TokenEmitFlags) -> bool {
+    pub(crate) fn should_emit_token_source_maps(
+        &self,
+        token: SyntaxKind,
+        pos: i32,
+        context_node: Node,
+        flags: TokenEmitFlags,
+    ) -> bool {
         // We don't emit source positions for most tokens as it tends to be quite noisy, however
         // we need to emit source positions for open and close braces so that tools like istanbul
         // can map branches for code coverage. However, we still omit brace source positions when
@@ -1038,17 +1238,26 @@ impl Printer {
 
     // Go: printer/printer.go:829 shouldEmitLeadingComments
     pub(crate) fn should_emit_leading_comments(&self, node: Node) -> bool {
-        !self.emit_context.emit_flags(node).intersects(EmitFlags::NO_LEADING_COMMENTS)
+        !self
+            .emit_context
+            .emit_flags(node)
+            .intersects(EmitFlags::NO_LEADING_COMMENTS)
     }
 
     // Go: printer/printer.go:833 shouldEmitTrailingComments
     pub(crate) fn should_emit_trailing_comments(&self, node: Node) -> bool {
-        !self.emit_context.emit_flags(node).intersects(EmitFlags::NO_TRAILING_COMMENTS)
+        !self
+            .emit_context
+            .emit_flags(node)
+            .intersects(EmitFlags::NO_TRAILING_COMMENTS)
     }
 
     // Go: printer/printer.go:837 shouldEmitNestedComments
     pub(crate) fn should_emit_nested_comments(&self, node: Node) -> bool {
-        !self.emit_context.emit_flags(node).intersects(EmitFlags::NO_NESTED_COMMENTS)
+        !self
+            .emit_context
+            .emit_flags(node)
+            .intersects(EmitFlags::NO_NESTED_COMMENTS)
     }
 
     // Go: printer/printer.go:841 shouldEmitDetachedComments
@@ -1062,7 +1271,9 @@ impl Printer {
         // Emit detached comment if there are no prologue directives or if the first node is synthesized.
         // The synthesized node will have no leading comment so some comments may be missed.
         let statements = file.statements();
-        statements.is_empty() || !is_prologue_directive(statements.get(0)) || node_is_synthesized(statements.get(0))
+        statements.is_empty()
+            || !is_prologue_directive(statements.get(0))
+            || node_is_synthesized(statements.get(0))
     }
 
     // Go: printer/printer.go:855 hasCommentsAtPosition
@@ -1078,12 +1289,16 @@ impl Printer {
 
     // Go: printer/printer.go:869 shouldEmitIndirectCall
     pub(crate) fn should_emit_indirect_call(&self, node: Node) -> bool {
-        self.emit_context.emit_flags(node).intersects(EmitFlags::INDIRECT_CALL)
+        self.emit_context
+            .emit_flags(node)
+            .intersects(EmitFlags::INDIRECT_CALL)
     }
 
     // Go: printer/printer.go:873 shouldAllowTrailingComma
     pub(crate) fn should_allow_trailing_comma(&self, node: Node, list: NodeList) -> bool {
-        if self.current_source_file.is_nil() || source_file_info(self.current_source_file).script_kind == ScriptKind::JSON {
+        if self.current_source_file.is_nil()
+            || source_file_info(self.current_source_file).script_kind == ScriptKind::JSON
+        {
             return false;
         }
 
@@ -1106,12 +1321,16 @@ impl Printer {
             | SyntaxKind::NamedImports
             | SyntaxKind::NamedExports
             | SyntaxKind::ImportAttributes => true,
-            SyntaxKind::ClassExpression | SyntaxKind::ClassDeclaration | SyntaxKind::InterfaceDeclaration => {
+            SyntaxKind::ClassExpression
+            | SyntaxKind::ClassDeclaration
+            | SyntaxKind::InterfaceDeclaration => {
                 // PORT: Go compares `*NodeList` pointers. NodeList handles
                 // are compared by list identity.
                 same_node_list(list, node.type_parameter_list())
             }
-            SyntaxKind::FunctionDeclaration | SyntaxKind::FunctionExpression | SyntaxKind::MethodDeclaration => true,
+            SyntaxKind::FunctionDeclaration
+            | SyntaxKind::FunctionExpression
+            | SyntaxKind::MethodDeclaration => true,
             SyntaxKind::CallExpression => true,
             SyntaxKind::NewExpression => true,
             _ => false,
@@ -1123,7 +1342,12 @@ impl Printer {
     //
 
     // Go: printer/printer.go:919 writeTokenText
-    pub(crate) fn write_token_text(&mut self, token: SyntaxKind, write_kind: WriteKind, pos: i32) -> i32 {
+    pub(crate) fn write_token_text(
+        &mut self,
+        token: SyntaxKind,
+        write_kind: WriteKind,
+        pos: i32,
+    ) -> i32 {
         // !!! emit leading and trailing comments
         // !!! emit leading and trailing source maps
         let token_string = token_to_string(token);
@@ -1136,7 +1360,13 @@ impl Printer {
     }
 
     // Go: printer/printer.go:931 emitToken
-    pub(crate) fn emit_token(&mut self, token: SyntaxKind, pos: i32, write_kind: WriteKind, context_node: Node) -> i32 {
+    pub(crate) fn emit_token(
+        &mut self,
+        token: SyntaxKind,
+        pos: i32,
+        write_kind: WriteKind,
+        context_node: Node,
+    ) -> i32 {
         self.emit_token_ex(token, pos, write_kind, context_node, TokenEmitFlags::NONE)
     }
 
@@ -1340,7 +1570,10 @@ impl Printer {
         );
         let text = self.get_text_of_node(node, false /*includeTrivia*/);
 
-        let symbol = self.id_to_symbol.as_ref().and_then(|id_to_symbol| id_to_symbol.get(&node).copied());
+        let symbol = self
+            .id_to_symbol
+            .as_ref()
+            .and_then(|id_to_symbol| id_to_symbol.get(&node).copied());
         if let Some(symbol) = symbol {
             self.write_symbol(&text, symbol);
             return;
@@ -1374,7 +1607,8 @@ impl Printer {
             let helper_name = self.emit_context.factory.new_unique_name_ex(
                 name,
                 AutoGenerateOptions {
-                    flags: GeneratedIdentifierFlags::FILE_LEVEL | GeneratedIdentifierFlags::OPTIMISTIC,
+                    flags: GeneratedIdentifierFlags::FILE_LEVEL
+                        | GeneratedIdentifierFlags::OPTIMISTIC,
                     ..Default::default()
                 },
             );
@@ -1394,7 +1628,10 @@ impl Printer {
     pub(crate) fn emit_identifier_reference(&mut self, node: Node) {
         let mut node = node;
         if (self.external_helpers_module_name.is_some() || self.unique_helper_names.is_some())
-            && self.emit_context.emit_flags(node).intersects(EmitFlags::HELPER_NAME)
+            && self
+                .emit_context
+                .emit_flags(node)
+                .intersects(EmitFlags::HELPER_NAME)
         {
             if self.external_helpers_module_name.is_some() {
                 // Substitute `__helper` with `tslib_1.__helper`
@@ -1405,14 +1642,16 @@ impl Printer {
                     factory.clone_node(node),
                     NodeFlags::NONE,
                 );
-                self.emit_context.assign_comment_and_source_map_ranges(helper, node);
+                self.emit_context
+                    .assign_comment_and_source_map_ranges(helper, node);
                 self.emit_property_access_expression(helper);
                 return;
             }
             if self.unique_helper_names.is_some() {
                 // Substitute `__helper` with `__helper_1` if there is a conflict in an ES module.
                 let helper_name = self.get_unique_helper_name(node.text());
-                self.emit_context.assign_comment_and_source_map_ranges(helper_name, node);
+                self.emit_context
+                    .assign_comment_and_source_map_ranges(helper_name, node);
                 node = helper_name;
             }
         }
@@ -1425,10 +1664,16 @@ impl Printer {
     // Go: printer/printer.go:1169 emitBindingIdentifier
     pub(crate) fn emit_binding_identifier(&mut self, node: Node) {
         let mut node = node;
-        if self.unique_helper_names.is_some() && self.emit_context.emit_flags(node).intersects(EmitFlags::HELPER_NAME) {
+        if self.unique_helper_names.is_some()
+            && self
+                .emit_context
+                .emit_flags(node)
+                .intersects(EmitFlags::HELPER_NAME)
+        {
             // Substitute `__helper` with `__helper_1` if there is a conflict in an ES module.
             let helper_name = self.get_unique_helper_name(node.text());
-            self.emit_context.assign_comment_and_source_map_ranges(helper_name, node);
+            self.emit_context
+                .assign_comment_and_source_map_ranges(helper_name, node);
             node = helper_name;
         }
 
@@ -1511,7 +1756,9 @@ impl Printer {
             SyntaxKind::Identifier => self.emit_identifier_name(node),
             SyntaxKind::PrivateIdentifier => self.emit_private_identifier(node),
             SyntaxKind::StringLiteral => self.emit_string_literal(node),
-            SyntaxKind::NoSubstitutionTemplateLiteral => self.emit_no_substitution_template_literal(node),
+            SyntaxKind::NoSubstitutionTemplateLiteral => {
+                self.emit_no_substitution_template_literal(node)
+            }
             SyntaxKind::NumericLiteral => self.emit_numeric_literal(node),
             SyntaxKind::BigIntLiteral => self.emit_big_int_literal(node),
             SyntaxKind::ComputedPropertyName => self.emit_computed_property_name(node),

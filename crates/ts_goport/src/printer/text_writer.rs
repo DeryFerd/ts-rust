@@ -21,7 +21,8 @@ impl TextWriter {
     // Go: printer/textwriter.go:30 Grow
     pub fn grow(&mut self, n: i32) {
         // Go `strings.Builder.Grow` panics on a negative count.
-        self.builder.reserve(usize::try_from(n).expect("strings.Builder.Grow: negative count"));
+        self.builder
+            .reserve(usize::try_from(n).expect("strings.Builder.Grow: negative count"));
     }
 
     // Go: printer/textwriter.go:97 updateLineCountAndPosFor
@@ -46,7 +47,8 @@ impl TextWriter {
     fn write_text(&mut self, s: &str) {
         if !s.is_empty() {
             if self.line_start {
-                self.builder.push_str(&get_indent_string(self.indent, self.indent_size));
+                self.builder
+                    .push_str(&get_indent_string(self.indent, self.indent_size));
                 self.line_start = false;
             }
             self.builder.push_str(s);

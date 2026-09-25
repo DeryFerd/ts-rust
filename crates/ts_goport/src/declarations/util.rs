@@ -19,9 +19,9 @@ pub(crate) fn needs_scope_marker(result: Node) -> bool {
 // Go: transformers/declarations/util.go:13 canHaveLiteralInitializer
 pub(crate) fn can_have_literal_initializer(host: &dyn DeclarationEmitHost, node: Node) -> bool {
     match node.kind() {
-        SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature => {
-            host.get_effective_declaration_flags(node, ModifierFlags::PRIVATE).is_empty()
-        }
+        SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature => host
+            .get_effective_declaration_flags(node, ModifierFlags::PRIVATE)
+            .is_empty(),
         SyntaxKind::Parameter | SyntaxKind::VariableDeclaration => true,
         _ => false,
     }
@@ -52,6 +52,7 @@ pub(crate) fn can_produce_diagnostics(node: Node) -> bool {
         || is_element_access_expression(node)
         || is_binary_expression(node)
         || is_call_expression(node) // || // !!! TODO: JSDoc support
+
     /* ast.IsJSDocTypeAlias(node); */
 }
 
@@ -66,7 +67,11 @@ pub(crate) fn can_reuse_modifier_nodes(nodes: &[Node]) -> bool {
 }
 
 // Go: transformers/declarations/util.go:61 isDeclarationAndNotVisible
-pub(crate) fn is_declaration_and_not_visible(emit_context: &EmitContext, resolver: &dyn EmitResolver, node: Node) -> bool {
+pub(crate) fn is_declaration_and_not_visible(
+    emit_context: &EmitContext,
+    resolver: &dyn EmitResolver,
+    node: Node,
+) -> bool {
     let node = emit_context.parse_node(node);
     match node.kind() {
         SyntaxKind::FunctionDeclaration
@@ -160,7 +165,9 @@ pub(crate) fn unwrap_parenthesized_expression(mut o: Node) -> Node {
 // Go: transformers/declarations/util.go:148 isPrivateMethodTypeParameter
 pub(crate) fn is_private_method_type_parameter(host: &dyn DeclarationEmitHost, node: Node) -> bool {
     node.parent().kind() == SyntaxKind::MethodDeclaration
-        && !host.get_effective_declaration_flags(node.parent(), ModifierFlags::PRIVATE).is_empty()
+        && !host
+            .get_effective_declaration_flags(node.parent(), ModifierFlags::PRIVATE)
+            .is_empty()
 }
 
 // Go: transformers/declarations/util.go:154 shouldEmitFunctionProperties

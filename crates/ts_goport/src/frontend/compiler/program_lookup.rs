@@ -23,7 +23,11 @@ pub type ResolutionCallback<'f, T> = dyn FnMut(&T, &str, ResolutionMode, &Path) 
 impl NewProgram {
     // Go: program.go:1788 (*Program).toPath
     pub fn to_path(&self, filename: &str) -> Path {
-        to_path(filename, &self.get_current_directory(), self.use_case_sensitive_file_names())
+        to_path(
+            filename,
+            &self.get_current_directory(),
+            self.use_case_sensitive_file_names(),
+        )
     }
 
     // Go: program.go:1792 (*Program).GetSourceFile
@@ -33,7 +37,10 @@ impl NewProgram {
     }
 
     // Go: program.go:1797 (*Program).GetSourceFileForResolvedModule
-    pub fn get_source_file_for_resolved_module(&self, file_name: &str) -> Option<Rc<ParsedSourceFile>> {
+    pub fn get_source_file_for_resolved_module(
+        &self,
+        file_name: &str,
+    ) -> Option<Rc<ParsedSourceFile>> {
         let file = self.get_source_file(file_name);
         if file.is_none() {
             let filename = self.get_parse_file_redirect(file_name);
@@ -58,16 +65,33 @@ impl NewProgram {
     // PORT: Go `maps.EqualFunc` treats a nil map as empty; a `None`
     // `redirect_files_by_path` is an empty map here.
     pub fn has_same_file_names(&self, other: &NewProgram) -> bool {
-        fn equal_maps<V>(a: &FxHashMap<Path, V>, b: &FxHashMap<Path, V>, eq: impl Fn(&V, &V) -> bool) -> bool {
-            a.len() == b.len() && a.iter().all(|(k, v1)| b.get(k).is_some_and(|v2| eq(v1, v2)))
+        fn equal_maps<V>(
+            a: &FxHashMap<Path, V>,
+            b: &FxHashMap<Path, V>,
+            eq: impl Fn(&V, &V) -> bool,
+        ) -> bool {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(k, v1)| b.get(k).is_some_and(|v2| eq(v1, v2)))
         }
         let empty = FxHashMap::default();
-        equal_maps(&self.processed_files.files_by_path, &other.processed_files.files_by_path, |a, b| {
-            // checks for casing differences on case-insensitive file systems
-            a.file_name() == b.file_name()
-        }) && equal_maps(
-            self.processed_files.redirect_files_by_path.as_ref().unwrap_or(&empty),
-            other.processed_files.redirect_files_by_path.as_ref().unwrap_or(&empty),
+        equal_maps(
+            &self.processed_files.files_by_path,
+            &other.processed_files.files_by_path,
+            |a, b| {
+                // checks for casing differences on case-insensitive file systems
+                a.file_name() == b.file_name()
+            },
+        ) && equal_maps(
+            self.processed_files
+                .redirect_files_by_path
+                .as_ref()
+                .unwrap_or(&empty),
+            other
+                .processed_files
+                .redirect_files_by_path
+                .as_ref()
+                .unwrap_or(&empty),
             |a, b| a.file_name() == b.file_name(),
         )
     }
@@ -86,7 +110,10 @@ impl NewProgram {
     // Go: program.go:1835 (*Program).IsMissingPath
     // Testing only
     pub fn is_missing_path(&self, path: &Path) -> bool {
-        self.processed_files.missing_files.iter().any(|missing_path| self.to_path(missing_path) == *path)
+        self.processed_files
+            .missing_files
+            .iter()
+            .any(|missing_path| self.to_path(missing_path) == *path)
     }
 
     // Go: program.go:1841 (*Program).ExplainFiles
@@ -97,38 +124,52 @@ impl NewProgram {
     // the callers do it, so the loop condition can read the counter.
     pub fn explain_files(&self, w: &mut String) {
         let to_relative_file_name = |file_name: &str| {
-            get_relative_path_from_directory(&self.get_current_directory(), file_name, &self.compare_paths_options)
+            get_relative_path_from_directory(
+                &self.get_current_directory(),
+                file_name,
+                &self.compare_paths_options,
+            )
         };
         let explain_file = |w: &mut String, file: &dyn HasFileName| {
             let _ = writeln!(w, "{}", to_relative_file_name(&file.file_name()));
-            if let Some(reasons) = self.processed_files.include_processor.file_include_reasons.get(&file.path()) {
+            if let Some(reasons) = self
+                .processed_files
+                .include_processor
+                .file_include_reasons
+                .get(&file.path())
+            {
                 for reason in reasons {
                     let _ = writeln!(w, "   {}", reason.to_diagnostic(self, true).localize());
                 }
             }
-            for diag in self.processed_files.include_processor.explain_redirect_and_implied_format(
-                self,
-                &file.path(),
-                to_relative_file_name,
-            ) {
+            for diag in self
+                .processed_files
+                .include_processor
+                .explain_redirect_and_implied_format(self, &file.path(), to_relative_file_name)
+            {
                 let _ = writeln!(w, "   {}", diag.localize());
             }
         };
         let mut files_explained: i32 = 0;
 
-        let mut redirect_files: Vec<&RedirectsFile> =
-            self.processed_files.redirect_files_by_path.iter().flat_map(|m| m.values()).collect();
+        let mut redirect_files: Vec<&RedirectsFile> = self
+            .processed_files
+            .redirect_files_by_path
+            .iter()
+            .flat_map(|m| m.values())
+            .collect();
         redirect_files.sort_by_key(|r| r.index);
 
         let files = self.get_source_files();
         let mut source_file_index = 0;
-        let mut explain_source_files = |w: &mut String, files_explained: &mut i32, end_index: i32| {
-            while *files_explained < end_index {
-                explain_file(w, &*files[source_file_index]);
-                *files_explained += 1;
-                source_file_index += 1;
-            }
-        };
+        let mut explain_source_files =
+            |w: &mut String, files_explained: &mut i32, end_index: i32| {
+                while *files_explained < end_index {
+                    explain_file(w, &*files[source_file_index]);
+                    *files_explained += 1;
+                    source_file_index += 1;
+                }
+            };
 
         for redirect_file in &redirect_files {
             // Explain all sourceFiles till we reach this redirectFile index
@@ -138,11 +179,18 @@ impl NewProgram {
         }
 
         // Explain any remaining sourceFiles
-        explain_source_files(w, &mut files_explained, (files.len() + redirect_files.len()) as i32);
+        explain_source_files(
+            w,
+            &mut files_explained,
+            (files.len() + redirect_files.len()) as i32,
+        );
     }
 
     // Go: program.go:1880 (*Program).GetLibFileFromReference
-    pub fn get_lib_file_from_reference(&self, ref_: &FileReference) -> Option<Rc<ParsedSourceFile>> {
+    pub fn get_lib_file_from_reference(
+        &self,
+        ref_: &FileReference,
+    ) -> Option<Rc<ParsedSourceFile>> {
         let (path, ok) = get_lib_file_name(&ref_.file_name);
         if !ok {
             return None;
@@ -156,7 +204,10 @@ impl NewProgram {
         type_ref: &FileReference,
         source_file: &ParsedSourceFile,
     ) -> Option<Rc<ResolvedTypeReferenceDirective>> {
-        let resolutions = self.processed_files.type_resolutions_in_file.get(source_file.path())?;
+        let resolutions = self
+            .processed_files
+            .type_resolutions_in_file
+            .get(source_file.path())?;
         let key = ModeAwareCacheKey {
             name: type_ref.file_name.clone(),
             mode: self.get_mode_for_type_reference_directive_in_file(type_ref, source_file),
@@ -185,13 +236,20 @@ impl NewProgram {
 
     // Go: program.go:1911 (*Program).IsSourceFileFromExternalLibrary
     pub fn is_source_file_from_external_library(&self, file: &ParsedSourceFile) -> bool {
-        self.processed_files.source_files_found_searching_node_modules.contains(file.path())
+        self.processed_files
+            .source_files_found_searching_node_modules
+            .contains(file.path())
     }
 
     // Go: program.go:1915 (*Program).GetJSXRuntimeImportSpecifier
     // PORT: a Go nil map is `None`.
     pub fn get_jsx_runtime_import_specifier(&self, path: &Path) -> (String, Node) {
-        if let Some(result) = self.processed_files.jsx_runtime_import_specifiers.as_ref().and_then(|m| m.get(path)) {
+        if let Some(result) = self
+            .processed_files
+            .jsx_runtime_import_specifiers
+            .as_ref()
+            .and_then(|m| m.get(path))
+        {
             return (result.module_reference.clone(), result.specifier);
         }
         (String::new(), Node::NIL)
@@ -208,7 +266,11 @@ impl NewProgram {
     }
 
     // Go: program.go:1926 (*Program).SourceFileMayBeEmitted
-    pub fn source_file_may_be_emitted(&self, source_file: &ParsedSourceFile, force_dts_emit: bool) -> bool {
+    pub fn source_file_may_be_emitted(
+        &self,
+        source_file: &ParsedSourceFile,
+        force_dts_emit: bool,
+    ) -> bool {
         source_file_may_be_emitted(source_file, self, force_dts_emit)
     }
 
@@ -232,7 +294,11 @@ impl NewProgram {
     fn collect_package_names(&self) -> &PackageNamesInfo {
         self.package_names.get_value(|| {
             let mut package_names = PackageNamesInfo::default();
-            let resolver = self.processed_files.resolver.as_ref().expect("program has a resolver");
+            let resolver = self
+                .processed_files
+                .resolver
+                .as_ref()
+                .expect("program has a resolver");
             for file in &self.processed_files.files {
                 if self.is_source_file_default_library(file.path())
                     || self.is_source_file_from_external_library(file)
@@ -246,7 +312,9 @@ impl NewProgram {
                     if is_external_module_name_relative(imp.text()) {
                         continue;
                     }
-                    if let Some(resolved_modules) = self.processed_files.resolved_modules.get(file.path()) {
+                    if let Some(resolved_modules) =
+                        self.processed_files.resolved_modules.get(file.path())
+                    {
                         let key = ModeAwareCacheKey {
                             name: imp.text().to_string(),
                             mode: self.get_mode_for_usage_location(&**file, imp),
@@ -262,11 +330,16 @@ impl NewProgram {
                             let mut name = resolved_module.package_id.name.clone();
                             if name.is_empty() {
                                 // 2. GetPackageScopeForPath - get name from package.json in the package directory
-                                if let Some(package_scope) =
-                                    resolver.get_package_scope_for_path(&resolved_module.resolved_file_name)
+                                if let Some(package_scope) = resolver
+                                    .get_package_scope_for_path(&resolved_module.resolved_file_name)
                                     && package_scope.exists()
                                 {
-                                    let (scope_name, ok) = package_scope.get_contents().expect("package scope exists").header_fields.name.get_value();
+                                    let (scope_name, ok) = package_scope
+                                        .get_contents()
+                                        .expect("package scope exists")
+                                        .header_fields
+                                        .name
+                                        .get_value();
                                     if ok {
                                         name = scope_name;
                                     }
@@ -274,7 +347,9 @@ impl NewProgram {
                             }
                             if name.is_empty() {
                                 // 3. GetPackageNameFromDirectory - extract from node_modules path
-                                name = get_package_name_from_directory(&resolved_module.resolved_file_name);
+                                name = get_package_name_from_directory(
+                                    &resolved_module.resolved_file_name,
+                                );
                             }
                             // 4. If all fail, don't add empty string
                             if !name.is_empty() {
@@ -284,10 +359,16 @@ impl NewProgram {
                                 // map, so auto-import can only find them via recursive directory search.
                                 let (_, rest) = parse_package_name(imp.text());
                                 if !rest.is_empty()
-                                    && let Some(scope) =
-                                        resolver.get_package_scope_for_path(&resolved_module.resolved_file_name)
+                                    && let Some(scope) = resolver.get_package_scope_for_path(
+                                        &resolved_module.resolved_file_name,
+                                    )
                                     && scope.exists()
-                                    && !scope.get_contents().expect("package scope exists").path_fields.exports.is_present()
+                                    && !scope
+                                        .get_contents()
+                                        .expect("package scope exists")
+                                        .path_fields
+                                        .exports
+                                        .is_present()
                                 {
                                     package_names
                                         .deep_import_packages
@@ -306,14 +387,19 @@ impl NewProgram {
 
     // Go: program.go:2002 (*Program).IsLibFile
     pub fn is_lib_file(&self, source_file: &ParsedSourceFile) -> bool {
-        self.processed_files.lib_files.contains_key(source_file.path())
+        self.processed_files
+            .lib_files
+            .contains_key(source_file.path())
     }
 
     // Go: program.go:2007 (*Program).HasTSFile
     // PORT: Go `hasTSFileOnce` plus `hasTSFile` is `has_ts_file: OnceCell<bool>`.
     pub fn has_ts_file(&self) -> bool {
         *self.has_ts_file.get_or_init(|| {
-            self.processed_files.files.iter().any(|file| has_implementation_ts_file_extension(file.file_name()))
+            self.processed_files
+                .files
+                .iter()
+                .any(|file| has_implementation_ts_file_extension(file.file_name()))
         })
     }
 
@@ -322,18 +408,24 @@ impl NewProgram {
     pub fn get_symlink_cache(&self) -> Rc<KnownSymlinks> {
         self.known_symlinks
             .get_value(|| {
-                let mut known_symlinks =
-                    KnownSymlinks::new(&self.get_current_directory(), self.use_case_sensitive_file_names());
+                let mut known_symlinks = KnownSymlinks::new(
+                    &self.get_current_directory(),
+                    self.use_case_sensitive_file_names(),
+                );
 
                 // Resolved modules store realpath information when they're resolved inside node_modules
                 if !self.processed_files.resolved_modules.is_empty()
                     || !self.processed_files.type_resolutions_in_file.is_empty()
                 {
                     known_symlinks.set_symlinks_from_resolutions(
-                        &|callback: &mut ResolutionCallback<'_, Rc<ResolvedModule>>, file: Option<&ParsedSourceFile>| {
+                        &|callback: &mut ResolutionCallback<'_, Rc<ResolvedModule>>,
+                          file: Option<&ParsedSourceFile>| {
                             self.for_each_resolved_module(callback, file);
                         },
-                        &|callback: &mut ResolutionCallback<'_, Rc<ResolvedTypeReferenceDirective>>,
+                        &|callback: &mut ResolutionCallback<
+                            '_,
+                            Rc<ResolvedTypeReferenceDirective>,
+                        >,
                           file: Option<&ParsedSourceFile>| {
                             self.for_each_resolved_type_reference_directive(callback, file);
                         },
@@ -341,7 +433,11 @@ impl NewProgram {
                 }
 
                 // Check other dependencies for symlinks
-                let resolver = self.processed_files.resolver.as_ref().expect("program has a resolver");
+                let resolver = self
+                    .processed_files
+                    .resolver
+                    .as_ref()
+                    .expect("program has a resolver");
                 let mut seen_package_jsons: FxHashSet<Path> = FxHashSet::default();
                 for (file_path, meta) in &self.processed_files.source_file_meta_datas {
                     if meta.package_json_directory.is_empty() {
@@ -354,7 +450,8 @@ impl NewProgram {
                     {
                         continue;
                     }
-                    let package_json_name = combine_paths(&meta.package_json_directory, &["package.json"]);
+                    let package_json_name =
+                        combine_paths(&meta.package_json_directory, &["package.json"]);
                     let info = self.get_package_json_info(&package_json_name);
                     let Some(contents) = info.as_ref().and_then(|info| info.get_contents()) else {
                         continue;
@@ -363,8 +460,10 @@ impl NewProgram {
                     for dep in contents.get_runtime_dependency_names() {
                         // Skip work in common case: we already saved a symlink for this package directory
                         // in the node_modules adjacent to this package.json
-                        let possible_directory_path =
-                            self.to_path(&combine_paths(&meta.package_json_directory, &["node_modules", &dep]));
+                        let possible_directory_path = self.to_path(&combine_paths(
+                            &meta.package_json_directory,
+                            &["node_modules", &dep],
+                        ));
                         if known_symlinks.has_directory(&possible_directory_path) {
                             continue;
                         }
@@ -378,13 +477,22 @@ impl NewProgram {
                             }
                         }
 
-                        if let Some(package_resolution) =
-                            resolver.resolve_package_directory(&dep, &package_json_name, RESOLUTION_MODE_COMMON_JS, None)
-                            && package_resolution.is_resolved()
+                        if let Some(package_resolution) = resolver.resolve_package_directory(
+                            &dep,
+                            &package_json_name,
+                            RESOLUTION_MODE_COMMON_JS,
+                            None,
+                        ) && package_resolution.is_resolved()
                         {
                             known_symlinks.process_resolution(
-                                &combine_paths(&package_resolution.original_path, &["package.json"]),
-                                &combine_paths(&package_resolution.resolved_file_name, &["package.json"]),
+                                &combine_paths(
+                                    &package_resolution.original_path,
+                                    &["package.json"],
+                                ),
+                                &combine_paths(
+                                    &package_resolution.resolved_file_name,
+                                    &["package.json"],
+                                ),
                             );
                         }
                     }
@@ -401,8 +509,13 @@ impl NewProgram {
         containing_file: &str,
         resolution_mode: ResolutionMode,
     ) -> Rc<ResolvedModule> {
-        let resolver = self.processed_files.resolver.as_ref().expect("program has a resolver");
-        let (resolved, _) = resolver.resolve_module_name(module_name, containing_file, resolution_mode, None);
+        let resolver = self
+            .processed_files
+            .resolver
+            .as_ref()
+            .expect("program has a resolver");
+        let (resolved, _) =
+            resolver.resolve_module_name(module_name, containing_file, resolution_mode, None);
         resolved
     }
 
@@ -421,7 +534,11 @@ impl NewProgram {
         callback: &mut ResolutionCallback<'_, Rc<ResolvedTypeReferenceDirective>>,
         file: Option<&ParsedSourceFile>,
     ) {
-        for_each_resolution(&self.processed_files.type_resolutions_in_file, callback, file);
+        for_each_resolution(
+            &self.processed_files.type_resolutions_in_file,
+            callback,
+            file,
+        );
     }
 }
 
@@ -557,14 +674,20 @@ pub fn plain_js_errors() -> &'static FxHashSet<i32> {
 impl KnownSymlinks {
     pub fn set_symlinks_from_resolutions(
         &mut self,
-        for_each_resolved_module: &dyn Fn(&mut ResolutionCallback<'_, Rc<ResolvedModule>>, Option<&ParsedSourceFile>),
+        for_each_resolved_module: &dyn Fn(
+            &mut ResolutionCallback<'_, Rc<ResolvedModule>>,
+            Option<&ParsedSourceFile>,
+        ),
         for_each_resolved_type_reference_directive: &dyn Fn(
             &mut ResolutionCallback<'_, Rc<ResolvedTypeReferenceDirective>>,
             Option<&ParsedSourceFile>,
         ),
     ) {
         for_each_resolved_module(
-            &mut |resolution: &Rc<ResolvedModule>, _module_name: &str, _mode: ResolutionMode, _file_path: &Path| {
+            &mut |resolution: &Rc<ResolvedModule>,
+                  _module_name: &str,
+                  _mode: ResolutionMode,
+                  _file_path: &Path| {
                 self.process_resolution(&resolution.original_path, &resolution.resolved_file_name);
             },
             None,
@@ -590,9 +713,10 @@ impl NewProgram {
         mode: ResolutionMode,
     ) -> Option<Rc<ResolvedModule>> {
         if let Some(resolutions) = self.processed_files.resolved_modules.get(&file.path()) {
-            if let Some(resolved) =
-                resolutions.get(&ModeAwareCacheKey { name: module_reference.to_string(), mode })
-            {
+            if let Some(resolved) = resolutions.get(&ModeAwareCacheKey {
+                name: module_reference.to_string(),
+                mode,
+            }) {
                 return Some(resolved.clone());
             }
         }
@@ -615,7 +739,11 @@ impl NewProgram {
     // Go: program.go:1519 (*Program).GetSourceFileMetaData
     // PORT: a missing Go map entry is the zero value.
     pub fn get_source_file_meta_data(&self, path: &Path) -> SourceFileMetaData {
-        self.processed_files.source_file_meta_datas.get(path).cloned().unwrap_or_default()
+        self.processed_files
+            .source_file_meta_datas
+            .get(path)
+            .cloned()
+            .unwrap_or_default()
     }
 
     // Go: program.go:1523 (*Program).GetEmitModuleFormatOfFile
@@ -628,7 +756,11 @@ impl NewProgram {
     }
 
     // Go: program.go:1527 (*Program).GetEmitSyntaxForUsageLocation
-    pub fn get_emit_syntax_for_usage_location(&self, source_file: &dyn HasFileName, location: Node) -> ResolutionMode {
+    pub fn get_emit_syntax_for_usage_location(
+        &self,
+        source_file: &dyn HasFileName,
+        location: Node,
+    ) -> ResolutionMode {
         super::file_loader::get_emit_syntax_for_usage_location_worker(
             &source_file.file_name(),
             &self.get_source_file_meta_data(&source_file.path()),
@@ -638,16 +770,25 @@ impl NewProgram {
     }
 
     // Go: program.go:1531 (*Program).GetImpliedNodeFormatForEmit
-    pub fn get_implied_node_format_for_emit(&self, source_file: &dyn HasFileName) -> ResolutionMode {
+    pub fn get_implied_node_format_for_emit(
+        &self,
+        source_file: &dyn HasFileName,
+    ) -> ResolutionMode {
         get_implied_node_format_for_emit_worker(
             &source_file.file_name(),
-            self.mapper().get_compiler_options_for_file(source_file).get_emit_module_kind(),
+            self.mapper()
+                .get_compiler_options_for_file(source_file)
+                .get_emit_module_kind(),
             &self.get_source_file_meta_data(&source_file.path()),
         )
     }
 
     // Go: program.go:1535 (*Program).GetModeForUsageLocation
-    pub fn get_mode_for_usage_location(&self, source_file: &dyn HasFileName, location: Node) -> ResolutionMode {
+    pub fn get_mode_for_usage_location(
+        &self,
+        source_file: &dyn HasFileName,
+        location: Node,
+    ) -> ResolutionMode {
         super::file_loader::get_mode_for_usage_location(
             &source_file.file_name(),
             &self.get_source_file_meta_data(&source_file.path()),
@@ -657,7 +798,10 @@ impl NewProgram {
     }
 
     // Go: program.go:1539 (*Program).GetDefaultResolutionModeForFile
-    pub fn get_default_resolution_mode_for_file(&self, source_file: &dyn HasFileName) -> ResolutionMode {
+    pub fn get_default_resolution_mode_for_file(
+        &self,
+        source_file: &dyn HasFileName,
+    ) -> ResolutionMode {
         super::file_loader::get_default_resolution_mode_for_file(
             &source_file.file_name(),
             &self.get_source_file_meta_data(&source_file.path()),
@@ -680,7 +824,10 @@ impl NewProgram {
                     self.processed_files
                         .files
                         .iter()
-                        .filter(|file| self.source_file_may_be_emitted(file, false) && !file.is_declaration_file)
+                        .filter(|file| {
+                            self.source_file_may_be_emitted(file, false)
+                                && !file.is_declaration_file
+                        })
                         .map(|file| file.file_name().to_string())
                         .collect()
                 };
@@ -705,7 +852,10 @@ impl NewProgram {
         force_dts_emit: bool,
     ) -> Vec<Rc<ParsedSourceFile>> {
         if target_source_file.is_none() && !force_dts_emit {
-            return self.source_files_to_emit.get_or_init(|| get_source_files_to_emit(self, None, false)).clone();
+            return self
+                .source_files_to_emit
+                .get_or_init(|| get_source_files_to_emit(self, None, false))
+                .clone();
         }
         get_source_files_to_emit(self, target_source_file, force_dts_emit)
     }
@@ -714,7 +864,11 @@ impl NewProgram {
 // Go: emitter.go:451 sourceFileMayBeEmitted
 // PORT: the Go host is `SourceFileMayBeEmittedHost`; the program is the only
 // host the frontend uses.
-pub fn source_file_may_be_emitted(source_file: &ParsedSourceFile, host: &NewProgram, force_dts_emit: bool) -> bool {
+pub fn source_file_may_be_emitted(
+    source_file: &ParsedSourceFile,
+    host: &NewProgram,
+    force_dts_emit: bool,
+) -> bool {
     // TODO: move this to outputpaths?
 
     let options = host.options();
@@ -740,7 +894,10 @@ pub fn source_file_may_be_emitted(source_file: &ParsedSourceFile, host: &NewProg
 
     // Check other conditions for file emit
     // Source files from referenced projects are not emitted
-    if host.get_project_reference_from_source(source_file.path()).is_some() {
+    if host
+        .get_project_reference_from_source(source_file.path())
+        .is_some()
+    {
         return false;
     }
 
@@ -800,7 +957,10 @@ pub fn get_source_files_to_emit(
         Some(target_source_file) => vec![target_source_file.clone()],
         None => host.processed_files.files.clone(),
     };
-    source_files.into_iter().filter(|source_file| source_file_may_be_emitted(source_file, host, force_dts_emit)).collect()
+    source_files
+        .into_iter()
+        .filter(|source_file| source_file_may_be_emitted(source_file, host, force_dts_emit))
+        .collect()
 }
 
 // Go: `*Program` implements `outputpaths.OutputPathsHost`.
@@ -818,7 +978,11 @@ impl OutputPathsHost for NewProgram {
 
 impl NewProgram {
     // Go: program.go:1580 (*Program).checkSourceFilesBelongToPath
-    pub fn check_source_files_belong_to_path(&self, source_files: &[String], root_directory: &str) -> bool {
+    pub fn check_source_files_belong_to_path(
+        &self,
+        source_files: &[String],
+        root_directory: &str,
+    ) -> bool {
         let mut all_files_belong_to_path = true;
         for file in source_files {
             let absolute_source_file_path = get_canonical_file_name(

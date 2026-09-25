@@ -11,7 +11,11 @@
 use crate::prelude::*;
 
 // Go: checker/utilities.go:22 NewDiagnosticForNode
-pub fn new_diagnostic_for_node(node: Node, message: &'static ts_diagnostics::Message, args: Vec<String>) -> Diagnostic {
+pub fn new_diagnostic_for_node(
+    node: Node,
+    message: &'static ts_diagnostics::Message,
+    args: Vec<String>,
+) -> Diagnostic {
     let mut file = Node::NIL;
     let mut loc = TextRange::new(0, 0);
     if node.is_some() {
@@ -36,7 +40,10 @@ pub fn new_diagnostic_chain_for_node(
 
 // Go: checker/utilities.go:39 findInMap
 // PORT: Go returns the zero value of V when nothing matches; here `V::default()`.
-pub fn find_in_map<K, V: Default + Clone>(m: &FxHashMap<K, V>, mut predicate: impl FnMut(&V) -> bool) -> V {
+pub fn find_in_map<K, V: Default + Clone>(
+    m: &FxHashMap<K, V>,
+    mut predicate: impl FnMut(&V) -> bool,
+) -> V {
     for value in m.values() {
         if predicate(value) {
             return value.clone();
@@ -104,7 +111,9 @@ pub fn get_assignment_target_kind(node: Node) -> AssignmentKind {
     match target.kind() {
         SyntaxKind::BinaryExpression => {
             let binary_operator = target.operator_token().kind();
-            if binary_operator == SyntaxKind::EqualsToken || is_logical_or_coalescing_assignment_operator(binary_operator) {
+            if binary_operator == SyntaxKind::EqualsToken
+                || is_logical_or_coalescing_assignment_operator(binary_operator)
+            {
                 return AssignmentKind::DEFINITE;
             }
             return AssignmentKind::COMPOUND;
@@ -180,7 +189,9 @@ pub fn is_in_type_query(node: Node) -> bool {
     // The expression is restricted to a single identifier or a sequence of identifiers separated by periods
     find_ancestor_or_quit(node, |n: Node| match n.kind() {
         SyntaxKind::TypeQuery => FindAncestorResult::FIND_ANCESTOR_TRUE,
-        SyntaxKind::Identifier | SyntaxKind::QualifiedName => FindAncestorResult::FIND_ANCESTOR_FALSE,
+        SyntaxKind::Identifier | SyntaxKind::QualifiedName => {
+            FindAncestorResult::FIND_ANCESTOR_FALSE
+        }
         _ => FindAncestorResult::FIND_ANCESTOR_QUIT,
     })
     .is_some()
@@ -280,7 +291,8 @@ pub fn get_external_module_require_argument(node: Node) -> Node {
 pub fn is_right_side_of_access_expression(node: Node) -> bool {
     node.parent().is_some()
         && (is_property_access_expression(node.parent()) && node.parent().name() == node
-            || is_element_access_expression(node.parent()) && node.parent().argument_expression() == node)
+            || is_element_access_expression(node.parent())
+                && node.parent().argument_expression() == node)
 }
 
 // Go: checker/utilities.go:223 isTopLevelInExternalModuleAugmentation
@@ -302,7 +314,12 @@ pub fn is_syntactic_default(node: Node) -> bool {
 impl Checker {
     // Go: checker/utilities.go:234 hasExportAssignmentSymbol
     pub fn has_export_assignment_symbol(&self, module_symbol: SymbolId) -> bool {
-        self.symbols.get(self.sym(module_symbol).exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS).is_some()
+        self.symbols
+            .get(
+                self.sym(module_symbol).exports,
+                INTERNAL_SYMBOL_NAME_EXPORT_EQUALS,
+            )
+            .is_some()
     }
 }
 
@@ -377,7 +394,8 @@ impl Checker {
             return parameter_index
                 >= self.get_min_argument_count_ex(
                     signature,
-                    MinArgumentCountFlags::STRONG_ARITY_FOR_UNTYPED_JS | MinArgumentCountFlags::VOID_IS_NON_OPTIONAL,
+                    MinArgumentCountFlags::STRONG_ARITY_FOR_UNTYPED_JS
+                        | MinArgumentCountFlags::VOID_IS_NON_OPTIONAL,
                 );
         }
         let iife = get_immediately_invoked_function_expression(node.parent());
@@ -423,7 +441,8 @@ pub fn declaration_belongs_to_private_ambient_member(declaration: Node) -> bool 
 
 // Go: checker/utilities.go:320 isPrivateWithinAmbient
 pub fn is_private_within_ambient(node: Node) -> bool {
-    (has_modifier(node, ModifierFlags::PRIVATE) || is_private_identifier_class_element_declaration(node))
+    (has_modifier(node, ModifierFlags::PRIVATE)
+        || is_private_identifier_class_element_declaration(node))
         && node.flags().intersects(NodeFlags::AMBIENT)
 }
 
@@ -607,16 +626,27 @@ impl Checker {
                 return c;
             }
             // When object types have the same or no symbol, order by kind. We order type references before other kinds.
-            if ty1.object_flags.intersects(ObjectFlags::REFERENCE) && ty2.object_flags.intersects(ObjectFlags::REFERENCE) {
+            if ty1.object_flags.intersects(ObjectFlags::REFERENCE)
+                && ty2.object_flags.intersects(ObjectFlags::REFERENCE)
+            {
                 let r1 = ty1.as_type_reference();
                 let r2 = ty2.as_type_reference();
                 let r1_target = r1.object.target;
                 let r2_target = r2.object.target;
-                if self.ty(r1_target).object_flags.intersects(ObjectFlags::TUPLE)
-                    && self.ty(r2_target).object_flags.intersects(ObjectFlags::TUPLE)
+                if self
+                    .ty(r1_target)
+                    .object_flags
+                    .intersects(ObjectFlags::TUPLE)
+                    && self
+                        .ty(r2_target)
+                        .object_flags
+                        .intersects(ObjectFlags::TUPLE)
                 {
                     // Tuple types have no associated symbol, instead we order by tuple element information.
-                    let c = compare_tuple_types(self.ty(r1_target).as_tuple_type(), self.ty(r2_target).as_tuple_type());
+                    let c = compare_tuple_types(
+                        self.ty(r1_target).as_tuple_type(),
+                        self.ty(r2_target).as_tuple_type(),
+                    );
                     if c != 0 {
                         return c;
                     }
@@ -624,7 +654,10 @@ impl Checker {
                 // Here we know we have references to instantiations of the same type because we have matching targets.
                 if r1.node.is_nil() && r2.node.is_nil() {
                     // Non-deferred type references with the same target are sorted by their type argument lists.
-                    let c = self.compare_type_lists(&r1.resolved_type_arguments, &r2.resolved_type_arguments);
+                    let c = self.compare_type_lists(
+                        &r1.resolved_type_arguments,
+                        &r2.resolved_type_arguments,
+                    );
                     if c != 0 {
                         return c;
                     }
@@ -636,7 +669,10 @@ impl Checker {
                     }
                     // Instantiations of the same deferred type reference are ordered by their associated type mappers
                     // (which reflect the mapping of in-scope type parameters to type arguments).
-                    let c = self.compare_type_mappers(ty1.as_object_type().mapper, ty2.as_object_type().mapper);
+                    let c = self.compare_type_mappers(
+                        ty1.as_object_type().mapper,
+                        ty2.as_object_type().mapper,
+                    );
                     if c != 0 {
                         return c;
                     }
@@ -655,7 +691,8 @@ impl Checker {
                 if c != 0 {
                     return c;
                 }
-                let c = self.compare_type_mappers(ty1.as_object_type().mapper, ty2.as_object_type().mapper);
+                let c = self
+                    .compare_type_mappers(ty1.as_object_type().mapper, ty2.as_object_type().mapper);
                 if c != 0 {
                     return c;
                 }
@@ -685,7 +722,10 @@ impl Checker {
             if c != 0 {
                 return c;
             }
-        } else if ty1.flags.intersects(TypeFlags::ENUM | TypeFlags::ENUM_LITERAL | TypeFlags::UNIQUE_ES_SYMBOL) {
+        } else if ty1
+            .flags
+            .intersects(TypeFlags::ENUM | TypeFlags::ENUM_LITERAL | TypeFlags::UNIQUE_ES_SYMBOL)
+        {
             // Enum members are ordered by their symbol (and thus their declaration order).
             let c = self.compare_symbols_worker(ty1.symbol, ty2.symbol);
             if c != 0 {
@@ -723,17 +763,24 @@ impl Checker {
                 return c;
             }
             let c = clamp_compare(
-                i64::from(ty1.as_index_type().index_flags.0) - i64::from(ty2.as_index_type().index_flags.0),
+                i64::from(ty1.as_index_type().index_flags.0)
+                    - i64::from(ty2.as_index_type().index_flags.0),
             );
             if c != 0 {
                 return c;
             }
         } else if ty1.flags.intersects(TypeFlags::INDEXED_ACCESS) {
-            let c = self.compare_types(ty1.as_indexed_access_type().object_type, ty2.as_indexed_access_type().object_type);
+            let c = self.compare_types(
+                ty1.as_indexed_access_type().object_type,
+                ty2.as_indexed_access_type().object_type,
+            );
             if c != 0 {
                 return c;
             }
-            let c = self.compare_types(ty1.as_indexed_access_type().index_type, ty2.as_indexed_access_type().index_type);
+            let c = self.compare_types(
+                ty1.as_indexed_access_type().index_type,
+                ty2.as_indexed_access_type().index_type,
+            );
             if c != 0 {
                 return c;
             }
@@ -744,30 +791,48 @@ impl Checker {
             if c != 0 {
                 return c;
             }
-            let c = self.compare_type_mappers(ty1.as_conditional_type().mapper, ty2.as_conditional_type().mapper);
+            let c = self.compare_type_mappers(
+                ty1.as_conditional_type().mapper,
+                ty2.as_conditional_type().mapper,
+            );
             if c != 0 {
                 return c;
             }
         } else if ty1.flags.intersects(TypeFlags::SUBSTITUTION) {
-            let c = self.compare_types(ty1.as_substitution_type().base_type, ty2.as_substitution_type().base_type);
+            let c = self.compare_types(
+                ty1.as_substitution_type().base_type,
+                ty2.as_substitution_type().base_type,
+            );
             if c != 0 {
                 return c;
             }
-            let c = self.compare_types(ty1.as_substitution_type().constraint, ty2.as_substitution_type().constraint);
+            let c = self.compare_types(
+                ty1.as_substitution_type().constraint,
+                ty2.as_substitution_type().constraint,
+            );
             if c != 0 {
                 return c;
             }
         } else if ty1.flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
-            let c = compare_string_slices(&ty1.as_template_literal_type().texts, &ty2.as_template_literal_type().texts);
+            let c = compare_string_slices(
+                &ty1.as_template_literal_type().texts,
+                &ty2.as_template_literal_type().texts,
+            );
             if c != 0 {
                 return c;
             }
-            let c = self.compare_type_lists(&ty1.as_template_literal_type().types, &ty2.as_template_literal_type().types);
+            let c = self.compare_type_lists(
+                &ty1.as_template_literal_type().types,
+                &ty2.as_template_literal_type().types,
+            );
             if c != 0 {
                 return c;
             }
         } else if ty1.flags.intersects(TypeFlags::STRING_MAPPING) {
-            let c = self.compare_types(ty1.as_string_mapping_type().target, ty2.as_string_mapping_type().target);
+            let c = self.compare_types(
+                ty1.as_string_mapping_type().target,
+                ty2.as_string_mapping_type().target,
+            );
             if c != 0 {
                 return c;
             }
@@ -823,7 +888,10 @@ fn compare_string_slices(s1: &[String], s2: &[String]) -> i32 {
 // PORT: takes `&Type` (pure read of one type's flags); returns Go `int` as `i64`.
 pub fn get_sort_order_flags(t: &Type) -> i64 {
     // Return TypeFlagsEnum for all enum-like unit types (they'll be sorted by their symbols)
-    if t.flags.intersects(TypeFlags::ENUM_LITERAL | TypeFlags::ENUM) && !t.flags.intersects(TypeFlags::UNION) {
+    if t.flags
+        .intersects(TypeFlags::ENUM_LITERAL | TypeFlags::ENUM)
+        && !t.flags.intersects(TypeFlags::UNION)
+    {
         return i64::from(TypeFlags::ENUM.0);
     }
     i64::from(t.flags.0)
@@ -858,8 +926,12 @@ impl Checker {
         if let Some(alias) = &ty.alias {
             return alias.symbol;
         }
-        if ty.flags.intersects(TypeFlags::TYPE_PARAMETER | TypeFlags::STRING_MAPPING)
-            || ty.object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE)
+        if ty
+            .flags
+            .intersects(TypeFlags::TYPE_PARAMETER | TypeFlags::STRING_MAPPING)
+            || ty
+                .object_flags
+                .intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE)
         {
             return ty.symbol;
         }
@@ -869,7 +941,10 @@ impl Checker {
     // Go: checker/utilities.go:592 getObjectTypeName
     pub fn get_object_type_name(&self, t: TypeId) -> SymbolId {
         let ty = self.ty(t);
-        if ty.object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE) {
+        if ty
+            .object_flags
+            .intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE)
+        {
             return ty.symbol;
         }
         SymbolId::NIL
@@ -890,13 +965,18 @@ pub fn compare_tuple_types(t1: &TupleType, t2: &TupleType) -> i32 {
         return t1.element_infos.len() as i32 - t2.element_infos.len() as i32;
     }
     for i in 0..t1.element_infos.len() {
-        let c = clamp_compare(i64::from(t1.element_infos[i].flags.0) - i64::from(t2.element_infos[i].flags.0));
+        let c = clamp_compare(
+            i64::from(t1.element_infos[i].flags.0) - i64::from(t2.element_infos[i].flags.0),
+        );
         if c != 0 {
             return c;
         }
     }
     for i in 0..t1.element_infos.len() {
-        let c = compare_element_labels(t1.element_infos[i].labeled_declaration, t2.element_infos[i].labeled_declaration);
+        let c = compare_element_labels(
+            t1.element_infos[i].labeled_declaration,
+            t2.element_infos[i].labeled_declaration,
+        );
         if c != 0 {
             return c;
         }
@@ -984,15 +1064,29 @@ impl Checker {
     }
 
     // Go: checker/utilities.go:684 getDeclarationModifierFlagsFromSymbolEx
-    pub fn get_declaration_modifier_flags_from_symbol_ex(&self, s: SymbolId, is_write: bool) -> ModifierFlags {
+    pub fn get_declaration_modifier_flags_from_symbol_ex(
+        &self,
+        s: SymbolId,
+        is_write: bool,
+    ) -> ModifierFlags {
         let sym = self.sym(s);
         if sym.value_declaration.is_some() {
             let mut declaration = Node::NIL;
             if is_write {
-                declaration = sym.declarations.iter().copied().find(|&d| is_set_accessor_declaration(d)).unwrap_or(Node::NIL);
+                declaration = sym
+                    .declarations
+                    .iter()
+                    .copied()
+                    .find(|&d| is_set_accessor_declaration(d))
+                    .unwrap_or(Node::NIL);
             }
             if declaration.is_nil() && sym.flags.intersects(SymbolFlags::GET_ACCESSOR) {
-                declaration = sym.declarations.iter().copied().find(|&d| is_get_accessor_declaration(d)).unwrap_or(Node::NIL);
+                declaration = sym
+                    .declarations
+                    .iter()
+                    .copied()
+                    .find(|&d| is_get_accessor_declaration(d))
+                    .unwrap_or(Node::NIL);
             }
             if declaration.is_nil() {
                 declaration = sym.value_declaration;
@@ -1036,7 +1130,9 @@ pub fn checker_is_exponentiation_operator(kind: SyntaxKind) -> bool {
 
 // Go: checker/utilities.go:734 isMultiplicativeOperator
 pub fn checker_is_multiplicative_operator(kind: SyntaxKind) -> bool {
-    kind == SyntaxKind::AsteriskToken || kind == SyntaxKind::SlashToken || kind == SyntaxKind::PercentToken
+    kind == SyntaxKind::AsteriskToken
+        || kind == SyntaxKind::SlashToken
+        || kind == SyntaxKind::PercentToken
 }
 
 // Go: checker/utilities.go:738 isMultiplicativeOperatorOrHigher
@@ -1096,7 +1192,9 @@ pub fn checker_is_equality_operator_or_higher(kind: SyntaxKind) -> bool {
 
 // Go: checker/utilities.go:777 isBitwiseOperator
 pub fn checker_is_bitwise_operator(kind: SyntaxKind) -> bool {
-    kind == SyntaxKind::AmpersandToken || kind == SyntaxKind::BarToken || kind == SyntaxKind::CaretToken
+    kind == SyntaxKind::AmpersandToken
+        || kind == SyntaxKind::BarToken
+        || kind == SyntaxKind::CaretToken
 }
 
 // Go: checker/utilities.go:781 isBitwiseOperatorOrHigher
@@ -1111,7 +1209,9 @@ pub fn checker_is_logical_operator_or_higher(kind: SyntaxKind) -> bool {
 
 // Go: checker/utilities.go:789 isAssignmentOperatorOrHigher
 pub fn checker_is_assignment_operator_or_higher(kind: SyntaxKind) -> bool {
-    kind == SyntaxKind::QuestionQuestionToken || checker_is_logical_operator_or_higher(kind) || is_assignment_operator(kind)
+    kind == SyntaxKind::QuestionQuestionToken
+        || checker_is_logical_operator_or_higher(kind)
+        || is_assignment_operator(kind)
 }
 
 // Go: checker/utilities.go:793 isBinaryOperator
@@ -1122,7 +1222,9 @@ pub fn checker_is_binary_operator(kind: SyntaxKind) -> bool {
 impl Checker {
     // Go: checker/utilities.go:797 isObjectLiteralType
     pub fn is_object_literal_type(&self, t: TypeId) -> bool {
-        self.ty(t).object_flags.intersects(ObjectFlags::OBJECT_LITERAL)
+        self.ty(t)
+            .object_flags
+            .intersects(ObjectFlags::OBJECT_LITERAL)
     }
 }
 
@@ -1147,7 +1249,10 @@ pub struct OrderedSet<T: Eq + std::hash::Hash + Clone> {
 
 impl<T: Eq + std::hash::Hash + Clone> Default for OrderedSet<T> {
     fn default() -> Self {
-        Self { values_by_key: None, values: Vec::new() }
+        Self {
+            values_by_key: None,
+            values: Vec::new(),
+        }
     }
 }
 
@@ -1184,7 +1289,10 @@ impl<T: Eq + std::hash::Hash + Clone> OrderedSet<T> {
 
 // Go: checker/utilities.go:843 getContainingFunctionOrClassStaticBlock
 pub fn get_containing_function_or_class_static_block(node: Node) -> Node {
-    find_ancestor(node.parent(), is_function_like_or_class_static_block_declaration)
+    find_ancestor(
+        node.parent(),
+        is_function_like_or_class_static_block_declaration,
+    )
 }
 
 // Go: checker/utilities.go:847 isNodeDescendantOf
@@ -1202,7 +1310,9 @@ pub fn checker_is_node_descendant_of(mut node: Node, ancestor: Node) -> bool {
 impl Checker {
     // Go: checker/utilities.go:857 isTypeUsableAsPropertyName
     pub fn is_type_usable_as_property_name(&self, t: TypeId) -> bool {
-        self.ty(t).flags.intersects(TypeFlags::STRING_OR_NUMBER_LITERAL_OR_UNIQUE)
+        self.ty(t)
+            .flags
+            .intersects(TypeFlags::STRING_OR_NUMBER_LITERAL_OR_UNIQUE)
     }
 
     // Go: checker/utilities.go:864 getPropertyNameFromType

@@ -16,7 +16,7 @@ pub struct Priority {
 #[derive(Debug)]
 pub struct EmitHelper {
     pub name: &'static str, // A unique name for this helper.
-    pub scoped: bool, // Indicates whether the helper MUST be emitted in the current scope.
+    pub scoped: bool,       // Indicates whether the helper MUST be emitted in the current scope.
     pub text: &'static str, // ES3-compatible raw script text
     pub text_callback: Option<fn(make_unique_name: &mut dyn FnMut(&str) -> String) -> String>, // A function yielding an ES3-compatible raw script text.
     pub priority: Option<Priority>, // Helpers with a higher priority are emitted earlier than other helpers on the node.
@@ -339,7 +339,9 @@ pub static ADVANCED_ASYNC_SUPER_HELPER: EmitHelper = EmitHelper {
 };
 
 // Go: printer/helpers.go:378 AdvancedAsyncSuperHelper.TextCallback
-fn advanced_async_super_helper_text_callback(make_unique_name: &mut dyn FnMut(&str) -> String) -> String {
+fn advanced_async_super_helper_text_callback(
+    make_unique_name: &mut dyn FnMut(&str) -> String,
+) -> String {
     "\nconst ".to_string()
         + &make_unique_name("_superIndex")
         + " = (function (geti, seti) {\n"
@@ -553,4 +555,3 @@ pub(crate) static REWRITE_RELATIVE_IMPORT_EXTENSIONS_HELPER: EmitHelper = EmitHe
 };"##,
     text_callback: None,
 };
-

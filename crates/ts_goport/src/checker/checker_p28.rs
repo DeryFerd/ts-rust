@@ -10,7 +10,11 @@ impl Checker {
     pub fn new_unique_es_symbol_type(&mut self, symbol: SymbolId, name: &str) -> TypeId {
         let mut data = UniqueESSymbolType::default();
         data.name = name.to_string();
-        let t = self.new_type(TypeFlags::UNIQUE_ES_SYMBOL, ObjectFlags::NONE, TypeData::UniqueESSymbol(data));
+        let t = self.new_type(
+            TypeFlags::UNIQUE_ES_SYMBOL,
+            ObjectFlags::NONE,
+            TypeData::UniqueESSymbol(data),
+        );
         self.ty_mut(t).symbol = symbol;
         t
     }
@@ -51,12 +55,22 @@ impl Checker {
         index_infos: &[IndexInfoId],
     ) -> TypeId {
         let t = self.new_object_type(ObjectFlags::ANONYMOUS, symbol);
-        self.set_structured_type_members(t, members, call_signatures, construct_signatures, index_infos);
+        self.set_structured_type_members(
+            t,
+            members,
+            call_signatures,
+            construct_signatures,
+            index_infos,
+        );
         t
     }
 
     // Go: checker/checker.go:24998 tryCreateTypeReference
-    pub fn try_create_type_reference(&mut self, target: TypeId, type_arguments: &[TypeId]) -> TypeId {
+    pub fn try_create_type_reference(
+        &mut self,
+        target: TypeId,
+        type_arguments: &[TypeId],
+    ) -> TypeId {
         if !type_arguments.is_empty() && target == self.empty_generic_type {
             return self.unknown_type;
         }
@@ -69,16 +83,30 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25009 createTypeReferenceEx
-    pub fn create_type_reference_ex(&mut self, target: TypeId, type_arguments: &[TypeId], object_flags: ObjectFlags) -> TypeId {
+    pub fn create_type_reference_ex(
+        &mut self,
+        target: TypeId,
+        type_arguments: &[TypeId],
+        object_flags: ObjectFlags,
+    ) -> TypeId {
         let id = self.get_type_list_key(type_arguments);
-        if let Some(instantiations) = &self.ty(target).as_interface_type().reference.object.instantiations {
+        if let Some(instantiations) = &self
+            .ty(target)
+            .as_interface_type()
+            .reference
+            .object
+            .instantiations
+        {
             if let Some(&t) = instantiations.get(&id) {
                 return t;
             }
         }
         let propagating = self.get_propagating_flags_of_types(type_arguments, TypeFlags::NONE);
         let target_symbol = self.ty(target).symbol;
-        let t = self.new_object_type(ObjectFlags::REFERENCE | object_flags | propagating, target_symbol);
+        let t = self.new_object_type(
+            ObjectFlags::REFERENCE | object_flags | propagating,
+            target_symbol,
+        );
         {
             let d = self.ty_mut(t).as_type_reference_mut();
             d.object.target = target;
@@ -115,7 +143,10 @@ impl Checker {
                     let symbol = a.symbol;
                     let type_arguments = a.type_arguments.clone();
                     let instantiated = self.instantiate_types(&type_arguments, mapper);
-                    alias = Some(Rc::new(TypeAlias { symbol, type_arguments: instantiated }));
+                    alias = Some(Rc::new(TypeAlias {
+                        symbol,
+                        type_arguments: instantiated,
+                    }));
                 }
             }
         }
@@ -135,10 +166,16 @@ impl Checker {
         let t = self.new_object_type(ObjectFlags::REFERENCE, source_symbol);
         let source_object_flags = self.ty(source).object_flags;
         let source_target = self.ty(source).as_type_reference().object.target;
-        let source_args = self.ty(source).as_type_reference().resolved_type_arguments.clone();
+        let source_args = self
+            .ty(source)
+            .as_type_reference()
+            .resolved_type_arguments
+            .clone();
         self.ty_mut(t).object_flags = source_object_flags.without(ObjectFlags::MEMBERS_RESOLVED);
         self.ty_mut(t).as_type_reference_mut().object.target = source_target;
-        self.ty_mut(t).as_type_reference_mut().resolved_type_arguments = source_args;
+        self.ty_mut(t)
+            .as_type_reference_mut()
+            .resolved_type_arguments = source_args;
         t
     }
 
@@ -179,7 +216,11 @@ impl Checker {
 
     // Go: checker/checker.go:25070 newTypeParameter
     pub fn new_type_parameter(&mut self, symbol: SymbolId) -> TypeId {
-        let t = self.new_type(TypeFlags::TYPE_PARAMETER, ObjectFlags::NONE, TypeData::TypeParameter(TypeParameter::default()));
+        let t = self.new_type(
+            TypeFlags::TYPE_PARAMETER,
+            ObjectFlags::NONE,
+            TypeData::TypeParameter(TypeParameter::default()),
+        );
         self.ty_mut(t).symbol = symbol;
         t
     }
@@ -189,7 +230,11 @@ impl Checker {
     // of an object literal or a non-inferrable type. This is because there are operations in the type checker
     // that care about the presence of such types at arbitrary depth in a containing type.
     // Go: checker/checker.go:25080 getPropagatingFlagsOfTypes
-    pub fn get_propagating_flags_of_types(&self, types: &[TypeId], exclude_kinds: TypeFlags) -> ObjectFlags {
+    pub fn get_propagating_flags_of_types(
+        &self,
+        types: &[TypeId],
+        exclude_kinds: TypeFlags,
+    ) -> ObjectFlags {
         let mut result = ObjectFlags::NONE;
         for &t in types {
             let ty = self.ty(t);
@@ -211,16 +256,29 @@ impl Checker {
     pub fn new_intersection_type(&mut self, object_flags: ObjectFlags, types: &[TypeId]) -> TypeId {
         let mut data = IntersectionType::default();
         data.union_or_intersection.types = types.to_vec();
-        self.new_type(TypeFlags::INTERSECTION, object_flags, TypeData::Intersection(data))
+        self.new_type(
+            TypeFlags::INTERSECTION,
+            object_flags,
+            TypeData::Intersection(data),
+        )
     }
 
     // Go: checker/checker.go:25102 newIndexedAccessType
-    pub fn new_indexed_access_type(&mut self, object_type: TypeId, index_type: TypeId, access_flags: AccessFlags) -> TypeId {
+    pub fn new_indexed_access_type(
+        &mut self,
+        object_type: TypeId,
+        index_type: TypeId,
+        access_flags: AccessFlags,
+    ) -> TypeId {
         let mut data = IndexedAccessType::default();
         data.object_type = object_type;
         data.index_type = index_type;
         data.access_flags = access_flags;
-        self.new_type(TypeFlags::INDEXED_ACCESS, ObjectFlags::NONE, TypeData::IndexedAccess(data))
+        self.new_type(
+            TypeFlags::INDEXED_ACCESS,
+            ObjectFlags::NONE,
+            TypeData::IndexedAccess(data),
+        )
     }
 
     // Go: checker/checker.go:25110 newIndexType
@@ -236,14 +294,22 @@ impl Checker {
         let mut data = TemplateLiteralType::default();
         data.texts = texts.to_vec();
         data.types = types.to_vec();
-        self.new_type(TypeFlags::TEMPLATE_LITERAL, ObjectFlags::NONE, TypeData::TemplateLiteral(data))
+        self.new_type(
+            TypeFlags::TEMPLATE_LITERAL,
+            ObjectFlags::NONE,
+            TypeData::TemplateLiteral(data),
+        )
     }
 
     // Go: checker/checker.go:25124 newStringMappingType
     pub fn new_string_mapping_type(&mut self, symbol: SymbolId, target: TypeId) -> TypeId {
         let mut data = StringMappingType::default();
         data.target = target;
-        let t = self.new_type(TypeFlags::STRING_MAPPING, ObjectFlags::NONE, TypeData::StringMapping(data));
+        let t = self.new_type(
+            TypeFlags::STRING_MAPPING,
+            ObjectFlags::NONE,
+            TypeData::StringMapping(data),
+        );
         self.ty_mut(t).symbol = symbol;
         t
     }
@@ -267,7 +333,11 @@ impl Checker {
         data.extends_type = extends_type;
         data.mapper = mapper;
         data.combined_mapper = combined_mapper;
-        self.new_type(TypeFlags::CONDITIONAL, ObjectFlags::NONE, TypeData::Conditional(data))
+        self.new_type(
+            TypeFlags::CONDITIONAL,
+            ObjectFlags::NONE,
+            TypeData::Conditional(data),
+        )
     }
 
     // Go: checker/checker.go:25142 newSubstitutionType
@@ -275,7 +345,11 @@ impl Checker {
         let mut data = SubstitutionType::default();
         data.base_type = base_type;
         data.constraint = constraint;
-        self.new_type(TypeFlags::SUBSTITUTION, ObjectFlags::NONE, TypeData::Substitution(data))
+        self.new_type(
+            TypeFlags::SUBSTITUTION,
+            ObjectFlags::NONE,
+            TypeData::Substitution(data),
+        )
     }
 
     // Go: checker/checker.go:25149 newSignature
@@ -341,7 +415,9 @@ impl Checker {
         }
         if flags.intersects(TypeFlags::UNION) {
             if self.ty(t).as_union_type().regular_type.is_nil() {
-                let regular = self.map_type(t, &mut |c: &mut Checker, t: TypeId| c.get_regular_type_of_literal_type(t));
+                let regular = self.map_type(t, &mut |c: &mut Checker, t: TypeId| {
+                    c.get_regular_type_of_literal_type(t)
+                });
                 self.ty_mut(t).as_union_type_mut().regular_type = regular;
             }
             return self.ty(t).as_union_type().regular_type;
@@ -374,9 +450,17 @@ impl Checker {
 
     // Go: checker/checker.go:25207 getStringLiteralType
     pub fn get_string_literal_type(&mut self, value: &str) -> TypeId {
-        let mut t = self.string_literal_types.get(value).copied().unwrap_or_default();
+        let mut t = self
+            .string_literal_types
+            .get(value)
+            .copied()
+            .unwrap_or_default();
         if t.is_nil() {
-            t = self.new_literal_type(TypeFlags::STRING_LITERAL, Some(LiteralValue::String(value.to_string())), TypeId::NIL);
+            t = self.new_literal_type(
+                TypeFlags::STRING_LITERAL,
+                Some(LiteralValue::String(value.to_string())),
+                TypeId::NIL,
+            );
             self.string_literal_types.insert(value.to_string(), t);
         }
         t
@@ -388,14 +472,26 @@ impl Checker {
         // so Go map lookups for NaN always miss. Cache NaN type separately.
         if value.is_nan() {
             if self.nan_type.is_nil() {
-                self.nan_type = self.new_literal_type(TypeFlags::NUMBER_LITERAL, Some(LiteralValue::Number(value)), TypeId::NIL);
+                self.nan_type = self.new_literal_type(
+                    TypeFlags::NUMBER_LITERAL,
+                    Some(LiteralValue::Number(value)),
+                    TypeId::NIL,
+                );
             }
             return self.nan_type;
         }
         let key = NumberKey::from(value);
-        let mut t = self.number_literal_types.get(&key).copied().unwrap_or_default();
+        let mut t = self
+            .number_literal_types
+            .get(&key)
+            .copied()
+            .unwrap_or_default();
         if t.is_nil() {
-            t = self.new_literal_type(TypeFlags::NUMBER_LITERAL, Some(LiteralValue::Number(value)), TypeId::NIL);
+            t = self.new_literal_type(
+                TypeFlags::NUMBER_LITERAL,
+                Some(LiteralValue::Number(value)),
+                TypeId::NIL,
+            );
             self.number_literal_types.insert(key, t);
         }
         t
@@ -404,9 +500,17 @@ impl Checker {
     // Go: checker/checker.go:25233 getBigIntLiteralType
     pub fn get_big_int_literal_type(&mut self, value: PseudoBigInt) -> TypeId {
         let key = PseudoBigIntKey::from(&value);
-        let mut t = self.bigint_literal_types.get(&key).copied().unwrap_or_default();
+        let mut t = self
+            .bigint_literal_types
+            .get(&key)
+            .copied()
+            .unwrap_or_default();
         if t.is_nil() {
-            t = self.new_literal_type(TypeFlags::BIG_INT_LITERAL, Some(LiteralValue::PseudoBigInt(value)), TypeId::NIL);
+            t = self.new_literal_type(
+                TypeFlags::BIG_INT_LITERAL,
+                Some(LiteralValue::PseudoBigInt(value)),
+                TypeId::NIL,
+            );
             self.bigint_literal_types.insert(key, t);
         }
         t
@@ -452,7 +556,12 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25264 getEnumLiteralType
-    pub fn get_enum_literal_type(&mut self, value: LiteralValue, enum_symbol: SymbolId, symbol: SymbolId) -> TypeId {
+    pub fn get_enum_literal_type(
+        &mut self,
+        value: LiteralValue,
+        enum_symbol: SymbolId,
+        symbol: SymbolId,
+    ) -> TypeId {
         let flags;
         match &value {
             LiteralValue::String(_) => {
@@ -463,7 +572,11 @@ impl Checker {
                 // NaN cannot be used as a Go map key because NaN != NaN in IEEE 754,
                 // so Go map lookups for NaN always miss. Cache NaN enum types separately by enum symbol.
                 if v.is_nan() {
-                    let mut t = self.enum_nan_literal_types.get(&enum_symbol).copied().unwrap_or_default();
+                    let mut t = self
+                        .enum_nan_literal_types
+                        .get(&enum_symbol)
+                        .copied()
+                        .unwrap_or_default();
                     if t.is_nil() {
                         t = self.new_literal_type(flags, Some(value.clone()), TypeId::NIL);
                         self.ty_mut(t).symbol = symbol;
@@ -474,8 +587,15 @@ impl Checker {
             }
             _ => panic!("Unhandled case in getEnumLiteralType"),
         }
-        let key = EnumLiteralKey { enum_symbol, value: LiteralValueKey::from(&value) };
-        let mut t = self.enum_literal_types.get(&key).copied().unwrap_or_default();
+        let key = EnumLiteralKey {
+            enum_symbol,
+            value: LiteralValueKey::from(&value),
+        };
+        let mut t = self
+            .enum_literal_types
+            .get(&key)
+            .copied()
+            .unwrap_or_default();
         if t.is_nil() {
             t = self.new_literal_type(flags, Some(value), TypeId::NIL);
             self.ty_mut(t).symbol = symbol;
@@ -501,7 +621,10 @@ impl Checker {
 
     // Go: checker/checker.go:25308 isNeitherUnitTypeNorNever
     pub fn is_neither_unit_type_nor_never(&self, t: TypeId) -> bool {
-        !self.ty(t).flags.intersects(TypeFlags::UNIT | TypeFlags::NEVER)
+        !self
+            .ty(t)
+            .flags
+            .intersects(TypeFlags::UNIT | TypeFlags::NEVER)
     }
 
     // Go: checker/checker.go:25312 isUnitType
@@ -515,7 +638,13 @@ impl Checker {
         let t = self.get_base_constraint_or_type(t);
         // Scan intersections such that tagged literal types are considered unit types.
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-            return self.ty(t).as_intersection_type().union_or_intersection.types.iter().any(|&u| self.is_unit_type(u));
+            return self
+                .ty(t)
+                .as_intersection_type()
+                .union_or_intersection
+                .types
+                .iter()
+                .any(|&u| self.is_unit_type(u));
         }
         self.is_unit_type(t)
     }
@@ -544,7 +673,9 @@ impl Checker {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::ENUM_LIKE) {
             return self.get_base_type_of_enum_like_type(t);
-        } else if flags.intersects(TypeFlags::STRING_LITERAL | TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING) {
+        } else if flags.intersects(
+            TypeFlags::STRING_LITERAL | TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING,
+        ) {
             return self.string_type;
         } else if flags.intersects(TypeFlags::NUMBER_LITERAL) {
             return self.number_type;
@@ -563,7 +694,9 @@ impl Checker {
     // Go: checker/checker.go:25356 getBaseTypeOfLiteralTypeForComparison
     pub fn get_base_type_of_literal_type_for_comparison(&mut self, t: TypeId) -> TypeId {
         let flags = self.ty(t).flags;
-        if flags.intersects(TypeFlags::STRING_LITERAL | TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING) {
+        if flags.intersects(
+            TypeFlags::STRING_LITERAL | TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING,
+        ) {
             return self.string_type;
         } else if flags.intersects(TypeFlags::NUMBER_LITERAL | TypeFlags::ENUM) {
             return self.number_type;
@@ -572,7 +705,9 @@ impl Checker {
         } else if flags.intersects(TypeFlags::BOOLEAN_LITERAL) {
             return self.boolean_type;
         } else if flags.intersects(TypeFlags::UNION) {
-            return self.map_type(t, &mut |c: &mut Checker, t: TypeId| c.get_base_type_of_literal_type_for_comparison(t));
+            return self.map_type(t, &mut |c: &mut Checker, t: TypeId| {
+                c.get_base_type_of_literal_type_for_comparison(t)
+            });
         }
         t
     }
@@ -581,7 +716,9 @@ impl Checker {
     pub fn get_base_type_of_enum_like_type(&mut self, t: TypeId) -> TypeId {
         let flags = self.ty(t).flags;
         let symbol = self.ty(t).symbol;
-        if flags.intersects(TypeFlags::ENUM_LIKE) && self.sym(symbol).flags.intersects(SymbolFlags::ENUM_MEMBER) {
+        if flags.intersects(TypeFlags::ENUM_LIKE)
+            && self.sym(symbol).flags.intersects(SymbolFlags::ENUM_MEMBER)
+        {
             let parent = self.get_parent_of_symbol(symbol);
             return self.get_declared_type_of_symbol(parent);
         }
@@ -590,11 +727,16 @@ impl Checker {
 
     // Go: checker/checker.go:25379 getBaseTypeOfLiteralTypeUnion
     pub fn get_base_type_of_literal_type_union(&mut self, t: TypeId) -> TypeId {
-        let key = CachedTypeKey { kind: CachedTypeKind::LITERAL_UNION_BASE_TYPE, type_id: self.ty(t).id };
+        let key = CachedTypeKey {
+            kind: CachedTypeKind::LITERAL_UNION_BASE_TYPE,
+            type_id: self.ty(t).id,
+        };
         if let Some(&cached) = self.cached_types.get(&key) {
             return cached;
         }
-        let result = self.map_type(t, &mut |c: &mut Checker, t: TypeId| c.get_base_type_of_literal_type(t));
+        let result = self.map_type(t, &mut |c: &mut Checker, t: TypeId| {
+            c.get_base_type_of_literal_type(t)
+        });
         self.cached_types.insert(key, result);
         result
     }
@@ -613,7 +755,9 @@ impl Checker {
         } else if flags.intersects(TypeFlags::BOOLEAN_LITERAL) && self.is_fresh_literal_type(t) {
             return self.boolean_type;
         } else if flags.intersects(TypeFlags::UNION) {
-            return self.map_type(t, &mut |c: &mut Checker, t: TypeId| c.get_widened_literal_type(t));
+            return self.map_type(t, &mut |c: &mut Checker, t: TypeId| {
+                c.get_widened_literal_type(t)
+            });
         }
         t
     }
@@ -624,13 +768,19 @@ impl Checker {
         if flags.intersects(TypeFlags::UNIQUE_ES_SYMBOL) {
             return self.es_symbol_type;
         } else if flags.intersects(TypeFlags::UNION) {
-            return self.map_type(t, &mut |c: &mut Checker, t: TypeId| c.get_widened_unique_es_symbol_type(t));
+            return self.map_type(t, &mut |c: &mut Checker, t: TypeId| {
+                c.get_widened_unique_es_symbol_type(t)
+            });
         }
         t
     }
 
     // Go: checker/checker.go:25417 getWidenedLiteralLikeTypeForContextualType
-    pub fn get_widened_literal_like_type_for_contextual_type(&mut self, t: TypeId, contextual_type: TypeId) -> TypeId {
+    pub fn get_widened_literal_like_type_for_contextual_type(
+        &mut self,
+        t: TypeId,
+        contextual_type: TypeId,
+    ) -> TypeId {
         let mut t = t;
         if !self.is_literal_of_contextual_type(t, contextual_type) {
             let widened = self.get_widened_literal_type(t);
@@ -640,12 +790,18 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25424 isLiteralOfContextualType
-    pub fn is_literal_of_contextual_type(&mut self, candidate_type: TypeId, contextual_type: TypeId) -> bool {
+    pub fn is_literal_of_contextual_type(
+        &mut self,
+        candidate_type: TypeId,
+        contextual_type: TypeId,
+    ) -> bool {
         if contextual_type.is_some() {
             let contextual_flags = self.ty(contextual_type).flags;
             if contextual_flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
                 let types = self.ty(contextual_type).types().to_vec();
-                return types.iter().any(|&t| self.is_literal_of_contextual_type(candidate_type, t));
+                return types
+                    .iter()
+                    .any(|&t| self.is_literal_of_contextual_type(candidate_type, t));
             }
             if contextual_flags.intersects(TypeFlags::INSTANTIABLE_NON_PRIMITIVE) {
                 // If the contextual type is a type variable constrained to a primitive type, consider
@@ -668,7 +824,10 @@ impl Checker {
             // If the contextual type is a literal of a particular primitive type, we consider this a
             // literal context for all literals of that primitive type.
             return contextual_flags.intersects(
-                TypeFlags::STRING_LITERAL | TypeFlags::INDEX | TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING,
+                TypeFlags::STRING_LITERAL
+                    | TypeFlags::INDEX
+                    | TypeFlags::TEMPLATE_LITERAL
+                    | TypeFlags::STRING_MAPPING,
             ) && self.maybe_type_of_kind(candidate_type, TypeFlags::STRING_LITERAL)
                 || contextual_flags.intersects(TypeFlags::NUMBER_LITERAL)
                     && self.maybe_type_of_kind(candidate_type, TypeFlags::NUMBER_LITERAL)
@@ -701,12 +860,21 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25463 mapType
-    pub fn map_type(&mut self, t: TypeId, f: &mut dyn FnMut(&mut Checker, TypeId) -> TypeId) -> TypeId {
+    pub fn map_type(
+        &mut self,
+        t: TypeId,
+        f: &mut dyn FnMut(&mut Checker, TypeId) -> TypeId,
+    ) -> TypeId {
         self.map_type_ex(t, f, false /*noReductions*/)
     }
 
     // Go: checker/checker.go:25467 mapTypeEx
-    pub fn map_type_ex(&mut self, t: TypeId, f: &mut dyn FnMut(&mut Checker, TypeId) -> TypeId, no_reductions: bool) -> TypeId {
+    pub fn map_type_ex(
+        &mut self,
+        t: TypeId,
+        f: &mut dyn FnMut(&mut Checker, TypeId) -> TypeId,
+        no_reductions: bool,
+    ) -> TypeId {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::NEVER) {
             return t;
@@ -718,7 +886,11 @@ impl Checker {
         let types = if origin.is_some() && self.ty(origin).flags.intersects(TypeFlags::UNION) {
             self.ty(origin).types().to_vec()
         } else {
-            self.ty(t).as_union_type().union_or_intersection.types.clone()
+            self.ty(t)
+                .as_union_type()
+                .union_or_intersection
+                .types
+                .clone()
         };
         let mut mapped_types: Vec<TypeId> = Vec::with_capacity(16);
         let mut changed = false;
@@ -739,14 +911,28 @@ impl Checker {
             if mapped_types.is_empty() {
                 return TypeId::NIL;
             }
-            let reduction = if no_reductions { UnionReduction::NONE } else { UnionReduction::LITERAL };
-            return self.get_union_type_ex(&mapped_types, reduction, None /*alias*/, TypeId::NIL /*origin*/);
+            let reduction = if no_reductions {
+                UnionReduction::NONE
+            } else {
+                UnionReduction::LITERAL
+            };
+            return self.get_union_type_ex(
+                &mapped_types,
+                reduction,
+                None,        /*alias*/
+                TypeId::NIL, /*origin*/
+            );
         }
         t
     }
 
     // Go: checker/checker.go:25512 getUnionOrIntersectionType
-    pub fn get_union_or_intersection_type(&mut self, types: &[TypeId], is_union: bool, union_reduction: UnionReduction) -> TypeId {
+    pub fn get_union_or_intersection_type(
+        &mut self,
+        types: &[TypeId],
+        is_union: bool,
+        union_reduction: UnionReduction,
+    ) -> TypeId {
         if is_union {
             return self.get_union_type_ex(types, union_reduction, None, TypeId::NIL);
         }
@@ -755,7 +941,12 @@ impl Checker {
 
     // Go: checker/checker.go:25519 getUnionType
     pub fn get_union_type(&mut self, types: &[TypeId]) -> TypeId {
-        self.get_union_type_ex(types, UnionReduction::LITERAL, None /*alias*/, TypeId::NIL /*origin*/)
+        self.get_union_type_ex(
+            types,
+            UnionReduction::LITERAL,
+            None,        /*alias*/
+            TypeId::NIL, /*origin*/
+        )
     }
 
     // We sort and deduplicate the constituent types based on object identity. If the subtypeReduction
@@ -782,17 +973,32 @@ impl Checker {
         // We optimize for the common case of unioning a union type with some other type (such as `undefined`).
         if types.len() == 2
             && origin.is_nil()
-            && (self.ty(types[0]).flags.intersects(TypeFlags::UNION) || self.ty(types[1]).flags.intersects(TypeFlags::UNION))
+            && (self.ty(types[0]).flags.intersects(TypeFlags::UNION)
+                || self.ty(types[1]).flags.intersects(TypeFlags::UNION))
         {
             let mut id1 = self.ty(types[0]).id;
             let mut id2 = self.ty(types[1]).id;
             if id1 > id2 {
                 std::mem::swap(&mut id1, &mut id2);
             }
-            let key = UnionOfUnionKey { id1, id2, r: union_reduction, a: self.get_alias_key(alias.as_deref()) };
-            let mut t = self.union_of_union_types.get(&key).copied().unwrap_or_default();
+            let key = UnionOfUnionKey {
+                id1,
+                id2,
+                r: union_reduction,
+                a: self.get_alias_key(alias.as_deref()),
+            };
+            let mut t = self
+                .union_of_union_types
+                .get(&key)
+                .copied()
+                .unwrap_or_default();
             if t.is_nil() {
-                t = self.get_union_type_worker(types, union_reduction, alias, TypeId::NIL /*origin*/);
+                t = self.get_union_type_worker(
+                    types,
+                    union_reduction,
+                    alias,
+                    TypeId::NIL, /*origin*/
+                );
                 self.union_of_union_types.insert(key, t);
             }
             return t;
@@ -809,7 +1015,8 @@ impl Checker {
         origin: TypeId,
     ) -> TypeId {
         let mut origin = origin;
-        let (mut type_set, includes) = self.add_types_to_union(Vec::with_capacity(types.len()), TypeFlags::NONE, types);
+        let (mut type_set, includes) =
+            self.add_types_to_union(Vec::with_capacity(types.len()), TypeFlags::NONE, types);
         if union_reduction != UnionReduction::NONE {
             if includes.intersects(TypeFlags::ANY_OR_UNKNOWN) {
                 if includes.intersects(TypeFlags::ANY) {
@@ -824,17 +1031,31 @@ impl Checker {
             }
             if includes.intersects(TypeFlags::UNDEFINED) {
                 // If type set contains both undefinedType and missingType, remove missingType
-                if type_set.len() >= 2 && type_set[0] == self.undefined_type && type_set[1] == self.missing_type {
+                if type_set.len() >= 2
+                    && type_set[0] == self.undefined_type
+                    && type_set[1] == self.missing_type
+                {
                     type_set.remove(1);
                 }
             }
             if includes.intersects(
-                TypeFlags::ENUM | TypeFlags::LITERAL | TypeFlags::UNIQUE_ES_SYMBOL | TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING,
-            ) || includes.intersects(TypeFlags::VOID) && includes.intersects(TypeFlags::UNDEFINED)
+                TypeFlags::ENUM
+                    | TypeFlags::LITERAL
+                    | TypeFlags::UNIQUE_ES_SYMBOL
+                    | TypeFlags::TEMPLATE_LITERAL
+                    | TypeFlags::STRING_MAPPING,
+            ) || includes.intersects(TypeFlags::VOID)
+                && includes.intersects(TypeFlags::UNDEFINED)
             {
-                type_set = self.remove_redundant_literal_types(type_set, includes, (union_reduction.0 & UnionReduction::SUBTYPE.0) != 0);
+                type_set = self.remove_redundant_literal_types(
+                    type_set,
+                    includes,
+                    (union_reduction.0 & UnionReduction::SUBTYPE.0) != 0,
+                );
             }
-            if includes.intersects(TypeFlags::STRING_LITERAL) && includes.intersects(TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING) {
+            if includes.intersects(TypeFlags::STRING_LITERAL)
+                && includes.intersects(TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING)
+            {
                 type_set = self.remove_string_literals_matched_by_template_literals(type_set);
             }
             if includes.intersects(TypeFlags::INCLUDES_CONSTRAINED_TYPE_VARIABLE) {
@@ -929,8 +1150,14 @@ impl Checker {
             self.ty_mut(t).as_union_type_mut().origin = origin;
             self.ty_mut(t).alias = alias;
             if types.len() == 2
-                && self.ty(types[0]).flags.intersects(TypeFlags::BOOLEAN_LITERAL)
-                && self.ty(types[1]).flags.intersects(TypeFlags::BOOLEAN_LITERAL)
+                && self
+                    .ty(types[0])
+                    .flags
+                    .intersects(TypeFlags::BOOLEAN_LITERAL)
+                && self
+                    .ty(types[1])
+                    .flags
+                    .intersects(TypeFlags::BOOLEAN_LITERAL)
             {
                 self.ty_mut(t).flags |= TypeFlags::BOOLEAN;
             }
@@ -949,7 +1176,12 @@ impl Checker {
     // Go: checker/checker.go:25663 addTypesToUnion
     // PORT: Go threads the slice through and returns it; Rust takes and
     // returns an owned `Vec`.
-    pub fn add_types_to_union(&mut self, type_set: Vec<TypeId>, includes: TypeFlags, types: &[TypeId]) -> (Vec<TypeId>, TypeFlags) {
+    pub fn add_types_to_union(
+        &mut self,
+        type_set: Vec<TypeId>,
+        includes: TypeFlags,
+        types: &[TypeId],
+    ) -> (Vec<TypeId>, TypeFlags) {
         let mut type_set = type_set;
         let mut includes = includes;
         let mut last_type = TypeId::NIL;
@@ -959,7 +1191,11 @@ impl Checker {
                     let (has_alias, origin, u_types) = {
                         let ty = self.ty(t);
                         let u = ty.as_union_type();
-                        (ty.alias.is_some(), u.origin, u.union_or_intersection.types.clone())
+                        (
+                            ty.alias.is_some(),
+                            u.origin,
+                            u.union_or_intersection.types.clone(),
+                        )
                     };
                     if has_alias || origin.is_some() {
                         includes |= TypeFlags::UNION;
@@ -975,7 +1211,12 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25682 addTypeToUnion
-    pub fn add_type_to_union(&mut self, type_set: Vec<TypeId>, includes: TypeFlags, t: TypeId) -> (Vec<TypeId>, TypeFlags) {
+    pub fn add_type_to_union(
+        &mut self,
+        type_set: Vec<TypeId>,
+        includes: TypeFlags,
+        t: TypeId,
+    ) -> (Vec<TypeId>, TypeFlags) {
         let mut type_set = type_set;
         let mut includes = includes;
         let flags = self.ty(t).flags;
@@ -986,7 +1227,9 @@ impl Checker {
             if flags.intersects(TypeFlags::INSTANTIABLE) {
                 includes |= TypeFlags::INCLUDES_INSTANTIABLE;
             }
-            if flags.intersects(TypeFlags::INTERSECTION) && object_flags.intersects(ObjectFlags::IS_CONSTRAINED_TYPE_VARIABLE) {
+            if flags.intersects(TypeFlags::INTERSECTION)
+                && object_flags.intersects(ObjectFlags::IS_CONSTRAINED_TYPE_VARIABLE)
+            {
                 includes |= TypeFlags::INCLUDES_CONSTRAINED_TYPE_VARIABLE;
             }
             if t == self.wildcard_type {
@@ -1002,7 +1245,9 @@ impl Checker {
             } else {
                 // PORT: the set is sorted and has no duplicates, so the Rust
                 // insertion index matches Go `slices.BinarySearchFunc`.
-                if let Err(index) = type_set.binary_search_by(|&probe| self.compare_types(probe, t).cmp(&0)) {
+                if let Err(index) =
+                    type_set.binary_search_by(|&probe| self.compare_types(probe, t).cmp(&0))
+                {
                     type_set.insert(index, t);
                 }
             }
@@ -1017,7 +1262,8 @@ impl Checker {
             let ty = self.ty(t);
             if ty.flags.intersects(TypeFlags::UNION) {
                 let origin = ty.as_union_type().origin;
-                let origin_is_union = origin.is_some() && self.ty(origin).flags.intersects(TypeFlags::UNION);
+                let origin_is_union =
+                    origin.is_some() && self.ty(origin).flags.intersects(TypeFlags::UNION);
                 if ty.alias.is_some() || origin.is_some() && !origin_is_union {
                     if !named_unions.contains(&t) {
                         named_unions.push(t);
@@ -1032,20 +1278,32 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25726 removeRedundantLiteralTypes
-    pub fn remove_redundant_literal_types(&mut self, types: Vec<TypeId>, includes: TypeFlags, reduce_void_undefined: bool) -> Vec<TypeId> {
+    pub fn remove_redundant_literal_types(
+        &mut self,
+        types: Vec<TypeId>,
+        includes: TypeFlags,
+        reduce_void_undefined: bool,
+    ) -> Vec<TypeId> {
         let mut types = types;
         let mut i = types.len();
         while i > 0 {
             i -= 1;
             let t = types[i];
             let flags = self.ty(t).flags;
-            let remove = flags.intersects(TypeFlags::STRING_LITERAL | TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING)
-                && includes.intersects(TypeFlags::STRING)
-                || flags.intersects(TypeFlags::NUMBER_LITERAL) && includes.intersects(TypeFlags::NUMBER)
-                || flags.intersects(TypeFlags::BIG_INT_LITERAL) && includes.intersects(TypeFlags::BIG_INT)
-                || flags.intersects(TypeFlags::UNIQUE_ES_SYMBOL) && includes.intersects(TypeFlags::ES_SYMBOL)
-                || reduce_void_undefined && flags.intersects(TypeFlags::UNDEFINED) && includes.intersects(TypeFlags::VOID)
-                || self.is_fresh_literal_type(t) && self.contains_type(&types, self.ty(t).as_literal_type().regular_type);
+            let remove = flags.intersects(
+                TypeFlags::STRING_LITERAL | TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING,
+            ) && includes.intersects(TypeFlags::STRING)
+                || flags.intersects(TypeFlags::NUMBER_LITERAL)
+                    && includes.intersects(TypeFlags::NUMBER)
+                || flags.intersects(TypeFlags::BIG_INT_LITERAL)
+                    && includes.intersects(TypeFlags::BIG_INT)
+                || flags.intersects(TypeFlags::UNIQUE_ES_SYMBOL)
+                    && includes.intersects(TypeFlags::ES_SYMBOL)
+                || reduce_void_undefined
+                    && flags.intersects(TypeFlags::UNDEFINED)
+                    && includes.intersects(TypeFlags::VOID)
+                || self.is_fresh_literal_type(t)
+                    && self.contains_type(&types, self.ty(t).as_literal_type().regular_type);
             if remove {
                 types.remove(i);
             }
@@ -1054,16 +1312,25 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25745 removeStringLiteralsMatchedByTemplateLiterals
-    pub fn remove_string_literals_matched_by_template_literals(&mut self, types: Vec<TypeId>) -> Vec<TypeId> {
+    pub fn remove_string_literals_matched_by_template_literals(
+        &mut self,
+        types: Vec<TypeId>,
+    ) -> Vec<TypeId> {
         let mut types = types;
-        let templates: Vec<TypeId> = types.iter().copied().filter(|&t| self.is_pattern_literal_type(t)).collect();
+        let templates: Vec<TypeId> = types
+            .iter()
+            .copied()
+            .filter(|&t| self.is_pattern_literal_type(t))
+            .collect();
         if !templates.is_empty() {
             let mut i = types.len();
             while i > 0 {
                 i -= 1;
                 let t = types[i];
                 if self.ty(t).flags.intersects(TypeFlags::STRING_LITERAL)
-                    && templates.iter().any(|&template| self.is_type_matched_by_template_literal_or_string_mapping(t, template))
+                    && templates.iter().any(|&template| {
+                        self.is_type_matched_by_template_literal_or_string_mapping(t, template)
+                    })
                 {
                     types.remove(i);
                 }
@@ -1073,11 +1340,23 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25762 isTypeMatchedByTemplateLiteralOrStringMapping
-    pub fn is_type_matched_by_template_literal_or_string_mapping(&mut self, t: TypeId, template: TypeId) -> bool {
-        if self.ty(template).flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
+    pub fn is_type_matched_by_template_literal_or_string_mapping(
+        &mut self,
+        t: TypeId,
+        template: TypeId,
+    ) -> bool {
+        if self
+            .ty(template)
+            .flags
+            .intersects(TypeFlags::TEMPLATE_LITERAL)
+        {
             let template_literal = self.ty(template).as_template_literal_type().clone();
             let comparer = self.compare_types_assignable.clone();
-            return self.is_type_matched_by_template_literal_type(t, &template_literal, &mut |c: &mut Checker, s: TypeId, t: TypeId, r: bool| comparer(c, s, t, r));
+            return self.is_type_matched_by_template_literal_type(
+                t,
+                &template_literal,
+                &mut |c: &mut Checker, s: TypeId, t: TypeId, r: bool| comparer(c, s, t, r),
+            );
         }
         self.is_member_of_string_mapping(t, template)
     }
@@ -1112,14 +1391,17 @@ impl Checker {
             let constraint = self.get_base_constraint_of_type(type_variable);
             let covered = {
                 let primitives = &primitives;
-                self.every_type(constraint, &mut |c: &mut Checker, t: TypeId| c.contains_type(primitives, t))
+                self.every_type(constraint, &mut |c: &mut Checker, t: TypeId| {
+                    c.contains_type(primitives, t)
+                })
             };
             if covered {
                 let mut i = types.len();
                 while i > 0 {
                     i -= 1;
                     let t = types[i];
-                    if let Some((variable, primitive)) = self.constrained_type_variable_parts_p28(t) {
+                    if let Some((variable, primitive)) = self.constrained_type_variable_parts_p28(t)
+                    {
                         if variable == type_variable && self.contains_type(&primitives, primitive) {
                             types.remove(i);
                         }
@@ -1137,9 +1419,21 @@ impl Checker {
     // where index is 0 when types[0] is a type variable and 1 otherwise.
     fn constrained_type_variable_parts_p28(&self, t: TypeId) -> Option<(TypeId, TypeId)> {
         let ty = self.ty(t);
-        if ty.flags.intersects(TypeFlags::INTERSECTION) && ty.object_flags.intersects(ObjectFlags::IS_CONSTRAINED_TYPE_VARIABLE) {
+        if ty.flags.intersects(TypeFlags::INTERSECTION)
+            && ty
+                .object_flags
+                .intersects(ObjectFlags::IS_CONSTRAINED_TYPE_VARIABLE)
+        {
             let members = &ty.as_intersection_type().union_or_intersection.types;
-            let index = if !self.ty(members[0]).flags.intersects(TypeFlags::TYPE_VARIABLE) { 1 } else { 0 };
+            let index = if !self
+                .ty(members[0])
+                .flags
+                .intersects(TypeFlags::TYPE_VARIABLE)
+            {
+                1
+            } else {
+                0
+            };
             return Some((members[index], members[1 - index]));
         }
         None
@@ -1148,7 +1442,11 @@ impl Checker {
     // Go: checker/checker.go:25822 removeSubtypes
     // PORT: Go returns nil when the union is too complex; Rust returns None.
     // The tracer instant event in Go is not ported (the checker has no tracer).
-    pub fn remove_subtypes(&mut self, types: Vec<TypeId>, has_object_types: bool) -> Option<Vec<TypeId>> {
+    pub fn remove_subtypes(
+        &mut self,
+        types: Vec<TypeId>,
+        has_object_types: bool,
+    ) -> Option<Vec<TypeId>> {
         let mut types = types;
         // [] and [T] immediately reduce to [] and [T] respectively
         if types.len() < 2 {
@@ -1164,7 +1462,8 @@ impl Checker {
         let mut has_empty_object = false;
         if has_object_types {
             for &t in &types {
-                if self.ty(t).flags.intersects(TypeFlags::OBJECT) && !self.is_generic_mapped_type(t) {
+                if self.ty(t).flags.intersects(TypeFlags::OBJECT) && !self.is_generic_mapped_type(t)
+                {
                     self.resolve_structured_type_members(t);
                     if self.is_empty_resolved_type(t) {
                         has_empty_object = true;
@@ -1189,7 +1488,10 @@ impl Checker {
                     let base = self.get_base_constraint_or_type(source);
                     if self.ty(base).flags.intersects(TypeFlags::UNION) {
                         let never = self.never_type;
-                        let others: Vec<TypeId> = types.iter().map(|&t| if t == source { never } else { t }).collect();
+                        let others: Vec<TypeId> = types
+                            .iter()
+                            .map(|&t| if t == source { never } else { t })
+                            .collect();
                         let others_union = self.get_union_type(&others);
                         let relation = self.strict_subtype_relation.clone();
                         if self.is_type_related_to(source, others_union, &relation) {
@@ -1203,7 +1505,11 @@ impl Checker {
                 // reduction of large discriminated union types.
                 let mut key_property = SymbolId::NIL;
                 let mut key_property_type = TypeId::NIL;
-                if source_flags.intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION | TypeFlags::INSTANTIABLE_NON_PRIMITIVE) {
+                if source_flags.intersects(
+                    TypeFlags::OBJECT
+                        | TypeFlags::INTERSECTION
+                        | TypeFlags::INSTANTIABLE_NON_PRIMITIVE,
+                ) {
                     for p in self.get_properties_of_type(source) {
                         let prop_type = self.get_type_of_symbol(p);
                         if self.is_unit_type(prop_type) {
@@ -1238,16 +1544,22 @@ impl Checker {
                         count += 1;
                         if key_property.is_some()
                             && self.ty(target).flags.intersects(
-                                TypeFlags::OBJECT | TypeFlags::INTERSECTION | TypeFlags::INSTANTIABLE_NON_PRIMITIVE,
+                                TypeFlags::OBJECT
+                                    | TypeFlags::INTERSECTION
+                                    | TypeFlags::INSTANTIABLE_NON_PRIMITIVE,
                             )
                         {
                             let name = self.sym(key_property).name.clone();
                             let t = self.get_type_of_property_of_type(target, &name);
-                            if t.is_some() && self.is_unit_type(t) && self.get_regular_type_of_literal_type(t) != key_property_type {
+                            if t.is_some()
+                                && self.is_unit_type(t)
+                                && self.get_regular_type_of_literal_type(t) != key_property_type
+                            {
                                 continue;
                             }
                         }
-                        if (source == self.empty_object_type || source == self.unknown_empty_object_type)
+                        if (source == self.empty_object_type
+                            || source == self.unknown_empty_object_type)
                             && self.ty(target).symbol.is_some()
                             && self.is_empty_anonymous_object_type(target)
                         {
@@ -1255,8 +1567,14 @@ impl Checker {
                         }
                         let relation = self.strict_subtype_relation.clone();
                         if self.is_type_related_to(source, target, &relation)
-                            && (!self.ty(self.get_target_type(source)).object_flags.intersects(ObjectFlags::CLASS)
-                                || !self.ty(self.get_target_type(target)).object_flags.intersects(ObjectFlags::CLASS)
+                            && (!self
+                                .ty(self.get_target_type(source))
+                                .object_flags
+                                .intersects(ObjectFlags::CLASS)
+                                || !self
+                                    .ty(self.get_target_type(target))
+                                    .object_flags
+                                    .intersects(ObjectFlags::CLASS)
                                 || self.is_type_derived_from(source, target))
                         {
                             types.remove(i);

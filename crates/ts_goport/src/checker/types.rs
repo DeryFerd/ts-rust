@@ -73,7 +73,7 @@ pub struct ValueSymbolLinks {
 // Go: checker/types.go:181 MappedSymbolLinks
 #[derive(Clone, Debug, Default)]
 pub struct MappedSymbolLinks {
-    pub key_type: TypeId,          // Key type for mapped type member
+    pub key_type: TypeId,           // Key type for mapped type member
     pub synthetic_origin: SymbolId, // For a property on a mapped or spread type, points back to the original property
 }
 
@@ -82,8 +82,8 @@ pub struct MappedSymbolLinks {
 // Go: checker/types.go:188 DeferredSymbolLinks
 #[derive(Clone, Debug, Default)]
 pub struct DeferredSymbolLinks {
-    pub parent: TypeId,                 // Source union/intersection of a deferred type
-    pub constituents: Vec<TypeId>,      // Calculated list of constituents for a deferred type
+    pub parent: TypeId,            // Source union/intersection of a deferred type
+    pub constituents: Vec<TypeId>, // Calculated list of constituents for a deferred type
     pub write_constituents: Vec<TypeId>, // Constituents of a deferred `writeType`
 }
 
@@ -94,7 +94,7 @@ pub struct DeferredSymbolLinks {
 pub struct AliasSymbolLinks {
     pub immediate_target: SymbolId, // Immediate target of an alias. May be another alias. Do not access directly, use `checker.getImmediateAliasedSymbol` instead.
     pub alias_target: SymbolId,     // Resolved (non-alias) target of an alias
-    pub referenced: bool,           // True if alias symbol has been referenced as a value that can be emitted
+    pub referenced: bool, // True if alias symbol has been referenced as a value that can be emitted
     pub type_only_declaration: Node, // First resolved alias declaration that makes the symbol only usable in type constructs
 }
 
@@ -130,7 +130,7 @@ pub struct LateBoundLinks {
 // Go: checker/types.go:225 ExportTypeLinks
 #[derive(Clone, Debug, Default)]
 pub struct ExportTypeLinks {
-    pub target: SymbolId,        // Target symbol
+    pub target: SymbolId,         // Target symbol
     pub originating_import: Node, // Import declaration which produced the symbol, present if the symbol is marked as uncallable but had call signatures in `resolveESModuleSymbol`
 }
 
@@ -244,7 +244,7 @@ pub struct ContainingSymbolLinks {
 // Go: checker/types.go:362 NodeLinks
 #[derive(Clone, Default)]
 pub struct NodeLinks {
-    pub flags: NodeCheckFlags,                      // Set of flags specific to Node
+    pub flags: NodeCheckFlags, // Set of flags specific to Node
     pub declaration_requires_scope_change: Tristate, // Set by `useOuterVariableScopeInParameter` in checker when downlevel emit would change the name resolution scope inside of a parameter.
     pub has_reported_statement_in_ambient_context: bool, // Cache boolean if we report statements in ambient context
 }
@@ -258,7 +258,7 @@ pub struct SymbolNodeLinks {
 // Go: checker/types.go:372 TypeNodeLinks
 #[derive(Clone, Debug, Default)]
 pub struct TypeNodeLinks {
-    pub resolved_type: TypeId,              // Resolved type associated with node
+    pub resolved_type: TypeId, // Resolved type associated with node
     pub outer_type_parameters: Vec<TypeId>, // Outer type parameters of anonymous object type
 }
 
@@ -301,8 +301,8 @@ pub struct SourceFileLinks {
 // Go: checker/types.go:407 SignatureLinks
 #[derive(Clone, Debug, Default)]
 pub struct SignatureLinks {
-    pub resolved_signature: SignatureId,  // Cached signature of signature node or call expression
-    pub effects_signature: SignatureId,   // Signature with possible control flow effects
+    pub resolved_signature: SignatureId, // Cached signature of signature node or call expression
+    pub effects_signature: SignatureId,  // Signature with possible control flow effects
     pub decorator_signature: SignatureId, // Signature for decorator as if invoked by the runtime
 }
 
@@ -715,42 +715,62 @@ impl Type {
 
     // Go: checker/types.go:712 Type.AsConstrainedType
     pub fn as_constrained_type(&self) -> &ConstrainedType {
-        self.data.as_constrained_type().unwrap_or_else(|| type_cast_panic("ConstrainedType"))
+        self.data
+            .as_constrained_type()
+            .unwrap_or_else(|| type_cast_panic("ConstrainedType"))
     }
     pub fn as_constrained_type_mut(&mut self) -> &mut ConstrainedType {
-        self.data.as_constrained_type_mut().unwrap_or_else(|| type_cast_panic("ConstrainedType"))
+        self.data
+            .as_constrained_type_mut()
+            .unwrap_or_else(|| type_cast_panic("ConstrainedType"))
     }
 
     // Go: checker/types.go:713 Type.AsStructuredType
     pub fn as_structured_type(&self) -> &StructuredType {
-        self.data.as_structured_type().unwrap_or_else(|| type_cast_panic("StructuredType"))
+        self.data
+            .as_structured_type()
+            .unwrap_or_else(|| type_cast_panic("StructuredType"))
     }
     pub fn as_structured_type_mut(&mut self) -> &mut StructuredType {
-        self.data.as_structured_type_mut().unwrap_or_else(|| type_cast_panic("StructuredType"))
+        self.data
+            .as_structured_type_mut()
+            .unwrap_or_else(|| type_cast_panic("StructuredType"))
     }
 
     // Go: checker/types.go:714 Type.AsObjectType
     pub fn as_object_type(&self) -> &ObjectType {
-        self.data.as_object_type().unwrap_or_else(|| type_cast_panic("ObjectType"))
+        self.data
+            .as_object_type()
+            .unwrap_or_else(|| type_cast_panic("ObjectType"))
     }
     pub fn as_object_type_mut(&mut self) -> &mut ObjectType {
-        self.data.as_object_type_mut().unwrap_or_else(|| type_cast_panic("ObjectType"))
+        self.data
+            .as_object_type_mut()
+            .unwrap_or_else(|| type_cast_panic("ObjectType"))
     }
 
     // Go: checker/types.go:715 Type.AsTypeReference
     pub fn as_type_reference(&self) -> &TypeReference {
-        self.data.as_type_reference().unwrap_or_else(|| type_cast_panic("TypeReference"))
+        self.data
+            .as_type_reference()
+            .unwrap_or_else(|| type_cast_panic("TypeReference"))
     }
     pub fn as_type_reference_mut(&mut self) -> &mut TypeReference {
-        self.data.as_type_reference_mut().unwrap_or_else(|| type_cast_panic("TypeReference"))
+        self.data
+            .as_type_reference_mut()
+            .unwrap_or_else(|| type_cast_panic("TypeReference"))
     }
 
     // Go: checker/types.go:716 Type.AsInterfaceType
     pub fn as_interface_type(&self) -> &InterfaceType {
-        self.data.as_interface_type().unwrap_or_else(|| type_cast_panic("InterfaceType"))
+        self.data
+            .as_interface_type()
+            .unwrap_or_else(|| type_cast_panic("InterfaceType"))
     }
     pub fn as_interface_type_mut(&mut self) -> &mut InterfaceType {
-        self.data.as_interface_type_mut().unwrap_or_else(|| type_cast_panic("InterfaceType"))
+        self.data
+            .as_interface_type_mut()
+            .unwrap_or_else(|| type_cast_panic("InterfaceType"))
     }
 
     // Go: checker/types.go:717 Type.AsUnionOrIntersectionType
@@ -789,7 +809,9 @@ impl Type {
             return self.as_index_type().target;
         } else if self.flags.intersects(TypeFlags::STRING_MAPPING) {
             return self.as_string_mapping_type().target;
-        } else if self.flags.intersects(TypeFlags::OBJECT) && self.object_flags.intersects(ObjectFlags::MAPPED) {
+        } else if self.flags.intersects(TypeFlags::OBJECT)
+            && self.object_flags.intersects(ObjectFlags::MAPPED)
+        {
             // PORT: unreachable in Go too (the first case already matches).
             return self.as_mapped_type().object.target;
         }
@@ -1148,7 +1170,11 @@ impl LiteralType {
     // PORT: Go `ValueToString(nil)` panics; unwrapping here panics the same way.
     // Go: checker/types.go:895 LiteralType.String
     pub fn string(&self) -> String {
-        value_to_string(self.value.as_ref().expect("unhandled value type in valueToString"))
+        value_to_string(
+            self.value
+                .as_ref()
+                .expect("unhandled value type in valueToString"),
+        )
     }
 }
 
@@ -1266,10 +1292,10 @@ pub struct InterfaceType {
     pub declared_members_resolved: bool,
     pub resolved_base_constructor_type: TypeId,
     pub resolved_base_types: Vec<TypeId>,
-    pub declared_members: SymbolTable,                   // Declared members
-    pub declared_call_signatures: Vec<SignatureId>,      // Declared call signatures
+    pub declared_members: SymbolTable, // Declared members
+    pub declared_call_signatures: Vec<SignatureId>, // Declared call signatures
     pub declared_construct_signatures: Vec<SignatureId>, // Declared construct signatures
-    pub declared_index_infos: Vec<IndexInfoId>,          // Declared index signatures
+    pub declared_index_infos: Vec<IndexInfoId>, // Declared index signatures
 }
 
 impl InterfaceType {
@@ -1286,7 +1312,8 @@ impl InterfaceType {
         if self.all_type_parameters.is_empty() {
             return &[];
         }
-        &self.all_type_parameters[self.outer_type_parameter_count as usize..self.all_type_parameters.len() - 1]
+        &self.all_type_parameters
+            [self.outer_type_parameter_count as usize..self.all_type_parameters.len() - 1]
     }
 
     // Go: checker/types.go:1027 InterfaceType.TypeParameters
@@ -1429,7 +1456,7 @@ pub struct UnionType {
     pub union_or_intersection: UnionOrIntersectionType,
     pub resolved_reduced_type: TypeId,
     pub regular_type: TypeId,
-    pub origin: TypeId,           // Denormalized union, intersection, or index type in which union originates
+    pub origin: TypeId, // Denormalized union, intersection, or index type in which union originates
     pub key_property_name: String, // Property with unique unit type that exists in every object/intersection in union type
     // PORT: Go nil map is `None`.
     pub constituent_map: Option<FxHashMap<TypeId, TypeId>>, // Constituents keyed by unit type discriminants
@@ -1676,7 +1703,7 @@ impl Signature {
 // Go: checker/types.go:1329 CompositeSignature
 #[derive(Clone, Debug, Default)]
 pub struct CompositeSignature {
-    pub is_union: bool,                // True for union, false for intersection
+    pub is_union: bool,               // True for union, false for intersection
     pub signatures: Vec<SignatureId>, // Individual signatures
 }
 
@@ -1720,9 +1747,9 @@ pub struct IndexInfo {
     pub key_type: TypeId,
     pub value_type: TypeId,
     pub is_readonly: bool,
-    pub declaration: Node,       // IndexSignatureDeclaration
-    pub index_symbol: SymbolId,  // Synthetic property symbol for this index signature
-    pub components: Vec<Node>,   // ElementWithComputedPropertyName
+    pub declaration: Node,      // IndexSignatureDeclaration
+    pub index_symbol: SymbolId, // Synthetic property symbol for this index signature
+    pub components: Vec<Node>,  // ElementWithComputedPropertyName
 }
 
 impl IndexInfo {
@@ -1816,28 +1843,29 @@ pub struct LanguageFeatureMinimumTargetMap {
 // PORT: Go package var `LanguageFeatureMinimumTarget` is never mutated, so
 // it is a Rust const.
 // Go: checker/types.go:1435 LanguageFeatureMinimumTarget
-pub const LANGUAGE_FEATURE_MINIMUM_TARGET: LanguageFeatureMinimumTargetMap = LanguageFeatureMinimumTargetMap {
-    exponentiation: ScriptTarget::ES2016,
-    async_functions: ScriptTarget::ES2017,
-    for_await_of: ScriptTarget::ES2018,
-    async_generators: ScriptTarget::ES2018,
-    async_iteration: ScriptTarget::ES2018,
-    object_spread_rest: ScriptTarget::ES2018,
-    regular_expression_flags_dot_all: ScriptTarget::ES2018,
-    bindingless_catch: ScriptTarget::ES2019,
-    big_int: ScriptTarget::ES2020,
-    nullish_coalesce: ScriptTarget::ES2020,
-    optional_chaining: ScriptTarget::ES2020,
-    logical_assignment: ScriptTarget::ES2021,
-    top_level_await: ScriptTarget::ES2022,
-    class_fields: ScriptTarget::ES2022,
-    private_names_and_class_static_blocks: ScriptTarget::ES2022,
-    regular_expression_flags_has_indices: ScriptTarget::ES2022,
-    shebang_comments: ScriptTarget::ES_NEXT,
-    using_and_await_using: ScriptTarget::ES_NEXT,
-    class_and_class_element_decorators: ScriptTarget::ES_NEXT,
-    regular_expression_flags_unicode_sets: ScriptTarget::ES_NEXT,
-};
+pub const LANGUAGE_FEATURE_MINIMUM_TARGET: LanguageFeatureMinimumTargetMap =
+    LanguageFeatureMinimumTargetMap {
+        exponentiation: ScriptTarget::ES2016,
+        async_functions: ScriptTarget::ES2017,
+        for_await_of: ScriptTarget::ES2018,
+        async_generators: ScriptTarget::ES2018,
+        async_iteration: ScriptTarget::ES2018,
+        object_spread_rest: ScriptTarget::ES2018,
+        regular_expression_flags_dot_all: ScriptTarget::ES2018,
+        bindingless_catch: ScriptTarget::ES2019,
+        big_int: ScriptTarget::ES2020,
+        nullish_coalesce: ScriptTarget::ES2020,
+        optional_chaining: ScriptTarget::ES2020,
+        logical_assignment: ScriptTarget::ES2021,
+        top_level_await: ScriptTarget::ES2022,
+        class_fields: ScriptTarget::ES2022,
+        private_names_and_class_static_blocks: ScriptTarget::ES2022,
+        regular_expression_flags_has_indices: ScriptTarget::ES2022,
+        shebang_comments: ScriptTarget::ES_NEXT,
+        using_and_await_using: ScriptTarget::ES_NEXT,
+        class_and_class_element_decorators: ScriptTarget::ES_NEXT,
+        regular_expression_flags_unicode_sets: ScriptTarget::ES_NEXT,
+    };
 
 // Aliases for types
 // Go: checker/types.go:1459 StringLiteralType

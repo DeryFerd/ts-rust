@@ -132,7 +132,9 @@ pub fn position_is_synthesized(pos: i32) -> bool {
 pub fn find_last_visible_node(nodes: &[Node]) -> Node {
     let mut from_end = 1usize;
     while from_end <= nodes.len()
-        && nodes[nodes.len() - from_end].flags().intersects(NodeFlags::REPARSED)
+        && nodes[nodes.len() - from_end]
+            .flags()
+            .intersects(NodeFlags::REPARSED)
     {
         from_end += 1;
     }
@@ -159,7 +161,8 @@ pub fn is_modifier_like(node: Node) -> bool {
 
 // Go: ast/utilities.go:112 IsCompoundAssignment
 pub fn is_compound_assignment(token: SyntaxKind) -> bool {
-    (token as u16) >= (SyntaxKind::FIRST_COMPOUND_ASSIGNMENT as u16) && (token as u16) <= (SyntaxKind::LAST_COMPOUND_ASSIGNMENT as u16)
+    (token as u16) >= (SyntaxKind::FIRST_COMPOUND_ASSIGNMENT as u16)
+        && (token as u16) <= (SyntaxKind::LAST_COMPOUND_ASSIGNMENT as u16)
 }
 
 // Go: ast/utilities.go:116 IsAssignmentExpression
@@ -221,7 +224,8 @@ pub fn is_array_binding_or_assignment_element(node: Node) -> bool {
 
 // Go: ast/utilities.go:166 IsBindingPattern
 pub fn is_binding_pattern(node: Node) -> bool {
-    node.kind() == SyntaxKind::ObjectBindingPattern || node.kind() == SyntaxKind::ArrayBindingPattern
+    node.kind() == SyntaxKind::ObjectBindingPattern
+        || node.kind() == SyntaxKind::ArrayBindingPattern
 }
 
 // Go: ast/utilities.go:170 IsForInOrOfStatement
@@ -421,7 +425,10 @@ pub fn is_literal_expression(node: Node) -> bool {
 
 // Go: ast/utilities.go:323 IsStringLiteralLike
 pub fn is_string_literal_like(node: Node) -> bool {
-    matches!(node.kind(), SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral)
+    matches!(
+        node.kind(),
+        SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral
+    )
 }
 
 // Go: ast/utilities.go:331 IsStringOrNumericLiteralLike
@@ -462,7 +469,9 @@ fn get_question_dot_token(node: Node) -> Node {
 // Determines if node is the root expression of an OptionalChain
 // Go: ast/utilities.go:362 IsOptionalChainRoot
 pub fn is_optional_chain_root(node: Node) -> bool {
-    is_optional_chain(node) && !is_non_null_expression(node) && get_question_dot_token(node).is_some()
+    is_optional_chain(node)
+        && !is_non_null_expression(node)
+        && get_question_dot_token(node).is_some()
 }
 
 // Determines whether a node is the outermost `OptionalChain` in an ECMAScript `OptionalExpression`:
@@ -925,7 +934,8 @@ pub fn is_type_node_kind(kind: SyntaxKind) -> bool {
         | SyntaxKind::JsDocVariadicType => return true,
         _ => {}
     }
-    (kind as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16) && (kind as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16)
+    (kind as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16)
+        && (kind as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16)
 }
 
 // Go: ast/utilities.go:751 IsTypeNode
@@ -935,7 +945,8 @@ pub fn is_type_node(node: Node) -> bool {
 
 // Go: ast/utilities.go:755 IsJSDocKind
 pub fn is_js_doc_kind(kind: SyntaxKind) -> bool {
-    (SyntaxKind::FIRST_JS_DOC_NODE as u16) <= (kind as u16) && (kind as u16) <= (SyntaxKind::LAST_JS_DOC_NODE as u16)
+    (SyntaxKind::FIRST_JS_DOC_NODE as u16) <= (kind as u16)
+        && (kind as u16) <= (SyntaxKind::LAST_JS_DOC_NODE as u16)
 }
 
 // Go: ast/utilities.go:759 IsJSDocTypeAssertion
@@ -958,9 +969,8 @@ pub fn is_prologue_directive(node: Node) -> bool {
 // PORT: `crate::flags` defines the single-bit `OEK*` consts. The composite
 // consts from the same Go const block are defined here.
 impl OuterExpressionKinds {
-    pub const OEK_ASSERTIONS: Self = Self(
-        Self::OEK_TYPE_ASSERTIONS.0 | Self::OEK_NON_NULL_ASSERTIONS.0 | Self::OEK_SATISFIES.0,
-    );
+    pub const OEK_ASSERTIONS: Self =
+        Self(Self::OEK_TYPE_ASSERTIONS.0 | Self::OEK_NON_NULL_ASSERTIONS.0 | Self::OEK_SATISFIES.0);
     pub const OEK_ALL: Self = Self(
         Self::OEK_PARENTHESES.0
             | Self::OEK_ASSERTIONS.0
@@ -1046,7 +1056,10 @@ pub fn skip_type_parentheses(node: Node) -> Node {
 
 // Go: ast/utilities.go:840 SkipPartiallyEmittedExpressions
 pub fn skip_partially_emitted_expressions(node: Node) -> Node {
-    skip_outer_expressions(node, OuterExpressionKinds::OEK_PARTIALLY_EMITTED_EXPRESSIONS)
+    skip_outer_expressions(
+        node,
+        OuterExpressionKinds::OEK_PARTIALLY_EMITTED_EXPRESSIONS,
+    )
 }
 
 // Walks up the parents of a parenthesized expression to find the containing node

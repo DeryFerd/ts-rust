@@ -102,7 +102,9 @@ pub fn parse_project_reference(json: &CompilerOptionsValue) -> Vec<ProjectRefere
 // PORT: Go returns a map pointer that is never nil. It is `Option` so it
 // can go straight to the nilable `json` argument of
 // `parseJsonConfigFileContentWorker`; it is always `Some`.
-pub fn parse_json_to_string_key(json: &CompilerOptionsValue) -> Option<IndexMap<String, CompilerOptionsValue>> {
+pub fn parse_json_to_string_key(
+    json: &CompilerOptionsValue,
+) -> Option<IndexMap<String, CompilerOptionsValue>> {
     let mut result = IndexMap::with_capacity(6);
     if let CompilerOptionsValue::Map(m) = json {
         if let Some(v) = m.get("include") {
@@ -119,7 +121,10 @@ pub fn parse_json_to_string_key(json: &CompilerOptionsValue) -> Option<IndexMap<
         }
         if let Some(v) = m.get("extends") {
             if let CompilerOptionsValue::String(str) = v {
-                result.insert("extends".to_string(), CompilerOptionsValue::List(vec![CompilerOptionsValue::String(str.clone())]));
+                result.insert(
+                    "extends".to_string(),
+                    CompilerOptionsValue::List(vec![CompilerOptionsValue::String(str.clone())]),
+                );
             }
             result.insert("extends".to_string(), v.clone());
         }
@@ -203,7 +208,11 @@ impl OptionParser for TypeAcquisitionParser<'_> {
 // Go: tsoptions/parsinghelpers.go:192 ParseCompilerOptions
 // PORT: Go `allOptions` can be nil; every Rust caller has options, so the
 // nil check is dropped.
-pub fn parse_compiler_options(key: &str, value: CompilerOptionsValue, all_options: &mut CompilerOptions) -> Vec<Diagnostic> {
+pub fn parse_compiler_options(
+    key: &str,
+    value: CompilerOptionsValue,
+    all_options: &mut CompilerOptions,
+) -> Vec<Diagnostic> {
     if value.is_nil() {
         return Vec::new();
     }
@@ -215,7 +224,11 @@ pub fn parse_compiler_options(key: &str, value: CompilerOptionsValue, all_option
 // PORT: renamed, because the snake_case form of the Go name is the same as
 // `ParseCompilerOptions`. Go `[]string` results go to `Vec<String>` fields
 // (nil and empty are the same there); `type_roots` keeps the nil state.
-fn parse_compiler_options_worker(key: &str, value: &CompilerOptionsValue, all_options: &mut CompilerOptions) -> bool {
+fn parse_compiler_options_worker(
+    key: &str,
+    value: &CompilerOptionsValue,
+    all_options: &mut CompilerOptions,
+) -> bool {
     let mut key = key;
     let option = COMMAND_LINE_COMPILER_OPTIONS_MAP.get(key);
     if let Some(option) = option {
@@ -223,13 +236,19 @@ fn parse_compiler_options_worker(key: &str, value: &CompilerOptionsValue, all_op
     }
     match key {
         "allowJs" => all_options.allow_js = parse_tristate(value),
-        "allowImportingTsExtensions" => all_options.allow_importing_ts_extensions = parse_tristate(value),
-        "allowSyntheticDefaultImports" => all_options.allow_synthetic_default_imports = parse_tristate(value),
+        "allowImportingTsExtensions" => {
+            all_options.allow_importing_ts_extensions = parse_tristate(value)
+        }
+        "allowSyntheticDefaultImports" => {
+            all_options.allow_synthetic_default_imports = parse_tristate(value)
+        }
         "allowNonTsExtensions" => all_options.allow_non_ts_extensions = parse_tristate(value),
         "allowUmdGlobalAccess" => all_options.allow_umd_global_access = parse_tristate(value),
         "allowUnreachableCode" => all_options.allow_unreachable_code = parse_tristate(value),
         "allowUnusedLabels" => all_options.allow_unused_labels = parse_tristate(value),
-        "allowArbitraryExtensions" => all_options.allow_arbitrary_extensions = parse_tristate(value),
+        "allowArbitraryExtensions" => {
+            all_options.allow_arbitrary_extensions = parse_tristate(value)
+        }
         "alwaysStrict" => all_options.always_strict = parse_tristate(value),
         "assumeChangesOnlyAffectDirectDependencies" => {
             all_options.assume_changes_only_affect_direct_dependencies = parse_tristate(value);
@@ -237,7 +256,9 @@ fn parse_compiler_options_worker(key: &str, value: &CompilerOptionsValue, all_op
         "baseUrl" => all_options.base_url = parse_string(value),
         "build" => all_options.build = parse_tristate(value),
         "checkJs" => all_options.check_js = parse_tristate(value),
-        "customConditions" => all_options.custom_conditions = parse_string_array(value).unwrap_or_default(),
+        "customConditions" => {
+            all_options.custom_conditions = parse_string_array(value).unwrap_or_default()
+        }
         "composite" => all_options.composite = parse_tristate(value),
         "declarationDir" => all_options.declaration_dir = parse_string(value),
         "deduplicatePackages" => all_options.deduplicate_packages = parse_tristate(value),
@@ -246,8 +267,12 @@ fn parse_compiler_options_worker(key: &str, value: &CompilerOptionsValue, all_op
         "disableSourceOfProjectReferenceRedirect" => {
             all_options.disable_source_of_project_reference_redirect = parse_tristate(value);
         }
-        "disableSolutionSearching" => all_options.disable_solution_searching = parse_tristate(value),
-        "disableReferencedProjectLoad" => all_options.disable_referenced_project_load = parse_tristate(value),
+        "disableSolutionSearching" => {
+            all_options.disable_solution_searching = parse_tristate(value)
+        }
+        "disableReferencedProjectLoad" => {
+            all_options.disable_referenced_project_load = parse_tristate(value)
+        }
         "declarationMap" => all_options.declaration_map = parse_tristate(value),
         "declaration" => all_options.declaration = parse_tristate(value),
         "downlevelIteration" => all_options.downlevel_iteration = parse_tristate(value),
@@ -257,10 +282,14 @@ fn parse_compiler_options_worker(key: &str, value: &CompilerOptionsValue, all_op
         "emitDecoratorMetadata" => all_options.emit_decorator_metadata = parse_tristate(value),
         "emitBOM" => all_options.emit_bom = parse_tristate(value),
         "esModuleInterop" => all_options.es_module_interop = parse_tristate(value),
-        "exactOptionalPropertyTypes" => all_options.exact_optional_property_types = parse_tristate(value),
+        "exactOptionalPropertyTypes" => {
+            all_options.exact_optional_property_types = parse_tristate(value)
+        }
         "explainFiles" => all_options.explain_files = parse_tristate(value),
         "experimentalDecorators" => all_options.experimental_decorators = parse_tristate(value),
-        "forceConsistentCasingInFileNames" => all_options.force_consistent_casing_in_file_names = parse_tristate(value),
+        "forceConsistentCasingInFileNames" => {
+            all_options.force_consistent_casing_in_file_names = parse_tristate(value)
+        }
         "generateCpuProfile" => all_options.generate_cpu_profile = parse_string(value),
         "generateTrace" => all_options.generate_trace = parse_string(value),
         "isolatedModules" => all_options.isolated_modules = parse_tristate(value),
@@ -291,31 +320,44 @@ fn parse_compiler_options_worker(key: &str, value: &CompilerOptionsValue, all_op
         "mapRoot" => all_options.map_root = parse_string(value),
         "module" => all_options.module = float_or_int32_to_flag(value, as_module_kind, ModuleKind),
         "moduleDetectionKind" => {
-            all_options.module_detection = float_or_int32_to_flag(value, as_module_detection_kind, ModuleDetectionKind);
+            all_options.module_detection =
+                float_or_int32_to_flag(value, as_module_detection_kind, ModuleDetectionKind);
         }
         "moduleResolution" => {
-            all_options.module_resolution = float_or_int32_to_flag(value, as_module_resolution_kind, ModuleResolutionKind);
+            all_options.module_resolution =
+                float_or_int32_to_flag(value, as_module_resolution_kind, ModuleResolutionKind);
         }
-        "moduleSuffixes" => all_options.module_suffixes = parse_string_array(value).unwrap_or_default(),
+        "moduleSuffixes" => {
+            all_options.module_suffixes = parse_string_array(value).unwrap_or_default()
+        }
         "moduleDetection" => {
-            all_options.module_detection = float_or_int32_to_flag(value, as_module_detection_kind, ModuleDetectionKind);
+            all_options.module_detection =
+                float_or_int32_to_flag(value, as_module_detection_kind, ModuleDetectionKind);
         }
         "noCheck" => all_options.no_check = parse_tristate(value),
-        "noFallthroughCasesInSwitch" => all_options.no_fallthrough_cases_in_switch = parse_tristate(value),
+        "noFallthroughCasesInSwitch" => {
+            all_options.no_fallthrough_cases_in_switch = parse_tristate(value)
+        }
         "noEmitForJsFiles" => all_options.no_emit_for_js_files = parse_tristate(value),
         "noErrorTruncation" => all_options.no_error_truncation = parse_tristate(value),
         "noImplicitAny" => all_options.no_implicit_any = parse_tristate(value),
         "noImplicitThis" => all_options.no_implicit_this = parse_tristate(value),
         "noLib" => all_options.no_lib = parse_tristate(value),
-        "noPropertyAccessFromIndexSignature" => all_options.no_property_access_from_index_signature = parse_tristate(value),
-        "noUncheckedIndexedAccess" => all_options.no_unchecked_indexed_access = parse_tristate(value),
+        "noPropertyAccessFromIndexSignature" => {
+            all_options.no_property_access_from_index_signature = parse_tristate(value)
+        }
+        "noUncheckedIndexedAccess" => {
+            all_options.no_unchecked_indexed_access = parse_tristate(value)
+        }
         "noEmitHelpers" => all_options.no_emit_helpers = parse_tristate(value),
         "noEmitOnError" => all_options.no_emit_on_error = parse_tristate(value),
         "noImplicitReturns" => all_options.no_implicit_returns = parse_tristate(value),
         "noUnusedLocals" => all_options.no_unused_locals = parse_tristate(value),
         "noUnusedParameters" => all_options.no_unused_parameters = parse_tristate(value),
         "noImplicitOverride" => all_options.no_implicit_override = parse_tristate(value),
-        "noUncheckedSideEffectImports" => all_options.no_unchecked_side_effect_imports = parse_tristate(value),
+        "noUncheckedSideEffectImports" => {
+            all_options.no_unchecked_side_effect_imports = parse_tristate(value)
+        }
         "outFile" => all_options.out_file = parse_string(value),
         "noResolve" => all_options.no_resolve = parse_tristate(value),
         "paths" => all_options.paths = parse_string_map(value),
@@ -325,32 +367,48 @@ fn parse_compiler_options_worker(key: &str, value: &CompilerOptionsValue, all_op
         "project" => all_options.project = parse_string(value),
         "pretty" => all_options.pretty = parse_tristate(value),
         "resolveJsonModule" => all_options.resolve_json_module = parse_tristate(value),
-        "resolvePackageJsonExports" => all_options.resolve_package_json_exports = parse_tristate(value),
-        "resolvePackageJsonImports" => all_options.resolve_package_json_imports = parse_tristate(value),
+        "resolvePackageJsonExports" => {
+            all_options.resolve_package_json_exports = parse_tristate(value)
+        }
+        "resolvePackageJsonImports" => {
+            all_options.resolve_package_json_imports = parse_tristate(value)
+        }
         "reactNamespace" => all_options.react_namespace = parse_string(value),
-        "rewriteRelativeImportExtensions" => all_options.rewrite_relative_import_extensions = parse_tristate(value),
+        "rewriteRelativeImportExtensions" => {
+            all_options.rewrite_relative_import_extensions = parse_tristate(value)
+        }
         "rootDir" => all_options.root_dir = parse_string(value),
         "rootDirs" => all_options.root_dirs = parse_string_array(value).unwrap_or_default(),
         "removeComments" => all_options.remove_comments = parse_tristate(value),
         "stableTypeOrdering" => all_options.stable_type_ordering = parse_tristate(value),
         "strict" => all_options.strict = parse_tristate(value),
         "strictBindCallApply" => all_options.strict_bind_call_apply = parse_tristate(value),
-        "strictBuiltinIteratorReturn" => all_options.strict_builtin_iterator_return = parse_tristate(value),
+        "strictBuiltinIteratorReturn" => {
+            all_options.strict_builtin_iterator_return = parse_tristate(value)
+        }
         "strictFunctionTypes" => all_options.strict_function_types = parse_tristate(value),
         "strictNullChecks" => all_options.strict_null_checks = parse_tristate(value),
-        "strictPropertyInitialization" => all_options.strict_property_initialization = parse_tristate(value),
+        "strictPropertyInitialization" => {
+            all_options.strict_property_initialization = parse_tristate(value)
+        }
         "skipDefaultLibCheck" => all_options.skip_default_lib_check = parse_tristate(value),
         "sourceMap" => all_options.source_map = parse_tristate(value),
         "sourceRoot" => all_options.source_root = parse_string(value),
         "stripInternal" => all_options.strip_internal = parse_tristate(value),
         "suppressOutputPathCheck" => all_options.suppress_output_path_check = parse_tristate(value),
-        "target" => all_options.target = float_or_int32_to_flag(value, as_script_target, ScriptTarget),
+        "target" => {
+            all_options.target = float_or_int32_to_flag(value, as_script_target, ScriptTarget)
+        }
         "traceResolution" => all_options.trace_resolution = parse_tristate(value),
         "tsBuildInfoFile" => all_options.ts_build_info_file = parse_string(value),
         "typeRoots" => all_options.type_roots = parse_string_array(value),
         "types" => all_options.types = parse_string_array(value).unwrap_or_default(),
-        "useDefineForClassFields" => all_options.use_define_for_class_fields = parse_tristate(value),
-        "useUnknownInCatchVariables" => all_options.use_unknown_in_catch_variables = parse_tristate(value),
+        "useDefineForClassFields" => {
+            all_options.use_define_for_class_fields = parse_tristate(value)
+        }
+        "useUnknownInCatchVariables" => {
+            all_options.use_unknown_in_catch_variables = parse_tristate(value)
+        }
         "verbatimModuleSyntax" => all_options.verbatim_module_syntax = parse_tristate(value),
         "version" => all_options.version = parse_tristate(value),
         "help" => all_options.help = parse_tristate(value),
@@ -363,7 +421,9 @@ fn parse_compiler_options_worker(key: &str, value: &CompilerOptionsValue, all_op
         "noDtsResolution" => all_options.no_dts_resolution = parse_tristate(value),
         "pathsBasePath" => all_options.paths_base_path = parse_string(value),
         "outDir" => all_options.out_dir = parse_string(value),
-        "newLine" => all_options.new_line = float_or_int32_to_flag(value, as_new_line_kind, NewLineKind),
+        "newLine" => {
+            all_options.new_line = float_or_int32_to_flag(value, as_new_line_kind, NewLineKind)
+        }
         "watch" => all_options.watch = parse_tristate(value),
         "pprofDir" => all_options.pprof_dir = parse_string(value),
         "singleThreaded" => all_options.single_threaded = parse_tristate(value),
@@ -380,29 +440,57 @@ fn parse_compiler_options_worker(key: &str, value: &CompilerOptionsValue, all_op
 // PORT: Go `value.(T)` for the enum types of `floatOrInt32ToFlag`. One
 // accessor per Go type argument.
 fn as_jsx_emit(value: &CompilerOptionsValue) -> Option<JsxEmit> {
-    if let CompilerOptionsValue::JsxEmit(v) = value { Some(*v) } else { None }
+    if let CompilerOptionsValue::JsxEmit(v) = value {
+        Some(*v)
+    } else {
+        None
+    }
 }
 fn as_module_kind(value: &CompilerOptionsValue) -> Option<ModuleKind> {
-    if let CompilerOptionsValue::ModuleKind(v) = value { Some(*v) } else { None }
+    if let CompilerOptionsValue::ModuleKind(v) = value {
+        Some(*v)
+    } else {
+        None
+    }
 }
 fn as_module_detection_kind(value: &CompilerOptionsValue) -> Option<ModuleDetectionKind> {
-    if let CompilerOptionsValue::ModuleDetectionKind(v) = value { Some(*v) } else { None }
+    if let CompilerOptionsValue::ModuleDetectionKind(v) = value {
+        Some(*v)
+    } else {
+        None
+    }
 }
 fn as_module_resolution_kind(value: &CompilerOptionsValue) -> Option<ModuleResolutionKind> {
-    if let CompilerOptionsValue::ModuleResolutionKind(v) = value { Some(*v) } else { None }
+    if let CompilerOptionsValue::ModuleResolutionKind(v) = value {
+        Some(*v)
+    } else {
+        None
+    }
 }
 fn as_script_target(value: &CompilerOptionsValue) -> Option<ScriptTarget> {
-    if let CompilerOptionsValue::ScriptTarget(v) = value { Some(*v) } else { None }
+    if let CompilerOptionsValue::ScriptTarget(v) = value {
+        Some(*v)
+    } else {
+        None
+    }
 }
 fn as_new_line_kind(value: &CompilerOptionsValue) -> Option<NewLineKind> {
-    if let CompilerOptionsValue::NewLineKind(v) = value { Some(*v) } else { None }
+    if let CompilerOptionsValue::NewLineKind(v) = value {
+        Some(*v)
+    } else {
+        None
+    }
 }
 
 // Go: tsoptions/parsinghelpers.go:482 floatOrInt32ToFlag
 // PORT: the Go type parameter `T ~int32` is the pair (`typed`, `from_i32`):
 // `typed` is Go `value.(T)` and `from_i32` is the Go conversion `T(...)`.
 // Go `value.(float64)` panics on another type; so does this port.
-fn float_or_int32_to_flag<T>(value: &CompilerOptionsValue, typed: fn(&CompilerOptionsValue) -> Option<T>, from_i32: fn(i32) -> T) -> T {
+fn float_or_int32_to_flag<T>(
+    value: &CompilerOptionsValue,
+    typed: fn(&CompilerOptionsValue) -> Option<T>,
+    from_i32: fn(i32) -> T,
+) -> T {
     if let Some(v) = typed(value) {
         return v;
     }
@@ -419,7 +507,11 @@ fn float_or_int32_to_flag<T>(value: &CompilerOptionsValue, typed: fn(&CompilerOp
 // Go: tsoptions/parsinghelpers.go:518 ParseTypeAcquisition
 // PORT: Go `allOptions` can be nil; every Rust caller has one, so the nil
 // check is dropped. Go `[]string` fields are `Vec<String>`.
-pub fn parse_type_acquisition(key: &str, value: CompilerOptionsValue, all_options: &mut TypeAcquisition) -> Vec<Diagnostic> {
+pub fn parse_type_acquisition(
+    key: &str,
+    value: CompilerOptionsValue,
+    all_options: &mut TypeAcquisition,
+) -> Vec<Diagnostic> {
     if value.is_nil() {
         return Vec::new();
     }
@@ -465,7 +557,9 @@ pub fn merge_compiler_options<'a>(
     let mut explicit_null_fields: FxHashSet<String> = FxHashSet::default();
     if let Some(raw_map) = raw_source {
         // Options are nested under "compilerOptions" in both tsconfig.json and wrapped command line options
-        if let Some(CompilerOptionsValue::Map(compiler_options_map)) = raw_map.get("compilerOptions") {
+        if let Some(CompilerOptionsValue::Map(compiler_options_map)) =
+            raw_map.get("compilerOptions")
+        {
             for (key, value) in compiler_options_map {
                 if value.is_nil() {
                     explicit_null_fields.insert(key.clone());
@@ -661,10 +755,18 @@ pub fn convert_option_to_absolute_path(
     };
     if option.kind == CommandLineOptionKind::LIST {
         // PORT: Go `option.Elements()` is never nil for a list option.
-        if option.elements().expect("list option has elements").is_file_path {
+        if option
+            .elements()
+            .expect("list option has elements")
+            .is_file_path
+        {
             if let CompilerOptionsValue::StringList(arr) = v {
                 return (
-                    CompilerOptionsValue::StringList(arr.iter().map(|item| get_normalized_absolute_path(item, cwd)).collect()),
+                    CompilerOptionsValue::StringList(
+                        arr.iter()
+                            .map(|item| get_normalized_absolute_path(item, cwd))
+                            .collect(),
+                    ),
                     true,
                 );
             }
@@ -674,7 +776,9 @@ pub fn convert_option_to_absolute_path(
                         arr.iter()
                             .map(|item| {
                                 if let CompilerOptionsValue::String(s) = item {
-                                    return CompilerOptionsValue::String(get_normalized_absolute_path(s, cwd));
+                                    return CompilerOptionsValue::String(
+                                        get_normalized_absolute_path(s, cwd),
+                                    );
                                 }
                                 item.clone()
                             })
@@ -686,7 +790,10 @@ pub fn convert_option_to_absolute_path(
         }
     } else if option.is_file_path {
         if let CompilerOptionsValue::String(value) = v {
-            return (CompilerOptionsValue::String(get_normalized_absolute_path(value, cwd)), true);
+            return (
+                CompilerOptionsValue::String(get_normalized_absolute_path(value, cwd)),
+                true,
+            );
         }
     }
     (CompilerOptionsValue::Nil, false)

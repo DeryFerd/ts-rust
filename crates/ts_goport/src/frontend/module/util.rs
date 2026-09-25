@@ -6,7 +6,8 @@ use std::sync::LazyLock;
 // Go: module/util.go:13 typeScriptVersion
 // PORT: Go package-level var is a `LazyLock`. It stays private, because
 // packagejson has its own copy with the same Go name.
-static TYPE_SCRIPT_VERSION: LazyLock<Version> = LazyLock::new(|| must_parse_version(crate::core::version()));
+static TYPE_SCRIPT_VERSION: LazyLock<Version> =
+    LazyLock::new(|| must_parse_version(crate::core::version()));
 
 // Go: module/util.go:15 InferredTypesContainingFile
 pub const INFERRED_TYPES_CONTAINING_FILE: &str = "__inferred type names__.ts";
@@ -37,8 +38,11 @@ pub fn parse_node_module_from_path(resolved: &str, is_folder: bool) -> String {
     let mut index_after_package_name =
         move_to_next_directory_separator_if_available(&path, index_after_node_modules, is_folder);
     if path.as_bytes()[index_after_node_modules as usize] == b'@' {
-        index_after_package_name =
-            move_to_next_directory_separator_if_available(&path, index_after_package_name, is_folder);
+        index_after_package_name = move_to_next_directory_separator_if_available(
+            &path,
+            index_after_package_name,
+            is_folder,
+        );
     }
     path[..index_after_package_name as usize].to_string()
 }
@@ -54,7 +58,10 @@ pub fn parse_package_name(module_name: &str) -> (String, String) {
     }
     match idx {
         None => (module_name.to_string(), String::new()),
-        Some(idx) => (module_name[..idx].to_string(), module_name[idx + 1..].to_string()),
+        Some(idx) => (
+            module_name[..idx].to_string(),
+            module_name[idx + 1..].to_string(),
+        ),
     }
 }
 
@@ -130,7 +137,11 @@ pub fn compare_pattern_keys(a: &str, b: &str) -> i32 {
 // PORT: Go `*ast.SourceFile` is a source file `Node`; `IsDeclarationFile`
 // is read through `source_file_info`.
 #[must_use]
-pub fn get_resolution_diagnostic(options: &CompilerOptions, resolved_module: &ResolvedModule, file: Node) -> Option<&'static Message> {
+pub fn get_resolution_diagnostic(
+    options: &CompilerOptions,
+    resolved_module: &ResolvedModule,
+    file: Node,
+) -> Option<&'static Message> {
     let need_jsx = || -> Option<&'static Message> {
         if options.jsx != JsxEmit::NONE {
             return None;
@@ -139,7 +150,12 @@ pub fn get_resolution_diagnostic(options: &CompilerOptions, resolved_module: &Re
     };
 
     let need_allow_js = || -> Option<&'static Message> {
-        if options.get_allow_js() || !options.no_implicit_any.default_if_unknown(options.strict).is_true() {
+        if options.get_allow_js()
+            || !options
+                .no_implicit_any
+                .default_if_unknown(options.strict)
+                .is_true()
+        {
             return None;
         }
         Some(diag::Could_not_find_a_declaration_file_for_module_0_1_implicitly_has_an_any_type)
@@ -153,7 +169,9 @@ pub fn get_resolution_diagnostic(options: &CompilerOptions, resolved_module: &Re
     };
 
     let need_allow_arbitrary_extensions = || -> Option<&'static Message> {
-        if source_file_info(file).is_declaration_file || options.allow_arbitrary_extensions.is_true() {
+        if source_file_info(file).is_declaration_file
+            || options.allow_arbitrary_extensions.is_true()
+        {
             return None;
         }
         Some(diag::Module_0_was_resolved_to_1_but_allowArbitraryExtensions_is_not_set)

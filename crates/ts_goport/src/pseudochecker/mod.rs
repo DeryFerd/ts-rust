@@ -38,6 +38,12 @@ pub struct PseudoChecker {
 }
 
 // Go: pseudochecker/checker.go:19 NewPseudoChecker
-pub fn new_pseudo_checker(strict_null_checks: bool, exact_optional_property_types: bool) -> PseudoChecker {
-    PseudoChecker { strict_null_checks, exact_optional_property_types }
+pub fn new_pseudo_checker(
+    strict_null_checks: bool,
+    exact_optional_property_types: bool,
+) -> PseudoChecker {
+    PseudoChecker {
+        strict_null_checks,
+        exact_optional_property_types,
+    }
 }

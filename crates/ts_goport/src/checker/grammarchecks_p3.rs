@@ -11,7 +11,10 @@ impl Checker {
             if range_.pos() == range_.end() {
                 pos = range_.pos();
             } else {
-                pos = skip_trivia(source_file_text(get_source_file_of_node(node)), range_.pos());
+                pos = skip_trivia(
+                    source_file_text(get_source_file_of_node(node)),
+                    range_.pos(),
+                );
             }
             return self.grammar_error_at_pos(
                 node,
@@ -29,13 +32,20 @@ impl Checker {
     pub fn check_grammar_constructor_type_annotation(&mut self, node: Node) -> bool {
         let t = node.type_();
         if t.is_some() {
-            return self.grammar_error_on_node(t, diag::Type_annotation_cannot_appear_on_a_constructor_declaration, args![]);
+            return self.grammar_error_on_node(
+                t,
+                diag::Type_annotation_cannot_appear_on_a_constructor_declaration,
+                args![],
+            );
         }
         false
     }
 
     // Go: checker/grammarchecks.go:1881 checkGrammarProperty
-    pub fn check_grammar_property(&mut self, node: Node /*Union[PropertyDeclaration, PropertySignature]*/) -> bool {
+    pub fn check_grammar_property(
+        &mut self,
+        node: Node, /*Union[PropertyDeclaration, PropertySignature]*/
+    ) -> bool {
         let property_name = node.name();
         if is_computed_property_name(property_name)
             && is_binary_expression(property_name.expression())
@@ -49,7 +59,11 @@ impl Checker {
         }
         if is_class_like(node.parent()) {
             if is_string_literal(property_name) && property_name.text() == "constructor" {
-                return self.grammar_error_on_node(property_name, diag::Classes_may_not_have_a_field_named_constructor, args![]);
+                return self.grammar_error_on_node(
+                    property_name,
+                    diag::Classes_may_not_have_a_field_named_constructor,
+                    args![],
+                );
             }
             if self.check_grammar_for_invalid_dynamic_name(
                 property_name,
@@ -78,7 +92,11 @@ impl Checker {
             }
             let initializer = node.initializer();
             if initializer.is_some() {
-                return self.grammar_error_on_node(initializer, diag::An_interface_property_cannot_have_an_initializer, args![]);
+                return self.grammar_error_on_node(
+                    initializer,
+                    diag::An_interface_property_cannot_have_an_initializer,
+                    args![],
+                );
             }
         } else if is_type_literal_node(node.parent()) {
             if self.check_grammar_for_invalid_dynamic_name(
@@ -93,7 +111,11 @@ impl Checker {
             }
             let initializer = node.initializer();
             if initializer.is_some() {
-                return self.grammar_error_on_node(initializer, diag::A_type_literal_property_cannot_have_an_initializer, args![]);
+                return self.grammar_error_on_node(
+                    initializer,
+                    diag::A_type_literal_property_cannot_have_an_initializer,
+                    args![],
+                );
             }
         }
 
@@ -154,13 +176,14 @@ impl Checker {
         }
 
         if initializer.is_some() {
-            let is_invalid_initializer = !(is_initializer_string_or_number_literal_expression(initializer)
-                || self.is_initializer_simple_literal_enum_reference(initializer)
-                || initializer.kind() == SyntaxKind::TrueKeyword
-                || initializer.kind() == SyntaxKind::FalseKeyword
-                || is_initializer_big_int_literal_expression(initializer));
-            let is_const_or_readonly =
-                is_declaration_readonly(node) || is_variable_declaration(node) && self.is_var_const_like(node);
+            let is_invalid_initializer =
+                !(is_initializer_string_or_number_literal_expression(initializer)
+                    || self.is_initializer_simple_literal_enum_reference(initializer)
+                    || initializer.kind() == SyntaxKind::TrueKeyword
+                    || initializer.kind() == SyntaxKind::FalseKeyword
+                    || is_initializer_big_int_literal_expression(initializer));
+            let is_const_or_readonly = is_declaration_readonly(node)
+                || is_variable_declaration(node) && self.is_var_const_like(node);
             if is_const_or_readonly && type_node.is_nil() {
                 if is_invalid_initializer {
                     return self.grammar_error_on_node(
@@ -170,7 +193,11 @@ impl Checker {
                     );
                 }
             } else {
-                return self.grammar_error_on_node(initializer, diag::Initializers_are_not_allowed_in_ambient_contexts, args![]);
+                return self.grammar_error_on_node(
+                    initializer,
+                    diag::Initializers_are_not_allowed_in_ambient_contexts,
+                    args![],
+                );
             }
         }
 
@@ -193,7 +220,8 @@ pub fn is_initializer_big_int_literal_expression(expr: Node) -> bool {
     }
 
     if expr.kind() == SyntaxKind::PrefixUnaryExpression {
-        return expr.operator() == SyntaxKind::MinusToken && expr.operand().kind() == SyntaxKind::BigIntLiteral;
+        return expr.operator() == SyntaxKind::MinusToken
+            && expr.operand().kind() == SyntaxKind::BigIntLiteral;
     }
 
     false
@@ -220,7 +248,10 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:2011 checkGrammarTopLevelElementForRequiredDeclareModifier
-    pub fn check_grammar_top_level_element_for_required_declare_modifier(&mut self, node: Node) -> bool {
+    pub fn check_grammar_top_level_element_for_required_declare_modifier(
+        &mut self,
+        node: Node,
+    ) -> bool {
         // A declare modifier is required for any top level .d.ts declaration except export=, export default, export as namespace
         // interfaces and imports categories:
         //
@@ -242,7 +273,10 @@ impl Checker {
             || kind == SyntaxKind::ExportDeclaration
             || kind == SyntaxKind::ExportAssignment
             || kind == SyntaxKind::NamespaceExportDeclaration
-            || has_syntactic_modifier(node, ModifierFlags::AMBIENT | ModifierFlags::EXPORT | ModifierFlags::DEFAULT)
+            || has_syntactic_modifier(
+                node,
+                ModifierFlags::AMBIENT | ModifierFlags::EXPORT | ModifierFlags::DEFAULT,
+            )
         {
             return false;
         }
@@ -255,7 +289,10 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:2031 checkGrammarTopLevelElementsForRequiredDeclareModifier
-    pub fn check_grammar_top_level_elements_for_required_declare_modifier(&mut self, file: Node) -> bool {
+    pub fn check_grammar_top_level_elements_for_required_declare_modifier(
+        &mut self,
+        file: Node,
+    ) -> bool {
         for decl in file.statements().iter() {
             if is_declaration_node(decl) || decl.kind() == SyntaxKind::VariableStatement {
                 if self.check_grammar_top_level_element_for_required_declare_modifier(decl) {
@@ -268,21 +305,27 @@ impl Checker {
 
     // Go: checker/grammarchecks.go:2042 checkGrammarSourceFile
     pub fn check_grammar_source_file(&mut self, node: Node) -> bool {
-        node.flags().intersects(NodeFlags::AMBIENT) && self.check_grammar_top_level_elements_for_required_declare_modifier(node)
+        node.flags().intersects(NodeFlags::AMBIENT)
+            && self.check_grammar_top_level_elements_for_required_declare_modifier(node)
     }
 
     // Go: checker/grammarchecks.go:2046 checkGrammarStatementInAmbientContext
     pub fn check_grammar_statement_in_ambient_context(&mut self, node: Node) -> bool {
         if node.flags().intersects(NodeFlags::AMBIENT) {
             // Find containing block which is either Block, ModuleBlock, SourceFile
-            let has_reported = self.node_links.get(node).has_reported_statement_in_ambient_context;
+            let has_reported = self
+                .node_links
+                .get(node)
+                .has_reported_statement_in_ambient_context;
             if !has_reported && (is_function_like(node.parent()) || is_accessor(node.parent())) {
                 let reported = self.grammar_error_on_first_token(
                     node,
                     diag::An_implementation_cannot_be_declared_in_ambient_contexts,
                     args![],
                 );
-                self.node_links.get(node).has_reported_statement_in_ambient_context = reported;
+                self.node_links
+                    .get(node)
+                    .has_reported_statement_in_ambient_context = reported;
                 return reported;
             }
 
@@ -297,13 +340,19 @@ impl Checker {
                 || parent.kind() == SyntaxKind::SourceFile
             {
                 // Check if the containing block ever report this error
-                if !self.node_links.get(parent).has_reported_statement_in_ambient_context {
+                if !self
+                    .node_links
+                    .get(parent)
+                    .has_reported_statement_in_ambient_context
+                {
                     let reported = self.grammar_error_on_first_token(
                         node,
                         diag::Statements_are_not_allowed_in_ambient_contexts,
                         args![],
                     );
-                    self.node_links.get(parent).has_reported_statement_in_ambient_context = reported;
+                    self.node_links
+                        .get(parent)
+                        .has_reported_statement_in_ambient_context = reported;
                     return reported;
                 }
             } else {
@@ -354,10 +403,13 @@ impl Checker {
     // Go: checker/grammarchecks.go:2104 checkGrammarBigIntLiteral
     pub fn check_grammar_big_int_literal(&mut self, node: Node) -> bool {
         let literal_type = is_literal_type_node(node.parent())
-            || is_prefix_unary_expression(node.parent()) && is_literal_type_node(node.parent().parent());
+            || is_prefix_unary_expression(node.parent())
+                && is_literal_type_node(node.parent().parent());
         if !literal_type {
             // Don't error on BigInt literals in ambient contexts
-            if !node.flags().intersects(NodeFlags::AMBIENT) && self.language_version < ScriptTarget::ES2020 {
+            if !node.flags().intersects(NodeFlags::AMBIENT)
+                && self.language_version < ScriptTarget::ES2020
+            {
                 if self.grammar_error_on_node(
                     node,
                     diag::BigInt_literals_are_not_available_when_targeting_lower_than_ES2020,
@@ -374,25 +426,43 @@ impl Checker {
     pub fn check_grammar_import_clause(&mut self, node: Node) -> bool {
         match node.phase_modifier() {
             SyntaxKind::TypeKeyword => {
-                if !node.flags().intersects(NodeFlags::JS_DOC) && node.name().is_some() && node.named_bindings().is_some() {
+                if !node.flags().intersects(NodeFlags::JS_DOC)
+                    && node.name().is_some()
+                    && node.named_bindings().is_some()
+                {
                     return self.grammar_error_on_node(
                         node,
                         diag::A_type_only_import_can_specify_a_default_import_or_named_bindings_but_not_both,
                         args![],
                     );
                 }
-                if node.named_bindings().is_some() && node.named_bindings().kind() == SyntaxKind::NamedImports {
-                    return self.check_grammar_type_only_named_imports_or_exports(node.named_bindings());
+                if node.named_bindings().is_some()
+                    && node.named_bindings().kind() == SyntaxKind::NamedImports
+                {
+                    return self
+                        .check_grammar_type_only_named_imports_or_exports(node.named_bindings());
                 }
             }
             SyntaxKind::DeferKeyword => {
                 if node.name().is_some() {
-                    return self.grammar_error_on_node(node, diag::Default_imports_are_not_allowed_in_a_deferred_import, args![]);
+                    return self.grammar_error_on_node(
+                        node,
+                        diag::Default_imports_are_not_allowed_in_a_deferred_import,
+                        args![],
+                    );
                 }
-                if node.named_bindings().is_some() && node.named_bindings().kind() == SyntaxKind::NamedImports {
-                    return self.grammar_error_on_node(node, diag::Named_imports_are_not_allowed_in_a_deferred_import, args![]);
+                if node.named_bindings().is_some()
+                    && node.named_bindings().kind() == SyntaxKind::NamedImports
+                {
+                    return self.grammar_error_on_node(
+                        node,
+                        diag::Named_imports_are_not_allowed_in_a_deferred_import,
+                        args![],
+                    );
                 }
-                if self.module_kind != ModuleKind::ES_NEXT && self.module_kind != ModuleKind::PRESERVE {
+                if self.module_kind != ModuleKind::ES_NEXT
+                    && self.module_kind != ModuleKind::PRESERVE
+                {
                     return self.grammar_error_on_node(
                         node,
                         diag::Deferred_imports_are_only_supported_when_the_module_flag_is_set_to_esnext_or_preserve,
@@ -406,7 +476,10 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:2140 checkGrammarTypeOnlyNamedImportsOrExports
-    pub fn check_grammar_type_only_named_imports_or_exports(&mut self, named_bindings: Node) -> bool {
+    pub fn check_grammar_type_only_named_imports_or_exports(
+        &mut self,
+        named_bindings: Node,
+    ) -> bool {
         let node_list = named_bindings.element_list();
         for specifier in node_list.nodes().iter() {
             let specifier_is_type_only: bool;
@@ -429,8 +502,14 @@ impl Checker {
 
     // Go: checker/grammarchecks.go:2161 checkGrammarImportCallExpression
     pub fn check_grammar_import_call_expression(&mut self, node: Node) -> bool {
-        if self.compiler_options.verbatim_module_syntax == Tristate::True && self.module_kind == ModuleKind::COMMON_JS {
-            return self.grammar_error_on_node(node, get_verbatim_module_syntax_error_message(node), args![]);
+        if self.compiler_options.verbatim_module_syntax == Tristate::True
+            && self.module_kind == ModuleKind::COMMON_JS
+        {
+            return self.grammar_error_on_node(
+                node,
+                get_verbatim_module_syntax_error_message(node),
+                args![],
+            );
         }
 
         if node.expression().kind() == SyntaxKind::MetaProperty {
@@ -466,7 +545,10 @@ impl Checker {
             && self.module_kind != ModuleKind::PRESERVE
         {
             // We are allowed trailing comma after proposal-import-assertions.
-            self.check_grammar_for_disallowed_trailing_comma(node_arguments, diag::Trailing_comma_not_allowed);
+            self.check_grammar_for_disallowed_trailing_comma(
+                node_arguments,
+                diag::Trailing_comma_not_allowed,
+            );
 
             if argument_nodes.len() > 1 {
                 let import_attributes_argument = argument_nodes.get(1);
@@ -488,9 +570,16 @@ impl Checker {
 
         // see: parseArgumentOrArrayLiteralElement...we use this function which parse arguments of callExpression to parse specifier for dynamic import.
         // parseArgumentOrArrayLiteralElement allows spread element to be in an argument list which is not allowed as specifier in dynamic import.
-        let spread_element = argument_nodes.iter().find(|n| is_spread_element(*n)).unwrap_or(Node::NIL);
+        let spread_element = argument_nodes
+            .iter()
+            .find(|n| is_spread_element(*n))
+            .unwrap_or(Node::NIL);
         if spread_element.is_some() {
-            return self.grammar_error_on_node(spread_element, diag::Argument_of_dynamic_import_cannot_be_spread_element, args![]);
+            return self.grammar_error_on_node(
+                spread_element,
+                diag::Argument_of_dynamic_import_cannot_be_spread_element,
+                args![],
+            );
         }
         false
     }

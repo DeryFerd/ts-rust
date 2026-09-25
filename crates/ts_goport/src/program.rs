@@ -167,7 +167,9 @@ impl Deref for SourceFileInfo {
     type Target = LateSourceFileInfo;
 
     fn deref(&self) -> &LateSourceFileInfo {
-        self.late.get().expect("SourceFileInfo tree fields read before program::install")
+        self.late
+            .get()
+            .expect("SourceFileInfo tree fields read before program::install")
     }
 }
 
@@ -191,7 +193,9 @@ pub struct PostBindInfo {
     pub common_js_module_indicator: Node,
 }
 
-static NOT_BOUND: PostBindInfo = PostBindInfo { common_js_module_indicator: Node::NIL };
+static NOT_BOUND: PostBindInfo = PostBindInfo {
+    common_js_module_indicator: Node::NIL,
+};
 
 impl Deref for LateSourceFileInfo {
     type Target = PostBindInfo;
@@ -219,7 +223,9 @@ impl Deref for LateSourceFileInfo {
             } else {
                 Node::NIL
             };
-            PostBindInfo { common_js_module_indicator: indicator }
+            PostBindInfo {
+                common_js_module_indicator: indicator,
+            }
         })
     }
 }
@@ -252,7 +258,8 @@ struct ProgramState {
     config_diagnostics: Vec<Diagnostic>,
     program_diagnostics: Vec<Diagnostic>,
     external_locations: Vec<ExternalLocation>,
-    resolved_modules: OnceCell<IndexMap<String, IndexMap<(String, ResolutionMode), ResolvedModule>>>,
+    resolved_modules:
+        OnceCell<IndexMap<String, IndexMap<(String, ResolutionMode), ResolvedModule>>>,
     common_source_directory: OnceCell<String>,
     pool: RefCell<Option<CheckerPool>>,
     /// Go `Program.declarationDiagnosticCache`.
@@ -300,30 +307,47 @@ pub fn try_load_with(
     let fs = ts_vfs::OsFileSystem::default();
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let cwd = ts_path::normalize_path(&cwd.to_string_lossy().replace('\\', "/"));
-    let case_sensitivity =
-        if fs.use_case_sensitive_file_names() { CaseSensitivity::Sensitive } else { CaseSensitivity::Insensitive };
+    let case_sensitivity = if fs.use_case_sensitive_file_names() {
+        CaseSensitivity::Sensitive
+    } else {
+        CaseSensitivity::Insensitive
+    };
     let mut config_abs = ts_path::resolve_path(&cwd, &[config_path]);
     // Go tsc `-p <dir>` reads `<dir>/tsconfig.json`.
     if fs.directory_exists(&config_abs) {
         config_abs = ts_path::combine_paths(&config_abs, &["tsconfig.json"]);
     }
-    let compiler_program =
-        ts_compiler::Program::load_config_graph_unchecked(&fs, &config_abs).map_err(|e| e.to_string())?;
+    let compiler_program = ts_compiler::Program::load_config_graph_unchecked(&fs, &config_abs)
+        .map_err(|e| e.to_string())?;
     let compiler_program: &'static ts_compiler::Program = Box::leak(Box::new(compiler_program));
 
     let mut options = from_ts_options(compiler_program.options());
-    options.config_file_path = compiler_program.config_file_path().map_or_else(|| config_abs.clone(), str::to_string);
+    options.config_file_path = compiler_program
+        .config_file_path()
+        .map_or_else(|| config_abs.clone(), str::to_string);
     edit_options(&mut options);
 
     let mut files = Vec::new();
     let mut file_by_path = FxHashMap::default();
-    for (index, id) in compiler_program.semantic_source_order().into_iter().enumerate() {
+    for (index, id) in compiler_program
+        .semantic_source_order()
+        .into_iter()
+        .enumerate()
+    {
         let source = compiler_program
             .source_file_by_id(id)
             .ok_or_else(|| format!("missing source file for {id:?}"))?;
         let parser_flags = compute_parser_flags(index, source);
         let root = Node::new(index, source.parse.source_file);
-        let info = build_early_info(index, source, &parser_flags, &options, &cwd, case_sensitivity, &fs);
+        let info = build_early_info(
+            index,
+            source,
+            &parser_flags,
+            &options,
+            &cwd,
+            case_sensitivity,
+            &fs,
+        );
         file_by_path.insert(info.path.clone(), index);
         files.push(GoFile {
             source: Some(source),
@@ -388,7 +412,10 @@ pub fn install(program: &'static GoProgram) {
     set_prog(program);
     for (index, file) in program.files.iter().enumerate() {
         let late = build_late_info(index, file);
-        assert!(file.info.late.set(late).is_ok(), "SourceFileInfo installed twice");
+        assert!(
+            file.info.late.set(late).is_ok(),
+            "SourceFileInfo installed twice"
+        );
     }
 }
 
@@ -443,7 +470,11 @@ fn build_early_info(
         .iter()
         .map(|d| CommentDirective {
             loc: TextRange::new(d.range.start.get() as i32, d.range.end.get() as i32),
-            kind: if d.expect_error { CommentDirectiveKind::EXPECT_ERROR } else { CommentDirectiveKind::IGNORE },
+            kind: if d.expect_error {
+                CommentDirectiveKind::EXPECT_ERROR
+            } else {
+                CommentDirectiveKind::IGNORE
+            },
         })
         .collect();
 
@@ -470,7 +501,10 @@ fn build_early_info(
     // PORT: the Rust parser may already report some pragma errors; add ours
     // only when no parse diagnostic has the same code and position.
     for d in pragma_diagnostics {
-        if !diagnostics.iter().any(|p| p.code == d.code && p.pos == d.pos) {
+        if !diagnostics
+            .iter()
+            .any(|p| p.code == d.code && p.pos == d.pos)
+        {
             diagnostics.push(d);
         }
     }
@@ -523,7 +557,12 @@ fn build_late_info(index: usize, file: &'static GoFile) -> LateSourceFileInfo {
 
     let external_module_indicator = get_external_module_indicator(root, info, &prog().options);
 
-    let mut refs = ModuleReferences { imports: Vec::new(), module_augmentations: Vec::new(), ambient_module_names: Vec::new(), uses_uri_style_node_core_modules: Tristate::Unknown };
+    let mut refs = ModuleReferences {
+        imports: Vec::new(),
+        module_augmentations: Vec::new(),
+        ambient_module_names: Vec::new(),
+        uses_uri_style_node_core_modules: Tristate::Unknown,
+    };
     collect_external_module_references(root, info, external_module_indicator, &mut refs);
 
     LateSourceFileInfo {
@@ -536,7 +575,11 @@ fn build_late_info(index: usize, file: &'static GoFile) -> LateSourceFileInfo {
         uses_uri_style_node_core_modules: refs.uses_uri_style_node_core_modules,
         // PORT: JS files treat a cache miss as an unported lazy parse; TS
         // files get the eager Go entries.
-        jsdoc_cache: if info.has_lazy_js_doc { FxHashMap::default() } else { crate::ast::build_jsdoc_cache(root) },
+        jsdoc_cache: if info.has_lazy_js_doc {
+            FxHashMap::default()
+        } else {
+            crate::ast::build_jsdoc_cache(root)
+        },
         post_bind: OnceCell::new(),
     }
 }
@@ -544,7 +587,9 @@ fn build_late_info(index: usize, file: &'static GoFile) -> LateSourceFileInfo {
 // Go: parser/parser.go getLanguageVariant
 fn get_language_variant(script_kind: ScriptKind) -> LanguageVariant {
     match script_kind {
-        ScriptKind::TSX | ScriptKind::JSX | ScriptKind::JS | ScriptKind::JSON => LanguageVariant::JSX,
+        ScriptKind::TSX | ScriptKind::JSX | ScriptKind::JS | ScriptKind::JSON => {
+            LanguageVariant::JSX
+        }
         _ => LanguageVariant::STANDARD,
     }
 }
@@ -578,9 +623,15 @@ fn convert_text_diagnostic(
         }
     }
     let code_value = code.unwrap_or(0);
-    let message: &'static ts_diagnostics::Message =
-        Box::leak(Box::new(ts_diagnostics::Message::new(code_value, category, "", "{0}", false, false, false)));
-    new_diagnostic(file, TextRange::new(pos, end), message, vec![text.to_string()])
+    let message: &'static ts_diagnostics::Message = Box::leak(Box::new(
+        ts_diagnostics::Message::new(code_value, category, "", "{0}", false, false, false),
+    ));
+    new_diagnostic(
+        file,
+        TextRange::new(pos, end),
+        message,
+        vec![text.to_string()],
+    )
 }
 
 // Splits `ts_compiler` program diagnostics into Go config-file diagnostics and
@@ -607,21 +658,39 @@ fn convert_program_diagnostics(
     const DROPPED_CODES: [u32; 4] = [2307, 2882, 5055, 5056];
     let config_path = ts_path::canonicalize(&options.config_file_path, cwd, case_sensitivity);
     for record in compiler_program.diagnostics() {
-        if record.code.is_some_and(|code| DROPPED_CODES.contains(&code)) {
+        if record
+            .code
+            .is_some_and(|code| DROPPED_CODES.contains(&code))
+        {
             continue;
         }
-        let path = record.file_name.as_deref().map(|name| ts_path::canonicalize(name, cwd, case_sensitivity));
+        let path = record
+            .file_name
+            .as_deref()
+            .map(|name| ts_path::canonicalize(name, cwd, case_sensitivity));
         if let (Some(path), Some(range)) = (&path, record.range) {
             if let Some(&index) = file_by_path.get(path) {
                 let pos = range.start.get() as i32;
                 let code = record.code.map_or(0, |c| c as i32);
-                if files[index].info.diagnostics.iter().any(|d| d.pos == pos && d.code == code) {
+                if files[index]
+                    .info
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.pos == pos && d.code == code)
+                {
                     continue;
                 }
             }
         }
-        let diagnostic =
-            convert_program_diagnostic(compiler_program, record, files, file_by_path, cwd, case_sensitivity, external_locations);
+        let diagnostic = convert_program_diagnostic(
+            compiler_program,
+            record,
+            files,
+            file_by_path,
+            cwd,
+            case_sensitivity,
+            external_locations,
+        );
         if path.as_deref() == Some(config_path.as_str()) {
             config_diagnostics.push(diagnostic);
         } else {
@@ -639,7 +708,9 @@ fn convert_program_diagnostic(
     case_sensitivity: CaseSensitivity,
     external_locations: &mut Vec<ExternalLocation>,
 ) -> Diagnostic {
-    let (pos, end) = record.range.map_or((0, 0), |r| (r.start.get() as i32, r.end.get() as i32));
+    let (pos, end) = record
+        .range
+        .map_or((0, 0), |r| (r.start.get() as i32, r.end.get() as i32));
     let mut file = Node::NIL;
     let mut external_name = None;
     if let Some(name) = &record.file_name {
@@ -651,7 +722,14 @@ fn convert_program_diagnostic(
             external_name = Some(name.clone());
         }
     }
-    let mut diagnostic = convert_text_diagnostic(file, pos, end, record.code, record.category, &record.message);
+    let mut diagnostic = convert_text_diagnostic(
+        file,
+        pos,
+        end,
+        record.code,
+        record.category,
+        &record.message,
+    );
     if let Some(name) = external_name {
         let text = compiler_program.diagnostic_source_text(&name).unwrap_or("");
         let starts = compute_ecma_line_starts(text);
@@ -672,7 +750,17 @@ fn convert_program_diagnostic(
     let related = record
         .related_information
         .iter()
-        .map(|r| convert_program_diagnostic(compiler_program, r, files, file_by_path, cwd, case_sensitivity, external_locations))
+        .map(|r| {
+            convert_program_diagnostic(
+                compiler_program,
+                r,
+                files,
+                file_by_path,
+                cwd,
+                case_sensitivity,
+                external_locations,
+            )
+        })
         .collect();
     diagnostic.set_related_info(related);
     diagnostic
@@ -798,7 +886,12 @@ fn extract_pragmas(comment_range: TextRange, kind: SyntaxKind, text: &str) -> Ve
                 );
                 pos += value.len() + 2;
             }
-            return vec![Pragma { name: "reference".to_string(), args, range: comment_range, kind }];
+            return vec![Pragma {
+                name: "reference".to_string(),
+                args,
+                range: comment_range,
+                kind,
+            }];
         }
         if pragma_match(text, pos, "@") {
             pos += 1;
@@ -806,7 +899,12 @@ fn extract_pragmas(comment_range: TextRange, kind: SyntaxKind, text: &str) -> Ve
             if !(pragma_name == "ts-check" || pragma_name == "ts-nocheck") {
                 return Vec::new();
             }
-            return vec![Pragma { name: pragma_name, args: IndexMap::new(), range: comment_range, kind }];
+            return vec![Pragma {
+                name: pragma_name,
+                args: IndexMap::new(),
+                range: comment_range,
+                kind,
+            }];
         }
     }
     if kind == SyntaxKind::MultiLineCommentTrivia {
@@ -826,7 +924,10 @@ fn extract_pragmas(comment_range: TextRange, kind: SyntaxKind, text: &str) -> Ve
             }
             let line_end = line_end_pos(text, pos);
             let pragma_name = text[name_pos..name_end].to_lowercase();
-            if matches!(pragma_name.as_str(), "jsx" | "jsxfrag" | "jsximportsource" | "jsxruntime") {
+            if matches!(
+                pragma_name.as_str(),
+                "jsx" | "jsxfrag" | "jsximportsource" | "jsxruntime"
+            ) {
                 let start = skip_blanks(text, name_end);
                 let arg_end = skip_non_blanks(text, start);
                 if arg_end != start {
@@ -842,7 +943,12 @@ fn extract_pragmas(comment_range: TextRange, kind: SyntaxKind, text: &str) -> Ve
                             ),
                         },
                     );
-                    pragmas.push(Pragma { name: pragma_name, args, range: comment_range, kind });
+                    pragmas.push(Pragma {
+                        name: pragma_name,
+                        args,
+                        range: comment_range,
+                        kind,
+                    });
                 }
             }
             pos = line_end;
@@ -854,7 +960,9 @@ fn extract_pragmas(comment_range: TextRange, kind: SyntaxKind, text: &str) -> Ve
 
 // Go: parser/parser.go match
 fn pragma_match(text: &str, pos: usize, s: &str) -> bool {
-    text.as_bytes().get(pos..).is_some_and(|rest| rest.starts_with(s.as_bytes()))
+    text.as_bytes()
+        .get(pos..)
+        .is_some_and(|rest| rest.starts_with(s.as_bytes()))
 }
 
 // Go: parser/parser.go skipBlanks
@@ -882,7 +990,10 @@ fn skip_to(text: &str, pos: usize, s: &str) -> Option<usize> {
     }
     let bytes = text.as_bytes();
     let needle = s.as_bytes();
-    bytes[pos..].windows(needle.len()).position(|w| w == needle).map(|i| pos + i)
+    bytes[pos..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|i| pos + i)
 }
 
 // Go: parser/parser.go lineEndPos
@@ -948,7 +1059,10 @@ fn process_pragmas_into_fields(
                 let lib = pragma.args.get("lib");
                 let path = pragma.args.get("path");
                 let resolution_mode = pragma.args.get("resolution-mode");
-                let preserve = pragma.args.get("preserve").is_some_and(|p| p.value == "true");
+                let preserve = pragma
+                    .args
+                    .get("preserve")
+                    .is_some_and(|p| p.value == "true");
                 let no_default_lib = pragma.args.get("no-default-lib");
                 if no_default_lib.is_some_and(|n| n.value == "true") {
                     // Ignored.
@@ -977,14 +1091,24 @@ fn process_pragmas_into_fields(
                         preserve,
                     });
                 } else {
-                    diagnostics.push(new_diagnostic(file, pragma.range, diag::Invalid_reference_directive_syntax, Vec::new()));
+                    diagnostics.push(new_diagnostic(
+                        file,
+                        pragma.range,
+                        diag::Invalid_reference_directive_syntax,
+                        Vec::new(),
+                    ));
                 }
             }
             "ts-check" | "ts-nocheck" => {
                 // _last_ of either nocheck or check in a file is the "winner"
-                if fields.check_js_directive.is_none_or(|d| pragma.range.pos() > d.range.pos()) {
-                    fields.check_js_directive =
-                        Some(CheckJsDirective { enabled: pragma.name == "ts-check", range: pragma.range });
+                if fields
+                    .check_js_directive
+                    .is_none_or(|d| pragma.range.pos() > d.range.pos())
+                {
+                    fields.check_js_directive = Some(CheckJsDirective {
+                        enabled: pragma.name == "ts-check",
+                        range: pragma.range,
+                    });
                 }
             }
             "jsx" | "jsxfrag" | "jsximportsource" | "jsxruntime" => {
@@ -996,14 +1120,24 @@ fn process_pragmas_into_fields(
 }
 
 // Go: parser/parser.go parseResolutionMode
-fn parse_resolution_mode(file: Node, mode: &str, range: TextRange, diagnostics: &mut Vec<Diagnostic>) -> ResolutionMode {
+fn parse_resolution_mode(
+    file: Node,
+    mode: &str,
+    range: TextRange,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> ResolutionMode {
     if mode == "import" {
         return ModuleKind::ES_NEXT;
     }
     if mode == "require" {
         return ModuleKind::COMMON_JS;
     }
-    diagnostics.push(new_diagnostic(file, range, diag::X_resolution_mode_should_be_either_require_or_import, Vec::new()));
+    diagnostics.push(new_diagnostic(
+        file,
+        range,
+        diag::X_resolution_mode_should_be_either_require_or_import,
+        Vec::new(),
+    ));
     RESOLUTION_MODE_NONE
 }
 
@@ -1014,7 +1148,11 @@ fn parse_resolution_mode(file: Node, mode: &str, range: TextRange, diagnostics: 
 // Go: ast/parseoptions.go:60 getExternalModuleIndicator
 // PORT: Go computes `ExternalModuleIndicatorOptions` first
 // (GetExternalModuleIndicatorOptions); it is inlined here as `jsx`/`force`.
-fn get_external_module_indicator(file: Node, info: &SourceFileInfo, options: &CompilerOptions) -> Node {
+fn get_external_module_indicator(
+    file: Node,
+    info: &SourceFileInfo,
+    options: &CompilerOptions,
+) -> Node {
     if info.script_kind == ScriptKind::JSON {
         return Node::NIL;
     }
@@ -1025,7 +1163,8 @@ fn get_external_module_indicator(file: Node, info: &SourceFileInfo, options: &Co
     if info.is_declaration_file {
         return Node::NIL;
     }
-    let (jsx, force) = get_external_module_indicator_options(&info.file_name, options, &info.meta_data);
+    let (jsx, force) =
+        get_external_module_indicator_options(&info.file_name, options, &info.meta_data);
     if jsx {
         let node = walk_tree_for_jsx_tags(file);
         if node.is_some() {
@@ -1062,8 +1201,13 @@ fn get_external_module_indicator_options(
 }
 
 // Go: ast/parseoptions.go:46 isFileForcedToBeModuleByFormat
-fn is_file_forced_to_be_module_by_format(file_name: &str, options: &CompilerOptions, metadata: &SourceFileMetaData) -> bool {
-    get_implied_node_format_for_emit_worker(file_name, options.get_emit_module_kind(), metadata) == ModuleKind::ES_NEXT
+fn is_file_forced_to_be_module_by_format(
+    file_name: &str,
+    options: &CompilerOptions,
+    metadata: &SourceFileMetaData,
+) -> bool {
+    get_implied_node_format_for_emit_worker(file_name, options.get_emit_module_kind(), metadata)
+        == ModuleKind::ES_NEXT
         || file_extension_is_one_of(file_name, &[".cjs", ".cts", ".mjs", ".mts"])
 }
 
@@ -1085,7 +1229,8 @@ fn is_file_probably_external_module(file: Node) -> Node {
 // Go: ast/parseoptions.go:95 isAnExternalModuleIndicatorNode
 fn is_an_external_module_indicator_node(node: Node) -> bool {
     has_syntactic_modifier(node, ModifierFlags::EXPORT)
-        || is_import_equals_declaration(node) && is_external_module_reference(node.module_reference())
+        || is_import_equals_declaration(node)
+            && is_external_module_reference(node.module_reference())
         || is_import_declaration(node)
         || is_export_assignment(node)
         || is_export_declaration(node)
@@ -1093,7 +1238,10 @@ fn is_an_external_module_indicator_node(node: Node) -> bool {
 
 // Go: ast/parseoptions.go:101 getImportMetaIfNecessary
 fn get_import_meta_if_necessary(file: Node) -> Node {
-    if file.flags().intersects(NodeFlags::POSSIBLY_CONTAINS_IMPORT_META) {
+    if file
+        .flags()
+        .intersects(NodeFlags::POSSIBLY_CONTAINS_IMPORT_META)
+    {
         return find_child_node(file, is_import_meta);
     }
     Node::NIL
@@ -1119,7 +1267,10 @@ fn walk_tree_for_jsx_tags(node: Node) -> Node {
         if found.is_some() {
             return true;
         }
-        if !node.subtree_facts().intersects(SubtreeFacts::SUBTREE_CONTAINS_JSX) {
+        if !node
+            .subtree_facts()
+            .intersects(SubtreeFacts::SUBTREE_CONTAINS_JSX)
+        {
             return false;
         }
         if is_jsx_opening_like_element(node) || is_jsx_fragment(node) {
@@ -1146,18 +1297,70 @@ struct ModuleReferences {
 
 // Go: core/nodemodules.go UnprefixedNodeCoreModules
 const UNPREFIXED_NODE_CORE_MODULES: [&str; 54] = [
-    "assert", "assert/strict", "async_hooks", "buffer", "child_process", "cluster", "console", "constants",
-    "crypto", "dgram", "diagnostics_channel", "dns", "dns/promises", "domain", "events", "fs", "fs/promises",
-    "http", "http2", "https", "inspector", "inspector/promises", "module", "net", "os", "path", "path/posix",
-    "path/win32", "perf_hooks", "process", "punycode", "querystring", "readline", "readline/promises", "repl",
-    "stream", "stream/consumers", "stream/promises", "stream/web", "string_decoder", "sys", "timers",
-    "timers/promises", "tls", "trace_events", "tty", "url", "util", "util/types", "v8", "vm", "wasi",
-    "worker_threads", "zlib",
+    "assert",
+    "assert/strict",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "dns/promises",
+    "domain",
+    "events",
+    "fs",
+    "fs/promises",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "inspector/promises",
+    "module",
+    "net",
+    "os",
+    "path",
+    "path/posix",
+    "path/win32",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "readline/promises",
+    "repl",
+    "stream",
+    "stream/consumers",
+    "stream/promises",
+    "stream/web",
+    "string_decoder",
+    "sys",
+    "timers",
+    "timers/promises",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "util/types",
+    "v8",
+    "vm",
+    "wasi",
+    "worker_threads",
+    "zlib",
 ];
 
 // Go: core/nodemodules.go ExclusivelyPrefixedNodeCoreModules
-const EXCLUSIVELY_PREFIXED_NODE_CORE_MODULES: [&str; 5] =
-    ["node:quic", "node:sea", "node:sqlite", "node:test", "node:test/reporters"];
+const EXCLUSIVELY_PREFIXED_NODE_CORE_MODULES: [&str; 5] = [
+    "node:quic",
+    "node:sea",
+    "node:sqlite",
+    "node:test",
+    "node:test/reporters",
+];
 
 // Go: tspath IsExternalModuleNameRelative
 fn is_external_module_name_relative(module_name: &str) -> bool {
@@ -1166,22 +1369,40 @@ fn is_external_module_name_relative(module_name: &str) -> bool {
 
 // Go: tspath PathIsRelative
 fn path_is_relative(path: &str) -> bool {
-    path == "." || path == ".." || ["./", "../", ".\\", "..\\"].iter().any(|prefix| path.starts_with(prefix))
+    path == "."
+        || path == ".."
+        || ["./", "../", ".\\", "..\\"]
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
 }
 
 // Go: parser/references.go:11 collectExternalModuleReferences
 // PORT: `is_external` is the file's own indicator result; Go reads
 // `ast.IsExternalModule(file)`, which is not readable until install ends.
-fn collect_external_module_references(file: Node, info: &SourceFileInfo, indicator: Node, refs: &mut ModuleReferences) {
+fn collect_external_module_references(
+    file: Node,
+    info: &SourceFileInfo,
+    indicator: Node,
+    refs: &mut ModuleReferences,
+) {
     let is_external = indicator.is_some();
     for node in file.statements().iter() {
         collect_module_references(info, node, false, is_external, refs);
     }
-    if file.flags().intersects(NodeFlags::POSSIBLY_CONTAINS_DYNAMIC_IMPORT) || is_in_js_file(file) {
-        for_each_dynamic_import_or_require_call(file, true, true, &mut |_node, module_specifier| {
-            refs.imports.push(module_specifier);
-            false
-        });
+    if file
+        .flags()
+        .intersects(NodeFlags::POSSIBLY_CONTAINS_DYNAMIC_IMPORT)
+        || is_in_js_file(file)
+    {
+        for_each_dynamic_import_or_require_call(
+            file,
+            true,
+            true,
+            &mut |_node, module_specifier| {
+                refs.imports.push(module_specifier);
+                false
+            },
+        );
     }
 }
 
@@ -1200,10 +1421,16 @@ fn collect_module_references(
         // only through top - level external module names. Relative external module names are not permitted.
         if module_name_expr.is_some() && is_string_literal(module_name_expr) {
             let module_name = module_name_expr.text();
-            if !module_name.is_empty() && (!in_ambient_module || !is_external_module_name_relative(module_name)) {
+            if !module_name.is_empty()
+                && (!in_ambient_module || !is_external_module_name_relative(module_name))
+            {
                 refs.imports.push(module_name_expr);
-                if refs.uses_uri_style_node_core_modules != Tristate::True && !info.is_declaration_file {
-                    if module_name.starts_with("node:") && !EXCLUSIVELY_PREFIXED_NODE_CORE_MODULES.contains(&module_name) {
+                if refs.uses_uri_style_node_core_modules != Tristate::True
+                    && !info.is_declaration_file
+                {
+                    if module_name.starts_with("node:")
+                        && !EXCLUSIVELY_PREFIXED_NODE_CORE_MODULES.contains(&module_name)
+                    {
                         // Presence of `node:` prefix takes precedence over unprefixed node core modules
                         refs.uses_uri_style_node_core_modules = Tristate::True;
                     } else if refs.uses_uri_style_node_core_modules == Tristate::Unknown
@@ -1218,7 +1445,9 @@ fn collect_module_references(
     }
     if is_module_declaration(node)
         && is_ambient_module(node)
-        && (in_ambient_module || has_syntactic_modifier(node, ModifierFlags::AMBIENT) || info.is_declaration_file)
+        && (in_ambient_module
+            || has_syntactic_modifier(node, ModifierFlags::AMBIENT)
+            || info.is_declaration_file)
     {
         let name_text = node.name().text();
         // Ambient module declarations can be interpreted as augmentations for some existing external modules.
@@ -1249,7 +1478,11 @@ fn collect_module_references(
 // PORT: Go asks the module resolver for the package scope (cached
 // package.json lookups). This walks up from the file's directory to the
 // nearest package.json and reads its "type" field.
-fn load_source_file_meta_data(file_name: &str, options: &CompilerOptions, fs: &ts_vfs::OsFileSystem) -> SourceFileMetaData {
+fn load_source_file_meta_data(
+    file_name: &str,
+    options: &CompilerOptions,
+    fs: &ts_vfs::OsFileSystem,
+) -> SourceFileMetaData {
     let module_resolution_kind = options.get_module_resolution_kind();
     let mut package_json_type = String::new();
     let mut package_json_directory = String::new();
@@ -1281,7 +1514,11 @@ fn load_source_file_meta_data(file_name: &str, options: &CompilerOptions, fs: &t
         directory = parent;
     }
     let implied_node_format = get_implied_node_format_for_file(file_name, &package_json_type);
-    SourceFileMetaData { package_json_type, package_json_directory, implied_node_format }
+    SourceFileMetaData {
+        package_json_type,
+        package_json_directory,
+        implied_node_format,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1337,7 +1574,8 @@ fn get_mode_for_usage_location_worker(
 // Go: compiler/fileloader.go:758 importSyntaxAffectsModuleResolution
 fn import_syntax_affects_module_resolution(options: &CompilerOptions) -> bool {
     let module_resolution = options.get_module_resolution_kind();
-    ModuleResolutionKind::NODE16 <= module_resolution && module_resolution <= ModuleResolutionKind::NODE_NEXT
+    ModuleResolutionKind::NODE16 <= module_resolution
+        && module_resolution <= ModuleResolutionKind::NODE_NEXT
         || options.get_resolve_package_json_exports()
         || options.get_resolve_package_json_imports()
 }
@@ -1350,7 +1588,8 @@ fn get_emit_syntax_for_usage_location_worker(
     options: &CompilerOptions,
 ) -> ResolutionMode {
     let parent = usage.parent();
-    if is_require_call(parent, false) || is_external_module_reference(parent) && is_import_equals_declaration(parent.parent())
+    if is_require_call(parent, false)
+        || is_external_module_reference(parent) && is_import_equals_declaration(parent.parent())
     {
         return ModuleKind::COMMON_JS;
     }
@@ -1387,7 +1626,10 @@ fn get_emit_syntax_for_usage_location_worker(
 // ---------------------------------------------------------------------------
 
 fn file_info_by_path(path: &str) -> Option<&'static SourceFileInfo> {
-    state().file_by_path.get(path).map(|&index| &prog().files[index].info)
+    state()
+        .file_by_path
+        .get(path)
+        .map(|&index| &prog().files[index].info)
 }
 
 /// Lazy JSDoc of `node` in `file` on the Go frontend path (Go
@@ -1424,7 +1666,9 @@ pub fn uses_uri_style_node_core_modules() -> Tristate {
 
 // Go: compiler/program.go:173 GetProjectReferenceFromSource
 // PORT: project references are not loaded; there is never a reference.
-pub fn get_project_reference_from_source(path: &str) -> Option<&'static SourceOutputAndProjectReference> {
+pub fn get_project_reference_from_source(
+    path: &str,
+) -> Option<&'static SourceOutputAndProjectReference> {
     let _ = path;
     None
 }
@@ -1436,7 +1680,9 @@ pub fn is_source_from_project_reference(path: &str) -> bool {
 
 // Go: compiler/program.go:182 GetProjectReferenceFromOutputDts
 // PORT: project references are not loaded; there is never a reference.
-pub fn get_project_reference_from_output_dts(path: &str) -> Option<&'static SourceOutputAndProjectReference> {
+pub fn get_project_reference_from_output_dts(
+    path: &str,
+) -> Option<&'static SourceOutputAndProjectReference> {
     let _ = path;
     None
 }
@@ -1485,14 +1731,25 @@ pub fn single_threaded() -> bool {
 // entry, the other modes are tried, because the Rust loader may key an
 // import by a different mode than the Go mode computation. A miss (Go: a
 // failed resolution) returns None.
-pub fn get_resolved_module(file: Node, module_reference: &str, mode: ResolutionMode) -> Option<ResolvedModule> {
+pub fn get_resolved_module(
+    file: Node,
+    module_reference: &str,
+    mode: ResolutionMode,
+) -> Option<ResolvedModule> {
     if let Some(go) = &state().go {
         let parsed: &ParsedSourceFileRef = &**go.parsed_file(file);
-        return go.program.get_resolved_module(parsed, module_reference, mode).map(|r| (*r).clone());
+        return go
+            .program
+            .get_resolved_module(parsed, module_reference, mode)
+            .map(|r| (*r).clone());
     }
     let program = prog();
     let go_file = &program.files[file.file_index()];
-    let formats = [None, Some(ts_module::ModuleFormat::CommonJs), Some(ts_module::ModuleFormat::Esm)];
+    let formats = [
+        None,
+        Some(ts_module::ModuleFormat::CommonJs),
+        Some(ts_module::ModuleFormat::Esm),
+    ];
     let wanted = if mode == ModuleKind::COMMON_JS {
         Some(ts_module::ModuleFormat::CommonJs)
     } else if mode == ModuleKind::ES_NEXT {
@@ -1502,12 +1759,18 @@ pub fn get_resolved_module(file: Node, module_reference: &str, mode: ResolutionM
     };
     let target = std::iter::once(wanted)
         .chain(formats.into_iter().filter(|f| *f != wanted))
-        .find_map(|format| program.program.expect("legacy program").resolved_module_file(go_file.legacy_source().id, module_reference, format))?;
+        .find_map(|format| {
+            program
+                .program
+                .expect("legacy program")
+                .resolved_module_file(go_file.legacy_source().id, module_reference, format)
+        })?;
     Some(build_resolved_module(module_reference, &target.file_name))
 }
 
 fn build_resolved_module(module_reference: &str, resolved_file_name: &str) -> ResolvedModule {
-    let extension = ts_path::extension_from_path(resolved_file_name).map_or("", ts_path::FileExtension::as_str);
+    let extension =
+        ts_path::extension_from_path(resolved_file_name).map_or("", ts_path::FileExtension::as_str);
     let is_external_library_import = resolved_file_name.contains("/node_modules/");
     let mut package_id = PackageId::default();
     if let Some(index) = resolved_file_name.rfind("/node_modules/") {
@@ -1519,8 +1782,14 @@ fn build_resolved_module(module_reference: &str, resolved_file_name: &str) -> Re
         } else {
             first.to_string()
         };
-        let sub_module_name = rest[name.len().min(rest.len())..].trim_start_matches('/').to_string();
-        package_id = PackageId { name, sub_module_name, ..PackageId::default() };
+        let sub_module_name = rest[name.len().min(rest.len())..]
+            .trim_start_matches('/')
+            .to_string();
+        package_id = PackageId {
+            name,
+            sub_module_name,
+            ..PackageId::default()
+        };
     }
     ResolvedModule {
         resolved_file_name: resolved_file_name.to_string(),
@@ -1536,7 +1805,10 @@ fn build_resolved_module(module_reference: &str, resolved_file_name: &str) -> Re
 }
 
 // Go: compiler/program.go:503 GetResolvedModuleFromModuleSpecifier
-pub fn get_resolved_module_from_module_specifier(file: Node, module_specifier: Node) -> Option<ResolvedModule> {
+pub fn get_resolved_module_from_module_specifier(
+    file: Node,
+    module_specifier: Node,
+) -> Option<ResolvedModule> {
     if !is_string_literal_like(module_specifier) {
         panic!("moduleSpecifier must be a StringLiteralLike");
     }
@@ -1547,12 +1819,18 @@ pub fn get_resolved_module_from_module_specifier(file: Node, module_specifier: N
 // Go: compiler/program.go:511 GetResolvedModules
 // PORT: built on first use from each file's imports and module
 // augmentations, keyed by file path, then (name, mode).
-pub fn get_resolved_modules() -> &'static IndexMap<String, IndexMap<(String, ResolutionMode), ResolvedModule>> {
+pub fn get_resolved_modules()
+-> &'static IndexMap<String, IndexMap<(String, ResolutionMode), ResolvedModule>> {
     state().resolved_modules.get_or_init(|| {
         let mut result = IndexMap::new();
         for file in prog().source_files() {
             let mut in_file = IndexMap::new();
-            let augmentations = file.info.module_augmentations.iter().copied().filter(|n| is_string_literal(*n));
+            let augmentations = file
+                .info
+                .module_augmentations
+                .iter()
+                .copied()
+                .filter(|n| is_string_literal(*n));
             for specifier in file.info.imports.iter().copied().chain(augmentations) {
                 let name = specifier.text().to_string();
                 let mode = get_mode_for_usage_location(file.root, specifier);
@@ -1571,13 +1849,19 @@ pub fn get_resolved_modules() -> &'static IndexMap<String, IndexMap<(String, Res
 
 // Go: compiler/program.go:1519 GetSourceFileMetaData
 pub fn get_source_file_meta_data(path: &str) -> SourceFileMetaData {
-    file_info_by_path(path).map(|info| info.meta_data.clone()).unwrap_or_default()
+    file_info_by_path(path)
+        .map(|info| info.meta_data.clone())
+        .unwrap_or_default()
 }
 
 // Go: compiler/program.go:1523 GetEmitModuleFormatOfFile
 pub fn get_emit_module_format_of_file(source_file: Node) -> ModuleKind {
     let info = source_file_info(source_file);
-    get_emit_module_format_of_file_worker(&info.file_name, &prog().options, &get_source_file_meta_data(&info.path))
+    get_emit_module_format_of_file_worker(
+        &info.file_name,
+        &prog().options,
+        &get_source_file_meta_data(&info.path),
+    )
 }
 
 // Go: compiler/program.go:1527 GetEmitSyntaxForUsageLocation
@@ -1604,13 +1888,22 @@ pub fn get_implied_node_format_for_emit(source_file: Node) -> ResolutionMode {
 // Go: compiler/program.go:1535 GetModeForUsageLocation
 pub fn get_mode_for_usage_location(source_file: Node, location: Node) -> ResolutionMode {
     let info = source_file_info(source_file);
-    get_mode_for_usage_location_worker(&info.file_name, &get_source_file_meta_data(&info.path), location, &prog().options)
+    get_mode_for_usage_location_worker(
+        &info.file_name,
+        &get_source_file_meta_data(&info.path),
+        location,
+        &prog().options,
+    )
 }
 
 // Go: compiler/program.go:1539 GetDefaultResolutionModeForFile
 pub fn get_default_resolution_mode_for_file(source_file: Node) -> ResolutionMode {
     let info = source_file_info(source_file);
-    get_default_resolution_mode_for_file_worker(&info.file_name, &get_source_file_meta_data(&info.path), &prog().options)
+    get_default_resolution_mode_for_file_worker(
+        &info.file_name,
+        &get_source_file_meta_data(&info.path),
+        &prog().options,
+    )
 }
 
 // Go: compiler/program.go:1543 IsSourceFileDefaultLibrary
@@ -1624,11 +1917,18 @@ pub fn common_source_directory() -> &'static str {
         let files = || {
             prog()
                 .source_files()
-                .filter(|file| source_file_may_be_emitted(file.root, false) && !file.info.is_declaration_file)
+                .filter(|file| {
+                    source_file_may_be_emitted(file.root, false) && !file.info.is_declaration_file
+                })
                 .map(|file| file.info.file_name.clone())
                 .collect::<Vec<_>>()
         };
-        get_common_source_directory(&prog().options, files, get_current_directory(), state().case_sensitivity)
+        get_common_source_directory(
+            &prog().options,
+            files,
+            get_current_directory(),
+            state().case_sensitivity,
+        )
     })
 }
 
@@ -1666,12 +1966,21 @@ fn get_normalized_path_components(path: &str, current_directory: &str) -> Vec<St
     let root_len = if absolute.starts_with('/') {
         1
     } else if absolute.as_bytes().get(1) == Some(&b':') {
-        if absolute.as_bytes().get(2) == Some(&b'/') { 3 } else { 2 }
+        if absolute.as_bytes().get(2) == Some(&b'/') {
+            3
+        } else {
+            2
+        }
     } else {
         0
     };
     let mut components = vec![absolute[..root_len].to_string()];
-    components.extend(absolute[root_len..].split('/').filter(|part| !part.is_empty()).map(str::to_string));
+    components.extend(
+        absolute[root_len..]
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_string),
+    );
     components
 }
 
@@ -1680,7 +1989,11 @@ fn get_path_from_path_components(components: &[String]) -> String {
     let Some((root, rest)) = components.split_first() else {
         return String::new();
     };
-    let root = if root.is_empty() { String::new() } else { ts_path::ensure_trailing_directory_separator(root) };
+    let root = if root.is_empty() {
+        String::new()
+    } else {
+        ts_path::ensure_trailing_directory_separator(root)
+    };
     format!("{root}{}", rest.join("/"))
 }
 
@@ -1693,7 +2006,8 @@ fn compute_common_source_directory_of_filenames(
     let mut common_path_components: Option<Vec<String>> = None;
     for source_file in file_names {
         // Each file contributes into common source file path
-        let mut source_path_components = get_normalized_path_components(source_file, current_directory);
+        let mut source_path_components =
+            get_normalized_path_components(source_file, current_directory);
         // The base file name is not part of the common directory path
         source_path_components.pop();
         let Some(common) = common_path_components.as_mut() else {
@@ -1775,10 +2089,20 @@ fn source_file_may_be_emitted_worker(source_file: Node, force_dts_emit: bool) ->
     if !options.root_dir.is_empty() || !options.config_file_path.is_empty() {
         let cwd = get_current_directory();
         let cs = state().case_sensitivity;
-        let common_dir =
-            ts_path::resolve_path(cwd, &[&get_common_source_directory(options, Vec::new, cwd, cs)]);
-        let output_path = get_source_file_path_in_new_dir_worker(&info.file_name, &options.out_dir, cwd, &common_dir, cs);
-        if ts_path::canonicalize(&info.file_name, cwd, cs) == ts_path::canonicalize(&output_path, cwd, cs) {
+        let common_dir = ts_path::resolve_path(
+            cwd,
+            &[&get_common_source_directory(options, Vec::new, cwd, cs)],
+        );
+        let output_path = get_source_file_path_in_new_dir_worker(
+            &info.file_name,
+            &options.out_dir,
+            cwd,
+            &common_dir,
+            cs,
+        );
+        if ts_path::canonicalize(&info.file_name, cwd, cs)
+            == ts_path::canonicalize(&output_path, cwd, cs)
+        {
             return false;
         }
     }
@@ -1811,7 +2135,10 @@ pub fn get_source_file(file_name: &str) -> Node {
 
 // Go: compiler/program.go:1812 GetSourceFileByPath
 pub fn get_source_file_by_path(path: &str) -> Node {
-    state().file_by_path.get(path).map_or(Node::NIL, |&index| prog().files[index].root)
+    state()
+        .file_by_path
+        .get(path)
+        .map_or(Node::NIL, |&index| prog().files[index].root)
 }
 
 // Go: compiler/program.go:1797 GetSourceFileForResolvedModule
@@ -1864,7 +2191,8 @@ fn needs_import_helpers_import_specifier(file: Node) -> bool {
     let is_java_script_file = is_source_file_js(file);
     let is_external_module_file = is_external_module(file);
     if !is_java_script_file
-        && (source_file_info(file).is_declaration_file || (!options.get_isolated_modules() && !is_external_module_file))
+        && (source_file_info(file).is_declaration_file
+            || (!options.get_isolated_modules() && !is_external_module_file))
     {
         return false;
     }
@@ -1877,8 +2205,14 @@ pub fn get_packages_map() -> FxHashMap<String, bool> {
     for resolved_modules_in_file in get_resolved_modules().values() {
         for module in resolved_modules_in_file.values() {
             if !module.package_id.name.is_empty() {
-                let previous = packages_map.get(&module.package_id.name).copied().unwrap_or(false);
-                packages_map.insert(module.package_id.name.clone(), previous || module.extension == ".d.ts");
+                let previous = packages_map
+                    .get(&module.package_id.name)
+                    .copied()
+                    .unwrap_or(false);
+                packages_map.insert(
+                    module.package_id.name.clone(),
+                    previous || module.extension == ".d.ts",
+                );
             }
         }
     }
@@ -1902,7 +2236,10 @@ fn checker_count() -> usize {
     } else if let Some(count) = program.options.checkers {
         checker_count = i64::from(count);
     }
-    checker_count.min(program.source_file_order.len() as i64).min(256).max(1) as usize
+    checker_count
+        .min(program.source_file_order.len() as i64)
+        .min(256)
+        .max(1) as usize
 }
 
 // Go: compiler/checkerpool.go:98 createCheckers
@@ -1914,7 +2251,10 @@ fn create_checkers() -> CheckerPool {
     for (i, &file_index) in program.source_file_order.iter().enumerate() {
         file_associations[file_index] = i % count;
     }
-    CheckerPool { checkers, file_associations }
+    CheckerPool {
+        checkers,
+        file_associations,
+    }
 }
 
 /// Runs `f` with the program's checker pool, creating the checkers on first
@@ -1952,7 +2292,9 @@ pub fn for_each_checker_parallel(cb: &mut dyn FnMut(usize, &mut Checker)) {
 // Go: compiler/checkerpool.go:136 GetGlobalDiagnostics
 fn pool_get_global_diagnostics() -> Vec<Diagnostic> {
     let mut global_diagnostics = Vec::new();
-    for_each_checker_parallel(&mut |_, checker| global_diagnostics.extend(checker.get_global_diagnostics()));
+    for_each_checker_parallel(&mut |_, checker| {
+        global_diagnostics.extend(checker.get_global_diagnostics())
+    });
     sort_and_deduplicate_diagnostics(global_diagnostics)
 }
 
@@ -1975,11 +2317,17 @@ fn for_each_checker_group_do(files: &[Node], cb: &mut dyn FnMut(&mut Checker, us
 
 // Go: compiler/program.go:534 collectDiagnostics
 // PORT: the per-file work runs serially (see the checker pool note).
-fn collect_diagnostics(file: Node, collect: &mut dyn FnMut(Node) -> Vec<Diagnostic>) -> Vec<Diagnostic> {
+fn collect_diagnostics(
+    file: Node,
+    collect: &mut dyn FnMut(Node) -> Vec<Diagnostic>,
+) -> Vec<Diagnostic> {
     let result = if file.is_some() {
         collect(file)
     } else {
-        prog().source_files().flat_map(|f| collect(f.root)).collect()
+        prog()
+            .source_files()
+            .flat_map(|f| collect(f.root))
+            .collect()
     };
     sort_and_deduplicate_diagnostics(result)
 }
@@ -2020,7 +2368,12 @@ pub fn get_syntactic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
     let options = &prog().options;
     collect_diagnostics(source_file, &mut |file| {
         let info = source_file_info(file);
-        let mut diags: Vec<Diagnostic> = info.diagnostics.iter().chain(&info.js_diagnostics).cloned().collect();
+        let mut diags: Vec<Diagnostic> = info
+            .diagnostics
+            .iter()
+            .chain(&info.js_diagnostics)
+            .cloned()
+            .collect();
         // For JS files that won't be checked by the checker (no checkJs/ts-check), we need
         // program-level syntactic checks that require compiler options. This mirrors Strada's
         // getJSSyntacticDiagnosticsForFile in program.ts.
@@ -2032,7 +2385,10 @@ pub fn get_syntactic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
 }
 
 // Go: compiler/program.go:618 getAdditionalJSSyntacticDiagnostics
-fn get_additional_js_syntactic_diagnostics(file: Node, options: &CompilerOptions) -> Vec<Diagnostic> {
+fn get_additional_js_syntactic_diagnostics(
+    file: Node,
+    options: &CompilerOptions,
+) -> Vec<Diagnostic> {
     if options.experimental_decorators.is_true() {
         return Vec::new();
     }
@@ -2040,12 +2396,20 @@ fn get_additional_js_syntactic_diagnostics(file: Node, options: &CompilerOptions
     // Parameter decorators are only valid with experimentalDecorators. Without it,
     // the checker would report this, but the checker doesn't run on unchecked JS files.
     fn walk(node: Node, file: Node, diags: &mut Vec<Diagnostic>) -> bool {
-        if !node.subtree_facts().intersects(SubtreeFacts::SUBTREE_CONTAINS_DECORATORS) {
+        if !node
+            .subtree_facts()
+            .intersects(SubtreeFacts::SUBTREE_CONTAINS_DECORATORS)
+        {
             return false;
         }
         if node.kind() == SyntaxKind::Parameter && has_decorators(node) {
             if let Some(decorator) = node.modifier_nodes().into_iter().find(|n| is_decorator(*n)) {
-                diags.push(new_diagnostic(file, decorator.loc(), diag::Decorators_are_not_valid_here, Vec::new()));
+                diags.push(new_diagnostic(
+                    file,
+                    decorator.loc(),
+                    diag::Decorators_are_not_valid_here,
+                    Vec::new(),
+                ));
             }
         }
         node.for_each_child(|child| walk(child, file, diags));
@@ -2060,7 +2424,9 @@ fn get_additional_js_syntactic_diagnostics(file: Node, options: &CompilerOptions
 // into one shared arena, so this always binds all files.
 pub fn get_bind_diagnostics(source_file: Node) -> Vec<Diagnostic> {
     bind_all();
-    collect_diagnostics(source_file, &mut |file| file_bind_data(file).bind_diagnostics.clone())
+    collect_diagnostics(source_file, &mut |file| {
+        file_bind_data(file).bind_diagnostics.clone()
+    })
 }
 
 // Go: compiler/program.go:654 GetSemanticDiagnostics
@@ -2069,8 +2435,13 @@ pub fn get_semantic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
 }
 
 // Go: compiler/program.go:658 GetSemanticDiagnosticsWithoutNoEmitFiltering
-pub fn get_semantic_diagnostics_without_no_emit_filtering(source_files: &[Node]) -> FxHashMap<Node, Vec<Diagnostic>> {
-    let all_diags = collect_checker_diagnostics_from_files(source_files, &mut get_bind_and_check_diagnostics_with_checker);
+pub fn get_semantic_diagnostics_without_no_emit_filtering(
+    source_files: &[Node],
+) -> FxHashMap<Node, Vec<Diagnostic>> {
+    let all_diags = collect_checker_diagnostics_from_files(
+        source_files,
+        &mut get_bind_and_check_diagnostics_with_checker,
+    );
     source_files
         .iter()
         .zip(all_diags)
@@ -2089,10 +2460,17 @@ pub fn get_suggestion_diagnostics(source_file: Node) -> Vec<Diagnostic> {
 pub fn get_program_diagnostics() -> Vec<Diagnostic> {
     if let Some(go) = &state().go {
         let mut diagnostics = go.program.program_diagnostics.clone();
-        diagnostics.extend(go.program.include_processor.get_diagnostics(go.program).borrow_mut().get_global_diagnostics());
+        diagnostics.extend(
+            go.program
+                .include_processor
+                .get_diagnostics(go.program)
+                .borrow_mut()
+                .get_global_diagnostics(),
+        );
         return sort_and_deduplicate_diagnostics(diagnostics);
     }
-    let mut diagnostics = verify_options::without_reverified_option_diagnostics(&state().program_diagnostics);
+    let mut diagnostics =
+        verify_options::without_reverified_option_diagnostics(&state().program_diagnostics);
     diagnostics.extend(verify_options::verify_compiler_options());
     sort_and_deduplicate_diagnostics(diagnostics)
 }
@@ -2135,7 +2513,10 @@ fn can_include_bind_and_check_diagnostics(source_file: Node) -> bool {
     if info.check_js_directive.is_some_and(|d| !d.enabled) {
         return false;
     }
-    if info.script_kind == ScriptKind::TS || info.script_kind == ScriptKind::TSX || info.script_kind == ScriptKind::EXTERNAL {
+    if info.script_kind == ScriptKind::TS
+        || info.script_kind == ScriptKind::TSX
+        || info.script_kind == ScriptKind::EXTERNAL
+    {
         return true;
     }
     let is_js = info.script_kind == ScriptKind::JS || info.script_kind == ScriptKind::JSX;
@@ -2167,7 +2548,11 @@ fn get_declaration_diagnostics_for_file(source_file: Node) -> Vec<Diagnostic> {
         return Vec::new();
     }
 
-    if let Some(cached) = state().declaration_diagnostic_cache.borrow().get(&source_file) {
+    if let Some(cached) = state()
+        .declaration_diagnostic_cache
+        .borrow()
+        .get(&source_file)
+    {
         return cached.clone();
     }
 
@@ -2185,9 +2570,15 @@ fn get_declaration_diagnostics_for_file(source_file: Node) -> Vec<Diagnostic> {
 // Go: compiler/emitter.go:506 getSourceFilesToEmit
 // PORT: Go takes a `SourceFileMayBeEmittedHost`; the program functions are that host.
 fn get_source_files_to_emit(target_source_file: Node, force_dts_emit: bool) -> Vec<Node> {
-    let source_files =
-        if target_source_file.is_some() { vec![target_source_file] } else { source_files() };
-    source_files.into_iter().filter(|&source_file| source_file_may_be_emitted(source_file, force_dts_emit)).collect()
+    let source_files = if target_source_file.is_some() {
+        vec![target_source_file]
+    } else {
+        source_files()
+    };
+    source_files
+        .into_iter()
+        .filter(|&source_file| source_file_may_be_emitted(source_file, force_dts_emit))
+        .collect()
 }
 
 // Go: compiler/emitter.go:518 isSourceFileNotJson
@@ -2200,8 +2591,10 @@ fn is_source_file_not_json(file: Node) -> bool {
 // `GetDeclarationDiagnostics` above already has the snake name.
 fn get_declaration_diagnostics_worker(host: Rc<EmitHost>, file: Node) -> Vec<Diagnostic> {
     // TODO: use p.getSourceFilesToEmit cache
-    let full_files: Vec<Node> =
-        get_source_files_to_emit(file, false).into_iter().filter(|&f| is_source_file_not_json(f)).collect();
+    let full_files: Vec<Node> = get_source_files_to_emit(file, false)
+        .into_iter()
+        .filter(|&f| is_source_file_not_json(f))
+        .collect();
     if !full_files.iter().any(|&f| f == file) {
         return Vec::new();
     }
@@ -2209,7 +2602,8 @@ fn get_declaration_diagnostics_worker(host: Rc<EmitHost>, file: Node) -> Vec<Dia
     // (emitHost.go:107). The trait method borrows `host`, but the transformer
     // needs `&'static`, so read the program options directly.
     let options = options();
-    let mut transform = crate::declarations::new_declaration_transformer(host.clone(), None, options, "", "");
+    let mut transform =
+        crate::declarations::new_declaration_transformer(host.clone(), None, options, "", "");
     transform.transform_source_file_root(file);
     transform.get_diagnostics()
 }
@@ -2254,7 +2648,11 @@ impl crate::declarations::DeclarationEmitHost for EmitHost {
     }
 
     // Go: compiler/emitHost.go:94 emitHost.GetOutputPathsFor
-    fn get_output_paths_for(&self, _file: Node, _force_dts_paths: bool) -> Box<dyn crate::declarations::OutputPaths> {
+    fn get_output_paths_for(
+        &self,
+        _file: Node,
+        _force_dts_paths: bool,
+    ) -> Box<dyn crate::declarations::OutputPaths> {
         // TODO: cache
         unported!("outputpaths.GetOutputPathsFor")
     }
@@ -2266,7 +2664,8 @@ impl crate::declarations::DeclarationEmitHost for EmitHost {
 
     // Go: compiler/emitHost.go:90 emitHost.GetEffectiveDeclarationFlags
     fn get_effective_declaration_flags(&self, node: Node, flags: ModifierFlags) -> ModifierFlags {
-        self.emit_resolver.get_effective_declaration_flags(node, flags)
+        self.emit_resolver
+            .get_effective_declaration_flags(node, flags)
     }
 
     // Go: compiler/emitHost.go:124 emitHost.GetEmitResolver
@@ -2331,14 +2730,20 @@ impl crate::printer::EmitHost for EmitHost {
 // PORT: Go `FilterNoEmitSemanticDiagnostics` drops diagnostics marked
 // SkippedOnNoEmit when noEmit is set. The port has no field for that mark
 // (see `Diagnostic::set_skipped_on_no_emit`), so nothing is dropped.
-pub fn get_semantic_diagnostics_with_checker(c: &mut Checker, source_file: Node) -> Vec<Diagnostic> {
+pub fn get_semantic_diagnostics_with_checker(
+    c: &mut Checker,
+    source_file: Node,
+) -> Vec<Diagnostic> {
     let mut diags = get_bind_and_check_diagnostics_with_checker(c, source_file);
     diags.extend(get_include_processor_diagnostics(source_file));
     diags
 }
 
 // Go: compiler/program.go:1325 getBindAndCheckDiagnosticsWithChecker
-pub fn get_bind_and_check_diagnostics_with_checker(file_checker: &mut Checker, source_file: Node) -> Vec<Diagnostic> {
+pub fn get_bind_and_check_diagnostics_with_checker(
+    file_checker: &mut Checker,
+    source_file: Node,
+) -> Vec<Diagnostic> {
     let compiler_options = &prog().options;
     if skip_type_checking(source_file, false) {
         return Vec::new();
@@ -2361,12 +2766,18 @@ pub fn get_bind_and_check_diagnostics_with_checker(file_checker: &mut Checker, s
         diags.extend(info.jsdoc_diagnostics.iter().cloned());
     }
 
-    let (mut filtered, directives_by_line) = get_diagnostics_with_preceding_directives(source_file, diags);
+    let (mut filtered, directives_by_line) =
+        get_diagnostics_with_preceding_directives(source_file, diags);
     for directive in directives_by_line.values() {
         // Above we changed all used directive kinds to @ts-ignore, so any @ts-expect-error directives that
         // remain are unused and thus errors.
         if directive.kind == CommentDirectiveKind::EXPECT_ERROR {
-            filtered.push(new_diagnostic(source_file, directive.loc, diag::Unused_ts_expect_error_directive, Vec::new()));
+            filtered.push(new_diagnostic(
+                source_file,
+                directive.loc,
+                diag::Unused_ts_expect_error_directive,
+                Vec::new(),
+            ));
         }
     }
     filtered
@@ -2378,7 +2789,10 @@ pub fn get_bind_and_check_diagnostics_with_checker(file_checker: &mut Checker, s
 fn get_diagnostics_with_preceding_directives(
     source_file: Node,
     diags: Vec<Diagnostic>,
-) -> (Vec<Diagnostic>, std::collections::BTreeMap<i32, CommentDirective>) {
+) -> (
+    Vec<Diagnostic>,
+    std::collections::BTreeMap<i32, CommentDirective>,
+) {
     let mut directives_by_line = std::collections::BTreeMap::new();
     let info = source_file_info(source_file);
     if info.comment_directives.is_empty() {
@@ -2417,13 +2831,18 @@ fn get_diagnostics_with_preceding_directives(
 }
 
 // Go: compiler/program.go:1410 getSuggestionDiagnosticsWithChecker
-fn get_suggestion_diagnostics_with_checker(file_checker: &mut Checker, source_file: Node) -> Vec<Diagnostic> {
+fn get_suggestion_diagnostics_with_checker(
+    file_checker: &mut Checker,
+    source_file: Node,
+) -> Vec<Diagnostic> {
     if skip_type_checking(source_file, false) {
         return Vec::new();
     }
     // Checker creation forces binding, so bind suggestion diagnostics will be populated.
     bind_all();
-    let mut diags = file_bind_data(source_file).bind_suggestion_diagnostics.clone();
+    let mut diags = file_bind_data(source_file)
+        .bind_suggestion_diagnostics
+        .clone();
     diags.extend(file_checker.get_suggestion_diagnostics(source_file));
     diags
 }
@@ -2457,13 +2876,16 @@ fn compact_and_merge_related_infos(diagnostics: Vec<Diagnostic>) -> Vec<Diagnost
     while i < diagnostics.len() {
         let d = &diagnostics[i];
         let mut n = 1;
-        while i + n < diagnostics.len() && equal_diagnostics_no_related_info(d, &diagnostics[i + n]) {
+        while i + n < diagnostics.len() && equal_diagnostics_no_related_info(d, &diagnostics[i + n])
+        {
             n += 1;
         }
         let mut merged = d.clone();
         if n > 1 {
-            let mut related_infos: Vec<Diagnostic> =
-                diagnostics[i..i + n].iter().flat_map(|x| x.related_information.iter().cloned()).collect();
+            let mut related_infos: Vec<Diagnostic> = diagnostics[i..i + n]
+                .iter()
+                .flat_map(|x| x.related_information.iter().cloned())
+                .collect();
             // PORT: Go tests `relatedInfos != nil`; appending empty slices
             // keeps it nil, so an empty list means "leave d alone".
             if !related_infos.is_empty() {
@@ -2636,7 +3058,11 @@ fn convert_to_relative_path(file_name: &str) -> String {
     if !ts_path::is_rooted_disk_path(file_name) {
         return file_name.to_string();
     }
-    ts_path::relative_path_from_directory(get_current_directory(), file_name, state().case_sensitivity)
+    ts_path::relative_path_from_directory(
+        get_current_directory(),
+        file_name,
+        state().case_sensitivity,
+    )
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:467 WriteFormatDiagnostic
@@ -2646,11 +3072,20 @@ fn convert_to_relative_path(file_name: &str) -> String {
 pub fn format_diagnostic(diagnostic: &Diagnostic) -> String {
     let mut output = String::new();
     if diagnostic.file.is_some() {
-        let (line, character) = get_ecma_line_and_utf16_character_of_position(diagnostic.file, diagnostic.pos);
+        let (line, character) =
+            get_ecma_line_and_utf16_character_of_position(diagnostic.file, diagnostic.pos);
         let file_name = &source_file_info(diagnostic.file).file_name;
-        output.push_str(&format!("{}({},{}): ", convert_to_relative_path(file_name), line + 1, character + 1));
+        output.push_str(&format!(
+            "{}({},{}): ",
+            convert_to_relative_path(file_name),
+            line + 1,
+            character + 1
+        ));
     } else if let Some(location) = state().external_locations.iter().find(|l| {
-        l.code == diagnostic.code && l.pos == diagnostic.pos && l.end == diagnostic.end && l.args == diagnostic.message_args
+        l.code == diagnostic.code
+            && l.pos == diagnostic.pos
+            && l.end == diagnostic.end
+            && l.args == diagnostic.message_args
     }) {
         output.push_str(&format!(
             "{}({},{}): ",
@@ -2659,7 +3094,11 @@ pub fn format_diagnostic(diagnostic: &Diagnostic) -> String {
             location.character + 1
         ));
     }
-    output.push_str(&format!("{} TS{}: ", diagnostic.category.name(), diagnostic.code));
+    output.push_str(&format!(
+        "{} TS{}: ",
+        diagnostic.category.name(),
+        diagnostic.code
+    ));
     write_flattened_diagnostic_message(&mut output, diagnostic, "\n");
     output.push('\n');
     output
@@ -2681,7 +3120,12 @@ fn write_flattened_diagnostic_message(writer: &mut String, diagnostic: &Diagnost
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:271 flattenDiagnosticMessageChain
-fn flatten_diagnostic_message_chain(writer: &mut String, chain: &Diagnostic, new_line: &str, level: usize) {
+fn flatten_diagnostic_message_chain(
+    writer: &mut String,
+    chain: &Diagnostic,
+    new_line: &str,
+    level: usize,
+) {
     writer.push_str(new_line);
     for _ in 0..level {
         writer.push_str("  ");

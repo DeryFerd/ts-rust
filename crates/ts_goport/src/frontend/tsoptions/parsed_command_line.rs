@@ -86,7 +86,11 @@ pub fn new_parsed_command_line(
     compare_paths_options: ComparePathsOptions,
 ) -> ParsedCommandLine {
     ParsedCommandLine {
-        parsed_config: ParsedOptions { compiler_options, file_names: root_file_names, ..Default::default() },
+        parsed_config: ParsedOptions {
+            compiler_options,
+            file_names: root_file_names,
+            ..Default::default()
+        },
         compare_paths_options,
         ..Default::default()
     }
@@ -111,30 +115,47 @@ impl ParsedCommandLine {
     // Go: tsoptions/parsedcommandline.go:85 (*ParsedCommandLine).ConfigName
     // PORT: Go panics when `ConfigFile` is nil; `expect` does the same.
     pub fn config_name(&self) -> &'static str {
-        let config_file = self.config_file.as_ref().expect("nil pointer dereference: ConfigFile");
+        let config_file = self
+            .config_file
+            .as_ref()
+            .expect("nil pointer dereference: ConfigFile");
         source_file_file_name(config_file.source_file)
     }
 
     // Go: tsoptions/parsedcommandline.go:92 (*ParsedCommandLine).SourceToProjectReference
     // PORT: Go returns a nil map before `ParseInputOutputNames`; that is `None`.
-    pub fn source_to_project_reference(&self) -> Option<&FxHashMap<Path, Rc<SourceOutputAndProjectReference>>> {
-        self.source_and_output_maps.get().map(|m| &m.source_to_project_reference)
+    pub fn source_to_project_reference(
+        &self,
+    ) -> Option<&FxHashMap<Path, Rc<SourceOutputAndProjectReference>>> {
+        self.source_and_output_maps
+            .get()
+            .map(|m| &m.source_to_project_reference)
     }
 
     // Go: tsoptions/parsedcommandline.go:96 (*ParsedCommandLine).OutputDtsToProjectReference
     // PORT: Go returns a nil map before `ParseInputOutputNames`; that is `None`.
-    pub fn output_dts_to_project_reference(&self) -> Option<&FxHashMap<Path, Rc<SourceOutputAndProjectReference>>> {
-        self.source_and_output_maps.get().map(|m| &m.output_dts_to_project_reference)
+    pub fn output_dts_to_project_reference(
+        &self,
+    ) -> Option<&FxHashMap<Path, Rc<SourceOutputAndProjectReference>>> {
+        self.source_and_output_maps
+            .get()
+            .map(|m| &m.output_dts_to_project_reference)
     }
 
     // Go: tsoptions/parsedcommandline.go:100 (*ParsedCommandLine).ParseInputOutputNames
     pub fn parse_input_output_names(self: &Rc<Self>) {
         self.source_and_output_maps.get_or_init(|| {
-            let mut source_to_output: FxHashMap<Path, Rc<SourceOutputAndProjectReference>> = FxHashMap::default();
-            let mut output_dts_to_source: FxHashMap<Path, Rc<SourceOutputAndProjectReference>> = FxHashMap::default();
+            let mut source_to_output: FxHashMap<Path, Rc<SourceOutputAndProjectReference>> =
+                FxHashMap::default();
+            let mut output_dts_to_source: FxHashMap<Path, Rc<SourceOutputAndProjectReference>> =
+                FxHashMap::default();
 
             for (output_dts, source) in self.get_output_declaration_and_source_file_names() {
-                let path = to_path(&source, self.get_current_directory(), self.use_case_sensitive_file_names());
+                let path = to_path(
+                    &source,
+                    self.get_current_directory(),
+                    self.use_case_sensitive_file_names(),
+                );
                 let project_reference = Rc::new(SourceOutputAndProjectReference {
                     source,
                     output_dts: output_dts.clone(),
@@ -142,7 +163,11 @@ impl ParsedCommandLine {
                 });
                 if !output_dts.is_empty() {
                     output_dts_to_source.insert(
-                        to_path(&output_dts, self.get_current_directory(), self.use_case_sensitive_file_names()),
+                        to_path(
+                            &output_dts,
+                            self.get_current_directory(),
+                            self.use_case_sensitive_file_names(),
+                        ),
                         project_reference.clone(),
                     );
                 }
@@ -166,7 +191,11 @@ impl ParsedCommandLine {
                     .file_names
                     .iter()
                     .filter(|file| {
-                        !(self.parsed_config.compiler_options.no_emit_for_js_files.is_true()
+                        !(self
+                            .parsed_config
+                            .compiler_options
+                            .no_emit_for_js_files
+                            .is_true()
                             && has_js_file_extension(file))
                             && !is_declaration_file_name(file)
                     })
@@ -187,7 +216,11 @@ impl ParsedCommandLine {
     }
 
     // Go: tsoptions/parsedcommandline.go:141 (*ParsedCommandLine).checkSourceFilesBelongToPath
-    pub fn check_source_files_belong_to_path(&self, source_files: &[String], root_directory: &str) -> bool {
+    pub fn check_source_files_belong_to_path(
+        &self,
+        source_files: &[String],
+        root_directory: &str,
+    ) -> bool {
         let mut all_files_belong_to_path = true;
         for file in source_files {
             let absolute_source_file_path = get_canonical_file_name(
@@ -222,8 +255,13 @@ impl ParsedCommandLine {
         let mut result = Vec::new();
         for file_name in &self.parsed_config.file_names {
             let mut output_dts = String::new();
-            if !is_declaration_file_name(file_name) && !file_extension_is(file_name, EXTENSION_JSON) {
-                output_dts = get_output_declaration_file_name_worker(file_name, &self.parsed_config.compiler_options, self);
+            if !is_declaration_file_name(file_name) && !file_extension_is(file_name, EXTENSION_JSON)
+            {
+                output_dts = get_output_declaration_file_name_worker(
+                    file_name,
+                    &self.parsed_config.compiler_options,
+                    self,
+                );
             }
             result.push((output_dts, file_name.clone()));
         }
@@ -272,7 +310,10 @@ impl ParsedCommandLine {
 
     // Go: tsoptions/parsedcommandline.go:218 (*ParsedCommandLine).GetBuildInfoFileName
     pub fn get_build_info_file_name(&self) -> String {
-        get_build_info_file_name(&self.parsed_config.compiler_options, &self.compare_paths_options)
+        get_build_info_file_name(
+            &self.parsed_config.compiler_options,
+            &self.compare_paths_options,
+        )
     }
 
     // Go: tsoptions/parsedcommandline.go:223 (*ParsedCommandLine).WildcardDirectories
@@ -342,10 +383,16 @@ impl ParsedCommandLine {
     // Go: tsoptions/parsedcommandline.go:298 (*ParsedCommandLine).FileNamesByPath
     pub fn file_names_by_path(&self) -> &FxHashMap<Path, String> {
         self.file_names_by_path.get_or_init(|| {
-            let mut file_names_by_path =
-                FxHashMap::with_capacity_and_hasher(self.parsed_config.file_names.len(), Default::default());
+            let mut file_names_by_path = FxHashMap::with_capacity_and_hasher(
+                self.parsed_config.file_names.len(),
+                Default::default(),
+            );
             for file_name in &self.parsed_config.file_names {
-                let path = to_path(file_name, self.get_current_directory(), self.use_case_sensitive_file_names());
+                let path = to_path(
+                    file_name,
+                    self.get_current_directory(),
+                    self.use_case_sensitive_file_names(),
+                );
                 file_names_by_path.insert(path, file_name.clone());
             }
             file_names_by_path
@@ -359,8 +406,13 @@ impl ParsedCommandLine {
 
     // Go: tsoptions/parsedcommandline.go:313 (*ParsedCommandLine).ResolvedProjectReferencePaths
     pub fn resolved_project_reference_paths(&self) -> &[String] {
-        self.resolved_project_reference_paths
-            .get_or_init(|| self.parsed_config.project_references.iter().map(resolve_project_reference_path).collect())
+        self.resolved_project_reference_paths.get_or_init(|| {
+            self.parsed_config
+                .project_references
+                .iter()
+                .map(resolve_project_reference_path)
+                .collect()
+        })
     }
 
     // Go: tsoptions/parsedcommandline.go:320 (*ParsedCommandLine).ExtendedSourceFiles
@@ -391,7 +443,11 @@ impl ParsedCommandLine {
     /// directories has no globs, so that case is exact. Otherwise this stops
     /// with `unported!`.
     pub fn possibly_matches_file_name(&self, file_name: &str) -> bool {
-        let path = to_path(file_name, self.get_current_directory(), self.use_case_sensitive_file_names());
+        let path = to_path(
+            file_name,
+            self.get_current_directory(),
+            self.use_case_sensitive_file_names(),
+        );
         if self.file_names_by_path().contains_key(&path) {
             return true;
         }
@@ -403,7 +459,11 @@ impl ParsedCommandLine {
             .expect("nil pointer dereference: ConfigFile.configFileSpecs");
         for include in &specs.validated_include_specs {
             if !include.contains(['*', '?']) && !is_implicit_glob(include) {
-                let include_path = to_path(include, self.get_current_directory(), self.use_case_sensitive_file_names());
+                let include_path = to_path(
+                    include,
+                    self.get_current_directory(),
+                    self.use_case_sensitive_file_names(),
+                );
                 if include_path == path {
                     return true;
                 }
@@ -418,8 +478,11 @@ impl ParsedCommandLine {
     // Go: tsoptions/parsedcommandline.go:361 (*ParsedCommandLine).PossiblyMatchesDirectoryName
     pub fn possibly_matches_directory_name(&self, directory_path: &Path) -> bool {
         for (wildcard_dir, recursive) in self.wildcard_directories() {
-            let wildcard_dir_path =
-                to_path(wildcard_dir, self.get_current_directory(), self.use_case_sensitive_file_names());
+            let wildcard_dir_path = to_path(
+                wildcard_dir,
+                self.get_current_directory(),
+                self.use_case_sensitive_file_names(),
+            );
             if *recursive {
                 if wildcard_dir_path.contains_path(directory_path) {
                     return true;
@@ -433,7 +496,8 @@ impl ParsedCommandLine {
 
     // Go: tsoptions/parsedcommandline.go:377 (*ParsedCommandLine).GetMatchedFileSpec
     pub fn get_matched_file_spec(&self, file_name: &str) -> String {
-        self.config_file_specs().get_matched_file_spec(file_name, &self.compare_paths_options)
+        self.config_file_specs()
+            .get_matched_file_spec(file_name, &self.compare_paths_options)
     }
 
     // Go: tsoptions/parsedcommandline.go:381 (*ParsedCommandLine).GetMatchedIncludeSpec
@@ -447,7 +511,10 @@ impl ParsedCommandLine {
             return (specs.validated_include_specs[0].clone(), true);
         }
 
-        (specs.get_matched_include_spec(file_name, &self.compare_paths_options), false)
+        (
+            specs.get_matched_include_spec(file_name, &self.compare_paths_options),
+            false,
+        )
     }
 
     // PORT: Go reads `p.ConfigFile.configFileSpecs` and panics when either

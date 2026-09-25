@@ -31,7 +31,8 @@ impl Checker {
             }
         }
         if is_property_access_expression(expression.expression())
-            && self.is_or_contains_matching_reference(reference, expression.expression().expression())
+            && self
+                .is_or_contains_matching_reference(reference, expression.expression().expression())
         {
             return true;
         }
@@ -40,7 +41,8 @@ impl Checker {
 
     // Go: checker/flow.go:1877 isOrContainsMatchingReference
     pub fn is_or_contains_matching_reference(&mut self, source: Node, target: Node) -> bool {
-        self.is_matching_reference(source, target) || self.contains_matching_reference(source, target)
+        self.is_matching_reference(source, target)
+            || self.contains_matching_reference(source, target)
     }
 
     // Return a new type in which occurrences of the string, number and bigint primitives and placeholder template
@@ -49,10 +51,17 @@ impl Checker {
     // true intersection because it is more costly and, when applied to union types, generates a large number of
     // types we don't actually care about.
     // Go: checker/flow.go:1886 replacePrimitivesWithLiterals
-    pub fn replace_primitives_with_literals(&mut self, type_with_primitives: TypeId, type_with_literals: TypeId) -> TypeId {
+    pub fn replace_primitives_with_literals(
+        &mut self,
+        type_with_primitives: TypeId,
+        type_with_literals: TypeId,
+    ) -> TypeId {
         if self.maybe_type_of_kind(
             type_with_primitives,
-            TypeFlags::STRING | TypeFlags::TEMPLATE_LITERAL | TypeFlags::NUMBER | TypeFlags::BIG_INT,
+            TypeFlags::STRING
+                | TypeFlags::TEMPLATE_LITERAL
+                | TypeFlags::NUMBER
+                | TypeFlags::BIG_INT,
         ) && self.maybe_type_of_kind(
             type_with_literals,
             TypeFlags::STRING_LITERAL
@@ -61,12 +70,17 @@ impl Checker {
                 | TypeFlags::NUMBER_LITERAL
                 | TypeFlags::BIG_INT_LITERAL,
         ) {
-            return self.map_type(type_with_primitives, &mut |c: &mut Checker, t: TypeId| -> TypeId {
+            return self.map_type(type_with_primitives, &mut |c: &mut Checker,
+                                                             t: TypeId|
+             -> TypeId {
                 let flags = c.ty(t).flags;
                 if flags.intersects(TypeFlags::STRING) {
                     return c.extract_types_of_kind(
                         type_with_literals,
-                        TypeFlags::STRING | TypeFlags::STRING_LITERAL | TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING,
+                        TypeFlags::STRING
+                            | TypeFlags::STRING_LITERAL
+                            | TypeFlags::TEMPLATE_LITERAL
+                            | TypeFlags::STRING_MAPPING,
                     );
                 }
                 if c.is_pattern_literal_type(t)
@@ -78,10 +92,16 @@ impl Checker {
                     return c.extract_types_of_kind(type_with_literals, TypeFlags::STRING_LITERAL);
                 }
                 if flags.intersects(TypeFlags::NUMBER) {
-                    return c.extract_types_of_kind(type_with_literals, TypeFlags::NUMBER | TypeFlags::NUMBER_LITERAL);
+                    return c.extract_types_of_kind(
+                        type_with_literals,
+                        TypeFlags::NUMBER | TypeFlags::NUMBER_LITERAL,
+                    );
                 }
                 if flags.intersects(TypeFlags::BIG_INT) {
-                    return c.extract_types_of_kind(type_with_literals, TypeFlags::BIG_INT | TypeFlags::BIG_INT_LITERAL);
+                    return c.extract_types_of_kind(
+                        type_with_literals,
+                        TypeFlags::BIG_INT | TypeFlags::BIG_INT_LITERAL,
+                    );
                 }
                 t
             });
@@ -93,8 +113,13 @@ impl Checker {
     // PORT: Go package function on `*Type`; a `Checker` method here so it can
     // read the type arena.
     pub fn is_coercible_under_double_equals(&self, source: TypeId, target: TypeId) -> bool {
-        self.ty(source).flags.intersects(TypeFlags::NUMBER | TypeFlags::STRING | TypeFlags::BOOLEAN_LITERAL)
-            && self.ty(target).flags.intersects(TypeFlags::NUMBER | TypeFlags::STRING | TypeFlags::BOOLEAN)
+        self.ty(source)
+            .flags
+            .intersects(TypeFlags::NUMBER | TypeFlags::STRING | TypeFlags::BOOLEAN_LITERAL)
+            && self
+                .ty(target)
+                .flags
+                .intersects(TypeFlags::NUMBER | TypeFlags::STRING | TypeFlags::BOOLEAN)
     }
 
     // Go: checker/flow.go:1912 isExhaustiveSwitchStatement
@@ -106,7 +131,11 @@ impl Checker {
             let is_exhaustive = self.compute_exhaustive_switch_statement(node);
             let links = self.switch_statement_links.get(node);
             if links.exhaustive_state == ExhaustiveState::COMPUTING {
-                links.exhaustive_state = if is_exhaustive { ExhaustiveState::TRUE } else { ExhaustiveState::FALSE };
+                links.exhaustive_state = if is_exhaustive {
+                    ExhaustiveState::TRUE
+                } else {
+                    ExhaustiveState::FALSE
+                };
             }
         } else if state == ExhaustiveState::COMPUTING {
             // Resolve circularity to false
@@ -130,12 +159,18 @@ impl Checker {
             let operand_constraint = self.get_base_constraint_or_type(expr_type);
             // Get the not-equal flags for all handled cases.
             let not_equal_facts = self.get_not_equal_facts_from_typeof_switch(0, 0, &witnesses);
-            if self.ty(operand_constraint).flags.intersects(TypeFlags::ANY_OR_UNKNOWN) {
+            if self
+                .ty(operand_constraint)
+                .flags
+                .intersects(TypeFlags::ANY_OR_UNKNOWN)
+            {
                 // We special case the top types to be exhaustive when all cases are handled.
                 return (TypeFacts::ALL_TYPEOF_NE & not_equal_facts) == TypeFacts::ALL_TYPEOF_NE;
             }
             // A missing not-equal flag indicates that the type wasn't handled by some case.
-            return !self.some_type(operand_constraint, &mut |c: &mut Checker, t: TypeId| -> bool {
+            return !self.some_type(operand_constraint, &mut |c: &mut Checker,
+                                                             t: TypeId|
+             -> bool {
                 c.get_type_facts(t, not_equal_facts) == not_equal_facts
             });
         }
@@ -145,10 +180,16 @@ impl Checker {
             return false;
         }
         let switch_types = self.get_switch_clause_types(node);
-        if switch_types.is_empty() || switch_types.iter().any(|&t| self.is_neither_unit_type_nor_never(t)) {
+        if switch_types.is_empty()
+            || switch_types
+                .iter()
+                .any(|&t| self.is_neither_unit_type_nor_never(t))
+        {
             return false;
         }
-        let mapped = self.map_type(t, &mut |c: &mut Checker, t: TypeId| c.get_regular_type_of_literal_type(t));
+        let mapped = self.map_type(t, &mut |c: &mut Checker, t: TypeId| {
+            c.get_regular_type_of_literal_type(t)
+        });
         self.each_type_contained_in(mapped, &switch_types)
     }
 
@@ -189,7 +230,12 @@ impl Checker {
 
     // Return the combined not-equal type facts for all cases except those between the start and end indices.
     // Go: checker/flow.go:1991 getNotEqualFactsFromTypeofSwitch
-    pub fn get_not_equal_facts_from_typeof_switch(&mut self, start: i32, end: i32, witnesses: &[String]) -> TypeFacts {
+    pub fn get_not_equal_facts_from_typeof_switch(
+        &mut self,
+        start: i32,
+        end: i32,
+        witnesses: &[String],
+    ) -> TypeFacts {
         let mut facts: TypeFacts = TypeFacts::NONE;
         for (i, witness) in witnesses.iter().enumerate() {
             let i = i as i32;
@@ -243,11 +289,13 @@ impl Checker {
                 let right_type = self.check_non_null_expression(node.right());
                 func_type = self.get_symbol_has_instance_method_of_object_type(right_type);
             } else if is_expression_statement(node.parent()) {
-                func_type = self.get_type_of_dotted_name(node.expression(), None /*diagnostic*/);
+                func_type =
+                    self.get_type_of_dotted_name(node.expression(), None /*diagnostic*/);
             } else if node.expression().kind() != SyntaxKind::SuperKeyword {
                 if is_optional_chain(node) {
                     let expr_type = self.check_expression(node.expression());
-                    let optional_type = self.get_optional_expression_type(expr_type, node.expression());
+                    let optional_type =
+                        self.get_optional_expression_type(expr_type, node.expression());
                     func_type = self.check_non_null_type(optional_type, node.expression());
                 } else {
                     func_type = self.check_non_null_expression(node.expression());
@@ -257,11 +305,18 @@ impl Checker {
             if func_type.is_some() {
                 apparent_type = self.get_apparent_type(func_type);
             }
-            let target = if apparent_type.is_some() { apparent_type } else { self.unknown_type };
+            let target = if apparent_type.is_some() {
+                apparent_type
+            } else {
+                self.unknown_type
+            };
             let signatures = self.get_signatures_of_type(target, SignatureKind::CALL);
             if signatures.len() == 1 && self.sig(signatures[0]).type_parameters.is_empty() {
                 signature = signatures[0];
-            } else if signatures.iter().any(|&s| self.has_type_predicate_or_never_return_type(s)) {
+            } else if signatures
+                .iter()
+                .any(|&s| self.has_type_predicate_or_never_return_type(s))
+            {
                 signature = self.get_resolved_signature(node, None, CheckMode::NORMAL);
             }
             if !(signature.is_some() && self.has_type_predicate_or_never_return_type(signature)) {
@@ -280,13 +335,16 @@ impl Checker {
      */
     // Go: checker/flow.go:2072 getSymbolHasInstanceMethodOfObjectType
     pub fn get_symbol_has_instance_method_of_object_type(&mut self, t: TypeId) -> TypeId {
-        let has_instance_property_name = self.get_property_name_for_known_symbol_name("hasInstance");
+        let has_instance_property_name =
+            self.get_property_name_for_known_symbol_name("hasInstance");
         if self.all_types_assignable_to_kind(t, TypeFlags::NON_PRIMITIVE) {
             let has_instance_property = self.get_property_of_type(t, &has_instance_property_name);
             if has_instance_property.is_some() {
                 let has_instance_property_type = self.get_type_of_symbol(has_instance_property);
                 if has_instance_property_type.is_some()
-                    && !self.get_signatures_of_type(has_instance_property_type, SignatureKind::CALL).is_empty()
+                    && !self
+                        .get_signatures_of_type(has_instance_property_type, SignatureKind::CALL)
+                        .is_empty()
                 {
                     return has_instance_property_type;
                 }
@@ -319,7 +377,11 @@ impl Checker {
     // copy returned by `error`; `get_explicit_type_of_symbol` appends the
     // related information to the stored copy (see
     // `add_related_info_to_stored_diagnostic`).
-    pub fn get_type_of_dotted_name(&mut self, node: Node, diagnostic: Option<Diagnostic>) -> TypeId {
+    pub fn get_type_of_dotted_name(
+        &mut self,
+        node: Node,
+        diagnostic: Option<Diagnostic>,
+    ) -> TypeId {
         if !node.flags().intersects(NodeFlags::IN_WITH_STATEMENT) {
             match node.kind() {
                 SyntaxKind::Identifier => {
@@ -341,7 +403,11 @@ impl Checker {
                         if is_private_identifier(name) {
                             let t_symbol = self.ty(t).symbol;
                             if t_symbol.is_some() {
-                                let prop_name = get_symbol_name_for_private_identifier(&self.symbols, t_symbol, name.text());
+                                let prop_name = get_symbol_name_for_private_identifier(
+                                    &self.symbols,
+                                    t_symbol,
+                                    name.text(),
+                                );
                                 prop = self.get_property_of_type(t, &prop_name);
                             }
                         } else {
@@ -362,16 +428,29 @@ impl Checker {
     }
 
     // Go: checker/flow.go:2134 getExplicitTypeOfSymbol
-    pub fn get_explicit_type_of_symbol(&mut self, symbol: SymbolId, diagnostic: Option<Diagnostic>) -> TypeId {
+    pub fn get_explicit_type_of_symbol(
+        &mut self,
+        symbol: SymbolId,
+        diagnostic: Option<Diagnostic>,
+    ) -> TypeId {
         let symbol = self.resolve_symbol(symbol);
         let flags = self.sym(symbol).flags;
-        if flags.intersects(SymbolFlags::FUNCTION | SymbolFlags::METHOD | SymbolFlags::CLASS | SymbolFlags::VALUE_MODULE) {
+        if flags.intersects(
+            SymbolFlags::FUNCTION
+                | SymbolFlags::METHOD
+                | SymbolFlags::CLASS
+                | SymbolFlags::VALUE_MODULE,
+        ) {
             return self.get_type_of_symbol(symbol);
         }
         if flags.intersects(SymbolFlags::VARIABLE | SymbolFlags::PROPERTY) {
             if self.sym(symbol).check_flags.intersects(CheckFlags::MAPPED) {
                 let origin = self.mapped_symbol_links.get(symbol).synthetic_origin;
-                if origin.is_some() && self.get_explicit_type_of_symbol(origin, diagnostic.clone()).is_some() {
+                if origin.is_some()
+                    && self
+                        .get_explicit_type_of_symbol(origin, diagnostic.clone())
+                        .is_some()
+                {
                     return self.get_type_of_symbol(symbol);
                 }
             }
@@ -380,9 +459,12 @@ impl Checker {
                 if self.is_declaration_with_explicit_type_annotation(declaration) {
                     return self.get_type_of_symbol(symbol);
                 }
-                if is_variable_declaration(declaration) && is_for_of_statement(declaration.parent().parent()) {
+                if is_variable_declaration(declaration)
+                    && is_for_of_statement(declaration.parent().parent())
+                {
                     let statement = declaration.parent().parent();
-                    let expression_type = self.get_type_of_dotted_name(statement.expression(), None /*diagnostic*/);
+                    let expression_type = self
+                        .get_type_of_dotted_name(statement.expression(), None /*diagnostic*/);
                     if expression_type.is_some() {
                         let use_ = if statement.await_modifier().is_some() {
                             IterationUse::FOR_AWAIT_OF
@@ -390,7 +472,12 @@ impl Checker {
                             IterationUse::FOR_OF
                         };
                         let undefined_type = self.undefined_type;
-                        return self.check_iterated_type_or_element_type(use_, expression_type, undefined_type, Node::NIL /*errorNode*/);
+                        return self.check_iterated_type_or_element_type(
+                            use_,
+                            expression_type,
+                            undefined_type,
+                            Node::NIL, /*errorNode*/
+                        );
                     }
                 }
                 if let Some(diagnostic) = &diagnostic {
@@ -413,7 +500,11 @@ impl Checker {
     // span, code, message and arguments) and appends to it. If the diagnostic
     // was never stored (`addDiagnostic` can drop it), the Go mutation is not
     // observable either, so nothing happens.
-    fn add_related_info_to_stored_diagnostic(&mut self, diagnostic: &Diagnostic, related: Diagnostic) {
+    fn add_related_info_to_stored_diagnostic(
+        &mut self,
+        diagnostic: &Diagnostic,
+        related: Diagnostic,
+    ) {
         let same = |d: &Diagnostic| {
             d.file == diagnostic.file
                 && d.pos == diagnostic.pos
@@ -474,7 +565,10 @@ impl Checker {
 
     // Go: checker/flow.go:2190 getExplicitThisType
     pub fn get_explicit_this_type(&mut self, node: Node) -> TypeId {
-        let container = get_this_container(node, false /*includeArrowFunctions*/, false /*includeClassComputedPropertyName*/);
+        let container = get_this_container(
+            node, false, /*includeArrowFunctions*/
+            false, /*includeClassComputedPropertyName*/
+        );
         if is_function_like(container) {
             let signature = self.get_signature_from_declaration(container);
             let this_parameter = self.sig(signature).this_parameter;
@@ -497,7 +591,9 @@ impl Checker {
     // Go: checker/flow.go:2209 getInitialType
     pub fn get_initial_type(&mut self, node: Node) -> TypeId {
         match node.kind() {
-            SyntaxKind::VariableDeclaration => return self.get_initial_type_of_variable_declaration(node),
+            SyntaxKind::VariableDeclaration => {
+                return self.get_initial_type_of_variable_declaration(node);
+            }
             SyntaxKind::BindingElement => return self.get_initial_type_of_binding_element(node),
             _ => {}
         }
@@ -540,9 +636,16 @@ impl Checker {
         let pattern = node.parent();
         let parent_type = self.get_initial_type(pattern.parent());
         let t = if is_object_binding_pattern(pattern) {
-            self.get_type_of_destructured_property(parent_type, get_binding_element_property_name(node))
+            self.get_type_of_destructured_property(
+                parent_type,
+                get_binding_element_property_name(node),
+            )
         } else if !has_dot_dot_dot_token(node) {
-            let index = pattern.elements().iter().position(|e| e == node).map_or(-1, |i| i as i32);
+            let index = pattern
+                .elements()
+                .iter()
+                .position(|e| e == node)
+                .map_or(-1, |i| i as i32);
             self.get_type_of_destructured_array_element(parent_type, index)
         } else {
             self.get_type_of_destructured_spread_expression(parent_type)
@@ -561,13 +664,21 @@ impl Checker {
                     return t;
                 }
             }
-            SyntaxKind::BinaryExpression => return self.get_assigned_type_of_binary_expression(parent),
+            SyntaxKind::BinaryExpression => {
+                return self.get_assigned_type_of_binary_expression(parent);
+            }
             SyntaxKind::DeleteExpression => return self.undefined_type,
-            SyntaxKind::ArrayLiteralExpression => return self.get_assigned_type_of_array_literal_element(parent, node),
-            SyntaxKind::SpreadElement => return self.get_assigned_type_of_spread_expression(parent),
-            SyntaxKind::PropertyAssignment => return self.get_assigned_type_of_property_assignment(parent),
+            SyntaxKind::ArrayLiteralExpression => {
+                return self.get_assigned_type_of_array_literal_element(parent, node);
+            }
+            SyntaxKind::SpreadElement => {
+                return self.get_assigned_type_of_spread_expression(parent);
+            }
+            SyntaxKind::PropertyAssignment => {
+                return self.get_assigned_type_of_property_assignment(parent);
+            }
             SyntaxKind::ShorthandPropertyAssignment => {
-                return self.get_assigned_type_of_shorthand_property_assignment(parent)
+                return self.get_assigned_type_of_shorthand_property_assignment(parent);
             }
             _ => {}
         }
@@ -578,7 +689,8 @@ impl Checker {
     pub fn get_assigned_type_of_binary_expression(&mut self, node: Node) -> TypeId {
         let is_destructuring_default_assignment = is_array_literal_expression(node.parent())
             && self.is_destructuring_assignment_target(node.parent())
-            || is_property_assignment(node.parent()) && self.is_destructuring_assignment_target(node.parent().parent());
+            || is_property_assignment(node.parent())
+                && self.is_destructuring_assignment_target(node.parent().parent());
         if is_destructuring_default_assignment {
             let t = self.get_assigned_type(node);
             return self.get_type_with_default(t, node.right());
@@ -587,9 +699,17 @@ impl Checker {
     }
 
     // Go: checker/flow.go:2298 getAssignedTypeOfArrayLiteralElement
-    pub fn get_assigned_type_of_array_literal_element(&mut self, node: Node, element: Node) -> TypeId {
+    pub fn get_assigned_type_of_array_literal_element(
+        &mut self,
+        node: Node,
+        element: Node,
+    ) -> TypeId {
         let t = self.get_assigned_type(node);
-        let index = node.elements().iter().position(|e| e == element).map_or(-1, |i| i as i32);
+        let index = node
+            .elements()
+            .iter()
+            .position(|e| e == element)
+            .map_or(-1, |i| i as i32);
         self.get_type_of_destructured_array_element(t, index)
     }
 
@@ -602,8 +722,12 @@ impl Checker {
             }
         }
         let undefined_type = self.undefined_type;
-        let element_type =
-            self.check_iterated_type_or_element_type(IterationUse::DESTRUCTURING, t, undefined_type, Node::NIL /*errorNode*/);
+        let element_type = self.check_iterated_type_or_element_type(
+            IterationUse::DESTRUCTURING,
+            t,
+            undefined_type,
+            Node::NIL, /*errorNode*/
+        );
         if element_type.is_some() {
             return self.include_undefined_in_index_signature(element_type);
         }
@@ -631,8 +755,12 @@ impl Checker {
     // Go: checker/flow.go:2328 getTypeOfDestructuredSpreadExpression
     pub fn get_type_of_destructured_spread_expression(&mut self, t: TypeId) -> TypeId {
         let undefined_type = self.undefined_type;
-        let mut element_type =
-            self.check_iterated_type_or_element_type(IterationUse::DESTRUCTURING, t, undefined_type, Node::NIL /*errorNode*/);
+        let mut element_type = self.check_iterated_type_or_element_type(
+            IterationUse::DESTRUCTURING,
+            t,
+            undefined_type,
+            Node::NIL, /*errorNode*/
+        );
         if element_type.is_nil() {
             element_type = self.error_type;
         }
@@ -690,15 +818,26 @@ impl Checker {
     // For example, when a variable of type number | string | boolean is assigned a value of type number | boolean,
     // we remove type string.
     // Go: checker/flow.go:2374 getAssignmentReducedType
-    pub fn get_assignment_reduced_type(&mut self, declared_type: TypeId, assigned_type: TypeId) -> TypeId {
+    pub fn get_assignment_reduced_type(
+        &mut self,
+        declared_type: TypeId,
+        assigned_type: TypeId,
+    ) -> TypeId {
         if declared_type == assigned_type {
             return declared_type;
         }
         if self.ty(assigned_type).flags.intersects(TypeFlags::NEVER) {
             return assigned_type;
         }
-        let key = AssignmentReducedKey { id1: self.ty(declared_type).id, id2: self.ty(assigned_type).id };
-        let mut result = self.assignment_reduced_types.get(&key).copied().unwrap_or_default();
+        let key = AssignmentReducedKey {
+            id1: self.ty(declared_type).id,
+            id2: self.ty(assigned_type).id,
+        };
+        let mut result = self
+            .assignment_reduced_types
+            .get(&key)
+            .copied()
+            .unwrap_or_default();
         if result.is_nil() {
             result = self.get_assignment_reduced_type_worker(declared_type, assigned_type);
             self.assignment_reduced_types.insert(key, result);
@@ -707,14 +846,26 @@ impl Checker {
     }
 
     // Go: checker/flow.go:2390 getAssignmentReducedTypeWorker
-    pub fn get_assignment_reduced_type_worker(&mut self, declared_type: TypeId, assigned_type: TypeId) -> TypeId {
-        let filtered_type = self.filter_type(declared_type, &mut |c: &mut Checker, t: TypeId| -> bool {
-            c.type_maybe_assignable_to(assigned_type, t)
-        });
+    pub fn get_assignment_reduced_type_worker(
+        &mut self,
+        declared_type: TypeId,
+        assigned_type: TypeId,
+    ) -> TypeId {
+        let filtered_type =
+            self.filter_type(declared_type, &mut |c: &mut Checker, t: TypeId| -> bool {
+                c.type_maybe_assignable_to(assigned_type, t)
+            });
         // Ensure that we narrow to fresh types if the assignment is a fresh boolean literal type.
         let mut reduced_type = filtered_type;
-        if self.ty(assigned_type).flags.intersects(TypeFlags::BOOLEAN_LITERAL) && self.is_fresh_literal_type(assigned_type) {
-            reduced_type = self.map_type(filtered_type, &mut |c: &mut Checker, t: TypeId| c.get_fresh_type_of_literal_type(t));
+        if self
+            .ty(assigned_type)
+            .flags
+            .intersects(TypeFlags::BOOLEAN_LITERAL)
+            && self.is_fresh_literal_type(assigned_type)
+        {
+            reduced_type = self.map_type(filtered_type, &mut |c: &mut Checker, t: TypeId| {
+                c.get_fresh_type_of_literal_type(t)
+            });
         }
         // Our crude heuristic produces an invalid result in some cases: see GH#26130.
         // For now, when that happens, we give up and don't narrow at all.  (This also
@@ -740,7 +891,11 @@ impl Checker {
     }
 
     // Go: checker/flow.go:2421 getTypePredicateArgument
-    pub fn get_type_predicate_argument(&mut self, predicate: TypePredicateId, call_expression: Node) -> Node {
+    pub fn get_type_predicate_argument(
+        &mut self,
+        predicate: TypePredicateId,
+        call_expression: Node,
+    ) -> Node {
         let kind = self.pred(predicate).kind;
         let parameter_index = self.pred(predicate).parameter_index;
         if kind == TypePredicateKind::IDENTIFIER || kind == TypePredicateKind::ASSERTS_IDENTIFIER {
@@ -768,26 +923,43 @@ impl Checker {
             self.factory.new_identifier(name.clone())
         };
         let this_keyword = self.factory.new_keyword_expression(SyntaxKind::ThisKeyword);
-        let reference = self.factory.new_property_access_expression(this_keyword, Node::NIL, access_name, NodeFlags::NONE);
+        let reference = self.factory.new_property_access_expression(
+            this_keyword,
+            Node::NIL,
+            access_name,
+            NodeFlags::NONE,
+        );
         set_node_parent(reference.expression(), reference);
         set_node_parent(reference, constructor);
         set_node_flow_node(reference, constructor.return_flow_node());
         let flow_type = self.get_flow_type_of_property(reference, symbol);
-        if self.no_implicit_any && (flow_type == self.auto_type || flow_type == self.auto_array_type) {
+        if self.no_implicit_any
+            && (flow_type == self.auto_type || flow_type == self.auto_array_type)
+        {
             let value_declaration = self.sym(symbol).value_declaration;
             let symbol_text = self.symbol_to_string(symbol);
             let type_text = self.type_to_string_exported(flow_type);
-            self.error(value_declaration, diag::Member_0_implicitly_has_an_1_type, args![symbol_text, type_text]);
+            self.error(
+                value_declaration,
+                diag::Member_0_implicitly_has_an_1_type,
+                args![symbol_text, type_text],
+            );
         }
         // We don't infer a type if assignments are only null or undefined.
-        if self.every_type(flow_type, &mut |c: &mut Checker, t: TypeId| c.is_nullable_type(t)) {
+        if self.every_type(flow_type, &mut |c: &mut Checker, t: TypeId| {
+            c.is_nullable_type(t)
+        }) {
             return TypeId::NIL;
         }
         self.convert_auto_to_any(flow_type)
     }
 
     // Go: checker/flow.go:2458 getFlowTypeInStaticBlocks
-    pub fn get_flow_type_in_static_blocks(&mut self, symbol: SymbolId, static_blocks: &[Node]) -> TypeId {
+    pub fn get_flow_type_in_static_blocks(
+        &mut self,
+        symbol: SymbolId,
+        static_blocks: &[Node],
+    ) -> TypeId {
         let name = self.sym(symbol).name.clone();
         let access_name = if name.starts_with(&format!("{}#", INTERNAL_SYMBOL_NAME_PREFIX)) {
             // Go: symbol.Name[strings.Index(symbol.Name, "@")+1:]
@@ -798,19 +970,32 @@ impl Checker {
         };
         for &static_block in static_blocks {
             let this_keyword = self.factory.new_keyword_expression(SyntaxKind::ThisKeyword);
-            let reference = self.factory.new_property_access_expression(this_keyword, Node::NIL, access_name, NodeFlags::NONE);
+            let reference = self.factory.new_property_access_expression(
+                this_keyword,
+                Node::NIL,
+                access_name,
+                NodeFlags::NONE,
+            );
             set_node_parent(reference.expression(), reference);
             set_node_parent(reference, static_block);
             set_node_flow_node(reference, static_block.return_flow_node());
             let flow_type = self.get_flow_type_of_property(reference, symbol);
-            if self.no_implicit_any && (flow_type == self.auto_type || flow_type == self.auto_array_type) {
+            if self.no_implicit_any
+                && (flow_type == self.auto_type || flow_type == self.auto_array_type)
+            {
                 let value_declaration = self.sym(symbol).value_declaration;
                 let symbol_text = self.symbol_to_string(symbol);
                 let type_text = self.type_to_string_exported(flow_type);
-                self.error(value_declaration, diag::Member_0_implicitly_has_an_1_type, args![symbol_text, type_text]);
+                self.error(
+                    value_declaration,
+                    diag::Member_0_implicitly_has_an_1_type,
+                    args![symbol_text, type_text],
+                );
             }
             // We don't infer a type if assignments are only null or undefined.
-            if self.every_type(flow_type, &mut |c: &mut Checker, t: TypeId| c.is_nullable_type(t)) {
+            if self.every_type(flow_type, &mut |c: &mut Checker, t: TypeId| {
+                c.is_nullable_type(t)
+            }) {
                 continue;
             }
             return self.convert_auto_to_any(flow_type);
@@ -829,7 +1014,12 @@ impl Checker {
     }
 
     // Go: checker/flow.go:2492 isReachableFlowNodeWorker
-    pub fn is_reachable_flow_node_worker(&mut self, f: &Rc<RefCell<FlowState>>, flow: FlowNodeId, no_cache_check: bool) -> bool {
+    pub fn is_reachable_flow_node_worker(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow: FlowNodeId,
+        no_cache_check: bool,
+    ) -> bool {
         let mut flow = flow;
         let mut no_cache_check = no_cache_check;
         loop {
@@ -843,13 +1033,16 @@ impl Checker {
                     if let Some(&reachable) = self.flow_node_reachable.get(&flow) {
                         return reachable;
                     }
-                    let reachable = self.is_reachable_flow_node_worker(f, flow, true /*noCacheCheck*/);
+                    let reachable =
+                        self.is_reachable_flow_node_worker(f, flow, true /*noCacheCheck*/);
                     self.flow_node_reachable.insert(flow, reachable);
                     return reachable;
                 }
                 no_cache_check = false;
             }
-            if flags.intersects(FlowFlags::ASSIGNMENT | FlowFlags::CONDITION | FlowFlags::ARRAY_MUTATION) {
+            if flags.intersects(
+                FlowFlags::ASSIGNMENT | FlowFlags::CONDITION | FlowFlags::ARRAY_MUTATION,
+            ) {
                 flow = flow_data.antecedent;
             } else if flags.intersects(FlowFlags::CALL) {
                 let signature = self.get_effects_signature(flow_data.node);
@@ -878,7 +1071,9 @@ impl Checker {
                 // A branching point is reachable if any branch is reachable.
                 let antecedents = get_branch_label_antecedents(flow, &f.borrow().reduce_labels);
                 for antecedent in antecedents {
-                    if self.is_reachable_flow_node_worker(f, antecedent, false /*noCacheCheck*/) {
+                    if self
+                        .is_reachable_flow_node_worker(f, antecedent, false /*noCacheCheck*/)
+                    {
                         return true;
                     }
                 }
@@ -893,15 +1088,23 @@ impl Checker {
                 // The control flow path representing an unmatched value in a switch statement with
                 // no default clause is unreachable if the switch statement is exhaustive.
                 let data = flow_data.as_flow_switch_clause_data();
-                if data.clause_start == data.clause_end && self.is_exhaustive_switch_statement(data.switch_statement) {
+                if data.clause_start == data.clause_end
+                    && self.is_exhaustive_switch_statement(data.switch_statement)
+                {
                     return false;
                 }
                 flow = flow_data.antecedent;
             } else if flags.intersects(FlowFlags::REDUCE_LABEL) {
                 // Cache is unreliable once we start adjusting labels
                 self.last_flow_node = FlowNodeId::NIL;
-                f.borrow_mut().reduce_labels.push(flow_data.as_flow_reduce_label_data());
-                let result = self.is_reachable_flow_node_worker(f, flow_data.antecedent, false /*noCacheCheck*/);
+                f.borrow_mut()
+                    .reduce_labels
+                    .push(flow_data.as_flow_reduce_label_data());
+                let result = self.is_reachable_flow_node_worker(
+                    f,
+                    flow_data.antecedent,
+                    false, /*noCacheCheck*/
+                );
                 f.borrow_mut().reduce_labels.pop();
                 return result;
             } else {
@@ -919,7 +1122,8 @@ impl Checker {
         if is_binary_expression(node) {
             let operator = node.operator_token().kind();
             return operator == SyntaxKind::AmpersandAmpersandToken
-                && (self.is_false_expression(node.left()) || self.is_false_expression(node.right()))
+                && (self.is_false_expression(node.left())
+                    || self.is_false_expression(node.right()))
                 || operator == SyntaxKind::BarBarToken
                     && self.is_false_expression(node.left())
                     && self.is_false_expression(node.right());
@@ -938,7 +1142,12 @@ impl Checker {
     }
 
     // Go: checker/flow.go:2581 isPostSuperFlowNodeWorker
-    pub fn is_post_super_flow_node_worker(&mut self, f: &Rc<RefCell<FlowState>>, flow: FlowNodeId, no_cache_check: bool) -> bool {
+    pub fn is_post_super_flow_node_worker(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow: FlowNodeId,
+        no_cache_check: bool,
+    ) -> bool {
         let mut flow = flow;
         let mut no_cache_check = no_cache_check;
         loop {
@@ -951,12 +1160,18 @@ impl Checker {
                     }
                     // PORT: Go computes and caches the result here, then falls
                     // through and walks the node again; kept as is.
-                    let post_super = self.is_post_super_flow_node_worker(f, flow, true /*noCacheCheck*/);
+                    let post_super =
+                        self.is_post_super_flow_node_worker(f, flow, true /*noCacheCheck*/);
                     self.flow_node_post_super.insert(flow, post_super);
                 }
                 no_cache_check = false;
             }
-            if flags.intersects(FlowFlags::ASSIGNMENT | FlowFlags::CONDITION | FlowFlags::ARRAY_MUTATION | FlowFlags::SWITCH_CLAUSE) {
+            if flags.intersects(
+                FlowFlags::ASSIGNMENT
+                    | FlowFlags::CONDITION
+                    | FlowFlags::ARRAY_MUTATION
+                    | FlowFlags::SWITCH_CLAUSE,
+            ) {
                 flow = flow_data.antecedent;
             } else if flags.intersects(FlowFlags::CALL) {
                 if flow_data.node.expression().kind() == SyntaxKind::SuperKeyword {
@@ -966,7 +1181,9 @@ impl Checker {
             } else if flags.intersects(FlowFlags::BRANCH_LABEL) {
                 let antecedents = get_branch_label_antecedents(flow, &f.borrow().reduce_labels);
                 for antecedent in antecedents {
-                    if !self.is_post_super_flow_node_worker(f, antecedent, false /*noCacheCheck*/) {
+                    if !self
+                        .is_post_super_flow_node_worker(f, antecedent, false /*noCacheCheck*/)
+                    {
                         return false;
                     }
                 }
@@ -975,8 +1192,14 @@ impl Checker {
                 // A loop is post-super if the control flow path that leads to the top is post-super.
                 flow = flow_data.antecedents[0];
             } else if flags.intersects(FlowFlags::REDUCE_LABEL) {
-                f.borrow_mut().reduce_labels.push(flow_data.as_flow_reduce_label_data());
-                let result = self.is_post_super_flow_node_worker(f, flow_data.antecedent, false /*noCacheCheck*/);
+                f.borrow_mut()
+                    .reduce_labels
+                    .push(flow_data.as_flow_reduce_label_data());
+                let result = self.is_post_super_flow_node_worker(
+                    f,
+                    flow_data.antecedent,
+                    false, /*noCacheCheck*/
+                );
                 f.borrow_mut().reduce_labels.pop();
                 return result;
             } else {
@@ -990,14 +1213,19 @@ impl Checker {
     // Go: checker/flow.go:2625 isSymbolAssignedDefinitely
     pub fn is_symbol_assigned_definitely(&mut self, symbol: SymbolId) -> bool {
         self.ensure_assignments_marked(symbol);
-        self.marked_assignment_symbol_links.get(symbol).has_definite_assignment
+        self.marked_assignment_symbol_links
+            .get(symbol)
+            .has_definite_assignment
     }
 
     // Check if a parameter, catch variable, or mutable local variable is assigned anywhere
     // Go: checker/flow.go:2631 isSymbolAssigned
     pub fn is_symbol_assigned(&mut self, symbol: SymbolId) -> bool {
         self.ensure_assignments_marked(symbol);
-        self.marked_assignment_symbol_links.get(symbol).last_assignment_pos != 0
+        self.marked_assignment_symbol_links
+            .get(symbol)
+            .last_assignment_pos
+            != 0
     }
 
     // Return true if there are no assignments to the given symbol or if the given location
@@ -1005,16 +1233,27 @@ impl Checker {
     // Go: checker/flow.go:2638 isPastLastAssignment
     pub fn is_past_last_assignment(&mut self, symbol: SymbolId, location: Node) -> bool {
         self.ensure_assignments_marked(symbol);
-        let last_assignment_pos = self.marked_assignment_symbol_links.get(symbol).last_assignment_pos;
+        let last_assignment_pos = self
+            .marked_assignment_symbol_links
+            .get(symbol)
+            .last_assignment_pos;
         last_assignment_pos == 0 || location.is_some() && last_assignment_pos < location.pos()
     }
 
     // Go: checker/flow.go:2644 ensureAssignmentsMarked
     pub fn ensure_assignments_marked(&mut self, symbol: SymbolId) {
-        if self.marked_assignment_symbol_links.get(symbol).last_assignment_pos != 0 {
+        if self
+            .marked_assignment_symbol_links
+            .get(symbol)
+            .last_assignment_pos
+            != 0
+        {
             return;
         }
-        let parent = find_ancestor(self.sym(symbol).value_declaration, is_function_or_source_file);
+        let parent = find_ancestor(
+            self.sym(symbol).value_declaration,
+            is_function_or_source_file,
+        );
         if parent.is_nil() {
             return;
         }
@@ -1031,7 +1270,12 @@ impl Checker {
     // Go: checker/flow.go:2661 hasParentWithAssignmentsMarked
     pub fn has_parent_with_assignments_marked(&mut self, node: Node) -> bool {
         find_ancestor(node.parent(), |node: Node| -> bool {
-            is_function_or_source_file(node) && self.node_links.get(node).flags.intersects(NodeCheckFlags::ASSIGNMENTS_MARKED)
+            is_function_or_source_file(node)
+                && self
+                    .node_links
+                    .get(node)
+                    .flags
+                    .intersects(NodeCheckFlags::ASSIGNMENTS_MARKED)
         })
         .is_some()
     }
@@ -1050,20 +1294,30 @@ impl Checker {
                 if assignment_kind != AssignmentKind::NONE {
                     let symbol = self.get_resolved_symbol(node);
                     if self.is_parameter_or_mutable_local_variable(symbol) {
-                        let pos = self.marked_assignment_symbol_links.get(symbol).last_assignment_pos;
+                        let pos = self
+                            .marked_assignment_symbol_links
+                            .get(symbol)
+                            .last_assignment_pos;
                         if pos == 0 || pos != i32::MAX {
                             let value_declaration = self.sym(symbol).value_declaration;
-                            let referencing_function = find_ancestor(node, is_function_or_source_file);
-                            let declaring_function = find_ancestor(value_declaration, is_function_or_source_file);
-                            let last_assignment_pos = if referencing_function == declaring_function {
+                            let referencing_function =
+                                find_ancestor(node, is_function_or_source_file);
+                            let declaring_function =
+                                find_ancestor(value_declaration, is_function_or_source_file);
+                            let last_assignment_pos = if referencing_function == declaring_function
+                            {
                                 self.extend_assignment_position(node, value_declaration)
                             } else {
                                 i32::MAX
                             };
-                            self.marked_assignment_symbol_links.get(symbol).last_assignment_pos = last_assignment_pos;
+                            self.marked_assignment_symbol_links
+                                .get(symbol)
+                                .last_assignment_pos = last_assignment_pos;
                         }
                         if assignment_kind == AssignmentKind::DEFINITE {
-                            self.marked_assignment_symbol_links.get(symbol).has_definite_assignment = true;
+                            self.marked_assignment_symbol_links
+                                .get(symbol)
+                                .has_definite_assignment = true;
                         }
                     }
                 }

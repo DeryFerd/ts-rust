@@ -1,7 +1,7 @@
 //! `goport -p <tsconfig>`: type checks a project with the Go port and prints
 //! the diagnostics like `tsgo --noEmit --pretty false`.
 //!
-//! Go: execute/tsc/emit.go EmitFilesAndReportErrors (the non-pretty path).
+//! Go: execute/tsc/emit.go `EmitFilesAndReportErrors` (the non-pretty path).
 //!
 //! Each Go-ported stage runs under `catch_unwind`, so one unported path does
 //! not hide the other diagnostics. Unported hits are printed to stderr as
@@ -33,13 +33,15 @@ fn main() {
     };
     install_panic_hook();
     // All program state is thread-local, so the whole run stays on one thread.
-    let worker = std::thread::Builder::new().name("goport".to_string()).stack_size(STACK_SIZE).spawn(move || run(&config));
-    let code = match worker.map(std::thread::JoinHandle::join) {
-        Ok(Ok(code)) => code,
-        _ => {
-            eprintln!("goport: worker thread failed");
-            2
-        }
+    let worker = std::thread::Builder::new()
+        .name("goport".to_string())
+        .stack_size(STACK_SIZE)
+        .spawn(move || run(&config));
+    let code = if let Ok(Ok(code)) = worker.map(std::thread::JoinHandle::join) {
+        code
+    } else {
+        eprintln!("goport: worker thread failed");
+        2
     };
     std::process::exit(code);
 }
@@ -52,9 +54,16 @@ fn parse_args(args: Vec<String>) -> Result<String, String> {
     while let Some(arg) = iter.next() {
         if arg == "-p" || arg == "--project" {
             project = Some(iter.next().ok_or_else(|| format!("{arg} needs a path"))?);
-        } else if let Some(value) = arg.strip_prefix("-p=").or_else(|| arg.strip_prefix("--project=")) {
+        } else if let Some(value) = arg
+            .strip_prefix("-p=")
+            .or_else(|| arg.strip_prefix("--project="))
+        {
             project = Some(value.to_string());
-        } else if arg == "--noEmit" || arg == "--pretty" || arg == "false" || arg == "--pretty=false" {
+        } else if arg == "--noEmit"
+            || arg == "--pretty"
+            || arg == "false"
+            || arg == "--pretty=false"
+        {
             // Accepted for tsgo command-line parity; this is always the mode.
         } else {
             return Err(format!("unknown argument {arg}"));
@@ -71,11 +80,17 @@ fn install_panic_hook() {
         if message.starts_with(UNPORTED_PREFIX) {
             // GOPORT_TRACE=1 prints where each unported hit came from.
             if std::env::var_os("GOPORT_TRACE").is_some() {
-                eprintln!("trace: {message}\n{}", std::backtrace::Backtrace::force_capture());
+                eprintln!(
+                    "trace: {message}\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                );
             }
             return;
         }
-        let location = info.location().map(|l| format!(" at {}:{}", l.file(), l.line())).unwrap_or_default();
+        let location = info
+            .location()
+            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .unwrap_or_default();
         eprintln!("goport: panic{location}: {message}");
     }));
 }
@@ -114,7 +129,9 @@ fn guard<T: Default>(f: impl FnOnce() -> T) -> T {
 // skipped. The error summary is only written in pretty mode, so it is not
 // written.
 fn run(config: &str) -> i32 {
-    let loaded = catch_unwind(AssertUnwindSafe(|| try_load_with(config, |options| options.no_emit = Tristate::True)));
+    let loaded = catch_unwind(AssertUnwindSafe(|| {
+        try_load_with(config, |options| options.no_emit = Tristate::True)
+    }));
     let diagnostics = match loaded {
         Ok(Ok(_)) => guard(collect_all_diagnostics),
         Ok(Err(message)) => {
@@ -139,12 +156,10 @@ fn run(config: &str) -> i32 {
         let _ = writeln!(stderr, "unported: {name} {count}");
     }
 
-    if !unported.is_empty() {
-        2
-    } else if !diagnostics.is_empty() {
-        1
+    if unported.is_empty() {
+        i32::from(!diagnostics.is_empty())
     } else {
-        0
+        2
     }
 }
 
@@ -164,7 +179,9 @@ fn collect_all_diagnostics() -> Vec<Diagnostic> {
 /// Semantic diagnostics for one file. A panic drops that file's results and
 /// replaces the checker, whose caches may be half written.
 fn check_file_guarded(checker: &mut Checker, file: Node) -> Vec<Diagnostic> {
-    match catch_unwind(AssertUnwindSafe(|| get_semantic_diagnostics_with_checker(checker, file))) {
+    match catch_unwind(AssertUnwindSafe(|| {
+        get_semantic_diagnostics_with_checker(checker, file)
+    })) {
         Ok(diagnostics) => diagnostics,
         Err(payload) => {
             note_panic(payload.as_ref());

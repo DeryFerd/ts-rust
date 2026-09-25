@@ -83,7 +83,12 @@ fn encode_utf16_escape_sequence(b: &mut String, char_code: u32) {
 // PORT: a Rust `&str` is valid UTF-8 and cannot hold Go's WTF-8 lone
 // surrogate sentinels or stray bytes, so the surrogate and invalid-byte
 // branches are kept but never trigger.
-fn escape_string_worker(s: &str, quote_char: QuoteChar, flags: GetLiteralTextFlags, b: &mut String) {
+fn escape_string_worker(
+    s: &str,
+    quote_char: QuoteChar,
+    flags: GetLiteralTextFlags,
+    b: &mut String,
+) {
     let bytes = s.as_bytes();
     let mut pos = 0usize;
     let mut i = 0usize;
@@ -117,14 +122,21 @@ fn escape_string_worker(s: &str, quote_char: QuoteChar, flags: GetLiteralTextFla
             if quote_char == QuoteChar::BACKTICK && i + 1 < s.len() && bytes[i + 1] == b'{' {
                 escape = true;
             }
-        } else if ch == quote_char.0 || ch == '\u{2028}' || ch == '\u{2029}' || ch == '\u{0085}' || ch == '\r' {
+        } else if ch == quote_char.0
+            || ch == '\u{2028}'
+            || ch == '\u{2029}'
+            || ch == '\u{0085}'
+            || ch == '\r'
+        {
             escape = true;
         } else if ch == '\n' {
             if quote_char != QuoteChar::BACKTICK {
                 // Template strings preserve simple LF newlines, still encode CRLF (or CR).
                 escape = true;
             }
-        } else if code <= 0x1f || !flags.intersects(GetLiteralTextFlags::NEVER_ASCII_ESCAPE) && code > 0x7f {
+        } else if code <= 0x1f
+            || !flags.intersects(GetLiteralTextFlags::NEVER_ASCII_ESCAPE) && code > 0x7f
+        {
             escape = true;
         }
 
@@ -142,7 +154,11 @@ fn escape_string_worker(s: &str, quote_char: QuoteChar, flags: GetLiteralTextFla
                 } else {
                     encode_jsx_character_entity(b, code);
                 }
-            } else if ch == '\r' && quote_char == QuoteChar::BACKTICK && i + 1 < s.len() && bytes[i + 1] == b'\n' {
+            } else if ch == '\r'
+                && quote_char == QuoteChar::BACKTICK
+                && i + 1 < s.len()
+                && bytes[i + 1] == b'\n'
+            {
                 // Template strings preserve simple LF newlines, but still must escape CRLF. Left alone, the
                 // above cases for `\r` and `\n` would inadvertently escape CRLF as two independent characters.
                 size += 1;
@@ -182,7 +198,12 @@ fn escape_string_worker(s: &str, quote_char: QuoteChar, flags: GetLiteralTextFla
 // Go: printer/utilities.go:178 EscapeString
 pub fn escape_string(s: &str, quote_char: QuoteChar) -> String {
     let mut b = String::with_capacity(s.len() + 2);
-    escape_string_worker(s, quote_char, GetLiteralTextFlags::NEVER_ASCII_ESCAPE, &mut b);
+    escape_string_worker(
+        s,
+        quote_char,
+        GetLiteralTextFlags::NEVER_ASCII_ESCAPE,
+        &mut b,
+    );
     b
 }
 
@@ -212,7 +233,8 @@ fn can_use_original_text(node: Node, flags: GetLiteralTextFlags) -> bool {
     // requested proper termination of unterminated literals
     if node_is_synthesized(node)
         || node.parent().is_nil()
-        || flags.intersects(GetLiteralTextFlags::TERMINATE_UNTERMINATED_LITERALS) && is_unterminated_literal(node)
+        || flags.intersects(GetLiteralTextFlags::TERMINATE_UNTERMINATED_LITERALS)
+            && is_unterminated_literal(node)
     {
         return false;
     }
@@ -238,11 +260,19 @@ fn can_use_original_text(node: Node, flags: GetLiteralTextFlags) -> bool {
 }
 
 // Go: printer/utilities.go:227 getLiteralText
-pub(crate) fn get_literal_text(node: Node, source_file: Node, flags: GetLiteralTextFlags) -> String {
+pub(crate) fn get_literal_text(
+    node: Node,
+    source_file: Node,
+    flags: GetLiteralTextFlags,
+) -> String {
     // If we don't need to downlevel and we can reach the original source text using
     // the node's parent reference, then simply get the text as it was originally written.
     if source_file.is_some() && can_use_original_text(node, flags) {
-        return get_source_text_of_node_from_source_file(source_file, node, false /*includeTrivia*/);
+        return get_source_text_of_node_from_source_file(
+            source_file,
+            node,
+            false, /*includeTrivia*/
+        );
     }
 
     // If we can't reach the original source text, use the canonical form if it's a number,
@@ -325,7 +355,9 @@ pub(crate) fn get_literal_text(node: Node, source_file: Node, flags: GetLiteralT
         SyntaxKind::NumericLiteral | SyntaxKind::BigIntLiteral => node.text().to_string(),
 
         SyntaxKind::RegularExpressionLiteral => {
-            if flags.intersects(GetLiteralTextFlags::TERMINATE_UNTERMINATED_LITERALS) && is_unterminated_literal(node) {
+            if flags.intersects(GetLiteralTextFlags::TERMINATE_UNTERMINATED_LITERALS)
+                && is_unterminated_literal(node)
+            {
                 let text = node.text();
                 let mut b;
                 if !text.is_empty() && text.as_bytes()[text.len() - 1] == b'\\' {
@@ -357,7 +389,11 @@ pub fn range_is_on_single_line(r: TextRange, source_file: Node) -> bool {
 }
 
 // Go: printer/utilities.go:349 RangeStartPositionsAreOnSameLine
-pub fn range_start_positions_are_on_same_line(range1: TextRange, range2: TextRange, source_file: Node) -> bool {
+pub fn range_start_positions_are_on_same_line(
+    range1: TextRange,
+    range2: TextRange,
+    source_file: Node,
+) -> bool {
     positions_are_on_same_line(
         get_start_position_of_range(range1, source_file, false /*includeComments*/),
         get_start_position_of_range(range2, source_file, false /*includeComments*/),
@@ -366,12 +402,20 @@ pub fn range_start_positions_are_on_same_line(range1: TextRange, range2: TextRan
 }
 
 // Go: printer/utilities.go:357 rangeEndPositionsAreOnSameLine
-pub(crate) fn range_end_positions_are_on_same_line(range1: TextRange, range2: TextRange, source_file: Node) -> bool {
+pub(crate) fn range_end_positions_are_on_same_line(
+    range1: TextRange,
+    range2: TextRange,
+    source_file: Node,
+) -> bool {
     positions_are_on_same_line(range1.end(), range2.end(), source_file)
 }
 
 // Go: printer/utilities.go:361 rangeStartIsOnSameLineAsRangeEnd
-pub(crate) fn range_start_is_on_same_line_as_range_end(range1: TextRange, range2: TextRange, source_file: Node) -> bool {
+pub(crate) fn range_start_is_on_same_line_as_range_end(
+    range1: TextRange,
+    range2: TextRange,
+    source_file: Node,
+) -> bool {
     positions_are_on_same_line(
         get_start_position_of_range(range1, source_file, false /*includeComments*/),
         range2.end(),
@@ -380,7 +424,11 @@ pub(crate) fn range_start_is_on_same_line_as_range_end(range1: TextRange, range2
 }
 
 // Go: printer/utilities.go:365 rangeEndIsOnSameLineAsRangeStart
-pub(crate) fn range_end_is_on_same_line_as_range_start(range1: TextRange, range2: TextRange, source_file: Node) -> bool {
+pub(crate) fn range_end_is_on_same_line_as_range_start(
+    range1: TextRange,
+    range2: TextRange,
+    source_file: Node,
+) -> bool {
     positions_are_on_same_line(
         range1.end(),
         get_start_position_of_range(range2, source_file, false /*includeComments*/),
@@ -389,14 +437,21 @@ pub(crate) fn range_end_is_on_same_line_as_range_start(range1: TextRange, range2
 }
 
 // Go: printer/utilities.go:369 getStartPositionOfRange
-pub(crate) fn get_start_position_of_range(r: TextRange, source_file: Node, include_comments: bool) -> i32 {
+pub(crate) fn get_start_position_of_range(
+    r: TextRange,
+    source_file: Node,
+    include_comments: bool,
+) -> i32 {
     if position_is_synthesized(r.pos()) {
         return -1;
     }
     skip_trivia_ex(
         source_file_text(source_file),
         r.pos(),
-        Some(&SkipTriviaOptions { stop_at_comments: include_comments, ..Default::default() }),
+        Some(&SkipTriviaOptions {
+            stop_at_comments: include_comments,
+            ..Default::default()
+        }),
     )
 }
 
@@ -415,8 +470,13 @@ pub fn get_lines_between_positions(source_file: Node, pos1: i32, pos2: i32) -> i
     let is_negative = lower == pos2;
     let upper = if is_negative { pos1 } else { pos2 };
     let lower_line = compute_line_of_position(&line_starts, lower);
-    let upper_line = lower_line + compute_line_of_position(&line_starts[lower_line as usize..], upper);
-    if is_negative { lower_line - upper_line } else { upper_line - lower_line }
+    let upper_line =
+        lower_line + compute_line_of_position(&line_starts[lower_line as usize..], upper);
+    if is_negative {
+        lower_line - upper_line
+    } else {
+        upper_line - lower_line
+    }
 }
 
 // Go: printer/utilities.go:397 getLinesBetweenRangeEndAndRangeStart
@@ -426,7 +486,8 @@ pub(crate) fn get_lines_between_range_end_and_range_start(
     source_file: Node,
     include_second_range_comments: bool,
 ) -> i32 {
-    let range2_start = get_start_position_of_range(range2, source_file, include_second_range_comments);
+    let range2_start =
+        get_start_position_of_range(range2, source_file, include_second_range_comments);
     get_lines_between_positions(source_file, range1.end(), range2_start)
 }
 
@@ -440,10 +501,17 @@ pub(crate) fn get_lines_between_position_and_preceding_non_whitespace_character(
     let start_pos = skip_trivia_ex(
         source_file_text(source_file),
         pos,
-        Some(&SkipTriviaOptions { stop_at_comments: include_comments, ..Default::default() }),
+        Some(&SkipTriviaOptions {
+            stop_at_comments: include_comments,
+            ..Default::default()
+        }),
     );
     let prev_pos = get_previous_non_whitespace_position(start_pos, stop_pos, source_file);
-    get_lines_between_positions(source_file, if prev_pos >= 0 { prev_pos } else { stop_pos }, start_pos)
+    get_lines_between_positions(
+        source_file,
+        if prev_pos >= 0 { prev_pos } else { stop_pos },
+        start_pos,
+    )
 }
 
 // Go: printer/utilities.go:408 getLinesBetweenPositionAndNextNonWhitespaceCharacter
@@ -456,9 +524,20 @@ pub(crate) fn get_lines_between_position_and_next_non_whitespace_character(
     let next_pos = skip_trivia_ex(
         source_file_text(source_file),
         pos,
-        Some(&SkipTriviaOptions { stop_at_comments: include_comments, ..Default::default() }),
+        Some(&SkipTriviaOptions {
+            stop_at_comments: include_comments,
+            ..Default::default()
+        }),
     );
-    get_lines_between_positions(source_file, pos, if stop_pos < next_pos { stop_pos } else { next_pos })
+    get_lines_between_positions(
+        source_file,
+        pos,
+        if stop_pos < next_pos {
+            stop_pos
+        } else {
+            next_pos
+        },
+    )
 }
 
 // Go: printer/utilities.go:413 getPreviousNonWhitespacePosition
@@ -475,7 +554,11 @@ fn get_previous_non_whitespace_position(mut pos: i32, stop_pos: i32, source_file
 }
 
 // Go: printer/utilities.go:422 siblingNodePositionsAreComparable
-pub(crate) fn sibling_node_positions_are_comparable(emit_context: &EmitContext, previous_node: Node, next_node: Node) -> bool {
+pub(crate) fn sibling_node_positions_are_comparable(
+    emit_context: &EmitContext,
+    previous_node: Node,
+    next_node: Node,
+) -> bool {
     if next_node.pos() < previous_node.end() {
         return false;
     }
@@ -562,7 +645,9 @@ pub(crate) fn get_containing_node_array(node: Node) -> NodeList {
         | SyntaxKind::TupleType
         | SyntaxKind::NamedImports
         | SyntaxKind::NamedExports => return parent.element_list(),
-        SyntaxKind::ObjectLiteralExpression | SyntaxKind::JsxAttributes => return parent.property_list(),
+        SyntaxKind::ObjectLiteralExpression | SyntaxKind::JsxAttributes => {
+            return parent.property_list();
+        }
         SyntaxKind::CallExpression | SyntaxKind::NewExpression => {
             // PORT: Go has one case each for CallExpression and NewExpression
             // with the same body.
@@ -582,7 +667,10 @@ pub(crate) fn get_containing_node_array(node: Node) -> NodeList {
                 return parent.type_argument_list();
             }
         }
-        SyntaxKind::Block | SyntaxKind::ModuleBlock | SyntaxKind::CaseClause | SyntaxKind::DefaultClause => {
+        SyntaxKind::Block
+        | SyntaxKind::ModuleBlock
+        | SyntaxKind::CaseClause
+        | SyntaxKind::DefaultClause => {
             return parent.statement_list();
         }
         SyntaxKind::CaseBlock => return parent.clauses(),
@@ -631,7 +719,11 @@ fn can_have_decorators(node: Node) -> bool {
 }
 
 // Go: printer/utilities.go:567 originalNodesHaveSameParent
-pub(crate) fn original_nodes_have_same_parent(emit_context: &EmitContext, node_a: Node, node_b: Node) -> bool {
+pub(crate) fn original_nodes_have_same_parent(
+    emit_context: &EmitContext,
+    node_a: Node,
+    node_b: Node,
+) -> bool {
     let node_a = emit_context.most_original(node_a);
     if node_a.parent().is_some() {
         // For performance, do not call `MostOriginal` for `nodeB` if `nodeA` doesn't even
@@ -652,19 +744,31 @@ pub(crate) trait EndLike {
 
 impl EndLike for Node {
     fn try_get_end(&self) -> (i32, bool) {
-        if self.is_some() { (self.end(), true) } else { (0, false) }
+        if self.is_some() {
+            (self.end(), true)
+        } else {
+            (0, false)
+        }
     }
 }
 
 impl EndLike for NodeList {
     fn try_get_end(&self) -> (i32, bool) {
-        if self.is_some() { (self.end(), true) } else { (0, false) }
+        if self.is_some() {
+            (self.end(), true)
+        } else {
+            (0, false)
+        }
     }
 }
 
 impl EndLike for ModifierList {
     fn try_get_end(&self) -> (i32, bool) {
-        if self.is_some() { (self.end(), true) } else { (0, false) }
+        if self.is_some() {
+            (self.end(), true)
+        } else {
+            (0, false)
+        }
     }
 }
 
@@ -742,7 +846,11 @@ pub(crate) fn is_immediately_invoked_function_expression_or_arrow_function(node:
 }
 
 // Go: printer/utilities.go:651 IsFileLevelUniqueName
-pub fn is_file_level_unique_name(source_file: Node, name: &str, has_global_name: Option<&dyn Fn(&str) -> bool>) -> bool {
+pub fn is_file_level_unique_name(
+    source_file: Node,
+    name: &str,
+    has_global_name: Option<&dyn Fn(&str) -> bool>,
+) -> bool {
     if let Some(has_global_name) = has_global_name
         && has_global_name(name)
     {
@@ -763,7 +871,10 @@ thread_local! {
 // PORT: the Rust parser does not record `Parser.identifiers`, so the set is
 // rebuilt from the tree with the same rules as the Go parser (see
 // `collect_interned_texts`). It is cached per file.
-fn source_file_identifiers<R>(source_file: Node, f: impl FnOnce(&FxHashSet<&'static str>) -> R) -> R {
+fn source_file_identifiers<R>(
+    source_file: Node,
+    f: impl FnOnce(&FxHashSet<&'static str>) -> R,
+) -> R {
     let cached = SOURCE_FILE_IDENTIFIERS.with(|cache| cache.borrow().get(&source_file).cloned());
     let identifiers = match cached {
         Some(identifiers) => identifiers,
@@ -771,7 +882,8 @@ fn source_file_identifiers<R>(source_file: Node, f: impl FnOnce(&FxHashSet<&'sta
             let mut identifiers = FxHashSet::default();
             collect_interned_texts(source_file, source_file, &mut identifiers);
             let identifiers = Rc::new(identifiers);
-            SOURCE_FILE_IDENTIFIERS.with(|cache| cache.borrow_mut().insert(source_file, identifiers.clone()));
+            SOURCE_FILE_IDENTIFIERS
+                .with(|cache| cache.borrow_mut().insert(source_file, identifiers.clone()));
             identifiers
         }
     };
@@ -841,12 +953,16 @@ fn is_interned_literal(node: Node) -> bool {
         | SyntaxKind::MethodSignature
         | SyntaxKind::EnumMember
         | SyntaxKind::PropertyAssignment => {
-            matches!(kind, SyntaxKind::StringLiteral | SyntaxKind::NumericLiteral | SyntaxKind::BigIntLiteral)
-                && parent.name() == node
+            matches!(
+                kind,
+                SyntaxKind::StringLiteral | SyntaxKind::NumericLiteral | SyntaxKind::BigIntLiteral
+            ) && parent.name() == node
         }
         SyntaxKind::BindingElement => {
-            matches!(kind, SyntaxKind::StringLiteral | SyntaxKind::NumericLiteral | SyntaxKind::BigIntLiteral)
-                && parent.property_name() == node
+            matches!(
+                kind,
+                SyntaxKind::StringLiteral | SyntaxKind::NumericLiteral | SyntaxKind::BigIntLiteral
+            ) && parent.property_name() == node
         }
         // parseAmbientExternalModuleDeclaration
         SyntaxKind::ModuleDeclaration => kind == SyntaxKind::StringLiteral && parent.name() == node,
@@ -854,13 +970,19 @@ fn is_interned_literal(node: Node) -> bool {
         SyntaxKind::ImportDeclaration
         | SyntaxKind::JsImportDeclaration
         | SyntaxKind::ExportDeclaration
-        | SyntaxKind::JsDocImportTag => kind == SyntaxKind::StringLiteral && parent.module_specifier() == node,
-        SyntaxKind::ExternalModuleReference => kind == SyntaxKind::StringLiteral && parent.expression() == node,
+        | SyntaxKind::JsDocImportTag => {
+            kind == SyntaxKind::StringLiteral && parent.module_specifier() == node
+        }
+        SyntaxKind::ExternalModuleReference => {
+            kind == SyntaxKind::StringLiteral && parent.expression() == node
+        }
         // parseElementAccessExpressionRest
         SyntaxKind::ElementAccessExpression => {
             matches!(
                 kind,
-                SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral | SyntaxKind::NumericLiteral
+                SyntaxKind::StringLiteral
+                    | SyntaxKind::NoSubstitutionTemplateLiteral
+                    | SyntaxKind::NumericLiteral
             ) && parent.argument_expression() == node
         }
         _ => false,
@@ -874,17 +996,30 @@ fn has_leading_hash(text: &str) -> bool {
 
 // Go: printer/utilities.go:663 removeLeadingHash
 pub(crate) fn remove_leading_hash(text: &str) -> &str {
-    if has_leading_hash(text) { &text[1..] } else { text }
+    if has_leading_hash(text) {
+        &text[1..]
+    } else {
+        text
+    }
 }
 
 // Go: printer/utilities.go:671 ensureLeadingHash
 pub(crate) fn ensure_leading_hash(text: &str) -> String {
-    if has_leading_hash(text) { text.to_string() } else { format!("#{text}") }
+    if has_leading_hash(text) {
+        text.to_string()
+    } else {
+        format!("#{text}")
+    }
 }
 
 // Go: printer/utilities.go:679 FormatGeneratedName
 pub fn format_generated_name(private_name: bool, prefix: &str, base: &str, suffix: &str) -> String {
-    let name = format!("{}{}{}", remove_leading_hash(prefix), remove_leading_hash(base), remove_leading_hash(suffix));
+    let name = format!(
+        "{}{}{}",
+        remove_leading_hash(prefix),
+        remove_leading_hash(base),
+        remove_leading_hash(suffix)
+    );
     if private_name {
         return ensure_leading_hash(&name);
     }
@@ -911,7 +1046,11 @@ fn tspath_get_base_file_name(path: &str) -> String {
     // return the trailing portion of the path starting after the last (non-terminal) directory
     // separator but not including any trailing directory separator.
     // Go: tspath.RemoveTrailingDirectorySeparator
-    let path: &str = if path.ends_with('/') || path.ends_with('\\') { &path[..path.len() - 1] } else { &path };
+    let path: &str = if path.ends_with('/') || path.ends_with('\\') {
+        &path[..path.len() - 1]
+    } else {
+        &path
+    };
     let after_sep = path.rfind('/').map_or(0, |i| i + 1);
     let start = std::cmp::max(ts_path::root_length(path), after_sep);
     path[start..].to_string()
@@ -1203,7 +1342,8 @@ impl LineCharacterCache {
         let mut character;
         if self.has_cached && line == self.cached_line && end_pos >= self.cached_pos {
             // Incremental: only count UTF-16 code units from the last cached position.
-            character = self.cached_char + utf16_len(&self.text[self.cached_pos as usize..end_pos as usize]);
+            character = self.cached_char
+                + utf16_len(&self.text[self.cached_pos as usize..end_pos as usize]);
         } else {
             // Full computation from line start.
             character = utf16_len(&self.text[line_start as usize..end_pos as usize]);

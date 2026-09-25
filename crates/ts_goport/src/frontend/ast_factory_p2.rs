@@ -64,5 +64,4 @@ impl NodeFactory {
             has_trailing_new_line,
         }
     }
-
 }

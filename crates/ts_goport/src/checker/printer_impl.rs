@@ -4,8 +4,8 @@
 
 use crate::prelude::*;
 use crate::printer::{
-    get_single_line_string_writer, new_printer, new_text_writer, EmitContext, EmitTextWriter, PrintHandlers, Printer,
-    PrinterOptions,
+    EmitContext, EmitTextWriter, PrintHandlers, Printer, PrinterOptions,
+    get_single_line_string_writer, new_printer, new_text_writer,
 };
 use std::cell::Cell;
 
@@ -25,28 +25,51 @@ pub struct VerbosityContext {
 
 // Go: checker/printer.go:13 createPrinterWithDefaults
 pub fn create_printer_with_defaults(emit_context: Rc<EmitContext>) -> Printer {
-    new_printer(PrinterOptions::default(), PrintHandlers::default(), Some(emit_context))
+    new_printer(
+        PrinterOptions::default(),
+        PrintHandlers::default(),
+        Some(emit_context),
+    )
 }
 
 // Go: checker/printer.go:17 createPrinterWithRemoveComments
 pub fn create_printer_with_remove_comments(emit_context: Rc<EmitContext>) -> Printer {
-    new_printer(PrinterOptions { remove_comments: true, ..Default::default() }, PrintHandlers::default(), Some(emit_context))
+    new_printer(
+        PrinterOptions {
+            remove_comments: true,
+            ..Default::default()
+        },
+        PrintHandlers::default(),
+        Some(emit_context),
+    )
 }
 
 // Go: checker/printer.go:21 createPrinterWithRemoveCommentsOmitTrailingSemicolonNeverAsciiEscape
-pub fn create_printer_with_remove_comments_omit_trailing_semicolon_never_ascii_escape(emit_context: Rc<EmitContext>) -> Printer {
+pub fn create_printer_with_remove_comments_omit_trailing_semicolon_never_ascii_escape(
+    emit_context: Rc<EmitContext>,
+) -> Printer {
     // TODO: OmitTrailingSemicolon support
     new_printer(
-        PrinterOptions { remove_comments: true, never_ascii_escape: true, ..Default::default() },
+        PrinterOptions {
+            remove_comments: true,
+            never_ascii_escape: true,
+            ..Default::default()
+        },
         PrintHandlers::default(),
         Some(emit_context),
     )
 }
 
 // Go: checker/printer.go:29 createPrinterWithRemoveCommentsNeverAsciiEscape
-pub fn create_printer_with_remove_comments_never_ascii_escape(emit_context: Rc<EmitContext>) -> Printer {
+pub fn create_printer_with_remove_comments_never_ascii_escape(
+    emit_context: Rc<EmitContext>,
+) -> Printer {
     new_printer(
-        PrinterOptions { remove_comments: true, never_ascii_escape: true, ..Default::default() },
+        PrinterOptions {
+            remove_comments: true,
+            never_ascii_escape: true,
+            ..Default::default()
+        },
         PrintHandlers::default(),
         Some(emit_context),
     )
@@ -227,8 +250,13 @@ impl EmitTextWriter for SemicolonRemoverWriter {
 }
 
 // Go: checker/printer.go:169 getTrailingSemicolonDeferringWriter
-pub fn get_trailing_semicolon_deferring_writer(writer: Rc<RefCell<dyn EmitTextWriter>>) -> Rc<RefCell<dyn EmitTextWriter>> {
-    Rc::new(RefCell::new(SemicolonRemoverWriter { has_pending_semicolon: false, inner: writer }))
+pub fn get_trailing_semicolon_deferring_writer(
+    writer: Rc<RefCell<dyn EmitTextWriter>>,
+) -> Rc<RefCell<dyn EmitTextWriter>> {
+    Rc::new(RefCell::new(SemicolonRemoverWriter {
+        has_pending_semicolon: false,
+        inner: writer,
+    }))
 }
 
 // Go: checker/printer.go:181 toNodeBuilderFlags
@@ -240,7 +268,11 @@ pub fn to_node_builder_flags(flags: TypeFormatFlags) -> NodeBuilderFlags {
 // check appears in every entry point. `get_source_file_of_node` panics on
 // nil, so the guard is kept at each call through this helper.
 fn source_file_of_enclosing(enclosing_declaration: Node) -> Node {
-    if enclosing_declaration.is_some() { get_source_file_of_node(enclosing_declaration) } else { Node::NIL }
+    if enclosing_declaration.is_some() {
+        get_source_file_of_node(enclosing_declaration)
+    } else {
+        Node::NIL
+    }
 }
 
 impl Checker {
@@ -262,7 +294,8 @@ impl Checker {
         self.type_to_string_ex(
             t,
             enclosing_declaration,
-            TypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE | TypeFormatFlags::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE,
+            TypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE
+                | TypeFormatFlags::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE,
             None,
         )
     }
@@ -297,7 +330,8 @@ impl Checker {
         // the factory free its arenas. Rust frees nodes by ownership, so there
         // is nothing to release.
         let node_builder = self.get_node_builder();
-        let old_verbosity = std::mem::replace(&mut node_builder.borrow_mut().verbosity, vc.cloned());
+        let old_verbosity =
+            std::mem::replace(&mut node_builder.borrow_mut().verbosity, vc.cloned());
         self.serialization_level += 1;
         let type_node = self.node_builder_type_to_type_node(
             &node_builder,
@@ -355,7 +389,12 @@ impl Checker {
 
     // Go: checker/printer.go:253 symbolToString
     pub fn symbol_to_string(&mut self, symbol: SymbolId) -> String {
-        self.symbol_to_string_ex(symbol, Node::NIL, SymbolFlags::ALL, SymbolFormatFlags::ALLOW_ANY_NODE_KIND)
+        self.symbol_to_string_ex(
+            symbol,
+            Node::NIL,
+            SymbolFlags::ALL,
+            SymbolFormatFlags::ALLOW_ANY_NODE_KIND,
+        )
     }
 
     // Go: checker/printer.go:257 SymbolToStringEx and checker/printer.go:261 symbolToStringEx
@@ -380,10 +419,12 @@ impl Checker {
             node_flags = node_flags | NodeBuilderFlags::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE;
         }
         if flags.intersects(SymbolFormatFlags::DO_NOT_INCLUDE_SYMBOL_CHAIN) {
-            internal_node_flags = internal_node_flags | InternalNodeBuilderFlags::DO_NOT_INCLUDE_SYMBOL_CHAIN;
+            internal_node_flags =
+                internal_node_flags | InternalNodeBuilderFlags::DO_NOT_INCLUDE_SYMBOL_CHAIN;
         }
         if flags.intersects(SymbolFormatFlags::WRITE_COMPUTED_PROPS) {
-            internal_node_flags = internal_node_flags | InternalNodeBuilderFlags::WRITE_COMPUTED_PROPS;
+            internal_node_flags =
+                internal_node_flags | InternalNodeBuilderFlags::WRITE_COMPUTED_PROPS;
         }
 
         // PORT: see type_to_string_ex about the release func.
@@ -391,14 +432,24 @@ impl Checker {
         let source_file = source_file_of_enclosing(enclosing_declaration);
         let emit_context = node_builder.borrow().emit_context();
         // add neverAsciiEscape for GH#39027
-        let mut printer_ = if enclosing_declaration.is_some() && enclosing_declaration.kind() == SyntaxKind::SourceFile {
+        let mut printer_ = if enclosing_declaration.is_some()
+            && enclosing_declaration.kind() == SyntaxKind::SourceFile
+        {
             create_printer_with_remove_comments_never_ascii_escape(emit_context)
         } else {
             create_printer_with_remove_comments(emit_context)
         };
 
         let entity = if flags.intersects(SymbolFormatFlags::ALLOW_ANY_NODE_KIND) {
-            self.node_builder_symbol_to_node(&node_builder, symbol, meaning, enclosing_declaration, node_flags, internal_node_flags, None)
+            self.node_builder_symbol_to_node(
+                &node_builder,
+                symbol,
+                meaning,
+                enclosing_declaration,
+                node_flags,
+                internal_node_flags,
+                None,
+            )
         } else {
             self.node_builder_symbol_to_entity_name(
                 &node_builder,
@@ -411,7 +462,12 @@ impl Checker {
             )
         }; // TODO: GH#18217
         let inner: Rc<RefCell<dyn EmitTextWriter>> = writer.clone();
-        printer_.write_exported(entity, source_file, get_trailing_semicolon_deferring_writer(inner), None); // TODO: GH#18217
+        printer_.write_exported(
+            entity,
+            source_file,
+            get_trailing_semicolon_deferring_writer(inner),
+            None,
+        ); // TODO: GH#18217
         let text = writer.borrow().string();
         text
     }
@@ -429,10 +485,17 @@ impl Checker {
         flags: TypeFormatFlags,
         vc: Option<&VerbosityContext>,
     ) -> String {
-        let is_constructor = self.sig(signature).flags.intersects(SignatureFlags::CONSTRUCT)
+        let is_constructor = self
+            .sig(signature)
+            .flags
+            .intersects(SignatureFlags::CONSTRUCT)
             && !flags.intersects(TypeFormatFlags::WRITE_CALL_STYLE_SIGNATURE);
         let sig_output = if flags.intersects(TypeFormatFlags::WRITE_ARROW_STYLE_SIGNATURE) {
-            if is_constructor { SyntaxKind::ConstructorType } else { SyntaxKind::FunctionType }
+            if is_constructor {
+                SyntaxKind::ConstructorType
+            } else {
+                SyntaxKind::FunctionType
+            }
         } else if is_constructor {
             SyntaxKind::ConstructSignature
         } else {
@@ -441,7 +504,8 @@ impl Checker {
 
         // PORT: see type_to_string_ex about the release func.
         let node_builder = self.get_node_builder();
-        let old_verbosity = std::mem::replace(&mut node_builder.borrow_mut().verbosity, vc.cloned());
+        let old_verbosity =
+            std::mem::replace(&mut node_builder.borrow_mut().verbosity, vc.cloned());
         let combined_flags = to_node_builder_flags(flags)
             | NodeBuilderFlags::IGNORE_ERRORS
             | NodeBuilderFlags::WRITE_TYPE_PARAMETERS_IN_QUALIFIED_NAME;
@@ -458,25 +522,41 @@ impl Checker {
         // not read it.
         node_builder.borrow_mut().verbosity = old_verbosity;
         let emit_context = node_builder.borrow().emit_context();
-        let mut p = create_printer_with_remove_comments_omit_trailing_semicolon_never_ascii_escape(emit_context);
+        let mut p = create_printer_with_remove_comments_omit_trailing_semicolon_never_ascii_escape(
+            emit_context,
+        );
         let source_file = source_file_of_enclosing(enclosing_declaration);
         if flags.intersects(TypeFormatFlags::MULTILINE_OBJECT_LITERALS) {
             let writer = Rc::new(RefCell::new(new_text_writer("\n", 0)));
             let inner: Rc<RefCell<dyn EmitTextWriter>> = writer.clone();
-            p.write_exported(sig, source_file, get_trailing_semicolon_deferring_writer(inner), None);
+            p.write_exported(
+                sig,
+                source_file,
+                get_trailing_semicolon_deferring_writer(inner),
+                None,
+            );
             let text = writer.borrow().string();
             return text;
         }
         let writer = Rc::new(RefCell::new(get_single_line_string_writer()));
         let inner: Rc<RefCell<dyn EmitTextWriter>> = writer.clone();
-        p.write_exported(sig, source_file, get_trailing_semicolon_deferring_writer(inner), None);
+        p.write_exported(
+            sig,
+            source_file,
+            get_trailing_semicolon_deferring_writer(inner),
+            None,
+        );
         let text = writer.borrow().string();
         text
     }
 
     // Go: checker/printer.go:362 typePredicateToString
     pub fn type_predicate_to_string(&mut self, type_predicate: TypePredicateId) -> String {
-        self.type_predicate_to_string_ex(type_predicate, Node::NIL, TypeFormatFlags::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE)
+        self.type_predicate_to_string_ex(
+            type_predicate,
+            Node::NIL,
+            TypeFormatFlags::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE,
+        )
     }
 
     // Go: checker/printer.go:366 typePredicateToStringEx
@@ -569,7 +649,14 @@ impl Checker {
         id_to_symbol: Option<FxHashMap<Node, SymbolId>>,
     ) -> Node {
         let node_builder = self.get_node_builder_ex(id_to_symbol);
-        self.node_builder_type_to_type_node(&node_builder, t, enclosing_declaration, flags, InternalNodeBuilderFlags::NONE, None)
+        self.node_builder_type_to_type_node(
+            &node_builder,
+            t,
+            enclosing_declaration,
+            flags,
+            InternalNodeBuilderFlags::NONE,
+            None,
+        )
     }
 
     // Go: checker/printer.go:424 SignatureToSignatureDeclaration
@@ -606,7 +693,8 @@ impl Checker {
     ) -> String {
         // PORT: see type_to_string_ex about the release func.
         let node_builder = self.get_node_builder();
-        let old_verbosity = std::mem::replace(&mut node_builder.borrow_mut().verbosity, vc.cloned());
+        let old_verbosity =
+            std::mem::replace(&mut node_builder.borrow_mut().verbosity, vc.cloned());
         let nodes = self.node_builder_expand_symbol_for_hover(&node_builder, symbol, meaning);
         let result = if nodes.is_empty() {
             String::new()
@@ -614,8 +702,11 @@ impl Checker {
             let emit_context = node_builder.borrow().emit_context();
             let mut p = create_printer_with_remove_comments(emit_context);
             let value_declaration = self.sym(symbol).value_declaration;
-            let source_file =
-                if value_declaration.is_some() { get_source_file_of_node(value_declaration) } else { Node::NIL };
+            let source_file = if value_declaration.is_some() {
+                get_source_file_of_node(value_declaration)
+            } else {
+                Node::NIL
+            };
             let mut b = String::new();
             for (i, node) in nodes.into_iter().enumerate() {
                 if i > 0 {
@@ -640,7 +731,8 @@ impl Checker {
     ) -> String {
         // PORT: see type_to_string_ex about the release func.
         let node_builder = self.get_node_builder();
-        let old_verbosity = std::mem::replace(&mut node_builder.borrow_mut().verbosity, vc.cloned());
+        let old_verbosity =
+            std::mem::replace(&mut node_builder.borrow_mut().verbosity, vc.cloned());
         let type_param_node = self.node_builder_type_parameter_to_declaration(
             &node_builder,
             t,
@@ -673,7 +765,14 @@ impl Checker {
         id_to_symbol: Option<FxHashMap<Node, SymbolId>>,
     ) -> Node {
         let node_builder = self.get_node_builder_ex(id_to_symbol);
-        self.node_builder_type_to_type_node(&node_builder, t, enclosing_declaration, flags, internal_flags, None)
+        self.node_builder_type_to_type_node(
+            &node_builder,
+            t,
+            enclosing_declaration,
+            flags,
+            internal_flags,
+            None,
+        )
     }
 
     // Go: checker/printer.go:481 TypePredicateToTypePredicateNode

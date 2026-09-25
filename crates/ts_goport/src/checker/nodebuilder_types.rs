@@ -2,8 +2,8 @@
 //! `SymbolTracker` interface. Also holds the Go `collections.CopyOnWriteMap`
 //! and `CopyOnWriteSet` types that `NodeBuilderContext` uses.
 
-use crate::prelude::*;
 use crate::flags_macros::go_flags;
+use crate::prelude::*;
 
 // Go: nodebuilder/types.go:9 SymbolTracker
 // TODO: previously all symboltracker methods were optional, but now they're required.
@@ -15,14 +15,31 @@ use crate::flags_macros::go_flags;
 // the node builder or its context while they call a tracker, because
 // `SymbolTrackerImpl` writes to that context.
 pub trait SymbolTracker {
-    fn track_symbol(&self, c: &mut Checker, symbol: SymbolId, enclosing_declaration: Node, meaning: SymbolFlags) -> bool;
+    fn track_symbol(
+        &self,
+        c: &mut Checker,
+        symbol: SymbolId,
+        enclosing_declaration: Node,
+        meaning: SymbolFlags,
+    ) -> bool;
     fn report_inaccessible_this_error(&self, c: &mut Checker);
     fn report_private_in_base_of_class_expression(&self, c: &mut Checker, property_name: &str);
     fn report_inaccessible_unique_symbol_error(&self, c: &mut Checker);
     fn report_cyclic_structure_error(&self, c: &mut Checker);
-    fn report_likely_unsafe_import_required_error(&self, c: &mut Checker, specifier: &str, symbol_name: &str);
+    fn report_likely_unsafe_import_required_error(
+        &self,
+        c: &mut Checker,
+        specifier: &str,
+        symbol_name: &str,
+    );
     fn report_truncation_error(&self, c: &mut Checker);
-    fn report_nonlocal_augmentation(&self, c: &mut Checker, containing_file: Node, parent_symbol: SymbolId, augmenting_symbol: SymbolId);
+    fn report_nonlocal_augmentation(
+        &self,
+        c: &mut Checker,
+        containing_file: Node,
+        parent_symbol: SymbolId,
+        augmenting_symbol: SymbolId,
+    );
     fn report_non_serializable_property(&self, c: &mut Checker, property_name: &str);
 
     fn report_inference_fallback(&self, c: &mut Checker, node: Node);
@@ -100,7 +117,9 @@ pub struct CopyOnWriteMap<K: std::hash::Hash + Eq + Clone, V: Clone> {
 
 impl<K: std::hash::Hash + Eq + Clone, V: Clone> Default for CopyOnWriteMap<K, V> {
     fn default() -> Self {
-        Self { m: Rc::new(FxHashMap::default()) }
+        Self {
+            m: Rc::new(FxHashMap::default()),
+        }
     }
 }
 
@@ -143,7 +162,9 @@ pub struct CopyOnWriteSet<K: std::hash::Hash + Eq + Clone> {
 
 impl<K: std::hash::Hash + Eq + Clone> Default for CopyOnWriteSet<K> {
     fn default() -> Self {
-        Self { m: CopyOnWriteMap::default() }
+        Self {
+            m: CopyOnWriteMap::default(),
+        }
     }
 }
 

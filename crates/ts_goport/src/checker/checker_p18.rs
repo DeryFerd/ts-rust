@@ -52,7 +52,13 @@ impl Checker {
         ignore_errors: bool,
         location: Node,
     ) -> SymbolId {
-        let mut namespace = self.resolve_entity_name(left, SymbolFlags::NAMESPACE, ignore_errors, false /*dontResolveAlias*/, location);
+        let mut namespace = self.resolve_entity_name(
+            left,
+            SymbolFlags::NAMESPACE,
+            ignore_errors,
+            false, /*dontResolveAlias*/
+            location,
+        );
         if namespace.is_nil() || node_is_missing(right) {
             return SymbolId::NIL;
         }
@@ -68,9 +74,14 @@ impl Checker {
             && self.is_common_js_require(value_declaration.initializer())
         {
             let module_name = value_declaration.initializer().arguments().get(0);
-            let module_sym = self.resolve_external_module_name(module_name, module_name, false /*ignoreErrors*/);
+            let module_sym = self.resolve_external_module_name(
+                module_name,
+                module_name,
+                false, /*ignoreErrors*/
+            );
             if module_sym.is_some() {
-                let resolved_module_symbol = self.resolve_external_module_symbol(module_sym, false /*dontResolveAlias*/);
+                let resolved_module_symbol = self
+                    .resolve_external_module_symbol(module_sym, false /*dontResolveAlias*/);
                 if resolved_module_symbol.is_some() {
                     namespace = resolved_module_symbol;
                 }
@@ -89,9 +100,11 @@ impl Checker {
         }
         if symbol.is_nil() {
             if !ignore_errors {
-                let namespace_name = self.get_fully_qualified_name(namespace, Node::NIL /*containingLocation*/);
+                let namespace_name =
+                    self.get_fully_qualified_name(namespace, Node::NIL /*containingLocation*/);
                 let declaration_name = declaration_name_to_string(right);
-                let suggestion_for_nonexistent_module = self.get_suggested_symbol_for_nonexistent_module(right, namespace);
+                let suggestion_for_nonexistent_module =
+                    self.get_suggested_symbol_for_nonexistent_module(right, namespace);
                 if suggestion_for_nonexistent_module.is_some() {
                     let suggestion = self.symbol_to_string(suggestion_for_nonexistent_module);
                     self.error(
@@ -109,7 +122,9 @@ impl Checker {
                     && meaning.intersects(SymbolFlags::TYPE)
                     && containing_qualified_name.is_some()
                     && !is_type_of_expression(containing_qualified_name.parent())
-                    && self.try_get_qualified_name_as_value(containing_qualified_name).is_some();
+                    && self
+                        .try_get_qualified_name_as_value(containing_qualified_name)
+                        .is_some();
                 if can_suggest_typeof {
                     self.error(
                         containing_qualified_name,
@@ -135,7 +150,11 @@ impl Checker {
                         }
                     }
                 }
-                self.error(right, diag::Namespace_0_has_no_exported_member_1, args![namespace_name, declaration_name]);
+                self.error(
+                    right,
+                    diag::Namespace_0_has_no_exported_member_1,
+                    args![namespace_name, declaration_name],
+                );
             }
         }
         symbol
@@ -144,7 +163,14 @@ impl Checker {
     // Go: checker/checker.go:15798 tryGetQualifiedNameAsValue
     pub fn try_get_qualified_name_as_value(&mut self, node: Node) -> SymbolId {
         let id = get_first_identifier(node);
-        let mut symbol = self.resolve_name(id, id.text(), SymbolFlags::VALUE, None /*nameNotFoundMessage*/, true /*isUse*/, false /*excludeGlobals*/);
+        let mut symbol = self.resolve_name(
+            id,
+            id.text(),
+            SymbolFlags::VALUE,
+            None,  /*nameNotFoundMessage*/
+            true,  /*isUse*/
+            false, /*excludeGlobals*/
+        );
         if symbol.is_nil() {
             return SymbolId::NIL;
         }
@@ -161,14 +187,22 @@ impl Checker {
     }
 
     // Go: checker/checker.go:15816 getSuggestedSymbolForNonexistentModule
-    pub fn get_suggested_symbol_for_nonexistent_module(&mut self, name: Node, target_module: SymbolId) -> SymbolId {
+    pub fn get_suggested_symbol_for_nonexistent_module(
+        &mut self,
+        name: Node,
+        target_module: SymbolId,
+    ) -> SymbolId {
         let exports = self.get_exports_of_module(target_module);
         let symbols = self.symbols.values(exports);
         self.get_spelling_suggestion_for_name(name.text(), &symbols, SymbolFlags::MODULE_MEMBER)
     }
 
     // Go: checker/checker.go:15820 getFullyQualifiedName
-    pub fn get_fully_qualified_name(&mut self, symbol: SymbolId, containing_location: Node) -> String {
+    pub fn get_fully_qualified_name(
+        &mut self,
+        symbol: SymbolId,
+        containing_location: Node,
+    ) -> String {
         let parent = self.sym(symbol).parent;
         if parent.is_some() {
             let parent_name = self.get_fully_qualified_name(parent, containing_location);
@@ -186,7 +220,10 @@ impl Checker {
     pub fn get_exports_of_symbol(&mut self, symbol: SymbolId) -> SymbolTable {
         let flags = self.sym(symbol).flags;
         if flags.intersects(SymbolFlags::LATE_BINDING_CONTAINER) {
-            return self.get_resolved_members_or_exports_of_symbol(symbol, MembersOrExportsResolutionKind::RESOLVED_EXPORTS);
+            return self.get_resolved_members_or_exports_of_symbol(
+                symbol,
+                MembersOrExportsResolutionKind::RESOLVED_EXPORTS,
+            );
         }
         if flags.intersects(SymbolFlags::MODULE) {
             return self.get_exports_of_module(symbol);
@@ -232,7 +269,9 @@ impl Checker {
             }
             if is_static {
                 let exports = self.sym(symbol).exports;
-                let assignment_symbol = self.symbols.get(exports, INTERNAL_SYMBOL_NAME_ASSIGNMENT_DECLARATION);
+                let assignment_symbol = self
+                    .symbols
+                    .get(exports, INTERNAL_SYMBOL_NAME_ASSIGNMENT_DECLARATION);
                 if assignment_symbol.is_some() {
                     let members = self.sym(assignment_symbol).declarations.clone();
                     for member in members {
@@ -285,12 +324,19 @@ impl Checker {
         late_symbols: SymbolTable,
         decl: Node,
     ) -> SymbolId {
-        debug_assert!(decl.symbol().is_some(), "The member is expected to have a symbol.");
+        debug_assert!(
+            decl.symbol().is_some(),
+            "The member is expected to have a symbol."
+        );
         if self.symbol_node_links.get(decl).resolved_symbol.is_nil() {
             // In the event we attempt to resolve the late-bound name of this member recursively,
             // fall back to the early-bound name of this member.
             self.symbol_node_links.get(decl).resolved_symbol = decl.symbol();
-            let decl_name = if is_binary_expression(decl) { decl.left() } else { decl.name() };
+            let decl_name = if is_binary_expression(decl) {
+                decl.left()
+            } else {
+                decl.name()
+            };
             let t = if is_element_access_expression(decl_name) {
                 self.check_expression_cached(decl_name.argument_expression())
             } else {
@@ -302,12 +348,18 @@ impl Checker {
                 // Get or add a late-bound symbol for the member. This allows us to merge late-bound accessor declarations.
                 let mut late_symbol = self.symbols.get(late_symbols, &member_name);
                 if late_symbol.is_nil() {
-                    late_symbol = self.new_symbol_ex(SymbolFlags::NONE, &member_name, CheckFlags::LATE);
-                    self.symbols.set(late_symbols, member_name.clone(), late_symbol);
+                    late_symbol =
+                        self.new_symbol_ex(SymbolFlags::NONE, &member_name, CheckFlags::LATE);
+                    self.symbols
+                        .set(late_symbols, member_name.clone(), late_symbol);
                 }
                 // Report an error if there's a symbol declaration with the same name and conflicting flags.
                 let early_symbol = self.symbols.get(early_symbols, &member_name);
-                if self.sym(late_symbol).flags.intersects(get_excluded_symbol_flags(symbol_flags)) {
+                if self
+                    .sym(late_symbol)
+                    .flags
+                    .intersects(get_excluded_symbol_flags(symbol_flags))
+                {
                     // If we have an existing early-bound member, combine its declarations so that we can
                     // report an error at each declaration.
                     let declarations: Vec<Node> = if early_symbol.is_some() {
@@ -323,18 +375,24 @@ impl Checker {
                     }
                     for d in declarations {
                         let name_of_declaration = get_name_of_declaration(d);
-                        let location = if name_of_declaration.is_some() { name_of_declaration } else { d };
+                        let location = if name_of_declaration.is_some() {
+                            name_of_declaration
+                        } else {
+                            d
+                        };
                         self.error(location, diag::Duplicate_identifier_0, args![name]);
                     }
                     let location = if decl_name.is_some() { decl_name } else { decl };
                     self.error(location, diag::Duplicate_identifier_0, args![name]);
                     let late_flags = self.sym(late_symbol).flags;
                     if late_flags.intersects(SymbolFlags::ACCESSOR)
-                        && (late_flags & SymbolFlags::ACCESSOR) != (symbol_flags & SymbolFlags::ACCESSOR)
+                        && (late_flags & SymbolFlags::ACCESSOR)
+                            != (symbol_flags & SymbolFlags::ACCESSOR)
                     {
                         self.sym_mut(late_symbol).flags |= SymbolFlags::ACCESSOR;
                     }
-                    late_symbol = self.new_symbol_ex(SymbolFlags::NONE, &member_name, CheckFlags::LATE);
+                    late_symbol =
+                        self.new_symbol_ex(SymbolFlags::NONE, &member_name, CheckFlags::LATE);
                 }
                 self.value_symbol_links.get(late_symbol).name_type = t;
                 self.add_declaration_to_late_bound_symbol(late_symbol, decl, symbol_flags);
@@ -360,18 +418,26 @@ impl Checker {
         if index_symbol.is_nil() {
             let early = self.symbols.get(early_symbols, INTERNAL_SYMBOL_NAME_INDEX);
             if early.is_nil() {
-                index_symbol = self.new_symbol_ex(SymbolFlags::NONE, INTERNAL_SYMBOL_NAME_INDEX, CheckFlags::LATE);
+                index_symbol = self.new_symbol_ex(
+                    SymbolFlags::NONE,
+                    INTERNAL_SYMBOL_NAME_INDEX,
+                    CheckFlags::LATE,
+                );
             } else {
                 index_symbol = self.clone_symbol(early);
                 self.sym_mut(index_symbol).check_flags |= CheckFlags::LATE;
             }
-            self.symbols.set(late_symbols, INTERNAL_SYMBOL_NAME_INDEX, index_symbol);
+            self.symbols
+                .set(late_symbols, INTERNAL_SYMBOL_NAME_INDEX, index_symbol);
         }
         // Then just add the computed name as a late bound declaration
         // (note: unlike `addDeclarationToLateBoundSymbol` we do not set up a `.lateSymbol` on `decl`'s links,
         // since that would point at an index symbol and not a single property symbol, like most consumers would expect)
         if self.sym(index_symbol).declarations.is_empty()
-            || !self.sym(decl.symbol()).flags.intersects(SymbolFlags::REPLACEABLE_BY_METHOD)
+            || !self
+                .sym(decl.symbol())
+                .flags
+                .intersects(SymbolFlags::REPLACEABLE_BY_METHOD)
         {
             self.sym_mut(index_symbol).declarations.push(decl);
         }
@@ -380,28 +446,46 @@ impl Checker {
     // Go: checker/checker.go:15996 isNotReplacableByMethod
     // PORT: Go package function; it reads symbol flags, so it is a Checker method.
     pub fn is_not_replacable_by_method(&self, decl: Node) -> bool {
-        !self.sym(decl.symbol()).flags.intersects(SymbolFlags::REPLACEABLE_BY_METHOD)
+        !self
+            .sym(decl.symbol())
+            .flags
+            .intersects(SymbolFlags::REPLACEABLE_BY_METHOD)
     }
 
     // Go: checker/checker.go:16003 addDeclarationToLateBoundSymbol
     // Adds a declaration to a late-bound dynamic member. This performs the same function for
     // late-bound members that `addDeclarationToSymbol` in binder.ts performs for early-bound
     // members.
-    pub fn add_declaration_to_late_bound_symbol(&mut self, symbol: SymbolId, member: Node, symbol_flags: SymbolFlags) {
-        debug_assert!(self.sym(symbol).check_flags.intersects(CheckFlags::LATE), "Expected a late-bound symbol.");
+    pub fn add_declaration_to_late_bound_symbol(
+        &mut self,
+        symbol: SymbolId,
+        member: Node,
+        symbol_flags: SymbolFlags,
+    ) {
+        debug_assert!(
+            self.sym(symbol).check_flags.intersects(CheckFlags::LATE),
+            "Expected a late-bound symbol."
+        );
         self.late_bound_links.get(member.symbol()).late_symbol = symbol;
         let member_symbol_flags = self.sym(member.symbol()).flags;
-        if self.sym(symbol).declarations.is_empty() || !member_symbol_flags.intersects(SymbolFlags::REPLACEABLE_BY_METHOD) {
+        if self.sym(symbol).declarations.is_empty()
+            || !member_symbol_flags.intersects(SymbolFlags::REPLACEABLE_BY_METHOD)
+        {
             let s = self.sym_mut(symbol);
             s.flags |= symbol_flags;
             s.declarations.push(member);
-        } else if self.sym(symbol).flags.intersects(SymbolFlags::REPLACEABLE_BY_METHOD)
+        } else if self
+            .sym(symbol)
+            .flags
+            .intersects(SymbolFlags::REPLACEABLE_BY_METHOD)
             && member_symbol_flags.intersects(SymbolFlags::METHOD)
         {
             // Remove all replacable-by-method members, along with their flags.
             let old_declarations = self.sym(symbol).declarations.clone();
-            let mut declarations: Vec<Node> =
-                old_declarations.into_iter().filter(|&d| self.is_not_replacable_by_method(d)).collect();
+            let mut declarations: Vec<Node> = old_declarations
+                .into_iter()
+                .filter(|&d| self.is_not_replacable_by_method(d))
+                .collect();
             declarations.push(member);
             let old_flags = self.sym(symbol).flags;
             let mut flags = SymbolFlags::NONE;
@@ -425,16 +509,29 @@ impl Checker {
     //
     // For a description of late-binding, see `lateBindMember`.
     pub fn get_members_of_symbol(&mut self, symbol: SymbolId) -> SymbolTable {
-        if self.sym(symbol).flags.intersects(SymbolFlags::LATE_BINDING_CONTAINER) {
-            return self.get_resolved_members_or_exports_of_symbol(symbol, MembersOrExportsResolutionKind::RESOLVED_MEMBERS);
+        if self
+            .sym(symbol)
+            .flags
+            .intersects(SymbolFlags::LATE_BINDING_CONTAINER)
+        {
+            return self.get_resolved_members_or_exports_of_symbol(
+                symbol,
+                MembersOrExportsResolutionKind::RESOLVED_MEMBERS,
+            );
         }
         self.sym(symbol).members
     }
 
     // Go: checker/checker.go:16038 getExportsOfModule
     pub fn get_exports_of_module(&mut self, module_symbol: SymbolId) -> SymbolTable {
-        if self.module_symbol_links.get(module_symbol).resolved_exports.is_nil() {
-            let (exports, type_only_export_star_map) = self.get_exports_of_module_worker(module_symbol);
+        if self
+            .module_symbol_links
+            .get(module_symbol)
+            .resolved_exports
+            .is_nil()
+        {
+            let (exports, type_only_export_star_map) =
+                self.get_exports_of_module_worker(module_symbol);
             let links = self.module_symbol_links.get(module_symbol);
             links.resolved_exports = exports;
             links.type_only_export_star_map = type_only_export_star_map;
@@ -443,9 +540,16 @@ impl Checker {
     }
 
     // Go: checker/checker.go:16055 getExportsOfModuleWorker
-    pub fn get_exports_of_module_worker(&mut self, module_symbol: SymbolId) -> (SymbolTable, FxHashMap<String, Node>) {
+    pub fn get_exports_of_module_worker(
+        &mut self,
+        module_symbol: SymbolId,
+    ) -> (SymbolTable, FxHashMap<String, Node>) {
         let mut module_symbol = module_symbol;
-        let size_hint = if module_symbol.is_some() { self.symbols.len(self.sym(module_symbol).exports) } else { 0 };
+        let size_hint = if module_symbol.is_some() {
+            self.symbols.len(self.sym(module_symbol).exports)
+        } else {
+            0
+        };
         let mut state = ExportsOfModuleVisitState {
             visited_symbols: Vec::new(),
             non_type_only_names: FxHashSet::with_capacity_and_hasher(size_hint, Default::default()),
@@ -453,14 +557,22 @@ impl Checker {
         };
         let mut original_module = SymbolId::NIL;
         if module_symbol.is_some() {
-            let export_equals = self.symbols.get(self.sym(module_symbol).exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS);
-            if self.resolve_symbol_ex(export_equals, false /*dontResolveAlias*/).is_some() {
+            let export_equals = self.symbols.get(
+                self.sym(module_symbol).exports,
+                INTERNAL_SYMBOL_NAME_EXPORT_EQUALS,
+            );
+            if self
+                .resolve_symbol_ex(export_equals, false /*dontResolveAlias*/)
+                .is_some()
+            {
                 original_module = module_symbol;
             }
         }
         // A module defined by an 'export=' consists of one export that needs to be resolved
-        module_symbol = self.resolve_external_module_symbol(module_symbol, false /*dontResolveAlias*/);
-        let mut exports = self.get_exports_of_module_worker_visit(&mut state, module_symbol, Node::NIL, false);
+        module_symbol =
+            self.resolve_external_module_symbol(module_symbol, false /*dontResolveAlias*/);
+        let mut exports =
+            self.get_exports_of_module_worker_visit(&mut state, module_symbol, Node::NIL, false);
         if exports.is_nil() {
             exports = self.symbols.new_table();
         }
@@ -469,7 +581,9 @@ impl Checker {
             let original_exports = self.symbols.values(self.sym(original_module).exports);
             for symbol in original_exports {
                 let symbol_name = self.sym(symbol).name.clone();
-                if symbol_name == INTERNAL_SYMBOL_NAME_EXPORT_EQUALS || symbol_name == INTERNAL_SYMBOL_NAME_EXPORT_STAR {
+                if symbol_name == INTERNAL_SYMBOL_NAME_EXPORT_EQUALS
+                    || symbol_name == INTERNAL_SYMBOL_NAME_EXPORT_STAR
+                {
                     continue;
                 }
                 let flags = self.get_symbol_flags(symbol);
@@ -507,7 +621,10 @@ impl Checker {
                 state.non_type_only_names.insert(name);
             }
         }
-        if symbol.is_nil() || self.sym(symbol).exports.is_nil() || state.visited_symbols.contains(&symbol) {
+        if symbol.is_nil()
+            || self.sym(symbol).exports.is_nil()
+            || state.visited_symbols.contains(&symbol)
+        {
             return SymbolTable::NIL;
         }
         state.visited_symbols.push(symbol);
@@ -517,20 +634,38 @@ impl Checker {
             self.symbols.set(symbols, name, s);
         }
         // All export * declarations are collected in an __export symbol by the binder
-        let export_stars = self.symbols.get(symbol_exports, INTERNAL_SYMBOL_NAME_EXPORT_STAR);
+        let export_stars = self
+            .symbols
+            .get(symbol_exports, INTERNAL_SYMBOL_NAME_EXPORT_STAR);
         if export_stars.is_some() {
             let nested_symbols = self.symbols.new_table();
             let mut lookup_table: ExportCollisionTable = IndexMap::new();
             let declarations = self.sym(export_stars).declarations.clone();
             for node in declarations {
-                let resolved_module = self.resolve_external_module_name(node, node.module_specifier(), false /*ignoreErrors*/);
-                let exported_symbols =
-                    self.get_exports_of_module_worker_visit(state, resolved_module, node, is_type_only || node.is_type_only());
-                self.extend_export_symbols(nested_symbols, exported_symbols, Some(&mut lookup_table), node);
+                let resolved_module = self.resolve_external_module_name(
+                    node,
+                    node.module_specifier(),
+                    false, /*ignoreErrors*/
+                );
+                let exported_symbols = self.get_exports_of_module_worker_visit(
+                    state,
+                    resolved_module,
+                    node,
+                    is_type_only || node.is_type_only(),
+                );
+                self.extend_export_symbols(
+                    nested_symbols,
+                    exported_symbols,
+                    Some(&mut lookup_table),
+                    node,
+                );
             }
             for (id, s) in &lookup_table {
                 // It's not an error if the file with multiple `export *`s with duplicate names exports a member with that name itself
-                if id == INTERNAL_SYMBOL_NAME_EXPORT_EQUALS || s.exports_with_duplicate.is_empty() || self.symbols.get(symbols, id).is_some() {
+                if id == INTERNAL_SYMBOL_NAME_EXPORT_EQUALS
+                    || s.exports_with_duplicate.is_empty()
+                    || self.symbols.get(symbols, id).is_some()
+                {
                     continue;
                 }
                 for &node in &s.exports_with_duplicate {
@@ -611,23 +746,41 @@ impl Checker {
             panic!("Should only get alias here");
         }
         if self.alias_symbol_links.get(symbol).alias_target.is_nil() {
-            if !self.push_type_resolution(TypeSystemEntity::Symbol(symbol), TypeSystemPropertyName::ALIAS_TARGET) {
+            if !self.push_type_resolution(
+                TypeSystemEntity::Symbol(symbol),
+                TypeSystemPropertyName::ALIAS_TARGET,
+            ) {
                 return self.unknown_symbol;
             }
             let node = self.get_declaration_of_alias_symbol(symbol);
             if node.is_nil() {
-                panic!("Unexpected nil in resolveAlias for symbol: {}", self.symbol_to_string(symbol));
+                panic!(
+                    "Unexpected nil in resolveAlias for symbol: {}",
+                    self.symbol_to_string(symbol)
+                );
             }
             let mut target = self.get_target_of_alias_declaration(node);
-            if is_non_local_alias(&self.symbols, target, SymbolFlags::VALUE | SymbolFlags::TYPE | SymbolFlags::NAMESPACE) {
+            if is_non_local_alias(
+                &self.symbols,
+                target,
+                SymbolFlags::VALUE | SymbolFlags::TYPE | SymbolFlags::NAMESPACE,
+            ) {
                 // When the target is a pure alias, we transitively resolve and propagate any typeOnlyDeclaration
                 target = self.resolve_indirection_alias(symbol, target);
             }
-            let alias_target = if target.is_some() { target } else { self.unknown_symbol };
+            let alias_target = if target.is_some() {
+                target
+            } else {
+                self.unknown_symbol
+            };
             self.alias_symbol_links.get(symbol).alias_target = alias_target;
             if !self.pop_type_resolution() {
                 let symbol_text = self.symbol_to_string(symbol);
-                self.error(node, diag::Circular_definition_of_import_alias_0, args![symbol_text]);
+                self.error(
+                    node,
+                    diag::Circular_definition_of_import_alias_0,
+                    args![symbol_text],
+                );
                 let unknown_symbol = self.unknown_symbol;
                 self.alias_symbol_links.get(symbol).alias_target = unknown_symbol;
             }
@@ -639,7 +792,8 @@ impl Checker {
     pub fn resolve_indirection_alias(&mut self, source: SymbolId, target: SymbolId) -> SymbolId {
         let resolved = self.resolve_alias(target);
         let result = self.get_merged_symbol(resolved);
-        let target_type_only_declaration = self.alias_symbol_links.get(target).type_only_declaration;
+        let target_type_only_declaration =
+            self.alias_symbol_links.get(target).type_only_declaration;
         if target_type_only_declaration.is_some() {
             let source_links = self.alias_symbol_links.get(source);
             if source_links.type_only_declaration.is_nil() {
@@ -653,7 +807,10 @@ impl Checker {
     pub fn try_resolve_alias(&mut self, symbol: SymbolId) -> SymbolId {
         let alias_target = self.alias_symbol_links.get(symbol).alias_target;
         if alias_target.is_some()
-            || self.find_resolution_cycle_start_index(TypeSystemEntity::Symbol(symbol), TypeSystemPropertyName::ALIAS_TARGET) < 0
+            || self.find_resolution_cycle_start_index(
+                TypeSystemEntity::Symbol(symbol),
+                TypeSystemPropertyName::ALIAS_TARGET,
+            ) < 0
         {
             return self.resolve_alias(symbol);
         }
@@ -661,7 +818,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:16218 resolveAliasWithDeprecationCheck
-    pub fn resolve_alias_with_deprecation_check(&mut self, symbol: SymbolId, location: Node) -> SymbolId {
+    pub fn resolve_alias_with_deprecation_check(
+        &mut self,
+        symbol: SymbolId,
+        location: Node,
+    ) -> SymbolId {
         let mut symbol = symbol;
         if !self.sym(symbol).flags.intersects(SymbolFlags::ALIAS)
             || self.is_deprecated_symbol(symbol)
@@ -719,11 +880,19 @@ impl Checker {
     // @returns SymbolFlags.All if `symbol` is an alias that ultimately resolves to `unknown`;
     // combined flags of all alias targets otherwise.
     pub fn get_symbol_flags(&mut self, symbol: SymbolId) -> SymbolFlags {
-        self.get_symbol_flags_ex(symbol, false /*excludeTypeOnlyMeanings*/, false /*excludeLocalMeanings*/)
+        self.get_symbol_flags_ex(
+            symbol, false, /*excludeTypeOnlyMeanings*/
+            false, /*excludeLocalMeanings*/
+        )
     }
 
     // Go: checker/checker.go:16274 getSymbolFlagsEx
-    pub fn get_symbol_flags_ex(&mut self, symbol: SymbolId, exclude_type_only_meanings: bool, exclude_local_meanings: bool) -> SymbolFlags {
+    pub fn get_symbol_flags_ex(
+        &mut self,
+        symbol: SymbolId,
+        exclude_type_only_meanings: bool,
+        exclude_local_meanings: bool,
+    ) -> SymbolFlags {
         let mut symbol = symbol;
         let mut seen_symbols: FxHashSet<SymbolId> = FxHashSet::default();
         let mut flags = SymbolFlags::NONE;
@@ -731,7 +900,8 @@ impl Checker {
             flags = self.sym(symbol).flags;
         }
         while self.sym(symbol).flags.intersects(SymbolFlags::ALIAS) {
-            if exclude_type_only_meanings && self.get_type_only_alias_declaration(symbol).is_some() {
+            if exclude_type_only_meanings && self.get_type_only_alias_declaration(symbol).is_some()
+            {
                 break;
             }
             let resolved = self.resolve_alias(symbol);
@@ -814,7 +984,11 @@ impl Checker {
                 return self.get_write_type_of_symbol_with_deferred_type(symbol);
             }
             let links = self.value_symbol_links.get(symbol);
-            return if links.write_type.is_some() { links.write_type } else { links.resolved_type };
+            return if links.write_type.is_some() {
+                links.write_type
+            } else {
+                links.resolved_type
+            };
         }
         if flags.intersects(SymbolFlags::PROPERTY) {
             let t = self.get_type_of_symbol(symbol);
@@ -839,26 +1013,39 @@ impl Checker {
             // of the expression (which will reflect control flow analysis). If the expression indeed
             // resolved to the given symbol, return the narrowed type.
             if (is_identifier(location) || is_private_identifier(location))
-                && !(is_jsx_tag_name(location) || is_jsx_attribute(location.parent()) || is_jsx_namespaced_name(location.parent()))
+                && !(is_jsx_tag_name(location)
+                    || is_jsx_attribute(location.parent())
+                    || is_jsx_namespaced_name(location.parent()))
             {
                 if is_right_side_of_qualified_name_or_property_access(location) {
                     location = location.parent();
                 }
-                if is_expression_node(location) && (!is_assignment_target(location) || is_write_access(location)) {
-                    let t = if is_write_access(location) && location.kind() == SyntaxKind::PropertyAccessExpression {
-                        self.check_property_access_expression(location, CheckMode::NORMAL, true /*writeOnly*/)
+                if is_expression_node(location)
+                    && (!is_assignment_target(location) || is_write_access(location))
+                {
+                    let t = if is_write_access(location)
+                        && location.kind() == SyntaxKind::PropertyAccessExpression
+                    {
+                        self.check_property_access_expression(
+                            location,
+                            CheckMode::NORMAL,
+                            true, /*writeOnly*/
+                        )
                     } else {
                         self.get_type_of_expression(location)
                     };
                     let resolved_symbol = self.symbol_node_links.get(location).resolved_symbol;
-                    if self.get_export_symbol_of_value_symbol_if_exported(resolved_symbol) == symbol {
+                    if self.get_export_symbol_of_value_symbol_if_exported(resolved_symbol) == symbol
+                    {
                         return self.remove_optional_type_marker(t);
                     }
                 }
             }
             if is_declaration_name(location)
                 && is_set_accessor_declaration(location.parent())
-                && self.get_annotated_accessor_type_node(location.parent()).is_some()
+                && self
+                    .get_annotated_accessor_type_node(location.parent())
+                    .is_some()
             {
                 return self.get_write_type_of_accessors(location.parent().symbol());
             }
@@ -897,7 +1084,11 @@ impl Checker {
             return self.get_type_of_variable_or_parameter_or_property(symbol);
         }
         if flags.intersects(
-            SymbolFlags::FUNCTION | SymbolFlags::METHOD | SymbolFlags::CLASS | SymbolFlags::ENUM | SymbolFlags::VALUE_MODULE,
+            SymbolFlags::FUNCTION
+                | SymbolFlags::METHOD
+                | SymbolFlags::CLASS
+                | SymbolFlags::ENUM
+                | SymbolFlags::VALUE_MODULE,
         ) {
             return self.get_type_of_func_class_enum_module(symbol);
         }
@@ -955,7 +1146,9 @@ impl Checker {
             // to preserve this type. In fact, we need to _prefer_ that type, but it won't
             // be assigned until contextual typing is complete, so we need to defer in
             // cases where contextual typing may take place.
-            if self.value_symbol_links.get(symbol).resolved_type.is_nil() && !self.is_parameter_of_context_sensitive_signature(symbol) {
+            if self.value_symbol_links.get(symbol).resolved_type.is_nil()
+                && !self.is_parameter_of_context_sensitive_signature(symbol)
+            {
                 self.value_symbol_links.get(symbol).resolved_type = t;
             }
             return t;
@@ -979,7 +1172,10 @@ impl Checker {
     }
 
     // Go: checker/checker.go:16485 getTypeOfVariableOrParameterOrPropertyWorker
-    pub fn get_type_of_variable_or_parameter_or_property_worker(&mut self, symbol: SymbolId) -> TypeId {
+    pub fn get_type_of_variable_or_parameter_or_property_worker(
+        &mut self,
+        symbol: SymbolId,
+    ) -> TypeId {
         // Handle prototype property
         if self.sym(symbol).flags.intersects(SymbolFlags::PROTOTYPE) {
             return self.get_type_of_prototype_property(symbol);
@@ -1000,13 +1196,23 @@ impl Checker {
             return self.get_widened_type(t);
         }
         // Handle variable, parameter or property
-        if !self.push_type_resolution(TypeSystemEntity::Symbol(symbol), TypeSystemPropertyName::TYPE) {
+        if !self.push_type_resolution(
+            TypeSystemEntity::Symbol(symbol),
+            TypeSystemPropertyName::TYPE,
+        ) {
             return self.report_circularity_error(symbol);
         }
-        if self.sym(symbol).flags.intersects(SymbolFlags::MODULE_EXPORTS) {
+        if self
+            .sym(symbol)
+            .flags
+            .intersects(SymbolFlags::MODULE_EXPORTS)
+        {
             if self.sym(symbol).name == "exports" {
                 let value_declaration_symbol = self.sym(symbol).value_declaration.symbol();
-                let module_symbol = self.resolve_external_module_symbol(value_declaration_symbol, false /*dontResolveAlias*/);
+                let module_symbol = self.resolve_external_module_symbol(
+                    value_declaration_symbol,
+                    false, /*dontResolveAlias*/
+                );
                 return self.get_type_of_symbol(module_symbol);
             }
             let members = self.sym(symbol).members;
@@ -1017,24 +1223,44 @@ impl Checker {
             | SyntaxKind::PropertyDeclaration
             | SyntaxKind::PropertySignature
             | SyntaxKind::VariableDeclaration
-            | SyntaxKind::BindingElement => self.get_widened_type_for_variable_like_declaration(declaration, true /*reportErrors*/),
-            SyntaxKind::PropertyAssignment => self.check_property_assignment(declaration, CheckMode::NORMAL),
-            SyntaxKind::ShorthandPropertyAssignment => {
-                self.check_shorthand_property_assignment(declaration, true /*inDestructuringPattern*/, CheckMode::NORMAL)
+            | SyntaxKind::BindingElement => self.get_widened_type_for_variable_like_declaration(
+                declaration,
+                true, /*reportErrors*/
+            ),
+            SyntaxKind::PropertyAssignment => {
+                self.check_property_assignment(declaration, CheckMode::NORMAL)
             }
-            SyntaxKind::MethodDeclaration => self.check_object_literal_method(declaration, CheckMode::NORMAL),
+            SyntaxKind::ShorthandPropertyAssignment => {
+                self.check_shorthand_property_assignment(
+                    declaration,
+                    true, /*inDestructuringPattern*/
+                    CheckMode::NORMAL,
+                )
+            }
+            SyntaxKind::MethodDeclaration => {
+                self.check_object_literal_method(declaration, CheckMode::NORMAL)
+            }
             SyntaxKind::ExportAssignment => {
                 if declaration.type_().is_some() {
                     self.get_type_from_type_node(declaration.type_())
                 } else {
                     let t = self.check_expression_cached(declaration.expression());
-                    self.widen_type_for_variable_like_declaration(t, declaration, false /*reportErrors*/)
+                    self.widen_type_for_variable_like_declaration(
+                        t,
+                        declaration,
+                        false, /*reportErrors*/
+                    )
                 }
             }
-            SyntaxKind::BinaryExpression | SyntaxKind::CallExpression => self.get_widened_type_for_assignment_declaration(symbol),
+            SyntaxKind::BinaryExpression | SyntaxKind::CallExpression => {
+                self.get_widened_type_for_assignment_declaration(symbol)
+            }
             SyntaxKind::JsxAttribute => self.check_jsx_attribute(declaration, CheckMode::NORMAL),
             SyntaxKind::EnumMember => self.get_type_of_enum_member(symbol),
-            kind => panic!("Unhandled case in getTypeOfVariableOrParameterOrPropertyWorker: {:?}", kind),
+            kind => panic!(
+                "Unhandled case in getTypeOfVariableOrParameterOrPropertyWorker: {:?}",
+                kind
+            ),
         };
         if !self.pop_type_resolution() {
             return self.report_circularity_error(symbol);
@@ -1052,8 +1278,16 @@ impl Checker {
     // Here, the array literal [1, "one"] is contextually typed by the type [any, string], which is the implied type of the
     // binding pattern [x, s = ""]. Because the contextual type is a tuple type, the resulting type of [1, "one"] is the
     // tuple type [number, string]. Thus, the type inferred for 'x' is number and the type inferred for 's' is string.
-    pub fn get_widened_type_for_variable_like_declaration(&mut self, declaration: Node, report_errors: bool) -> TypeId {
-        let t = self.get_type_for_variable_like_declaration(declaration, true /*includeOptionality*/, CheckMode::NORMAL);
+    pub fn get_widened_type_for_variable_like_declaration(
+        &mut self,
+        declaration: Node,
+        report_errors: bool,
+    ) -> TypeId {
+        let t = self.get_type_for_variable_like_declaration(
+            declaration,
+            true, /*includeOptionality*/
+            CheckMode::NORMAL,
+        );
         self.widen_type_for_variable_like_declaration(t, declaration, report_errors)
     }
 
@@ -1071,10 +1305,17 @@ impl Checker {
             let grand_parent = declaration.parent().parent();
             match grand_parent.kind() {
                 SyntaxKind::ForInStatement => {
-                    let t = self.check_expression_ex(grand_parent.expression(), check_mode /*checkMode*/);
+                    let t = self.check_expression_ex(
+                        grand_parent.expression(),
+                        check_mode, /*checkMode*/
+                    );
                     let t = self.get_non_nullable_type_if_needed(t);
                     let index_type = self.get_index_type(t);
-                    if self.ty(index_type).flags.intersects(TypeFlags::TYPE_PARAMETER | TypeFlags::INDEX) {
+                    if self
+                        .ty(index_type)
+                        .flags
+                        .intersects(TypeFlags::TYPE_PARAMETER | TypeFlags::INDEX)
+                    {
                         return self.get_extract_string_type(index_type);
                     }
                     return self.string_type;
@@ -1091,7 +1332,8 @@ impl Checker {
         } else if is_binding_element(declaration) {
             return self.get_type_for_binding_element(declaration);
         }
-        let is_property = is_property_declaration(declaration) && !has_accessor_modifier(declaration)
+        let is_property = is_property_declaration(declaration)
+            && !has_accessor_modifier(declaration)
             || is_property_signature_declaration(declaration);
         let is_optional = include_optionality && is_optional_declaration(declaration);
         // Use type from type annotation if one is present
@@ -1099,7 +1341,11 @@ impl Checker {
         if is_catch_clause_variable_declaration_or_binding_element(declaration) {
             if declared_type.is_some() {
                 // If the catch clause is explicitly annotated with any or unknown, accept it, otherwise error.
-                if self.ty(declared_type).flags.intersects(TypeFlags::ANY_OR_UNKNOWN) {
+                if self
+                    .ty(declared_type)
+                    .flags
+                    .intersects(TypeFlags::ANY_OR_UNKNOWN)
+                {
                     return declared_type;
                 }
                 return self.error_type;
@@ -1118,14 +1364,18 @@ impl Checker {
         if self.no_implicit_any
             && is_variable_declaration(declaration)
             && !is_binding_pattern(declaration.name())
-            && !self.get_combined_modifier_flags_cached(declaration).intersects(ModifierFlags::EXPORT)
+            && !self
+                .get_combined_modifier_flags_cached(declaration)
+                .intersects(ModifierFlags::EXPORT)
             && !declaration.flags().intersects(NodeFlags::AMBIENT)
         {
             // If --noImplicitAny is on or the declaration is in a Javascript file,
             // use control flow tracked 'any' type for non-ambient, non-exported var or let variables with no
             // initializer or a 'null' or 'undefined' initializer.
             let initializer = declaration.initializer();
-            if !self.get_combined_node_flags_cached(declaration).intersects(NodeFlags::CONSTANT)
+            if !self
+                .get_combined_node_flags_cached(declaration)
+                .intersects(NodeFlags::CONSTANT)
                 && (initializer.is_nil() || self.is_null_or_undefined(initializer))
             {
                 return self.auto_type;
@@ -1145,7 +1395,11 @@ impl Checker {
             // For a parameter of a set accessor, use the type of the get accessor if one is present
             if is_set_accessor_declaration(fn_) && self.has_bindable_name(fn_) {
                 let accessor_symbol = self.get_symbol_of_declaration(declaration.parent());
-                let getter = get_declaration_of_kind(&self.symbols, accessor_symbol, SyntaxKind::GetAccessor);
+                let getter = get_declaration_of_kind(
+                    &self.symbols,
+                    accessor_symbol,
+                    SyntaxKind::GetAccessor,
+                );
                 if getter.is_some() {
                     let getter_signature = self.get_signature_from_declaration(getter);
                     let this_parameter = self.get_accessor_this_parameter(fn_);
@@ -1175,7 +1429,11 @@ impl Checker {
         // Use the type of the initializer expression if one is present and the declaration is
         // not a parameter of a contextually typed function
         if declaration.initializer().is_some() {
-            let initializer_type = self.check_declaration_initializer(declaration, check_mode, TypeId::NIL /*contextualType*/);
+            let initializer_type = self.check_declaration_initializer(
+                declaration,
+                check_mode,
+                TypeId::NIL, /*contextualType*/
+            );
             let t = self.widen_type_inferred_from_initializer(declaration, initializer_type);
             return self.add_optionality_ex(t, is_property, is_optional);
         }
@@ -1186,7 +1444,10 @@ impl Checker {
                 let constructor = find_constructor_declaration(declaration.parent());
                 let t = if constructor.is_some() {
                     self.get_flow_type_in_constructor(declaration.symbol(), constructor)
-                } else if declaration.modifier_flags().intersects(ModifierFlags::AMBIENT) {
+                } else if declaration
+                    .modifier_flags()
+                    .intersects(ModifierFlags::AMBIENT)
+                {
                     self.get_type_of_property_in_base_class(declaration.symbol())
                 } else {
                     TypeId::NIL
@@ -1205,7 +1466,10 @@ impl Checker {
                     .collect();
                 let t = if !static_blocks.is_empty() {
                     self.get_flow_type_in_static_blocks(declaration.symbol(), &static_blocks)
-                } else if declaration.modifier_flags().intersects(ModifierFlags::AMBIENT) {
+                } else if declaration
+                    .modifier_flags()
+                    .intersects(ModifierFlags::AMBIENT)
+                {
                     self.get_type_of_property_in_base_class(declaration.symbol())
                 } else {
                     TypeId::NIL
@@ -1224,7 +1488,11 @@ impl Checker {
         // If the declaration specifies a binding pattern and is not a parameter of a contextually
         // typed function, use the type implied by the binding pattern
         if is_binding_pattern(declaration.name()) {
-            return self.get_type_from_binding_pattern(declaration.name(), false /*includePatternInType*/, true /*reportErrors*/);
+            return self.get_type_from_binding_pattern(
+                declaration.name(),
+                false, /*includePatternInType*/
+                true,  /*reportErrors*/
+            );
         }
         // No type specified and nothing can be inferred
         TypeId::NIL

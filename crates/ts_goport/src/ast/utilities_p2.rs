@@ -270,7 +270,9 @@ pub fn can_have_decorators(node: Node) -> bool {
 
 // Go: ast/utilities.go:1128 IsFunctionOrModuleBlock
 pub fn is_function_or_module_block(node: Node) -> bool {
-    is_source_file(node) || is_module_block(node) || is_block(node) && is_function_like(node.parent())
+    is_source_file(node)
+        || is_module_block(node)
+        || is_block(node) && is_function_like(node.parent())
 }
 
 // Go: ast/utilities.go:1132 IsFunctionExpressionOrArrowFunction
@@ -299,7 +301,9 @@ pub fn for_each_return_statement(body: Node, mut visitor: impl FnMut(Node) -> bo
             | SyntaxKind::DefaultClause
             | SyntaxKind::LabeledStatement
             | SyntaxKind::TryStatement
-            | SyntaxKind::CatchClause => node.for_each_child(&mut |child: Node| traverse(child, visitor)),
+            | SyntaxKind::CatchClause => {
+                node.for_each_child(&mut |child: Node| traverse(child, visitor))
+            }
             _ => false,
         }
     }
@@ -315,7 +319,10 @@ pub fn get_root_declaration(mut node: Node) -> Node {
 }
 
 // Go: ast/utilities.go:1161 getCombinedFlags
-fn get_combined_flags<T: Copy + std::ops::BitOrAssign>(node: Node, get_flags: impl Fn(Node) -> T) -> T {
+fn get_combined_flags<T: Copy + std::ops::BitOrAssign>(
+    node: Node,
+    get_flags: impl Fn(Node) -> T,
+) -> T {
     let mut node = get_root_declaration(node);
     let mut flags = get_flags(node);
     if node.kind() == SyntaxKind::VariableDeclaration {
@@ -385,7 +392,10 @@ pub fn is_deprecated_declaration(declaration: Node) -> bool {
 // Go: ast/utilities.go:1223 IsDeprecatedDeclarationWithCachedFlags
 /// The core logic for IsDeprecatedDeclaration, parameterized on pre-computed
 /// combined flags so the checker can supply cached flags.
-pub fn is_deprecated_declaration_with_cached_flags(declaration: Node, combined_flags: NodeFlags) -> bool {
+pub fn is_deprecated_declaration_with_cached_flags(
+    declaration: Node,
+    combined_flags: NodeFlags,
+) -> bool {
     if !combined_flags.intersects(NodeFlags::POSSIBLY_CONTAINS_DEPRECATED_TAG) {
         return false;
     }
@@ -393,7 +403,9 @@ pub fn is_deprecated_declaration_with_cached_flags(declaration: Node, combined_f
     // attached to that node (e.g. VariableStatement, not VariableDeclaration).
     let mut n = declaration;
     while n.is_some() {
-        if n.flags().intersects(NodeFlags::POSSIBLY_CONTAINS_DEPRECATED_TAG) {
+        if n.flags()
+            .intersects(NodeFlags::POSSIBLY_CONTAINS_DEPRECATED_TAG)
+        {
             return get_js_doc_deprecated_tag(n).is_some();
         }
         n = n.parent();
@@ -505,9 +517,9 @@ pub fn is_literal_import_type_node(node: Node) -> bool {
 pub fn is_jsx_tag_name(node: Node) -> bool {
     let parent = node.parent();
     match parent.kind() {
-        SyntaxKind::JsxOpeningElement | SyntaxKind::JsxClosingElement | SyntaxKind::JsxSelfClosingElement => {
-            parent.tag_name() == node
-        }
+        SyntaxKind::JsxOpeningElement
+        | SyntaxKind::JsxClosingElement
+        | SyntaxKind::JsxSelfClosingElement => parent.tag_name() == node,
         _ => false,
     }
 }
@@ -519,7 +531,9 @@ pub fn is_import_or_export_specifier(node: Node) -> bool {
 
 // Go: ast/utilities.go:1332 IsVoidZero
 pub fn is_void_zero(node: Node) -> bool {
-    is_void_expression(node) && is_numeric_literal(node.expression()) && node.expression().text() == "0"
+    is_void_expression(node)
+        && is_numeric_literal(node.expression())
+        && node.expression().text() == "0"
 }
 
 // Go: ast/utilities.go:1336 IsExportsIdentifier
@@ -547,16 +561,25 @@ pub fn is_bindable_static_access_expression(node: Node, exclude_this_keyword: bo
     is_property_access_expression(node)
         && (!exclude_this_keyword && node.expression().kind() == SyntaxKind::ThisKeyword
             || is_identifier(node.name())
-                && is_bindable_static_name_expression(node.expression(), true /*excludeThisKeyword*/))
+                && is_bindable_static_name_expression(
+                    node.expression(),
+                    true, /*excludeThisKeyword*/
+                ))
         || is_bindable_static_element_access_expression(node, exclude_this_keyword)
 }
 
 // Go: ast/utilities.go:1358 IsBindableStaticElementAccessExpression
-pub fn is_bindable_static_element_access_expression(node: Node, exclude_this_keyword: bool) -> bool {
+pub fn is_bindable_static_element_access_expression(
+    node: Node,
+    exclude_this_keyword: bool,
+) -> bool {
     is_literal_like_element_access(node)
         && ((!exclude_this_keyword && node.expression().kind() == SyntaxKind::ThisKeyword)
             || is_entity_name_expression(node.expression())
-            || is_bindable_static_access_expression(node.expression(), true /*excludeThisKeyword*/))
+            || is_bindable_static_access_expression(
+                node.expression(),
+                true, /*excludeThisKeyword*/
+            ))
 }
 
 // Go: ast/utilities.go:1365 IsPrototypeAccess
@@ -572,12 +595,14 @@ pub fn is_prototype_access(node: Node) -> bool {
 
 // Go: ast/utilities.go:1374 IsLiteralLikeElementAccess
 pub fn is_literal_like_element_access(node: Node) -> bool {
-    is_element_access_expression(node) && is_string_or_numeric_literal_like(node.argument_expression())
+    is_element_access_expression(node)
+        && is_string_or_numeric_literal_like(node.argument_expression())
 }
 
 // Go: ast/utilities.go:1378 IsBindableStaticNameExpression
 pub fn is_bindable_static_name_expression(node: Node, exclude_this_keyword: bool) -> bool {
-    is_entity_name_expression(node) || is_bindable_static_access_expression(node, exclude_this_keyword)
+    is_entity_name_expression(node)
+        || is_bindable_static_access_expression(node, exclude_this_keyword)
 }
 
 // Go: ast/utilities.go:1384 GetElementOrPropertyAccessName
@@ -620,7 +645,8 @@ pub fn is_expression_with_type_arguments_in_class_extends_clause(node: Node) -> 
 
 // Go: ast/utilities.go:1411 TryGetClassExtendingExpressionWithTypeArguments
 pub fn try_get_class_extending_expression_with_type_arguments(node: Node) -> Node {
-    let (cls, is_implements) = try_get_class_implementing_or_extending_expression_with_type_arguments(node);
+    let (cls, is_implements) =
+        try_get_class_implementing_or_extending_expression_with_type_arguments(node);
     if cls.is_some() && !is_implements {
         return cls;
     }
@@ -629,10 +655,15 @@ pub fn try_get_class_extending_expression_with_type_arguments(node: Node) -> Nod
 
 // Go: ast/utilities.go:1419 TryGetClassImplementingOrExtendingExpressionWithTypeArguments
 /// Returns `(class, isImplements)`.
-pub fn try_get_class_implementing_or_extending_expression_with_type_arguments(node: Node) -> (Node, bool) {
+pub fn try_get_class_implementing_or_extending_expression_with_type_arguments(
+    node: Node,
+) -> (Node, bool) {
     if is_expression_with_type_arguments(node) {
         if is_heritage_clause(node.parent()) && is_class_like(node.parent().parent()) {
-            return (node.parent().parent(), node.parent().token() == SyntaxKind::ImplementsKeyword);
+            return (
+                node.parent().parent(),
+                node.parent().token() == SyntaxKind::ImplementsKeyword,
+            );
         }
     }
     (Node::NIL, false)
@@ -647,7 +678,10 @@ pub fn get_name_of_declaration(declaration: Node) -> Node {
     if non_assigned_name.is_some() {
         return non_assigned_name;
     }
-    if is_function_expression(declaration) || is_arrow_function(declaration) || is_class_expression(declaration) {
+    if is_function_expression(declaration)
+        || is_arrow_function(declaration)
+        || is_class_expression(declaration)
+    {
         return get_assigned_name(declaration);
     }
     Node::NIL
@@ -737,7 +771,8 @@ pub fn get_assignment_declaration_kind(node: Node) -> JSDeclarationKind {
         SyntaxKind::BinaryExpression => {
             let left = node.left();
             let right = node.right();
-            if node.operator_token().kind() == SyntaxKind::EqualsToken && is_access_expression(left) {
+            if node.operator_token().kind() == SyntaxKind::EqualsToken && is_access_expression(left)
+            {
                 if is_in_js_file(left) {
                     if is_module_exports_access_expression(left) && !is_exports_identifier(right) {
                         return JSDeclarationKind::MODULE_EXPORTS;
@@ -765,7 +800,9 @@ pub fn get_assignment_declaration_kind(node: Node) -> JSDeclarationKind {
         SyntaxKind::CallExpression => {
             if is_in_js_file(node) && is_bindable_object_define_property_call(node) {
                 let entity_name = node.arguments().get(0);
-                if is_exports_identifier(entity_name) || is_module_exports_access_expression(entity_name) {
+                if is_exports_identifier(entity_name)
+                    || is_module_exports_access_expression(entity_name)
+                {
                     return JSDeclarationKind::OBJECT_DEFINE_PROPERTY_EXPORTS;
                 }
                 return JSDeclarationKind::OBJECT_DEFINE_PROPERTY_VALUE;
@@ -826,7 +863,8 @@ pub fn is_entity_name_expression_ex(node: Node, allow_js: bool) -> bool {
     is_identifier(node)
         || is_property_access_entity_name_expression(node, allow_js)
         || allow_js
-            && (node.kind() == SyntaxKind::ThisKeyword || is_element_access_entity_name_expression(node, allow_js))
+            && (node.kind() == SyntaxKind::ThisKeyword
+                || is_element_access_entity_name_expression(node, allow_js))
 }
 
 // Go: ast/utilities.go:1605 IsPropertyAccessEntityNameExpression
@@ -846,9 +884,10 @@ pub fn is_element_access_entity_name_expression(node: Node, allow_js: bool) -> b
 // Go: ast/utilities.go:1613 IsDottedName
 pub fn is_dotted_name(node: Node) -> bool {
     match node.kind() {
-        SyntaxKind::Identifier | SyntaxKind::ThisKeyword | SyntaxKind::SuperKeyword | SyntaxKind::MetaProperty => {
-            true
-        }
+        SyntaxKind::Identifier
+        | SyntaxKind::ThisKeyword
+        | SyntaxKind::SuperKeyword
+        | SyntaxKind::MetaProperty => true,
         SyntaxKind::PropertyAccessExpression | SyntaxKind::ParenthesizedExpression => {
             is_dotted_name(node.expression())
         }
@@ -908,14 +947,17 @@ pub fn is_common_js_containing_module_kind(kind: ModuleKind) -> bool {
 // Go: ast/utilities.go:1658 IsExternalModuleIndicator
 pub fn is_external_module_indicator(node: Node) -> bool {
     // Exported top-level member indicates moduleness
-    is_any_import_or_re_export(node) || is_export_assignment(node) || has_syntactic_modifier(node, ModifierFlags::EXPORT)
+    is_any_import_or_re_export(node)
+        || is_export_assignment(node)
+        || has_syntactic_modifier(node, ModifierFlags::EXPORT)
 }
 
 // Go: ast/utilities.go:1663 IsExportNamespaceAsDefaultDeclaration
 pub fn is_export_namespace_as_default_declaration(node: Node) -> bool {
     if is_export_declaration(node) {
         let export_clause = node.export_clause();
-        return is_namespace_export(export_clause) && module_export_name_is_default(export_clause.name());
+        return is_namespace_export(export_clause)
+            && module_export_name_is_default(export_clause.name());
     }
     false
 }
@@ -955,7 +997,10 @@ pub fn get_containing_class(node: Node) -> Node {
 // Go: ast/utilities.go:1697 GetExtendsHeritageClauseElement
 pub fn get_extends_heritage_clause_element(node: Node) -> Node {
     // Go: core.FirstOrNil
-    get_extends_heritage_clause_elements(node).first().copied().unwrap_or(Node::NIL)
+    get_extends_heritage_clause_elements(node)
+        .first()
+        .copied()
+        .unwrap_or(Node::NIL)
 }
 
 // Go: ast/utilities.go:1701 GetExtendsHeritageClauseElements
@@ -993,9 +1038,9 @@ pub fn get_heritage_clause(node: Node, kind: SyntaxKind) -> Node {
 // Go: ast/utilities.go:1729 getHeritageClauses
 pub fn get_heritage_clauses(node: Node) -> NodeList {
     match node.kind() {
-        SyntaxKind::ClassDeclaration | SyntaxKind::ClassExpression | SyntaxKind::InterfaceDeclaration => {
-            node.heritage_clauses()
-        }
+        SyntaxKind::ClassDeclaration
+        | SyntaxKind::ClassExpression
+        | SyntaxKind::InterfaceDeclaration => node.heritage_clauses(),
         _ => NodeList::NIL,
     }
 }
@@ -1023,11 +1068,16 @@ pub fn is_in_top_level_context(mut node: Node) -> bool {
     // The name of a class or function declaration is a BindingIdentifier in its surrounding scope.
     if is_identifier(node) {
         let parent = node.parent();
-        if (is_class_declaration(parent) || is_function_declaration(parent)) && parent.name() == node {
+        if (is_class_declaration(parent) || is_function_declaration(parent))
+            && parent.name() == node
+        {
             node = parent;
         }
     }
-    let container = get_this_container(node, true /*includeArrowFunctions*/, false /*includeClassComputedPropertyName*/);
+    let container = get_this_container(
+        node, true,  /*includeArrowFunctions*/
+        false, /*includeClassComputedPropertyName*/
+    );
     is_source_file(container)
 }
 
@@ -1050,7 +1100,9 @@ pub fn get_this_container(
                 node = node.parent().parent();
             }
             SyntaxKind::Decorator => {
-                if node.parent().kind() == SyntaxKind::Parameter && is_class_element(node.parent().parent()) {
+                if node.parent().kind() == SyntaxKind::Parameter
+                    && is_class_element(node.parent().parent())
+                {
                     // If the decorator's parent is a ParameterDeclaration, we resolve the this container from
                     // the grandparent class declaration.
                     node = node.parent().parent();

@@ -653,7 +653,10 @@ pub fn basename(name: &str) -> &str {
     // Remove leading directory name
     // PORT: Go starts the search one byte before the last byte.
     if name.len() > 1 {
-        if let Some(i) = name.as_bytes()[..name.len() - 1].iter().rposition(|&b| b == b'/') {
+        if let Some(i) = name.as_bytes()[..name.len() - 1]
+            .iter()
+            .rposition(|&b| b == b'/')
+        {
             name = &name[i + 1..];
         }
     }

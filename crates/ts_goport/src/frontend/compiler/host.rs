@@ -13,7 +13,11 @@ pub trait CompilerHost {
     fn get_current_directory(&self) -> String;
     fn trace(&self, msg: &'static Message, args: Vec<String>);
     fn get_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>>;
-    fn get_resolved_project_reference(&self, file_name: &str, path: &Path) -> Option<Rc<ParsedCommandLine>>;
+    fn get_resolved_project_reference(
+        &self,
+        file_name: &str,
+        path: &Path,
+    ) -> Option<Rc<ParsedCommandLine>>;
 }
 
 /// Go trace callback `func(msg *diagnostics.Message, args ...any)`.
@@ -39,7 +43,13 @@ pub fn new_cached_fs_compiler_host(
     extended_config_cache: Option<Rc<dyn ExtendedConfigCache>>,
     trace: Option<TraceFn>,
 ) -> Rc<dyn CompilerHost> {
-    new_compiler_host(current_directory, cachedvfs_from(fs), default_library_path, extended_config_cache, trace)
+    new_compiler_host(
+        current_directory,
+        cachedvfs_from(fs),
+        default_library_path,
+        extended_config_cache,
+        trace,
+    )
 }
 
 // Go: host.go:44 NewCompilerHost
@@ -91,11 +101,19 @@ impl CompilerHost for CompilerHostImpl {
         // PORT: the parser takes `&'static str` (node data points into the
         // text), so the file text is leaked for the program lifetime.
         let text: &'static str = Box::leak(text.into_boxed_str());
-        Some(Rc::new(parse_source_file(opts, text, get_script_kind_from_file_name(&opts.file_name))))
+        Some(Rc::new(parse_source_file(
+            opts,
+            text,
+            get_script_kind_from_file_name(&opts.file_name),
+        )))
     }
 
     // Go: host.go:86 (*compilerHost).GetResolvedProjectReference
-    fn get_resolved_project_reference(&self, file_name: &str, path: &Path) -> Option<Rc<ParsedCommandLine>> {
+    fn get_resolved_project_reference(
+        &self,
+        file_name: &str,
+        path: &Path,
+    ) -> Option<Rc<ParsedCommandLine>> {
         let (command_line, _) = get_parsed_command_line_of_config_file_path(
             file_name,
             path.clone(),

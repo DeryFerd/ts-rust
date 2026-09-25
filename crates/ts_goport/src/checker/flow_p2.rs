@@ -11,11 +11,13 @@ use std::sync::LazyLock;
 impl Checker {
     // Go: checker/flow.go:953 getInstanceType
     pub fn get_instance_type(&mut self, constructor_type: TypeId) -> TypeId {
-        let prototype_property_type = self.get_type_of_property_of_type(constructor_type, "prototype");
+        let prototype_property_type =
+            self.get_type_of_property_of_type(constructor_type, "prototype");
         if prototype_property_type.is_some() && !self.is_type_any(prototype_property_type) {
             return prototype_property_type;
         }
-        let construct_signatures = self.get_signatures_of_type(constructor_type, SignatureKind::CONSTRUCT);
+        let construct_signatures =
+            self.get_signatures_of_type(constructor_type, SignatureKind::CONSTRUCT);
         if !construct_signatures.is_empty() {
             let mut types = Vec::with_capacity(construct_signatures.len());
             for signature in construct_signatures {
@@ -66,12 +68,15 @@ impl Checker {
         assume_true: bool,
     ) -> TypeId {
         let name = self.get_property_name_from_type(name_type);
-        let is_known_property =
-            self.some_type(t, &mut |c: &mut Checker, t: TypeId| c.is_type_presence_possible(t, &name, true /*assumeTrue*/));
+        let is_known_property = self.some_type(t, &mut |c: &mut Checker, t: TypeId| {
+            c.is_type_presence_possible(t, &name, true /*assumeTrue*/)
+        });
         if is_known_property {
             // If the check is for a known property (i.e. a property declared in some constituent of
             // the target type), we filter the target type by presence of absence of the property.
-            return self.filter_type(t, &mut |c: &mut Checker, t: TypeId| c.is_type_presence_possible(t, &name, assume_true));
+            return self.filter_type(t, &mut |c: &mut Checker, t: TypeId| {
+                c.is_type_presence_possible(t, &name, assume_true)
+            });
         }
         if assume_true {
             // If the check is for an unknown property, we intersect the target type with `Record<X, unknown>`,
@@ -80,7 +85,11 @@ impl Checker {
             let record_symbol = get_global_record_symbol(self);
             if record_symbol.is_some() {
                 let unknown_type = self.unknown_type;
-                let record = self.get_type_alias_instantiation(record_symbol, &[name_type, unknown_type], None);
+                let record = self.get_type_alias_instantiation(
+                    record_symbol,
+                    &[name_type, unknown_type],
+                    None,
+                );
                 return self.get_intersection_type(&[t, record]);
             }
         }
@@ -88,14 +97,21 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1011 isTypePresencePossible
-    pub fn is_type_presence_possible(&mut self, t: TypeId, prop_name: &str, assume_true: bool) -> bool {
+    pub fn is_type_presence_possible(
+        &mut self,
+        t: TypeId,
+        prop_name: &str,
+        assume_true: bool,
+    ) -> bool {
         let prop = self.get_property_of_type(t, prop_name);
         if prop.is_some() {
             return self.sym(prop).flags.intersects(SymbolFlags::OPTIONAL)
                 || self.sym(prop).check_flags.intersects(CheckFlags::PARTIAL)
                 || assume_true;
         }
-        self.get_applicable_index_info_for_name(t, prop_name).is_some() || !assume_true
+        self.get_applicable_index_info_for_name(t, prop_name)
+            .is_some()
+            || !assume_true
     }
 
     // Go: checker/flow.go:1019 narrowTypeByOptionalChainContainment
@@ -116,8 +132,11 @@ impl Checker {
         // When operator is !== and type of value is undefined, null and undefined is removed from type of obj in true branch.
         // When operator is == and type of value is null or undefined, null and undefined is removed from type of obj in false branch.
         // When operator is != and type of value is null or undefined, null and undefined is removed from type of obj in true branch.
-        let equals_operator = operator == SyntaxKind::EqualsEqualsToken || operator == SyntaxKind::EqualsEqualsEqualsToken;
-        let nullable_flags = if operator == SyntaxKind::EqualsEqualsToken || operator == SyntaxKind::ExclamationEqualsToken {
+        let equals_operator = operator == SyntaxKind::EqualsEqualsToken
+            || operator == SyntaxKind::EqualsEqualsEqualsToken;
+        let nullable_flags = if operator == SyntaxKind::EqualsEqualsToken
+            || operator == SyntaxKind::ExclamationEqualsToken
+        {
             TypeFlags::NULLABLE
         } else {
             TypeFlags::UNDEFINED
@@ -125,10 +144,14 @@ impl Checker {
         let value_type = self.get_type_of_expression(value);
         // Note that we include any and unknown in the exclusion test because their domain includes null and undefined.
         let remove_nullable = equals_operator != assume_true
-            && self.every_type(value_type, &mut |c: &mut Checker, t: TypeId| c.ty(t).flags.intersects(nullable_flags))
+            && self.every_type(value_type, &mut |c: &mut Checker, t: TypeId| {
+                c.ty(t).flags.intersects(nullable_flags)
+            })
             || equals_operator == assume_true
                 && self.every_type(value_type, &mut |c: &mut Checker, t: TypeId| {
-                    !c.ty(t).flags.intersects(TypeFlags::ANY_OR_UNKNOWN | nullable_flags)
+                    !c.ty(t)
+                        .flags
+                        .intersects(TypeFlags::ANY_OR_UNKNOWN | nullable_flags)
                 });
         if remove_nullable {
             return self.get_adjusted_type_with_facts(t, TypeFacts::NE_UNDEFINED_OR_NULL);
@@ -137,7 +160,11 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1046 getTypeAtSwitchClause
-    pub fn get_type_at_switch_clause(&mut self, f: &Rc<RefCell<FlowState>>, flow: FlowNodeId) -> FlowType {
+    pub fn get_type_at_switch_clause(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow: FlowNodeId,
+    ) -> FlowType {
         let flow_node = flow.get_flow();
         let data = flow_node.as_flow_switch_clause_data();
         let expr = skip_parentheses(data.switch_statement.expression());
@@ -146,21 +173,36 @@ impl Checker {
         let reference = f.borrow().reference;
         if self.is_matching_reference(reference, expr) {
             t = self.narrow_type_by_switch_on_discriminant(t, &data);
-        } else if expr.kind() == SyntaxKind::TypeOfExpression && self.is_matching_reference(reference, expr.expression()) {
+        } else if expr.kind() == SyntaxKind::TypeOfExpression
+            && self.is_matching_reference(reference, expr.expression())
+        {
             t = self.narrow_type_by_switch_on_type_of(t, &data);
         } else if expr.kind() == SyntaxKind::TrueKeyword {
             t = self.narrow_type_by_switch_on_true(f, t, &data);
         } else {
             if self.strict_null_checks {
                 if self.optional_chain_contains_reference(expr, reference) {
-                    t = self.narrow_type_by_switch_optional_chain_containment(t, &data, &mut |c: &mut Checker, t: TypeId| {
-                        !c.ty(t).flags.intersects(TypeFlags::UNDEFINED | TypeFlags::NEVER)
-                    });
-                } else if is_type_of_expression(expr) && self.optional_chain_contains_reference(expr.expression(), reference) {
-                    t = self.narrow_type_by_switch_optional_chain_containment(t, &data, &mut |c: &mut Checker, t: TypeId| {
-                        !(c.ty(t).flags.intersects(TypeFlags::NEVER)
-                            || c.ty(t).flags.intersects(TypeFlags::STRING_LITERAL) && c.get_string_literal_value(t) == "undefined")
-                    });
+                    t = self.narrow_type_by_switch_optional_chain_containment(
+                        t,
+                        &data,
+                        &mut |c: &mut Checker, t: TypeId| {
+                            !c.ty(t)
+                                .flags
+                                .intersects(TypeFlags::UNDEFINED | TypeFlags::NEVER)
+                        },
+                    );
+                } else if is_type_of_expression(expr)
+                    && self.optional_chain_contains_reference(expr.expression(), reference)
+                {
+                    t = self.narrow_type_by_switch_optional_chain_containment(
+                        t,
+                        &data,
+                        &mut |c: &mut Checker, t: TypeId| {
+                            !(c.ty(t).flags.intersects(TypeFlags::NEVER)
+                                || c.ty(t).flags.intersects(TypeFlags::STRING_LITERAL)
+                                    && c.get_string_literal_value(t) == "undefined")
+                        },
+                    );
                 }
             }
             let access = self.get_discriminant_property_access(f, expr, t);
@@ -172,7 +214,11 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1078 narrowTypeBySwitchOnDiscriminant
-    pub fn narrow_type_by_switch_on_discriminant(&mut self, t: TypeId, data: &FlowSwitchClauseData) -> TypeId {
+    pub fn narrow_type_by_switch_on_discriminant(
+        &mut self,
+        t: TypeId,
+        data: &FlowSwitchClauseData,
+    ) -> TypeId {
         // We only narrow if all case expressions specify
         // values with unit types, except for the case where
         // `type` is unknown. In this instance we map object
@@ -181,9 +227,11 @@ impl Checker {
         if switch_types.is_empty() {
             return t;
         }
-        let clause_types: Vec<TypeId> = switch_types[data.clause_start as usize..data.clause_end as usize].to_vec();
+        let clause_types: Vec<TypeId> =
+            switch_types[data.clause_start as usize..data.clause_end as usize].to_vec();
         let never_type = self.never_type;
-        let has_default_clause = data.clause_start == data.clause_end || clause_types.contains(&never_type);
+        let has_default_clause =
+            data.clause_start == data.clause_end || clause_types.contains(&never_type);
         if self.ty(t).flags.intersects(TypeFlags::UNKNOWN) && !has_default_clause {
             let mut ground_clause_types: Option<Vec<TypeId>> = None;
             for (i, &s) in clause_types.iter().enumerate() {
@@ -197,7 +245,10 @@ impl Checker {
                         ground_clause_types = Some(clause_types[..i].to_vec());
                     }
                     let non_primitive_type = self.non_primitive_type;
-                    ground_clause_types.as_mut().unwrap().push(non_primitive_type);
+                    ground_clause_types
+                        .as_mut()
+                        .unwrap()
+                        .push(non_primitive_type);
                 } else {
                     return t;
                 }
@@ -208,11 +259,16 @@ impl Checker {
             };
         }
         let discriminant_type = self.get_union_type(&clause_types);
-        let case_type = if self.ty(discriminant_type).flags.intersects(TypeFlags::NEVER) {
+        let case_type = if self
+            .ty(discriminant_type)
+            .flags
+            .intersects(TypeFlags::NEVER)
+        {
             self.never_type
         } else {
-            let filtered =
-                self.filter_type(t, &mut |c: &mut Checker, t: TypeId| c.are_types_comparable(discriminant_type, t));
+            let filtered = self.filter_type(t, &mut |c: &mut Checker, t: TypeId| {
+                c.are_types_comparable(discriminant_type, t)
+            });
             self.replace_primitives_with_literals(filtered, discriminant_type)
         };
         if !has_default_clause {
@@ -227,7 +283,9 @@ impl Checker {
                 let unit = c.extract_unit_type(t);
                 u = c.get_regular_type_of_literal_type(unit);
             }
-            !switch_types.iter().any(|&st| c.is_unit_type(st) && c.are_types_comparable(st, u))
+            !switch_types
+                .iter()
+                .any(|&st| c.is_unit_type(st) && c.are_types_comparable(st, u))
         });
         if self.ty(case_type).flags.intersects(TypeFlags::NEVER) {
             return default_type;
@@ -236,7 +294,11 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1136 narrowTypeBySwitchOnTypeOf
-    pub fn narrow_type_by_switch_on_type_of(&mut self, t: TypeId, data: &FlowSwitchClauseData) -> TypeId {
+    pub fn narrow_type_by_switch_on_type_of(
+        &mut self,
+        t: TypeId,
+        data: &FlowSwitchClauseData,
+    ) -> TypeId {
         let witnesses = self.get_switch_clause_type_of_witnesses(data.switch_statement);
         // PORT: Go distinguishes a nil witness slice (a non-string case exists) from an
         // empty one (no clauses). `SwitchStatementLinks.witnesses` is a `Vec`, so both
@@ -245,21 +307,32 @@ impl Checker {
         if witnesses.is_empty() {
             return t;
         }
-        let clauses = data.switch_statement.case_block().clauses().nodes().to_vec();
+        let clauses = data
+            .switch_statement
+            .case_block()
+            .clauses()
+            .nodes()
+            .to_vec();
         // Equal start and end denotes implicit fallthrough; undefined marks explicit default clause.
-        let default_index =
-            clauses.iter().position(|clause| clause.kind() == SyntaxKind::DefaultClause).map_or(-1, |i| i as i32);
+        let default_index = clauses
+            .iter()
+            .position(|clause| clause.kind() == SyntaxKind::DefaultClause)
+            .map_or(-1, |i| i as i32);
         let clause_start = data.clause_start;
         let clause_end = data.clause_end;
-        let has_default_clause =
-            clause_start == clause_end || (default_index >= clause_start && default_index < clause_end);
+        let has_default_clause = clause_start == clause_end
+            || (default_index >= clause_start && default_index < clause_end);
         if has_default_clause {
             // In the default clause we filter constituents down to those that are not-equal to all handled cases.
-            let not_equal_facts = self.get_not_equal_facts_from_typeof_switch(clause_start, clause_end, &witnesses);
-            return self.filter_type(t, &mut |c: &mut Checker, t: TypeId| c.get_type_facts(t, not_equal_facts) == not_equal_facts);
+            let not_equal_facts =
+                self.get_not_equal_facts_from_typeof_switch(clause_start, clause_end, &witnesses);
+            return self.filter_type(t, &mut |c: &mut Checker, t: TypeId| {
+                c.get_type_facts(t, not_equal_facts) == not_equal_facts
+            });
         }
         // In the non-default cause we create a union of the type narrowed by each of the listed cases.
-        let clause_witnesses: Vec<String> = witnesses[clause_start as usize..clause_end as usize].to_vec();
+        let clause_witnesses: Vec<String> =
+            witnesses[clause_start as usize..clause_end as usize].to_vec();
         let mut types = Vec::with_capacity(clause_witnesses.len());
         for text in &clause_witnesses {
             if !text.is_empty() {
@@ -278,13 +351,20 @@ impl Checker {
         mut t: TypeId,
         data: &FlowSwitchClauseData,
     ) -> TypeId {
-        let clauses = data.switch_statement.case_block().clauses().nodes().to_vec();
-        let default_index =
-            clauses.iter().position(|clause| clause.kind() == SyntaxKind::DefaultClause).map_or(-1, |i| i as i32);
+        let clauses = data
+            .switch_statement
+            .case_block()
+            .clauses()
+            .nodes()
+            .to_vec();
+        let default_index = clauses
+            .iter()
+            .position(|clause| clause.kind() == SyntaxKind::DefaultClause)
+            .map_or(-1, |i| i as i32);
         let clause_start = data.clause_start;
         let clause_end = data.clause_end;
-        let has_default_clause =
-            clause_start == clause_end || (default_index >= clause_start && default_index < clause_end);
+        let has_default_clause = clause_start == clause_end
+            || (default_index >= clause_start && default_index < clause_end);
         // First, narrow away all of the cases that preceded this set of cases.
         for i in 0..clause_start as usize {
             let clause = clauses[i];
@@ -407,7 +487,10 @@ impl Checker {
             // possible outcome is subtypes that will be removed in the final union type anyway.
             if flow_type.t == declared_type && declared_type == initial_type {
                 self.antecedent_types.truncate(antecedent_start);
-                return FlowType { t: flow_type.t, incomplete: false };
+                return FlowType {
+                    t: flow_type.t,
+                    incomplete: false,
+                };
             }
             if !self.antecedent_types[antecedent_start..].contains(&flow_type.t) {
                 self.antecedent_types.push(flow_type.t);
@@ -429,7 +512,12 @@ impl Checker {
             // the risk of circularities, we only want to perform them when they make a difference.
             if !self.ty(flow_type.t).flags.intersects(TypeFlags::NEVER)
                 && !self.antecedent_types[antecedent_start..].contains(&flow_type.t)
-                && !self.is_exhaustive_switch_statement(bypass_flow.get_flow().as_flow_switch_clause_data().switch_statement)
+                && !self.is_exhaustive_switch_statement(
+                    bypass_flow
+                        .get_flow()
+                        .as_flow_switch_clause_data()
+                        .switch_statement,
+                )
             {
                 let (declared_type, initial_type) = {
                     let fs = f.borrow();
@@ -437,7 +525,10 @@ impl Checker {
                 };
                 if flow_type.t == declared_type && declared_type == initial_type {
                     self.antecedent_types.truncate(antecedent_start);
-                    return FlowType { t: flow_type.t, incomplete: false };
+                    return FlowType {
+                        t: flow_type.t,
+                        incomplete: false,
+                    };
                 }
                 self.antecedent_types.push(flow_type.t);
                 if !self.is_type_subset_of(flow_type.t, initial_type) {
@@ -452,7 +543,11 @@ impl Checker {
         let union_or_evolving = self.get_union_or_evolving_array_type(
             f,
             &types,
-            if subtype_reduction { UnionReduction::SUBTYPE } else { UnionReduction::LITERAL },
+            if subtype_reduction {
+                UnionReduction::SUBTYPE
+            } else {
+                UnionReduction::LITERAL
+            },
         );
         let result = self.new_flow_type(union_or_evolving, seen_incomplete);
         self.antecedent_types.truncate(antecedent_start);
@@ -494,7 +589,11 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1304 getTypeAtFlowLoopLabel
-    pub fn get_type_at_flow_loop_label(&mut self, f: &Rc<RefCell<FlowState>>, flow: FlowNodeId) -> FlowType {
+    pub fn get_type_at_flow_loop_label(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow: FlowNodeId,
+    ) -> FlowType {
         if f.borrow().ref_key.is_zero() {
             let ref_key = self.get_flow_reference_key(f);
             f.borrow_mut().ref_key = ref_key;
@@ -502,14 +601,23 @@ impl Checker {
         let ref_key = f.borrow().ref_key;
         if ref_key == *NON_DOTTED_NAME_CACHE_KEY {
             // No cache key is generated when binding patterns are in unnarrowable situations
-            return FlowType { t: f.borrow().declared_type, incomplete: false };
+            return FlowType {
+                t: f.borrow().declared_type,
+                incomplete: false,
+            };
         }
-        let key = FlowLoopKey { flow_node: flow, ref_key };
+        let key = FlowLoopKey {
+            flow_node: flow,
+            ref_key,
+        };
         // If we have previously computed the control flow type for the reference at
         // this flow loop junction, return the cached type.
         if let Some(&cached) = self.flow_loop_cache.get(&key) {
             if cached.is_some() {
-                return FlowType { t: cached, incomplete: false };
+                return FlowType {
+                    t: cached,
+                    incomplete: false,
+                };
             }
         }
         // If this flow loop junction and reference are already being processed, return
@@ -526,14 +634,18 @@ impl Checker {
             .find(|loop_info| loop_info.key == key && !loop_info.types.is_empty())
             .map(|loop_info| loop_info.types.clone());
         if let Some(loop_types) = in_process {
-            let union = self.get_union_or_evolving_array_type(f, &loop_types, UnionReduction::LITERAL);
+            let union =
+                self.get_union_or_evolving_array_type(f, &loop_types, UnionReduction::LITERAL);
             return self.new_flow_type(union, true /*incomplete*/);
         }
         // Add the flow loop junction and reference to the in-process stack and analyze
         // each antecedent code path.
         let mut antecedent_types: Vec<TypeId> = Vec::with_capacity(4);
         let mut subtype_reduction = false;
-        let mut first_antecedent_type = FlowType { t: TypeId::NIL, incomplete: false };
+        let mut first_antecedent_type = FlowType {
+            t: TypeId::NIL,
+            incomplete: false,
+        };
         let antecedents = flow.get_flow().antecedents.clone();
         for antecedent in antecedents {
             let flow_type;
@@ -541,14 +653,20 @@ impl Checker {
                 // The first antecedent of a loop junction is always the non-looping control
                 // flow path that leads to the top.
                 first_antecedent_type = self.get_type_at_flow_node(f, antecedent);
-                flow_type = FlowType { t: first_antecedent_type.t, incomplete: first_antecedent_type.incomplete };
+                flow_type = FlowType {
+                    t: first_antecedent_type.t,
+                    incomplete: first_antecedent_type.incomplete,
+                };
             } else {
                 // All but the first antecedent are the looping control flow paths that lead
                 // back to the loop junction. We track these on the flow loop stack.
                 // PORT: Go appends a slice header that shares `antecedentTypes`; this
                 // frame does not change `antecedentTypes` while the entry is on the
                 // stack, so a copy is equivalent.
-                self.flow_loop_stack.push(FlowLoopInfo { key, types: antecedent_types.clone() });
+                self.flow_loop_stack.push(FlowLoopInfo {
+                    key,
+                    types: antecedent_types.clone(),
+                });
                 // PORT: Go sets `c.flowTypeCache = nil`; the map field is taken and
                 // restored instead.
                 let save_flow_type_cache = std::mem::take(&mut self.flow_type_cache);
@@ -560,7 +678,10 @@ impl Checker {
                 // the resulting type and bail out.
                 if let Some(&cached) = self.flow_loop_cache.get(&key) {
                     if cached.is_some() {
-                        return FlowType { t: cached, incomplete: false };
+                        return FlowType {
+                            t: cached,
+                            incomplete: false,
+                        };
                     }
                 }
             }
@@ -589,27 +710,46 @@ impl Checker {
         let result = self.get_union_or_evolving_array_type(
             f,
             &antecedent_types,
-            if subtype_reduction { UnionReduction::SUBTYPE } else { UnionReduction::LITERAL },
+            if subtype_reduction {
+                UnionReduction::SUBTYPE
+            } else {
+                UnionReduction::LITERAL
+            },
         );
         if first_antecedent_type.incomplete {
             return self.new_flow_type(result, true /*incomplete*/);
         }
         self.flow_loop_cache.insert(key, result);
-        FlowType { t: result, incomplete: false }
+        FlowType {
+            t: result,
+            incomplete: false,
+        }
     }
 
     // Go: checker/flow.go:1383 getTypeAtFlowArrayMutation
-    pub fn get_type_at_flow_array_mutation(&mut self, f: &Rc<RefCell<FlowState>>, flow: FlowNodeId) -> FlowType {
+    pub fn get_type_at_flow_array_mutation(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow: FlowNodeId,
+    ) -> FlowType {
         let declared_type = f.borrow().declared_type;
         if declared_type == self.auto_type || declared_type == self.auto_array_type {
             let flow_node = flow.get_flow();
             let node = flow_node.node;
-            let expr = if is_call_expression(node) { node.expression().expression() } else { node.left().expression() };
+            let expr = if is_call_expression(node) {
+                node.expression().expression()
+            } else {
+                node.left().expression()
+            };
             let reference = f.borrow().reference;
             let candidate = self.get_reference_candidate(expr);
             if self.is_matching_reference(reference, candidate) {
                 let flow_type = self.get_type_at_flow_node(f, flow_node.antecedent);
-                if self.ty(flow_type.t).object_flags.intersects(ObjectFlags::EVOLVING_ARRAY) {
+                if self
+                    .ty(flow_type.t)
+                    .object_flags
+                    .intersects(ObjectFlags::EVOLVING_ARRAY)
+                {
                     let mut evolved_type = flow_type.t;
                     if is_call_expression(node) {
                         for arg in node.arguments().to_vec() {
@@ -617,9 +757,11 @@ impl Checker {
                         }
                     } else {
                         // We must get the context free expression type so as to not recur in an uncached fashion on the LHS (which causes exponential blowup in compile time)
-                        let index_type = self.get_context_free_type_of_expression(node.left().argument_expression());
+                        let index_type = self
+                            .get_context_free_type_of_expression(node.left().argument_expression());
                         if self.is_type_assignable_to_kind(index_type, TypeFlags::NUMBER_LIKE) {
-                            evolved_type = self.add_evolving_array_element_type(evolved_type, node.right());
+                            evolved_type =
+                                self.add_evolving_array_element_type(evolved_type, node.right());
                         }
                     }
                     return self.new_flow_type(evolved_type, flow_type.incomplete);
@@ -627,7 +769,10 @@ impl Checker {
                 return flow_type;
             }
         }
-        FlowType { t: TypeId::NIL, incomplete: false }
+        FlowType {
+            t: TypeId::NIL,
+            incomplete: false,
+        }
     }
 
     // Go: checker/flow.go:1415 getDiscriminantPropertyAccess
@@ -641,7 +786,9 @@ impl Checker {
         // a discriminant property. In cases where the computed type isn't a subset, e.g because of a preceding type
         // predicate narrowing, we use the actual computed type.
         let declared_type = f.borrow().declared_type;
-        if self.ty(declared_type).flags.intersects(TypeFlags::UNION) || self.ty(computed_type).flags.intersects(TypeFlags::UNION) {
+        if self.ty(declared_type).flags.intersects(TypeFlags::UNION)
+            || self.ty(computed_type).flags.intersects(TypeFlags::UNION)
+        {
             let access = self.get_candidate_discriminant_property_access(f, expr);
             if access.is_some() {
                 let (name, ok) = self.get_accessed_property_name(access);
@@ -662,7 +809,11 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1436 getCandidateDiscriminantPropertyAccess
-    pub fn get_candidate_discriminant_property_access(&mut self, f: &Rc<RefCell<FlowState>>, expr: Node) -> Node {
+    pub fn get_candidate_discriminant_property_access(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        expr: Node,
+    ) -> Node {
         let reference = f.borrow().reference;
         if is_binding_pattern(reference)
             || is_function_expression_or_arrow_function(reference)
@@ -703,7 +854,9 @@ impl Checker {
                 }
                 // Given 'const { kind: x } = obj', allow 'x' as an alias for 'obj.kind'
                 if is_binding_element(declaration) && declaration.initializer().is_nil() {
-                    initializer = get_candidate_variable_declaration_initializer(declaration.parent().parent());
+                    initializer = get_candidate_variable_declaration_initializer(
+                        declaration.parent().parent(),
+                    );
                     if initializer.is_some()
                         && (is_identifier(initializer) || is_access_expression(initializer))
                         && self.is_matching_reference(reference, initializer)
@@ -735,11 +888,16 @@ impl Checker {
     // and never escape the getFlowTypeOfReference function.
     // Go: checker/flow.go:1488 getEvolvingArrayType
     pub fn get_evolving_array_type(&mut self, element_type: TypeId) -> TypeId {
-        let key = CachedTypeKey { kind: CachedTypeKind::EVOLVING_ARRAY_TYPE, type_id: self.ty(element_type).id };
+        let key = CachedTypeKey {
+            kind: CachedTypeKind::EVOLVING_ARRAY_TYPE,
+            type_id: self.ty(element_type).id,
+        };
         let mut result = self.cached_types.get(&key).copied().unwrap_or_default();
         if result.is_nil() {
             result = self.new_object_type(ObjectFlags::EVOLVING_ARRAY, SymbolId::NIL);
-            self.ty_mut(result).as_evolving_array_type_mut().element_type = element_type;
+            self.ty_mut(result)
+                .as_evolving_array_type_mut()
+                .element_type = element_type;
             self.cached_types.insert(key, result);
         }
         result
@@ -747,7 +905,11 @@ impl Checker {
 
     // Go: checker/flow.go:1499 getElementTypeOfEvolvingArrayType
     pub fn get_element_type_of_evolving_array_type(&mut self, t: TypeId) -> TypeId {
-        if self.ty(t).object_flags.intersects(ObjectFlags::EVOLVING_ARRAY) {
+        if self
+            .ty(t)
+            .object_flags
+            .intersects(ObjectFlags::EVOLVING_ARRAY)
+        {
             return self.ty(t).as_evolving_array_type().element_type;
         }
         self.never_type
@@ -759,7 +921,11 @@ impl Checker {
         let mut has_evolving_array_type = false;
         for &t in types {
             if !self.ty(t).flags.intersects(TypeFlags::NEVER) {
-                if !self.ty(t).object_flags.intersects(ObjectFlags::EVOLVING_ARRAY) {
+                if !self
+                    .ty(t)
+                    .object_flags
+                    .intersects(ObjectFlags::EVOLVING_ARRAY)
+                {
                     return false;
                 }
                 has_evolving_array_type = true;
@@ -796,11 +962,18 @@ impl Checker {
     // we defer subtype reduction until the evolving array type is finalized into a manifest
     // array type.
     // Go: checker/flow.go:1536 addEvolvingArrayElementType
-    pub fn add_evolving_array_element_type(&mut self, evolving_array_type: TypeId, node: Node) -> TypeId {
+    pub fn add_evolving_array_element_type(
+        &mut self,
+        evolving_array_type: TypeId,
+        node: Node,
+    ) -> TypeId {
         let context_free = self.get_context_free_type_of_expression(node);
         let base = self.get_base_type_of_literal_type(context_free);
         let new_element_type = self.get_regular_type_of_object_literal(base);
-        let element_type = self.ty(evolving_array_type).as_evolving_array_type().element_type;
+        let element_type = self
+            .ty(evolving_array_type)
+            .as_evolving_array_type()
+            .element_type;
         if self.is_type_subset_of(new_element_type, element_type) {
             return evolving_array_type;
         }
@@ -810,7 +983,11 @@ impl Checker {
 
     // Go: checker/flow.go:1545 finalizeEvolvingArrayType
     pub fn finalize_evolving_array_type(&mut self, t: TypeId) -> TypeId {
-        if self.ty(t).object_flags.intersects(ObjectFlags::EVOLVING_ARRAY) {
+        if self
+            .ty(t)
+            .object_flags
+            .intersects(ObjectFlags::EVOLVING_ARRAY)
+        {
             return self.get_final_array_type(t);
         }
         t
@@ -819,7 +996,12 @@ impl Checker {
     // Go: checker/flow.go:1552 getFinalArrayType
     // PORT: Go takes `*EvolvingArrayType`; this takes the evolving array `TypeId`.
     pub fn get_final_array_type(&mut self, t: TypeId) -> TypeId {
-        if self.ty(t).as_evolving_array_type().final_array_type.is_nil() {
+        if self
+            .ty(t)
+            .as_evolving_array_type()
+            .final_array_type
+            .is_nil()
+        {
             let element_type = self.ty(t).as_evolving_array_type().element_type;
             let final_array_type = self.create_final_array_type(element_type);
             self.ty_mut(t).as_evolving_array_type_mut().final_array_type = final_array_type;
@@ -861,7 +1043,8 @@ impl Checker {
                 return self.is_matching_reference(source, target.expression());
             }
             SyntaxKind::BinaryExpression => {
-                return is_assignment_expression(target, false) && self.is_matching_reference(source, target.left())
+                return is_assignment_expression(target, false)
+                    && self.is_matching_reference(source, target.left())
                     || is_binary_expression(target)
                         && target.operator_token().kind() == SyntaxKind::CommaToken
                         && self.is_matching_reference(source, target.right());
@@ -886,7 +1069,8 @@ impl Checker {
                 }
                 if is_variable_declaration(target) || is_binding_element(target) {
                     let resolved = self.get_resolved_symbol(source);
-                    let export_symbol = self.get_export_symbol_of_value_symbol_if_exported(resolved);
+                    let export_symbol =
+                        self.get_export_symbol_of_value_symbol_if_exported(resolved);
                     return export_symbol == self.get_symbol_of_declaration(target);
                 }
                 return false;
@@ -897,7 +1081,9 @@ impl Checker {
             SyntaxKind::SuperKeyword => {
                 return target.kind() == SyntaxKind::SuperKeyword;
             }
-            SyntaxKind::NonNullExpression | SyntaxKind::ParenthesizedExpression | SyntaxKind::SatisfiesExpression => {
+            SyntaxKind::NonNullExpression
+            | SyntaxKind::ParenthesizedExpression
+            | SyntaxKind::SatisfiesExpression => {
                 return self.is_matching_reference(source.expression(), target);
             }
             SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression => {
@@ -907,7 +1093,10 @@ impl Checker {
                         let (target_property_name, ok) = self.get_accessed_property_name(target);
                         if ok {
                             return target_property_name == source_property_name
-                                && self.is_matching_reference(source.expression(), target.expression());
+                                && self.is_matching_reference(
+                                    source.expression(),
+                                    target.expression(),
+                                );
                         }
                     }
                 }
@@ -918,9 +1107,11 @@ impl Checker {
                         let symbol = self.get_resolved_symbol(source_arg);
                         if symbol == self.get_resolved_symbol(target_arg)
                             && (self.is_constant_variable(symbol)
-                                || self.is_parameter_or_mutable_local_variable(symbol) && !self.is_symbol_assigned(symbol))
+                                || self.is_parameter_or_mutable_local_variable(symbol)
+                                    && !self.is_symbol_assigned(symbol))
                         {
-                            return self.is_matching_reference(source.expression(), target.expression());
+                            return self
+                                .is_matching_reference(source.expression(), target.expression());
                         }
                     }
                 }
@@ -963,10 +1154,21 @@ impl Checker {
     pub fn get_flow_reference_key(&mut self, f: &Rc<RefCell<FlowState>>) -> CacheHashKey {
         let (reference, declared_type, initial_type, flow_container) = {
             let fs = f.borrow();
-            (fs.reference, fs.declared_type, fs.initial_type, fs.flow_container)
+            (
+                fs.reference,
+                fs.declared_type,
+                fs.initial_type,
+                fs.flow_container,
+            )
         };
         let mut b = KeyBuilder::default();
-        if self.write_flow_cache_key(&mut b, reference, declared_type, initial_type, flow_container) {
+        if self.write_flow_cache_key(
+            &mut b,
+            reference,
+            declared_type,
+            initial_type,
+            flow_container,
+        ) {
             return b.hash();
         }
         *NON_DOTTED_NAME_CACHE_KEY // Reference isn't a dotted name
@@ -1004,10 +1206,22 @@ impl Checker {
                 return true;
             }
             SyntaxKind::NonNullExpression | SyntaxKind::ParenthesizedExpression => {
-                return self.write_flow_cache_key(b, node.expression(), declared_type, initial_type, flow_container);
+                return self.write_flow_cache_key(
+                    b,
+                    node.expression(),
+                    declared_type,
+                    initial_type,
+                    flow_container,
+                );
             }
             SyntaxKind::QualifiedName => {
-                if !self.write_flow_cache_key(b, node.left(), declared_type, initial_type, flow_container) {
+                if !self.write_flow_cache_key(
+                    b,
+                    node.left(),
+                    declared_type,
+                    initial_type,
+                    flow_container,
+                ) {
                     return false;
                 }
                 b.write_byte(b'.');
@@ -1017,7 +1231,13 @@ impl Checker {
             SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression => {
                 let (prop_name, ok) = self.get_accessed_property_name(node);
                 if ok {
-                    if !self.write_flow_cache_key(b, node.expression(), declared_type, initial_type, flow_container) {
+                    if !self.write_flow_cache_key(
+                        b,
+                        node.expression(),
+                        declared_type,
+                        initial_type,
+                        flow_container,
+                    ) {
                         return false;
                     }
                     b.write_byte(b'.');
@@ -1027,9 +1247,16 @@ impl Checker {
                 if is_element_access_expression(node) && is_identifier(node.argument_expression()) {
                     let symbol = self.get_resolved_symbol(node.argument_expression());
                     if self.is_constant_variable(symbol)
-                        || self.is_parameter_or_mutable_local_variable(symbol) && !self.is_symbol_assigned(symbol)
+                        || self.is_parameter_or_mutable_local_variable(symbol)
+                            && !self.is_symbol_assigned(symbol)
                     {
-                        if !self.write_flow_cache_key(b, node.expression(), declared_type, initial_type, flow_container) {
+                        if !self.write_flow_cache_key(
+                            b,
+                            node.expression(),
+                            declared_type,
+                            initial_type,
+                            flow_container,
+                        ) {
                             return false;
                         }
                         b.write_string(".@");
@@ -1066,7 +1293,13 @@ impl Checker {
             return self.get_destructuring_property_name(access);
         }
         if is_parameter_declaration(access) {
-            let index = access.parent().parameters().to_vec().iter().position(|&p| p == access).map_or(-1, |i| i as i32);
+            let index = access
+                .parent()
+                .parameters()
+                .to_vec()
+                .iter()
+                .position(|&p| p == access)
+                .map_or(-1, |i| i as i32);
             return (index.to_string(), true);
         }
         (String::new(), false)
@@ -1087,9 +1320,16 @@ impl Checker {
 
     // Go: checker/flow.go:1732 tryGetNameFromEntityNameExpression
     pub fn try_get_name_from_entity_name_expression(&mut self, node: Node) -> (String, bool) {
-        let symbol = self.resolve_entity_name(node, SymbolFlags::VALUE, true /*ignoreErrors*/, false, Node::NIL);
+        let symbol = self.resolve_entity_name(
+            node,
+            SymbolFlags::VALUE,
+            true, /*ignoreErrors*/
+            false,
+            Node::NIL,
+        );
         if symbol.is_nil()
-            || !(self.is_constant_variable(symbol) || self.sym(symbol).flags.intersects(SymbolFlags::ENUM_MEMBER))
+            || !(self.is_constant_variable(symbol)
+                || self.sym(symbol).flags.intersects(SymbolFlags::ENUM_MEMBER))
         {
             return (String::new(), false);
         }
@@ -1136,7 +1376,12 @@ pub fn try_get_name_from_type(c: &Checker, t: TypeId) -> (String, bool) {
     }
     if flags.intersects(TypeFlags::STRING_OR_NUMBER_LITERAL) {
         // PORT: Go passes the `any` value; a nil value panics in `AnyToString`.
-        let value = c.ty(t).as_literal_type().value.as_ref().expect("Unhandled case in AnyToString");
+        let value = c
+            .ty(t)
+            .as_literal_type()
+            .value
+            .as_ref()
+            .expect("Unhandled case in AnyToString");
         return (any_to_string(value), true);
     }
     (String::new(), false)
@@ -1153,7 +1398,12 @@ impl Checker {
             return self.get_literal_property_name_text(node.name());
         }
         if is_array_literal_expression(parent) || is_array_binding_pattern(parent) {
-            let index = parent.elements().to_vec().iter().position(|&e| e == node).map_or(-1, |i| i as i32);
+            let index = parent
+                .elements()
+                .to_vec()
+                .iter()
+                .position(|&e| e == node)
+                .map_or(-1, |i| i as i32);
             return (index.to_string(), true);
         }
         (String::new(), false)
@@ -1162,8 +1412,17 @@ impl Checker {
     // Go: checker/flow.go:1785 getLiteralPropertyNameText
     pub fn get_literal_property_name_text(&mut self, name: Node) -> (String, bool) {
         let t = self.get_literal_type_from_property_name(name);
-        if self.ty(t).flags.intersects(TypeFlags::STRING_LITERAL | TypeFlags::NUMBER_LITERAL) {
-            let value = self.ty(t).as_literal_type().value.as_ref().expect("Unhandled case in AnyToString");
+        if self
+            .ty(t)
+            .flags
+            .intersects(TypeFlags::STRING_LITERAL | TypeFlags::NUMBER_LITERAL)
+        {
+            let value = self
+                .ty(t)
+                .as_literal_type()
+                .value
+                .as_ref()
+                .expect("Unhandled case in AnyToString");
             return (any_to_string(value), true);
         }
         (String::new(), false)
@@ -1179,7 +1438,8 @@ impl Checker {
                 if !is_this_in_type_query(node) {
                     let symbol = self.get_resolved_symbol(node);
                     return self.is_constant_variable(symbol)
-                        || self.is_parameter_or_mutable_local_variable(symbol) && !self.is_symbol_assigned(symbol)
+                        || self.is_parameter_or_mutable_local_variable(symbol)
+                            && !self.is_symbol_assigned(symbol)
                         || {
                             let value_declaration = self.sym(symbol).value_declaration;
                             value_declaration.is_some() && is_function_expression(value_declaration)
@@ -1198,11 +1458,13 @@ impl Checker {
             SyntaxKind::ObjectBindingPattern | SyntaxKind::ArrayBindingPattern => {
                 let root_declaration = get_root_declaration(node.parent());
                 if is_parameter_declaration(root_declaration)
-                    || is_variable_declaration(root_declaration) && is_catch_clause(root_declaration.parent())
+                    || is_variable_declaration(root_declaration)
+                        && is_catch_clause(root_declaration.parent())
                 {
                     return !self.is_some_symbol_assigned(root_declaration);
                 }
-                return is_variable_declaration(root_declaration) && self.is_var_const_like(root_declaration);
+                return is_variable_declaration(root_declaration)
+                    && self.is_var_const_like(root_declaration);
             }
             _ => {}
         }

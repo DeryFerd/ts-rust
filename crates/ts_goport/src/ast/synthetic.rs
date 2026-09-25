@@ -103,7 +103,10 @@ struct SyntheticArena {
 
 impl SyntheticArena {
     fn new() -> Self {
-        Self { slots: vec![Slot::Nil], aliases: FxHashMap::default() }
+        Self {
+            slots: vec![Slot::Nil],
+            aliases: FxHashMap::default(),
+        }
     }
 }
 
@@ -159,7 +162,11 @@ fn with_node<R>(n: Node, f: impl FnOnce(&SyntheticNode) -> R) -> R {
 
 /// Writes the node slot of a synthetic handle. Panics on a parsed node.
 fn with_node_mut<R>(n: Node, f: impl FnOnce(&mut SyntheticNode) -> R) -> R {
-    assert!(is_synthetic_node(n), "cannot mutate a parsed node (kind {:?})", n.kind());
+    assert!(
+        is_synthetic_node(n),
+        "cannot mutate a parsed node (kind {:?})",
+        n.kind()
+    );
     ARENA.with(|a| match &mut a.borrow_mut().slots[slot_index(n)] {
         Slot::Node(s) => f(s),
         _ => panic!("synthetic handle does not name a node slot"),
@@ -272,7 +279,10 @@ pub fn replace_node_data(n: Node, data: NodeData) {
     }
     with_node_mut(n, |s| {
         let kind = s.node.kind;
-        debug_assert!(data.matches_syntax_kind(kind), "{kind:?} does not fit its NodeData");
+        debug_assert!(
+            data.matches_syntax_kind(kind),
+            "{kind:?} does not fit its NodeData"
+        );
         s.node = Box::leak(Box::new(ts_ast::Node {
             kind,
             flags: ts_ast::NodeFlags(0),
@@ -291,7 +301,11 @@ pub fn replace_node_data(n: Node, data: NodeData) {
 pub fn set_node_kind(n: Node, kind: SyntaxKind) {
     with_node_mut(n, |s| {
         let data = s.node.data.clone();
-        assert!(data.matches_syntax_kind(kind), "{kind:?} does not fit the data of {:?}", s.node.kind);
+        assert!(
+            data.matches_syntax_kind(kind),
+            "{kind:?} does not fit the data of {:?}",
+            s.node.kind
+        );
         s.node = Box::leak(Box::new(ts_ast::Node {
             kind,
             flags: ts_ast::NodeFlags(0),
@@ -386,7 +400,10 @@ pub fn set_node_locals(n: Node, locals: SymbolTable) {
 /// Go `newNode(kind, data, hooks)`: a new factory node with
 /// `Loc = UndefinedTextRange()`, nil parent, no flags and no binder data.
 pub fn alloc_synthetic_node(kind: SyntaxKind, data: NodeData) -> Node {
-    debug_assert!(data.matches_syntax_kind(kind), "{kind:?} does not fit its NodeData");
+    debug_assert!(
+        data.matches_syntax_kind(kind),
+        "{kind:?} does not fit its NodeData"
+    );
     let node: &'static ts_ast::Node = Box::leak(Box::new(ts_ast::Node {
         kind,
         flags: ts_ast::NodeFlags(0),
@@ -433,14 +450,25 @@ pub fn is_synthetic_source_file(n: Node) -> bool {
 
 /// Reads the Go `ast.SourceFile` fields of a factory SourceFile.
 pub fn with_synthetic_source_file<R>(n: Node, f: impl FnOnce(&SyntheticSourceFileData) -> R) -> R {
-    with_node(n, |s| f(s.source_file.as_deref().expect("node is not a factory SourceFile")))
+    with_node(n, |s| {
+        f(s.source_file
+            .as_deref()
+            .expect("node is not a factory SourceFile"))
+    })
 }
 
 /// Go writes to the fields of a factory SourceFile
 /// (`file.AsSourceFile().IsDeclarationFile = true`, ...). Panics on a
 /// parsed SourceFile (see the module comment).
-pub fn update_synthetic_source_file<R>(n: Node, f: impl FnOnce(&mut SyntheticSourceFileData) -> R) -> R {
-    with_node_mut(n, |s| f(s.source_file.as_deref_mut().expect("node is not a factory SourceFile")))
+pub fn update_synthetic_source_file<R>(
+    n: Node,
+    f: impl FnOnce(&mut SyntheticSourceFileData) -> R,
+) -> R {
+    with_node_mut(n, |s| {
+        f(s.source_file
+            .as_deref_mut()
+            .expect("node is not a factory SourceFile"))
+    })
 }
 
 /// Go `file.Text()` of a factory SourceFile.
@@ -537,7 +565,11 @@ pub fn synthetic_child_id(n: Node) -> ts_ast::NodeId {
 /// Like `synthetic_child_id`, for ts_ast fields that are `Option<NodeId>`.
 #[must_use]
 pub fn synthetic_opt_child_id(n: Node) -> Option<ts_ast::NodeId> {
-    if n.is_nil() { None } else { Some(synthetic_child_id(n)) }
+    if n.is_nil() {
+        None
+    } else {
+        Some(synthetic_child_id(n))
+    }
 }
 
 /// Go `core.UndefinedTextRange()` in ts_ast form. `TextPos` is `u32`; the
@@ -548,7 +580,10 @@ fn undefined_ts_range() -> ts_core::TextRange {
 
 /// A Go `core.TextRange` in ts_ast form (`-1` is stored as `u32::MAX`).
 fn ts_range(loc: TextRange) -> ts_core::TextRange {
-    ts_core::TextRange { start: ts_core::TextPos::new(loc.pos() as u32), end: ts_core::TextPos::new(loc.end() as u32) }
+    ts_core::TextRange {
+        start: ts_core::TextPos::new(loc.pos() as u32),
+        end: ts_core::TextPos::new(loc.end() as u32),
+    }
 }
 
 /// The ts_ast list for a synthetic node's list field.
@@ -566,7 +601,10 @@ fn ts_list(nodes: &[Node], loc: TextRange, has_trailing_comma: bool) -> ts_ast::
 #[must_use]
 pub fn new_synthetic_node_list(nodes: &[Node], loc: TextRange) -> NodeList {
     let list: &'static ts_ast::NodeList = Box::leak(Box::new(ts_list(nodes, loc, false)));
-    NodeList { file: SYNTHETIC_NODE_FILE as u32, list: Some(list) }
+    NodeList {
+        file: SYNTHETIC_NODE_FILE as u32,
+        list: Some(list),
+    }
 }
 
 /// Go `f.NewModifierList(nodes)` with a given `Loc`. `modifier_flags()` in
@@ -577,7 +615,10 @@ pub fn new_synthetic_modifier_list(nodes: &[Node], loc: TextRange) -> ModifierLi
         list: ts_list(nodes, loc, false),
         flags: ts_ast::ModifierFlags(modifiers_to_flags(nodes).0 as u32),
     }));
-    ModifierList { file: SYNTHETIC_NODE_FILE as u32, list: Some(list) }
+    ModifierList {
+        file: SYNTHETIC_NODE_FILE as u32,
+        list: Some(list),
+    }
 }
 
 /// A list value to store inside new synthetic `NodeData`. Go stores the

@@ -53,7 +53,8 @@ impl Checker {
                 }
                 if access_expression.is_some() {
                     let object_symbol = self.ty(object_type).symbol;
-                    let is_self_type_access = self.is_self_type_access(access_expression.expression(), object_symbol);
+                    let is_self_type_access =
+                        self.is_self_type_access(access_expression.expression(), object_symbol);
                     self.mark_property_as_referenced(prop, access_expression, is_self_type_access);
                     if self.is_assignment_to_readonly_entity(
                         access_expression,
@@ -94,20 +95,27 @@ impl Checker {
                     return prop_type;
                 }
             }
-            if self.every_type(object_type, &mut |c: &mut Checker, t: TypeId| c.is_tuple_type(t))
-                && is_numeric_literal_name(&prop_name)
+            if self.every_type(object_type, &mut |c: &mut Checker, t: TypeId| {
+                c.is_tuple_type(t)
+            }) && is_numeric_literal_name(&prop_name)
             {
                 let index = Number::from_string(&prop_name);
                 if access_node.is_some()
                     && self.every_type(object_type, &mut |c: &mut Checker, t: TypeId| {
-                        !c.target_tuple_type(t).combined_flags.intersects(ElementFlags::VARIABLE)
+                        !c.target_tuple_type(t)
+                            .combined_flags
+                            .intersects(ElementFlags::VARIABLE)
                     })
                     && !access_flags.intersects(AccessFlags::ALLOW_MISSING)
                 {
                     let index_node = get_index_node_for_access_expression(access_node);
                     if self.is_tuple_type(object_type) {
                         if index < Number(0.0) {
-                            self.error(index_node, diag::A_tuple_type_cannot_be_indexed_with_a_negative_value, args![]);
+                            self.error(
+                                index_node,
+                                diag::A_tuple_type_cannot_be_indexed_with_a_negative_value,
+                                args![],
+                            );
                             return self.undefined_type;
                         }
                         let type_string = self.type_to_string_exported(object_type);
@@ -119,19 +127,32 @@ impl Checker {
                         );
                     } else {
                         let type_string = self.type_to_string_exported(object_type);
-                        self.error(index_node, diag::Property_0_does_not_exist_on_type_1, args![prop_name, type_string]);
+                        self.error(
+                            index_node,
+                            diag::Property_0_does_not_exist_on_type_1,
+                            args![prop_name, type_string],
+                        );
                     }
                 }
                 if index >= Number(0.0) {
                     let number_type = self.number_type;
                     let index_info = self.get_index_info_of_type(object_type, number_type);
-                    self.error_if_writing_to_readonly_index(index_info, object_type, access_expression);
-                    let undefined_like_type = if access_flags.intersects(AccessFlags::INCLUDE_UNDEFINED) {
-                        self.missing_type
-                    } else {
-                        TypeId::NIL
-                    };
-                    return self.get_tuple_element_type_out_of_start_count(object_type, index, undefined_like_type);
+                    self.error_if_writing_to_readonly_index(
+                        index_info,
+                        object_type,
+                        access_expression,
+                    );
+                    let undefined_like_type =
+                        if access_flags.intersects(AccessFlags::INCLUDE_UNDEFINED) {
+                            self.missing_type
+                        } else {
+                            TypeId::NIL
+                        };
+                    return self.get_tuple_element_type_out_of_start_count(
+                        object_type,
+                        index,
+                        undefined_like_type,
+                    );
                 }
             }
         }
@@ -141,7 +162,11 @@ impl Checker {
                 TypeFlags::STRING_LIKE | TypeFlags::NUMBER_LIKE | TypeFlags::ES_SYMBOL_LIKE,
             )
         {
-            if self.ty(object_type).flags.intersects(TypeFlags::ANY | TypeFlags::NEVER) {
+            if self
+                .ty(object_type)
+                .flags
+                .intersects(TypeFlags::ANY | TypeFlags::NEVER)
+            {
                 return object_type;
             }
             // If no index signature is applicable, we default to the string index signature. In effect, this means the string
@@ -154,7 +179,9 @@ impl Checker {
             if index_info.is_some() {
                 let info_key_type = self.index_info(index_info).key_type;
                 let info_value_type = self.index_info(index_info).value_type;
-                if access_flags.intersects(AccessFlags::NO_INDEX_SIGNATURES) && info_key_type != self.number_type {
+                if access_flags.intersects(AccessFlags::NO_INDEX_SIGNATURES)
+                    && info_key_type != self.number_type
+                {
                     if access_expression.is_some() {
                         if access_flags.intersects(AccessFlags::WRITING) {
                             let type_string = self.type_to_string_exported(original_object_type);
@@ -177,11 +204,18 @@ impl Checker {
                 }
                 if access_node.is_some()
                     && info_key_type == self.string_type
-                    && !self.is_type_assignable_to_kind(index_type, TypeFlags::STRING | TypeFlags::NUMBER)
+                    && !self.is_type_assignable_to_kind(
+                        index_type,
+                        TypeFlags::STRING | TypeFlags::NUMBER,
+                    )
                 {
                     let index_node = get_index_node_for_access_expression(access_node);
                     let index_string = self.type_to_string_exported(index_type);
-                    self.error(index_node, diag::Type_0_cannot_be_used_as_an_index_type, args![index_string]);
+                    self.error(
+                        index_node,
+                        diag::Type_0_cannot_be_used_as_an_index_type,
+                        args![index_string],
+                    );
                     if access_flags.intersects(AccessFlags::INCLUDE_UNDEFINED) {
                         let missing_type = self.missing_type;
                         return self.get_union_type(&[info_value_type, missing_type]);
@@ -197,9 +231,15 @@ impl Checker {
                     let object_symbol = self.ty(object_type).symbol;
                     let index_symbol = self.ty(index_type).symbol;
                     let is_own_enum_access = object_symbol.is_some()
-                        && self.sym(object_symbol).flags.intersects(SymbolFlags::REGULAR_ENUM | SymbolFlags::CONST_ENUM)
+                        && self
+                            .sym(object_symbol)
+                            .flags
+                            .intersects(SymbolFlags::REGULAR_ENUM | SymbolFlags::CONST_ENUM)
                         && (index_symbol.is_some()
-                            && self.ty(index_type).flags.intersects(TypeFlags::ENUM_LITERAL)
+                            && self
+                                .ty(index_type)
+                                .flags
+                                .intersects(TypeFlags::ENUM_LITERAL)
                             && self.get_parent_of_symbol(index_symbol) == object_symbol);
                     if !is_own_enum_access {
                         let missing_type = self.missing_type;
@@ -218,7 +258,8 @@ impl Checker {
                 if self.is_object_literal_type(object_type) {
                     let index_flags = self.ty(index_type).flags;
                     if self.no_implicit_any
-                        && index_flags.intersects(TypeFlags::STRING_LITERAL | TypeFlags::NUMBER_LITERAL)
+                        && index_flags
+                            .intersects(TypeFlags::STRING_LITERAL | TypeFlags::NUMBER_LITERAL)
                     {
                         let value_string = self.ty(index_type).as_literal_type().string();
                         let type_string = self.type_to_string_exported(object_type);
@@ -229,7 +270,8 @@ impl Checker {
                         ));
                         return self.undefined_type;
                     } else if index_flags.intersects(TypeFlags::NUMBER | TypeFlags::STRING) {
-                        let properties = self.ty(object_type).as_structured_type().properties.clone();
+                        let properties =
+                            self.ty(object_type).as_structured_type().properties.clone();
                         let mut types: Vec<TypeId> = Vec::with_capacity(properties.len() + 1);
                         for prop in properties {
                             types.push(self.get_type_of_symbol(prop));
@@ -239,21 +281,30 @@ impl Checker {
                     }
                 }
                 let global_this_symbol = self.global_this_symbol;
-                let is_block_scoped_global_this_property = self.ty(object_type).symbol == global_this_symbol
-                    && has_prop_name
-                    && {
+                let is_block_scoped_global_this_property =
+                    self.ty(object_type).symbol == global_this_symbol && has_prop_name && {
                         let exports = self.sym(global_this_symbol).exports;
                         let export = self.symbols.get(exports, &prop_name);
-                        export.is_some() && self.sym(export).flags.intersects(SymbolFlags::BLOCK_SCOPED)
+                        export.is_some()
+                            && self.sym(export).flags.intersects(SymbolFlags::BLOCK_SCOPED)
                     };
                 if is_block_scoped_global_this_property {
                     let type_string = self.type_to_string_exported(object_type);
-                    self.error(access_expression, diag::Property_0_does_not_exist_on_type_1, args![prop_name, type_string]);
-                } else if self.no_implicit_any && !access_flags.intersects(AccessFlags::SUPPRESS_NO_IMPLICIT_ANY_ERROR) {
+                    self.error(
+                        access_expression,
+                        diag::Property_0_does_not_exist_on_type_1,
+                        args![prop_name, type_string],
+                    );
+                } else if self.no_implicit_any
+                    && !access_flags.intersects(AccessFlags::SUPPRESS_NO_IMPLICIT_ANY_ERROR)
+                {
                     if has_prop_name && self.type_has_static_property(&prop_name, object_type) {
                         let type_name = self.type_to_string_exported(object_type);
-                        let suggestion =
-                            format!("{}[{}]", type_name, get_text_of_node(access_expression.argument_expression()));
+                        let suggestion = format!(
+                            "{}[{}]",
+                            type_name,
+                            get_text_of_node(access_expression.argument_expression())
+                        );
                         self.error(
                             access_expression,
                             diag::Property_0_does_not_exist_on_type_1_Did_you_mean_to_access_the_static_member_2_instead,
@@ -261,7 +312,8 @@ impl Checker {
                         );
                     } else if {
                         let number_type = self.number_type;
-                        self.get_index_type_of_type(object_type, number_type).is_some()
+                        self.get_index_type_of_type(object_type, number_type)
+                            .is_some()
                     } {
                         self.error(
                             access_expression.argument_expression(),
@@ -271,7 +323,8 @@ impl Checker {
                     } else {
                         let mut suggestion = String::new();
                         if has_prop_name {
-                            suggestion = self.get_suggestion_for_nonexistent_property(&prop_name, object_type);
+                            suggestion = self
+                                .get_suggestion_for_nonexistent_property(&prop_name, object_type);
                         }
                         if !suggestion.is_empty() {
                             let type_string = self.type_to_string_exported(object_type);
@@ -281,8 +334,11 @@ impl Checker {
                                 args![prop_name /* as string */, type_string, suggestion],
                             );
                         } else {
-                            suggestion =
-                                self.get_suggestion_for_nonexistent_index_signature(object_type, access_expression, index_type);
+                            suggestion = self.get_suggestion_for_nonexistent_index_signature(
+                                object_type,
+                                access_expression,
+                                index_type,
+                            );
                             if !suggestion.is_empty() {
                                 let type_string = self.type_to_string_exported(object_type);
                                 self.error(
@@ -303,7 +359,8 @@ impl Checker {
                                     ));
                                 } else if index_flags.intersects(TypeFlags::UNIQUE_ES_SYMBOL) {
                                     let index_symbol = self.ty(index_type).symbol;
-                                    let symbol_name = self.get_fully_qualified_name(index_symbol, access_expression);
+                                    let symbol_name = self
+                                        .get_fully_qualified_name(index_symbol, access_expression);
                                     let type_string = self.type_to_string_exported(object_type);
                                     diagnostic = Some(new_diagnostic_for_node(
                                         access_expression,
@@ -311,7 +368,8 @@ impl Checker {
                                         args![format!("[{}]", symbol_name), type_string],
                                     ));
                                 } else if index_flags.intersects(TypeFlags::STRING_LITERAL) {
-                                    let value_string = self.ty(index_type).as_literal_type().string();
+                                    let value_string =
+                                        self.ty(index_type).as_literal_type().string();
                                     let type_string = self.type_to_string_exported(object_type);
                                     diagnostic = Some(new_diagnostic_for_node(
                                         access_expression,
@@ -319,14 +377,17 @@ impl Checker {
                                         args![value_string, type_string],
                                     ));
                                 } else if index_flags.intersects(TypeFlags::NUMBER_LITERAL) {
-                                    let value_string = self.ty(index_type).as_literal_type().string();
+                                    let value_string =
+                                        self.ty(index_type).as_literal_type().string();
                                     let type_string = self.type_to_string_exported(object_type);
                                     diagnostic = Some(new_diagnostic_for_node(
                                         access_expression,
                                         diag::Property_0_does_not_exist_on_type_1,
                                         args![value_string, type_string],
                                     ));
-                                } else if index_flags.intersects(TypeFlags::NUMBER | TypeFlags::STRING) {
+                                } else if index_flags
+                                    .intersects(TypeFlags::NUMBER | TypeFlags::STRING)
+                                {
                                     let index_string = self.type_to_string_exported(index_type);
                                     let type_string = self.type_to_string_exported(object_type);
                                     diagnostic = Some(new_diagnostic_for_node(
@@ -335,7 +396,8 @@ impl Checker {
                                         args![index_string, type_string],
                                     ));
                                 }
-                                let full_index_string = self.type_to_string_exported(full_index_type);
+                                let full_index_string =
+                                    self.type_to_string_exported(full_index_type);
                                 let type_string = self.type_to_string_exported(object_type);
                                 self.add_diagnostic(new_diagnostic_chain_for_node(
                                     diagnostic,
@@ -350,7 +412,9 @@ impl Checker {
                 return TypeId::NIL;
             }
         }
-        if access_flags.intersects(AccessFlags::ALLOW_MISSING) && self.is_object_literal_type(object_type) {
+        if access_flags.intersects(AccessFlags::ALLOW_MISSING)
+            && self.is_object_literal_type(object_type)
+        {
             return self.undefined_type;
         }
         if self.is_js_literal_type(object_type) {
@@ -364,7 +428,11 @@ impl Checker {
             {
                 let value_string = self.ty(index_type).as_literal_type().string();
                 let type_string = self.type_to_string_exported(object_type);
-                self.error(index_node, diag::Property_0_does_not_exist_on_type_1, args![value_string, type_string]);
+                self.error(
+                    index_node,
+                    diag::Property_0_does_not_exist_on_type_1,
+                    args![value_string, type_string],
+                );
             } else if index_flags.intersects(TypeFlags::STRING | TypeFlags::NUMBER) {
                 let type_string = self.type_to_string_exported(object_type);
                 let index_string = self.type_to_string_exported(index_type);
@@ -379,7 +447,11 @@ impl Checker {
                 } else {
                     self.type_to_string_exported(index_type)
                 };
-                self.error(index_node, diag::Type_0_cannot_be_used_as_an_index_type, args![type_string]);
+                self.error(
+                    index_node,
+                    diag::Type_0_cannot_be_used_as_an_index_type,
+                    args![type_string],
+                );
             }
         }
         if self.is_type_any(index_type) {
@@ -402,7 +474,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:27083 getSuggestionForNonexistentProperty
-    pub fn get_suggestion_for_nonexistent_property(&mut self, name: &str, containing_type: TypeId) -> String {
+    pub fn get_suggestion_for_nonexistent_property(
+        &mut self,
+        name: &str,
+        containing_type: TypeId,
+    ) -> String {
         let properties = self.get_properties_of_type(containing_type);
         let symbol = self.get_spelling_suggestion_for_name(name, &properties, SymbolFlags::VALUE);
         if symbol.is_some() {
@@ -431,7 +507,11 @@ impl Checker {
             }
             false
         };
-        let suggested_method = if is_assignment_target(expr) { "set" } else { "get" };
+        let suggested_method = if is_assignment_target(expr) {
+            "set"
+        } else {
+            "get"
+        };
         if !has_prop(self, suggested_method) {
             return String::new();
         }
@@ -443,7 +523,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:27112 getSuggestedTypeForNonexistentStringLiteralType
-    pub fn get_suggested_type_for_nonexistent_string_literal_type(&mut self, source: TypeId, target: TypeId) -> TypeId {
+    pub fn get_suggested_type_for_nonexistent_string_literal_type(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+    ) -> TypeId {
         // PORT: Go `getStringLiteralValue(t)` is `t.AsLiteralType().value.(string)`; it is read
         // inline here so the name callback only needs `&self`.
         let string_literal_value = |c: &Checker, t: TypeId| -> String {
@@ -495,7 +579,11 @@ impl Checker {
             && (is_assignment_target(access_expression) || is_delete_target(access_expression))
         {
             let type_string = self.type_to_string_exported(object_type);
-            self.error(access_expression, diag::Index_signature_in_type_0_only_permits_reading, args![type_string]);
+            self.error(
+                access_expression,
+                diag::Index_signature_in_type_0_only_permits_reading,
+                args![type_string],
+            );
         }
     }
 
@@ -523,7 +611,11 @@ impl Checker {
             if is_identifier(node) {
                 let expression_symbol = self.get_resolved_symbol(node);
                 // CommonJS module.exports is never readonly
-                if self.sym(expression_symbol).flags.intersects(SymbolFlags::MODULE_EXPORTS) {
+                if self
+                    .sym(expression_symbol)
+                    .flags
+                    .intersects(SymbolFlags::MODULE_EXPORTS)
+                {
                     return false;
                 }
             }
@@ -548,10 +640,11 @@ impl Checker {
                         let parent = self.sym(symbol).parent;
                         self.sym(parent).value_declaration == ctor.parent()
                     };
-                    let is_local_this_property_assignment_constructor_function = is_assignment_declaration && {
-                        let parent = self.sym(symbol).parent;
-                        self.sym(parent).value_declaration == ctor
-                    };
+                    let is_local_this_property_assignment_constructor_function =
+                        is_assignment_declaration && {
+                            let parent = self.sym(symbol).parent;
+                            self.sym(parent).value_declaration == ctor
+                        };
                     let is_writeable_symbol = is_local_property_declaration
                         || is_local_parameter_property
                         || is_local_this_property_assignment
@@ -566,7 +659,11 @@ impl Checker {
             let node = skip_parentheses(expr.expression());
             if is_identifier(node) {
                 let expression_symbol = self.get_resolved_symbol(node);
-                if self.sym(expression_symbol).flags.intersects(SymbolFlags::ALIAS) {
+                if self
+                    .sym(expression_symbol)
+                    .flags
+                    .intersects(SymbolFlags::ALIAS)
+                {
                     let declaration = self.get_declaration_of_alias_symbol(expression_symbol);
                     return declaration.is_some() && is_namespace_import(declaration);
                 }
@@ -584,8 +681,10 @@ impl Checker {
         } else if is_this_property(node) && self.is_auto_typed_property(prop) {
             constructor = self.get_declaring_constructor(prop);
         }
-        get_this_container(node, true /*includeArrowFunctions*/, false /*includeClassComputedPropertyName*/)
-            == constructor
+        get_this_container(
+            node, true,  /*includeArrowFunctions*/
+            false, /*includeClassComputedPropertyName*/
+        ) == constructor
     }
 
     // Go: checker/checker.go:27198 isAutoTypedProperty
@@ -604,8 +703,11 @@ impl Checker {
     pub fn get_declaring_constructor(&mut self, symbol: SymbolId) -> Node {
         let declarations = self.sym(symbol).declarations.clone();
         for declaration in declarations {
-            let container =
-                get_this_container(declaration, false /*includeArrowFunctions*/, false /*includeClassComputedPropertyName*/);
+            let container = get_this_container(
+                declaration,
+                false, /*includeArrowFunctions*/
+                false, /*includeClassComputedPropertyName*/
+            );
             if container.is_some() && is_constructor_declaration(container) {
                 return container;
             }
@@ -614,7 +716,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:27215 getPropertyNameFromIndex
-    pub fn get_property_name_from_index(&mut self, index_type: TypeId, access_node: Node) -> String {
+    pub fn get_property_name_from_index(
+        &mut self,
+        index_type: TypeId,
+        access_node: Node,
+    ) -> String {
         if self.is_type_usable_as_property_name(index_type) {
             return self.get_property_name_from_type(index_type);
         }
@@ -637,12 +743,19 @@ impl Checker {
             })
             || (flags.intersects(TypeFlags::UNION_OR_INTERSECTION) && {
                 let types = self.ty(t).types().to_vec();
-                types.into_iter().all(|t| self.is_string_index_signature_only_type(t))
+                types
+                    .into_iter()
+                    .all(|t| self.is_string_index_signature_only_type(t))
             })
     }
 
     // Go: checker/checker.go:27230 shouldDeferIndexedAccessType
-    pub fn should_defer_indexed_access_type(&mut self, object_type: TypeId, index_type: TypeId, access_node: Node) -> bool {
+    pub fn should_defer_indexed_access_type(
+        &mut self,
+        object_type: TypeId,
+        index_type: TypeId,
+        access_node: Node,
+    ) -> bool {
         if self.is_generic_index_type(index_type) {
             return true;
         }
@@ -663,7 +776,10 @@ impl Checker {
     // Go: checker/checker.go:27241 indexTypeLessThan
     pub fn index_type_less_than(&mut self, index_type: TypeId, limit: i32) -> bool {
         self.every_type(index_type, &mut |c: &mut Checker, t: TypeId| {
-            if c.ty(t).flags.intersects(TypeFlags::STRING_OR_NUMBER_LITERAL) {
+            if c.ty(t)
+                .flags
+                .intersects(TypeFlags::STRING_OR_NUMBER_LITERAL)
+            {
                 let prop_name = c.get_property_name_from_type(t);
                 if is_numeric_literal_name(&prop_name) {
                     let index = Number::from_string(&prop_name);
@@ -702,7 +818,10 @@ impl Checker {
 
     // Go: checker/checker.go:27271 getSubstitutionType
     pub fn get_substitution_type(&mut self, base_type: TypeId, constraint: TypeId) -> TypeId {
-        if self.ty(constraint).flags.intersects(TypeFlags::ANY_OR_UNKNOWN)
+        if self
+            .ty(constraint)
+            .flags
+            .intersects(TypeFlags::ANY_OR_UNKNOWN)
             || constraint == base_type
             || self.ty(base_type).flags.intersects(TypeFlags::ANY)
         {
@@ -712,8 +831,15 @@ impl Checker {
     }
 
     // Go: checker/checker.go:27278 getOrCreateSubstitutionType
-    pub fn get_or_create_substitution_type(&mut self, base_type: TypeId, constraint: TypeId) -> TypeId {
-        let key = SubstitutionTypeKey { base_id: self.ty(base_type).id, constraint_id: self.ty(constraint).id };
+    pub fn get_or_create_substitution_type(
+        &mut self,
+        base_type: TypeId,
+        constraint: TypeId,
+    ) -> TypeId {
+        let key = SubstitutionTypeKey {
+            base_id: self.ty(base_type).id,
+            constraint_id: self.ty(constraint).id,
+        };
         if let Some(&cached) = self.substitution_types.get(&key) {
             if cached.is_some() {
                 return cached;
@@ -744,7 +870,8 @@ impl Checker {
         ) || self.is_generic_tuple_type(t)
         {
             let constraint = self.get_resolved_base_constraint(t, &[]);
-            if constraint != self.no_constraint_type && constraint != self.circular_constraint_type {
+            if constraint != self.no_constraint_type && constraint != self.circular_constraint_type
+            {
                 return constraint;
             }
             return TypeId::NIL;
@@ -760,7 +887,10 @@ impl Checker {
         if constrained.resolved_base_constraint.is_some() {
             return constrained.resolved_base_constraint;
         }
-        if !self.push_type_resolution(TypeSystemEntity::Type(t), TypeSystemPropertyName::RESOLVED_BASE_CONSTRAINT) {
+        if !self.push_type_resolution(
+            TypeSystemEntity::Type(t),
+            TypeSystemPropertyName::RESOLVED_BASE_CONSTRAINT,
+        ) {
             return self.circular_constraint_type;
         }
         let mut constraint = TypeId::NIL;
@@ -783,8 +913,11 @@ impl Checker {
                 if error_node.is_some() {
                     let type_string = self.type_to_string_exported(t);
                     let count_before = self.diagnostics.count;
-                    let diagnostic =
-                        self.error(error_node, diag::Type_parameter_0_has_a_circular_constraint, args![type_string]);
+                    let diagnostic = self.error(
+                        error_node,
+                        diag::Type_parameter_0_has_a_circular_constraint,
+                        args![type_string],
+                    );
                     let current_node = self.current_node;
                     if current_node.is_some()
                         && !is_node_descendant_of(error_node, current_node)
@@ -795,7 +928,11 @@ impl Checker {
                             diag::Circularity_originates_in_type_at_this_location,
                             args![],
                         );
-                        self.p30_add_related_info_to_stored_error(&diagnostic, count_before, related);
+                        self.p30_add_related_info_to_stored_error(
+                            &diagnostic,
+                            count_before,
+                            related,
+                        );
                     }
                 }
             }
@@ -817,13 +954,21 @@ impl Checker {
     // file, since nothing is added in between) and appends to it. When `addDiagnostic`
     // discarded the diagnostic (maximum serialization level), the count did not change
     // and Go's mutation is unobservable, so nothing is done.
-    fn p30_add_related_info_to_stored_error(&mut self, reported: &Diagnostic, count_before: i32, related: Diagnostic) {
+    fn p30_add_related_info_to_stored_error(
+        &mut self,
+        reported: &Diagnostic,
+        count_before: i32,
+        related: Diagnostic,
+    ) {
         if self.diagnostics.count == count_before {
             return;
         }
         let stored = if reported.file().is_some() {
             let file_name = source_file_file_name(reported.file()).to_string();
-            self.diagnostics.file_diagnostics.get_mut(&file_name).and_then(|list| list.last_mut())
+            self.diagnostics
+                .file_diagnostics
+                .get_mut(&file_name)
+                .and_then(|list| list.last_mut())
         } else {
             self.diagnostics.non_file_diagnostics.last_mut()
         };
@@ -872,7 +1017,8 @@ impl Checker {
                 if self.get_name_type_from_mapped_type(mapped_type).is_some()
                     && !self.is_mapped_type_with_keyof_constraint_declaration(mapped_type)
                 {
-                    let index_type = self.get_index_type_for_mapped_type(mapped_type, IndexFlags::NONE);
+                    let index_type =
+                        self.get_index_type_for_mapped_type(mapped_type, IndexFlags::NONE);
                     return self.get_next_base_constraint(index_type, stack);
                 }
             }
@@ -926,11 +1072,19 @@ impl Checker {
             let (is_distributive, root_check_type, d_check_type, d_mapper) = {
                 let d = self.ty(t).as_conditional_type();
                 let root = d.root.borrow();
-                (root.is_distributive, root.check_type, d.check_type, d.mapper)
+                (
+                    root.is_distributive,
+                    root.check_type,
+                    d.check_type,
+                    d.mapper,
+                )
             };
             let restrictive = self
                 .cached_types
-                .get(&CachedTypeKey { kind: CachedTypeKind::RESTRICTIVE_INSTANTIATION, type_id: self.ty(t).id })
+                .get(&CachedTypeKey {
+                    kind: CachedTypeKind::RESTRICTIVE_INSTANTIATION,
+                    type_id: self.ty(t).id,
+                })
                 .copied()
                 .unwrap_or_default();
             if is_distributive && restrictive != t {
@@ -940,8 +1094,10 @@ impl Checker {
                 }
                 if constraint.is_some() && constraint != d_check_type {
                     let mapper = self.prepend_type_mapping(root_check_type, constraint, d_mapper);
-                    let instantiated =
-                        self.get_conditional_type_instantiation(t, mapper, true /*forConstraint*/, None);
+                    let instantiated = self.get_conditional_type_instantiation(
+                        t, mapper, true, /*forConstraint*/
+                        None,
+                    );
                     if !self.ty(instantiated).flags.intersects(TypeFlags::NEVER) {
                         return self.get_next_base_constraint(instantiated, stack);
                     }
@@ -1013,7 +1169,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:27487 maybeTypeOfKindConsideringBaseConstraint
-    pub fn maybe_type_of_kind_considering_base_constraint(&mut self, t: TypeId, kind: TypeFlags) -> bool {
+    pub fn maybe_type_of_kind_considering_base_constraint(
+        &mut self,
+        t: TypeId,
+        kind: TypeFlags,
+    ) -> bool {
         if self.maybe_type_of_kind(t, kind) {
             return true;
         }
@@ -1027,10 +1187,17 @@ impl Checker {
     }
 
     // Go: checker/checker.go:27499 allTypesAssignableToKindEx
-    pub fn all_types_assignable_to_kind_ex(&mut self, source: TypeId, kind: TypeFlags, strict: bool) -> bool {
+    pub fn all_types_assignable_to_kind_ex(
+        &mut self,
+        source: TypeId,
+        kind: TypeFlags,
+        strict: bool,
+    ) -> bool {
         if self.ty(source).flags.intersects(TypeFlags::UNION) {
             let types = self.ty(source).types().to_vec();
-            return types.into_iter().all(|sub_type| self.all_types_assignable_to_kind_ex(sub_type, kind, strict));
+            return types
+                .into_iter()
+                .all(|sub_type| self.all_types_assignable_to_kind_ex(sub_type, kind, strict));
         }
         self.is_type_assignable_to_kind_ex(source, kind, strict)
     }
@@ -1041,13 +1208,23 @@ impl Checker {
     }
 
     // Go: checker/checker.go:27512 isTypeAssignableToKindEx
-    pub fn is_type_assignable_to_kind_ex(&mut self, source: TypeId, kind: TypeFlags, strict: bool) -> bool {
+    pub fn is_type_assignable_to_kind_ex(
+        &mut self,
+        source: TypeId,
+        kind: TypeFlags,
+        strict: bool,
+    ) -> bool {
         let source_flags = self.ty(source).flags;
         if source_flags.intersects(kind) {
             return true;
         }
         if strict
-            && source_flags.intersects(TypeFlags::ANY_OR_UNKNOWN | TypeFlags::VOID | TypeFlags::UNDEFINED | TypeFlags::NULL)
+            && source_flags.intersects(
+                TypeFlags::ANY_OR_UNKNOWN
+                    | TypeFlags::VOID
+                    | TypeFlags::UNDEFINED
+                    | TypeFlags::NULL,
+            )
         {
             return false;
         }
@@ -1087,7 +1264,9 @@ impl Checker {
     // Go: checker/checker.go:27531 isConstEnumObjectType
     pub fn is_const_enum_object_type(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
-        ty.object_flags.intersects(ObjectFlags::ANONYMOUS) && ty.symbol.is_some() && self.is_const_enum_symbol(ty.symbol)
+        ty.object_flags.intersects(ObjectFlags::ANONYMOUS)
+            && ty.symbol.is_some()
+            && self.is_const_enum_symbol(ty.symbol)
     }
 
     // Go: checker/checker.go:27535 isConstEnumSymbol
@@ -1108,9 +1287,11 @@ impl Checker {
         if source_prop == target_prop {
             return Ternary::TRUE;
         }
-        let source_prop_accessibility = self.get_declaration_modifier_flags_from_symbol(source_prop)
+        let source_prop_accessibility = self
+            .get_declaration_modifier_flags_from_symbol(source_prop)
             & ModifierFlags::NON_PUBLIC_ACCESSIBILITY_MODIFIER;
-        let target_prop_accessibility = self.get_declaration_modifier_flags_from_symbol(target_prop)
+        let target_prop_accessibility = self
+            .get_declaration_modifier_flags_from_symbol(target_prop)
             & ModifierFlags::NON_PUBLIC_ACCESSIBILITY_MODIFIER;
         if source_prop_accessibility != target_prop_accessibility {
             return Ternary::FALSE;
@@ -1145,7 +1326,12 @@ pub fn compare_types_equal(s: TypeId, t: TypeId) -> Ternary {
 
 impl Checker {
     // Go: checker/checker.go:27573 markPropertyAsReferenced
-    pub fn mark_property_as_referenced(&mut self, prop: SymbolId, node_for_check_write_only: Node, is_self_type_access: bool) {
+    pub fn mark_property_as_referenced(
+        &mut self,
+        prop: SymbolId,
+        node_for_check_write_only: Node,
+        is_self_type_access: bool,
+    ) {
         let (prop_flags, value_declaration, check_flags) = {
             let s = self.sym(prop);
             (s.flags, s.value_declaration, s.check_flags)
@@ -1154,7 +1340,8 @@ impl Checker {
             return;
         }
         let has_private_modifier = has_modifier(value_declaration, ModifierFlags::PRIVATE);
-        let has_private_identifier = value_declaration.name().is_some() && is_private_identifier(value_declaration.name());
+        let has_private_identifier =
+            value_declaration.name().is_some() && is_private_identifier(value_declaration.name());
         if !has_private_modifier && !has_private_identifier {
             return;
         }
@@ -1166,7 +1353,8 @@ impl Checker {
         }
         if is_self_type_access {
             // Find any FunctionLikeDeclaration because those create a new 'this' binding. But this should only matter for methods (or getters/setters).
-            let containing_method = find_ancestor(node_for_check_write_only, is_function_like_declaration);
+            let containing_method =
+                find_ancestor(node_for_check_write_only, is_function_like_declaration);
             if containing_method.is_some() && containing_method.symbol() == prop {
                 return;
             }
@@ -1189,8 +1377,10 @@ impl Checker {
     ) -> Vec<SymbolId> {
         let element_types = self.get_type_arguments(rest_type);
         let element_infos = self.target_tuple_type(rest_type).element_infos.clone();
-        let associated_names = self.get_uniq_associated_names_from_tuple_type(rest_type, rest_symbol);
-        let mut expanded: Vec<SymbolId> = Vec::with_capacity(rest_index as usize + element_types.len());
+        let associated_names =
+            self.get_uniq_associated_names_from_tuple_type(rest_type, rest_symbol);
+        let mut expanded: Vec<SymbolId> =
+            Vec::with_capacity(rest_index as usize + element_types.len());
         expanded.extend_from_slice(&self.sig(signature).parameters[..rest_index as usize]);
         for (i, &t) in element_types.iter().enumerate() {
             let flags = element_infos[i].flags;
@@ -1200,8 +1390,16 @@ impl Checker {
             } else if flags.intersects(ElementFlags::OPTIONAL) {
                 check_flags = CheckFlags::OPTIONAL_PARAMETER;
             }
-            let symbol = self.new_symbol_ex(SymbolFlags::FUNCTION_SCOPED_VARIABLE, &associated_names[i], check_flags);
-            let resolved_type = if flags.intersects(ElementFlags::REST) { self.create_array_type(t) } else { t };
+            let symbol = self.new_symbol_ex(
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                &associated_names[i],
+                check_flags,
+            );
+            let resolved_type = if flags.intersects(ElementFlags::REST) {
+                self.create_array_type(t)
+            } else {
+                t
+            };
             self.value_symbol_links.get(symbol).resolved_type = resolved_type;
             expanded.push(symbol);
         }
@@ -1210,7 +1408,11 @@ impl Checker {
 
     // Go: checker/checker.go:27625 getUniqAssociatedNamesFromTupleType
     // PORT: t is a *TypeReference in Go; it is passed as its TypeId.
-    pub fn get_uniq_associated_names_from_tuple_type(&mut self, t: TypeId, rest_symbol: SymbolId) -> Vec<String> {
+    pub fn get_uniq_associated_names_from_tuple_type(
+        &mut self,
+        t: TypeId,
+        rest_symbol: SymbolId,
+    ) -> Vec<String> {
         let element_infos = self.target_tuple_type(t).element_infos.clone();
         let mut names: Vec<String> = vec![String::new(); element_infos.len()];
         let mut counters: FxHashMap<String, i32> = FxHashMap::default();
@@ -1244,7 +1446,12 @@ impl Checker {
 
 // Go: checker/checker.go:27654 hasRestParameter
 pub fn has_rest_parameter(signature: Node) -> bool {
-    let last = signature.parameters().to_vec().last().copied().unwrap_or(Node::NIL);
+    let last = signature
+        .parameters()
+        .to_vec()
+        .last()
+        .copied()
+        .unwrap_or(Node::NIL);
     last.is_some() && is_rest_parameter(last)
 }
 
@@ -1267,18 +1474,27 @@ impl Checker {
     // Go: checker/checker.go:27670 isUnknownLikeUnionType
     pub fn is_unknown_like_union_type(&mut self, t: TypeId) -> bool {
         if self.strict_null_checks && self.ty(t).flags.intersects(TypeFlags::UNION) {
-            if !self.ty(t).object_flags.intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED) {
+            if !self
+                .ty(t)
+                .object_flags
+                .intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED)
+            {
                 self.ty_mut(t).object_flags |= ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED;
                 let types = self.ty(t).types().to_vec();
                 if types.len() >= 3
                     && self.ty(types[0]).flags.intersects(TypeFlags::UNDEFINED)
                     && self.ty(types[1]).flags.intersects(TypeFlags::NULL)
-                    && types.iter().any(|&s| self.is_empty_anonymous_object_type(s))
+                    && types
+                        .iter()
+                        .any(|&s| self.is_empty_anonymous_object_type(s))
                 {
                     self.ty_mut(t).object_flags |= ObjectFlags::IS_UNKNOWN_LIKE_UNION;
                 }
             }
-            return self.ty(t).object_flags.intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION);
+            return self
+                .ty(t)
+                .object_flags
+                .intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION);
         }
         false
     }
@@ -1295,7 +1511,10 @@ impl Checker {
     // Go: checker/checker.go:27691 typeHasCallOrConstructSignatures
     pub fn type_has_call_or_construct_signatures(&mut self, t: TypeId) -> bool {
         self.ty(t).flags.intersects(TypeFlags::STRUCTURED_TYPE)
-            && !self.resolve_structured_type_members(t).signatures.is_empty()
+            && !self
+                .resolve_structured_type_members(t)
+                .signatures
+                .is_empty()
     }
 
     // Go: checker/checker.go:27695 getNormalizedType
@@ -1363,7 +1582,11 @@ impl Checker {
         };
         if let Some(&cached) = self.cached_types.get(&key) {
             if cached.is_some() {
-                return if cached == self.circular_constraint_type { t } else { cached };
+                return if cached == self.circular_constraint_type {
+                    t
+                } else {
+                    cached
+                };
             }
         }
         self.cached_types.insert(key, t);
@@ -1377,7 +1600,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:27760 getSimplifiedIndexedAccessTypeWorker
-    pub fn get_simplified_indexed_access_type_worker(&mut self, t: TypeId, writing: bool) -> TypeId {
+    pub fn get_simplified_indexed_access_type_worker(
+        &mut self,
+        t: TypeId,
+        writing: bool,
+    ) -> TypeId {
         // We recursively simplify the object type as it may in turn be an indexed access type. For example, with
         // '{ [P in T]: { [Q in U]: number } }[T][U]' we want to first simplify the inner indexed access type.
         let t_object_type = self.ty(t).as_indexed_access_type().object_type;
@@ -1386,16 +1613,22 @@ impl Checker {
         let index_type = self.get_simplified_type(t_index_type, writing);
         // T[A | B] -> T[A] | T[B] (reading)
         // T[A | B] -> T[A] & T[B] (writing)
-        let distributed_over_index = self.distribute_object_over_index_type(object_type, index_type, writing);
+        let distributed_over_index =
+            self.distribute_object_over_index_type(object_type, index_type, writing);
         if distributed_over_index.is_some() {
             return distributed_over_index;
         }
         // Only do the inner distributions if the index can no longer be instantiated to cause index distribution again
-        if !self.ty(index_type).flags.intersects(TypeFlags::INSTANTIABLE) {
+        if !self
+            .ty(index_type)
+            .flags
+            .intersects(TypeFlags::INSTANTIABLE)
+        {
             // (T | U)[K] -> T[K] | U[K] (reading)
             // (T | U)[K] -> T[K] & U[K] (writing)
             // (T & U)[K] -> T[K] & U[K]
-            let distributed_over_object = self.distribute_index_over_object_type(object_type, index_type, writing);
+            let distributed_over_object =
+                self.distribute_index_over_object_type(object_type, index_type, writing);
             if distributed_over_object.is_some() {
                 return distributed_over_object;
             }
@@ -1405,14 +1638,21 @@ impl Checker {
         // A generic tuple type indexed by a number exists only when the index type doesn't select a
         // fixed element. We simplify to either the combined type of all elements (when the index type
         // the actual number type) or to the combined type of all non-fixed elements.
-        if self.is_generic_tuple_type(object_type) && self.ty(index_type).flags.intersects(TypeFlags::NUMBER_LIKE) {
+        if self.is_generic_tuple_type(object_type)
+            && self.ty(index_type).flags.intersects(TypeFlags::NUMBER_LIKE)
+        {
             let index = if self.ty(index_type).flags.intersects(TypeFlags::NUMBER) {
                 0
             } else {
                 self.target_tuple_type(object_type).fixed_length
             };
-            let element_type =
-                self.get_element_type_of_slice_of_tuple_type(object_type, index, 0 /*endSkipCount*/, writing, false);
+            let element_type = self.get_element_type_of_slice_of_tuple_type(
+                object_type,
+                index,
+                0, /*endSkipCount*/
+                writing,
+                false,
+            );
             if element_type.is_some() {
                 return element_type;
             }
@@ -1421,9 +1661,12 @@ impl Checker {
         // K is generic and N is assignable to P, instantiate E using a mapper that substitutes the index type for P.
         // For example, for an index access { [P in K]: Box<T[P]> }[X], we construct the type Box<T[X]>.
         if self.is_generic_mapped_type(object_type) {
-            if self.get_mapped_type_name_type_kind(object_type) != MappedTypeNameTypeKind::REMAPPING {
+            if self.get_mapped_type_name_type_kind(object_type) != MappedTypeNameTypeKind::REMAPPING
+            {
                 let substituted = self.substitute_indexed_mapped_type(object_type, t_index_type);
-                return self.map_type(substituted, &mut |c: &mut Checker, t: TypeId| c.get_simplified_type(t, writing));
+                return self.map_type(substituted, &mut |c: &mut Checker, t: TypeId| {
+                    c.get_simplified_type(t, writing)
+                });
             }
         }
         t

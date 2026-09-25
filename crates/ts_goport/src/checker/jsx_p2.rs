@@ -16,19 +16,31 @@ use crate::prelude::*;
 
 impl Checker {
     // Go: checker/jsx.go:929 getEffectiveFirstArgumentForJsxSignature
-    pub fn get_effective_first_argument_for_jsx_signature(&mut self, signature: SignatureId, node: Node) -> TypeId {
-        if is_jsx_opening_fragment(node) || self.get_jsx_reference_kind(node) != JsxReferenceKind::COMPONENT {
+    pub fn get_effective_first_argument_for_jsx_signature(
+        &mut self,
+        signature: SignatureId,
+        node: Node,
+    ) -> TypeId {
+        if is_jsx_opening_fragment(node)
+            || self.get_jsx_reference_kind(node) != JsxReferenceKind::COMPONENT
+        {
             return self.get_jsx_props_type_from_call_signature(signature, node);
         }
         self.get_jsx_props_type_from_class_type(signature, node)
     }
 
     // Go: checker/jsx.go:936 getJsxPropsTypeFromCallSignature
-    pub fn get_jsx_props_type_from_call_signature(&mut self, sig: SignatureId, context: Node) -> TypeId {
+    pub fn get_jsx_props_type_from_call_signature(
+        &mut self,
+        sig: SignatureId,
+        context: Node,
+    ) -> TypeId {
         let unknown_type = self.unknown_type;
-        let mut props_type = self.get_type_of_first_parameter_of_signature_with_fallback(sig, unknown_type);
+        let mut props_type =
+            self.get_type_of_first_parameter_of_signature_with_fallback(sig, unknown_type);
         let ns = self.get_jsx_namespace_at(context);
-        props_type = self.get_jsx_managed_attributes_from_located_attributes(context, ns, props_type);
+        props_type =
+            self.get_jsx_managed_attributes_from_located_attributes(context, ns, props_type);
         let intrinsic_attribs = self.get_jsx_type("IntrinsicAttributes", context);
         if !self.is_error_type(intrinsic_attribs) {
             props_type = self.intersect_types(intrinsic_attribs, props_type);
@@ -37,20 +49,26 @@ impl Checker {
     }
 
     // Go: checker/jsx.go:946 getJsxPropsTypeFromClassType
-    pub fn get_jsx_props_type_from_class_type(&mut self, sig: SignatureId, context: Node) -> TypeId {
+    pub fn get_jsx_props_type_from_class_type(
+        &mut self,
+        sig: SignatureId,
+        context: Node,
+    ) -> TypeId {
         let ns = self.get_jsx_namespace_at(context);
         let forced_lookup_location = self.get_jsx_element_properties_name(ns);
         let mut attributes_type;
         match forced_lookup_location.as_str() {
             INTERNAL_SYMBOL_NAME_MISSING => {
                 let unknown_type = self.unknown_type;
-                attributes_type = self.get_type_of_first_parameter_of_signature_with_fallback(sig, unknown_type);
+                attributes_type =
+                    self.get_type_of_first_parameter_of_signature_with_fallback(sig, unknown_type);
             }
             "" => {
                 attributes_type = self.get_return_type_of_signature(sig);
             }
             _ => {
-                attributes_type = self.get_jsx_props_type_for_signature_from_member(sig, &forced_lookup_location);
+                attributes_type =
+                    self.get_jsx_props_type_for_signature_from_member(sig, &forced_lookup_location);
                 if attributes_type.is_nil() && !context.attributes().properties().is_empty() {
                     // There is no property named 'props' on this instance type
                     self.error(
@@ -64,7 +82,8 @@ impl Checker {
         if attributes_type.is_nil() {
             return self.unknown_type;
         }
-        attributes_type = self.get_jsx_managed_attributes_from_located_attributes(context, ns, attributes_type);
+        attributes_type =
+            self.get_jsx_managed_attributes_from_located_attributes(context, ns, attributes_type);
         if self.is_type_any(attributes_type) {
             // Props is of type 'any' or unknown
             return attributes_type;
@@ -74,7 +93,9 @@ impl Checker {
         let intrinsic_class_attribs = self.get_jsx_type("IntrinsicClassAttributes", context);
         if !self.is_error_type(intrinsic_class_attribs) {
             let intrinsic_class_attribs_symbol = self.ty(intrinsic_class_attribs).symbol;
-            let type_params = self.get_local_type_parameters_of_class_or_interface_or_type_alias(intrinsic_class_attribs_symbol);
+            let type_params = self.get_local_type_parameters_of_class_or_interface_or_type_alias(
+                intrinsic_class_attribs_symbol,
+            );
             let host_class_type = self.get_return_type_of_signature(sig);
             let library_managed_attribute_type;
             // PORT: Go `typeParams != nil`; the callee returns nil when it finds no type parameters.
@@ -88,21 +109,28 @@ impl Checker {
                     is_in_js_file(context),
                 );
                 let mapper = self.new_type_mapper(&type_params, &inferred_args);
-                library_managed_attribute_type = self.instantiate_type(intrinsic_class_attribs, mapper);
+                library_managed_attribute_type =
+                    self.instantiate_type(intrinsic_class_attribs, mapper);
             } else {
                 library_managed_attribute_type = intrinsic_class_attribs;
             }
-            apparent_attributes_type = self.intersect_types(library_managed_attribute_type, apparent_attributes_type);
+            apparent_attributes_type =
+                self.intersect_types(library_managed_attribute_type, apparent_attributes_type);
         }
         let intrinsic_attribs = self.get_jsx_type("IntrinsicAttributes", context);
         if !self.is_error_type(intrinsic_attribs) {
-            apparent_attributes_type = self.intersect_types(intrinsic_attribs, apparent_attributes_type);
+            apparent_attributes_type =
+                self.intersect_types(intrinsic_attribs, apparent_attributes_type);
         }
         apparent_attributes_type
     }
 
     // Go: checker/jsx.go:993 getJsxPropsTypeForSignatureFromMember
-    pub fn get_jsx_props_type_for_signature_from_member(&mut self, sig: SignatureId, forced_lookup_location: &str) -> TypeId {
+    pub fn get_jsx_props_type_for_signature_from_member(
+        &mut self,
+        sig: SignatureId,
+        forced_lookup_location: &str,
+    ) -> TypeId {
         if let Some(composite) = self.sig(sig).composite.clone() {
             // JSX Elements using the legacy `props`-field based lookup (eg, react class components) need to treat the `props` member as an input
             // instead of an output position when resolving the signature. We need to go back to the input signatures of the composite signature,
@@ -162,8 +190,16 @@ impl Checker {
     ) -> TypeId {
         let declared_managed_type = self.get_declared_type_of_symbol(managed_sym);
         // fetches interface type, or initializes symbol links type parameters
-        if self.sym(managed_sym).flags.intersects(SymbolFlags::TYPE_ALIAS) {
-            let params = self.type_alias_links.get(managed_sym).type_parameters.clone();
+        if self
+            .sym(managed_sym)
+            .flags
+            .intersects(SymbolFlags::TYPE_ALIAS)
+        {
+            let params = self
+                .type_alias_links
+                .get(managed_sym)
+                .type_parameters
+                .clone();
             if params.len() >= type_arguments.len() {
                 let args = self.fill_missing_type_arguments(
                     type_arguments,
@@ -177,10 +213,22 @@ impl Checker {
                 return self.get_type_alias_instantiation(managed_sym, &args, None);
             }
         }
-        if self.ty(declared_managed_type).object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE)
-            && self.ty(declared_managed_type).as_interface_type().type_parameters().len() >= type_arguments.len()
+        if self
+            .ty(declared_managed_type)
+            .object_flags
+            .intersects(ObjectFlags::CLASS_OR_INTERFACE)
+            && self
+                .ty(declared_managed_type)
+                .as_interface_type()
+                .type_parameters()
+                .len()
+                >= type_arguments.len()
         {
-            let type_parameters = self.ty(declared_managed_type).as_interface_type().type_parameters().to_vec();
+            let type_parameters = self
+                .ty(declared_managed_type)
+                .as_interface_type()
+                .type_parameters()
+                .to_vec();
             let args = self.fill_missing_type_arguments(
                 type_arguments,
                 &type_parameters,
@@ -221,16 +269,24 @@ impl Checker {
     //	non-intrinsic elements' attributes type is the element instance type)
     // Go: checker/jsx.go:1077 getJsxElementPropertiesName
     pub fn get_jsx_element_properties_name(&mut self, jsx_namespace: SymbolId) -> String {
-        self.get_name_from_jsx_element_attributes_container("ElementAttributesProperty", jsx_namespace)
+        self.get_name_from_jsx_element_attributes_container(
+            "ElementAttributesProperty",
+            jsx_namespace,
+        )
     }
 
     // Go: checker/jsx.go:1081 getJsxElementChildrenPropertyName
     pub fn get_jsx_element_children_property_name(&mut self, jsx_namespace: SymbolId) -> String {
-        if self.compiler_options.jsx == JsxEmit::REACT_JSX || self.compiler_options.jsx == JsxEmit::REACT_JSX_DEV {
+        if self.compiler_options.jsx == JsxEmit::REACT_JSX
+            || self.compiler_options.jsx == JsxEmit::REACT_JSX_DEV
+        {
             // In these JsxEmit modes the children property is fixed to 'children'
             return "children".to_string();
         }
-        self.get_name_from_jsx_element_attributes_container("ElementChildrenAttribute", jsx_namespace)
+        self.get_name_from_jsx_element_attributes_container(
+            "ElementChildrenAttribute",
+            jsx_namespace,
+        )
     }
 
     // Look into JSX namespace and then look for container with matching name as nameOfAttribPropContainer.
@@ -260,13 +316,20 @@ impl Checker {
                     return String::new();
                 }
                 if properties_of_jsx_element_attrib_prop_interface.len() == 1 {
-                    return self.sym(properties_of_jsx_element_attrib_prop_interface[0]).name.clone();
+                    return self
+                        .sym(properties_of_jsx_element_attrib_prop_interface[0])
+                        .name
+                        .clone();
                 }
                 if properties_of_jsx_element_attrib_prop_interface.len() > 1
-                    && !self.sym(jsx_element_attrib_prop_interface_sym).declarations.is_empty()
+                    && !self
+                        .sym(jsx_element_attrib_prop_interface_sym)
+                        .declarations
+                        .is_empty()
                 {
                     // More than one property on ElementAttributesProperty is an error
-                    let declaration = self.sym(jsx_element_attrib_prop_interface_sym).declarations[0];
+                    let declaration =
+                        self.sym(jsx_element_attrib_prop_interface_sym).declarations[0];
                     self.error(
                         declaration,
                         diag::The_global_type_JSX_0_may_not_have_more_than_one_property,
@@ -289,8 +352,13 @@ impl Checker {
             return self.get_or_create_type_from_signature(fake_signature);
         }
         let tag_type = self.check_expression_cached(context.tag_name());
-        if self.ty(tag_type).flags.intersects(TypeFlags::STRING_LITERAL) {
-            let result = self.get_intrinsic_attributes_type_from_string_literal_type(tag_type, context);
+        if self
+            .ty(tag_type)
+            .flags
+            .intersects(TypeFlags::STRING_LITERAL)
+        {
+            let result =
+                self.get_intrinsic_attributes_type_from_string_literal_type(tag_type, context);
             if result.is_nil() {
                 return self.error_type;
             }
@@ -301,7 +369,11 @@ impl Checker {
     }
 
     // Go: checker/jsx.go:1139 getIntrinsicAttributesTypeFromStringLiteralType
-    pub fn get_intrinsic_attributes_type_from_string_literal_type(&mut self, t: TypeId, location: Node) -> TypeId {
+    pub fn get_intrinsic_attributes_type_from_string_literal_type(
+        &mut self,
+        t: TypeId,
+        location: Node,
+    ) -> TypeId {
         // If the elemType is a stringLiteral type, we can then provide a check to make sure that the string literal type is one of the Jsx intrinsic element type
         // For example:
         //      var CustomTag: "h1" = "h1";
@@ -309,12 +381,14 @@ impl Checker {
         let intrinsic_elements_type = self.get_jsx_type("IntrinsicElements", location);
         if !self.is_error_type(intrinsic_elements_type) {
             let string_literal_type_name = self.get_string_literal_value(t);
-            let intrinsic_prop = self.get_property_of_type(intrinsic_elements_type, &string_literal_type_name);
+            let intrinsic_prop =
+                self.get_property_of_type(intrinsic_elements_type, &string_literal_type_name);
             if intrinsic_prop.is_some() {
                 return self.get_type_of_symbol(intrinsic_prop);
             }
             let string_type = self.string_type;
-            let index_signature_type = self.get_index_type_of_type(intrinsic_elements_type, string_type);
+            let index_signature_type =
+                self.get_index_type_of_type(intrinsic_elements_type, string_type);
             if index_signature_type.is_some() {
                 return index_signature_type;
             }
@@ -331,17 +405,27 @@ impl Checker {
         }
         let tag_expr_type = self.check_expression(node.tag_name());
         let tag_type = self.get_apparent_type(tag_expr_type);
-        if !self.get_signatures_of_type(tag_type, SignatureKind::CONSTRUCT).is_empty() {
+        if !self
+            .get_signatures_of_type(tag_type, SignatureKind::CONSTRUCT)
+            .is_empty()
+        {
             return JsxReferenceKind::COMPONENT;
         }
-        if !self.get_signatures_of_type(tag_type, SignatureKind::CALL).is_empty() {
+        if !self
+            .get_signatures_of_type(tag_type, SignatureKind::CALL)
+            .is_empty()
+        {
             return JsxReferenceKind::FUNCTION;
         }
         JsxReferenceKind::MIXED
     }
 
     // Go: checker/jsx.go:1175 createSignatureForJSXIntrinsic
-    pub fn create_signature_for_jsx_intrinsic(&mut self, node: Node, result: TypeId) -> SignatureId {
+    pub fn create_signature_for_jsx_intrinsic(
+        &mut self,
+        node: Node,
+        result: TypeId,
+    ) -> SignatureId {
         let mut element_type = self.error_type;
         let namespace = self.get_jsx_namespace_at(node);
         if namespace.is_some() {
@@ -371,9 +455,15 @@ impl Checker {
     // The function is intended to be called from a function which has checked that the opening element is an intrinsic element.
     // @param node an intrinsic JSX opening-like element
     // Go: checker/jsx.go:1192 getIntrinsicAttributesTypeFromJsxOpeningLikeElement
-    pub fn get_intrinsic_attributes_type_from_jsx_opening_like_element(&mut self, node: Node) -> TypeId {
+    pub fn get_intrinsic_attributes_type_from_jsx_opening_like_element(
+        &mut self,
+        node: Node,
+    ) -> TypeId {
         debug_assert!(is_jsx_intrinsic_tag_name(node.tag_name()));
-        let resolved = self.jsx_element_links.get(node).resolved_jsx_element_attributes_type;
+        let resolved = self
+            .jsx_element_links
+            .get(node)
+            .resolved_jsx_element_attributes_type;
         if resolved.is_some() {
             return resolved;
         }
@@ -385,20 +475,29 @@ impl Checker {
             if t.is_nil() {
                 t = self.error_type;
             }
-            self.jsx_element_links.get(node).resolved_jsx_element_attributes_type = t;
+            self.jsx_element_links
+                .get(node)
+                .resolved_jsx_element_attributes_type = t;
             return t;
         }
         if jsx_flags.intersects(JsxFlags::INTRINSIC_INDEXED_ELEMENT) {
             let intrinsic_elements_type = self.get_jsx_type("IntrinsicElements", node);
-            let index_info = self.get_applicable_index_info_for_name(intrinsic_elements_type, node.tag_name().text());
+            let index_info = self.get_applicable_index_info_for_name(
+                intrinsic_elements_type,
+                node.tag_name().text(),
+            );
             if index_info.is_some() {
                 let value_type = self.index_info(index_info).value_type;
-                self.jsx_element_links.get(node).resolved_jsx_element_attributes_type = value_type;
+                self.jsx_element_links
+                    .get(node)
+                    .resolved_jsx_element_attributes_type = value_type;
                 return value_type;
             }
         }
         let error_type = self.error_type;
-        self.jsx_element_links.get(node).resolved_jsx_element_attributes_type = error_type;
+        self.jsx_element_links
+            .get(node)
+            .resolved_jsx_element_attributes_type = error_type;
         error_type
     }
 
@@ -428,13 +527,17 @@ impl Checker {
             }
             // Intrinsic string indexer case
             let prop_name_type = self.get_string_literal_type(prop_name);
-            let index_symbol = self.get_applicable_index_symbol(intrinsic_elements_type, prop_name_type);
+            let index_symbol =
+                self.get_applicable_index_symbol(intrinsic_elements_type, prop_name_type);
             if index_symbol.is_some() {
                 self.jsx_element_links.get(node).jsx_flags |= JsxFlags::INTRINSIC_INDEXED_ELEMENT;
                 self.symbol_node_links.get(node).resolved_symbol = index_symbol;
                 return index_symbol;
             }
-            if self.get_type_of_property_or_index_signature_of_type(intrinsic_elements_type, prop_name).is_some() {
+            if self
+                .get_type_of_property_or_index_signature_of_type(intrinsic_elements_type, prop_name)
+                .is_some()
+            {
                 self.jsx_element_links.get(node).jsx_flags |= JsxFlags::INTRINSIC_INDEXED_ELEMENT;
                 let s = self.ty(intrinsic_elements_type).symbol;
                 self.symbol_node_links.get(node).resolved_symbol = s;
@@ -496,7 +599,8 @@ impl Checker {
         if sym.is_nil() {
             return TypeId::NIL;
         }
-        let t = self.instantiate_alias_or_interface_with_defaults(sym, &[], is_in_js_file(location));
+        let t =
+            self.instantiate_alias_or_interface_with_defaults(sym, &[], is_in_js_file(location));
         if t.is_nil() || self.is_error_type(t) {
             return TypeId::NIL;
         }
@@ -525,13 +629,17 @@ impl Checker {
         // re-fetched from the store instead of holding a pointer.
         let has_links = location.is_some();
         let unknown_symbol = self.unknown_symbol;
-        let links_jsx_namespace =
-            if has_links { self.jsx_element_links.get(location).jsx_namespace } else { SymbolId::NIL };
+        let links_jsx_namespace = if has_links {
+            self.jsx_element_links.get(location).jsx_namespace
+        } else {
+            SymbolId::NIL
+        };
         if has_links && links_jsx_namespace.is_some() && links_jsx_namespace != unknown_symbol {
             return links_jsx_namespace;
         }
         if !has_links || links_jsx_namespace != unknown_symbol {
-            let mut resolved_namespace = self.get_jsx_namespace_container_for_implicit_import(location);
+            let mut resolved_namespace =
+                self.get_jsx_namespace_container_for_implicit_import(location);
             if resolved_namespace.is_nil() || resolved_namespace == unknown_symbol {
                 let namespace_name = self.get_jsx_namespace(location);
                 let resolve_name = self.resolve_name.clone();
@@ -562,7 +670,8 @@ impl Checker {
             }
         }
         // JSX global fallback
-        let global = self.get_global_symbol("JSX", SymbolFlags::NAMESPACE, None /*diagnostic*/);
+        let global =
+            self.get_global_symbol("JSX", SymbolFlags::NAMESPACE, None /*diagnostic*/);
         let s = self.resolve_symbol(global);
         if s == unknown_symbol {
             return SymbolId::NIL;
@@ -576,7 +685,11 @@ impl Checker {
             let file = get_source_file_of_node(location);
             if file.is_some() {
                 if is_jsx_opening_fragment(location) {
-                    let local_jsx_fragment_namespace = self.source_file_links.get(file).local_jsx_fragment_namespace.clone();
+                    let local_jsx_fragment_namespace = self
+                        .source_file_links
+                        .get(file)
+                        .local_jsx_fragment_namespace
+                        .clone();
                     if !local_jsx_fragment_namespace.is_empty() {
                         return local_jsx_fragment_namespace;
                     }
@@ -585,10 +698,15 @@ impl Checker {
                         // PORT: Go `pragma.Args["factory"].Value` (zero value when absent).
                         let factory = get_pragma_argument(jsx_fragment_pragma, "factory");
                         let local_jsx_fragment_factory = self.parse_isolated_entity_name(&factory);
-                        self.source_file_links.get(file).local_jsx_fragment_factory = local_jsx_fragment_factory;
+                        self.source_file_links.get(file).local_jsx_fragment_factory =
+                            local_jsx_fragment_factory;
                         if local_jsx_fragment_factory.is_some() {
-                            let namespace = get_first_identifier(local_jsx_fragment_factory).text().to_string();
-                            self.source_file_links.get(file).local_jsx_fragment_namespace = namespace.clone();
+                            let namespace = get_first_identifier(local_jsx_fragment_factory)
+                                .text()
+                                .to_string();
+                            self.source_file_links
+                                .get(file)
+                                .local_jsx_fragment_namespace = namespace.clone();
                             return namespace;
                         }
                     }
@@ -603,7 +721,8 @@ impl Checker {
                 } else {
                     let local_jsx_namespace = self.get_local_jsx_namespace(file);
                     if !local_jsx_namespace.is_empty() {
-                        self.source_file_links.get(file).local_jsx_namespace = local_jsx_namespace.clone();
+                        self.source_file_links.get(file).local_jsx_namespace =
+                            local_jsx_namespace.clone();
                         return local_jsx_namespace;
                     }
                 }
@@ -615,7 +734,9 @@ impl Checker {
                 let jsx_factory = self.compiler_options.jsx_factory.clone();
                 self._jsx_factory_entity = self.parse_isolated_entity_name(&jsx_factory);
                 if self._jsx_factory_entity.is_some() {
-                    self._jsx_namespace = get_first_identifier(self._jsx_factory_entity).text().to_string();
+                    self._jsx_namespace = get_first_identifier(self._jsx_factory_entity)
+                        .text()
+                        .to_string();
                 }
             } else if !self.compiler_options.react_namespace.is_empty() {
                 self._jsx_namespace = self.compiler_options.react_namespace.clone();
@@ -654,7 +775,10 @@ impl Checker {
     pub fn get_jsx_factory_entity(&mut self, location: Node) -> Node {
         if location.is_some() {
             self.get_jsx_namespace(location);
-            let local_jsx_factory = self.source_file_links.get(get_source_file_of_node(location)).local_jsx_factory;
+            let local_jsx_factory = self
+                .source_file_links
+                .get(get_source_file_of_node(location))
+                .local_jsx_factory;
             if local_jsx_factory.is_some() {
                 return local_jsx_factory;
             }
@@ -667,7 +791,8 @@ impl Checker {
         if location.is_some() {
             let file = get_source_file_of_node(location);
             if file.is_some() {
-                let local_jsx_fragment_factory = self.source_file_links.get(file).local_jsx_fragment_factory;
+                let local_jsx_fragment_factory =
+                    self.source_file_links.get(file).local_jsx_fragment_factory;
                 if local_jsx_fragment_factory.is_some() {
                     return local_jsx_fragment_factory;
                 }
@@ -676,7 +801,8 @@ impl Checker {
                     // PORT: Go `pragma.Args["factory"].Value` (zero value when absent).
                     let factory = get_pragma_argument(jsx_frag_pragma, "factory");
                     let local_jsx_fragment_factory = self.parse_isolated_entity_name(&factory);
-                    self.source_file_links.get(file).local_jsx_fragment_factory = local_jsx_fragment_factory;
+                    self.source_file_links.get(file).local_jsx_fragment_factory =
+                        local_jsx_fragment_factory;
                     return local_jsx_fragment_factory;
                 }
             }
@@ -689,15 +815,11 @@ impl Checker {
     }
 
     // Go: checker/jsx.go:1439 parseIsolatedEntityName
-    pub fn parse_isolated_entity_name(&mut self, name: &str) -> Node {
+    pub fn parse_isolated_entity_name(&mut self, _name: &str) -> Node {
         // PORT: Go calls `parser.ParseIsolatedEntityName(name)`, which parses a
         // new detached node tree, then `markAsSynthetic(result)`. Detached parser
         // nodes cannot be represented by `Node` handles yet.
-        let result: Node = unported!("ParseIsolatedEntityName");
-        if result.is_some() {
-            mark_as_synthetic(result);
-        }
-        result
+        unported!("ParseIsolatedEntityName")
     }
 
     // Go: checker/jsx.go:1453 getJsxNamespaceContainerForImplicitImport
@@ -712,9 +834,16 @@ impl Checker {
             }
         }
         if has_links {
-            let container = self.jsx_element_links.get(file).jsx_implicit_import_container;
+            let container = self
+                .jsx_element_links
+                .get(file)
+                .jsx_implicit_import_container;
             if container.is_some() {
-                return if container == self.unknown_symbol { SymbolId::NIL } else { container };
+                return if container == self.unknown_symbol {
+                    SymbolId::NIL
+                } else {
+                    container
+                };
             }
         }
         let (module_reference, specifier) = self.get_jsx_runtime_import_specifier(file);
@@ -722,16 +851,32 @@ impl Checker {
             return SymbolId::NIL;
         }
         let error_message = diag::This_JSX_tag_requires_the_module_path_0_to_exist_but_none_could_be_found_Make_sure_you_have_types_for_the_appropriate_package_installed;
-        let module_location = if specifier.is_some() { specifier } else { location };
-        let mod_ = self.resolve_external_module(module_location, &module_reference, Some(error_message), location, false);
+        let module_location = if specifier.is_some() {
+            specifier
+        } else {
+            location
+        };
+        let mod_ = self.resolve_external_module(
+            module_location,
+            &module_reference,
+            Some(error_message),
+            location,
+            false,
+        );
         let mut result = SymbolId::NIL;
         if mod_.is_some() && mod_ != self.unknown_symbol {
             let resolved = self.resolve_symbol(mod_);
             result = self.get_merged_symbol(resolved);
         }
         if has_links {
-            let container = if result.is_some() { result } else { self.unknown_symbol };
-            self.jsx_element_links.get(file).jsx_implicit_import_container = container;
+            let container = if result.is_some() {
+                result
+            } else {
+                self.unknown_symbol
+            };
+            self.jsx_element_links
+                .get(file)
+                .jsx_implicit_import_container = container;
         }
         result
     }

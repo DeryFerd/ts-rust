@@ -13,44 +13,80 @@ impl Checker {
     // Go: checker/checker.go:6626 getIterationTypesOfIteratorResult
     pub fn get_iteration_types_of_iterator_result(&mut self, t: TypeId) -> IterationTypes {
         if self.is_type_any(t) {
-            return IterationTypes { yield_type: self.any_type, return_type: self.any_type, next_type: self.any_type };
+            return IterationTypes {
+                yield_type: self.any_type,
+                return_type: self.any_type,
+                next_type: self.any_type,
+            };
         }
         // As an optimization, if the type is an instantiation of one of the global `IteratorYieldResult<T>`
         // or `IteratorReturnResult<TReturn>` types, then just grab its type argument.
         // PORT: Go `c.getGlobalIteratorYieldResultType` is a stored func field
         // (`Rc<dyn Fn(&mut Checker) -> TypeId>`).
-        let get_global_iterator_yield_result_type = self.get_global_iterator_yield_result_type.clone();
+        let get_global_iterator_yield_result_type =
+            self.get_global_iterator_yield_result_type.clone();
         let global_yield = get_global_iterator_yield_result_type(self);
         if self.is_reference_to_type(t, global_yield) {
             let arg = self.get_type_arguments(t)[0];
-            return IterationTypes { yield_type: arg, return_type: TypeId::NIL, next_type: TypeId::NIL };
+            return IterationTypes {
+                yield_type: arg,
+                return_type: TypeId::NIL,
+                next_type: TypeId::NIL,
+            };
         }
-        let get_global_iterator_return_result_type = self.get_global_iterator_return_result_type.clone();
+        let get_global_iterator_return_result_type =
+            self.get_global_iterator_return_result_type.clone();
         let global_return = get_global_iterator_return_result_type(self);
         if self.is_reference_to_type(t, global_return) {
             let arg = self.get_type_arguments(t)[0];
-            return IterationTypes { yield_type: TypeId::NIL, return_type: arg, next_type: TypeId::NIL };
+            return IterationTypes {
+                yield_type: TypeId::NIL,
+                return_type: arg,
+                next_type: TypeId::NIL,
+            };
         }
         // Choose any constituents that can produce the requested iteration type.
-        let yield_iterator_result = self.filter_type(t, &mut |c: &mut Checker, t: TypeId| c.is_yield_iterator_result(t));
+        let yield_iterator_result = self.filter_type(t, &mut |c: &mut Checker, t: TypeId| {
+            c.is_yield_iterator_result(t)
+        });
         let mut yield_type = TypeId::NIL;
         if yield_iterator_result != self.never_type {
-            yield_type = self.get_type_of_property_of_type(yield_iterator_result, "value" /* as __String */);
+            yield_type = self.get_type_of_property_of_type(
+                yield_iterator_result,
+                "value", /* as __String */
+            );
         }
-        let return_iterator_result = self.filter_type(t, &mut |c: &mut Checker, t: TypeId| c.is_return_iterator_result(t));
+        let return_iterator_result = self.filter_type(t, &mut |c: &mut Checker, t: TypeId| {
+            c.is_return_iterator_result(t)
+        });
         let mut return_type = TypeId::NIL;
         if return_iterator_result != self.never_type {
-            return_type = self.get_type_of_property_of_type(return_iterator_result, "value" /* as __String */);
+            return_type = self.get_type_of_property_of_type(
+                return_iterator_result,
+                "value", /* as __String */
+            );
         }
         if yield_type.is_nil() && return_type.is_nil() {
-            return IterationTypes { yield_type: TypeId::NIL, return_type: TypeId::NIL, next_type: TypeId::NIL };
+            return IterationTypes {
+                yield_type: TypeId::NIL,
+                return_type: TypeId::NIL,
+                next_type: TypeId::NIL,
+            };
         }
         // From https://tc39.github.io/ecma262/#sec-iteratorresult-interface
         // > ... If the iterator does not have a return value, `value` is `undefined`. In that case, the
         // > `value` property may be absent from the conforming object if it does not inherit an explicit
         // > `value` property.
-        let return_type = if return_type.is_some() { return_type } else { self.void_type };
-        IterationTypes { yield_type, return_type, next_type: TypeId::NIL }
+        let return_type = if return_type.is_some() {
+            return_type
+        } else {
+            self.void_type
+        };
+        IterationTypes {
+            yield_type,
+            return_type,
+            next_type: TypeId::NIL,
+        }
     }
 
     // Go: checker/checker.go:6659 isYieldIteratorResult
@@ -70,13 +106,26 @@ impl Checker {
         // > If the end was not reached `done` is `false` and a value is available.
         // > If a `done` property (either own or inherited) does not exist, it is consider to have the value `false`.
         let done = self.get_type_of_property_of_type(t, "done");
-        let done_type = if done.is_some() { done } else { self.false_type };
-        let source = if kind == IterationTypeKind::YIELD { self.false_type } else { self.true_type };
+        let done_type = if done.is_some() {
+            done
+        } else {
+            self.false_type
+        };
+        let source = if kind == IterationTypeKind::YIELD {
+            self.false_type
+        } else {
+            self.true_type
+        };
         self.is_type_assignable_to(source, done_type)
     }
 
     // Go: checker/checker.go:6676 reportTypeNotIterableError
-    pub fn report_type_not_iterable_error(&mut self, error_node: Node, t: TypeId, allow_async_iterables: bool) -> Diagnostic {
+    pub fn report_type_not_iterable_error(
+        &mut self,
+        error_node: Node,
+        t: TypeId,
+        allow_async_iterables: bool,
+    ) -> Diagnostic {
         let message: &'static ts_diagnostics::Message = if allow_async_iterables {
             diag::Type_0_must_have_a_Symbol_asyncIterator_method_that_returns_an_async_iterator
         } else {
@@ -87,14 +136,17 @@ impl Checker {
                 && is_for_of_statement(error_node.parent())
                 && error_node.parent().expression() == error_node
                 && {
-                    let get_global_async_iterable_type = self.get_global_async_iterable_type.clone();
+                    let get_global_async_iterable_type =
+                        self.get_global_async_iterable_type.clone();
                     get_global_async_iterable_type(self) != self.empty_generic_type
                 }
                 && {
-                    let get_global_async_iterable_type = self.get_global_async_iterable_type.clone();
+                    let get_global_async_iterable_type =
+                        self.get_global_async_iterable_type.clone();
                     let global = get_global_async_iterable_type(self);
                     let any = self.any_type;
-                    let target = self.create_type_from_generic_global_type(global, &[any, any, any]);
+                    let target =
+                        self.create_type_from_generic_global_type(global, &[any, any, any]);
                     self.is_type_assignable_to(t, target)
                 });
         let type_string = self.type_to_string_exported(t);
@@ -108,7 +160,12 @@ impl Checker {
         input_type: TypeId,
         allows_strings: bool,
     ) -> (&'static ts_diagnostics::Message, bool) {
-        let yield_type = self.get_iteration_type_of_iterable(use_, IterationTypeKind::YIELD, input_type, Node::NIL /*errorNode*/);
+        let yield_type = self.get_iteration_type_of_iterable(
+            use_,
+            IterationTypeKind::YIELD,
+            input_type,
+            Node::NIL, /*errorNode*/
+        );
         if yield_type.is_some() {
             return (diag::Type_0_can_only_be_iterated_through_when_using_the_downlevelIteration_flag_or_with_a_target_of_es2015_or_higher, false);
         }
@@ -155,22 +212,39 @@ impl Checker {
         // otherwise it will conflict with some local declaration). Note that in addition to normal flags we include matching SymbolFlags.Export*
         // in order to prevent collisions with declarations that were exported from the current module (they still contribute to local names).
         let export_symbol = self.sym(symbol).export_symbol;
-        symbol = self.get_merged_symbol(if export_symbol.is_some() { export_symbol } else { symbol });
+        symbol = self.get_merged_symbol(if export_symbol.is_some() {
+            export_symbol
+        } else {
+            symbol
+        });
         let target_flags = self.get_symbol_flags(target);
         // A type-only import/export will already have a grammar error in a JS file, so no need to issue more errors within
-        if is_in_js_file(node) && !target_flags.intersects(SymbolFlags::VALUE) && !is_type_only_import_or_export_declaration(node) {
+        if is_in_js_file(node)
+            && !target_flags.intersects(SymbolFlags::VALUE)
+            && !is_type_only_import_or_export_declaration(node)
+        {
             let property_name_or_name = node.property_name_or_name();
-            let error_node = if property_name_or_name.is_some() { property_name_or_name } else { node };
+            let error_node = if property_name_or_name.is_some() {
+                property_name_or_name
+            } else {
+                node
+            };
             debug_assert!(node.kind() != SyntaxKind::NamespaceExport);
             if is_export_specifier(node) {
                 // PORT: Go mutates the diagnostic returned by `c.error` after it
                 // was added. `Diagnostic` is owned here, so this builds it,
                 // adds the related info, then adds it (the same steps as `c.error`).
-                let mut diagnostic = new_diagnostic_for_node(error_node, diag::Types_cannot_appear_in_export_declarations_in_JavaScript_files, args![]);
+                let mut diagnostic = new_diagnostic_for_node(
+                    error_node,
+                    diag::Types_cannot_appear_in_export_declarations_in_JavaScript_files,
+                    args![],
+                );
                 let source_symbol = get_source_file_of_node(node).symbol();
                 if source_symbol.is_some() {
                     let exports = self.sym(source_symbol).exports;
-                    let already_exported_symbol = self.symbols.get(exports, node.property_name_or_name().text());
+                    let already_exported_symbol = self
+                        .symbols
+                        .get(exports, node.property_name_or_name().text());
                     if already_exported_symbol == target {
                         let exporting_declaration = self
                             .sym(already_exported_symbol)
@@ -196,10 +270,12 @@ impl Checker {
                     identifier_text = error_node.text().to_string();
                 }
                 let mut specifier_text = "...".to_string();
-                let import_declaration =
-                    find_ancestor(node, |n: Node| is_import_or_import_equals_declaration(n) || is_variable_declaration(n));
+                let import_declaration = find_ancestor(node, |n: Node| {
+                    is_import_or_import_equals_declaration(n) || is_variable_declaration(n)
+                });
                 if import_declaration.is_some() {
-                    let module_specifier = try_get_module_specifier_from_declaration(import_declaration);
+                    let module_specifier =
+                        try_get_module_specifier_from_declaration(import_declaration);
                     if module_specifier.is_some() {
                         specifier_text = module_specifier.text().to_string();
                     }
@@ -217,12 +293,20 @@ impl Checker {
             return;
         }
         let symbol_flags = self.sym(symbol).flags;
-        let excluded_meanings = (if symbol_flags.intersects(SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE) {
-            SymbolFlags::VALUE
-        } else {
-            SymbolFlags::NONE
-        }) | (if symbol_flags.intersects(SymbolFlags::TYPE) { SymbolFlags::TYPE } else { SymbolFlags::NONE })
-            | (if symbol_flags.intersects(SymbolFlags::NAMESPACE) { SymbolFlags::NAMESPACE } else { SymbolFlags::NONE });
+        let excluded_meanings =
+            (if symbol_flags.intersects(SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE) {
+                SymbolFlags::VALUE
+            } else {
+                SymbolFlags::NONE
+            }) | (if symbol_flags.intersects(SymbolFlags::TYPE) {
+                SymbolFlags::TYPE
+            } else {
+                SymbolFlags::NONE
+            }) | (if symbol_flags.intersects(SymbolFlags::NAMESPACE) {
+                SymbolFlags::NAMESPACE
+            } else {
+                SymbolFlags::NONE
+            });
         if target_flags.intersects(excluded_meanings) {
             let message = if is_export_specifier(node) {
                 diag::Export_declaration_conflicts_with_exported_declaration_of_0
@@ -236,7 +320,9 @@ impl Checker {
             // here because 'verbatimModuleSyntax' will already have an error for importing a type without 'import type'.
             let appears_valuey_to_transpiler = self.compiler_options.isolated_modules.is_true()
                 && find_ancestor(node, is_type_only_import_or_export_declaration).is_nil();
-            if appears_valuey_to_transpiler && symbol_flags.intersects(SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE) {
+            if appears_valuey_to_transpiler
+                && symbol_flags.intersects(SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE)
+            {
                 let symbol_string = self.symbol_to_string(symbol);
                 let flag_name = self.get_isolated_modules_like_flag_name();
                 self.error(
@@ -254,10 +340,18 @@ impl Checker {
             let is_type = !target_flags.intersects(SymbolFlags::VALUE);
             if is_type || type_only_alias.is_some() {
                 match node.kind() {
-                    SyntaxKind::ImportClause | SyntaxKind::ImportSpecifier | SyntaxKind::ImportEqualsDeclaration => {
+                    SyntaxKind::ImportClause
+                    | SyntaxKind::ImportSpecifier
+                    | SyntaxKind::ImportEqualsDeclaration => {
                         if self.compiler_options.verbatim_module_syntax.is_true() {
-                            debug_assert!(node.name().is_some(), "An ImportClause with a symbol should have a name");
-                            let message: &'static ts_diagnostics::Message = if self.compiler_options.verbatim_module_syntax.is_true()
+                            debug_assert!(
+                                node.name().is_some(),
+                                "An ImportClause with a symbol should have a name"
+                            );
+                            let message: &'static ts_diagnostics::Message = if self
+                                .compiler_options
+                                .verbatim_module_syntax
+                                .is_true()
                                 && is_internal_module_import_equals_declaration(node)
                             {
                                 diag::An_import_alias_cannot_resolve_to_a_type_or_type_only_declaration_when_verbatimModuleSyntax_is_enabled
@@ -294,8 +388,11 @@ impl Checker {
                         // The exception is that `import type { A } from './a'; export { A }` is allowed
                         // because single-file analysis can determine that the export should be dropped.
                         // PORT: Go `ast.GetSourceFileOfNode(nil)` returns nil.
-                        let type_only_alias_file =
-                            if type_only_alias.is_some() { get_source_file_of_node(type_only_alias) } else { Node::NIL };
+                        let type_only_alias_file = if type_only_alias.is_some() {
+                            get_source_file_of_node(type_only_alias)
+                        } else {
+                            Node::NIL
+                        };
                         if self.compiler_options.verbatim_module_syntax.is_true()
                             || type_only_alias_file != get_source_file_of_node(node)
                         {
@@ -329,13 +426,19 @@ impl Checker {
             if self.compiler_options.verbatim_module_syntax.is_true()
                 && !is_import_equals_declaration(node)
                 && !is_in_js_file(node)
-                && get_emit_module_format_of_file(get_source_file_of_node(node)) == ModuleKind::COMMON_JS
+                && get_emit_module_format_of_file(get_source_file_of_node(node))
+                    == ModuleKind::COMMON_JS
             {
-                self.error(node, get_verbatim_module_syntax_error_message(node), args![]);
+                self.error(
+                    node,
+                    get_verbatim_module_syntax_error_message(node),
+                    args![],
+                );
             } else if self.module_kind == ModuleKind::PRESERVE
                 && !is_import_equals_declaration(node)
                 && !is_variable_declaration(node)
-                && get_emit_module_format_of_file(get_source_file_of_node(node)) == ModuleKind::COMMON_JS
+                && get_emit_module_format_of_file(get_source_file_of_node(node))
+                    == ModuleKind::COMMON_JS
             {
                 // In `--module preserve`, ESM input syntax emits ESM output syntax, but there will be times
                 // when we look at the `impliedNodeFormat` of this file and decide it's CommonJS (i.e., currently,
@@ -359,21 +462,32 @@ impl Checker {
                 let redirect = get_project_reference_from_output_dts(
                     &source_file_info(get_source_file_of_node(const_enum_declaration)).path,
                 );
-                if const_enum_declaration.flags().intersects(NodeFlags::AMBIENT)
+                if const_enum_declaration
+                    .flags()
+                    .intersects(NodeFlags::AMBIENT)
                     && (match &redirect {
                         None => true,
-                        Some(redirect) => !redirect.resolved.compiler_options().should_preserve_const_enums(),
+                        Some(redirect) => !redirect
+                            .resolved
+                            .compiler_options()
+                            .should_preserve_const_enums(),
                     })
                 {
                     let flag_name = self.get_isolated_modules_like_flag_name();
-                    self.error(node, diag::Cannot_access_ambient_const_enums_when_0_is_enabled, args![flag_name]);
+                    self.error(
+                        node,
+                        diag::Cannot_access_ambient_const_enums_when_0_is_enabled,
+                        args![flag_name],
+                    );
                 }
             }
         }
         if is_import_specifier(node) {
             let target_symbol = self.resolve_alias_with_deprecation_check(symbol, node);
             // PORT: Go checks `targetSymbol.Declarations != nil`; an empty slice here.
-            if self.is_deprecated_symbol(target_symbol) && !self.sym(target_symbol).declarations.is_empty() {
+            if self.is_deprecated_symbol(target_symbol)
+                && !self.sym(target_symbol).declarations.is_empty()
+            {
                 let declarations = self.sym(target_symbol).declarations.clone();
                 let name = self.sym(target_symbol).name.clone();
                 self.add_deprecated_suggestion(node, &declarations, &name);
@@ -398,7 +512,8 @@ impl Checker {
             | ModifierFlags::ABSTRACT
             | ModifierFlags::READONLY
             | ModifierFlags::STATIC;
-        get_selected_modifier_flags(left, interesting_flags) == get_selected_modifier_flags(right, interesting_flags)
+        get_selected_modifier_flags(left, interesting_flags)
+            == get_selected_modifier_flags(right, interesting_flags)
     }
 
     // Go: checker/checker.go:6853 checkTypeAliasDeclaration
@@ -407,7 +522,11 @@ impl Checker {
         self.check_grammar_modifiers(node);
         self.check_type_name_is_reserved(node.name(), diag::Type_alias_name_cannot_be_0);
         if !self.container_allows_block_scoped_variable(node.parent()) {
-            self.grammar_error_on_node(node, diag::X_0_declarations_can_only_be_declared_inside_a_block, args!["type"]);
+            self.grammar_error_on_node(
+                node,
+                diag::X_0_declarations_can_only_be_declared_inside_a_block,
+                args!["type"],
+            );
         }
         self.check_exports_on_merged_declarations(node);
 
@@ -417,7 +536,12 @@ impl Checker {
         if type_node.is_some() && type_node.kind() == SyntaxKind::IntrinsicKeyword {
             let name_text = node.name().text();
             if !(type_parameters.is_empty() && name_text == "BuiltinIteratorReturn"
-                || type_parameters.len() == 1 && INTRINSIC_TYPE_KINDS.get(name_text).copied().unwrap_or(IntrinsicTypeKind::UNKNOWN) != IntrinsicTypeKind::UNKNOWN)
+                || type_parameters.len() == 1
+                    && INTRINSIC_TYPE_KINDS
+                        .get(name_text)
+                        .copied()
+                        .unwrap_or(IntrinsicTypeKind::UNKNOWN)
+                        != IntrinsicTypeKind::UNKNOWN)
             {
                 self.error(
                     type_node,
@@ -432,12 +556,16 @@ impl Checker {
     }
 
     // Go: checker/checker.go:6876 checkTypeNameIsReserved
-    pub fn check_type_name_is_reserved(&mut self, name: Node, message: &'static ts_diagnostics::Message) {
+    pub fn check_type_name_is_reserved(
+        &mut self,
+        name: Node,
+        message: &'static ts_diagnostics::Message,
+    ) {
         // TS 1.0 spec (April 2014): 3.6.1
         // The predefined type keywords are reserved and cannot be used as names of user defined types.
         match name.text() {
-            "any" | "unknown" | "never" | "number" | "bigint" | "boolean" | "string" | "symbol" | "void" | "object"
-            | "undefined" => {
+            "any" | "unknown" | "never" | "number" | "bigint" | "boolean" | "string" | "symbol"
+            | "void" | "object" | "undefined" => {
                 self.error(name, message, args![name.text()]);
             }
             _ => {}
@@ -467,36 +595,47 @@ impl Checker {
         let declarations = self.sym(symbol).declarations.clone();
         for &d in &declarations {
             let declaration_spaces = self.get_declaration_spaces(d);
-            let effective_declaration_flags =
-                self.get_effective_declaration_flags(d, ModifierFlags::EXPORT | ModifierFlags::DEFAULT);
+            let effective_declaration_flags = self
+                .get_effective_declaration_flags(d, ModifierFlags::EXPORT | ModifierFlags::DEFAULT);
             if effective_declaration_flags.intersects(ModifierFlags::EXPORT) {
                 if effective_declaration_flags.intersects(ModifierFlags::DEFAULT) {
-                    default_exported_declaration_spaces = DeclarationSpaces(default_exported_declaration_spaces.0 | declaration_spaces.0);
+                    default_exported_declaration_spaces = DeclarationSpaces(
+                        default_exported_declaration_spaces.0 | declaration_spaces.0,
+                    );
                 } else {
-                    exported_declaration_spaces = DeclarationSpaces(exported_declaration_spaces.0 | declaration_spaces.0);
+                    exported_declaration_spaces =
+                        DeclarationSpaces(exported_declaration_spaces.0 | declaration_spaces.0);
                 }
             } else {
-                non_exported_declaration_spaces = DeclarationSpaces(non_exported_declaration_spaces.0 | declaration_spaces.0);
+                non_exported_declaration_spaces =
+                    DeclarationSpaces(non_exported_declaration_spaces.0 | declaration_spaces.0);
             }
         }
         // Spaces for anything not declared a 'default export'.
-        let non_default_exported_declaration_spaces = exported_declaration_spaces.0 | non_exported_declaration_spaces.0;
-        let common_declaration_spaces_for_exports_and_locals = exported_declaration_spaces.0 & non_exported_declaration_spaces.0;
+        let non_default_exported_declaration_spaces =
+            exported_declaration_spaces.0 | non_exported_declaration_spaces.0;
+        let common_declaration_spaces_for_exports_and_locals =
+            exported_declaration_spaces.0 & non_exported_declaration_spaces.0;
         let common_declaration_spaces_for_default_and_non_default =
             default_exported_declaration_spaces.0 & non_default_exported_declaration_spaces;
-        if common_declaration_spaces_for_exports_and_locals != 0 || common_declaration_spaces_for_default_and_non_default != 0 {
+        if common_declaration_spaces_for_exports_and_locals != 0
+            || common_declaration_spaces_for_default_and_non_default != 0
+        {
             // declaration spaces for exported and non-exported declarations intersect
             for &d in &declarations {
                 let declaration_spaces = self.get_declaration_spaces(d);
                 let name = get_name_of_declaration(d);
                 // Only error on the declarations that contributed to the intersecting spaces.
-                if declaration_spaces.0 & common_declaration_spaces_for_default_and_non_default != 0 {
+                if declaration_spaces.0 & common_declaration_spaces_for_default_and_non_default != 0
+                {
                     self.error(
                         name,
                         diag::Merged_declaration_0_cannot_include_a_default_export_declaration_Consider_adding_a_separate_export_default_0_declaration_instead,
                         args![declaration_name_to_string(name)],
                     );
-                } else if declaration_spaces.0 & common_declaration_spaces_for_exports_and_locals != 0 {
+                } else if declaration_spaces.0 & common_declaration_spaces_for_exports_and_locals
+                    != 0
+                {
                     self.error(
                         name,
                         diag::Individual_declarations_in_merged_declaration_0_must_be_all_exported_or_all_local,
@@ -519,21 +658,33 @@ impl Checker {
             | SyntaxKind::JsDocTypedefTag
             | SyntaxKind::JsDocCallbackTag => return DeclarationSpaces::EXPORT_TYPE,
             SyntaxKind::ModuleDeclaration => {
-                if is_ambient_module(node) || get_module_instance_state(node) != ModuleInstanceState::NON_INSTANTIATED {
-                    return DeclarationSpaces(DeclarationSpaces::EXPORT_NAMESPACE.0 | DeclarationSpaces::EXPORT_VALUE.0);
+                if is_ambient_module(node)
+                    || get_module_instance_state(node) != ModuleInstanceState::NON_INSTANTIATED
+                {
+                    return DeclarationSpaces(
+                        DeclarationSpaces::EXPORT_NAMESPACE.0 | DeclarationSpaces::EXPORT_VALUE.0,
+                    );
                 }
                 return DeclarationSpaces::EXPORT_NAMESPACE;
             }
             SyntaxKind::ClassDeclaration | SyntaxKind::EnumDeclaration | SyntaxKind::EnumMember => {
-                return DeclarationSpaces(DeclarationSpaces::EXPORT_TYPE.0 | DeclarationSpaces::EXPORT_VALUE.0);
+                return DeclarationSpaces(
+                    DeclarationSpaces::EXPORT_TYPE.0 | DeclarationSpaces::EXPORT_VALUE.0,
+                );
             }
             SyntaxKind::SourceFile => {
                 return DeclarationSpaces(
-                    DeclarationSpaces::EXPORT_TYPE.0 | DeclarationSpaces::EXPORT_VALUE.0 | DeclarationSpaces::EXPORT_NAMESPACE.0,
+                    DeclarationSpaces::EXPORT_TYPE.0
+                        | DeclarationSpaces::EXPORT_VALUE.0
+                        | DeclarationSpaces::EXPORT_NAMESPACE.0,
                 );
             }
             SyntaxKind::ExportAssignment | SyntaxKind::BinaryExpression => {
-                let expression = if is_export_assignment(node) { node.expression() } else { node.right() };
+                let expression = if is_export_assignment(node) {
+                    node.expression()
+                } else {
+                    node.right()
+                };
                 // Export assigned entity name expressions act as aliases and should fall through, otherwise they export values.
                 if !is_entity_name_expression(expression) || {
                     let s = self.get_symbol_of_declaration(node);
@@ -544,14 +695,18 @@ impl Checker {
                 // The below options all declare an Alias, which is allowed to merge with other values within the importing module.
                 resolve_alias_spaces = true;
             }
-            SyntaxKind::ImportEqualsDeclaration | SyntaxKind::NamespaceImport | SyntaxKind::ImportClause => {
+            SyntaxKind::ImportEqualsDeclaration
+            | SyntaxKind::NamespaceImport
+            | SyntaxKind::ImportClause => {
                 resolve_alias_spaces = true;
             }
             SyntaxKind::VariableDeclaration
             | SyntaxKind::BindingElement
             | SyntaxKind::FunctionDeclaration
             | SyntaxKind::ImportSpecifier => return DeclarationSpaces::EXPORT_VALUE,
-            SyntaxKind::MethodSignature | SyntaxKind::PropertySignature => return DeclarationSpaces::EXPORT_TYPE,
+            SyntaxKind::MethodSignature | SyntaxKind::PropertySignature => {
+                return DeclarationSpaces::EXPORT_TYPE;
+            }
             _ => {}
         }
         if resolve_alias_spaces {
@@ -575,13 +730,25 @@ impl Checker {
             let default_type_node = node.default_type();
             if default_type_node.is_some() {
                 seen_default = true;
-                self.check_type_parameters_not_referenced(default_type_node, type_parameter_declarations, i as i32);
+                self.check_type_parameters_not_referenced(
+                    default_type_node,
+                    type_parameter_declarations,
+                    i as i32,
+                );
             } else if seen_default {
-                self.error(node, diag::Required_type_parameters_may_not_follow_optional_type_parameters, args![]);
+                self.error(
+                    node,
+                    diag::Required_type_parameters_may_not_follow_optional_type_parameters,
+                    args![],
+                );
             }
             for j in 0..i {
                 if type_parameter_declarations[j].symbol() == node.symbol() {
-                    self.error(node.name(), diag::Duplicate_identifier_0, args![declaration_name_to_string(node.name())]);
+                    self.error(
+                        node.name(),
+                        diag::Duplicate_identifier_0,
+                        args![declaration_name_to_string(node.name())],
+                    );
                 }
             }
         }
@@ -589,7 +756,12 @@ impl Checker {
 
     // Check that type parameter defaults only reference previously declared type parameters */
     // Go: checker/checker.go:6997 checkTypeParametersNotReferenced
-    pub fn check_type_parameters_not_referenced(&mut self, root: Node, type_parameters: &[Node], index: i32) {
+    pub fn check_type_parameters_not_referenced(
+        &mut self,
+        root: Node,
+        type_parameters: &[Node],
+        index: i32,
+    ) {
         fn visit(c: &mut Checker, node: Node, type_parameters: &[Node], index: i32) -> bool {
             if is_type_reference_node(node) {
                 let t = c.get_type_from_type_reference(node);
@@ -668,7 +840,11 @@ impl Checker {
 
     // Go: checker/checker.go:7048 isReferenced
     pub fn is_referenced(&mut self, symbol: SymbolId) -> bool {
-        !self.symbol_reference_links.get(symbol).reference_kinds.is_empty()
+        !self
+            .symbol_reference_links
+            .get(symbol)
+            .reference_kinds
+            .is_empty()
     }
 
     // PORT: Go `type UnusedKind` and its consts are generated in `crate::flags`.
@@ -678,13 +854,20 @@ impl Checker {
         while is_binding_element(location) || is_binding_pattern(location) {
             location = location.parent();
         }
-        let kind = if is_parameter_declaration(location) { UnusedKind::PARAMETER } else { UnusedKind::LOCAL };
+        let kind = if is_parameter_declaration(location) {
+            UnusedKind::PARAMETER
+        } else {
+            UnusedKind::LOCAL
+        };
         self.report_unused(location, kind, diagnostic);
     }
 
     // Go: checker/checker.go:7066 reportUnused
     pub fn report_unused(&mut self, location: Node, kind: UnusedKind, diagnostic: Diagnostic) {
-        if !location.flags().intersects(NodeFlags::AMBIENT | NodeFlags::THIS_NODE_OR_ANY_SUB_NODES_HAS_ERROR) {
+        if !location
+            .flags()
+            .intersects(NodeFlags::AMBIENT | NodeFlags::THIS_NODE_OR_ANY_SUB_NODES_HAS_ERROR)
+        {
             let is_error = self.unused_is_error(kind);
             if is_error {
                 self.add_diagnostic(diagnostic);
@@ -715,7 +898,12 @@ impl Checker {
                 | SyntaxKind::PropertyDeclaration
                 | SyntaxKind::GetAccessor
                 | SyntaxKind::SetAccessor => {
-                    if is_set_accessor_declaration(member) && self.sym(member.symbol()).flags.intersects(SymbolFlags::GET_ACCESSOR) {
+                    if is_set_accessor_declaration(member)
+                        && self
+                            .sym(member.symbol())
+                            .flags
+                            .intersects(SymbolFlags::GET_ACCESSOR)
+                    {
                         continue; // Already would have reported an error on the getter.
                     }
                     let symbol = self.get_symbol_of_declaration(member);
@@ -728,13 +916,19 @@ impl Checker {
                         self.report_unused(
                             member,
                             UnusedKind::LOCAL,
-                            new_diagnostic_for_node(member.name(), diag::X_0_is_declared_but_its_value_is_never_read, args![symbol_string]),
+                            new_diagnostic_for_node(
+                                member.name(),
+                                diag::X_0_is_declared_but_its_value_is_never_read,
+                                args![symbol_string],
+                            ),
                         );
                     }
                 }
                 SyntaxKind::Constructor => {
                     for parameter in member.parameters().to_vec() {
-                        if !self.is_referenced(parameter.symbol()) && has_syntactic_modifier(parameter, ModifierFlags::PRIVATE) {
+                        if !self.is_referenced(parameter.symbol())
+                            && has_syntactic_modifier(parameter, ModifierFlags::PRIVATE)
+                        {
                             let name = symbol_name(&self.symbols, parameter.symbol());
                             self.report_unused(
                                 parameter,
@@ -770,7 +964,8 @@ impl Checker {
             let local_flags = self.sym(local).flags;
             let local_export_symbol = self.sym(local).export_symbol;
             if local_flags.intersects(SymbolFlags::TYPE_PARAMETER)
-                && (!local_flags.intersects(SymbolFlags::VARIABLE) || reference_kinds.intersects(SymbolFlags::VARIABLE))
+                && (!local_flags.intersects(SymbolFlags::VARIABLE)
+                    || reference_kinds.intersects(SymbolFlags::VARIABLE))
                 || !local_flags.intersects(SymbolFlags::TYPE_PARAMETER)
                     && (!reference_kinds.is_empty()
                         || local_export_symbol.is_some()
@@ -780,14 +975,25 @@ impl Checker {
             }
             let declarations = self.sym(local).declarations.clone();
             for declaration in declarations {
-                if is_variable_declaration(declaration) || is_parameter_declaration(declaration) || is_binding_element(declaration) {
+                if is_variable_declaration(declaration)
+                    || is_parameter_declaration(declaration)
+                    || is_binding_element(declaration)
+                {
                     variable_parents.insert(get_root_declaration(declaration).parent());
-                } else if is_import_clause(declaration) || is_import_specifier(declaration) || is_namespace_import(declaration) {
+                } else if is_import_clause(declaration)
+                    || is_import_specifier(declaration)
+                    || is_namespace_import(declaration)
+                {
                     if !is_identifier_that_starts_with_underscore(declaration.name()) {
                         let import_clause = import_clause_from_imported(declaration);
-                        import_clauses.entry(import_clause).or_default().push(declaration);
+                        import_clauses
+                            .entry(import_clause)
+                            .or_default()
+                            .push(declaration);
                     }
-                } else if !is_type_parameter_declaration(declaration) && !is_ambient_module(declaration) {
+                } else if !is_type_parameter_declaration(declaration)
+                    && !is_ambient_module(declaration)
+                {
                     let name = symbol_name(&self.symbols, local);
                     self.report_unused_local(declaration, &name);
                 }
@@ -814,14 +1020,21 @@ impl Checker {
         };
         let node_name = node.name();
         let location = if node_name.is_some() { node_name } else { node };
-        self.report_unused(node, UnusedKind::LOCAL, new_diagnostic_for_node(location, message, args![name]));
+        self.report_unused(
+            node,
+            UnusedKind::LOCAL,
+            new_diagnostic_for_node(location, message, args![name]),
+        );
     }
 
     // Go: checker/checker.go:7161 reportUnusedVariables
     pub fn report_unused_variables(&mut self, node: Node) {
         let declarations = node.declarations().nodes().to_vec();
         if declarations.len() > 1 && self.every_unreferenced_variable_declaration(&declarations) {
-            self.report_unused_variable(node, new_diagnostic_for_node(node, diag::All_variables_are_unused, args![]));
+            self.report_unused_variable(
+                node,
+                new_diagnostic_for_node(node, diag::All_variables_are_unused, args![]),
+            );
         } else {
             self.report_unused_variable_declarations(&declarations);
         }
@@ -847,7 +1060,10 @@ impl Checker {
     pub fn report_unused_binding_elements(&mut self, node: Node) {
         let declarations = node.elements().to_vec();
         if declarations.len() > 1 && self.every_unreferenced_variable_declaration(&declarations) {
-            self.report_unused_variable(node, new_diagnostic_for_node(node, diag::All_destructured_elements_are_unused, args![]));
+            self.report_unused_variable(
+                node,
+                new_diagnostic_for_node(node, diag::All_destructured_elements_are_unused, args![]),
+            );
         } else {
             self.report_unused_variable_declarations(&declarations);
         }
@@ -857,13 +1073,20 @@ impl Checker {
     pub fn report_unused_variable_declarations(&mut self, declarations: &[Node]) {
         for &declaration in declarations {
             let name = declaration.name();
-            if name.is_some() && !is_parameter_property_declaration(declaration, declaration.parent()) && !is_this_parameter(declaration) {
+            if name.is_some()
+                && !is_parameter_property_declaration(declaration, declaration.parent())
+                && !is_this_parameter(declaration)
+            {
                 if is_binding_pattern(name) {
                     self.report_unused_binding_elements(name);
                 } else if self.is_unreferenced_variable_declaration(declaration) {
                     self.report_unused_variable(
                         declaration,
-                        new_diagnostic_for_node(name, diag::X_0_is_declared_but_its_value_is_never_read, args![name.text()]),
+                        new_diagnostic_for_node(
+                            name,
+                            diag::X_0_is_declared_but_its_value_is_never_read,
+                            args![name.text()],
+                        ),
                     );
                 }
             }
@@ -881,13 +1104,22 @@ impl Checker {
             return self.every_unreferenced_variable_declaration(&elements);
         }
         let symbol = self.get_symbol_of_declaration(node);
-        if self.symbol_reference_links.get(symbol).reference_kinds.intersects(SymbolFlags::VARIABLE) {
+        if self
+            .symbol_reference_links
+            .get(symbol)
+            .reference_kinds
+            .intersects(SymbolFlags::VARIABLE)
+        {
             return false;
         }
         if is_binding_element(node) && is_object_binding_pattern(node.parent()) {
             // In `{ a, ...b }, `a` is considered used since it removes a property from `b`. `b` may still be unused though.
             let elements = node.parent().elements();
-            let last_element = if elements.is_empty() { Node::NIL } else { elements.get(elements.len() - 1) };
+            let last_element = if elements.is_empty() {
+                Node::NIL
+            } else {
+                elements.get(elements.len() - 1)
+            };
             if node != last_element && has_dot_dot_dot_token(last_element) {
                 return false;
             }
@@ -895,8 +1127,11 @@ impl Checker {
         if (is_parameter_declaration(node)
             || is_variable_declaration(node)
                 && (is_for_in_or_of_statement(node.parent().parent())
-                    || self.get_combined_node_flags_cached(node).intersects(NodeFlags::USING))
-            || is_binding_element(node) && !(is_object_binding_pattern(node.parent()) && node.property_name().is_nil()))
+                    || self
+                        .get_combined_node_flags_cached(node)
+                        .intersects(NodeFlags::USING))
+            || is_binding_element(node)
+                && !(is_object_binding_pattern(node.parent()) && node.property_name().is_nil()))
             && is_identifier_that_starts_with_underscore(name)
         {
             return false;
@@ -919,7 +1154,11 @@ impl Checker {
             self.report_unused(
                 node,
                 UnusedKind::LOCAL,
-                new_diagnostic_for_node(node.parent(), diag::All_imports_in_import_declaration_are_unused, args![]),
+                new_diagnostic_for_node(
+                    node.parent(),
+                    diag::All_imports_in_import_declaration_are_unused,
+                    args![],
+                ),
             );
         } else {
             for &unused in unuseds {
@@ -953,7 +1192,11 @@ impl Checker {
             self.report_unused(
                 node,
                 UnusedKind::PARAMETER,
-                new_diagnostic_for_node(type_parameter.name(), diag::X_0_is_declared_but_never_used, args![name]),
+                new_diagnostic_for_node(
+                    type_parameter.name(),
+                    diag::X_0_is_declared_but_never_used,
+                    args![name],
+                ),
             );
         }
     }
@@ -995,7 +1238,11 @@ impl Checker {
                     self.report_unused(
                         node,
                         UnusedKind::PARAMETER,
-                        new_diagnostic_for_node(type_parameter, diag::X_0_is_declared_but_never_used, args![name]),
+                        new_diagnostic_for_node(
+                            type_parameter,
+                            diag::X_0_is_declared_but_never_used,
+                            args![name],
+                        ),
                     );
                 }
             }
@@ -1005,7 +1252,11 @@ impl Checker {
     // Go: checker/checker.go:7285 isUnreferencedTypeParameter
     pub fn is_unreferenced_type_parameter(&mut self, type_parameter: Node) -> bool {
         let symbol = self.get_merged_symbol(type_parameter.symbol());
-        !self.symbol_reference_links.get(symbol).reference_kinds.intersects(SymbolFlags::TYPE_PARAMETER)
+        !self
+            .symbol_reference_links
+            .get(symbol)
+            .reference_kinds
+            .intersects(SymbolFlags::TYPE_PARAMETER)
             && !is_identifier_that_starts_with_underscore(type_parameter.name())
     }
 
@@ -1014,7 +1265,12 @@ impl Checker {
         let nodes = self.renamed_binding_elements_in_types.clone();
         for node in nodes {
             let symbol = self.get_symbol_of_declaration(node);
-            if self.symbol_reference_links.get(symbol).reference_kinds.is_empty() {
+            if self
+                .symbol_reference_links
+                .get(symbol)
+                .reference_kinds
+                .is_empty()
+            {
                 let wrapping_declaration = walk_up_binding_elements_and_patterns(node);
                 debug_assert!(
                     is_part_of_parameter_declaration(wrapping_declaration),
@@ -1095,11 +1351,15 @@ impl Checker {
                 return self.get_return_type_of_single_non_generic_signature_of_call_chain(expr);
             }
             let func_type = self.check_non_null_expression(expr.expression());
-            return self.get_return_type_of_single_non_generic_signature(func_type, SignatureKind::CALL);
+            return self
+                .get_return_type_of_single_non_generic_signature(func_type, SignatureKind::CALL);
         }
         if is_new_expression(expr) {
             let func_type = self.check_non_null_expression(expr.expression());
-            return self.get_return_type_of_single_non_generic_signature(func_type, SignatureKind::CONSTRUCT);
+            return self.get_return_type_of_single_non_generic_signature(
+                func_type,
+                SignatureKind::CONSTRUCT,
+            );
         }
         if is_assertion_expression(expr) && !is_const_type_reference(expr.type_()) {
             return self.get_type_from_type_node(expr.type_());
@@ -1111,7 +1371,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:7362 getReturnTypeOfSingleNonGenericSignature
-    pub fn get_return_type_of_single_non_generic_signature(&mut self, func_type: TypeId, kind: SignatureKind) -> TypeId {
+    pub fn get_return_type_of_single_non_generic_signature(
+        &mut self,
+        func_type: TypeId,
+        kind: SignatureKind,
+    ) -> TypeId {
         let signature = self.get_single_signature(func_type, kind, true /*allowMembers*/);
         if signature.is_some() && self.sig(signature).type_parameters.is_empty() {
             return self.get_return_type_of_signature(signature);
@@ -1120,12 +1384,20 @@ impl Checker {
     }
 
     // Go: checker/checker.go:7370 getReturnTypeOfSingleNonGenericSignatureOfCallChain
-    pub fn get_return_type_of_single_non_generic_signature_of_call_chain(&mut self, expr: Node) -> TypeId {
+    pub fn get_return_type_of_single_non_generic_signature_of_call_chain(
+        &mut self,
+        expr: Node,
+    ) -> TypeId {
         let func_type = self.check_expression(expr.expression());
         let non_optional_type = self.get_optional_expression_type(func_type, expr.expression());
-        let return_type = self.get_return_type_of_single_non_generic_signature(func_type, SignatureKind::CALL);
+        let return_type =
+            self.get_return_type_of_single_non_generic_signature(func_type, SignatureKind::CALL);
         if return_type.is_some() {
-            return self.propagate_optional_type_marker(return_type, expr, non_optional_type != func_type);
+            return self.propagate_optional_type_marker(
+                return_type,
+                expr,
+                non_optional_type != func_type,
+            );
         }
         TypeId::NIL
     }
@@ -1138,9 +1410,13 @@ impl Checker {
 
     // Go: checker/checker.go:7384 checkNonNullType
     pub fn check_non_null_type(&mut self, t: TypeId, node: Node) -> TypeId {
-        self.check_non_null_type_with_reporter(t, node, &mut |c: &mut Checker, n: Node, facts: TypeFacts| {
-            c.report_object_possibly_null_or_undefined_error(n, facts)
-        })
+        self.check_non_null_type_with_reporter(
+            t,
+            node,
+            &mut |c: &mut Checker, n: Node, facts: TypeFacts| {
+                c.report_object_possibly_null_or_undefined_error(n, facts)
+            },
+        )
     }
 
     // Go: checker/checker.go:7388 checkNonNullTypeWithReporter
@@ -1167,7 +1443,11 @@ impl Checker {
         if facts.intersects(TypeFacts::IS_UNDEFINED_OR_NULL) {
             report_error(self, node, facts);
             let non_nullable = self.get_non_nullable_type(t);
-            if self.ty(non_nullable).flags.intersects(TypeFlags::NULLABLE | TypeFlags::NEVER) {
+            if self
+                .ty(non_nullable)
+                .flags
+                .intersects(TypeFlags::NULLABLE | TypeFlags::NEVER)
+            {
                 return self.error_type;
             }
             return non_nullable;
@@ -1183,7 +1463,11 @@ impl Checker {
                 // PORT: checker `entityNameToString(node)`, see above.
                 let node_text = entity_name_to_string(node, Some(&get_text_of_node));
                 if is_identifier(node) && node_text == "undefined" {
-                    self.error(node, diag::The_value_0_cannot_be_used_here, args![node_text]);
+                    self.error(
+                        node,
+                        diag::The_value_0_cannot_be_used_here,
+                        args![node_text],
+                    );
                     return non_null_type;
                 }
                 if node_text.len() < 100 {
@@ -1209,7 +1493,11 @@ impl Checker {
         }
         if !node_text.is_empty() && node_text.len() < 100 {
             if is_identifier(node) && node_text == "undefined" {
-                self.error(node, diag::The_value_0_cannot_be_used_here, args!["undefined"]);
+                self.error(
+                    node,
+                    diag::The_value_0_cannot_be_used_here,
+                    args!["undefined"],
+                );
                 return;
             }
             let message = if facts.intersects(TypeFacts::IS_UNDEFINED) {
@@ -1247,19 +1535,31 @@ impl Checker {
         let context_node = self.get_context_node(node);
         self.push_contextual_type(context_node, contextual_type, false /*isCache*/);
         self.push_inference_context(context_node, inference_context);
-        let inferential = if inference_context.is_some() { CheckMode::INFERENTIAL } else { CheckMode::NORMAL };
-        let mut t = self.check_expression_ex(node, check_mode | CheckMode::CONTEXTUAL | inferential);
+        let inferential = if inference_context.is_some() {
+            CheckMode::INFERENTIAL
+        } else {
+            CheckMode::NORMAL
+        };
+        let mut t =
+            self.check_expression_ex(node, check_mode | CheckMode::CONTEXTUAL | inferential);
         // In CheckMode.Inferential we collect intra-expression inference sites to process before fixing any type
         // parameters. This information is no longer needed after the call to checkExpression.
         // PORT: Go sets the slice to nil; an empty Vec is the Rust nil.
-        if inference_context.is_some() && !self.inference_context(inference_context).intra_expression_inference_sites.is_empty() {
-            self.inference_context_mut(inference_context).intra_expression_inference_sites = Vec::new();
+        if inference_context.is_some()
+            && !self
+                .inference_context(inference_context)
+                .intra_expression_inference_sites
+                .is_empty()
+        {
+            self.inference_context_mut(inference_context)
+                .intra_expression_inference_sites = Vec::new();
         }
         // We strip literal freshness when an appropriate contextual type is present such that contextually typed
         // literals always preserve their literal types (otherwise they might widen during type inference). An alternative
         // here would be to not mark contextually typed literals as fresh in the first place.
         if self.maybe_type_of_kind(t, TypeFlags::LITERAL) && {
-            let instantiated = self.instantiate_contextual_type(contextual_type, node, ContextFlags::NONE);
+            let instantiated =
+                self.instantiate_contextual_type(contextual_type, node, ContextFlags::NONE);
             self.is_literal_of_contextual_type(t, instantiated)
         } {
             t = self.get_regular_type_of_literal_type(t);

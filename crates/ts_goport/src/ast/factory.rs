@@ -63,7 +63,10 @@ impl NodeFactory {
     /// (`new_file_store`).
     #[must_use]
     pub fn for_file(store: usize) -> Self {
-        Self { target: NodeFactoryTarget::File(store), ..Self::default() }
+        Self {
+            target: NodeFactoryTarget::File(store),
+            ..Self::default()
+        }
     }
 
     /// Where this factory puts new nodes.
@@ -115,7 +118,10 @@ impl NodeFactory {
     // Go: ast/ast.go:67 NewNodeFactory
     #[must_use]
     pub fn new_with_hooks(hooks: NodeFactoryHooks) -> Self {
-        Self { hooks, ..Self::default() }
+        Self {
+            hooks,
+            ..Self::default()
+        }
     }
 
     /// Go `f.hooks`.
@@ -197,7 +203,12 @@ impl NodeFactory {
         if self.target == NodeFactoryTarget::Synthetic {
             set_synthetic_source_file_data(
                 node,
-                SyntheticSourceFileData { file_name, path: path.to_string(), text, ..Default::default() },
+                SyntheticSourceFileData {
+                    file_name,
+                    path: path.to_string(),
+                    text,
+                    ..Default::default()
+                },
             );
         }
         node
@@ -207,11 +218,20 @@ impl NodeFactory {
     /// endOfFileToken)` followed by `updated.copyFrom(node)`, the shared start
     /// of Go `UpdateSourceFile` and `SourceFile.Clone`. `node` is a parsed or
     /// factory SourceFile.
-    pub fn new_source_file_from(&self, node: Node, statements: NodeList, end_of_file_token: Node) -> Node {
+    pub fn new_source_file_from(
+        &self,
+        node: Node,
+        statements: NodeList,
+        end_of_file_token: Node,
+    ) -> Node {
         let (file_name, path, text) = if is_synthetic_node(node) {
             with_synthetic_source_file(node, |d| (d.file_name, d.path.clone(), d.text))
         } else {
-            (source_file_file_name(node), source_file_info(node).path.clone(), source_file_text(node))
+            (
+                source_file_file_name(node),
+                source_file_info(node).path.clone(),
+                source_file_text(node),
+            )
         };
         let updated = self.new_source_file(file_name, &path, text, statements, end_of_file_token);
         source_file_copy_from(updated, node);
@@ -270,7 +290,10 @@ impl NodeFactory {
     pub fn new_identifier(&self, text: impl Into<String>) -> Node {
         self.new_text_node(
             SyntaxKind::Identifier,
-            D::Identifier(Box::new(ts_ast::IdentifierData { flow_node: None, text: text.into() })),
+            D::Identifier(Box::new(ts_ast::IdentifierData {
+                flow_node: None,
+                text: text.into(),
+            })),
         )
     }
 
@@ -278,7 +301,9 @@ impl NodeFactory {
     pub fn new_private_identifier(&self, text: impl Into<String>) -> Node {
         self.new_text_node(
             SyntaxKind::PrivateIdentifier,
-            D::PrivateIdentifier(Box::new(ts_ast::PrivateIdentifierData { text: text.into() })),
+            D::PrivateIdentifier(Box::new(ts_ast::PrivateIdentifierData {
+                text: text.into(),
+            })),
         )
     }
 
@@ -299,7 +324,10 @@ impl NodeFactory {
     pub fn new_computed_property_name(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ComputedPropertyName,
-            D::ComputedPropertyName(Box::new(ts_ast::ComputedPropertyNameData { expression: self.id(expression), facts: 0 })),
+            D::ComputedPropertyName(Box::new(ts_ast::ComputedPropertyNameData {
+                expression: self.id(expression),
+                facts: 0,
+            })),
         )
     }
 
@@ -337,7 +365,11 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:3836 NewRegularExpressionLiteral
-    pub fn new_regular_expression_literal(&self, text: impl Into<String>, flags: TokenFlags) -> Node {
+    pub fn new_regular_expression_literal(
+        &self,
+        text: impl Into<String>,
+        flags: TokenFlags,
+    ) -> Node {
         self.new_text_node(
             SyntaxKind::RegularExpressionLiteral,
             D::RegularExpressionLiteral(Box::new(ts_ast::RegularExpressionLiteralData {
@@ -349,13 +381,19 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:3862 NewNoSubstitutionTemplateLiteral
     // PORT: Go sets no `RawText`; ts_ast stores an empty string for it.
-    pub fn new_no_substitution_template_literal(&self, text: impl Into<String>, template_flags: TokenFlags) -> Node {
+    pub fn new_no_substitution_template_literal(
+        &self,
+        text: impl Into<String>,
+        template_flags: TokenFlags,
+    ) -> Node {
         self.new_text_node(
             SyntaxKind::NoSubstitutionTemplateLiteral,
             D::NoSubstitutionTemplateLiteral(Box::new(ts_ast::NoSubstitutionTemplateLiteralData {
                 raw_text: String::new(),
                 symbol: None,
-                template_flags: token_flags(template_flags & TokenFlags::TEMPLATE_LITERAL_LIKE_FLAGS),
+                template_flags: token_flags(
+                    template_flags & TokenFlags::TEMPLATE_LITERAL_LIKE_FLAGS,
+                ),
                 text: text.into(),
                 token_flags: NO_TOKEN_FLAGS,
             })),
@@ -363,12 +401,19 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:6287 NewTemplateHead
-    pub fn new_template_head(&self, text: impl Into<String>, raw_text: impl Into<String>, template_flags: TokenFlags) -> Node {
+    pub fn new_template_head(
+        &self,
+        text: impl Into<String>,
+        raw_text: impl Into<String>,
+        template_flags: TokenFlags,
+    ) -> Node {
         self.new_text_node(
             SyntaxKind::TemplateHead,
             D::TemplateHead(Box::new(ts_ast::TemplateHeadData {
                 raw_text: raw_text.into(),
-                template_flags: token_flags(template_flags & TokenFlags::TEMPLATE_LITERAL_LIKE_FLAGS),
+                template_flags: token_flags(
+                    template_flags & TokenFlags::TEMPLATE_LITERAL_LIKE_FLAGS,
+                ),
                 text: text.into(),
                 token_flags: NO_TOKEN_FLAGS,
             })),
@@ -376,12 +421,19 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:6313 NewTemplateMiddle
-    pub fn new_template_middle(&self, text: impl Into<String>, raw_text: impl Into<String>, template_flags: TokenFlags) -> Node {
+    pub fn new_template_middle(
+        &self,
+        text: impl Into<String>,
+        raw_text: impl Into<String>,
+        template_flags: TokenFlags,
+    ) -> Node {
         self.new_text_node(
             SyntaxKind::TemplateMiddle,
             D::TemplateMiddle(Box::new(ts_ast::TemplateMiddleData {
                 raw_text: raw_text.into(),
-                template_flags: token_flags(template_flags & TokenFlags::TEMPLATE_LITERAL_LIKE_FLAGS),
+                template_flags: token_flags(
+                    template_flags & TokenFlags::TEMPLATE_LITERAL_LIKE_FLAGS,
+                ),
                 text: text.into(),
                 token_flags: NO_TOKEN_FLAGS,
             })),
@@ -389,12 +441,19 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:6339 NewTemplateTail
-    pub fn new_template_tail(&self, text: impl Into<String>, raw_text: impl Into<String>, template_flags: TokenFlags) -> Node {
+    pub fn new_template_tail(
+        &self,
+        text: impl Into<String>,
+        raw_text: impl Into<String>,
+        template_flags: TokenFlags,
+    ) -> Node {
         self.new_text_node(
             SyntaxKind::TemplateTail,
             D::TemplateTail(Box::new(ts_ast::TemplateTailData {
                 raw_text: raw_text.into(),
-                template_flags: token_flags(template_flags & TokenFlags::TEMPLATE_LITERAL_LIKE_FLAGS),
+                template_flags: token_flags(
+                    template_flags & TokenFlags::TEMPLATE_LITERAL_LIKE_FLAGS,
+                ),
                 text: text.into(),
                 token_flags: NO_TOKEN_FLAGS,
             })),
@@ -405,24 +464,40 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:5271 NewKeywordTypeNode
     pub fn new_keyword_type_node(&self, kind: SyntaxKind) -> Node {
-        self.new_node(kind, D::KeywordTypeNode(Box::new(ts_ast::KeywordTypeNodeData)))
+        self.new_node(
+            kind,
+            D::KeywordTypeNode(Box::new(ts_ast::KeywordTypeNodeData)),
+        )
     }
 
     // Go: ast/ast_generated.go:5308 NewUnionTypeNode
     pub fn new_union_type_node(&self, types: NodeList) -> Node {
-        self.new_node(SyntaxKind::UnionType, D::UnionTypeNode(Box::new(ts_ast::UnionTypeNodeData { types: self.req_list(types) })))
+        self.new_node(
+            SyntaxKind::UnionType,
+            D::UnionTypeNode(Box::new(ts_ast::UnionTypeNodeData {
+                types: self.req_list(types),
+            })),
+        )
     }
 
     // Go: ast/ast_generated.go:5346 NewIntersectionTypeNode
     pub fn new_intersection_type_node(&self, types: NodeList) -> Node {
         self.new_node(
             SyntaxKind::IntersectionType,
-            D::IntersectionTypeNode(Box::new(ts_ast::IntersectionTypeNodeData { types: self.req_list(types) })),
+            D::IntersectionTypeNode(Box::new(ts_ast::IntersectionTypeNodeData {
+                types: self.req_list(types),
+            })),
         )
     }
 
     // Go: ast/ast_generated.go:5388 NewConditionalTypeNode
-    pub fn new_conditional_type_node(&self, check_type: Node, extends_type: Node, true_type: Node, false_type: Node) -> Node {
+    pub fn new_conditional_type_node(
+        &self,
+        check_type: Node,
+        extends_type: Node,
+        true_type: Node,
+        false_type: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::ConditionalType,
             D::ConditionalTypeNode(Box::new(ts_ast::ConditionalTypeNodeData {
@@ -440,7 +515,10 @@ impl NodeFactory {
     pub fn new_type_operator_node(&self, operator: SyntaxKind, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::TypeOperator,
-            D::TypeOperatorNode(Box::new(ts_ast::TypeOperatorNodeData { operator, type_: self.id(type_node) })),
+            D::TypeOperatorNode(Box::new(ts_ast::TypeOperatorNodeData {
+                operator,
+                type_: self.id(type_node),
+            })),
         )
     }
 
@@ -448,7 +526,9 @@ impl NodeFactory {
     pub fn new_infer_type_node(&self, type_parameter: Node) -> Node {
         self.new_node(
             SyntaxKind::InferType,
-            D::InferTypeNode(Box::new(ts_ast::InferTypeNodeData { type_parameter: self.id(type_parameter) })),
+            D::InferTypeNode(Box::new(ts_ast::InferTypeNodeData {
+                type_parameter: self.id(type_parameter),
+            })),
         )
     }
 
@@ -456,7 +536,9 @@ impl NodeFactory {
     pub fn new_array_type_node(&self, element_type: Node) -> Node {
         self.new_node(
             SyntaxKind::ArrayType,
-            D::ArrayTypeNode(Box::new(ts_ast::ArrayTypeNodeData { element_type: self.id(element_type) })),
+            D::ArrayTypeNode(Box::new(ts_ast::ArrayTypeNodeData {
+                element_type: self.id(element_type),
+            })),
         )
     }
 
@@ -483,7 +565,11 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:5629 NewExpressionWithTypeArguments
-    pub fn new_expression_with_type_arguments(&self, expression: Node, type_arguments: NodeList) -> Node {
+    pub fn new_expression_with_type_arguments(
+        &self,
+        expression: Node,
+        type_arguments: NodeList,
+    ) -> Node {
         self.new_node(
             SyntaxKind::ExpressionWithTypeArguments,
             D::ExpressionWithTypeArguments(Box::new(ts_ast::ExpressionWithTypeArgumentsData {
@@ -496,16 +582,29 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:5668 NewLiteralTypeNode
     pub fn new_literal_type_node(&self, literal: Node) -> Node {
-        self.new_node(SyntaxKind::LiteralType, D::LiteralTypeNode(Box::new(ts_ast::LiteralTypeNodeData { literal: self.id(literal) })))
+        self.new_node(
+            SyntaxKind::LiteralType,
+            D::LiteralTypeNode(Box::new(ts_ast::LiteralTypeNodeData {
+                literal: self.id(literal),
+            })),
+        )
     }
 
     // Go: ast/ast_generated.go:5705 NewThisTypeNode
     pub fn new_this_type_node(&self) -> Node {
-        self.new_node(SyntaxKind::ThisType, D::ThisTypeNode(Box::new(ts_ast::ThisTypeNodeData)))
+        self.new_node(
+            SyntaxKind::ThisType,
+            D::ThisTypeNode(Box::new(ts_ast::ThisTypeNodeData)),
+        )
     }
 
     // Go: ast/ast_generated.go:5729 NewTypePredicateNode
-    pub fn new_type_predicate_node(&self, asserts_modifier: Node, parameter_name: Node, type_node: Node) -> Node {
+    pub fn new_type_predicate_node(
+        &self,
+        asserts_modifier: Node,
+        parameter_name: Node,
+        type_node: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::TypePredicate,
             D::TypePredicateNode(Box::new(ts_ast::TypePredicateNodeData {
@@ -557,17 +656,31 @@ impl NodeFactory {
     pub fn new_type_literal_node(&self, members: NodeList) -> Node {
         self.new_node(
             SyntaxKind::TypeLiteral,
-            D::TypeLiteralNode(Box::new(ts_ast::TypeLiteralNodeData { members: self.req_list(members), symbol: None })),
+            D::TypeLiteralNode(Box::new(ts_ast::TypeLiteralNodeData {
+                members: self.req_list(members),
+                symbol: None,
+            })),
         )
     }
 
     // Go: ast/ast_generated.go:5999 NewTupleTypeNode
     pub fn new_tuple_type_node(&self, elements: NodeList) -> Node {
-        self.new_node(SyntaxKind::TupleType, D::TupleTypeNode(Box::new(ts_ast::TupleTypeNodeData { elements: self.req_list(elements) })))
+        self.new_node(
+            SyntaxKind::TupleType,
+            D::TupleTypeNode(Box::new(ts_ast::TupleTypeNodeData {
+                elements: self.req_list(elements),
+            })),
+        )
     }
 
     // Go: ast/ast_generated.go:6041 NewNamedTupleMember
-    pub fn new_named_tuple_member(&self, dot_dot_dot_token: Node, name: Node, question_token: Node, type_node: Node) -> Node {
+    pub fn new_named_tuple_member(
+        &self,
+        dot_dot_dot_token: Node,
+        name: Node,
+        question_token: Node,
+        type_node: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::NamedTupleMember,
             D::NamedTupleMember(Box::new(ts_ast::NamedTupleMemberData {
@@ -582,24 +695,41 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:6089 NewOptionalTypeNode
     pub fn new_optional_type_node(&self, type_node: Node) -> Node {
-        self.new_node(SyntaxKind::OptionalType, D::OptionalTypeNode(Box::new(ts_ast::OptionalTypeNodeData { type_: self.id(type_node) })))
+        self.new_node(
+            SyntaxKind::OptionalType,
+            D::OptionalTypeNode(Box::new(ts_ast::OptionalTypeNodeData {
+                type_: self.id(type_node),
+            })),
+        )
     }
 
     // Go: ast/ast_generated.go:6127 NewRestTypeNode
     pub fn new_rest_type_node(&self, type_node: Node) -> Node {
-        self.new_node(SyntaxKind::RestType, D::RestTypeNode(Box::new(ts_ast::RestTypeNodeData { type_: self.id(type_node) })))
+        self.new_node(
+            SyntaxKind::RestType,
+            D::RestTypeNode(Box::new(ts_ast::RestTypeNodeData {
+                type_: self.id(type_node),
+            })),
+        )
     }
 
     // Go: ast/ast_generated.go:6165 NewParenthesizedTypeNode
     pub fn new_parenthesized_type_node(&self, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::ParenthesizedType,
-            D::ParenthesizedTypeNode(Box::new(ts_ast::ParenthesizedTypeNodeData { type_: self.id(type_node) })),
+            D::ParenthesizedTypeNode(Box::new(ts_ast::ParenthesizedTypeNodeData {
+                type_: self.id(type_node),
+            })),
         )
     }
 
     // Go: ast/ast_generated.go:6203 NewFunctionTypeNode
-    pub fn new_function_type_node(&self, type_parameters: NodeList, parameters: NodeList, type_node: Node) -> Node {
+    pub fn new_function_type_node(
+        &self,
+        type_parameters: NodeList,
+        parameters: NodeList,
+        type_node: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::FunctionType,
             D::FunctionTypeNode(Box::new(ts_ast::FunctionTypeNodeData {
@@ -616,7 +746,13 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:6243 NewConstructorTypeNode
-    pub fn new_constructor_type_node(&self, modifiers: ModifierList, type_parameters: NodeList, parameters: NodeList, type_node: Node) -> Node {
+    pub fn new_constructor_type_node(
+        &self,
+        modifiers: ModifierList,
+        type_parameters: NodeList,
+        parameters: NodeList,
+        type_node: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::ConstructorType,
             D::ConstructorTypeNode(Box::new(ts_ast::ConstructorTypeNodeData {
@@ -647,12 +783,22 @@ impl NodeFactory {
     pub fn new_template_literal_type_span(&self, type_node: Node, literal: Node) -> Node {
         self.new_node(
             SyntaxKind::TemplateLiteralTypeSpan,
-            D::TemplateLiteralTypeSpan(Box::new(ts_ast::TemplateLiteralTypeSpanData { literal: self.id(literal), type_: self.id(type_node) })),
+            D::TemplateLiteralTypeSpan(Box::new(ts_ast::TemplateLiteralTypeSpanData {
+                literal: self.id(literal),
+                type_: self.id(type_node),
+            })),
         )
     }
 
     // Go: ast/ast_generated.go:8372 NewImportTypeNode
-    pub fn new_import_type_node(&self, is_type_of: bool, argument: Node, attributes: Node, qualifier: Node, type_arguments: NodeList) -> Node {
+    pub fn new_import_type_node(
+        &self,
+        is_type_of: bool,
+        argument: Node,
+        attributes: Node,
+        qualifier: Node,
+        type_arguments: NodeList,
+    ) -> Node {
         self.new_node(
             SyntaxKind::ImportType,
             D::ImportTypeNode(Box::new(ts_ast::ImportTypeNodeData {
@@ -668,7 +814,14 @@ impl NodeFactory {
     // ── Signatures and type elements ───────────────────────────────────
 
     // Go: ast/ast_generated.go:8676 NewTypeParameterDeclaration
-    pub fn new_type_parameter_declaration(&self, modifiers: ModifierList, name: Node, constraint: Node, expression: Node, default_type: Node) -> Node {
+    pub fn new_type_parameter_declaration(
+        &self,
+        modifiers: ModifierList,
+        name: Node,
+        constraint: Node,
+        expression: Node,
+        default_type: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::TypeParameter,
             D::TypeParameterDeclaration(Box::new(ts_ast::TypeParameterDeclarationData {
@@ -708,7 +861,12 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:3132 NewCallSignatureDeclaration
-    pub fn new_call_signature_declaration(&self, type_parameters: NodeList, parameters: NodeList, type_node: Node) -> Node {
+    pub fn new_call_signature_declaration(
+        &self,
+        type_parameters: NodeList,
+        parameters: NodeList,
+        type_node: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::CallSignature,
             D::CallSignatureDeclaration(Box::new(ts_ast::CallSignatureDeclarationData {
@@ -724,7 +882,12 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:3175 NewConstructSignatureDeclaration
-    pub fn new_construct_signature_declaration(&self, type_parameters: NodeList, parameters: NodeList, type_node: Node) -> Node {
+    pub fn new_construct_signature_declaration(
+        &self,
+        type_parameters: NodeList,
+        parameters: NodeList,
+        type_node: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::ConstructSignature,
             D::ConstructSignatureDeclaration(Box::new(ts_ast::ConstructSignatureDeclarationData {
@@ -840,7 +1003,12 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:3379 NewIndexSignatureDeclaration
     // PORT: Go keeps a nil `Type`; ts_ast requires one, so nil is stored in
     // the nil slot and `type_node()` still reads nil.
-    pub fn new_index_signature_declaration(&self, modifiers: ModifierList, parameters: NodeList, type_node: Node) -> Node {
+    pub fn new_index_signature_declaration(
+        &self,
+        modifiers: ModifierList,
+        parameters: NodeList,
+        type_node: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::IndexSignature,
             D::IndexSignatureDeclaration(Box::new(ts_ast::IndexSignatureDeclarationData {
@@ -968,7 +1136,10 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:2660 NewNotEmittedTypeElement
     pub fn new_not_emitted_type_element(&self) -> Node {
-        self.new_node(SyntaxKind::NotEmittedTypeElement, D::NotEmittedTypeElement(Box::new(ts_ast::NotEmittedTypeElementData)))
+        self.new_node(
+            SyntaxKind::NotEmittedTypeElement,
+            D::NotEmittedTypeElement(Box::new(ts_ast::NotEmittedTypeElementData)),
+        )
     }
 
     // ── Declarations ───────────────────────────────────────────────────
@@ -989,7 +1160,12 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:2552 NewEnumDeclaration
-    pub fn new_enum_declaration(&self, modifiers: ModifierList, name: Node, members: NodeList) -> Node {
+    pub fn new_enum_declaration(
+        &self,
+        modifiers: ModifierList,
+        name: Node,
+        members: NodeList,
+    ) -> Node {
         self.new_node(
             SyntaxKind::EnumDeclaration,
             D::EnumDeclaration(Box::new(ts_ast::EnumDeclarationData {
@@ -1097,7 +1273,11 @@ impl NodeFactory {
     pub fn new_heritage_clause(&self, token: SyntaxKind, types: NodeList) -> Node {
         self.new_node(
             SyntaxKind::HeritageClause,
-            D::HeritageClause(Box::new(ts_ast::HeritageClauseData { token, types: self.req_list(types), facts: 0 })),
+            D::HeritageClause(Box::new(ts_ast::HeritageClauseData {
+                token,
+                types: self.req_list(types),
+                facts: 0,
+            })),
         )
     }
 
@@ -1126,7 +1306,13 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:2427 NewTypeAliasDeclaration
-    pub fn new_type_alias_declaration(&self, modifiers: ModifierList, name: Node, type_parameters: NodeList, type_node: Node) -> Node {
+    pub fn new_type_alias_declaration(
+        &self,
+        modifiers: ModifierList,
+        name: Node,
+        type_parameters: NodeList,
+        type_node: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::TypeAliasDeclaration,
             D::TypeAliasDeclaration(Box::new(ts_ast::TypeAliasDeclarationData {
@@ -1144,7 +1330,13 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:8222 NewModuleDeclaration
-    pub fn new_module_declaration(&self, modifiers: ModifierList, keyword: SyntaxKind, name: Node, body: Node) -> Node {
+    pub fn new_module_declaration(
+        &self,
+        modifiers: ModifierList,
+        keyword: SyntaxKind,
+        name: Node,
+        body: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::ModuleDeclaration,
             D::ModuleDeclaration(Box::new(ts_ast::ModuleDeclarationData {
@@ -1168,7 +1360,11 @@ impl NodeFactory {
     pub fn new_module_block(&self, statements: NodeList) -> Node {
         self.new_node(
             SyntaxKind::ModuleBlock,
-            D::ModuleBlock(Box::new(ts_ast::ModuleBlockData { flow_node: None, statements: self.req_list(statements), facts: 0 })),
+            D::ModuleBlock(Box::new(ts_ast::ModuleBlockData {
+                flow_node: None,
+                statements: self.req_list(statements),
+                facts: 0,
+            })),
         )
     }
 
@@ -1176,12 +1372,21 @@ impl NodeFactory {
     pub fn new_import_attribute(&self, name: Node, value: Node) -> Node {
         self.new_node(
             SyntaxKind::ImportAttribute,
-            D::ImportAttribute(Box::new(ts_ast::ImportAttributeData { value: self.id(value), facts: 0, name: self.id(name) })),
+            D::ImportAttribute(Box::new(ts_ast::ImportAttributeData {
+                value: self.id(value),
+                facts: 0,
+                name: self.id(name),
+            })),
         )
     }
 
     // Go: ast/ast_generated.go:5822 NewImportAttributes
-    pub fn new_import_attributes(&self, token: SyntaxKind, attributes: NodeList, multi_line: bool) -> Node {
+    pub fn new_import_attributes(
+        &self,
+        token: SyntaxKind,
+        attributes: NodeList,
+        multi_line: bool,
+    ) -> Node {
         self.new_node(
             SyntaxKind::ImportAttributes,
             D::ImportAttributes(Box::new(ts_ast::ImportAttributesData {
@@ -1194,7 +1399,13 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:2903 NewExportAssignment
-    pub fn new_export_assignment(&self, modifiers: ModifierList, is_export_equals: bool, type_node: Node, expression: Node) -> Node {
+    pub fn new_export_assignment(
+        &self,
+        modifiers: ModifierList,
+        is_export_equals: bool,
+        type_node: Node,
+        expression: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::ExportAssignment,
             D::ExportAssignment(Box::new(ts_ast::ExportAssignmentData {
@@ -1213,12 +1424,20 @@ impl NodeFactory {
     pub fn new_named_exports(&self, elements: NodeList) -> Node {
         self.new_node(
             SyntaxKind::NamedExports,
-            D::NamedExports(Box::new(ts_ast::NamedExportsData { elements: self.req_list(elements), facts: 0 })),
+            D::NamedExports(Box::new(ts_ast::NamedExportsData {
+                elements: self.req_list(elements),
+                facts: 0,
+            })),
         )
     }
 
     // Go: ast/ast_generated.go:3085 NewExportSpecifier
-    pub fn new_export_specifier(&self, is_type_only: bool, property_name: Node, name: Node) -> Node {
+    pub fn new_export_specifier(
+        &self,
+        is_type_only: bool,
+        property_name: Node,
+        name: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::ExportSpecifier,
             D::ExportSpecifier(Box::new(ts_ast::ExportSpecifierData {
@@ -1257,7 +1476,13 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:2687 NewImportDeclaration
-    pub fn new_import_declaration(&self, modifiers: ModifierList, import_clause: Node, module_specifier: Node, attributes: Node) -> Node {
+    pub fn new_import_declaration(
+        &self,
+        modifiers: ModifierList,
+        import_clause: Node,
+        module_specifier: Node,
+        attributes: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::ImportDeclaration,
             D::ImportDeclaration(Box::new(ts_ast::ImportDeclarationData {
@@ -1276,7 +1501,9 @@ impl NodeFactory {
     pub fn new_external_module_reference(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ExternalModuleReference,
-            D::ExternalModuleReference(Box::new(ts_ast::ExternalModuleReferenceData { expression: self.id(expression) })),
+            D::ExternalModuleReference(Box::new(ts_ast::ExternalModuleReferenceData {
+                expression: self.id(expression),
+            })),
         )
     }
 
@@ -1284,18 +1511,30 @@ impl NodeFactory {
     pub fn new_named_imports(&self, elements: NodeList) -> Node {
         self.new_node(
             SyntaxKind::NamedImports,
-            D::NamedImports(Box::new(ts_ast::NamedImportsData { elements: self.req_list(elements), facts: 0 })),
+            D::NamedImports(Box::new(ts_ast::NamedImportsData {
+                elements: self.req_list(elements),
+                facts: 0,
+            })),
         )
     }
 
     // Go: ast/ast_generated.go:7017 NewSyntaxList
     pub fn new_syntax_list(&self, children: &[Node]) -> Node {
         let children = children.iter().map(|&n| self.id(n)).collect();
-        self.new_node(SyntaxKind::SyntaxList, D::SyntaxList(Box::new(ts_ast::SyntaxListData { children })))
+        self.new_node(
+            SyntaxKind::SyntaxList,
+            D::SyntaxList(Box::new(ts_ast::SyntaxListData { children })),
+        )
     }
 
     // Go: ast/ast_generated.go:8273 NewImportEqualsDeclaration
-    pub fn new_import_equals_declaration(&self, modifiers: ModifierList, is_type_only: bool, name: Node, module_reference: Node) -> Node {
+    pub fn new_import_equals_declaration(
+        &self,
+        modifiers: ModifierList,
+        is_type_only: bool,
+        name: Node,
+        module_reference: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::ImportEqualsDeclaration,
             D::ImportEqualsDeclaration(Box::new(ts_ast::ImportEqualsDeclarationData {
@@ -1313,13 +1552,22 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:8422 NewImportClause
     // PORT: Go KindUnknown for `phaseModifier` is `None` in the data.
-    pub fn new_import_clause(&self, phase_modifier: SyntaxKind, name: Node, named_bindings: Node) -> Node {
+    pub fn new_import_clause(
+        &self,
+        phase_modifier: SyntaxKind,
+        name: Node,
+        named_bindings: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::ImportClause,
             D::ImportClause(Box::new(ts_ast::ImportClauseData {
                 local_symbol: None,
                 named_bindings: self.oid(named_bindings),
-                phase_modifier: if phase_modifier == SyntaxKind::Unknown { None } else { Some(phase_modifier) },
+                phase_modifier: if phase_modifier == SyntaxKind::Unknown {
+                    None
+                } else {
+                    Some(phase_modifier)
+                },
                 symbol: None,
                 facts: 0,
                 name: self.oid(name),
@@ -1328,7 +1576,12 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:8471 NewImportSpecifier
-    pub fn new_import_specifier(&self, is_type_only: bool, property_name: Node, name: Node) -> Node {
+    pub fn new_import_specifier(
+        &self,
+        is_type_only: bool,
+        property_name: Node,
+        name: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::ImportSpecifier,
             D::ImportSpecifier(Box::new(ts_ast::ImportSpecifierData {
@@ -1346,11 +1599,20 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:3734 NewKeywordExpression
     pub fn new_keyword_expression(&self, kind: SyntaxKind) -> Node {
-        self.new_node(kind, D::KeywordExpression(Box::new(ts_ast::KeywordExpressionData { flow_node: None })))
+        self.new_node(
+            kind,
+            D::KeywordExpression(Box::new(ts_ast::KeywordExpressionData { flow_node: None })),
+        )
     }
 
     // Go: ast/ast_generated.go:4327 NewPropertyAccessExpression
-    pub fn new_property_access_expression(&self, expression: Node, question_dot_token: Node, name: Node, flags: NodeFlags) -> Node {
+    pub fn new_property_access_expression(
+        &self,
+        expression: Node,
+        question_dot_token: Node,
+        name: Node,
+        flags: NodeFlags,
+    ) -> Node {
         self.new_chain_node(
             SyntaxKind::PropertyAccessExpression,
             D::PropertyAccessExpression(Box::new(ts_ast::PropertyAccessExpressionData {
@@ -1409,7 +1671,12 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:4479 NewNewExpression
-    pub fn new_new_expression(&self, expression: Node, type_arguments: NodeList, arguments: NodeList) -> Node {
+    pub fn new_new_expression(
+        &self,
+        expression: Node,
+        type_arguments: NodeList,
+        arguments: NodeList,
+    ) -> Node {
         self.new_node(
             SyntaxKind::NewExpression,
             D::NewExpression(Box::new(ts_ast::NewExpressionData {
@@ -1425,7 +1692,9 @@ impl NodeFactory {
     pub fn new_non_null_expression(&self, expression: Node, flags: NodeFlags) -> Node {
         self.new_chain_node(
             SyntaxKind::NonNullExpression,
-            D::NonNullExpression(Box::new(ts_ast::NonNullExpressionData { expression: self.id(expression) })),
+            D::NonNullExpression(Box::new(ts_ast::NonNullExpressionData {
+                expression: self.id(expression),
+            })),
             flags,
         )
     }
@@ -1456,12 +1725,22 @@ impl NodeFactory {
     pub fn new_prefix_unary_expression(&self, operator: SyntaxKind, operand: Node) -> Node {
         self.new_node(
             SyntaxKind::PrefixUnaryExpression,
-            D::PrefixUnaryExpression(Box::new(ts_ast::PrefixUnaryExpressionData { operand: self.id(operand), operator })),
+            D::PrefixUnaryExpression(Box::new(ts_ast::PrefixUnaryExpressionData {
+                operand: self.id(operand),
+                operator,
+            })),
         )
     }
 
     // Go: ast/ast_generated.go:3893 NewBinaryExpression
-    pub fn new_binary_expression(&self, modifiers: ModifierList, left: Node, type_node: Node, operator_token: Node, right: Node) -> Node {
+    pub fn new_binary_expression(
+        &self,
+        modifiers: ModifierList,
+        left: Node,
+        type_node: Node,
+        operator_token: Node,
+        right: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::BinaryExpression,
             D::BinaryExpression(Box::new(ts_ast::BinaryExpressionData {
@@ -1477,7 +1756,14 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:4269 NewConditionalExpression
-    pub fn new_conditional_expression(&self, condition: Node, question_token: Node, when_true: Node, colon_token: Node, when_false: Node) -> Node {
+    pub fn new_conditional_expression(
+        &self,
+        condition: Node,
+        question_token: Node,
+        when_true: Node,
+        colon_token: Node,
+        when_false: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::ConditionalExpression,
             D::ConditionalExpression(Box::new(ts_ast::ConditionalExpressionData {
@@ -1495,7 +1781,9 @@ impl NodeFactory {
     pub fn new_parenthesized_expression(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ParenthesizedExpression,
-            D::ParenthesizedExpression(Box::new(ts_ast::ParenthesizedExpressionData { expression: self.id(expression) })),
+            D::ParenthesizedExpression(Box::new(ts_ast::ParenthesizedExpressionData {
+                expression: self.id(expression),
+            })),
         )
     }
 
@@ -1570,7 +1858,12 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:6447 NewSyntheticExpression
     // PORT: Go `Type any` holds a `*checker.Type`; here it is a `TypeId`,
     // read back with `synthetic_expression_type`.
-    pub fn new_synthetic_expression(&self, type_: TypeId, is_spread: bool, tuple_name_source: Node) -> Node {
+    pub fn new_synthetic_expression(
+        &self,
+        type_: TypeId,
+        is_spread: bool,
+        tuple_name_source: Node,
+    ) -> Node {
         let node = self.new_node(
             SyntaxKind::SyntheticExpression,
             D::SyntheticExpression(Box::new(ts_ast::SyntheticExpressionData {
@@ -1585,14 +1878,23 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:4605 NewSpreadElement
     pub fn new_spread_element(&self, expression: Node) -> Node {
-        self.new_node(SyntaxKind::SpreadElement, D::SpreadElement(Box::new(ts_ast::SpreadElementData { expression: self.id(expression) })))
+        self.new_node(
+            SyntaxKind::SpreadElement,
+            D::SpreadElement(Box::new(ts_ast::SpreadElementData {
+                expression: self.id(expression),
+            })),
+        )
     }
 
     // Go: ast/ast_generated.go:4828 NewArrayLiteralExpression
     pub fn new_array_literal_expression(&self, elements: NodeList, multi_line: bool) -> Node {
         self.new_node(
             SyntaxKind::ArrayLiteralExpression,
-            D::ArrayLiteralExpression(Box::new(ts_ast::ArrayLiteralExpressionData { elements: self.req_list(elements), multi_line, facts: 0 })),
+            D::ArrayLiteralExpression(Box::new(ts_ast::ArrayLiteralExpressionData {
+                elements: self.req_list(elements),
+                multi_line,
+                facts: 0,
+            })),
         )
     }
 
@@ -1610,7 +1912,14 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:4961 NewPropertyAssignment
-    pub fn new_property_assignment(&self, modifiers: ModifierList, name: Node, postfix_token: Node, type_node: Node, initializer: Node) -> Node {
+    pub fn new_property_assignment(
+        &self,
+        modifiers: ModifierList,
+        name: Node,
+        postfix_token: Node,
+        type_node: Node,
+        initializer: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::PropertyAssignment,
             D::PropertyAssignment(Box::new(ts_ast::PropertyAssignmentData {
@@ -1629,7 +1938,10 @@ impl NodeFactory {
     pub fn new_as_expression(&self, expression: Node, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::AsExpression,
-            D::AsExpression(Box::new(ts_ast::AsExpressionData { expression: self.id(expression), type_: self.id(type_node) })),
+            D::AsExpression(Box::new(ts_ast::AsExpressionData {
+                expression: self.id(expression),
+                type_: self.id(type_node),
+            })),
         )
     }
 
@@ -1637,7 +1949,10 @@ impl NodeFactory {
     pub fn new_satisfies_expression(&self, expression: Node, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::SatisfiesExpression,
-            D::SatisfiesExpression(Box::new(ts_ast::SatisfiesExpressionData { expression: self.id(expression), type_: self.id(type_node) })),
+            D::SatisfiesExpression(Box::new(ts_ast::SatisfiesExpressionData {
+                expression: self.id(expression),
+                type_: self.id(type_node),
+            })),
         )
     }
 
@@ -1645,41 +1960,73 @@ impl NodeFactory {
     pub fn new_type_assertion(&self, type_node: Node, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::TypeAssertionExpression,
-            D::TypeAssertion(Box::new(ts_ast::TypeAssertionData { expression: self.id(expression), type_: self.id(type_node) })),
+            D::TypeAssertion(Box::new(ts_ast::TypeAssertionData {
+                expression: self.id(expression),
+                type_: self.id(type_node),
+            })),
         )
     }
 
     // Go: ast/ast_generated.go:5068 NewDeleteExpression
     pub fn new_delete_expression(&self, expression: Node) -> Node {
-        self.new_node(SyntaxKind::DeleteExpression, D::DeleteExpression(Box::new(ts_ast::DeleteExpressionData { expression: self.id(expression) })))
+        self.new_node(
+            SyntaxKind::DeleteExpression,
+            D::DeleteExpression(Box::new(ts_ast::DeleteExpressionData {
+                expression: self.id(expression),
+            })),
+        )
     }
 
     // Go: ast/ast_generated.go:5110 NewTypeOfExpression
     pub fn new_type_of_expression(&self, expression: Node) -> Node {
-        self.new_node(SyntaxKind::TypeOfExpression, D::TypeOfExpression(Box::new(ts_ast::TypeOfExpressionData { expression: self.id(expression) })))
+        self.new_node(
+            SyntaxKind::TypeOfExpression,
+            D::TypeOfExpression(Box::new(ts_ast::TypeOfExpressionData {
+                expression: self.id(expression),
+            })),
+        )
     }
 
     // Go: ast/ast_generated.go:5152 NewVoidExpression
     pub fn new_void_expression(&self, expression: Node) -> Node {
-        self.new_node(SyntaxKind::VoidExpression, D::VoidExpression(Box::new(ts_ast::VoidExpressionData { expression: self.id(expression) })))
+        self.new_node(
+            SyntaxKind::VoidExpression,
+            D::VoidExpression(Box::new(ts_ast::VoidExpressionData {
+                expression: self.id(expression),
+            })),
+        )
     }
 
     // Go: ast/ast_generated.go:5194 NewAwaitExpression
     pub fn new_await_expression(&self, expression: Node) -> Node {
-        self.new_node(SyntaxKind::AwaitExpression, D::AwaitExpression(Box::new(ts_ast::AwaitExpressionData { expression: self.id(expression) })))
+        self.new_node(
+            SyntaxKind::AwaitExpression,
+            D::AwaitExpression(Box::new(ts_ast::AwaitExpressionData {
+                expression: self.id(expression),
+            })),
+        )
     }
 
     // Go: ast/ast_generated.go:4028 NewYieldExpression
     pub fn new_yield_expression(&self, asterisk_token: Node, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::YieldExpression,
-            D::YieldExpression(Box::new(ts_ast::YieldExpressionData { asterisk_token: self.oid(asterisk_token), expression: self.oid(expression) })),
+            D::YieldExpression(Box::new(ts_ast::YieldExpressionData {
+                asterisk_token: self.oid(asterisk_token),
+                expression: self.oid(expression),
+            })),
         )
     }
 
     // Go: ast/ast_generated.go:931 NewDecorator
     pub fn new_decorator(&self, expression: Node) -> Node {
-        self.new_node(SyntaxKind::Decorator, D::Decorator(Box::new(ts_ast::DecoratorData { expression: self.id(expression), facts: 0 })))
+        self.new_node(
+            SyntaxKind::Decorator,
+            D::Decorator(Box::new(ts_ast::DecoratorData {
+                expression: self.id(expression),
+                facts: 0,
+            })),
+        )
     }
 
     // ── Statements ─────────────────────────────────────────────────────
@@ -1713,7 +2060,13 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:1874 NewVariableDeclaration
-    pub fn new_variable_declaration(&self, name: Node, exclamation_token: Node, type_node: Node, initializer: Node) -> Node {
+    pub fn new_variable_declaration(
+        &self,
+        name: Node,
+        exclamation_token: Node,
+        type_node: Node,
+        initializer: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::VariableDeclaration,
             D::VariableDeclaration(Box::new(ts_ast::VariableDeclarationData {
@@ -1732,7 +2085,10 @@ impl NodeFactory {
     pub fn new_variable_declaration_list(&self, declarations: NodeList, flags: NodeFlags) -> Node {
         let node = self.new_node(
             SyntaxKind::VariableDeclarationList,
-            D::VariableDeclarationList(Box::new(ts_ast::VariableDeclarationListData { declarations: self.req_list(declarations), facts: 0 })),
+            D::VariableDeclarationList(Box::new(ts_ast::VariableDeclarationListData {
+                declarations: self.req_list(declarations),
+                facts: 0,
+            })),
         );
         set_node_flags(node, flags);
         node
@@ -1742,7 +2098,10 @@ impl NodeFactory {
     pub fn new_expression_statement(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ExpressionStatement,
-            D::ExpressionStatement(Box::new(ts_ast::ExpressionStatementData { expression: self.id(expression), flow_node: None })),
+            D::ExpressionStatement(Box::new(ts_ast::ExpressionStatementData {
+                expression: self.id(expression),
+                flow_node: None,
+            })),
         )
     }
 
@@ -1750,12 +2109,21 @@ impl NodeFactory {
     pub fn new_return_statement(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ReturnStatement,
-            D::ReturnStatement(Box::new(ts_ast::ReturnStatementData { expression: self.oid(expression), flow_node: None, facts: 0 })),
+            D::ReturnStatement(Box::new(ts_ast::ReturnStatementData {
+                expression: self.oid(expression),
+                flow_node: None,
+                facts: 0,
+            })),
         )
     }
 
     // Go: ast/ast_generated.go:993 NewIfStatement
-    pub fn new_if_statement(&self, expression: Node, then_statement: Node, else_statement: Node) -> Node {
+    pub fn new_if_statement(
+        &self,
+        expression: Node,
+        then_statement: Node,
+        else_statement: Node,
+    ) -> Node {
         self.new_node(
             SyntaxKind::IfStatement,
             D::IfStatement(Box::new(ts_ast::IfStatementData {
@@ -1770,12 +2138,20 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:968 NewEmptyStatement
     pub fn new_empty_statement(&self) -> Node {
-        self.new_node(SyntaxKind::EmptyStatement, D::EmptyStatement(Box::new(ts_ast::EmptyStatementData { flow_node: None })))
+        self.new_node(
+            SyntaxKind::EmptyStatement,
+            D::EmptyStatement(Box::new(ts_ast::EmptyStatementData { flow_node: None })),
+        )
     }
 
     // Go: ast/ast_generated.go:2638 NewNotEmittedStatement
     pub fn new_not_emitted_statement(&self) -> Node {
-        self.new_node(SyntaxKind::NotEmittedStatement, D::NotEmittedStatement(Box::new(ts_ast::NotEmittedStatementData { flow_node: None })))
+        self.new_node(
+            SyntaxKind::NotEmittedStatement,
+            D::NotEmittedStatement(Box::new(ts_ast::NotEmittedStatementData {
+                flow_node: None,
+            })),
+        )
     }
 }
 
@@ -1788,7 +2164,12 @@ mod tests {
         let f = NodeFactory::new();
         let this = f.new_keyword_expression(SyntaxKind::ThisKeyword);
         let name = f.new_identifier("x");
-        let access = f.new_property_access_expression(this, Node::NIL, name, NodeFlags::OPTIONAL_CHAIN | NodeFlags::SYNTHESIZED);
+        let access = f.new_property_access_expression(
+            this,
+            Node::NIL,
+            name,
+            NodeFlags::OPTIONAL_CHAIN | NodeFlags::SYNTHESIZED,
+        );
 
         // Go `newNode`: undefined loc, nil parent, and only OptionalChain kept.
         assert_eq!(access.kind(), SyntaxKind::PropertyAccessExpression);
@@ -1807,7 +2188,8 @@ mod tests {
         assert_eq!(access.pos(), 3);
 
         // Go nil in a field that ts_ast requires still reads as nil.
-        let sig = f.new_index_signature_declaration(ModifierList::NIL, f.new_node_list(&[]), Node::NIL);
+        let sig =
+            f.new_index_signature_declaration(ModifierList::NIL, f.new_node_list(&[]), Node::NIL);
         assert!(sig.type_().is_nil());
         assert_eq!(f.node_count(), 4);
         assert_eq!(f.text_count(), 1);

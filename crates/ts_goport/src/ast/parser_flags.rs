@@ -33,7 +33,9 @@ enum Entry {
     Postfix,
     /// parseParameterWorker. `outer_await` is the Await context of the
     /// enclosing signature, used for the parameter modifiers.
-    Param { outer_await: bool },
+    Param {
+        outer_await: bool,
+    },
     /// The type parameter of an `infer T extends C` type.
     InferParam,
     /// A modifier of a `declare` declaration. Go ORs Ambient into the
@@ -139,7 +141,10 @@ fn modifiers_of(data: &D) -> Option<&ModifierList> {
 // PORT: checks the modifier token kinds directly instead of ModifierFlags.
 fn has_modifier(arena: &NodeArena, data: &D, kind: SyntaxKind) -> bool {
     modifiers_of(data).is_some_and(|m| {
-        m.list.nodes.iter().any(|&id| arena.get(id).is_some_and(|n| n.kind == kind))
+        m.list
+            .nodes
+            .iter()
+            .any(|&id| arena.get(id).is_some_and(|n| n.kind == kind))
     })
 }
 
@@ -248,10 +253,22 @@ fn utf8_len(first: u8) -> usize {
 // Go: stringutil IsWhiteSpaceLike / IsLineBreak (non-ASCII part)
 fn is_unicode_space(text: &[u8], pos: usize) -> bool {
     let end = (pos + utf8_len(text[pos])).min(text.len());
-    let Ok(s) = std::str::from_utf8(&text[pos..end]) else { return false };
+    let Ok(s) = std::str::from_utf8(&text[pos..end]) else {
+        return false;
+    };
     s.chars().next().is_some_and(|c| {
-        matches!(c, '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200b}' | '\u{2028}' | '\u{2029}'
-            | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}' | '\u{0085}')
+        matches!(
+            c,
+            '\u{00a0}' | '\u{1680}' | '\u{2000}'
+                ..='\u{200b}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{202f}'
+                    | '\u{205f}'
+                    | '\u{3000}'
+                    | '\u{feff}'
+                    | '\u{0085}'
+        )
     })
 }
 
@@ -268,7 +285,10 @@ pub fn compute_parser_flags(file_index: usize, source: &ts_compiler::SourceFile)
     let arena = &source.parse.arena;
     let root = source.parse.source_file;
     let script_kind = ts_path::script_kind_from_path(&source.file_name);
-    let is_js = matches!(script_kind, ts_path::ScriptKind::Js | ts_path::ScriptKind::Jsx);
+    let is_js = matches!(
+        script_kind,
+        ts_path::ScriptKind::Js | ts_path::ScriptKind::Jsx
+    );
     let is_json = script_kind == ts_path::ScriptKind::Json;
     let is_declaration = is_declaration_file_name(&source.file_name);
 
@@ -294,7 +314,12 @@ pub fn compute_parser_flags(file_index: usize, source: &ts_compiler::SourceFile)
     if !is_declaration && is_external_module(arena, root, &source.file_name, script_kind) {
         w.await_statements = w.top_level_await_statements(root);
     }
-    w.walk(Item { id: root, ctx: base, entry: Entry::Normal, host: base });
+    w.walk(Item {
+        id: root,
+        ctx: base,
+        entry: Entry::Normal,
+        host: base,
+    });
     w.walk_unreached(base);
     w.set_optional_chains();
     w.set_has_jsdoc();
@@ -358,8 +383,17 @@ impl Walker<'_> {
                 .and_then(|p| self.out.get(p.index()).copied())
                 .map_or(base, |f| f & NodeFlags::CONTEXT_FLAGS);
             let jsdoc = self.kind(top).is_some_and(is_jsdoc_kind);
-            let ctx = if jsdoc { parent_ctx | NodeFlags::JS_DOC } else { parent_ctx };
-            self.walk(Item { id: top, ctx, entry: Entry::Normal, host: ctx });
+            let ctx = if jsdoc {
+                parent_ctx | NodeFlags::JS_DOC
+            } else {
+                parent_ctx
+            };
+            self.walk(Item {
+                id: top,
+                ctx,
+                entry: Entry::Normal,
+                host: ctx,
+            });
             if !self.seen[index] {
                 // A cycle or a bad parent link. Mark it so the loop ends.
                 self.seen[index] = true;
@@ -370,7 +404,9 @@ impl Walker<'_> {
     // Go: parser/parser.go finishNode (Flags |= contextFlags)
     fn visit(&mut self, item: Item, stack: &mut Vec<Item>) {
         let index = item.id.index();
-        let Some(node) = self.arena.get(item.id) else { return };
+        let Some(node) = self.arena.get(item.id) else {
+            return;
+        };
         if self.seen.get(index).copied().unwrap_or(true) {
             return;
         }
@@ -380,7 +416,10 @@ impl Walker<'_> {
 
         // Go: parser/parser.go:2220 parseModuleOrNamespaceDeclaration sets
         // `implicitExport.Flags = NodeFlagsReparsed` after finishNode.
-        if reparsed && node.kind == SyntaxKind::ExportKeyword && self.is_nested_namespace_modifier(node) {
+        if reparsed
+            && node.kind == SyntaxKind::ExportKeyword
+            && self.is_nested_namespace_modifier(node)
+        {
             self.out[index] = rust;
             return;
         }
@@ -419,18 +458,28 @@ impl Walker<'_> {
         let ambient_outer = if ambient { Some(item.ctx) } else { None };
         node.for_each_child(|child| {
             let (ctx, entry) = self.child(node, item.id, mode, child_base, child, ambient_outer);
-            stack.push(Item { id: child, ctx, entry, host });
+            stack.push(Item {
+                id: child,
+                ctx,
+                entry,
+                host,
+            });
         });
     }
 
     /// The implicit `export` modifier on `B` in `namespace A.B {}`.
     // Go: parser/parser.go parseModuleOrNamespaceDeclaration (nested namespace export modifier)
     fn is_nested_namespace_modifier(&self, node: &AstNode) -> bool {
-        let Some(module_id) = node.parent else { return false };
+        let Some(module_id) = node.parent else {
+            return false;
+        };
         if self.kind(module_id) != Some(SyntaxKind::ModuleDeclaration) {
             return false;
         }
-        let outer = self.node(module_id).and_then(|m| m.parent).and_then(|p| self.node(p));
+        let outer = self
+            .node(module_id)
+            .and_then(|m| m.parent)
+            .and_then(|p| self.node(p));
         matches!(outer.map(|n| &n.data), Some(D::ModuleDeclaration(d)) if d.body == Some(module_id))
     }
 
@@ -576,7 +625,9 @@ fn resolve(node: &AstNode, ctx: NodeFlags, entry: Entry) -> (NodeFlags, Mode) {
 fn params(outer: NodeFlags, yield_: bool, await_: bool) -> (NodeFlags, Entry) {
     (
         set(set(outer, Y, yield_), A, await_),
-        Entry::Param { outer_await: outer.intersects(A) },
+        Entry::Param {
+            outer_await: outer.intersects(A),
+        },
     )
 }
 
@@ -614,8 +665,12 @@ impl Walker<'_> {
             (Mode::Intersection | Mode::Operator, _) => (f, Entry::Operator),
             (Mode::Infer, _) => (f, Entry::InferParam),
             // Go: parseFunctionOrConstructorType
-            (Mode::FnType, D::FunctionTypeNode(d)) => self.fn_type_child(f, c, &d.parameters, d.type_),
-            (Mode::FnType, D::ConstructorTypeNode(d)) => self.fn_type_child(f, c, &d.parameters, d.type_),
+            (Mode::FnType, D::FunctionTypeNode(d)) => {
+                self.fn_type_child(f, c, &d.parameters, d.type_)
+            }
+            (Mode::FnType, D::ConstructorTypeNode(d)) => {
+                self.fn_type_child(f, c, &d.parameters, d.type_)
+            }
             // Go: parseType (conditional type branch)
             (Mode::CondType, D::ConditionalTypeNode(d)) => {
                 if c == d.check_type {
@@ -627,23 +682,39 @@ impl Walker<'_> {
                 }
             }
             (Mode::Predicate, D::TypePredicateNode(d)) => {
-                if is(d.type_, c) { (f, Entry::Type) } else { (f, Entry::Normal) }
+                if is(d.type_, c) {
+                    (f, Entry::Type)
+                } else {
+                    (f, Entry::Normal)
+                }
             }
             // Go: parseInferType / tryParseConstraintOfInferType
-            (Mode::InferParam, D::TypeParameterDeclaration(d)) if is(d.constraint, c) => (f | DCT, Entry::Type),
+            (Mode::InferParam, D::TypeParameterDeclaration(d)) if is(d.constraint, c) => {
+                (f | DCT, Entry::Type)
+            }
             // Go: parsePostfixTypeOrHigher (element and object types)
             (Mode::Postfix, D::ArrayTypeNode(d)) if c == d.element_type => (f, Entry::Postfix),
-            (Mode::Postfix, D::IndexedAccessTypeNode(d)) if c == d.object_type => (f, Entry::Postfix),
+            (Mode::Postfix, D::IndexedAccessTypeNode(d)) if c == d.object_type => {
+                (f, Entry::Postfix)
+            }
             (Mode::Postfix, _) => self.default_child(f, c),
             // Go: parseParameterWorker (modifiers in the outer Await context)
-            (Mode::Param { outer_await }, D::ParameterDeclaration(d)) if in_mods(&d.modifiers, c) => {
+            (Mode::Param { outer_await }, D::ParameterDeclaration(d))
+                if in_mods(&d.modifiers, c) =>
+            {
                 (set(f, A, outer_await), Entry::Normal)
             }
             _ => self.normal_child(node, id, f, c),
         }
     }
 
-    fn fn_type_child(&self, f: NodeFlags, c: AstId, parameters: &NodeList, type_: Option<AstId>) -> (NodeFlags, Entry) {
+    fn fn_type_child(
+        &self,
+        f: NodeFlags,
+        c: AstId,
+        parameters: &NodeList,
+        type_: Option<AstId>,
+    ) -> (NodeFlags, Entry) {
         if in_list(parameters, c) {
             params(f, false, false)
         } else if is(type_, c) {
@@ -695,9 +766,16 @@ impl Walker<'_> {
         if d.parameters.nodes.len() != 1 || d.type_parameters.is_some() || d.type_.is_some() {
             return false;
         }
-        let Some(param) = self.node(d.parameters.nodes[0]) else { return false };
+        let Some(param) = self.node(d.parameters.nodes[0]) else {
+            return false;
+        };
         let mut from = node.range.start.get() as usize;
-        if let Some(last) = d.modifiers.as_ref().and_then(|m| m.list.nodes.last()).and_then(|&m| self.node(m)) {
+        if let Some(last) = d
+            .modifiers
+            .as_ref()
+            .and_then(|m| m.list.nodes.last())
+            .and_then(|&m| self.node(m))
+        {
             from = from.max(last.range.end.get() as usize);
         }
         let to = param.range.start.get() as usize;
@@ -710,20 +788,32 @@ impl Walker<'_> {
     /// Child context rules for ordinary (non-type-chain) nodes. Each arm
     /// names the Go parse function that changes the context for that slot.
     // Go: parser/parser.go doInContext call sites
-    fn normal_child(&self, node: &AstNode, id: AstId, f: NodeFlags, c: AstId) -> (NodeFlags, Entry) {
+    fn normal_child(
+        &self,
+        node: &AstNode,
+        id: AstId,
+        f: NodeFlags,
+        c: AstId,
+    ) -> (NodeFlags, Entry) {
         // Go: parseExpressionAllowIn clears DisallowIn; parseExpression
         // clears Decorator.
         let allow_in = (f.without(DI | DEC), Entry::Normal);
         let has = |kind| has_modifier(self.arena, &node.data, kind);
         match &node.data {
             // Go: parser/parser.go:500 parseToplevelStatement, :519 reparseTopLevelAwait
-            D::SourceFile(d) if in_list(&d.statements, c) && self.await_statements.contains(&c) => (f | A, Entry::Normal),
+            D::SourceFile(d) if in_list(&d.statements, c) && self.await_statements.contains(&c) => {
+                (f | A, Entry::Normal)
+            }
 
             // Go: parseFunctionDeclaration
             D::FunctionDeclaration(d) => {
                 let generator = d.asterisk_token.is_some();
                 let async_ = has(SyntaxKind::AsyncKeyword);
-                let g = if has(SyntaxKind::ExportKeyword) { f | A } else { f };
+                let g = if has(SyntaxKind::ExportKeyword) {
+                    f | A
+                } else {
+                    f
+                };
                 if in_list(&d.parameters, c) {
                     params(g, generator, async_)
                 } else if is(d.type_, c) {
@@ -765,7 +855,11 @@ impl Walker<'_> {
             D::ArrowFunction(d) => {
                 let async_ = has(SyntaxKind::AsyncKeyword);
                 if in_list(&d.parameters, c) {
-                    if self.is_simple_arrow(node, d) { (f, Entry::Normal) } else { params(f, false, async_) }
+                    if self.is_simple_arrow(node, d) {
+                        (f, Entry::Normal)
+                    } else {
+                        params(f, false, async_)
+                    }
                 } else if is(d.type_, c) {
                     (f.without(DCT), Entry::ReturnType)
                 } else if c == d.body {
@@ -793,19 +887,37 @@ impl Walker<'_> {
                 }
             }
             // Go: parseConstructorDeclaration, parseAccessorDeclaration
-            D::ConstructorDeclaration(d) => self.plain_signature_child(f, c, &d.parameters, d.type_, d.body),
-            D::GetAccessorDeclaration(d) => self.plain_signature_child(f, c, &d.parameters, d.type_, d.body),
-            D::SetAccessorDeclaration(d) => self.plain_signature_child(f, c, &d.parameters, d.type_, d.body),
+            D::ConstructorDeclaration(d) => {
+                self.plain_signature_child(f, c, &d.parameters, d.type_, d.body)
+            }
+            D::GetAccessorDeclaration(d) => {
+                self.plain_signature_child(f, c, &d.parameters, d.type_, d.body)
+            }
+            D::SetAccessorDeclaration(d) => {
+                self.plain_signature_child(f, c, &d.parameters, d.type_, d.body)
+            }
             // Go: parseSignatureMember, parsePropertyOrMethodSignature
-            D::MethodSignatureDeclaration(d) => self.plain_signature_child(f, c, &d.parameters, d.type_, None),
-            D::CallSignatureDeclaration(d) => self.plain_signature_child(f, c, &d.parameters, d.type_, None),
-            D::ConstructSignatureDeclaration(d) => self.plain_signature_child(f, c, &d.parameters, d.type_, None),
+            D::MethodSignatureDeclaration(d) => {
+                self.plain_signature_child(f, c, &d.parameters, d.type_, None)
+            }
+            D::CallSignatureDeclaration(d) => {
+                self.plain_signature_child(f, c, &d.parameters, d.type_, None)
+            }
+            D::ConstructSignatureDeclaration(d) => {
+                self.plain_signature_child(f, c, &d.parameters, d.type_, None)
+            }
             // Go: parseIndexSignatureDeclaration (parseBracketedList of parseParameter)
-            D::IndexSignatureDeclaration(d) if in_list(&d.parameters, c) => (f, Entry::Param { outer_await: false }),
+            D::IndexSignatureDeclaration(d) if in_list(&d.parameters, c) => {
+                (f, Entry::Param { outer_await: false })
+            }
 
             // Go: parseClassDeclarationOrExpression (export sets Await for the heritage and members)
             D::ClassDeclaration(d) => {
-                let g = if has(SyntaxKind::ExportKeyword) { f | A } else { f };
+                let g = if has(SyntaxKind::ExportKeyword) {
+                    f | A
+                } else {
+                    f
+                };
                 if in_opt_list(&d.heritage_clauses, c) || in_list(&d.members, c) {
                     (g, Entry::Normal)
                 } else {
@@ -813,7 +925,11 @@ impl Walker<'_> {
                 }
             }
             D::ClassExpression(d) => {
-                let g = if has(SyntaxKind::ExportKeyword) { f | A } else { f };
+                let g = if has(SyntaxKind::ExportKeyword) {
+                    f | A
+                } else {
+                    f
+                };
                 if in_opt_list(&d.heritage_clauses, c) || in_list(&d.members, c) {
                     (g, Entry::Normal)
                 } else {
@@ -821,9 +937,13 @@ impl Walker<'_> {
                 }
             }
             // Go: parsePropertyDeclaration (initializer outside Yield, Await and DisallowIn)
-            D::PropertyDeclaration(d) if is(d.initializer, c) => (f.without(Y | A | DI), Entry::Normal),
+            D::PropertyDeclaration(d) if is(d.initializer, c) => {
+                (f.without(Y | A | DI), Entry::Normal)
+            }
             // Go: parseClassStaticBlockBody
-            D::ClassStaticBlockDeclaration(d) if c == d.body => (set(set(f, Y, false), A, true), Entry::Normal),
+            D::ClassStaticBlockDeclaration(d) if c == d.body => {
+                (set(set(f, Y, false), A, true), Entry::Normal)
+            }
 
             // Go: parseVariableDeclarationList (DisallowIn = inForStatementInitializer)
             D::VariableDeclarationList(d) if in_list(&d.declarations, c) => {
@@ -858,7 +978,11 @@ impl Walker<'_> {
                         ((f | DI).without(DEC), Entry::Normal)
                     }
                 } else if c == d.expression {
-                    if node.kind == SyntaxKind::ForOfStatement { (f.without(DI), Entry::Normal) } else { allow_in }
+                    if node.kind == SyntaxKind::ForOfStatement {
+                        (f.without(DI), Entry::Normal)
+                    } else {
+                        allow_in
+                    }
                 } else {
                     self.default_child(f, c)
                 }
@@ -903,7 +1027,9 @@ impl Walker<'_> {
             D::EnumMember(d) if is(d.initializer, c) => (f.without(DI), Entry::Normal),
             // Go: parseObjectLiteralElement (allowInAnd for initializers)
             D::PropertyAssignment(d) if c == d.initializer => (f.without(DI), Entry::Normal),
-            D::ShorthandPropertyAssignment(d) if is(d.object_assignment_initializer, c) => (f.without(DI), Entry::Normal),
+            D::ShorthandPropertyAssignment(d) if is(d.object_assignment_initializer, c) => {
+                (f.without(DI), Entry::Normal)
+            }
 
             // Go: parseExportAssignment, parseExportDeclaration (Await context set after the modifiers)
             D::ExportAssignment(d) if !in_mods(&d.modifiers, c) => {
@@ -925,32 +1051,56 @@ impl Walker<'_> {
 // PORT: compiler options are not available here. moduleDetection=force,
 // the react-jsx tag rule and an ESM implied node format from package.json
 // are not applied. The .mts/.cts/.mjs/.cjs rule of moduleDetection=auto is.
-fn is_external_module(arena: &NodeArena, root: AstId, file_name: &str, script_kind: ts_path::ScriptKind) -> bool {
+fn is_external_module(
+    arena: &NodeArena,
+    root: AstId,
+    file_name: &str,
+    script_kind: ts_path::ScriptKind,
+) -> bool {
     if script_kind == ts_path::ScriptKind::Json {
         return false;
     }
-    let Some(AstNode { data: D::SourceFile(sf), .. }) = arena.get(root) else { return false };
-    if sf.statements.nodes.iter().any(|&s| is_an_external_module_indicator_node(arena, s)) {
+    let Some(AstNode {
+        data: D::SourceFile(sf),
+        ..
+    }) = arena.get(root)
+    else {
+        return false;
+    };
+    if sf
+        .statements
+        .nodes
+        .iter()
+        .any(|&s| is_an_external_module_indicator_node(arena, s))
+    {
         return true;
     }
     if ts_ast::source_file_contains_import_meta(arena, root) {
         return true;
     }
     let lower = file_name.to_ascii_lowercase();
-    [".mts", ".cts", ".mjs", ".cjs"].iter().any(|ext| lower.ends_with(ext))
+    [".mts", ".cts", ".mjs", ".cjs"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
 }
 
 // Go: ast/parseoptions.go:95 isAnExternalModuleIndicatorNode
 fn is_an_external_module_indicator_node(arena: &NodeArena, id: AstId) -> bool {
-    let Some(node) = arena.get(id) else { return false };
+    let Some(node) = arena.get(id) else {
+        return false;
+    };
     if has_modifier(arena, &node.data, SyntaxKind::ExportKeyword) {
         return true;
     }
     match &node.data {
-        D::ImportEqualsDeclaration(d) => arena.get(d.module_reference).is_some_and(|r| r.kind == SyntaxKind::ExternalModuleReference),
+        D::ImportEqualsDeclaration(d) => arena
+            .get(d.module_reference)
+            .is_some_and(|r| r.kind == SyntaxKind::ExternalModuleReference),
         _ => matches!(
             node.kind,
-            SyntaxKind::ImportDeclaration | SyntaxKind::ExportAssignment | SyntaxKind::ExportDeclaration
+            SyntaxKind::ImportDeclaration
+                | SyntaxKind::ExportAssignment
+                | SyntaxKind::ExportDeclaration
         ),
     }
 }
@@ -960,7 +1110,13 @@ impl Walker<'_> {
     /// pass (outside Await) created an `await` identifier in them.
     // Go: parser/parser.go:500 parseToplevelStatement
     fn top_level_await_statements(&self, root: AstId) -> Vec<AstId> {
-        let Some(AstNode { data: D::SourceFile(sf), .. }) = self.node(root) else { return Vec::new() };
+        let Some(AstNode {
+            data: D::SourceFile(sf),
+            ..
+        }) = self.node(root)
+        else {
+            return Vec::new();
+        };
         sf.statements
             .nodes
             .iter()
@@ -986,7 +1142,11 @@ impl Walker<'_> {
             }
             match &node.data {
                 D::Identifier(d) if d.text == "await" => return true,
-                D::AwaitExpression(d) if self.await_expression_was_identifier(node, d.expression) => return true,
+                D::AwaitExpression(d)
+                    if self.await_expression_was_identifier(node, d.expression) =>
+                {
+                    return true;
+                }
                 D::EnumDeclaration(_)
                 | D::ModuleDeclaration(_)
                 | D::ImportDeclaration(_)
@@ -1050,13 +1210,27 @@ impl Walker<'_> {
         let text = self.text;
         let keyword_start = skip_trivia(text, (node.range.start.get() as usize).min(text.len()));
         let keyword_end = (keyword_start + "await".len()).min(text.len());
-        let Some(op) = self.node(operand) else { return false };
-        let op_start = skip_trivia(text, (op.range.start.get() as usize).min(text.len()).max(keyword_end));
-        if text[keyword_end..op_start].iter().any(|&b| b == b'\n' || b == b'\r') {
+        let Some(op) = self.node(operand) else {
+            return false;
+        };
+        let op_start = skip_trivia(
+            text,
+            (op.range.start.get() as usize)
+                .min(text.len())
+                .max(keyword_end),
+        );
+        if text[keyword_end..op_start]
+            .iter()
+            .any(|&b| b == b'\n' || b == b'\r')
+        {
             return true;
         }
-        let Some(&ch) = text.get(op_start) else { return true };
-        !(ch.is_ascii_alphanumeric() || matches!(ch, b'_' | b'$' | b'\\' | b'"' | b'\'') || ch >= 0x80)
+        let Some(&ch) = text.get(op_start) else {
+            return true;
+        };
+        !(ch.is_ascii_alphanumeric()
+            || matches!(ch, b'_' | b'$' | b'\\' | b'"' | b'\'')
+            || ch >= 0x80)
     }
 
     /// Sets OptionalChain bottom-up along property access, element access,
@@ -1087,7 +1261,9 @@ impl Walker<'_> {
                 }
             }
             while let Some(id) = spine.pop() {
-                let Some((inner, question_dot, reparse)) = self.chain_link(id) else { continue };
+                let Some((inner, question_dot, reparse)) = self.chain_link(id) else {
+                    continue;
+                };
                 if state[id.index()].is_some() {
                     continue;
                 }
@@ -1111,7 +1287,8 @@ impl Walker<'_> {
 
     // Go: parser/parser.go parseCallExpressionRest
     fn has_rust_optional_chain(&self, id: AstId) -> bool {
-        self.node(id).is_some_and(|n| n.flags.0 & NodeFlags::OPTIONAL_CHAIN.0 != 0)
+        self.node(id)
+            .is_some_and(|n| n.flags.0 & NodeFlags::OPTIONAL_CHAIN.0 != 0)
     }
 
     /// (inner expression, has `?.`, uses tryReparseOptionalChain)
@@ -1119,8 +1296,12 @@ impl Walker<'_> {
     fn chain_link(&self, id: AstId) -> Option<(AstId, bool, bool)> {
         let node = self.node(id)?;
         match &node.data {
-            D::PropertyAccessExpression(d) => Some((d.expression, d.question_dot_token.is_some(), true)),
-            D::ElementAccessExpression(d) => Some((d.expression, d.question_dot_token.is_some(), true)),
+            D::PropertyAccessExpression(d) => {
+                Some((d.expression, d.question_dot_token.is_some(), true))
+            }
+            D::ElementAccessExpression(d) => {
+                Some((d.expression, d.question_dot_token.is_some(), true))
+            }
             D::CallExpression(d) if node.kind == SyntaxKind::CallExpression => {
                 Some((d.expression, d.question_dot_token.is_some(), true))
             }
@@ -1140,9 +1321,13 @@ impl Walker<'_> {
             return false;
         }
         let inner = |id: AstId| self.chain_link(id).map(|(e, _, _)| e);
-        let Some(mut expr) = inner(node) else { return false };
+        let Some(mut expr) = inner(node) else {
+            return false;
+        };
         while is_non_null(expr) && state[expr.index()] != Some(true) {
-            let Some(next) = inner(expr) else { return false };
+            let Some(next) = inner(expr) else {
+                return false;
+            };
             expr = next;
         }
         if state[expr.index()] != Some(true) {
@@ -1289,7 +1474,8 @@ impl Walker<'_> {
     fn set_has_jsdoc(&mut self) {
         let text = self.text;
         let skip = NodeFlags::JS_DOC | NodeFlags::REPARSED;
-        let token_start = |node: &AstNode| skip_trivia(text, (node.range.start.get() as usize).min(text.len()));
+        let token_start =
+            |node: &AstNode| skip_trivia(text, (node.range.start.get() as usize).min(text.len()));
         let mut bounds: Vec<usize> = Vec::with_capacity(self.arena.len() * 2);
         for (id, node) in self.arena.iter() {
             // The zero-width EndOfFile token must not bound its own leading

@@ -52,16 +52,25 @@ impl ProcessingDiagnostic {
                 let loc = r.get_referenced_location(program);
                 // PORT: Go reads `loc.ref.FileName`; `ref` is not nil for
                 // these kinds. `None` panics like a Go nil dereference.
-                let reference = loc.ref_.as_ref().expect("reference location has no file reference");
+                let reference = loc
+                    .ref_
+                    .as_ref()
+                    .expect("reference location has no file reference");
                 match r.kind {
-                    FileIncludeKind::TYPE_REFERENCE_DIRECTIVE => {
-                        loc.diagnostic_at(diag::Cannot_find_type_definition_file_for_0, args![reference.file_name])
-                    }
+                    FileIncludeKind::TYPE_REFERENCE_DIRECTIVE => loc.diagnostic_at(
+                        diag::Cannot_find_type_definition_file_for_0,
+                        args![reference.file_name],
+                    ),
                     FileIncludeKind::LIB_REFERENCE_DIRECTIVE => {
                         let lib_name = to_file_name_lower_case(&reference.file_name);
                         let without_prefix = lib_name.strip_prefix("lib.").unwrap_or(&lib_name);
-                        let unqualified_lib_name = without_prefix.strip_suffix(".d.ts").unwrap_or(without_prefix);
-                        let suggestion = get_spelling_suggestion_for_strings(unqualified_lib_name, LIBS.iter().cloned());
+                        let unqualified_lib_name = without_prefix
+                            .strip_suffix(".d.ts")
+                            .unwrap_or(without_prefix);
+                        let suggestion = get_spelling_suggestion_for_strings(
+                            unqualified_lib_name,
+                            LIBS.iter().cloned(),
+                        );
                         let message = if !suggestion.is_empty() {
                             diag::Cannot_find_lib_definition_for_0_Did_you_mean_1
                         } else {
@@ -72,7 +81,9 @@ impl ProcessingDiagnostic {
                     _ => panic!("unknown include kind"),
                 }
             }
-            ProcessingDiagnosticKind::EXPLAINING_FILE_INCLUDE => self.create_diagnostic_explaining_file(program),
+            ProcessingDiagnosticKind::EXPLAINING_FILE_INCLUDE => {
+                self.create_diagnostic_explaining_file(program)
+            }
             _ => panic!("unknown processingDiagnosticKind"),
         }
     }
@@ -82,7 +93,9 @@ impl ProcessingDiagnostic {
     pub fn as_file_include_reason(&self) -> &Rc<FileIncludeReason> {
         match &self.data {
             ProcessingDiagnosticData::FileIncludeReason(r) => r,
-            ProcessingDiagnosticData::IncludeExplaining(_) => panic!("processing diagnostic data is not a FileIncludeReason"),
+            ProcessingDiagnosticData::IncludeExplaining(_) => {
+                panic!("processing diagnostic data is not a FileIncludeReason")
+            }
         }
     }
 
@@ -109,45 +122,64 @@ impl ProcessingDiagnostic {
         let mut seen_reasons: FxHashSet<*const FileIncludeReason> = FxHashSet::default();
         if let Some(reason) = &diag.diagnostic_reason
             && reason.is_referenced_file()
-            && !program.include_processor.get_reference_location(reason, program).is_synthetic
+            && !program
+                .include_processor
+                .get_reference_location(reason, program)
+                .is_synthetic
         {
             preferred_location = Some(reason.clone());
         }
 
         // PORT: the Go closures `processRelatedInfo` and `processInclude`
         // capture locals by reference. Here they take the locals as arguments.
-        let process_related_info = |include_reason: &Rc<FileIncludeReason>,
-                                    preferred_location: &mut Option<Rc<FileIncludeReason>>,
-                                    related_info: &mut Option<Vec<Diagnostic>>| {
-            if preferred_location.is_none()
-                && include_reason.is_referenced_file()
-                && !program.include_processor.get_reference_location(include_reason, program).is_synthetic
-            {
-                *preferred_location = Some(include_reason.clone());
-            } else if !preferred_location.as_ref().is_some_and(|p| Rc::ptr_eq(p, include_reason)) {
-                let info = program.include_processor.get_related_info(include_reason, program);
-                if let Some(info) = info {
-                    related_info.get_or_insert_with(Vec::new).push(info);
+        let process_related_info =
+            |include_reason: &Rc<FileIncludeReason>,
+             preferred_location: &mut Option<Rc<FileIncludeReason>>,
+             related_info: &mut Option<Vec<Diagnostic>>| {
+                if preferred_location.is_none()
+                    && include_reason.is_referenced_file()
+                    && !program
+                        .include_processor
+                        .get_reference_location(include_reason, program)
+                        .is_synthetic
+                {
+                    *preferred_location = Some(include_reason.clone());
+                } else if !preferred_location
+                    .as_ref()
+                    .is_some_and(|p| Rc::ptr_eq(p, include_reason))
+                {
+                    let info = program
+                        .include_processor
+                        .get_related_info(include_reason, program);
+                    if let Some(info) = info {
+                        related_info.get_or_insert_with(Vec::new).push(info);
+                    }
                 }
-            }
-        };
-        let process_include = |include_reason: &Rc<FileIncludeReason>,
-                               seen_reasons: &mut FxHashSet<*const FileIncludeReason>,
-                               include_details: &mut Option<Vec<Diagnostic>>,
-                               preferred_location: &mut Option<Rc<FileIncludeReason>>,
-                               related_info: &mut Option<Vec<Diagnostic>>| {
-            if !seen_reasons.insert(Rc::as_ptr(include_reason)) {
-                return;
-            }
-            include_details.get_or_insert_with(Vec::new).push(include_reason.to_diagnostic(program, false).clone());
-            process_related_info(include_reason, preferred_location, related_info);
-        };
+            };
+        let process_include =
+            |include_reason: &Rc<FileIncludeReason>,
+             seen_reasons: &mut FxHashSet<*const FileIncludeReason>,
+             include_details: &mut Option<Vec<Diagnostic>>,
+             preferred_location: &mut Option<Rc<FileIncludeReason>>,
+             related_info: &mut Option<Vec<Diagnostic>>| {
+                if !seen_reasons.insert(Rc::as_ptr(include_reason)) {
+                    return;
+                }
+                include_details
+                    .get_or_insert_with(Vec::new)
+                    .push(include_reason.to_diagnostic(program, false).clone());
+                process_related_info(include_reason, preferred_location, related_info);
+            };
 
         // !!! todo sheetal caching
 
         if !diag.file.is_empty() {
-            let reasons: Vec<Rc<FileIncludeReason>> =
-                program.include_processor.file_include_reasons.get(&diag.file).cloned().unwrap_or_default();
+            let reasons: Vec<Rc<FileIncludeReason>> = program
+                .include_processor
+                .file_include_reasons
+                .get(&diag.file)
+                .cloned()
+                .unwrap_or_default();
             include_details = Some(Vec::with_capacity(reasons.len()));
             for reason in &reasons {
                 process_include(
@@ -158,10 +190,13 @@ impl ProcessingDiagnostic {
                     &mut related_info,
                 );
             }
-            redirect_info =
-                Some(program.include_processor.explain_redirect_and_implied_format(program, &diag.file, |file_name| {
-                    file_name.to_string()
-                }));
+            redirect_info = Some(
+                program
+                    .include_processor
+                    .explain_redirect_and_implied_format(program, &diag.file, |file_name| {
+                        file_name.to_string()
+                    }),
+            );
         }
         if let Some(reason) = &diag.diagnostic_reason {
             process_include(
@@ -176,7 +211,8 @@ impl ProcessingDiagnostic {
         if let Some(include_details) = include_details
             && (preferred_location.is_none() || seen_reasons.len() != 1)
         {
-            let mut file_reason = new_compiler_diagnostic(diag::The_file_is_in_the_program_because_Colon, args![]);
+            let mut file_reason =
+                new_compiler_diagnostic(diag::The_file_is_in_the_program_because_Colon, args![]);
             file_reason.set_message_chain(include_details);
             chain = Some(vec![file_reason]);
         }
@@ -197,7 +233,8 @@ impl ProcessingDiagnostic {
                     .diagnostic_at(diag.message, diag.args.clone()),
             );
         }
-        let mut result = result.unwrap_or_else(|| new_compiler_diagnostic(diag.message, diag.args.clone()));
+        let mut result =
+            result.unwrap_or_else(|| new_compiler_diagnostic(diag.message, diag.args.clone()));
         if let Some(chain) = chain {
             result.set_message_chain(chain);
         }

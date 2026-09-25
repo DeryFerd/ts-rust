@@ -31,24 +31,26 @@ pub struct ExtendsResult {
 // Go: tsoptions/tsconfigparsing.go:34 compilerOptionsDeclaration
 // PORT: Go package-level vars are `LazyLock` statics of leaked
 // declarations, so Go pointer identity is `std::ptr::eq`.
-pub static COMPILER_OPTIONS_DECLARATION: LazyLock<&'static CommandLineOption> = LazyLock::new(|| {
-    leak_option(CommandLineOption {
-        name: "compilerOptions",
-        kind: CommandLineOptionKind::OBJECT,
-        element_options: COMMAND_LINE_COMPILER_OPTIONS_MAP.clone(),
-        ..Default::default()
-    })
-});
+pub static COMPILER_OPTIONS_DECLARATION: LazyLock<&'static CommandLineOption> =
+    LazyLock::new(|| {
+        leak_option(CommandLineOption {
+            name: "compilerOptions",
+            kind: CommandLineOptionKind::OBJECT,
+            element_options: COMMAND_LINE_COMPILER_OPTIONS_MAP.clone(),
+            ..Default::default()
+        })
+    });
 
 // Go: tsoptions/tsconfigparsing.go:40 compileOnSaveCommandLineOption
-pub static COMPILE_ON_SAVE_COMMAND_LINE_OPTION: LazyLock<&'static CommandLineOption> = LazyLock::new(|| {
-    leak_option(CommandLineOption {
-        name: "compileOnSave",
-        kind: CommandLineOptionKind::BOOLEAN,
-        default_value_description: CompilerOptionsValue::Bool(false),
-        ..Default::default()
-    })
-});
+pub static COMPILE_ON_SAVE_COMMAND_LINE_OPTION: LazyLock<&'static CommandLineOption> =
+    LazyLock::new(|| {
+        leak_option(CommandLineOption {
+            name: "compileOnSave",
+            kind: CommandLineOptionKind::BOOLEAN,
+            default_value_description: CompilerOptionsValue::Bool(false),
+            ..Default::default()
+        })
+    });
 
 // Go: tsoptions/tsconfigparsing.go:46 extendsOptionDeclaration
 pub static EXTENDS_OPTION_DECLARATION: LazyLock<&'static CommandLineOption> = LazyLock::new(|| {
@@ -125,7 +127,11 @@ pub struct ConfigFileSpecs {
 
 impl ConfigFileSpecs {
     // Go: tsoptions/tsconfigparsing.go:103 (*configFileSpecs).matchesExclude
-    pub fn matches_exclude(&self, file_name: &str, compare_paths_options: &ComparePathsOptions) -> bool {
+    pub fn matches_exclude(
+        &self,
+        file_name: &str,
+        compare_paths_options: &ComparePathsOptions,
+    ) -> bool {
         if self.validated_exclude_specs.is_empty() {
             return false;
         }
@@ -140,14 +146,20 @@ impl ConfigFileSpecs {
         if exclude_matcher.match_string(file_name) {
             return true;
         }
-        if !has_extension(file_name) && exclude_matcher.match_string(&ensure_trailing_directory_separator(file_name)) {
+        if !has_extension(file_name)
+            && exclude_matcher.match_string(&ensure_trailing_directory_separator(file_name))
+        {
             return true;
         }
         false
     }
 
     // Go: tsoptions/tsconfigparsing.go:122 (*configFileSpecs).getMatchedIncludeSpec
-    pub fn get_matched_include_spec(&self, file_name: &str, compare_paths_options: &ComparePathsOptions) -> String {
+    pub fn get_matched_include_spec(
+        &self,
+        file_name: &str,
+        compare_paths_options: &ComparePathsOptions,
+    ) -> String {
         if self.validated_include_specs.is_empty() {
             return String::new();
         }
@@ -168,7 +180,11 @@ impl ConfigFileSpecs {
     }
 
     // Go: tsoptions/tsconfigparsing.go:135 (*configFileSpecs).getMatchedFileSpec
-    pub fn get_matched_file_spec(&self, file_name: &str, compare_paths_options: &ComparePathsOptions) -> String {
+    pub fn get_matched_file_spec(
+        &self,
+        file_name: &str,
+        compare_paths_options: &ComparePathsOptions,
+    ) -> String {
         if self.validated_files_spec.is_empty() {
             return String::new();
         }
@@ -178,8 +194,11 @@ impl ConfigFileSpecs {
             compare_paths_options.use_case_sensitive_file_names,
         );
         for (index, spec) in self.validated_files_spec.iter().enumerate() {
-            if to_path(spec, &compare_paths_options.current_directory, compare_paths_options.use_case_sensitive_file_names)
-                == file_path
+            if to_path(
+                spec,
+                &compare_paths_options.current_directory,
+                compare_paths_options.use_case_sensitive_file_names,
+            ) == file_path
             {
                 return self.validated_files_spec_before_substitution[index].clone();
             }
@@ -262,7 +281,9 @@ pub fn parse_own_config_of_json_source_file(
                            option: Option<&'static CommandLineOption>|
      -> (CompilerOptionsValue, Vec<Diagnostic>) {
         let mut value = value;
-        let is_extends = |o: Option<&'static CommandLineOption>| o.is_some_and(|o| std::ptr::eq(o, *EXTENDS_OPTION_DECLARATION));
+        let is_extends = |o: Option<&'static CommandLineOption>| {
+            o.is_some_and(|o| std::ptr::eq(o, *EXTENDS_OPTION_DECLARATION))
+        };
         // Ensure value is verified except for extends which is handled in its own way for error reporting
         let mut property_set_errors: Vec<Diagnostic> = Vec::new();
         if let Some(option) = option
@@ -286,8 +307,12 @@ pub fn parse_own_config_of_json_source_file(
             {
                 // PORT: Go passes the `any` value; the parsers get a copy.
                 let parse_diagnostics = match parent_option.name {
-                    "compilerOptions" => parse_compiler_options(option.name, value.clone(), &mut compiler_options),
-                    "typeAcquisition" => parse_type_acquisition(option.name, value.clone(), &mut type_acquisition),
+                    "compilerOptions" => {
+                        parse_compiler_options(option.name, value.clone(), &mut compiler_options)
+                    }
+                    "typeAcquisition" => {
+                        parse_type_acquisition(option.name, value.clone(), &mut type_acquisition)
+                    }
                     _ => Vec::new(),
                 };
                 property_set_errors.extend(parse_diagnostics);
@@ -342,7 +367,10 @@ pub fn parse_own_config_of_json_source_file(
                         args![],
                     ));
                 }
-                if OPTIONS_DECLARATIONS.iter().any(|option| option.name == key_text) {
+                if OPTIONS_DECLARATIONS
+                    .iter()
+                    .any(|option| option.name == key_text)
+                {
                     root_compiler_options.push(property_assignment.name());
                 }
             }
@@ -458,14 +486,25 @@ pub fn convert_config_file_to_object(
         if get_base_file_name(source_file_file_name(source_file)) == "jsconfig.json" {
             base_file_name = "jsconfig.json";
         }
-        let errors = vec![new_compiler_diagnostic(diag::The_root_value_of_a_0_file_must_be_an_object, args![base_file_name])];
+        let errors = vec![new_compiler_diagnostic(
+            diag::The_root_value_of_a_0_file_must_be_an_object,
+            args![base_file_name],
+        )];
         // Last-ditch error recovery. Somewhat useful because the JSON parser will recover from some parse errors by
         // synthesizing a top-level array literal expression. There's a reasonable chance the first element of that
         // array is a well-formed configuration object, made into an array element by stray characters.
         if is_array_literal_expression(root_expression) {
-            let first_object = root_expression.elements().iter().find(|e| is_object_literal_expression(*e));
+            let first_object = root_expression
+                .elements()
+                .iter()
+                .find(|e| is_object_literal_expression(*e));
             if let Some(first_object) = first_object {
-                return convert_to_json(source_file, first_object, true /*returnValue*/, json_conversion_notifier);
+                return convert_to_json(
+                    source_file,
+                    first_object,
+                    true, /*returnValue*/
+                    json_conversion_notifier,
+                );
             }
         }
         return (CompilerOptionsValue::Map(IndexMap::new()), errors);
@@ -475,13 +514,19 @@ pub fn convert_config_file_to_object(
 
 /// Go `reflect.TypeOf(value).Kind() == reflect.Slice` on a non-nil value.
 fn is_slice_value(value: &CompilerOptionsValue) -> bool {
-    matches!(value, CompilerOptionsValue::List(_) | CompilerOptionsValue::StringList(_))
+    matches!(
+        value,
+        CompilerOptionsValue::List(_) | CompilerOptionsValue::StringList(_)
+    )
 }
 
 // Go: tsoptions/tsconfigparsing.go:335 isCompilerOptionsValue
 // PORT: Go `reflect` kind tests are variant matches (Go `orderedMapType`, line 333, is the `Map` match). Slice kinds are `List`
 // and `StringList`; `orderedMapType` is only the `Map` variant.
-pub fn is_compiler_options_value(option: Option<&CommandLineOption>, value: &CompilerOptionsValue) -> bool {
+pub fn is_compiler_options_value(
+    option: Option<&CommandLineOption>,
+    value: &CompilerOptionsValue,
+) -> bool {
     if let Some(option) = option {
         if value.is_nil() {
             return !option.disallow_null_or_undefined();
@@ -508,7 +553,9 @@ pub fn is_compiler_options_value(option: Option<&CommandLineOption>, value: &Com
         if option.kind == CommandLineOptionKind::OBJECT {
             return matches!(value, CompilerOptionsValue::Map(_));
         }
-        if option.kind == CommandLineOptionKind::ENUM && matches!(value, CompilerOptionsValue::String(_)) {
+        if option.kind == CommandLineOptionKind::ENUM
+            && matches!(value, CompilerOptionsValue::String(_))
+        {
             return true;
         }
     }
@@ -539,17 +586,22 @@ pub fn validate_json_option_value(
     match opt.extra_validation {
         ExtraValidation::SPEC => {
             if let Some(diag) = spec_to_diagnostic(as_string(&val), false) {
-                errors.push(create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
-                    source_file,
-                    value_expression,
-                    diag,
-                    args![],
-                ));
+                errors.push(
+                    create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
+                        source_file,
+                        value_expression,
+                        diag,
+                        args![],
+                    ),
+                );
             }
         }
         ExtraValidation::LOCALE => {
             // PORT: Go `locale.Parse` is not ported.
-            let _ = (as_string(&val), diag::Locale_must_be_an_IETF_BCP_47_language_tag_Examples_Colon_0_1);
+            let _ = (
+                as_string(&val),
+                diag::Locale_must_be_an_IETF_BCP_47_language_tag_Examples_Colon_0_1,
+            );
             unported!("locale.Parse");
         }
         _ => {}
@@ -585,8 +637,14 @@ pub fn convert_json_option_of_list_type(
                 if value_expression.is_some() {
                     expression = value_expression.elements().get(index);
                 }
-                let (result, err) =
-                    convert_json_option(elements, v, base_path, property_assignment, expression, source_file);
+                let (result, err) = convert_json_option(
+                    elements,
+                    v,
+                    base_path,
+                    property_assignment,
+                    expression,
+                    source_file,
+                );
                 errors.extend(err);
                 result
             })
@@ -594,8 +652,10 @@ pub fn convert_json_option_of_list_type(
         let mut filtered_values = mapped_values;
         if !option.list_preserve_falsy_values {
             filtered_values.retain(|v| {
-                !matches!(v, CompilerOptionsValue::Nil | CompilerOptionsValue::Bool(false))
-                    && !matches!(v, CompilerOptionsValue::String(s) if s.is_empty())
+                !matches!(
+                    v,
+                    CompilerOptionsValue::Nil | CompilerOptionsValue::Bool(false)
+                ) && !matches!(v, CompilerOptionsValue::String(s) if s.is_empty())
             });
         }
         return (CompilerOptionsValue::List(filtered_values), errors);
@@ -611,7 +671,8 @@ pub fn starts_with_config_dir_template(value: &CompilerOptionsValue) -> bool {
     let CompilerOptionsValue::String(str) = value else {
         return false;
     };
-    str.to_lowercase().starts_with(&CONFIG_DIR_TEMPLATE.to_lowercase())
+    str.to_lowercase()
+        .starts_with(&CONFIG_DIR_TEMPLATE.to_lowercase())
 }
 
 // Go: tsoptions/tsconfigparsing.go:438 normalizeNonListOptionValue
@@ -624,7 +685,10 @@ pub fn normalize_non_list_option_value(
     if option.is_file_path {
         value = CompilerOptionsValue::String(normalize_slashes(as_string(&value)));
         if !starts_with_config_dir_template(&value) {
-            value = CompilerOptionsValue::String(get_normalized_absolute_path(as_string(&value), base_path));
+            value = CompilerOptionsValue::String(get_normalized_absolute_path(
+                as_string(&value),
+                base_path,
+            ));
         }
         if as_string(&value).is_empty() {
             value = CompilerOptionsValue::String(".".to_string());
@@ -650,17 +714,22 @@ pub fn convert_json_option(
         if source_file.is_nil() && node_value.is_nil() {
             return (
                 CompilerOptionsValue::Nil,
-                vec![new_compiler_diagnostic(diag::Option_0_can_only_be_specified_on_command_line, args![opt.name])],
+                vec![new_compiler_diagnostic(
+                    diag::Option_0_can_only_be_specified_on_command_line,
+                    args![opt.name],
+                )],
             );
         } else {
             return (
                 CompilerOptionsValue::Nil,
-                vec![create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
-                    source_file,
-                    node_value,
-                    diag::Option_0_can_only_be_specified_on_command_line,
-                    args![opt.name],
-                )],
+                vec![
+                    create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
+                        source_file,
+                        node_value,
+                        diag::Option_0_can_only_be_specified_on_command_line,
+                        args![opt.name],
+                    ),
+                ],
             );
         }
     }
@@ -704,26 +773,37 @@ pub fn convert_json_option(
                 if value.is_nil() {
                     return (CompilerOptionsValue::Nil, Vec::new());
                 }
-                return convert_json_option_of_enum_type(opt, as_string(&value), value_expression, source_file);
+                return convert_json_option_of_enum_type(
+                    opt,
+                    as_string(&value),
+                    value_expression,
+                    source_file,
+                );
             }
             _ => {}
         }
 
-        let (validated_value, errors) = validate_json_option_value(opt, value, value_expression, source_file);
+        let (validated_value, errors) =
+            validate_json_option_value(opt, value, value_expression, source_file);
         if !errors.is_empty() || validated_value.is_nil() {
             (validated_value, errors)
         } else {
-            (normalize_non_list_option_value(opt, base_path, validated_value), errors)
+            (
+                normalize_non_list_option_value(opt, base_path, validated_value),
+                errors,
+            )
         }
     } else {
         (
             CompilerOptionsValue::Nil,
-            vec![create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
-                source_file,
-                value_expression,
-                diag::Compiler_option_0_requires_a_value_of_type_1,
-                args![opt.name, get_compiler_option_value_type_string(opt)],
-            )],
+            vec![
+                create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
+                    source_file,
+                    value_expression,
+                    diag::Compiler_option_0_requires_a_value_of_type_1,
+                    args![opt.name, get_compiler_option_value_type_string(opt)],
+                ),
+            ],
         )
     }
 }
@@ -757,7 +837,8 @@ pub fn get_extends_config_path_or_array(
         return (extended_config_path_array, errors);
     }
     if let CompilerOptionsValue::String(value) = value {
-        let (val, err) = get_extends_config_path(value, host, &new_base, value_expression, source_file);
+        let (val, err) =
+            get_extends_config_path(value, host, &new_base, value_expression, source_file);
         if !val.is_empty() {
             extended_config_path_array.push(val);
         }
@@ -776,7 +857,8 @@ pub fn get_extends_config_path_or_array(
                 expression = value_expression.elements().get(index);
             }
             if let CompilerOptionsValue::String(file_name) = file_name {
-                let (val, err) = get_extends_config_path(file_name, host, &new_base, expression, source_file);
+                let (val, err) =
+                    get_extends_config_path(file_name, host, &new_base, expression, source_file);
                 if !val.is_empty() {
                     extended_config_path_array.push(val);
                 }
@@ -785,7 +867,9 @@ pub fn get_extends_config_path_or_array(
                 // PORT: Go passes the whole `value` here, not `fileName`.
                 // Kept as Go does.
                 let (_, err) = convert_json_option(
-                    EXTENDS_OPTION_DECLARATION.elements().expect("extends has elements"),
+                    EXTENDS_OPTION_DECLARATION
+                        .elements()
+                        .expect("extends has elements"),
                     value.clone(),
                     base_path,
                     property_assignment,
@@ -822,43 +906,60 @@ pub fn get_extends_config_path(
     if source_file.is_some() {
         error_file = source_file;
     }
-    if is_rooted_disk_path(&extended_config) || extended_config.starts_with("./") || extended_config.starts_with("../") {
+    if is_rooted_disk_path(&extended_config)
+        || extended_config.starts_with("./")
+        || extended_config.starts_with("../")
+    {
         let mut extended_config_path = get_normalized_absolute_path(&extended_config, base_path);
-        if !host.fs().file_exists(&extended_config_path) && !extended_config_path.ends_with(EXTENSION_JSON) {
+        if !host.fs().file_exists(&extended_config_path)
+            && !extended_config_path.ends_with(EXTENSION_JSON)
+        {
             extended_config_path = extended_config_path + EXTENSION_JSON;
             if !host.fs().file_exists(&extended_config_path) {
-                errors.push(create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
-                    error_file,
-                    value_expression,
-                    diag::File_0_not_found,
-                    args![extended_config],
-                ));
+                errors.push(
+                    create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
+                        error_file,
+                        value_expression,
+                        diag::File_0_not_found,
+                        args![extended_config],
+                    ),
+                );
                 return (String::new(), errors);
             }
         }
         return (extended_config_path, errors);
     }
     // If the path isn't a rooted or relative path, resolve like a module
-    let resolver_host: Rc<dyn ResolutionHost> =
-        Rc::new(ResolverHost { fs: host.fs(), current_directory: host.get_current_directory() });
-    let resolved = resolve_config(&extended_config, &combine_paths(base_path, &["tsconfig.json"]), resolver_host);
+    let resolver_host: Rc<dyn ResolutionHost> = Rc::new(ResolverHost {
+        fs: host.fs(),
+        current_directory: host.get_current_directory(),
+    });
+    let resolved = resolve_config(
+        &extended_config,
+        &combine_paths(base_path, &["tsconfig.json"]),
+        resolver_host,
+    );
     if resolved.is_resolved() {
         return (resolved.resolved_file_name.clone(), errors);
     }
     if extended_config.is_empty() {
-        errors.push(create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
-            error_file,
-            value_expression,
-            diag::Compiler_option_0_cannot_be_given_an_empty_string,
-            args!["extends"],
-        ));
+        errors.push(
+            create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
+                error_file,
+                value_expression,
+                diag::Compiler_option_0_cannot_be_given_an_empty_string,
+                args!["extends"],
+            ),
+        );
     } else {
-        errors.push(create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
-            error_file,
-            value_expression,
-            diag::File_0_not_found,
-            args![extended_config],
-        ));
+        errors.push(
+            create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
+                error_file,
+                value_expression,
+                diag::File_0_not_found,
+                args![extended_config],
+            ),
+        );
     }
     (String::new(), errors)
 }
@@ -891,7 +992,9 @@ impl CommandLineOptionNameMap {
 }
 
 // Go: tsoptions/tsconfigparsing.go:600 commandLineOptionsToMap
-pub fn command_line_options_to_map(compiler_options: &[&'static CommandLineOption]) -> CommandLineOptionNameMap {
+pub fn command_line_options_to_map(
+    compiler_options: &[&'static CommandLineOption],
+) -> CommandLineOptionNameMap {
     let mut result: FxHashMap<String, &'static CommandLineOption> =
         FxHashMap::with_capacity_and_hasher(compiler_options.len() * 2, Default::default());
     for option in compiler_options {
@@ -938,16 +1041,25 @@ pub fn convert_options_from_json<O: OptionParser>(
             && opt.name != key
         {
             // Case-insensitive match found but exact case doesn't match - provide "did you mean" suggestion
-            errors.push(create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
-                Node::NIL,
-                Node::NIL,
-                result.unknown_did_you_mean_diagnostic(),
-                args![key, opt.name],
-            ));
+            errors.push(
+                create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
+                    Node::NIL,
+                    Node::NIL,
+                    result.unknown_did_you_mean_diagnostic(),
+                    args![key, opt.name],
+                ),
+            );
             continue;
         }
         let Some(opt) = opt else {
-            errors.push(create_unknown_option_error(key, result.unknown_option_diagnostic(), "", Node::NIL, Node::NIL, None));
+            errors.push(create_unknown_option_error(
+                key,
+                result.unknown_option_diagnostic(),
+                "",
+                Node::NIL,
+                Node::NIL,
+                None,
+            ));
             continue;
         };
 
@@ -959,13 +1071,27 @@ pub fn convert_options_from_json<O: OptionParser>(
                     errors = result.parse_option(key, val.clone());
                 }
             } else {
-                let (convert_json, err) = convert_json_option(opt, value.clone(), base_path, Node::NIL, Node::NIL, Node::NIL);
+                let (convert_json, err) = convert_json_option(
+                    opt,
+                    value.clone(),
+                    base_path,
+                    Node::NIL,
+                    Node::NIL,
+                    Node::NIL,
+                );
                 errors.extend(err);
                 let compiler_options_err = result.parse_option(key, convert_json);
                 errors.extend(compiler_options_err);
             }
         } else {
-            let (convert_json, err) = convert_json_option(opt, value.clone(), base_path, Node::NIL, Node::NIL, Node::NIL);
+            let (convert_json, err) = convert_json_option(
+                opt,
+                value.clone(),
+                base_path,
+                Node::NIL,
+                Node::NIL,
+                Node::NIL,
+            );
             errors.extend(err);
             let compiler_options_err = result.parse_option(key, convert_json);
             errors.extend(compiler_options_err);
@@ -986,7 +1112,13 @@ pub fn convert_array_literal_expression_to_json(
 ) -> (CompilerOptionsValue, Vec<Diagnostic>) {
     if !return_value {
         for element in elements.iter() {
-            let _ = convert_property_value_to_json(source_file, element, element_option, return_value, None);
+            let _ = convert_property_value_to_json(
+                source_file,
+                element,
+                element_option,
+                return_value,
+                None,
+            );
         }
         return (CompilerOptionsValue::Nil, Vec::new());
     }
@@ -999,7 +1131,13 @@ pub fn convert_array_literal_expression_to_json(
     let mut errors: Vec<Diagnostic> = Vec::new();
     let mut value: Vec<CompilerOptionsValue> = Vec::new();
     for element in elements.iter() {
-        let (converted_value, err) = convert_property_value_to_json(source_file, element, element_option, return_value, None);
+        let (converted_value, err) = convert_property_value_to_json(
+            source_file,
+            element,
+            element_option,
+            return_value,
+            None,
+        );
         errors.extend(err);
         if !converted_value.is_nil() {
             value.push(converted_value);
@@ -1019,14 +1157,23 @@ pub fn directory_of_combined_path(file_name: &str, base_path: &str) -> String {
 // fileName is the path to the config file
 // jsonText is the text of the config file
 // Go: tsoptions/tsconfigparsing.go:703 ParseConfigFileTextToJson
-pub fn parse_config_file_text_to_json(file_name: &str, path: Path, json_text: &str) -> (CompilerOptionsValue, Vec<Diagnostic>) {
+pub fn parse_config_file_text_to_json(
+    file_name: &str,
+    path: Path,
+    json_text: &str,
+) -> (CompilerOptionsValue, Vec<Diagnostic>) {
     let json_source_file = parse_source_file(
-        &SourceFileParseOptions { file_name: file_name.to_string(), path, ..Default::default() },
+        &SourceFileParseOptions {
+            file_name: file_name.to_string(),
+            path,
+            ..Default::default()
+        },
         Box::leak(json_text.to_string().into_boxed_str()),
         ScriptKind::JSON,
     )
     .root;
-    let (config, mut errors) = convert_config_file_to_object(json_source_file /*jsonConversionNotifier*/, None);
+    let (config, mut errors) =
+        convert_config_file_to_object(json_source_file /*jsonConversionNotifier*/, None);
     let diagnostics = parsed_source_file_diagnostics(json_source_file);
     if !diagnostics.is_empty() {
         errors = vec![diagnostics[0].clone()];
@@ -1113,7 +1260,12 @@ pub fn convert_object_literal_expression_to_json(
     let mut errors: Vec<Diagnostic> = Vec::new();
     for element in node.properties().iter() {
         if element.kind() != SyntaxKind::PropertyAssignment {
-            errors.push(new_diagnostic(source_file, element.loc(), diag::Property_assignment_expected, args![]));
+            errors.push(new_diagnostic(
+                source_file,
+                element.loc(),
+                diag::Property_assignment_expected,
+                args![],
+            ));
             continue;
         }
 
@@ -1155,12 +1307,16 @@ pub fn convert_object_literal_expression_to_json(
             }
             // Notify key value set, if user asked for it
             if let Some(notifier) = json_conversion_notifier.as_deref_mut() {
-                let (_, err) = (notifier.on_property_set)(&key_text, value, element, object_option, option);
+                let (_, err) =
+                    (notifier.on_property_set)(&key_text, value, element, object_option, option);
                 errors.extend(err);
             }
         }
     }
-    (result.map_or(CompilerOptionsValue::Nil, CompilerOptionsValue::Map), errors)
+    (
+        result.map_or(CompilerOptionsValue::Nil, CompilerOptionsValue::Map),
+        errors,
+    )
 }
 
 // convertToJson converts the json syntax tree into the json value and report errors
@@ -1186,7 +1342,13 @@ pub fn convert_to_json(
     if let Some(notifier) = &json_conversion_notifier {
         root_options = Some(notifier.root_options);
     }
-    convert_property_value_to_json(source_file, root_expression, root_options, return_value, json_conversion_notifier)
+    convert_property_value_to_json(
+        source_file,
+        root_expression,
+        root_options,
+        return_value,
+        json_conversion_notifier,
+    )
 }
 
 // Go: tsoptions/tsconfigparsing.go:815 isDoubleQuotedString
@@ -1219,11 +1381,19 @@ pub fn convert_property_value_to_json(
                     )],
                 );
             }
-            return (CompilerOptionsValue::String(value_expression.text().to_string()), Vec::new());
+            return (
+                CompilerOptionsValue::String(value_expression.text().to_string()),
+                Vec::new(),
+            );
         }
 
         SyntaxKind::NumericLiteral => {
-            return (CompilerOptionsValue::Number(ts_jsnum::Number::from_string(value_expression.text()).0), Vec::new());
+            return (
+                CompilerOptionsValue::Number(
+                    ts_jsnum::Number::from_string(value_expression.text()).0,
+                ),
+                Vec::new(),
+            );
         }
         SyntaxKind::PrefixUnaryExpression => {
             // Go `break` for a non-JSON form falls through to the error below.
@@ -1231,7 +1401,9 @@ pub fn convert_property_value_to_json(
                 && value_expression.operand().kind() == SyntaxKind::NumericLiteral
             {
                 return (
-                    CompilerOptionsValue::Number(-ts_jsnum::Number::from_string(value_expression.operand().text()).0),
+                    CompilerOptionsValue::Number(
+                        -ts_jsnum::Number::from_string(value_expression.operand().text()).0,
+                    ),
                     Vec::new(),
                 );
             }
@@ -1318,7 +1490,12 @@ pub fn convert_to_object(source_file: Node) -> (CompilerOptionsValue, Vec<Diagno
     if !statements.is_empty() {
         root_expression = statements.get(0).expression();
     }
-    convert_to_json(source_file, root_expression, true /*returnValue*/, None /*jsonConversionNotifier*/)
+    convert_to_json(
+        source_file,
+        root_expression,
+        true, /*returnValue*/
+        None, /*jsonConversionNotifier*/
+    )
 }
 
 // Go: tsoptions/tsconfigparsing.go:887 getDefaultCompilerOptions

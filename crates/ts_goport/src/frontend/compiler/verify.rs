@@ -24,9 +24,13 @@ impl OptionsSyntax {
             None => Node::NIL,
             Some(config_file) => config_file.source_file,
         };
-        let config_file_path =
-            if source_file.is_some() { source_file_file_name(source_file).to_string() } else { String::new() };
-        let compiler_options_property = for_each_tsconfig_prop_array(source_file, "compilerOptions", Some);
+        let config_file_path = if source_file.is_some() {
+            source_file_file_name(source_file).to_string()
+        } else {
+            String::new()
+        };
+        let compiler_options_property =
+            for_each_tsconfig_prop_array(source_file, "compilerOptions", Some);
         let mut compiler_options_object_literal = Node::NIL;
         if let Some(compiler_options_property) = compiler_options_property
             && compiler_options_property.initializer().is_some()
@@ -34,7 +38,12 @@ impl OptionsSyntax {
         {
             compiler_options_object_literal = compiler_options_property.initializer();
         }
-        OptionsSyntax { source_file, config_file_path, compiler_options_property, compiler_options_object_literal }
+        OptionsSyntax {
+            source_file,
+            config_file_path,
+            compiler_options_property,
+            compiler_options_object_literal,
+        }
     }
 }
 
@@ -86,7 +95,11 @@ impl NewProgram {
             |property: Node| {
                 Some(create_diagnostic_for_node_in_source_file(
                     syntax.source_file,
-                    if on_key { property.name() } else { property.initializer() },
+                    if on_key {
+                        property.name()
+                    } else {
+                        property.initializer()
+                    },
                     message,
                     args.to_vec(),
                 ))
@@ -158,7 +171,10 @@ impl NewProgram {
         new_args.push(option1.to_string());
         new_args.push(option2.to_string());
         new_args.extend_from_slice(args);
-        self.create_diagnostic_for_option(syntax, true /*onKey*/, option1, option2, message, &new_args);
+        self.create_diagnostic_for_option(
+            syntax, true, /*onKey*/
+            option1, option2, message, &new_args,
+        );
     }
 
     // Go: program.go:794 createOptionValueDiagnostic (closure)
@@ -173,17 +189,32 @@ impl NewProgram {
     }
 
     // Go: program.go:798 createRemovedOptionDiagnostic (closure)
-    fn create_removed_option_diagnostic(&mut self, syntax: &OptionsSyntax, name: &str, value: &str, use_instead: &str) {
+    fn create_removed_option_diagnostic(
+        &mut self,
+        syntax: &OptionsSyntax,
+        name: &str,
+        value: &str,
+        use_instead: &str,
+    ) {
         let (message, args) = if value.is_empty() {
-            (diag::Option_0_has_been_removed_Please_remove_it_from_your_configuration, args![name])
+            (
+                diag::Option_0_has_been_removed_Please_remove_it_from_your_configuration,
+                args![name],
+            )
         } else {
-            (diag::Option_0_1_has_been_removed_Please_remove_it_from_your_configuration, args![name, value])
+            (
+                diag::Option_0_1_has_been_removed_Please_remove_it_from_your_configuration,
+                args![name, value],
+            )
         };
 
-        let diag = self.create_diagnostic_for_option(syntax, value.is_empty(), name, "", message, &args);
+        let diag =
+            self.create_diagnostic_for_option(syntax, value.is_empty(), name, "", message, &args);
         if !use_instead.is_empty() {
-            self.program_diagnostics[diag]
-                .add_message_chain(Some(new_compiler_diagnostic(diag::Use_0_instead, args![use_instead])));
+            self.program_diagnostics[diag].add_message_chain(Some(new_compiler_diagnostic(
+                diag::Use_0_instead,
+                args![use_instead],
+            )));
         }
     }
 
@@ -284,13 +315,19 @@ impl NewProgram {
             // BaseUrl will have been turned absolute by this point.
             let mut use_instead = String::new();
             if !syntax.config_file_path.is_empty() {
-                let mut relative =
-                    get_relative_path_from_file(&syntax.config_file_path, &options.base_url, &self.compare_paths_options);
+                let mut relative = get_relative_path_from_file(
+                    &syntax.config_file_path,
+                    &options.base_url,
+                    &self.compare_paths_options,
+                );
                 if !(relative.starts_with("./") || relative.starts_with("../")) {
                     relative = format!("./{relative}");
                 }
                 let suggestion = combine_paths(&relative, &["*"]);
-                use_instead = format!(r#""paths": {{"*": [{}]}}"#, marshal_json_string(&suggestion));
+                use_instead = format!(
+                    r#""paths": {{"*": [{}]}}"#,
+                    marshal_json_string(&suggestion)
+                );
             }
             self.create_removed_option_diagnostic(syntax, "baseUrl", "", &use_instead);
         }
@@ -326,7 +363,12 @@ impl NewProgram {
         }
 
         if options.allow_synthetic_default_imports.is_false() {
-            self.create_removed_option_diagnostic(syntax, "allowSyntheticDefaultImports", "false", "");
+            self.create_removed_option_diagnostic(
+                syntax,
+                "allowSyntheticDefaultImports",
+                "false",
+                "",
+            );
         }
 
         if options.module_resolution == ModuleResolutionKind::NODE10 {
@@ -348,7 +390,8 @@ impl NewProgram {
                 &[],
             );
         }
-        if options.exact_optional_property_types.is_true() && !options.get_strict_option_value(options.strict_null_checks)
+        if options.exact_optional_property_types.is_true()
+            && !options.get_strict_option_value(options.strict_null_checks)
         {
             self.create_diagnostic_for_option_name(
                 syntax,
@@ -422,7 +465,9 @@ impl NewProgram {
             }
         }
 
-        if options.ts_build_info_file.is_empty() && options.incremental.is_true() && options.config_file_path.is_empty()
+        if options.ts_build_info_file.is_empty()
+            && options.incremental.is_true()
+            && options.config_file_path.is_empty()
         {
             self.create_compiler_options_diagnostic(
                 syntax,
@@ -443,7 +488,8 @@ impl NewProgram {
             // loop over `self.files` does not overlap the mutable borrow.
             let mut not_listed: Vec<Rc<ProcessingDiagnostic>> = Vec::new();
             for file in &self.files {
-                if self.source_file_may_be_emitted(file, false) && !root_paths.contains(file.path()) {
+                if self.source_file_may_be_emitted(file, false) && !root_paths.contains(file.path())
+                {
                     not_listed.push(Rc::new(ProcessingDiagnostic {
                         kind: ProcessingDiagnosticKind::EXPLAINING_FILE_INCLUDE,
                         data: ProcessingDiagnosticData::IncludeExplaining(IncludeExplainingDiagnostic {
@@ -455,7 +501,9 @@ impl NewProgram {
                     }));
                 }
             }
-            self.processed_files.include_processor.add_processing_diagnostic(not_listed);
+            self.processed_files
+                .include_processor
+                .add_processing_diagnostic(not_listed);
         }
 
         // PORT: Go `options.Paths.Entries()` walks the ordered map. Go can
@@ -506,7 +554,9 @@ impl NewProgram {
             }
         }
 
-        if options.source_map.is_false_or_unknown() && options.inline_source_map.is_false_or_unknown() {
+        if options.source_map.is_false_or_unknown()
+            && options.inline_source_map.is_false_or_unknown()
+        {
             if options.inline_sources.is_true() {
                 self.create_diagnostic_for_option_name(
                     syntax,
@@ -527,7 +577,9 @@ impl NewProgram {
             }
         }
 
-        if !options.map_root.is_empty() && !(options.source_map.is_true() || options.declaration_map.is_true()) {
+        if !options.map_root.is_empty()
+            && !(options.source_map.is_true() || options.declaration_map.is_true())
+        {
             // Error to specify --mapRoot without --sourcemap
             self.create_diagnostic_for_option_name(
                 syntax,
@@ -576,7 +628,11 @@ impl NewProgram {
             self.create_diagnostic_for_option_name(
                 syntax,
                 diag::Option_preserveConstEnums_cannot_be_disabled_when_0_is_enabled,
-                if options.verbatim_module_syntax.is_true() { "verbatimModuleSyntax" } else { "isolatedModules" },
+                if options.verbatim_module_syntax.is_true() {
+                    "verbatimModuleSyntax"
+                } else {
+                    "isolatedModules"
+                },
                 "preserveConstEnums",
                 &[],
             );
@@ -592,7 +648,10 @@ impl NewProgram {
             let dir = self.common_source_directory();
             if !options.out_dir.is_empty()
                 && dir.is_empty()
-                && self.files.iter().any(|f| get_root_length(f.file_name()) > 1)
+                && self
+                    .files
+                    .iter()
+                    .any(|f| get_root_length(f.file_name()) > 1)
             {
                 self.create_diagnostic_for_option_name(
                     syntax,
@@ -637,7 +696,11 @@ impl NewProgram {
                 } else {
                     "declarationDir"
                 };
-                let option2 = if options.out_file.is_empty() && !options.out_dir.is_empty() { "declarationDir" } else { "" };
+                let option2 = if options.out_file.is_empty() && !options.out_dir.is_empty() {
+                    "declarationDir"
+                } else {
+                    ""
+                };
                 let diag = self.create_diagnostic_for_option(
                     syntax,
                     true, /*onKey*/
@@ -676,7 +739,9 @@ impl NewProgram {
             );
         }
 
-        if options.emit_decorator_metadata.is_true() && options.experimental_decorators.is_false_or_unknown() {
+        if options.emit_decorator_metadata.is_true()
+            && options.experimental_decorators.is_false_or_unknown()
+        {
             self.create_diagnostic_for_option_name(
                 syntax,
                 diag::Option_0_cannot_be_specified_without_specifying_option_1,
@@ -844,7 +909,8 @@ impl NewProgram {
 
         if ModuleKind::NODE16 <= module_kind
             && module_kind <= ModuleKind::NODE_NEXT
-            && !(ModuleResolutionKind::NODE16 <= module_resolution && module_resolution <= ModuleResolutionKind::NODE_NEXT)
+            && !(ModuleResolutionKind::NODE16 <= module_resolution
+                && module_resolution <= ModuleResolutionKind::NODE_NEXT)
         {
             let module_kind_name = module_kind.to_string();
             let module_resolution_name = match module_kind_to_module_resolution_kind(module_kind) {
@@ -882,11 +948,15 @@ impl NewProgram {
             for_each_emitted_file(
                 self,
                 &options,
-                |emit_file_names_of_file: &OutputPaths, _source_file: Option<&Rc<ParsedSourceFile>>| {
+                |emit_file_names_of_file: &OutputPaths,
+                 _source_file: Option<&Rc<ParsedSourceFile>>| {
                     emit_file_names.push(emit_file_names_of_file.js_file_path().to_string());
-                    emit_file_names.push(emit_file_names_of_file.source_map_file_path().to_string());
-                    emit_file_names.push(emit_file_names_of_file.declaration_file_path().to_string());
-                    emit_file_names.push(emit_file_names_of_file.declaration_map_path().to_string());
+                    emit_file_names
+                        .push(emit_file_names_of_file.source_map_file_path().to_string());
+                    emit_file_names
+                        .push(emit_file_names_of_file.declaration_file_path().to_string());
+                    emit_file_names
+                        .push(emit_file_names_of_file.declaration_map_path().to_string());
                     false
                 },
                 &source_files_to_emit,
@@ -958,7 +1028,8 @@ impl NewProgram {
 
     // Go: program.go:1225 (*Program).IsEmitBlocked
     pub fn is_emit_blocked(&self, emit_file_name: &str) -> bool {
-        self.has_emit_blocking_diagnostics.contains(&self.to_path(emit_file_name))
+        self.has_emit_blocking_diagnostics
+            .contains(&self.to_path(emit_file_name))
     }
 
     // Go: program.go:1229 (*Program).verifyProjectReferences
@@ -974,15 +1045,17 @@ impl NewProgram {
         let mut diagnostics: Vec<Diagnostic> = Vec::new();
         let mut blocked_paths: Vec<Path> = Vec::new();
         // Go: program.go:1231 createDiagnosticForReference (closure)
-        let create_diagnostic_for_reference = |diagnostics: &mut Vec<Diagnostic>,
-                                               config: &ParsedCommandLine,
-                                               index: usize,
-                                               message: &'static Message,
-                                               args: Vec<String>| {
-            let diag = create_diagnostic_at_reference_syntax(config, index, message, args.clone())
-                .unwrap_or_else(|| new_compiler_diagnostic(message, args));
-            diagnostics.push(diag);
-        };
+        let create_diagnostic_for_reference =
+            |diagnostics: &mut Vec<Diagnostic>,
+             config: &ParsedCommandLine,
+             index: usize,
+             message: &'static Message,
+             args: Vec<String>| {
+                let diag =
+                    create_diagnostic_at_reference_syntax(config, index, message, args.clone())
+                        .unwrap_or_else(|| new_compiler_diagnostic(message, args));
+                diagnostics.push(diag);
+            };
 
         self.range_resolved_project_reference(
             |_path: &Path,
@@ -1062,8 +1135,11 @@ pub fn has_zero_or_one_asterisk_character(str: &str) -> bool {
 }
 
 // Go: program.go:1281 moduleResolutionSupportsPackageJsonExportsAndImports
-pub fn module_resolution_supports_package_json_exports_and_imports(module_resolution: ModuleResolutionKind) -> bool {
-    module_resolution >= ModuleResolutionKind::NODE16 && module_resolution <= ModuleResolutionKind::NODE_NEXT
+pub fn module_resolution_supports_package_json_exports_and_imports(
+    module_resolution: ModuleResolutionKind,
+) -> bool {
+    module_resolution >= ModuleResolutionKind::NODE16
+        && module_resolution <= ModuleResolutionKind::NODE_NEXT
         || module_resolution == ModuleResolutionKind::BUNDLER
 }
 

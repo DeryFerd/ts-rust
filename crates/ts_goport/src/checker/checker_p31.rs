@@ -7,7 +7,12 @@ use crate::prelude::*;
 
 impl Checker {
     // Go: checker/checker.go:27805 distributeObjectOverIndexType
-    pub fn distribute_object_over_index_type(&mut self, object_type: TypeId, index_type: TypeId, writing: bool) -> TypeId {
+    pub fn distribute_object_over_index_type(
+        &mut self,
+        object_type: TypeId,
+        index_type: TypeId,
+        writing: bool,
+    ) -> TypeId {
         // T[A | B] -> T[A] | T[B] (reading)
         // T[A | B] -> T[A] & T[B] (writing)
         if self.ty(index_type).flags.intersects(TypeFlags::UNION) {
@@ -26,13 +31,19 @@ impl Checker {
     }
 
     // Go: checker/checker.go:27821 distributeIndexOverObjectType
-    pub fn distribute_index_over_object_type(&mut self, object_type: TypeId, index_type: TypeId, writing: bool) -> TypeId {
+    pub fn distribute_index_over_object_type(
+        &mut self,
+        object_type: TypeId,
+        index_type: TypeId,
+        writing: bool,
+    ) -> TypeId {
         // (T | U)[K] -> T[K] | U[K] (reading)
         // (T | U)[K] -> T[K] & U[K] (writing)
         // (T & U)[K] -> T[K] & U[K]
         let object_flags = self.ty(object_type).flags;
         if object_flags.intersects(TypeFlags::UNION)
-            || object_flags.intersects(TypeFlags::INTERSECTION) && !self.should_defer_index_type(object_type, IndexFlags::NONE)
+            || object_flags.intersects(TypeFlags::INTERSECTION)
+                && !self.should_defer_index_type(object_type, IndexFlags::NONE)
         {
             let object_types = self.ty(object_type).types().to_vec();
             let mut types: Vec<TypeId> = Vec::with_capacity(object_types.len());
@@ -40,7 +51,12 @@ impl Checker {
                 let indexed = self.get_indexed_access_type(t, index_type);
                 types.push(self.get_simplified_type(indexed, writing));
             }
-            if self.ty(object_type).flags.intersects(TypeFlags::INTERSECTION) || writing {
+            if self
+                .ty(object_type)
+                .flags
+                .intersects(TypeFlags::INTERSECTION)
+                || writing
+            {
                 return self.get_intersection_type(&types);
             }
             return self.get_union_type(&types);
@@ -68,7 +84,8 @@ impl Checker {
                 return self.never_type;
             }
         } else if self.ty(true_type).flags.intersects(TypeFlags::NEVER)
-            && self.get_actual_type_variable(false_type) == self.get_actual_type_variable(check_type)
+            && self.get_actual_type_variable(false_type)
+                == self.get_actual_type_variable(check_type)
         {
             if !self.ty(check_type).flags.intersects(TypeFlags::ANY) && {
                 let source = self.get_restrictive_instantiation(check_type);
@@ -76,7 +93,9 @@ impl Checker {
                 self.is_type_assignable_to(source, target)
             } {
                 return self.never_type;
-            } else if self.ty(check_type).flags.intersects(TypeFlags::ANY) || self.is_intersection_empty(check_type, extends_type) {
+            } else if self.ty(check_type).flags.intersects(TypeFlags::ANY)
+                || self.is_intersection_empty(check_type, extends_type)
+            {
                 return self.get_simplified_type(false_type, writing);
             }
         }
@@ -102,12 +121,18 @@ impl Checker {
     }
 
     // Go: checker/checker.go:27871 getNormalizedUnionOrIntersectionType
-    pub fn get_normalized_union_or_intersection_type(&mut self, t: TypeId, writing: bool) -> TypeId {
+    pub fn get_normalized_union_or_intersection_type(
+        &mut self,
+        t: TypeId,
+        writing: bool,
+    ) -> TypeId {
         let reduced = self.get_reduced_type(t);
         if reduced != t {
             return reduced;
         }
-        if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) && self.should_normalize_intersection(t) {
+        if self.ty(t).flags.intersects(TypeFlags::INTERSECTION)
+            && self.should_normalize_intersection(t)
+        {
             // Normalization handles cases like
             // Partial<T>[K] & ({} | null) ==>
             // Partial<T>[K] & {} | Partial<T>[K} & null ==>
@@ -134,7 +159,8 @@ impl Checker {
         let mut has_nullable_or_empty = false;
         let types = self.ty(t).types().to_vec();
         for t in types {
-            has_instantiable = has_instantiable || self.ty(t).flags.intersects(TypeFlags::INSTANTIABLE);
+            has_instantiable =
+                has_instantiable || self.ty(t).flags.intersects(TypeFlags::INSTANTIABLE);
             has_nullable_or_empty = has_nullable_or_empty
                 || self.ty(t).flags.intersects(TypeFlags::NULLABLE)
                 || self.is_empty_anonymous_object_type(t);
@@ -170,11 +196,22 @@ impl Checker {
             return TypeId::NIL;
         }
         let target = self.ty(t).target();
-        if !self.ty(target).object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE) {
+        if !self
+            .ty(target)
+            .object_flags
+            .intersects(ObjectFlags::CLASS_OR_INTERFACE)
+        {
             return TypeId::NIL;
         }
-        let key = CachedTypeKey { kind: CachedTypeKind::EQUIVALENT_BASE_TYPE, type_id: self.ty(t).id };
-        if self.ty(t).object_flags.intersects(ObjectFlags::IDENTICAL_BASE_TYPE_CALCULATED) {
+        let key = CachedTypeKey {
+            kind: CachedTypeKind::EQUIVALENT_BASE_TYPE,
+            type_id: self.ty(t).id,
+        };
+        if self
+            .ty(t)
+            .object_flags
+            .intersects(ObjectFlags::IDENTICAL_BASE_TYPE_CALCULATED)
+        {
             return self.cached_types.get(&key).copied().unwrap_or_default();
         }
         self.ty_mut(t).object_flags |= ObjectFlags::IDENTICAL_BASE_TYPE_CALCULATED;
@@ -200,12 +237,17 @@ impl Checker {
             return TypeId::NIL;
         }
         let instantiated_base: TypeId;
-        let type_parameters = self.ty(target).as_interface_type().type_parameters().to_vec();
+        let type_parameters = self
+            .ty(target)
+            .as_interface_type()
+            .type_parameters()
+            .to_vec();
         if type_parameters.is_empty() {
             instantiated_base = bases[0];
         } else {
             let type_arguments = self.get_type_arguments(t);
-            let mapper = self.new_type_mapper(&type_parameters, &type_arguments[..type_parameters.len()]);
+            let mapper =
+                self.new_type_mapper(&type_parameters, &type_arguments[..type_parameters.len()]);
             instantiated_base = self.instantiate_type(bases[0], mapper);
         }
         let mut instantiated_base = instantiated_base;
@@ -238,10 +280,20 @@ impl Checker {
                 let declared_type = self.get_type_from_mapped_type_node(declaration);
                 let constraint = self.get_constraint_type_from_mapped_type(declared_type);
                 let mut extended_constraint = constraint;
-                if constraint.is_some() && self.ty(constraint).flags.intersects(TypeFlags::TYPE_PARAMETER) {
+                if constraint.is_some()
+                    && self
+                        .ty(constraint)
+                        .flags
+                        .intersects(TypeFlags::TYPE_PARAMETER)
+                {
                     extended_constraint = self.get_constraint_of_type_parameter(constraint);
                 }
-                if extended_constraint.is_some() && self.ty(extended_constraint).flags.intersects(TypeFlags::INDEX) {
+                if extended_constraint.is_some()
+                    && self
+                        .ty(extended_constraint)
+                        .flags
+                        .intersects(TypeFlags::INDEX)
+                {
                     let index_target = self.ty(extended_constraint).as_index_type().target;
                     let mapper = self.ty(t).as_object_type().mapper;
                     modifiers_type = self.instantiate_type(index_target, mapper);
@@ -256,34 +308,57 @@ impl Checker {
 
     // Go: checker/checker.go:27987 extractTypesOfKind
     pub fn extract_types_of_kind(&mut self, t: TypeId, kind: TypeFlags) -> TypeId {
-        self.filter_type(t, &mut |c: &mut Checker, t: TypeId| c.ty(t).flags.intersects(kind))
+        self.filter_type(t, &mut |c: &mut Checker, t: TypeId| {
+            c.ty(t).flags.intersects(kind)
+        })
     }
 
     // Go: checker/checker.go:27991 getRegularTypeOfObjectLiteral
     pub fn get_regular_type_of_object_literal(&mut self, t: TypeId) -> TypeId {
-        if !(self.is_object_literal_type(t) && self.ty(t).object_flags.intersects(ObjectFlags::FRESH_LITERAL)) {
+        if !(self.is_object_literal_type(t)
+            && self
+                .ty(t)
+                .object_flags
+                .intersects(ObjectFlags::FRESH_LITERAL))
+        {
             return t;
         }
-        let key = CachedTypeKey { kind: CachedTypeKind::REGULAR_OBJECT_LITERAL, type_id: self.ty(t).id };
+        let key = CachedTypeKey {
+            kind: CachedTypeKind::REGULAR_OBJECT_LITERAL,
+            type_id: self.ty(t).id,
+        };
         if let Some(&cached) = self.cached_types.get(&key) {
             if cached.is_some() {
                 return cached;
             }
         }
         self.resolve_structured_type_members(t);
-        let members = self.transform_type_of_members(t, &mut |c: &mut Checker, pt: TypeId| c.get_regular_type_of_object_literal(pt));
+        let members = self.transform_type_of_members(t, &mut |c: &mut Checker, pt: TypeId| {
+            c.get_regular_type_of_object_literal(pt)
+        });
         // PORT: Go `resolved` is the StructuredType embedded in `t`, so
         // `resolved.flags`/`resolved.objectFlags` are `t`'s flags.
         let symbol = self.ty(t).symbol;
         let (call_signatures, construct_signatures, index_infos) = {
             let resolved = self.ty(t).as_structured_type();
-            (resolved.call_signatures().to_vec(), resolved.construct_signatures().to_vec(), resolved.index_infos.clone())
+            (
+                resolved.call_signatures().to_vec(),
+                resolved.construct_signatures().to_vec(),
+                resolved.index_infos.clone(),
+            )
         };
-        let regular = self.new_anonymous_type(symbol, members, &call_signatures, &construct_signatures, &index_infos);
+        let regular = self.new_anonymous_type(
+            symbol,
+            members,
+            &call_signatures,
+            &construct_signatures,
+            &index_infos,
+        );
         let resolved_flags = self.ty(t).flags;
         let resolved_object_flags = self.ty(t).object_flags;
         self.ty_mut(regular).flags = resolved_flags;
-        self.ty_mut(regular).object_flags |= resolved_object_flags.without(ObjectFlags::FRESH_LITERAL);
+        self.ty_mut(regular).object_flags |=
+            resolved_object_flags.without(ObjectFlags::FRESH_LITERAL);
         self.cached_types.insert(key, regular);
         regular
     }
@@ -309,7 +384,13 @@ impl Checker {
     }
 
     // Go: checker/checker.go:28023 markLinkedReferences
-    pub fn mark_linked_references(&mut self, location: Node, hint: ReferenceHint, prop_symbol: SymbolId, parent_type: TypeId) {
+    pub fn mark_linked_references(
+        &mut self,
+        location: Node,
+        hint: ReferenceHint,
+        prop_symbol: SymbolId,
+        parent_type: TypeId,
+    ) {
         if !self.can_collect_symbol_alias_accessibility_data {
             return;
         }
@@ -375,7 +456,11 @@ impl Checker {
                         }
                         top_prop = top_prop.parent();
                     }
-                    self.mark_property_alias_referenced(location, SymbolId::NIL /*propSymbol*/, TypeId::NIL /*parentType*/);
+                    self.mark_property_alias_referenced(
+                        location,
+                        SymbolId::NIL, /*propSymbol*/
+                        TypeId::NIL,   /*parentType*/
+                    );
                     return;
                 }
                 if is_export_assignment(location) {
@@ -405,7 +490,12 @@ impl Checker {
                 if !can_have_decorators(location)
                     || !has_decorators(location)
                     || location.modifiers().is_nil()
-                    || !node_can_be_decorated(self.legacy_decorators, location, location.parent(), location.parent().parent())
+                    || !node_can_be_decorated(
+                        self.legacy_decorators,
+                        location,
+                        location.parent(),
+                        location.parent().parent(),
+                    )
                 {
                     return;
                 }
@@ -448,7 +538,10 @@ pub fn should_mark_identifier_alias_referenced(node: Node) -> bool {
         }
         if parent.parent().is_some() {
             let great_grandparent = parent.parent().parent();
-            if great_grandparent.is_some() && is_export_declaration(great_grandparent) && great_grandparent.is_type_only() {
+            if great_grandparent.is_some()
+                && is_export_declaration(great_grandparent)
+                && great_grandparent.is_type_only()
+            {
                 return false;
             }
         }
@@ -462,24 +555,38 @@ pub fn should_mark_identifier_alias_referenced(node: Node) -> bool {
 // This checker-package copy is private and suffixed so the prelude globs do
 // not see two items with one name.
 fn is_internal_module_import_equals_declaration_p31(node: Node) -> bool {
-    node.kind() == SyntaxKind::ImportEqualsDeclaration && node.module_reference().kind() != SyntaxKind::ExternalModuleReference
+    node.kind() == SyntaxKind::ImportEqualsDeclaration
+        && node.module_reference().kind() != SyntaxKind::ExternalModuleReference
 }
 
 impl Checker {
     // Go: checker/checker.go:28152 markIdentifierAliasReferenced
     pub fn mark_identifier_alias_referenced(&mut self, location: Node) {
         let symbol = self.get_resolved_symbol(location);
-        if symbol.is_some() && symbol != self.arguments_symbol && symbol != self.unknown_symbol && !is_this_in_type_query(location) {
+        if symbol.is_some()
+            && symbol != self.arguments_symbol
+            && symbol != self.unknown_symbol
+            && !is_this_in_type_query(location)
+        {
             self.mark_alias_referenced(symbol, location);
         }
     }
 
     // Go: checker/checker.go:28159 markPropertyAliasReferenced
-    pub fn mark_property_alias_referenced(&mut self, location: Node /*PropertyAccessExpression | QualifiedName*/, prop_symbol: SymbolId, parent_type: TypeId) {
+    pub fn mark_property_alias_referenced(
+        &mut self,
+        location: Node, /*PropertyAccessExpression | QualifiedName*/
+        prop_symbol: SymbolId,
+        parent_type: TypeId,
+    ) {
         if is_part_of_import_equals_module_reference(location) {
             return;
         }
-        let left = if is_property_access_expression(location) { location.expression() } else { location.left() };
+        let left = if is_property_access_expression(location) {
+            location.expression()
+        } else {
+            location.left()
+        };
         if is_this_identifier(left) || !is_identifier(left) {
             return;
         }
@@ -498,7 +605,8 @@ impl Checker {
         // The property lookup is deferred as much as possible, in as many situations as possible, to avoid alias marking
         // pulling on types/symbols it doesn't strictly need to.
         if self.compiler_options.get_isolated_modules()
-            || (self.compiler_options.should_preserve_const_enums() && is_export_or_export_expression(location))
+            || (self.compiler_options.should_preserve_const_enums()
+                && is_export_or_export_expression(location))
         {
             self.mark_alias_referenced(parent_symbol, location);
             return;
@@ -514,13 +622,20 @@ impl Checker {
         }
         let mut prop = prop_symbol;
         if prop.is_nil() && parent_type.is_nil() {
-            let right = if is_property_access_expression(location) { location.name() } else { location.right() };
+            let right = if is_property_access_expression(location) {
+                location.name()
+            } else {
+                location.right()
+            };
             let mut lexically_scoped_symbol = SymbolId::NIL;
             if is_private_identifier(right) {
-                lexically_scoped_symbol = self.lookup_symbol_for_private_identifier_declaration(right.text(), right);
+                lexically_scoped_symbol =
+                    self.lookup_symbol_for_private_identifier_declaration(right.text(), right);
             }
             let assignment_kind = get_assignment_target_kind(location);
-            let apparent_type = if assignment_kind != AssignmentKind::NONE || self.is_method_access_for_call(location) {
+            let apparent_type = if assignment_kind != AssignmentKind::NONE
+                || self.is_method_access_for_call(location)
+            {
                 let widened = self.get_widened_type(left_type);
                 self.get_apparent_type(widened)
             } else {
@@ -528,7 +643,10 @@ impl Checker {
             };
             if is_private_identifier(right) {
                 if lexically_scoped_symbol.is_some() {
-                    prop = self.get_private_identifier_property_of_type(apparent_type, lexically_scoped_symbol);
+                    prop = self.get_private_identifier_property_of_type(
+                        apparent_type,
+                        lexically_scoped_symbol,
+                    );
                 }
             } else {
                 prop = self.get_property_of_type(apparent_type, right.text());
@@ -536,7 +654,8 @@ impl Checker {
         }
         if !(prop.is_some()
             && (self.is_const_enum_or_const_enum_only_module(prop)
-                || self.sym(prop).flags.intersects(SymbolFlags::ENUM_MEMBER) && location.parent().kind() == SyntaxKind::EnumMember))
+                || self.sym(prop).flags.intersects(SymbolFlags::ENUM_MEMBER)
+                    && location.parent().kind() == SyntaxKind::EnumMember))
         {
             self.mark_alias_referenced(parent_symbol, location);
         }
@@ -561,10 +680,19 @@ pub fn is_part_of_import_equals_module_reference(location: Node) -> bool {
 
 impl Checker {
     // Go: checker/checker.go:28244 markExportAssignmentAliasReferenced
-    pub fn mark_export_assignment_alias_referenced(&mut self, location: Node /*ExportAssignment*/) {
+    pub fn mark_export_assignment_alias_referenced(
+        &mut self,
+        location: Node, /*ExportAssignment*/
+    ) {
         let id = location.expression();
         if is_identifier(id) {
-            let resolved = self.resolve_entity_name(id, SymbolFlags::ALL, true /*ignoreErrors*/, true /*dontResolveAlias*/, location);
+            let resolved = self.resolve_entity_name(
+                id,
+                SymbolFlags::ALL,
+                true, /*ignoreErrors*/
+                true, /*dontResolveAlias*/
+                location,
+            );
             let sym = self.get_export_symbol_of_value_symbol_if_exported(resolved);
             if sym.is_some() {
                 self.mark_alias_referenced(sym, id);
@@ -573,24 +701,31 @@ impl Checker {
     }
 
     // Go: checker/checker.go:28254 markJsxAliasReferenced
-    pub fn mark_jsx_alias_referenced(&mut self, node: Node /*JsxOpeningLikeElement | JsxOpeningFragment*/) {
-        if self.get_jsx_namespace_container_for_implicit_import(node).is_some() {
+    pub fn mark_jsx_alias_referenced(
+        &mut self,
+        node: Node, /*JsxOpeningLikeElement | JsxOpeningFragment*/
+    ) {
+        if self
+            .get_jsx_namespace_container_for_implicit_import(node)
+            .is_some()
+        {
             return;
         }
         // The reactNamespace/jsxFactory's root symbol should be marked as 'used' so we don't incorrectly elide its import.
         // And if there is no reactNamespace/jsxFactory's symbol in scope when targeting React emit, we should issue an error.
-        let jsx_factory_ref_err: Option<&'static ts_diagnostics::Message> = if self.compiler_options.jsx == JsxEmit::REACT {
-            Some(diag::This_JSX_tag_requires_0_to_be_in_scope_but_it_could_not_be_found)
-        } else {
-            None
-        };
+        let jsx_factory_ref_err: Option<&'static ts_diagnostics::Message> =
+            if self.compiler_options.jsx == JsxEmit::REACT {
+                Some(diag::This_JSX_tag_requires_0_to_be_in_scope_but_it_could_not_be_found)
+            } else {
+                None
+            };
         let jsx_factory_namespace = self.get_jsx_namespace(node);
         let mut jsx_factory_location = node;
         if is_jsx_opening_like_element(node) {
             jsx_factory_location = node.tag_name();
         }
-        let should_factory_ref_err =
-            self.compiler_options.jsx != JsxEmit::PRESERVE && self.compiler_options.jsx != JsxEmit::REACT_NATIVE;
+        let should_factory_ref_err = self.compiler_options.jsx != JsxEmit::PRESERVE
+            && self.compiler_options.jsx != JsxEmit::REACT_NATIVE;
         // #38720/60122, allow null as jsxFragmentFactory
         let mut jsx_factory_sym = SymbolId::NIL;
         if !(is_jsx_opening_fragment(node) && jsx_factory_namespace == "null") {
@@ -603,7 +738,7 @@ impl Checker {
                 &jsx_factory_namespace,
                 flags,
                 jsx_factory_ref_err,
-                true, /*isUse*/
+                true,  /*isUse*/
                 false, /*excludeGlobals*/
             );
         }
@@ -613,8 +748,13 @@ impl Checker {
             self.symbol_referenced(jsx_factory_sym, SymbolFlags::ALL);
             // If react/jsxFactory symbol is alias, mark it as referenced
             if self.can_collect_symbol_alias_accessibility_data
-                && self.sym(jsx_factory_sym).flags.intersects(SymbolFlags::ALIAS)
-                && self.get_type_only_alias_declaration(jsx_factory_sym).is_nil()
+                && self
+                    .sym(jsx_factory_sym)
+                    .flags
+                    .intersects(SymbolFlags::ALIAS)
+                && self
+                    .get_type_only_alias_declaration(jsx_factory_sym)
+                    .is_nil()
             {
                 self.mark_alias_symbol_as_referenced(jsx_factory_sym);
             }
@@ -634,7 +774,7 @@ impl Checker {
                     local_jsx_namespace,
                     flags,
                     jsx_factory_ref_err,
-                    true, /*isUse*/
+                    true,  /*isUse*/
                     false, /*excludeGlobals*/
                 );
             }
@@ -642,14 +782,20 @@ impl Checker {
     }
 
     // Go: checker/checker.go:28300 markImportEqualsAliasReferenced
-    pub fn mark_import_equals_alias_referenced(&mut self, location: Node /*ImportEqualsDeclaration*/) {
+    pub fn mark_import_equals_alias_referenced(
+        &mut self,
+        location: Node, /*ImportEqualsDeclaration*/
+    ) {
         if has_syntactic_modifier(location, ModifierFlags::EXPORT) {
             self.mark_export_as_referenced(location);
         }
     }
 
     // Go: checker/checker.go:28306 markExportSpecifierAliasReferenced
-    pub fn mark_export_specifier_alias_referenced(&mut self, location: Node /*ExportSpecifier*/) {
+    pub fn mark_export_specifier_alias_referenced(
+        &mut self,
+        location: Node, /*ExportSpecifier*/
+    ) {
         if location.parent().parent().module_specifier().is_nil()
             && !location.is_type_only()
             && !location.parent().parent().is_type_only()
@@ -661,16 +807,21 @@ impl Checker {
             let symbol = self.resolve_name(
                 exported_name,
                 exported_name.text(),
-                SymbolFlags::VALUE | SymbolFlags::TYPE | SymbolFlags::NAMESPACE | SymbolFlags::ALIAS,
-                None, /*nameNotFoundMessage*/
-                true, /*isUse*/
+                SymbolFlags::VALUE
+                    | SymbolFlags::TYPE
+                    | SymbolFlags::NAMESPACE
+                    | SymbolFlags::ALIAS,
+                None,  /*nameNotFoundMessage*/
+                true,  /*isUse*/
                 false, /*excludeGlobals*/
             );
             if symbol.is_some()
                 && (symbol == self.undefined_symbol
                     || symbol == self.global_this_symbol
                     || !self.sym(symbol).declarations.is_empty()
-                        && is_global_source_file(get_declaration_container(self.sym(symbol).declarations[0])))
+                        && is_global_source_file(get_declaration_container(
+                            self.sym(symbol).declarations[0],
+                        )))
             {
                 // Do nothing, non-local symbol
             } else {
@@ -692,14 +843,19 @@ impl Checker {
             return;
         }
         let source_file = get_source_file_of_node(location);
-        if !is_effective_external_module(source_file, self.compiler_options) || location.flags().intersects(NodeFlags::AMBIENT) {
+        if !is_effective_external_module(source_file, self.compiler_options)
+            || location.flags().intersects(NodeFlags::AMBIENT)
+        {
             return;
         }
         let helpers_module = self.resolve_helpers_module(source_file, location);
         if helpers_module == self.unknown_symbol {
             return;
         }
-        let requested = self.source_file_links.get(source_file).requested_external_emit_helpers;
+        let requested = self
+            .source_file_links
+            .get(source_file)
+            .requested_external_emit_helpers;
         if !requested.contains(helpers) {
             let unchecked_helpers = helpers.without(requested);
             let mut helper = ExternalEmitHelpers::FIRST_EMIT_HELPER;
@@ -737,7 +893,9 @@ impl Checker {
                 helper = ExternalEmitHelpers(helper.0 << 1);
             }
         }
-        self.source_file_links.get(source_file).requested_external_emit_helpers |= helpers;
+        self.source_file_links
+            .get(source_file)
+            .requested_external_emit_helpers |= helpers;
     }
 
     // Go: checker/checker.go:28366 hasSignatureWithArityGreaterThan
@@ -780,7 +938,9 @@ impl Checker {
             ExternalEmitHelpers::ADD_DISPOSABLE_RESOURCE_AND_DISPOSE_RESOURCES => {
                 &["__addDisposableResource", "__disposeResources"]
             }
-            ExternalEmitHelpers::REWRITE_RELATIVE_IMPORT_EXTENSION => &["__rewriteRelativeImportExtension"],
+            ExternalEmitHelpers::REWRITE_RELATIVE_IMPORT_EXTENSION => {
+                &["__rewriteRelativeImportExtension"]
+            }
             _ => panic!("Unrecognized helper"),
         };
         names.iter().map(|s| (*s).to_string()).collect()
@@ -788,7 +948,12 @@ impl Checker {
 
     // Go: checker/checker.go:28424 resolveHelpersModule
     pub fn resolve_helpers_module(&mut self, file: Node, error_node: Node) -> SymbolId {
-        if self.source_file_links.get(file).external_helpers_module.is_nil() {
+        if self
+            .source_file_links
+            .get(file)
+            .external_helpers_module
+            .is_nil()
+        {
             let location = get_import_helpers_import_specifier(&source_file_info(file).path);
             let mut helpers_module = self.resolve_external_module(
                 location,
@@ -807,11 +972,19 @@ impl Checker {
 
     // Go: checker/checker.go:28437 markDecoratorAliasReferenced
     pub fn mark_decorator_alias_referenced(&mut self, node: Node /*HasDecorators*/) {
-        if self.compiler_options.emit_decorator_metadata.is_false_or_unknown() {
+        if self
+            .compiler_options
+            .emit_decorator_metadata
+            .is_false_or_unknown()
+        {
             return;
         }
         let decorators = node.decorators();
-        let first_decorator = if decorators.is_empty() { Node::NIL } else { decorators.get(0) };
+        let first_decorator = if decorators.is_empty() {
+            Node::NIL
+        } else {
+            decorators.get(0)
+        };
         if first_decorator.is_nil() {
             return;
         }
@@ -867,7 +1040,10 @@ impl Checker {
     }
 
     // Go: checker/checker.go:28486 getParameterTypeNodeForDecoratorCheck
-    pub fn get_parameter_type_node_for_decorator_check(&mut self, node: Node /*ParameterDeclaration*/) -> Node {
+    pub fn get_parameter_type_node_for_decorator_check(
+        &mut self,
+        node: Node, /*ParameterDeclaration*/
+    ) -> Node {
         let type_node = node.type_();
         if node.dot_dot_dot_token().is_some() {
             return get_rest_parameter_element_type(type_node);
@@ -876,7 +1052,10 @@ impl Checker {
     }
 
     // Go: checker/checker.go:28494 markDecoratorMedataDataTypeNodeAsReferenced
-    pub fn mark_decorator_meda_data_type_node_as_referenced(&mut self, node: Node /*TypeNode*/) {
+    pub fn mark_decorator_meda_data_type_node_as_referenced(
+        &mut self,
+        node: Node, /*TypeNode*/
+    ) {
         let entity_name = self.get_entity_name_for_decorator_metadata(node);
         if entity_name.is_some() && is_entity_name(entity_name) {
             self.mark_entity_name_or_entity_expression_as_reference(entity_name, true);
@@ -901,22 +1080,30 @@ impl Checker {
                 let types = [node.true_type(), node.false_type()];
                 self.get_entity_name_for_decorator_metadata_from_type_list(&types)
             }
-            SyntaxKind::ParenthesizedType => self.get_entity_name_for_decorator_metadata(node.type_()),
-            SyntaxKind::NamedTupleMember => self.get_entity_name_for_decorator_metadata(node.type_()),
+            SyntaxKind::ParenthesizedType => {
+                self.get_entity_name_for_decorator_metadata(node.type_())
+            }
+            SyntaxKind::NamedTupleMember => {
+                self.get_entity_name_for_decorator_metadata(node.type_())
+            }
             SyntaxKind::TypeReference => node.type_name(),
             _ => Node::NIL,
         }
     }
 
     // Go: checker/checker.go:28521 getEntityNameForDecoratorMetadataFromTypeList
-    pub fn get_entity_name_for_decorator_metadata_from_type_list(&mut self, type_nodes: &[Node]) -> Node {
+    pub fn get_entity_name_for_decorator_metadata_from_type_list(
+        &mut self,
+        type_nodes: &[Node],
+    ) -> Node {
         let mut common_entity_name = Node::NIL;
         for &type_node in type_nodes {
             if type_node.kind() == SyntaxKind::NeverKeyword {
                 continue; // Always elide `never` from the union/intersection if possible
             }
             if !self.strict_null_checks
-                && (type_node.kind() == SyntaxKind::LiteralType && type_node.literal().kind() == SyntaxKind::NullKeyword
+                && (type_node.kind() == SyntaxKind::LiteralType
+                    && type_node.literal().kind() == SyntaxKind::NullKeyword
                     || type_node.kind() == SyntaxKind::UndefinedKeyword)
             {
                 continue; // Elide null and undefined from unions for metadata, just like what we did prior to the implementation of strict null checks
@@ -952,19 +1139,26 @@ impl Checker {
         if !self.can_collect_symbol_alias_accessibility_data {
             return;
         }
-        if is_non_local_alias(&self.symbols, symbol, SymbolFlags::VALUE /*excludes*/) && !is_in_type_query(location) {
+        if is_non_local_alias(&self.symbols, symbol, SymbolFlags::VALUE /*excludes*/)
+            && !is_in_type_query(location)
+        {
             let target = self.resolve_alias(symbol);
             if self
-                .get_symbol_flags_ex(symbol, true /*excludeTypeOnlyMeanings*/, false /*excludeLocalMeanings*/)
+                .get_symbol_flags_ex(
+                    symbol, true,  /*excludeTypeOnlyMeanings*/
+                    false, /*excludeLocalMeanings*/
+                )
                 .intersects(SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE)
             {
                 // An alias resolving to a const enum cannot be elided if (1) 'isolatedModules' is enabled
                 // (because the const enum value will not be inlined), or if (2) the alias is an export
                 // of a const enum declaration that will be preserved.
                 if self.compiler_options.get_isolated_modules()
-                    || self.compiler_options.should_preserve_const_enums() && is_export_or_export_expression(location)
+                    || self.compiler_options.should_preserve_const_enums()
+                        && is_export_or_export_expression(location)
                     || {
-                        let export_symbol = self.get_export_symbol_of_value_symbol_if_exported(target);
+                        let export_symbol =
+                            self.get_export_symbol_of_value_symbol_if_exported(target);
                         !self.is_const_enum_or_const_enum_only_module(export_symbol)
                     }
                 {
@@ -988,9 +1182,14 @@ impl Checker {
             // We defer checking of the reference of an `import =` until the import itself is referenced,
             // This way a chain of imports can be elided if ultimately the final input is only used in a type
             // position.
-            if is_import_equals_declaration(node) && node.module_reference().kind() != SyntaxKind::ExternalModuleReference {
+            if is_import_equals_declaration(node)
+                && node.module_reference().kind() != SyntaxKind::ExternalModuleReference
+            {
                 let resolved = self.resolve_symbol(symbol);
-                if self.get_symbol_flags(resolved).intersects(SymbolFlags::VALUE) {
+                if self
+                    .get_symbol_flags(resolved)
+                    .intersects(SymbolFlags::VALUE)
+                {
                     // import foo = <symbol>
                     let left = get_first_identifier(node.module_reference());
                     self.mark_identifier_alias_referenced(left);
@@ -1000,13 +1199,19 @@ impl Checker {
     }
 
     // Go: checker/checker.go:28600 markExportAsReferenced
-    pub fn mark_export_as_referenced(&mut self, node: Node /*ImportEqualsDeclaration | ExportSpecifier*/) {
+    pub fn mark_export_as_referenced(
+        &mut self,
+        node: Node, /*ImportEqualsDeclaration | ExportSpecifier*/
+    ) {
         let symbol = self.get_symbol_of_declaration(node);
         let target = self.resolve_alias(symbol);
         if target.is_some() {
             let mark_alias = target == self.unknown_symbol
                 || (self
-                    .get_symbol_flags_ex(symbol, true /*excludeTypeOnlyMeanings*/, false /*excludeLocalMeanings*/)
+                    .get_symbol_flags_ex(
+                        symbol, true,  /*excludeTypeOnlyMeanings*/
+                        false, /*excludeLocalMeanings*/
+                    )
                     .intersects(SymbolFlags::VALUE)
                     && !self.is_const_enum_or_const_enum_only_module(target));
             if mark_alias {
@@ -1016,20 +1221,27 @@ impl Checker {
     }
 
     // Go: checker/checker.go:28613 markEntityNameOrEntityExpressionAsReference
-    pub fn mark_entity_name_or_entity_expression_as_reference(&mut self, type_name: Node /*EntityNameOrEntityNameExpression | nil*/, for_decorator_metadata: bool) {
+    pub fn mark_entity_name_or_entity_expression_as_reference(
+        &mut self,
+        type_name: Node, /*EntityNameOrEntityNameExpression | nil*/
+        for_decorator_metadata: bool,
+    ) {
         if type_name.is_nil() {
             return;
         }
 
         let root_name = get_first_identifier(type_name);
-        let meaning = (if type_name.kind() == SyntaxKind::Identifier { SymbolFlags::TYPE } else { SymbolFlags::NAMESPACE })
-            | SymbolFlags::ALIAS;
+        let meaning = (if type_name.kind() == SyntaxKind::Identifier {
+            SymbolFlags::TYPE
+        } else {
+            SymbolFlags::NAMESPACE
+        }) | SymbolFlags::ALIAS;
         let root_symbol = self.resolve_name(
             root_name,
             root_name.text(),
             meaning,
-            None, /*nameNotFoundMessage*/
-            true, /*isUse*/
+            None,  /*nameNotFoundMessage*/
+            true,  /*isUse*/
             false, /*excludeGlobals*/
         );
 
@@ -1047,7 +1259,11 @@ impl Checker {
                 && self.compiler_options.get_isolated_modules()
                 && self.compiler_options.get_emit_module_kind() >= ModuleKind::ES2015
                 && !self.symbol_is_value(root_symbol)
-                && !self.sym(root_symbol).declarations.iter().any(|&d| is_type_only_import_or_export_declaration(d))
+                && !self
+                    .sym(root_symbol)
+                    .declarations
+                    .iter()
+                    .any(|&d| is_type_only_import_or_export_declaration(d))
             {
                 // PORT: Go calls `c.error` (which adds the diagnostic) and then
                 // mutates it with SetRelatedInfo. `error` returns an owned copy,
@@ -1102,7 +1318,10 @@ impl Checker {
     // Go: checker/checker.go:28664 markTypeNodeAsReferenced
     pub fn mark_type_node_as_referenced(&mut self, node: Node /*TypeNode*/) {
         if node.is_some() {
-            self.mark_entity_name_or_entity_expression_as_reference(get_entity_name_from_type_node(node), false /*forDecoratorMetadata*/);
+            self.mark_entity_name_or_entity_expression_as_reference(
+                get_entity_name_from_type_node(node),
+                false, /*forDecoratorMetadata*/
+            );
         }
     }
 
@@ -1133,7 +1352,10 @@ impl Checker {
         if self.is_type_any(t) {
             return TypeId::NIL;
         }
-        let key = CachedTypeKey { kind: CachedTypeKind::PROMISED_TYPE_OF_PROMISE, type_id: self.ty(t).id };
+        let key = CachedTypeKey {
+            kind: CachedTypeKind::PROMISED_TYPE_OF_PROMISE,
+            type_id: self.ty(t).id,
+        };
         if let Some(&cached) = self.cached_types.get(&key) {
             if cached.is_some() {
                 return cached;
@@ -1199,22 +1421,30 @@ impl Checker {
             first_parameter_types.push(self.get_type_of_first_parameter_of_signature(candidate));
         }
         let union = self.get_union_type(&first_parameter_types);
-        let onfulfilled_parameter_type = self.get_type_with_facts(union, TypeFacts::NE_UNDEFINED_OR_NULL);
+        let onfulfilled_parameter_type =
+            self.get_type_with_facts(union, TypeFacts::NE_UNDEFINED_OR_NULL);
         if self.is_type_any(onfulfilled_parameter_type) {
             return TypeId::NIL;
         }
-        let onfulfilled_parameter_signatures = self.get_signatures_of_type(onfulfilled_parameter_type, SignatureKind::CALL);
+        let onfulfilled_parameter_signatures =
+            self.get_signatures_of_type(onfulfilled_parameter_type, SignatureKind::CALL);
         if onfulfilled_parameter_signatures.is_empty() {
             if error_node.is_some() {
-                self.error(error_node, diag::The_first_parameter_of_the_then_method_of_a_promise_must_be_a_callback, args![]);
+                self.error(
+                    error_node,
+                    diag::The_first_parameter_of_the_then_method_of_a_promise_must_be_a_callback,
+                    args![],
+                );
             }
             return TypeId::NIL;
         }
-        let mut value_types: Vec<TypeId> = Vec::with_capacity(onfulfilled_parameter_signatures.len());
+        let mut value_types: Vec<TypeId> =
+            Vec::with_capacity(onfulfilled_parameter_signatures.len());
         for &signature in &onfulfilled_parameter_signatures {
             value_types.push(self.get_type_of_first_parameter_of_signature(signature));
         }
-        let result = self.get_union_type_ex(&value_types, UnionReduction::SUBTYPE, None, TypeId::NIL);
+        let result =
+            self.get_union_type_ex(&value_types, UnionReduction::SUBTYPE, None, TypeId::NIL);
         self.cached_types.insert(key, result);
         result
     }

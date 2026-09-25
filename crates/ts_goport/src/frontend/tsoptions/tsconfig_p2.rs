@@ -29,7 +29,9 @@ fn convert_compiler_options_from_json_worker(
         &COMMAND_LINE_COMPILER_OPTIONS_MAP,
         json_options,
         base_path,
-        CompilerOptionsParser { compiler_options: &mut options },
+        CompilerOptionsParser {
+            compiler_options: &mut options,
+        },
     );
     if !config_file_name.is_empty() {
         options.config_file_path = normalize_slashes(config_file_name);
@@ -48,7 +50,9 @@ fn convert_type_acquisition_from_json_worker(
         &TYPE_ACQUISITION_DECLARATION.element_options,
         json_options,
         base_path,
-        TypeAcquisitionParser { type_acquisition: &mut options },
+        TypeAcquisitionParser {
+            type_acquisition: &mut options,
+        },
     );
     (options, errors)
 }
@@ -65,12 +69,21 @@ fn parse_own_config_of_json(
     let nil = CompilerOptionsValue::Nil;
     let mut errors: Vec<Diagnostic> = Vec::new();
     if json.contains_key("excludes") {
-        errors.push(new_compiler_diagnostic(diag::Unknown_option_excludes_Did_you_mean_exclude, args![]));
+        errors.push(new_compiler_diagnostic(
+            diag::Unknown_option_excludes_Did_you_mean_exclude,
+            args![],
+        ));
     }
-    let (options, err) =
-        convert_compiler_options_from_json_worker(json.get("compilerOptions").unwrap_or(&nil), base_path, config_file_name);
-    let (type_acquisition, err2) =
-        convert_type_acquisition_from_json_worker(json.get("typeAcquisition").unwrap_or(&nil), base_path, config_file_name);
+    let (options, err) = convert_compiler_options_from_json_worker(
+        json.get("compilerOptions").unwrap_or(&nil),
+        base_path,
+        config_file_name,
+    );
+    let (type_acquisition, err2) = convert_type_acquisition_from_json_worker(
+        json.get("typeAcquisition").unwrap_or(&nil),
+        base_path,
+        config_file_name,
+    );
     errors.extend(err);
     errors.extend(err2);
     // watchOptions := convertWatchOptionsFromJsonWorker(json.watchOptions, basePath, errors)
@@ -79,8 +92,15 @@ fn parse_own_config_of_json(
     let extends = json.get("extends").unwrap_or(&nil);
     if !extends.is_nil() && *extends != CompilerOptionsValue::String(String::new()) {
         let err;
-        (extended_config_path, err) =
-            get_extends_config_path_or_array(extends, host, base_path, config_file_name, Node::NIL, Node::NIL, Node::NIL);
+        (extended_config_path, err) = get_extends_config_path_or_array(
+            extends,
+            host,
+            base_path,
+            config_file_name,
+            Node::NIL,
+            Node::NIL,
+            Node::NIL,
+        );
         errors.extend(err);
     }
     let parsed_config = ParsedTsconfig {
@@ -101,10 +121,15 @@ fn read_json_config_file(
     path: Path,
     read_file: &dyn Fn(&str) -> (String, bool),
 ) -> (TsConfigSourceFile, Vec<Diagnostic>) {
-    let (text, diagnostic) = try_read_file(file_name, &mut |name: &str| read_file(name), Vec::new());
+    let (text, diagnostic) =
+        try_read_file(file_name, &mut |name: &str| read_file(name), Vec::new());
     if !text.is_empty() {
         let source_file = parse_source_file(
-            &SourceFileParseOptions { file_name: file_name.to_string(), path, ..Default::default() },
+            &SourceFileParseOptions {
+                file_name: file_name.to_string(),
+                path,
+                ..Default::default()
+            },
             Box::leak(text.into_boxed_str()),
             ScriptKind::JSON,
         );
@@ -118,12 +143,19 @@ fn read_json_config_file(
             diagnostic,
         )
     } else {
-        let factory = NodeFactory::for_file(new_file_store(Box::leak(file_name.to_string().into_boxed_str()), ""));
+        let factory = NodeFactory::for_file(new_file_store(
+            Box::leak(file_name.to_string().into_boxed_str()),
+            "",
+        ));
         let file = TsConfigSourceFile {
             path: path.clone(),
             file_name: file_name.to_string(),
             source_file: factory.new_parsed_source_file(
-                &SourceFileParseOptions { file_name: file_name.to_string(), path, ..Default::default() },
+                &SourceFileParseOptions {
+                    file_name: file_name.to_string(),
+                    path,
+                    ..Default::default()
+                },
                 "",
                 factory.new_node_list(&[]),
                 factory.new_token(SyntaxKind::EndOfFile),
@@ -145,17 +177,24 @@ fn get_extended_config(
     result: &mut ExtendsResult,
 ) -> (Option<Rc<ParsedTsconfig>>, Vec<Diagnostic>) {
     let mut errors: Vec<Diagnostic> = Vec::new();
-    let extended_config_path =
-        to_path(extended_config_file_name, &host.get_current_directory(), host.fs().use_case_sensitive_file_names());
+    let extended_config_path = to_path(
+        extended_config_file_name,
+        &host.get_current_directory(),
+        host.fs().use_case_sensitive_file_names(),
+    );
 
     // Bypass the cache when we detect a cycle in the resolution stack.
     // The cache locks entries during parsing, and a cycle would cause the same goroutine
     // to re-lock the same entry, resulting in a deadlock. Let parseConfig handle the
     // circularity error via its own resolution stack check.
     let cache_entry: Rc<ExtendedConfigCacheEntry> = match extended_config_cache {
-        Some(cache) if !resolution_stack.contains(&extended_config_path) => {
-            cache.get_extended_config(extended_config_file_name, &extended_config_path, resolution_stack, host)
-        }
+        Some(cache) if !resolution_stack.contains(&extended_config_path) => cache
+            .get_extended_config(
+                extended_config_file_name,
+                &extended_config_path,
+                resolution_stack,
+                host,
+            ),
         _ => Rc::new(parse_extended_config(
             extended_config_file_name,
             extended_config_path,
@@ -172,9 +211,13 @@ fn get_extended_config(
     if let Some(extended_result) = &cache_entry.extended_result
         && source_file.is_some()
     {
-        result.extended_source_files.insert(source_file_file_name(extended_result.source_file).to_string());
+        result
+            .extended_source_files
+            .insert(source_file_file_name(extended_result.source_file).to_string());
         for extended_source_file in &extended_result.extended_source_files {
-            result.extended_source_files.insert(extended_source_file.clone());
+            result
+                .extended_source_files
+                .insert(extended_source_file.clone());
         }
     }
     (cache_entry.extended_config.clone(), errors)
@@ -190,7 +233,8 @@ pub fn parse_extended_config(
     host: &dyn ParseConfigHost,
     extended_config_cache: Option<&dyn ExtendedConfigCache>,
 ) -> ExtendedConfigCacheEntry {
-    let (mut extended_result, read_errors) = read_json_config_file(file_name, path, &|name| host.fs().read_file(name));
+    let (mut extended_result, read_errors) =
+        read_json_config_file(file_name, path, &|name| host.fs().read_file(name));
     let mut entry = ExtendedConfigCacheEntry::default();
 
     if !read_errors.is_empty() {
@@ -234,7 +278,9 @@ fn raw_as_map(raw: &CompilerOptionsValue) -> Option<&IndexMap<String, CompilerOp
 fn raw_as_map_mut(raw: &mut CompilerOptionsValue) -> &mut IndexMap<String, CompilerOptionsValue> {
     match raw {
         CompilerOptionsValue::Map(m) => m,
-        _ => panic!("interface conversion: raw config is not *collections.OrderedMap[string,interface {{}}]"),
+        _ => panic!(
+            "interface conversion: raw config is not *collections.OrderedMap[string,interface {{}}]"
+        ),
     }
 }
 
@@ -257,21 +303,38 @@ pub fn parse_config(
     extended_config_cache: Option<&dyn ExtendedConfigCache>,
 ) -> (ParsedTsconfig, Vec<Diagnostic>) {
     let base_path = normalize_slashes(base_path);
-    let resolved_path = to_path(config_file_name, &base_path, host.fs().use_case_sensitive_file_names());
+    let resolved_path = to_path(
+        config_file_name,
+        &base_path,
+        host.fs().use_case_sensitive_file_names(),
+    );
     let mut errors: Vec<Diagnostic> = Vec::new();
     if resolution_stack.contains(&resolved_path) {
-        errors.push(new_compiler_diagnostic(diag::Circularity_detected_while_resolving_configuration_Colon_0, args![]));
+        errors.push(new_compiler_diagnostic(
+            diag::Circularity_detected_while_resolving_configuration_Colon_0,
+            args![],
+        ));
         let result;
         if json.as_ref().map_or(0, IndexMap::len) == 0 {
             // PORT: Go stores the (maybe nil) map pointer. A nil map is `Nil`.
-            result = ParsedTsconfig { raw: json.map_or(CompilerOptionsValue::Nil, CompilerOptionsValue::Map), ..Default::default() };
+            result = ParsedTsconfig {
+                raw: json.map_or(CompilerOptionsValue::Nil, CompilerOptionsValue::Map),
+                ..Default::default()
+            };
         } else {
             // PORT: Go reads `sourceFile.SourceFile` here, which panics when
             // `sourceFile` is nil (the `json` path). Kept as Go does.
-            let (raw_result, err) =
-                convert_to_object(source_file.as_deref().expect("nil pointer dereference: sourceFile").source_file);
+            let (raw_result, err) = convert_to_object(
+                source_file
+                    .as_deref()
+                    .expect("nil pointer dereference: sourceFile")
+                    .source_file,
+            );
             errors.extend(err);
-            result = ParsedTsconfig { raw: raw_result, ..Default::default() };
+            result = ParsedTsconfig {
+                raw: raw_result,
+                ..Default::default()
+            };
         }
         return (result, errors);
     }
@@ -336,18 +399,27 @@ pub fn parse_config(
                                 let CompilerOptionsValue::String(path_str) = path else {
                                     panic!("interface conversion: path is not string");
                                 };
-                                if starts_with_config_dir_template(path) || is_rooted_disk_path(path_str) {
+                                if starts_with_config_dir_template(path)
+                                    || is_rooted_disk_path(path_str)
+                                {
                                     CompilerOptionsValue::String(path_str.clone())
                                 } else {
                                     if relative_difference.is_empty() {
                                         let t = ComparePathsOptions {
-                                            use_case_sensitive_file_names: host.fs().use_case_sensitive_file_names(),
+                                            use_case_sensitive_file_names: host
+                                                .fs()
+                                                .use_case_sensitive_file_names(),
                                             current_directory: base_path.clone(),
                                         };
-                                        relative_difference =
-                                            convert_to_relative_path(&get_directory_path(extended_config_path), &t);
+                                        relative_difference = convert_to_relative_path(
+                                            &get_directory_path(extended_config_path),
+                                            &t,
+                                        );
                                     }
-                                    CompilerOptionsValue::String(combine_paths(&relative_difference, &[path_str]))
+                                    CompilerOptionsValue::String(combine_paths(
+                                        &relative_difference,
+                                        &[path_str],
+                                    ))
                                 }
                             })
                             .collect();
@@ -360,37 +432,58 @@ pub fn parse_config(
                 }
                 if let Some(extended_raw_map) = raw_as_map(extends_raw)
                     && extended_raw_map.contains_key("compileOnSave")
-                    && let Some(CompilerOptionsValue::Bool(compile_on_save)) = extended_raw_map.get("compileOnSave")
+                    && let Some(CompilerOptionsValue::Bool(compile_on_save)) =
+                        extended_raw_map.get("compileOnSave")
                 {
                     result.compile_on_save = *compile_on_save;
                 }
-                merge_compiler_options(&mut result.options, extended_config.options.as_ref(), raw_as_map(extends_raw));
+                merge_compiler_options(
+                    &mut result.options,
+                    extended_config.options.as_ref(),
+                    raw_as_map(extends_raw),
+                );
             }
         }
         if let Some(include) = result.include.take() {
-            raw_as_map_mut(&mut own_config.raw).insert("include".to_string(), CompilerOptionsValue::List(include));
+            raw_as_map_mut(&mut own_config.raw)
+                .insert("include".to_string(), CompilerOptionsValue::List(include));
         }
         if let Some(exclude) = result.exclude.take() {
-            raw_as_map_mut(&mut own_config.raw).insert("exclude".to_string(), CompilerOptionsValue::List(exclude));
+            raw_as_map_mut(&mut own_config.raw)
+                .insert("exclude".to_string(), CompilerOptionsValue::List(exclude));
         }
         if let Some(files) = result.files.take() {
-            raw_as_map_mut(&mut own_config.raw).insert("files".to_string(), CompilerOptionsValue::List(files));
-        }
-        if result.compile_on_save && !raw_as_map_mut(&mut own_config.raw).contains_key("compileOnSave") {
             raw_as_map_mut(&mut own_config.raw)
-                .insert("compileOnSave".to_string(), CompilerOptionsValue::Bool(result.compile_on_save));
+                .insert("files".to_string(), CompilerOptionsValue::List(files));
+        }
+        if result.compile_on_save
+            && !raw_as_map_mut(&mut own_config.raw).contains_key("compileOnSave")
+        {
+            raw_as_map_mut(&mut own_config.raw).insert(
+                "compileOnSave".to_string(),
+                CompilerOptionsValue::Bool(result.compile_on_save),
+            );
         }
         if let Some(source_file) = source_file.as_deref_mut() {
             for extended_source_file in &result.extended_source_files {
                 // Go: core.InsertSorted(..., cmp.Compare)
-                let i = match source_file.extended_source_files.binary_search(extended_source_file) {
+                let i = match source_file
+                    .extended_source_files
+                    .binary_search(extended_source_file)
+                {
                     Ok(i) | Err(i) => i,
                 };
-                source_file.extended_source_files.insert(i, extended_source_file.clone());
+                source_file
+                    .extended_source_files
+                    .insert(i, extended_source_file.clone());
             }
         }
         let own_options = own_config.options.take();
-        merge_compiler_options(&mut result.options, own_options.as_ref(), raw_as_map(&own_config.raw));
+        merge_compiler_options(
+            &mut result.options,
+            own_options.as_ref(),
+            raw_as_map(&own_config.raw),
+        );
         own_config.options = Some(result.options);
         // ownConfig.watchOptions = ownConfig.watchOptions && result.watchOptions ?
         //     assignWatchOptions(result, ownConfig.watchOptions) :
@@ -434,7 +527,10 @@ fn get_prop_from_raw(
                         args![prop, element_type_name],
                     ));
                 }
-                return PropOfRaw { slice_value: Some(result.clone()), wrong_value: "" };
+                return PropOfRaw {
+                    slice_value: Some(result.clone()),
+                    wrong_value: "",
+                };
             }
             CompilerOptionsValue::StringList(_) => {
                 panic!("interface conversion: raw value is []string, not []interface {{}}");
@@ -445,12 +541,18 @@ fn get_prop_from_raw(
                         diag::Compiler_option_0_requires_a_value_of_type_1,
                         args![prop, "Array"],
                     ));
-                    return PropOfRaw { slice_value: None, wrong_value: "not-array" };
+                    return PropOfRaw {
+                        slice_value: None,
+                        wrong_value: "not-array",
+                    };
                 }
             }
         }
     }
-    PropOfRaw { slice_value: None, wrong_value: "no-prop" }
+    PropOfRaw {
+        slice_value: None,
+        wrong_value: "no-prop",
+    }
 }
 
 /// Go `reflect.TypeOf(element) == orderedMapType`.
@@ -570,7 +672,9 @@ pub fn parse_json_config_file_content_worker(
     extra_file_extensions: &[FileExtensionInfo],
     extended_config_cache: Option<&dyn ExtendedConfigCache>,
 ) -> ParsedCommandLine {
-    debug_assert!((json.is_none() && source_file.is_some()) || (json.is_some() && source_file.is_none()));
+    debug_assert!(
+        (json.is_none() && source_file.is_some()) || (json.is_some() && source_file.is_none())
+    );
     let mut source_file = source_file;
 
     let base_path_for_file_names = if !config_file_name.is_empty() {
@@ -591,7 +695,10 @@ pub fn parse_json_config_file_content_worker(
     if let Some(options) = parsed_config.options.as_mut() {
         merge_compiler_options(options, existing_options, existing_options_raw);
     }
-    handle_option_config_dir_template_substitution(parsed_config.options.as_mut(), &base_path_for_file_names);
+    handle_option_config_dir_template_substitution(
+        parsed_config.options.as_mut(),
+        &base_path_for_file_names,
+    );
     // PORT: `parse_json_to_string_key` is always `Some`.
     let raw_config = parse_json_to_string_key(&parsed_config.raw).unwrap_or_default();
     if !config_file_name.is_empty()
@@ -600,8 +707,22 @@ pub fn parse_json_config_file_content_worker(
         options.config_file_path = normalize_slashes(config_file_name);
     }
     let is_json = source_file.is_none();
-    let references_of_raw = get_prop_from_raw(&raw_config, is_json, &mut errors, "references", is_map_element, "object");
-    let file_specs = get_prop_from_raw(&raw_config, is_json, &mut errors, "files", is_string_element, "string");
+    let references_of_raw = get_prop_from_raw(
+        &raw_config,
+        is_json,
+        &mut errors,
+        "references",
+        is_map_element,
+        "object",
+    );
+    let file_specs = get_prop_from_raw(
+        &raw_config,
+        is_json,
+        &mut errors,
+        "files",
+        is_string_element,
+        "string",
+    );
     if file_specs.slice_value.is_some() || file_specs.wrong_value.is_empty() {
         let mut has_zero_or_no_references = false;
         if references_of_raw.wrong_value == "no-prop"
@@ -611,13 +732,22 @@ pub fn parse_json_config_file_content_worker(
             has_zero_or_no_references = true;
         }
         let has_extends = raw_config.get("extends").is_some_and(|v| !v.is_nil());
-        if file_specs.slice_value.as_ref().is_some_and(Vec::is_empty) && has_zero_or_no_references && !has_extends {
+        if file_specs.slice_value.as_ref().is_some_and(Vec::is_empty)
+            && has_zero_or_no_references
+            && !has_extends
+        {
             if let Some(source_file) = &source_file {
-                let file_name = if !config_file_name.is_empty() { config_file_name } else { "tsconfig.json" };
+                let file_name = if !config_file_name.is_empty() {
+                    config_file_name
+                } else {
+                    "tsconfig.json"
+                };
                 let diagnostic_message = diag::The_files_list_in_config_file_0_is_empty;
                 let node_value =
-                    for_each_tsconfig_prop_array(source_file.source_file, "files", |property| Some(property.initializer()))
-                        .unwrap_or(Node::NIL);
+                    for_each_tsconfig_prop_array(source_file.source_file, "files", |property| {
+                        Some(property.initializer())
+                    })
+                    .unwrap_or(Node::NIL);
                 errors.push(create_diagnostic_for_node_in_source_file(
                     source_file.source_file,
                     node_value,
@@ -632,8 +762,22 @@ pub fn parse_json_config_file_content_worker(
             }
         }
     }
-    let mut include_specs = get_prop_from_raw(&raw_config, is_json, &mut errors, "include", is_string_element, "string");
-    let mut exclude_specs = get_prop_from_raw(&raw_config, is_json, &mut errors, "exclude", is_string_element, "string");
+    let mut include_specs = get_prop_from_raw(
+        &raw_config,
+        is_json,
+        &mut errors,
+        "include",
+        is_string_element,
+        "string",
+    );
+    let mut exclude_specs = get_prop_from_raw(
+        &raw_config,
+        is_json,
+        &mut errors,
+        "exclude",
+        is_string_element,
+        "string",
+    );
     let mut is_default_include_spec = false;
     if exclude_specs.wrong_value == "no-prop"
         && let Some(options) = &parsed_config.options
@@ -648,12 +792,17 @@ pub fn parse_json_config_file_content_worker(
             if !declaration_dir.is_empty() {
                 values.push(CompilerOptionsValue::String(declaration_dir.clone()));
             }
-            exclude_specs = PropOfRaw { slice_value: Some(values), wrong_value: "" };
+            exclude_specs = PropOfRaw {
+                slice_value: Some(values),
+                wrong_value: "",
+            };
         }
     }
     if file_specs.slice_value.is_none() && include_specs.slice_value.is_none() {
         include_specs = PropOfRaw {
-            slice_value: Some(vec![CompilerOptionsValue::String(DEFAULT_INCLUDE_SPEC.to_string())]),
+            slice_value: Some(vec![CompilerOptionsValue::String(
+                DEFAULT_INCLUDE_SPEC.to_string(),
+            )]),
             wrong_value: "",
         };
         is_default_include_spec = true;
@@ -669,8 +818,12 @@ pub fn parse_json_config_file_content_worker(
     // file system.
     if let Some(specs) = &include_specs.slice_value {
         let err;
-        (validated_include_specs_before_substitution, err) =
-            validate_specs(specs, true /*disallowTrailingRecursion*/, tsconfig_node, "include");
+        (validated_include_specs_before_substitution, err) = validate_specs(
+            specs,
+            true, /*disallowTrailingRecursion*/
+            tsconfig_node,
+            "include",
+        );
         errors.extend(err);
         validated_include_specs = match get_substituted_string_array_with_config_dir_template(
             &validated_include_specs_before_substitution,
@@ -682,11 +835,18 @@ pub fn parse_json_config_file_content_worker(
     }
     if let Some(specs) = &exclude_specs.slice_value {
         let err;
-        (validated_exclude_specs, err) =
-            validate_specs(specs, false /*disallowTrailingRecursion*/, tsconfig_node, "exclude");
+        (validated_exclude_specs, err) = validate_specs(
+            specs,
+            false, /*disallowTrailingRecursion*/
+            tsconfig_node,
+            "exclude",
+        );
         errors.extend(err);
         if let Some(validated_exclude_specs_with_substitution) =
-            get_substituted_string_array_with_config_dir_template(&validated_exclude_specs, &base_path_for_file_names)
+            get_substituted_string_array_with_config_dir_template(
+                &validated_exclude_specs,
+                &base_path_for_file_names,
+            )
         {
             validated_exclude_specs = validated_exclude_specs_with_substitution;
         }
@@ -731,7 +891,11 @@ pub fn parse_json_config_file_content_worker(
             &*host.fs(),
             extra_file_extensions,
         );
-        if should_report_no_input_files(&file_names, can_json_report_no_input_files(&raw_config), resolution_stack) {
+        if should_report_no_input_files(
+            &file_names,
+            can_json_report_no_input_files(&raw_config),
+            resolution_stack,
+        ) {
             let mut include_json = String::new();
             stringify_json(&config_file_specs.include_specs, &mut include_json);
             let mut exclude_json = String::new();
@@ -746,8 +910,14 @@ pub fn parse_json_config_file_content_worker(
 
     // Go: getProjectReferences(basePathForFileNames)
     let mut project_references: Vec<ProjectReference> = Vec::new();
-    let new_references_of_raw =
-        get_prop_from_raw(&raw_config, is_json, &mut errors, "references", is_map_element, "object");
+    let new_references_of_raw = get_prop_from_raw(
+        &raw_config,
+        is_json,
+        &mut errors,
+        "references",
+        is_map_element,
+        "object",
+    );
     if let Some(references) = &new_references_of_raw.slice_value {
         for reference in references {
             for r in parse_project_reference(reference) {
@@ -800,7 +970,11 @@ fn can_json_report_no_input_files(raw_config: &IndexMap<String, CompilerOptionsV
 }
 
 // Go: tsoptions/tsconfigparsing.go:1394 shouldReportNoInputFiles
-fn should_report_no_input_files(file_names: &[String], can_json_report_no_input_files: bool, resolution_stack: &[Path]) -> bool {
+fn should_report_no_input_files(
+    file_names: &[String],
+    can_json_report_no_input_files: bool,
+    resolution_stack: &[Path],
+) -> bool {
     file_names.is_empty() && can_json_report_no_input_files && resolution_stack.is_empty()
 }
 
@@ -814,7 +988,12 @@ fn validate_specs(
 ) -> (Vec<String>, Vec<Diagnostic>) {
     let create_diagnostic = |message: &'static Message, spec: &str| -> Diagnostic {
         let element = get_tsconfig_prop_array_element_value(json_source_file, spec_key, spec);
-        create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(json_source_file, element, message, args![spec])
+        create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
+            json_source_file,
+            element,
+            message,
+            args![spec],
+        )
     };
     let mut errors: Vec<Diagnostic> = Vec::new();
     let mut final_specs: Vec<String> = Vec::new();
@@ -833,7 +1012,10 @@ fn validate_specs(
 }
 
 // Go: tsoptions/tsconfigparsing.go:1423 specToDiagnostic
-pub(crate) fn spec_to_diagnostic(spec: &str, disallow_trailing_recursion: bool) -> Option<&'static Message> {
+pub(crate) fn spec_to_diagnostic(
+    spec: &str,
+    disallow_trailing_recursion: bool,
+) -> Option<&'static Message> {
     if disallow_trailing_recursion && invalid_trailing_recursion(spec) {
         return Some(diag::File_specification_cannot_end_in_a_recursive_directory_wildcard_Asterisk_Asterisk_Colon_0);
     }
@@ -879,9 +1061,16 @@ fn invalid_dot_dot_after_recursive_wildcard(s: &str) -> bool {
 
 // Go: tsoptions/tsconfigparsing.go:1464 GetTsConfigPropArrayElementValue
 // PORT: Go returns `*ast.StringLiteral`; that is a `Node` (`NIL` for nil).
-pub fn get_tsconfig_prop_array_element_value(tsconfig_source_file: Node, prop_key: &str, element_value: &str) -> Node {
+pub fn get_tsconfig_prop_array_element_value(
+    tsconfig_source_file: Node,
+    prop_key: &str,
+    element_value: &str,
+) -> Node {
     let callback = get_callback_for_finding_property_assignment_by_value(element_value);
-    for_each_tsconfig_prop_array(tsconfig_source_file, prop_key, |property| callback(property)).unwrap_or(Node::NIL)
+    for_each_tsconfig_prop_array(tsconfig_source_file, prop_key, |property| {
+        callback(property)
+    })
+    .unwrap_or(Node::NIL)
 }
 
 // Go: tsoptions/tsconfigparsing.go:1474 ForEachTsConfigPropArray
@@ -911,12 +1100,21 @@ pub fn create_diagnostic_at_reference_syntax(
     message: &'static Message,
     args: Vec<String>,
 ) -> Option<Diagnostic> {
-    let source_file = config.config_file.as_ref().expect("nil pointer dereference: config.ConfigFile").source_file;
+    let source_file = config
+        .config_file
+        .as_ref()
+        .expect("nil pointer dereference: config.ConfigFile")
+        .source_file;
     for_each_tsconfig_prop_array(source_file, "references", |property| {
         if is_array_literal_expression(property.initializer()) {
             let value = property.initializer().elements();
             if value.len() > index {
-                return Some(create_diagnostic_for_node_in_source_file(source_file, value.get(index), message, args.clone()));
+                return Some(create_diagnostic_for_node_in_source_file(
+                    source_file,
+                    value.get(index),
+                    message,
+                    args.clone(),
+                ));
             }
         }
         None
@@ -924,7 +1122,9 @@ pub fn create_diagnostic_at_reference_syntax(
 }
 
 // Go: tsoptions/tsconfigparsing.go:1493 GetCallbackForFindingPropertyAssignmentByValue
-pub fn get_callback_for_finding_property_assignment_by_value(value: &str) -> impl Fn(Node) -> Option<Node> + use<> {
+pub fn get_callback_for_finding_property_assignment_by_value(
+    value: &str,
+) -> impl Fn(Node) -> Option<Node> + use<> {
     let value = value.to_string();
     move |property: Node| -> Option<Node> {
         if is_array_literal_expression(property.initializer()) {
@@ -939,7 +1139,11 @@ pub fn get_callback_for_finding_property_assignment_by_value(value: &str) -> imp
 }
 
 // Go: tsoptions/tsconfigparsing.go:1504 GetOptionsSyntaxByArrayElementValue
-pub fn get_options_syntax_by_array_element_value(object_literal: Node, prop_key: &str, element_value: &str) -> Node {
+pub fn get_options_syntax_by_array_element_value(
+    object_literal: Node,
+    prop_key: &str,
+    element_value: &str,
+) -> Node {
     for_each_property_assignment(
         object_literal,
         prop_key,
@@ -993,7 +1197,10 @@ fn get_substituted_path_with_config_dir_template(value: &str, base_path: &str) -
 // Go: tsoptions/tsconfigparsing.go:1538 getSubstitutedStringArrayWithConfigDirTemplate
 // PORT: Go returns a nil slice for "no change"; that is `None`. Go passes
 // the string as `any` to `startsWithConfigDirTemplate`.
-fn get_substituted_string_array_with_config_dir_template(list: &[String], base_path: &str) -> Option<Vec<String>> {
+fn get_substituted_string_array_with_config_dir_template(
+    list: &[String],
+    base_path: &str,
+) -> Option<Vec<String>> {
     let mut result: Option<Vec<String>> = None;
     for (i, element) in list.iter().enumerate() {
         if starts_with_config_dir_template(&CompilerOptionsValue::String(element.clone())) {
@@ -1008,7 +1215,10 @@ fn get_substituted_string_array_with_config_dir_template(list: &[String], base_p
 // PORT: Go `mergeCompilerOptions` copies the `Paths` pointer, so in Go this
 // also changes `paths` of a cached extended config. Here each options value
 // owns its `paths`, so only this config changes.
-fn handle_option_config_dir_template_substitution(compiler_options: Option<&mut CompilerOptions>, base_path: &str) {
+fn handle_option_config_dir_template_substitution(
+    compiler_options: Option<&mut CompilerOptions>,
+    base_path: &str,
+) {
     let Some(compiler_options) = compiler_options else {
         return;
     };
@@ -1017,17 +1227,23 @@ fn handle_option_config_dir_template_substitution(compiler_options: Option<&mut 
 
     if let Some(paths) = compiler_options.paths.as_mut() {
         for v in paths.values_mut() {
-            if let Some(substitution) = get_substituted_string_array_with_config_dir_template(v, base_path) {
+            if let Some(substitution) =
+                get_substituted_string_array_with_config_dir_template(v, base_path)
+            {
                 *v = substitution;
             }
         }
     }
 
-    if let Some(root_dirs) = get_substituted_string_array_with_config_dir_template(&compiler_options.root_dirs, base_path) {
+    if let Some(root_dirs) = get_substituted_string_array_with_config_dir_template(
+        &compiler_options.root_dirs,
+        base_path,
+    ) {
         compiler_options.root_dirs = root_dirs;
     }
     if let Some(type_roots) = compiler_options.type_roots.as_deref()
-        && let Some(type_roots) = get_substituted_string_array_with_config_dir_template(type_roots, base_path)
+        && let Some(type_roots) =
+            get_substituted_string_array_with_config_dir_template(type_roots, base_path)
     {
         compiler_options.type_roots = Some(type_roots);
     }
@@ -1060,7 +1276,11 @@ fn str_group(group: &[String]) -> Vec<&str> {
 // hasFileWithHigherPriorityExtension determines whether a literal or wildcard file has already been included that has a higher extension priority.
 // file is the path to the file.
 // Go: tsoptions/tsconfigparsing.go:1601 hasFileWithHigherPriorityExtension
-fn has_file_with_higher_priority_extension(file: &str, extensions: &[Vec<String>], has_file: impl Fn(&str) -> bool) -> bool {
+fn has_file_with_higher_priority_extension(
+    file: &str,
+    extensions: &[Vec<String>],
+    has_file: impl Fn(&str) -> bool,
+) -> bool {
     let mut extension_group: Vec<&str> = Vec::new();
     for group in extensions {
         if file_extension_is_one_of(file, &str_group(group)) {
@@ -1074,11 +1294,15 @@ fn has_file_with_higher_priority_extension(file: &str, extensions: &[Vec<String>
         // d.ts files match with .ts extension and with case sensitive sorting the file order for same files with ts tsx and dts extension is
         // d.ts, .ts, .tsx in that order so we need to handle tsx and dts of same same name case here and in remove files with same extensions
         // So dont match .d.ts files with .ts extension
-        if file_extension_is(file, ext) && (ext != EXTENSION_TS || !file_extension_is(file, EXTENSION_DTS)) {
+        if file_extension_is(file, ext)
+            && (ext != EXTENSION_TS || !file_extension_is(file, EXTENSION_DTS))
+        {
             return false;
         }
         if has_file(&change_extension(file, ext)) {
-            if ext == EXTENSION_DTS && (file_extension_is(file, EXTENSION_JS) || file_extension_is(file, EXTENSION_JSX)) {
+            if ext == EXTENSION_DTS
+                && (file_extension_is(file, EXTENSION_JS) || file_extension_is(file, EXTENSION_JSX))
+            {
                 // LEGACY BEHAVIOR: An off-by-one bug somewhere in the extension priority system for wildcard module loading allowed declaration
                 // files to be loaded alongside their js(x) counterparts. We regard this as generally undesirable, but retain the behavior to
                 // prevent breakage.
@@ -1140,7 +1364,9 @@ pub(crate) fn get_file_names_from_config_specs(
     let _ = extra_file_extensions;
     let extra_file_extensions: &[FileExtensionInfo] = &[];
     let base_path = normalize_path(base_path);
-    let key_mappper = |value: &str| -> String { get_canonical_file_name(value, host.use_case_sensitive_file_names()) };
+    let key_mappper = |value: &str| -> String {
+        get_canonical_file_name(value, host.use_case_sensitive_file_names())
+    };
     // Literal file names (provided via the "files" array in tsconfig.json) are stored in a
     // file map with a possibly case insensitive key. We use this map later when when including
     // wildcard paths.
@@ -1158,10 +1384,15 @@ pub(crate) fn get_file_names_from_config_specs(
     let validated_exclude_specs = &config_file_specs.validated_exclude_specs;
     // Rather than re-query this for each file and filespec, we query the supported extensions
     // once and store it on the expansion context.
-    let supported_extensions =
-        get_supported_extensions(options.expect("nil pointer dereference: options"), extra_file_extensions);
+    let supported_extensions = get_supported_extensions(
+        options.expect("nil pointer dereference: options"),
+        extra_file_extensions,
+    );
     let supported_extensions_with_json_if_resolve_json_module =
-        get_supported_extensions_with_json_if_resolve_json_module(options, supported_extensions.clone());
+        get_supported_extensions_with_json_if_resolve_json_module(
+            options,
+            supported_extensions.clone(),
+        );
     // Literal files are always included verbatim. An "include" or "exclude" specification cannot
     // remove a literal file.
     for file_name in validated_files_spec {
@@ -1171,8 +1402,11 @@ pub(crate) fn get_file_names_from_config_specs(
 
     let mut json_only_include_matchers: Option<SpecMatcher> = None;
     if !validated_include_specs.is_empty() {
-        let flat_extensions: Vec<String> =
-            supported_extensions_with_json_if_resolve_json_module.iter().flatten().cloned().collect();
+        let flat_extensions: Vec<String> = supported_extensions_with_json_if_resolve_json_module
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
         let files = read_directory(
             host,
             &base_path,
@@ -1185,10 +1419,17 @@ pub(crate) fn get_file_names_from_config_specs(
         for file in &files {
             if file_extension_is(file, EXTENSION_JSON) {
                 if json_only_include_matchers.is_none() {
-                    let includes: Vec<String> =
-                        validated_include_specs.iter().filter(|include| include.ends_with(EXTENSION_JSON)).cloned().collect();
-                    json_only_include_matchers =
-                        new_spec_matcher(&includes, &base_path, Usage::Files, host.use_case_sensitive_file_names());
+                    let includes: Vec<String> = validated_include_specs
+                        .iter()
+                        .filter(|include| include.ends_with(EXTENSION_JSON))
+                        .cloned()
+                        .collect();
+                    json_only_include_matchers = new_spec_matcher(
+                        &includes,
+                        &base_path,
+                        Usage::Files,
+                        host.use_case_sensitive_file_names(),
+                    );
                 }
                 let mut include_index: i32 = -1;
                 if let Some(matchers) = &json_only_include_matchers {
@@ -1196,7 +1437,9 @@ pub(crate) fn get_file_names_from_config_specs(
                 }
                 if include_index != -1 {
                     let key = key_mappper(file);
-                    if !literal_file_map.contains_key(&key) && !wild_card_json_file_map.contains_key(&key) {
+                    if !literal_file_map.contains_key(&key)
+                        && !wild_card_json_file_map.contains_key(&key)
+                    {
                         wild_card_json_file_map.insert(key, file.clone());
                     }
                 }
@@ -1210,7 +1453,8 @@ pub(crate) fn get_file_names_from_config_specs(
             // directory when they are compilation outputs.
             if has_file_with_higher_priority_extension(file, &supported_extensions, |file_name| {
                 let canonical_file_name = key_mappper(file_name);
-                literal_file_map.contains_key(&canonical_file_name) || wildcard_file_map.contains_key(&canonical_file_name)
+                literal_file_map.contains_key(&canonical_file_name)
+                    || wildcard_file_map.contains_key(&canonical_file_name)
             }) {
                 continue;
             }
@@ -1218,15 +1462,21 @@ pub(crate) fn get_file_names_from_config_specs(
             // extension due to the user-defined order of entries in the
             // "include" array. If there is a lower priority extension in the
             // same directory, we should remove it.
-            remove_wildcard_files_with_lower_priority_extension(file, &mut wildcard_file_map, &supported_extensions, key_mappper);
+            remove_wildcard_files_with_lower_priority_extension(
+                file,
+                &mut wildcard_file_map,
+                &supported_extensions,
+                key_mappper,
+            );
             let key = key_mappper(file);
             if !literal_file_map.contains_key(&key) && !wildcard_file_map.contains_key(&key) {
                 wildcard_file_map.insert(key, file.clone());
             }
         }
     }
-    let mut files: Vec<String> =
-        Vec::with_capacity(literal_file_map.len() + wildcard_file_map.len() + wild_card_json_file_map.len());
+    let mut files: Vec<String> = Vec::with_capacity(
+        literal_file_map.len() + wildcard_file_map.len() + wild_card_json_file_map.len(),
+    );
     files.extend(literal_file_map.values().cloned());
     files.extend(wildcard_file_map.values().cloned());
     files.extend(wild_card_json_file_map.values().cloned());
@@ -1235,7 +1485,10 @@ pub(crate) fn get_file_names_from_config_specs(
 
 /// Go `[][]string` copy of a tspath extension table.
 fn owned_groups(groups: &[&[&str]]) -> Vec<Vec<String>> {
-    groups.iter().map(|group| group.iter().map(|ext| (*ext).to_string()).collect()).collect()
+    groups
+        .iter()
+        .map(|group| group.iter().map(|ext| (*ext).to_string()).collect())
+        .collect()
 }
 
 // Go: tsoptions/tsconfigparsing.go:1753 GetSupportedExtensions
@@ -1252,12 +1505,17 @@ pub fn get_supported_extensions(
             return owned_groups(SUPPORTED_TS_EXTENSIONS);
         }
     }
-    let builtins = if need_js_extensions { owned_groups(ALL_SUPPORTED_EXTENSIONS) } else { owned_groups(SUPPORTED_TS_EXTENSIONS) };
+    let builtins = if need_js_extensions {
+        owned_groups(ALL_SUPPORTED_EXTENSIONS)
+    } else {
+        owned_groups(SUPPORTED_TS_EXTENSIONS)
+    };
     let flat_builtins: Vec<&String> = builtins.iter().flatten().collect();
     let mut result: Vec<Vec<String>> = Vec::new();
     for x in extra_file_extensions {
         if x.script_kind == ScriptKind::DEFERRED
-            || (need_js_extensions && (x.script_kind == ScriptKind::JS || x.script_kind == ScriptKind::JSX))
+            || (need_js_extensions
+                && (x.script_kind == ScriptKind::JS || x.script_kind == ScriptKind::JSX))
                 && !flat_builtins.contains(&&x.extension)
         {
             result.push(vec![x.extension.clone()]);
@@ -1303,9 +1561,21 @@ pub fn get_parsed_command_line_of_config_file(
     sys: &dyn ParseConfigHost,
     extended_config_cache: Option<&dyn ExtendedConfigCache>,
 ) -> (Option<ParsedCommandLine>, Vec<Diagnostic>) {
-    let config_file_name = get_normalized_absolute_path(config_file_name, &sys.get_current_directory());
-    let path = to_path(&config_file_name, &sys.get_current_directory(), sys.fs().use_case_sensitive_file_names());
-    get_parsed_command_line_of_config_file_path(&config_file_name, path, options, options_raw, sys, extended_config_cache)
+    let config_file_name =
+        get_normalized_absolute_path(config_file_name, &sys.get_current_directory());
+    let path = to_path(
+        &config_file_name,
+        &sys.get_current_directory(),
+        sys.fs().use_case_sensitive_file_names(),
+    );
+    get_parsed_command_line_of_config_file_path(
+        &config_file_name,
+        path,
+        options,
+        options_raw,
+        sys,
+        extended_config_cache,
+    )
 }
 
 // Go: tsoptions/tsconfigparsing.go:1804 GetParsedCommandLineOfConfigFilePath
@@ -1318,13 +1588,18 @@ pub fn get_parsed_command_line_of_config_file_path(
     extended_config_cache: Option<&dyn ExtendedConfigCache>,
 ) -> (Option<ParsedCommandLine>, Vec<Diagnostic>) {
     let errors: Vec<Diagnostic> = Vec::new();
-    let (config_file_text, errors) = try_read_file(config_file_name, &mut |name: &str| sys.fs().read_file(name), errors);
+    let (config_file_text, errors) = try_read_file(
+        config_file_name,
+        &mut |name: &str| sys.fs().read_file(name),
+        errors,
+    );
     if !errors.is_empty() {
         // these are unrecoverable errors--exit to report them as diagnostics
         return (None, errors);
     }
 
-    let ts_config_source_file = new_tsconfig_source_file_from_file_path(config_file_name, path, &config_file_text);
+    let ts_config_source_file =
+        new_tsconfig_source_file_from_file_path(config_file_name, path, &config_file_text);
     // tsConfigSourceFile.resolvedPath = tsConfigSourceFile.FileName()
     // tsConfigSourceFile.originalFileName = tsConfigSourceFile.FileName()
     (

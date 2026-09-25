@@ -50,19 +50,27 @@ pub struct TypeRefDirectiveResolutionCacheKey {
 // PORT: see `ModuleResolutionCache`.
 #[derive(Default)]
 pub struct TypeRefDirectiveResolutionCache {
-    pub cache: RefCell<FxHashMap<TypeRefDirectiveResolutionCacheKey, Rc<ResolvedTypeReferenceDirective>>>,
+    pub cache:
+        RefCell<FxHashMap<TypeRefDirectiveResolutionCacheKey, Rc<ResolvedTypeReferenceDirective>>>,
 }
 
 impl TypeRefDirectiveResolutionCache {
     // Go: module/cache.go:44 typeRefDirectiveResolutionCache.Get
     #[must_use]
-    pub fn get(&self, key: &TypeRefDirectiveResolutionCacheKey) -> Option<Rc<ResolvedTypeReferenceDirective>> {
+    pub fn get(
+        &self,
+        key: &TypeRefDirectiveResolutionCacheKey,
+    ) -> Option<Rc<ResolvedTypeReferenceDirective>> {
         self.cache.borrow().get(key).cloned()
     }
 
     // Go: module/cache.go:48 typeRefDirectiveResolutionCache.Set
     // PORT: Go `Store`: the last stored value wins.
-    pub fn set(&self, key: TypeRefDirectiveResolutionCacheKey, value: Rc<ResolvedTypeReferenceDirective>) {
+    pub fn set(
+        &self,
+        key: TypeRefDirectiveResolutionCacheKey,
+        value: Rc<ResolvedTypeReferenceDirective>,
+    ) {
         self.cache.borrow_mut().insert(key, value);
     }
 }
@@ -99,8 +107,15 @@ impl Caches {
 
 // Go: module/cache.go:64 newCaches
 #[must_use]
-pub fn new_caches(current_directory: &str, use_case_sensitive_file_names: bool, _options: &CompilerOptions) -> Caches {
-    Caches::with_package_json_info_cache(Rc::new(new_info_cache(current_directory, use_case_sensitive_file_names)))
+pub fn new_caches(
+    current_directory: &str,
+    use_case_sensitive_file_names: bool,
+    _options: &CompilerOptions,
+) -> Caches {
+    Caches::with_package_json_info_cache(Rc::new(new_info_cache(
+        current_directory,
+        use_case_sensitive_file_names,
+    )))
 }
 
 // Go: module/cache.go:74 getRedirectConfigName

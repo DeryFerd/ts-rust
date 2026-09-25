@@ -72,7 +72,8 @@ pub fn get_output_paths_for(
         }
     }
     if force_dts_emit || options.get_emit_declarations() && !is_json_file {
-        paths.declaration_file_path = get_declaration_emit_output_file_path(source_file.file_name(), options, host);
+        paths.declaration_file_path =
+            get_declaration_emit_output_file_path(source_file.file_name(), options, host);
         if options.get_are_declaration_maps_enabled() {
             paths.declaration_map_path = format!("{}.map", paths.declaration_file_path);
         }
@@ -89,7 +90,10 @@ pub fn for_each_emitted_file(
     force_dts_emit: bool,
 ) -> bool {
     for source_file in source_files {
-        if action(&get_output_paths_for(source_file, options, host, force_dts_emit), Some(source_file)) {
+        if action(
+            &get_output_paths_for(source_file, options, host, force_dts_emit),
+            Some(source_file),
+        ) {
             return true;
         }
     }
@@ -97,7 +101,11 @@ pub fn for_each_emitted_file(
 }
 
 // Go: outputpaths/outputpaths.go:76 GetOutputJSFileName
-pub fn get_output_js_file_name(input_file_name: &str, options: &CompilerOptions, host: &dyn OutputPathsHost) -> String {
+pub fn get_output_js_file_name(
+    input_file_name: &str,
+    options: &CompilerOptions,
+    host: &dyn OutputPathsHost,
+) -> String {
     if options.emit_declaration_only.is_true() {
         return String::new();
     }
@@ -118,7 +126,11 @@ pub fn get_output_js_file_name(input_file_name: &str, options: &CompilerOptions,
 }
 
 // Go: outputpaths/outputpaths.go:91 GetOutputJSFileNameWorker
-pub fn get_output_js_file_name_worker(input_file_name: &str, options: &CompilerOptions, host: &dyn OutputPathsHost) -> String {
+pub fn get_output_js_file_name_worker(
+    input_file_name: &str,
+    options: &CompilerOptions,
+    host: &dyn OutputPathsHost,
+) -> String {
     change_extension(
         &get_output_path_without_changing_extension(input_file_name, &options.out_dir, host),
         get_output_extension(input_file_name, options.jsx),
@@ -145,7 +157,9 @@ pub fn get_output_declaration_file_name_worker(
 pub fn get_output_extension(file_name: &str, jsx: JsxEmit) -> &'static str {
     if file_extension_is(file_name, EXTENSION_JSON) {
         EXTENSION_JSON
-    } else if jsx == JsxEmit::PRESERVE && file_extension_is_one_of(file_name, &[EXTENSION_JSX, EXTENSION_TSX]) {
+    } else if jsx == JsxEmit::PRESERVE
+        && file_extension_is_one_of(file_name, &[EXTENSION_JSX, EXTENSION_TSX])
+    {
         EXTENSION_JSX
     } else if file_extension_is_one_of(file_name, &[EXTENSION_MTS, EXTENSION_MJS]) {
         EXTENSION_MJS
@@ -157,7 +171,11 @@ pub fn get_output_extension(file_name: &str, jsx: JsxEmit) -> &'static str {
 }
 
 // Go: outputpaths/outputpaths.go:124 GetDeclarationEmitOutputFilePath
-pub fn get_declaration_emit_output_file_path(file: &str, options: &CompilerOptions, host: &dyn OutputPathsHost) -> String {
+pub fn get_declaration_emit_output_file_path(
+    file: &str,
+    options: &CompilerOptions,
+    host: &dyn OutputPathsHost,
+) -> String {
     let output_dir: Option<&str> = if !options.declaration_dir.is_empty() {
         Some(&options.declaration_dir)
     } else if !options.out_dir.is_empty() {
@@ -236,7 +254,8 @@ pub fn get_source_file_path_in_new_dir_worker(
     use_case_sensitive_file_names: bool,
 ) -> String {
     let mut source_file_path = get_normalized_absolute_path(file_name, current_directory);
-    let common_dir = get_canonical_file_name(common_source_directory, use_case_sensitive_file_names);
+    let common_dir =
+        get_canonical_file_name(common_source_directory, use_case_sensitive_file_names);
     let canon_file = get_canonical_file_name(&source_file_path, use_case_sensitive_file_names);
     let is_source_file_in_common_source_directory = canon_file.starts_with(common_dir.as_str());
     if is_source_file_in_common_source_directory {
@@ -292,10 +311,17 @@ pub fn get_build_info_file_name(options: &CompilerOptions, opts: &ComparePathsOp
         if !options.root_dir.is_empty() {
             resolve_path(
                 &options.out_dir,
-                &[&get_relative_path_from_directory(&options.root_dir, config_file_extension_less, opts)],
+                &[&get_relative_path_from_directory(
+                    &options.root_dir,
+                    config_file_extension_less,
+                    opts,
+                )],
             )
         } else {
-            combine_paths(&options.out_dir, &[&get_base_file_name(config_file_extension_less)])
+            combine_paths(
+                &options.out_dir,
+                &[&get_base_file_name(config_file_extension_less)],
+            )
         }
     } else {
         config_file_extension_less.to_string()
@@ -313,7 +339,8 @@ fn compute_common_source_directory_of_filenames(
     let mut common_path_components: Option<Vec<String>> = None;
     for source_file in file_names {
         // Each file contributes into common source file path
-        let mut source_path_components = get_normalized_path_components(source_file, current_directory);
+        let mut source_path_components =
+            get_normalized_path_components(source_file, current_directory);
 
         // The base file name is not part of the common directory path
         source_path_components.pop();
@@ -327,7 +354,10 @@ fn compute_common_source_directory_of_filenames(
         let n = common.len().min(source_path_components.len());
         for i in 0..n {
             if get_canonical_file_name(&common[i], use_case_sensitive_file_names)
-                != get_canonical_file_name(&source_path_components[i], use_case_sensitive_file_names)
+                != get_canonical_file_name(
+                    &source_path_components[i],
+                    use_case_sensitive_file_names,
+                )
             {
                 if i == 0 {
                     // Failed to find any common path component
@@ -361,8 +391,11 @@ pub fn get_computed_common_source_directory(
     current_directory: &str,
     use_case_sensitive_file_names: bool,
 ) -> String {
-    let mut common_source_directory =
-        compute_common_source_directory_of_filenames(emitted_files, current_directory, use_case_sensitive_file_names);
+    let mut common_source_directory = compute_common_source_directory_of_filenames(
+        emitted_files,
+        current_directory,
+        use_case_sensitive_file_names,
+    );
     if !common_source_directory.is_empty() {
         common_source_directory = ensure_trailing_directory_separator(&common_source_directory);
     }
@@ -393,8 +426,11 @@ pub fn get_common_source_directory(
             check(&files(), &common_source_directory);
         }
     } else {
-        common_source_directory =
-            compute_common_source_directory_of_filenames(&files(), current_directory, use_case_sensitive_file_names);
+        common_source_directory = compute_common_source_directory_of_filenames(
+            &files(),
+            current_directory,
+            use_case_sensitive_file_names,
+        );
     }
 
     if !common_source_directory.is_empty() {

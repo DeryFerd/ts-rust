@@ -17,12 +17,20 @@ pub fn identifier_to_keyword_kind(node: Node) -> SyntaxKind {
 }
 
 // Go: scanner/utilities.go:21 GetSourceTextOfNodeFromSourceFile
-pub fn get_source_text_of_node_from_source_file(source_file: Node, node: Node, include_trivia: bool) -> String {
+pub fn get_source_text_of_node_from_source_file(
+    source_file: Node,
+    node: Node,
+    include_trivia: bool,
+) -> String {
     get_text_of_node_from_source_text(source_file_text(source_file), node, include_trivia)
 }
 
 // Go: scanner/utilities.go:25 GetTextOfNodeFromSourceText
-pub fn get_text_of_node_from_source_text(source_text: &str, node: Node, include_trivia: bool) -> String {
+pub fn get_text_of_node_from_source_text(
+    source_text: &str,
+    node: Node,
+    include_trivia: bool,
+) -> String {
     if node_is_missing(node) {
         return String::new();
     }
@@ -31,7 +39,10 @@ pub fn get_text_of_node_from_source_text(source_text: &str, node: Node, include_
         pos = skip_trivia(source_text, pos);
     }
     let text = &source_text[pos as usize..node.end() as usize];
-    if node.flags().intersects(NodeFlags::REPARSER_TRANSFORMED_LITERAL) {
+    if node
+        .flags()
+        .intersects(NodeFlags::REPARSER_TRANSFORMED_LITERAL)
+    {
         // This is similar to `getLiteralTextOfNode` in the printer, but without the context of an `emitContext` to provide overrides
         if is_string_literal(node) {
             if node.token_flags().intersects(TokenFlags::SINGLE_QUOTE) {
@@ -45,7 +56,10 @@ pub fn get_text_of_node_from_source_text(source_text: &str, node: Node, include_
         // (Any reamppings done by emit transforms are handled by `getLiteralTextOfNode` in the printer)
         // Fail on any other kinds.
         // PORT: Go `debug.FailBadSyntaxKind` panics.
-        panic!("Unexpected reparser-transformed node kind: {:?}", node.kind());
+        panic!(
+            "Unexpected reparser-transformed node kind: {:?}",
+            node.kind()
+        );
     }
     // if (isJSDocTypeExpressionOrChild(node)) {
     //     // strip space + asterisk at line start
@@ -56,7 +70,11 @@ pub fn get_text_of_node_from_source_text(source_text: &str, node: Node, include_
 
 // Go: scanner/utilities.go:56 GetTextOfNode
 pub fn get_text_of_node(node: Node) -> String {
-    get_source_text_of_node_from_source_file(get_source_file_of_node(node), node, false /*includeTrivia*/)
+    get_source_text_of_node_from_source_file(
+        get_source_file_of_node(node),
+        node,
+        false, /*includeTrivia*/
+    )
 }
 
 // Go: scanner/utilities.go:60 GetTextOfJSDocComment

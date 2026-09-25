@@ -10,19 +10,24 @@
 //! The other Go visitor fields (`cjsExportAssignmentVisitor`,
 //! `expressionVisitor`, ...) are not fields; see `transform_source_file`.
 
-use super::diagnostics::{
-    bound_symbol_declarations, create_diagnostic_for_node, create_get_symbol_accessibility_diagnostic_for_node,
-    create_get_symbol_accessibility_diagnostic_for_node_name, GetSymbolAccessibilityDiagnostic,
-    SymbolAccessibilityDiagnostic,
-};
-use super::tracker::{new_symbol_tracker, SymbolTrackerImpl, SymbolTrackerSharedState};
-use super::util::{can_produce_diagnostics, is_declaration_and_not_visible, is_enclosing_declaration, needs_scope_marker};
 use super::DeclarationEmitHost;
+use super::diagnostics::{
+    GetSymbolAccessibilityDiagnostic, SymbolAccessibilityDiagnostic, bound_symbol_declarations,
+    create_diagnostic_for_node, create_get_symbol_accessibility_diagnostic_for_node,
+    create_get_symbol_accessibility_diagnostic_for_node_name,
+};
+use super::tracker::{SymbolTrackerImpl, SymbolTrackerSharedState, new_symbol_tracker};
+use super::util::{
+    can_produce_diagnostics, is_declaration_and_not_visible, is_enclosing_declaration,
+    needs_scope_marker,
+};
 use crate::ast::visitor::syntax_list_children;
 use crate::checker::checker_p17::tspath_p17;
 use crate::checker::nodebuilder_types::{InternalNodeBuilderFlags, NodeBuilderFlags};
 use crate::prelude::*;
-use crate::printer::{new_emit_context, CommentRange, EmitContext, EmitResolver, SymbolAccessibilityResult};
+use crate::printer::{
+    CommentRange, EmitContext, EmitResolver, SymbolAccessibilityResult, new_emit_context,
+};
 
 // Go: transformers/declarations/transform.go:23 ReferencedFilePair
 #[derive(Clone)]
@@ -41,15 +46,29 @@ pub(crate) struct ThisPropertyAssignmentKey {
 }
 
 // Go: transformers/declarations/transform.go:53 getThisPropertyAssignmentKey
-pub(crate) fn get_this_property_assignment_key(name: Node, node: Node, is_static: bool) -> ThisPropertyAssignmentKey {
+pub(crate) fn get_this_property_assignment_key(
+    name: Node,
+    node: Node,
+    is_static: bool,
+) -> ThisPropertyAssignmentKey {
     let is_private = is_private_identifier(name);
     if name.is_some() && !is_dynamic_name(name) {
         let (name_text, ok) = try_get_text_of_property_name(name);
         if ok {
-            return ThisPropertyAssignmentKey { name: name_text, node: Node::NIL, is_static, is_private };
+            return ThisPropertyAssignmentKey {
+                name: name_text,
+                node: Node::NIL,
+                is_static,
+                is_private,
+            };
         }
     }
-    ThisPropertyAssignmentKey { name: String::new(), node, is_static, is_private }
+    ThisPropertyAssignmentKey {
+        name: String::new(),
+        node,
+        is_static,
+        is_private,
+    }
 }
 
 // Go: transformers/declarations/transform.go:63 DeclarationTransformer
@@ -122,7 +141,11 @@ pub fn new_declaration_transformer(
         current_source_file: Node::NIL,
         resolver: resolver.clone(),
     }));
-    let tracker = Rc::new(new_symbol_tracker(host.clone(), resolver.clone(), state.clone()));
+    let tracker = Rc::new(new_symbol_tracker(
+        host.clone(),
+        resolver.clone(),
+        state.clone(),
+    ));
     // TODO: Use new host GetOutputPathsFor method instead of passing in entrypoint paths (which will also better support bundled emit)
     // Go: transformers/transformer.go:14 Transformer.NewTransformer
     let emit_context = context.unwrap_or_else(new_emit_context);
@@ -160,13 +183,14 @@ pub fn new_declaration_transformer(
 /// Go `declarationEmitNodeBuilderFlags`.
 // Go: transformers/declarations/transform.go:214 declarationEmitNodeBuilderFlags
 #[allow(dead_code)]
-pub(crate) const DECLARATION_EMIT_NODE_BUILDER_FLAGS: NodeBuilderFlags = NodeBuilderFlags::MULTILINE_OBJECT_LITERALS
-    .union(NodeBuilderFlags::WRITE_CLASS_EXPRESSION_AS_TYPE_LITERAL)
-    .union(NodeBuilderFlags::USE_TYPE_OF_FUNCTION)
-    .union(NodeBuilderFlags::USE_STRUCTURAL_FALLBACK)
-    .union(NodeBuilderFlags::ALLOW_EMPTY_TUPLE)
-    .union(NodeBuilderFlags::GENERATE_NAMES_FOR_SHADOWED_TYPE_PARAMS)
-    .union(NodeBuilderFlags::NO_TRUNCATION);
+pub(crate) const DECLARATION_EMIT_NODE_BUILDER_FLAGS: NodeBuilderFlags =
+    NodeBuilderFlags::MULTILINE_OBJECT_LITERALS
+        .union(NodeBuilderFlags::WRITE_CLASS_EXPRESSION_AS_TYPE_LITERAL)
+        .union(NodeBuilderFlags::USE_TYPE_OF_FUNCTION)
+        .union(NodeBuilderFlags::USE_STRUCTURAL_FALLBACK)
+        .union(NodeBuilderFlags::ALLOW_EMPTY_TUPLE)
+        .union(NodeBuilderFlags::GENERATE_NAMES_FOR_SHADOWED_TYPE_PARAMS)
+        .union(NodeBuilderFlags::NO_TRUNCATION);
 
 /// Go `declarationEmitInternalNodeBuilderFlags`.
 // Go: transformers/declarations/transform.go:222 declarationEmitInternalNodeBuilderFlags
@@ -245,13 +269,22 @@ impl DeclarationTransformer {
                 let trailing_pos = skip_trivia_ex(
                     text,
                     previous_sibling.end() + 1,
-                    Some(&SkipTriviaOptions { stop_at_comments: true, ..Default::default() }),
+                    Some(&SkipTriviaOptions {
+                        stop_at_comments: true,
+                        ..Default::default()
+                    }),
                 );
                 comment_ranges.extend(get_trailing_comment_ranges(text, trailing_pos));
                 comment_ranges.extend(get_leading_comment_ranges(text, node.pos()));
             } else {
-                let trailing_pos =
-                    skip_trivia_ex(text, node.pos(), Some(&SkipTriviaOptions { stop_at_comments: true, ..Default::default() }));
+                let trailing_pos = skip_trivia_ex(
+                    text,
+                    node.pos(),
+                    Some(&SkipTriviaOptions {
+                        stop_at_comments: true,
+                        ..Default::default()
+                    }),
+                );
                 comment_ranges.extend(get_trailing_comment_ranges(text, trailing_pos));
             }
 
@@ -270,7 +303,11 @@ impl DeclarationTransformer {
     }
 
     // Go: transformers/declarations/transform.go:202 DeclarationTransformer.getLeadingCommentRangesOfNode
-    fn get_leading_comment_ranges_of_node(&self, node: Node, source_file: Node) -> Vec<CommentRange> {
+    fn get_leading_comment_ranges_of_node(
+        &self,
+        node: Node,
+        source_file: Node,
+    ) -> Vec<CommentRange> {
         if node.is_nil() || node.kind() == SyntaxKind::JsxText {
             return Vec::new();
         }
@@ -358,11 +395,15 @@ impl DeclarationTransformer {
     // Go: transformers/declarations/transform.go:308 DeclarationTransformer.collectFileReferences
     fn collect_file_references(&mut self, source_file: Node) {
         let info = source_file_info(source_file);
-        self.raw_referenced_files.extend(
-            info.referenced_files.iter().map(|r| ReferencedFilePair { file: source_file, r#ref: r.clone() }),
-        );
-        self.raw_type_reference_directives.extend(info.type_reference_directives.iter().cloned());
-        self.raw_lib_reference_directives.extend(info.lib_reference_directives.iter().cloned());
+        self.raw_referenced_files
+            .extend(info.referenced_files.iter().map(|r| ReferencedFilePair {
+                file: source_file,
+                r#ref: r.clone(),
+            }));
+        self.raw_type_reference_directives
+            .extend(info.type_reference_directives.iter().cloned());
+        self.raw_lib_reference_directives
+            .extend(info.lib_reference_directives.iter().cloned());
     }
 
     // Go: transformers/declarations/transform.go:325 DeclarationTransformer.appendCjsExports
@@ -397,18 +438,23 @@ impl DeclarationTransformer {
         self.visit_nested_expression(node); // collect expando members (requires any export assignment be located in advance)
         let source_statements = node.statement_list();
         let statements = self.with_visitor(|v| v.visit_nodes(source_statements));
-        let mut combined_statements = self.transform_and_replace_late_painted_statements(statements);
+        let mut combined_statements =
+            self.transform_and_replace_late_painted_statements(statements);
         combined_statements = self.append_cjs_exports(combined_statements);
         // setTextRange
         // PORT: a synthetic list fixes its `Loc` at creation, so Go
         // `combinedStatements.Loc = statements.Loc` makes the list again. The
         // list is always new here, so no other holder sees the change.
-        combined_statements = new_synthetic_node_list(&combined_statements.nodes().to_vec(), statements.loc());
+        combined_statements =
+            new_synthetic_node_list(&combined_statements.nodes().to_vec(), statements.loc());
         if is_external_or_common_js_module(node) {
             if is_in_js_file(node) {
                 let export_equals = {
                     let symbols = prog().bound_symbols.get().expect("program not bound");
-                    symbols.get(symbols.sym(node.symbol()).exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS)
+                    symbols.get(
+                        symbols.sym(node.symbol()).exports,
+                        INTERNAL_SYMBOL_NAME_EXPORT_EQUALS,
+                    )
                 };
                 if export_equals.is_some() {
                     let declarations = bound_symbol_declarations(export_equals);
@@ -423,7 +469,9 @@ impl DeclarationTransformer {
                     }
                 }
             }
-            if !self.result_has_external_module_indicator || (self.needs_scope_fix_marker && !self.result_has_scope_marker) {
+            if !self.result_has_external_module_indicator
+                || (self.needs_scope_fix_marker && !self.result_has_scope_marker)
+            {
                 let marker = create_empty_exports(self.emit_context.factory().as_node_factory());
                 let mut new_list = combined_statements.nodes().to_vec();
                 new_list.push(marker);
@@ -432,9 +480,14 @@ impl DeclarationTransformer {
                 combined_statements = with_marker;
             }
         }
-        let output_file_path =
-            tspath_p17::get_directory_path(&tspath_p17::normalize_slashes(&self.declaration_file_path));
-        let result = self.emit_context.factory().update_source_file(node, combined_statements, node.end_of_file_token());
+        let output_file_path = tspath_p17::get_directory_path(&tspath_p17::normalize_slashes(
+            &self.declaration_file_path,
+        ));
+        let result = self.emit_context.factory().update_source_file(
+            node,
+            combined_statements,
+            node.end_of_file_token(),
+        );
         let lib_reference_directives = self.get_lib_references();
         let type_reference_directives = self.get_type_references();
         let referenced_files = self.get_referenced_files(&output_file_path);
@@ -454,7 +507,10 @@ impl DeclarationTransformer {
     }
 
     // Go: transformers/declarations/transform.go:384 DeclarationTransformer.transformAndReplaceLatePaintedStatements
-    pub(crate) fn transform_and_replace_late_painted_statements(&mut self, statements: NodeList) -> NodeList {
+    pub(crate) fn transform_and_replace_late_painted_statements(
+        &mut self,
+        statements: NodeList,
+    ) -> NodeList {
         // This is a `while` loop because `handleSymbolAccessibilityError` can see additional import aliases marked as visible during
         // error handling which must now be included in the output and themselves checked for errors.
         // For example:
@@ -511,7 +567,8 @@ impl DeclarationTransformer {
                         if needs_scope_marker(elem) {
                             self.needs_scope_fix_marker = true;
                         }
-                        if is_source_file(statement.parent()) && is_external_module_indicator(elem) {
+                        if is_source_file(statement.parent()) && is_external_module_indicator(elem)
+                        {
                             self.result_has_external_module_indicator = true;
                         }
                     }
@@ -601,7 +658,10 @@ impl DeclarationTransformer {
     }
 
     // Go: transformers/declarations/transform.go:549 DeclarationTransformer.setupDiagnosticContext
-    pub(crate) fn setup_diagnostic_context(&mut self, input: Node) -> (bool, CleanupDiagnosticContext) {
+    pub(crate) fn setup_diagnostic_context(
+        &mut self,
+        input: Node,
+    ) -> (bool, CleanupDiagnosticContext) {
         let can_prodice_diagnostic = can_produce_diagnostics(input);
         let old_within_object_literal_type = self.suppress_new_diagnostic_contexts;
         let should_enter_suppress_new_diagnostics_context_context =
@@ -609,7 +669,11 @@ impl DeclarationTransformer {
                 && !(input.parent().kind() == SyntaxKind::TypeAliasDeclaration
                     || input.parent().kind() == SyntaxKind::JsTypeAliasDeclaration);
 
-        let old_diag = self.state.borrow().get_symbol_accessibility_diagnostic.clone();
+        let old_diag = self
+            .state
+            .borrow()
+            .get_symbol_accessibility_diagnostic
+            .clone();
         if can_prodice_diagnostic && !self.suppress_new_diagnostic_contexts {
             self.state.borrow_mut().get_symbol_accessibility_diagnostic =
                 Some(create_get_symbol_accessibility_diagnostic_for_node(input));
@@ -620,7 +684,14 @@ impl DeclarationTransformer {
             self.suppress_new_diagnostic_contexts = true;
         }
 
-        (can_prodice_diagnostic, CleanupDiagnosticContext { old_diag, old_name, old_within_object_literal_type })
+        (
+            can_prodice_diagnostic,
+            CleanupDiagnosticContext {
+                old_diag,
+                old_name,
+                old_within_object_literal_type,
+            },
+        )
     }
 
     // Go: transformers/declarations/transform.go:571 DeclarationTransformer.visitDeclarationSubtree
@@ -637,15 +708,21 @@ impl DeclarationTransformer {
                 if isolated_declarations {
                     // Classes and object literals usually elide properties with computed names that are not of a literal type
                     // In isolated declarations TSC needs to error on these as we don't know the type in a DTE.
-                    if !self.resolver.is_definitely_reference_to_global_symbol_object(input.name().expression()) {
-                        if is_class_declaration(input.parent()) || is_object_literal_expression(input.parent()) {
+                    if !self
+                        .resolver
+                        .is_definitely_reference_to_global_symbol_object(input.name().expression())
+                    {
+                        if is_class_declaration(input.parent())
+                            || is_object_literal_expression(input.parent())
+                        {
                             self.state.borrow_mut().add_diagnostic(create_diagnostic_for_node(
                                 input,
                                 diag::Computed_property_names_on_class_or_object_literals_cannot_be_inferred_with_isolatedDeclarations,
                                 args![],
                             ));
                             return Node::NIL;
-                        } else if (is_interface_declaration(input.parent()) || is_type_literal_node(input.parent()))
+                        } else if (is_interface_declaration(input.parent())
+                            || is_type_literal_node(input.parent()))
                             && !is_entity_name_expression(input.name().expression())
                         {
                             // Type declarations just need to double-check that the input computed name is an entity name expression
@@ -657,7 +734,9 @@ impl DeclarationTransformer {
                             return Node::NIL;
                         }
                     }
-                } else if !self.resolver.is_late_bound(self.emit_context.parse_node(input))
+                } else if !self
+                    .resolver
+                    .is_late_bound(self.emit_context.parse_node(input))
                     || !is_entity_name_expression(input.name().expression())
                 {
                     return Node::NIL;
@@ -686,7 +765,8 @@ impl DeclarationTransformer {
             self.enclosing_declaration = input;
         }
 
-        let (can_prodice_diagnostic, cleanup_diagnostic_context) = self.setup_diagnostic_context(input);
+        let (can_prodice_diagnostic, cleanup_diagnostic_context) =
+            self.setup_diagnostic_context(input);
 
         let result = match input.kind() {
             SyntaxKind::MappedType => self.transform_mapped_type_node(input),
@@ -703,7 +783,9 @@ impl DeclarationTransformer {
             SyntaxKind::IndexSignature => self.transform_index_signature_declaration(input),
             SyntaxKind::VariableDeclaration => self.transform_variable_declaration(input),
             SyntaxKind::TypeParameter => self.transform_type_parameter_declaration(input),
-            SyntaxKind::ExpressionWithTypeArguments => self.transform_expression_with_type_arguments(input),
+            SyntaxKind::ExpressionWithTypeArguments => {
+                self.transform_expression_with_type_arguments(input)
+            }
             SyntaxKind::TypeReference => self.transform_type_reference(input),
             SyntaxKind::ConditionalType => self.transform_conditional_type_node(input),
             SyntaxKind::FunctionType => self.transform_function_type_node(input),
@@ -717,7 +799,8 @@ impl DeclarationTransformer {
             SyntaxKind::TupleType => {
                 let result = self.with_visitor(|v| v.visit_each_child(input));
                 if result.is_some() && is_original_node_single_line(&self.emit_context, input) {
-                    self.emit_context.add_emit_flags(result, EmitFlags::SINGLE_LINE);
+                    self.emit_context
+                        .add_emit_flags(result, EmitFlags::SINGLE_LINE);
                 }
                 result
             }
@@ -744,10 +827,15 @@ impl DeclarationTransformer {
 
     // Go: transformers/declarations/transform.go:701 DeclarationTransformer.checkName
     pub(crate) fn check_name(&mut self, node: Node) {
-        let old_diag = self.state.borrow().get_symbol_accessibility_diagnostic.clone();
+        let old_diag = self
+            .state
+            .borrow()
+            .get_symbol_accessibility_diagnostic
+            .clone();
         if !self.suppress_new_diagnostic_contexts {
-            self.state.borrow_mut().get_symbol_accessibility_diagnostic =
-                Some(create_get_symbol_accessibility_diagnostic_for_node_name(node));
+            self.state.borrow_mut().get_symbol_accessibility_diagnostic = Some(
+                create_get_symbol_accessibility_diagnostic_for_node_name(node),
+            );
         }
         self.state.borrow_mut().error_name_node = node.name();
         assert!(has_dynamic_name(node)); // Should only be called with dynamic names
@@ -764,7 +852,9 @@ impl DeclarationTransformer {
     fn transform_mapped_type_node(&mut self, input: Node) -> Node {
         // handle missing template type nodes, since the printer does not
         let type_node = if input.type_().is_nil() {
-            self.emit_context.factory().new_keyword_type_node(SyntaxKind::AnyKeyword)
+            self.emit_context
+                .factory()
+                .new_keyword_type_node(SyntaxKind::AnyKeyword)
         } else {
             self.visit(input.type_())
         };
@@ -788,7 +878,8 @@ impl DeclarationTransformer {
             .iter()
             .filter(|&t| {
                 is_entity_name_expression(t.expression())
-                    || (clause.token() == SyntaxKind::ExtendsKeyword && t.expression().kind() == SyntaxKind::NullKeyword)
+                    || (clause.token() == SyntaxKind::ExtendsKeyword
+                        && t.expression().kind() == SyntaxKind::NullKeyword)
             })
             .collect();
         if retained_clauses.is_empty() {
@@ -799,21 +890,26 @@ impl DeclarationTransformer {
         }
         let retained = self.emit_context.factory().new_node_list(&retained_clauses);
         let types = self.with_visitor(|v| v.visit_nodes(retained));
-        self.emit_context.factory().update_heritage_clause(clause, clause.token(), types)
+        self.emit_context
+            .factory()
+            .update_heritage_clause(clause, clause.token(), types)
     }
 }
 
 // Go: transformers/declarations/transform.go:209 hasInternalAnnotation
 fn has_internal_annotation(comment_range: &CommentRange, source_file: Node) -> bool {
-    let comment = &source_file_text(source_file)[comment_range.pos() as usize..comment_range.end() as usize];
+    let comment =
+        &source_file_text(source_file)[comment_range.pos() as usize..comment_range.end() as usize];
     comment.contains("@internal")
 }
 
 // Go: transformers/declarations/transform.go:275 throwDiagnostic
 fn throw_diagnostic() -> GetSymbolAccessibilityDiagnostic {
-    Rc::new(|_result: &SymbolAccessibilityResult| -> Option<SymbolAccessibilityDiagnostic> {
-        panic!("Diagnostic emitted without context")
-    })
+    Rc::new(
+        |_result: &SymbolAccessibilityResult| -> Option<SymbolAccessibilityDiagnostic> {
+            panic!("Diagnostic emitted without context")
+        },
+    )
 }
 
 // Go: transformers/declarations/transform.go:314 nodeOrSyntaxListChildren
@@ -826,7 +922,10 @@ pub(crate) fn node_or_syntax_list_children(node: Node) -> Vec<Node> {
 
 // Go: transformers/declarations/transform.go:321 flattenSyntaxLists
 pub(crate) fn flatten_syntax_lists(nodes: &[Node]) -> Vec<Node> {
-    nodes.iter().flat_map(|&n| node_or_syntax_list_children(n)).collect()
+    nodes
+        .iter()
+        .flat_map(|&n| node_or_syntax_list_children(n))
+        .collect()
 }
 
 // Go: transformers/declarations/transform.go:380 createEmptyExports
@@ -887,12 +986,19 @@ fn get_relative_path_to_directory_or_url(
     is_absolute_path_an_url: bool,
     options: &tspath_p17::ComparePathsOptions,
 ) -> String {
-    let mut path_components =
-        tspath_p17::get_path_components_relative_to(directory_path_or_url, relative_or_absolute_path, options);
+    let mut path_components = tspath_p17::get_path_components_relative_to(
+        directory_path_or_url,
+        relative_or_absolute_path,
+        options,
+    );
 
     let first_component = path_components[0].clone();
     if is_absolute_path_an_url && tspath_p17::is_rooted_disk_path(&first_component) {
-        let prefix = if first_component.as_bytes()[0] == b'/' { "file://" } else { "file:///" };
+        let prefix = if first_component.as_bytes()[0] == b'/' {
+            "file://"
+        } else {
+            "file:///"
+        };
         path_components[0] = format!("{prefix}{first_component}");
     }
 
@@ -929,7 +1035,10 @@ fn is_shebang_trivia(text: &str, pos: usize) -> bool {
     if bytes.len() < 2 {
         return false;
     }
-    assert!(pos == 0, "Shebangs check must only be done at the start of the file");
+    assert!(
+        pos == 0,
+        "Shebangs check must only be done at the start of the file"
+    );
     bytes[0] == b'#' && bytes[1] == b'!'
 }
 
@@ -958,11 +1067,12 @@ asterisk-slash characters.
 // PORT: Go yields lazily; this collects the ranges into a Vec.
 fn iterate_comment_ranges(text: &str, pos: i32, trailing: bool) -> Vec<CommentRange> {
     let mut out = Vec::new();
-    let new_comment_range = |kind: SyntaxKind, pos: usize, end: usize, has_trailing_new_line: bool| CommentRange {
-        text_range: TextRange::new(pos as i32, end as i32),
-        kind,
-        has_trailing_new_line,
-    };
+    let new_comment_range =
+        |kind: SyntaxKind, pos: usize, end: usize, has_trailing_new_line: bool| CommentRange {
+            text_range: TextRange::new(pos as i32, end as i32),
+            kind,
+            has_trailing_new_line,
+        };
     if pos < 0 {
         return out;
     }
@@ -1004,7 +1114,11 @@ fn iterate_comment_ranges(text: &str, pos: i32, trailing: bool) -> Vec<CommentRa
                 continue;
             }
             '/' => {
-                let next_char = if pos + 1 < text.len() { bytes[pos + 1] } else { 0 };
+                let next_char = if pos + 1 < text.len() {
+                    bytes[pos + 1]
+                } else {
+                    0
+                };
                 let mut has_trailing_new_line = false;
                 if next_char == b'/' || next_char == b'*' {
                     let kind = if next_char == b'/' {
@@ -1065,7 +1179,12 @@ fn iterate_comment_ranges(text: &str, pos: i32, trailing: bool) -> Vec<CommentRa
     }
 
     if has_pending_comment_range {
-        out.push(new_comment_range(pending_kind, pending_pos, pending_end, pending_has_trailing_new_line));
+        out.push(new_comment_range(
+            pending_kind,
+            pending_pos,
+            pending_end,
+            pending_has_trailing_new_line,
+        ));
     }
     out
 }

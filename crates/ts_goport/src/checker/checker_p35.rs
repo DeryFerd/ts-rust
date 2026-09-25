@@ -4,7 +4,10 @@ impl Checker {
     // Go: checker/checker.go:31516 getIndexSignaturesAtLocation
     pub fn get_index_signatures_at_location(&mut self, node: Node) -> Vec<Node> {
         let mut signatures: Vec<Node> = Vec::new();
-        if is_identifier(node) && is_property_access_expression(node.parent()) && node.parent().name() == node {
+        if is_identifier(node)
+            && is_property_access_expression(node.parent())
+            && node.parent().name() == node
+        {
             let key_type = self.get_literal_type_from_property_name(node);
             let object_type = self.get_type_of_expression(node.parent().expression());
             let distributed = self.ty(object_type).distributed();
@@ -32,9 +35,13 @@ impl Checker {
             // Even an entity name expression that doesn't resolve as an entityname may still typecheck as a property access expression
             let success = self.resolve_entity_name(
                 name,
-                /*all meanings*/ SymbolFlags::VALUE | SymbolFlags::TYPE | SymbolFlags::NAMESPACE | SymbolFlags::ALIAS,
-                true,  /*ignoreErrors*/
-                false, /*dontResolveAlias*/
+                /*all meanings*/
+                SymbolFlags::VALUE
+                    | SymbolFlags::TYPE
+                    | SymbolFlags::NAMESPACE
+                    | SymbolFlags::ALIAS,
+                true,      /*ignoreErrors*/
+                false,     /*dontResolveAlias*/
                 Node::NIL, /*location*/
             );
             if success.is_some() && success != self.unknown_symbol {
@@ -42,7 +49,8 @@ impl Checker {
             }
         } else if is_entity_name(name) && is_in_right_side_of_import_or_export_assignment(name) {
             // Since we already checked for ExportAssignment, this really could only be an Import
-            let import_equals_declaration = find_ancestor_kind(name, SyntaxKind::ImportEqualsDeclaration);
+            let import_equals_declaration =
+                find_ancestor_kind(name, SyntaxKind::ImportEqualsDeclaration);
             if import_equals_declaration.is_nil() {
                 panic!("ImportEqualsDeclaration should be defined");
             }
@@ -54,7 +62,11 @@ impl Checker {
             if possible_import_node.is_some() {
                 self.get_type_from_type_node(possible_import_node);
                 let sym = self.get_resolved_symbol_or_nil(name);
-                return if sym == self.unknown_symbol { SymbolId::NIL } else { sym };
+                return if sym == self.unknown_symbol {
+                    SymbolId::NIL
+                } else {
+                    sym
+                };
             }
         }
 
@@ -67,7 +79,11 @@ impl Checker {
             if name.parent().kind() == SyntaxKind::ExpressionWithTypeArguments {
                 // An 'ExpressionWithTypeArguments' may appear in type space (interface Foo extends Bar<T>),
                 // value space (return foo<T>), or both(class Foo extends Bar<T>); ensure the meaning matches.
-                meaning = if is_part_of_type_node(name) { SymbolFlags::TYPE } else { SymbolFlags::VALUE };
+                meaning = if is_part_of_type_node(name) {
+                    SymbolFlags::TYPE
+                } else {
+                    SymbolFlags::VALUE
+                };
 
                 // In a class 'extends' clause we are also looking for a value.
                 if is_expression_with_type_arguments_in_class_extends_clause(name.parent()) {
@@ -81,8 +97,10 @@ impl Checker {
             let mut entity_name_symbol = SymbolId::NIL;
             if is_entity_name_expression(name) {
                 entity_name_symbol = self.resolve_entity_name(
-                    name, meaning, true, /*ignoreErrors*/
-                    false, /*dontResolveAlias*/
+                    name,
+                    meaning,
+                    true,      /*ignoreErrors*/
+                    false,     /*dontResolveAlias*/
                     Node::NIL, /*location*/
                 );
             }
@@ -100,7 +118,11 @@ impl Checker {
             if is_identifier(name) {
                 if is_jsx_tag_name(name) && is_jsx_intrinsic_tag_name(name) {
                     let symbol = self.get_intrinsic_tag_symbol(name.parent());
-                    return if symbol == self.unknown_symbol { SymbolId::NIL } else { symbol };
+                    return if symbol == self.unknown_symbol {
+                        SymbolId::NIL
+                    } else {
+                        symbol
+                    };
                 }
                 let meaning = if is_js_doc {
                     SymbolFlags::VALUE | SymbolFlags::TYPE | SymbolFlags::NAMESPACE
@@ -139,8 +161,14 @@ impl Checker {
                     return resolved_symbol;
                 }
                 if is_property_access_expression(name) {
-                    self.check_property_access_expression(name, CheckMode::NORMAL, false /*writeOnly*/);
-                    if self.symbol_node_links.get(name).resolved_symbol.is_nil() && !is_private_identifier(name.name()) {
+                    self.check_property_access_expression(
+                        name,
+                        CheckMode::NORMAL,
+                        false, /*writeOnly*/
+                    );
+                    if self.symbol_node_links.get(name).resolved_symbol.is_nil()
+                        && !is_private_identifier(name.name())
+                    {
                         let expr_type = self.check_expression_cached(name.expression());
                         let key_type = self.get_literal_type_from_property_name(name.name());
                         let index_symbol = self.get_applicable_index_symbol(expr_type, key_type);
@@ -149,7 +177,10 @@ impl Checker {
                 } else {
                     self.check_qualified_name(name, CheckMode::NORMAL);
                 }
-                if self.symbol_node_links.get(name).resolved_symbol.is_nil() && is_js_doc && is_qualified_name(name) {
+                if self.symbol_node_links.get(name).resolved_symbol.is_nil()
+                    && is_js_doc
+                    && is_qualified_name(name)
+                {
                     return self.resolve_js_doc_member_name(name);
                 }
                 return self.symbol_node_links.get(name).resolved_symbol;
@@ -161,8 +192,10 @@ impl Checker {
                 SymbolFlags::NAMESPACE
             };
             let symbol = self.resolve_entity_name(
-                name, meaning, true, /*ignoreErrors*/
-                true, /*dontResolveAlias*/
+                name,
+                meaning,
+                true,      /*ignoreErrors*/
+                true,      /*dontResolveAlias*/
                 Node::NIL, /*location*/
             );
             if symbol.is_some() && symbol != self.unknown_symbol {
@@ -186,12 +219,21 @@ impl Checker {
     // Go: checker/checker.go:31671 isThisPropertyAndThisTyped
     pub fn is_this_property_and_this_typed(&mut self, node: Node) -> bool {
         if node.expression().kind() == SyntaxKind::ThisKeyword {
-            let container = self.get_this_container(node, false /*includeArrowFunctions*/, false /*includeClassComputedPropertyName*/);
+            let container = self.get_this_container(
+                node, false, /*includeArrowFunctions*/
+                false, /*includeClassComputedPropertyName*/
+            );
             if is_function_like(container) {
                 let containing_literal = get_containing_object_literal(container);
                 if containing_literal.is_some() {
-                    let contextual_type = self.get_apparent_type_of_contextual_type(containing_literal, ContextFlags::NONE);
-                    let t = self.get_this_type_of_object_literal_from_contextual_type(containing_literal, contextual_type);
+                    let contextual_type = self.get_apparent_type_of_contextual_type(
+                        containing_literal,
+                        ContextFlags::NONE,
+                    );
+                    let t = self.get_this_type_of_object_literal_from_contextual_type(
+                        containing_literal,
+                        contextual_type,
+                    );
                     return t.is_some() && !self.is_type_any(t);
                 }
             }
@@ -210,7 +252,8 @@ impl Checker {
             return self.error_type;
         }
 
-        let (class_decl, is_implements) = try_get_class_implementing_or_extending_expression_with_type_arguments(node);
+        let (class_decl, is_implements) =
+            try_get_class_implementing_or_extending_expression_with_type_arguments(node);
         let mut class_type = TypeId::NIL;
         if class_decl.is_some() {
             let class_symbol = self.get_symbol_of_declaration(class_decl);
@@ -221,7 +264,11 @@ impl Checker {
             let type_from_type_node = self.get_type_from_type_node(node);
             if class_type.is_some() {
                 let this_type = self.ty(class_type).as_interface_type().this_type;
-                return self.get_type_with_this_argument(type_from_type_node, this_type, false /*needApparentType*/);
+                return self.get_type_with_this_argument(
+                    type_from_type_node,
+                    this_type,
+                    false, /*needApparentType*/
+                );
             }
             return type_from_type_node;
         }
@@ -233,10 +280,16 @@ impl Checker {
         if class_type.is_some() && !is_implements {
             // A SyntaxKind.ExpressionWithTypeArguments is considered a type node, except when it occurs in the
             // extends clause of a class. We handle that case here.
-            let base_type = self.get_base_types(class_type).first().copied().unwrap_or(TypeId::NIL);
+            let base_type = self
+                .get_base_types(class_type)
+                .first()
+                .copied()
+                .unwrap_or(TypeId::NIL);
             if base_type.is_some() {
                 let this_type = self.ty(class_type).as_interface_type().this_type;
-                return self.get_type_with_this_argument(base_type, this_type, false /*needApparentType*/);
+                return self.get_type_with_this_argument(
+                    base_type, this_type, false, /*needApparentType*/
+                );
             }
             return self.error_type;
         }
@@ -256,7 +309,11 @@ impl Checker {
         }
 
         if is_binding_element(node) {
-            let t = self.get_type_for_variable_like_declaration(node, true /*includeOptionality*/, CheckMode::NORMAL);
+            let t = self.get_type_for_variable_like_declaration(
+                node,
+                true, /*includeOptionality*/
+                CheckMode::NORMAL,
+            );
             if t.is_some() {
                 return t;
             }
@@ -281,7 +338,11 @@ impl Checker {
         }
 
         if is_binding_pattern(node) {
-            let t = self.get_type_for_variable_like_declaration(node.parent(), true /*includeOptionality*/, CheckMode::NORMAL);
+            let t = self.get_type_for_variable_like_declaration(
+                node.parent(),
+                true, /*includeOptionality*/
+                CheckMode::NORMAL,
+            );
             if t.is_some() {
                 return t;
             }
@@ -311,7 +372,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:31797 getThisTypeOfObjectLiteralFromContextualType
-    pub fn get_this_type_of_object_literal_from_contextual_type(&mut self, containing_literal: Node, contextual_type: TypeId) -> TypeId {
+    pub fn get_this_type_of_object_literal_from_contextual_type(
+        &mut self,
+        containing_literal: Node,
+        contextual_type: TypeId,
+    ) -> TypeId {
         let mut literal = containing_literal;
         let mut t = contextual_type;
         while t.is_some() {
@@ -383,7 +448,9 @@ impl Checker {
                     for info in self.get_index_infos_of_type(t) {
                         let declaration = self.index_info(info).declaration;
                         let info_key_type = self.index_info(info).key_type;
-                        if declaration.is_some() && self.is_applicable_index_type(key_type, info_key_type) {
+                        if declaration.is_some()
+                            && self.is_applicable_index_type(key_type, info_key_type)
+                        {
                             declarations.push(declaration);
                         }
                     }
@@ -428,7 +495,8 @@ impl Checker {
         }
 
         let contains_arguments = self.contains_arguments_reference_visit(node.body());
-        self.cached_arguments_referenced.insert(node, contains_arguments);
+        self.cached_arguments_referenced
+            .insert(node, contains_arguments);
         contains_arguments
     }
 

@@ -18,8 +18,10 @@ pub struct IncludeProcessor {
     // apart and read after `processing_diagnostics`, the Go append order.
     pub late_processing_diagnostics: RefCell<Vec<Rc<ProcessingDiagnostic>>>,
 
-    pub(crate) reason_to_reference_location: RefCell<FxHashMap<*const FileIncludeReason, Rc<ReferenceFileLocation>>>,
-    pub(crate) include_reason_to_related_info: RefCell<FxHashMap<*const FileIncludeReason, Option<Diagnostic>>>,
+    pub(crate) reason_to_reference_location:
+        RefCell<FxHashMap<*const FileIncludeReason, Rc<ReferenceFileLocation>>>,
+    pub(crate) include_reason_to_related_info:
+        RefCell<FxHashMap<*const FileIncludeReason, Option<Diagnostic>>>,
     pub(crate) redirect_and_file_format: RefCell<FxHashMap<Path, Vec<Diagnostic>>>,
     // PORT: Go returns a shared `*ast.DiagnosticsCollection` that callers
     // sort in place. Here callers borrow the `RefCell` mutably.
@@ -60,7 +62,11 @@ impl IncludeProcessor {
     pub fn get_diagnostics(&self, p: &NewProgram) -> &RefCell<DiagnosticsCollection> {
         self.computed_diagnostics.get_or_init(|| {
             let mut computed_diagnostics = DiagnosticsCollection::default();
-            for d in self.processing_diagnostics.iter().chain(self.late_processing_diagnostics.borrow().iter()) {
+            for d in self
+                .processing_diagnostics
+                .iter()
+                .chain(self.late_processing_diagnostics.borrow().iter())
+            {
                 computed_diagnostics.add(d.to_diagnostic(p));
             }
             // PORT: Go map order is random here; the collection sorts later.
@@ -83,7 +89,10 @@ impl IncludeProcessor {
     }
 
     // Go: includeprocessor.go:59 (*includeProcessor).addProcessingDiagnostic
-    pub fn add_processing_diagnostic(&mut self, d: impl IntoIterator<Item = Rc<ProcessingDiagnostic>>) {
+    pub fn add_processing_diagnostic(
+        &mut self,
+        d: impl IntoIterator<Item = Rc<ProcessingDiagnostic>>,
+    ) {
         self.processing_diagnostics.extend(d);
     }
 
@@ -96,14 +105,18 @@ impl IncludeProcessor {
         reason: Rc<FileIncludeReason>,
     ) {
         if !reason.is_referenced_file()
-            && self.file_include_reasons.get(file).is_some_and(|reasons| reasons.iter().any(|r| r.is_referenced_file()))
+            && self
+                .file_include_reasons
+                .get(file)
+                .is_some_and(|reasons| reasons.iter().any(|r| r.is_referenced_file()))
         {
             self.add_processing_diagnostic([Rc::new(ProcessingDiagnostic {
                 kind: ProcessingDiagnosticKind::EXPLAINING_FILE_INCLUDE,
                 data: ProcessingDiagnosticData::IncludeExplaining(IncludeExplainingDiagnostic {
                     file: file.clone(),
                     diagnostic_reason: Some(reason),
-                    message: diag::Already_included_file_name_0_differs_from_file_name_1_only_in_casing,
+                    message:
+                        diag::Already_included_file_name_0_differs_from_file_name_1_only_in_casing,
                     args: args![existing_casing, current_casing],
                 }),
             })]);
@@ -113,7 +126,8 @@ impl IncludeProcessor {
                 data: ProcessingDiagnosticData::IncludeExplaining(IncludeExplainingDiagnostic {
                     file: file.clone(),
                     diagnostic_reason: Some(reason),
-                    message: diag::File_name_0_differs_from_already_included_file_name_1_only_in_casing,
+                    message:
+                        diag::File_name_0_differs_from_already_included_file_name_1_only_in_casing,
                     args: args![current_casing, existing_casing],
                 }),
             })]);
@@ -121,7 +135,11 @@ impl IncludeProcessor {
     }
 
     // Go: includeprocessor.go:89 (*includeProcessor).getReferenceLocation
-    pub fn get_reference_location(&self, r: &FileIncludeReason, program: &NewProgram) -> Rc<ReferenceFileLocation> {
+    pub fn get_reference_location(
+        &self,
+        r: &FileIncludeReason,
+        program: &NewProgram,
+    ) -> Rc<ReferenceFileLocation> {
         let key: *const FileIncludeReason = r;
         if let Some(existing) = self.reason_to_reference_location.borrow().get(&key) {
             return existing.clone();
@@ -129,7 +147,11 @@ impl IncludeProcessor {
 
         // PORT: the borrow is released while the location is computed.
         let loc = Rc::new(r.get_referenced_location(program));
-        self.reason_to_reference_location.borrow_mut().entry(key).or_insert(loc).clone()
+        self.reason_to_reference_location
+            .borrow_mut()
+            .entry(key)
+            .or_insert(loc)
+            .clone()
     }
 
     // Go: includeprocessor.go:98 (*includeProcessor).getCompilerOptionsObjectLiteralSyntax
@@ -151,7 +173,11 @@ impl IncludeProcessor {
     }
 
     // Go: includeprocessor.go:114 (*includeProcessor).getRelatedInfo
-    pub fn get_related_info(&self, r: &FileIncludeReason, program: &NewProgram) -> Option<Diagnostic> {
+    pub fn get_related_info(
+        &self,
+        r: &FileIncludeReason,
+        program: &NewProgram,
+    ) -> Option<Diagnostic> {
         let key: *const FileIncludeReason = r;
         if let Some(existing) = self.include_reason_to_related_info.borrow().get(&key) {
             return existing.clone();
@@ -159,7 +185,11 @@ impl IncludeProcessor {
 
         // PORT: the borrow is released while the info is computed.
         let related_info = r.to_related_info(program);
-        self.include_reason_to_related_info.borrow_mut().entry(key).or_insert(related_info).clone()
+        self.include_reason_to_related_info
+            .borrow_mut()
+            .entry(key)
+            .or_insert(related_info)
+            .clone()
     }
 
     // Go: includeprocessor.go:123 (*includeProcessor).explainRedirectAndImpliedFormat
@@ -177,8 +207,10 @@ impl IncludeProcessor {
         // PORT: Go `file ast.HasFileName` is the redirect file or the source
         // file. Both are kept, and `file_name`/`path` read the one that is set.
         let mut source_file: Option<Rc<ParsedSourceFile>> = None;
-        let redirects_file: Option<&RedirectsFile> =
-            program.redirect_files_by_path.as_ref().and_then(|redirects| redirects.get(file_path));
+        let redirects_file: Option<&RedirectsFile> = program
+            .redirect_files_by_path
+            .as_ref()
+            .and_then(|redirects| redirects.get(file_path));
         let file: &dyn HasFileName = if let Some(redirects_file) = redirects_file {
             redirects_file
         } else {
@@ -212,7 +244,8 @@ impl IncludeProcessor {
         // the source file. `prog()` is not set during program construction,
         // so this reads the `ParsedSourceFile` fields.
         if let Some(source_file) = &source_file
-            && (source_file.external_module_indicator.is_some() || source_file.common_js_module_indicator.is_some())
+            && (source_file.external_module_indicator.is_some()
+                || source_file.common_js_module_indicator.is_some())
         {
             let meta_data = program.get_source_file_meta_data(&file.path());
             match program.get_implied_node_format_for_emit(file) {
@@ -234,7 +267,10 @@ impl IncludeProcessor {
                         if meta_data.package_json_type.is_empty() {
                             result.push(new_compiler_diagnostic(
                                 diag::File_is_CommonJS_module_because_0_does_not_have_field_type,
-                                args![to_file_name(&format!("{}/package.json", meta_data.package_json_directory))],
+                                args![to_file_name(&format!(
+                                    "{}/package.json",
+                                    meta_data.package_json_directory
+                                ))],
                             ));
                         }
                     } else {
@@ -248,6 +284,10 @@ impl IncludeProcessor {
             }
         }
 
-        self.redirect_and_file_format.borrow_mut().entry(file_path.clone()).or_insert(result).clone()
+        self.redirect_and_file_format
+            .borrow_mut()
+            .entry(file_path.clone())
+            .or_insert(result)
+            .clone()
     }
 }

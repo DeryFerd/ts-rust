@@ -14,8 +14,17 @@ impl Checker {
     // property is computed by inferring from the source property type to X for the type
     // variable T[P] (i.e. we treat the type T[P] as the type variable we're inferring for).
     // Go: checker/inference.go:947 inferTypeForHomomorphicMappedType
-    pub fn infer_type_for_homomorphic_mapped_type(&mut self, source: TypeId, target: TypeId, constraint: TypeId) -> TypeId {
-        let key = ReverseMappedTypeKey { source_id: source, target_id: target, constraint_id: constraint };
+    pub fn infer_type_for_homomorphic_mapped_type(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        constraint: TypeId,
+    ) -> TypeId {
+        let key = ReverseMappedTypeKey {
+            source_id: source,
+            target_id: target,
+            constraint_id: constraint,
+        };
         if let Some(&cached) = self.reverse_homomorphic_mapped_cache.get(&key) {
             if cached.is_some() {
                 return cached;
@@ -27,12 +36,18 @@ impl Checker {
     }
 
     // Go: checker/inference.go:957 createReverseMappedType
-    pub fn create_reverse_mapped_type(&mut self, source: TypeId, target: TypeId, constraint: TypeId) -> TypeId {
+    pub fn create_reverse_mapped_type(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        constraint: TypeId,
+    ) -> TypeId {
         // We consider a source type reverse mappable if it has a string index signature or if
         // it has one or more properties and is of a partially inferable type.
         let string_type = self.string_type;
         if !(self.get_index_info_of_type(source, string_type).is_some()
-            || !self.get_properties_of_type(source).is_empty() && self.is_partially_inferable_type(source))
+            || !self.get_properties_of_type(source).is_empty()
+                && self.is_partially_inferable_type(source))
         {
             return TypeId::NIL;
         }
@@ -57,7 +72,10 @@ impl Checker {
                 return TypeId::NIL;
             }
             let mut element_infos = self.target_tuple_type(source).element_infos.clone();
-            if self.get_mapped_type_modifiers(target).intersects(MappedTypeModifiers::INCLUDE_OPTIONAL) {
+            if self
+                .get_mapped_type_modifiers(target)
+                .intersects(MappedTypeModifiers::INCLUDE_OPTIONAL)
+            {
                 element_infos = element_infos
                     .into_iter()
                     .map(|info| {
@@ -76,7 +94,10 @@ impl Checker {
         }
         // For all other object types we infer a new object type where the reverse mapping has been
         // applied to the type of each property.
-        let reversed = self.new_object_type(ObjectFlags::REVERSE_MAPPED | ObjectFlags::ANONYMOUS, SymbolId::NIL /*symbol*/);
+        let reversed = self.new_object_type(
+            ObjectFlags::REVERSE_MAPPED | ObjectFlags::ANONYMOUS,
+            SymbolId::NIL, /*symbol*/
+        );
         {
             let r = self.ty_mut(reversed).as_reverse_mapped_type_mut();
             r.source = source;
@@ -92,7 +113,11 @@ impl Checker {
     // arrow function, but is considered partially inferable because property 'a' has an inferable type.
     // Go: checker/inference.go:1003 isPartiallyInferableType
     pub fn is_partially_inferable_type(&mut self, t: TypeId) -> bool {
-        if !self.ty(t).object_flags.intersects(ObjectFlags::NON_INFERRABLE_TYPE) {
+        if !self
+            .ty(t)
+            .object_flags
+            .intersects(ObjectFlags::NON_INFERRABLE_TYPE)
+        {
             return true;
         }
         if self.is_object_literal_type(t) {
@@ -114,10 +139,23 @@ impl Checker {
     }
 
     // Go: checker/inference.go:1009 inferReverseMappedType
-    pub fn infer_reverse_mapped_type(&mut self, source: TypeId, target: TypeId, constraint: TypeId) -> TypeId {
-        let key = ReverseMappedTypeKey { source_id: source, target_id: target, constraint_id: constraint };
+    pub fn infer_reverse_mapped_type(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        constraint: TypeId,
+    ) -> TypeId {
+        let key = ReverseMappedTypeKey {
+            source_id: source,
+            target_id: target,
+            constraint_id: constraint,
+        };
         if let Some(&cached) = self.reverse_mapped_cache.get(&key) {
-            return if cached.is_some() { cached } else { self.unknown_type };
+            return if cached.is_some() {
+                cached
+            } else {
+                self.unknown_type
+            };
         }
         self.reverse_mapped_source_stack.push(source);
         self.reverse_mapped_target_stack.push(target);
@@ -142,10 +180,16 @@ impl Checker {
     }
 
     // Go: checker/inference.go:1034 inferReverseMappedTypeWorker
-    pub fn infer_reverse_mapped_type_worker(&mut self, source: TypeId, target: TypeId, constraint: TypeId) -> TypeId {
+    pub fn infer_reverse_mapped_type_worker(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        constraint: TypeId,
+    ) -> TypeId {
         let constraint_target = self.ty(constraint).as_index_type().target;
         let type_parameter_from_mapped = self.get_type_parameter_from_mapped_type(target);
-        let type_parameter = self.get_indexed_access_type(constraint_target, type_parameter_from_mapped);
+        let type_parameter =
+            self.get_indexed_access_type(constraint_target, type_parameter_from_mapped);
         let template_type = self.get_template_type_from_mapped_type(target);
         let inference = new_inference_info(type_parameter);
         // PORT: Go passes the one-element `[]*InferenceInfo{inference}` to
@@ -153,10 +197,23 @@ impl Checker {
         // an inference context, so the lone inference lives in a scratch
         // context. `inferTypes` reads only the inference list.
         let inferences = InferenceContextId(self.inference_contexts.len() as u32);
-        self.inference_contexts.push(InferenceContext { inferences: vec![inference], ..InferenceContext::default() });
-        self.infer_types(inferences, source, template_type, InferencePriority::NONE, false);
+        self.inference_contexts.push(InferenceContext {
+            inferences: vec![inference],
+            ..InferenceContext::default()
+        });
+        self.infer_types(
+            inferences,
+            source,
+            template_type,
+            InferencePriority::NONE,
+            false,
+        );
         let inferred = self.get_type_from_inference(inferences, 0);
-        let t = if inferred.is_some() { inferred } else { self.unknown_type };
+        let t = if inferred.is_some() {
+            inferred
+        } else {
+            self.unknown_type
+        };
         self.get_widened_type(t)
     }
 
@@ -170,17 +227,31 @@ impl Checker {
         let index_info = self.get_index_info_of_type(r_source, string_type);
         let modifiers = self.get_mapped_type_modifiers(r_mapped_type);
         let readonly_mask = !modifiers.intersects(MappedTypeModifiers::INCLUDE_READONLY);
-        let optional_mask =
-            if modifiers.intersects(MappedTypeModifiers::INCLUDE_OPTIONAL) { SymbolFlags::NONE } else { SymbolFlags::OPTIONAL };
+        let optional_mask = if modifiers.intersects(MappedTypeModifiers::INCLUDE_OPTIONAL) {
+            SymbolFlags::NONE
+        } else {
+            SymbolFlags::OPTIONAL
+        };
         let mut index_infos: Vec<IndexInfoId> = Vec::new();
         if index_info.is_some() {
             let (value_type, is_readonly) = {
                 let info = self.index_info(index_info);
                 (info.value_type, info.is_readonly)
             };
-            let inferred = self.infer_reverse_mapped_type(value_type, r_mapped_type, r_constraint_type);
-            let inferred = if inferred.is_some() { inferred } else { self.unknown_type };
-            index_infos = vec![self.new_index_info(string_type, inferred, readonly_mask && is_readonly, Node::NIL, &[])];
+            let inferred =
+                self.infer_reverse_mapped_type(value_type, r_mapped_type, r_constraint_type);
+            let inferred = if inferred.is_some() {
+                inferred
+            } else {
+                self.unknown_type
+            };
+            index_infos = vec![self.new_index_info(
+                string_type,
+                inferred,
+                readonly_mask && is_readonly,
+                Node::NIL,
+                &[],
+            )];
         }
         let members = self.symbols.new_table();
         let limited_constraint = self.get_limited_constraint(t);
@@ -189,40 +260,70 @@ impl Checker {
             // extract the filtering type literals we skip those properties that are not assignable to them,
             // because the extra properties wouldn't get through the application of the mapped type anyway
             if limited_constraint.is_some() {
-                let property_name_type =
-                    self.get_literal_type_from_property(prop, TypeFlags::STRING_OR_NUMBER_LITERAL_OR_UNIQUE, false);
+                let property_name_type = self.get_literal_type_from_property(
+                    prop,
+                    TypeFlags::STRING_OR_NUMBER_LITERAL_OR_UNIQUE,
+                    false,
+                );
                 if !self.is_type_assignable_to(property_name_type, limited_constraint) {
                     continue;
                 }
             }
             let check_flags = CheckFlags::REVERSE_MAPPED
-                | if readonly_mask && self.is_readonly_symbol(prop) { CheckFlags::READONLY } else { CheckFlags::NONE };
+                | if readonly_mask && self.is_readonly_symbol(prop) {
+                    CheckFlags::READONLY
+                } else {
+                    CheckFlags::NONE
+                };
             let (prop_flags, prop_name, prop_declarations) = {
                 let p = self.sym(prop);
                 (p.flags, p.name.clone(), p.declarations.clone())
             };
-            let inferred_prop = self.new_symbol_ex(SymbolFlags::PROPERTY | (prop_flags & optional_mask), &prop_name, check_flags);
+            let inferred_prop = self.new_symbol_ex(
+                SymbolFlags::PROPERTY | (prop_flags & optional_mask),
+                &prop_name,
+                check_flags,
+            );
             self.sym_mut(inferred_prop).declarations = prop_declarations;
             let name_type = self.value_symbol_links.get(prop).name_type;
             self.value_symbol_links.get(inferred_prop).name_type = name_type;
             let property_type = self.get_type_of_symbol(prop);
-            self.reverse_mapped_symbol_links.get(inferred_prop).property_type = property_type;
+            self.reverse_mapped_symbol_links
+                .get(inferred_prop)
+                .property_type = property_type;
             let constraint_target = self.ty(r_constraint_type).as_index_type().target;
-            let is_simplifiable = self.ty(constraint_target).flags.intersects(TypeFlags::INDEXED_ACCESS) && {
-                let ia = self.ty(constraint_target).as_indexed_access_type();
-                let (object_type, index_type) = (ia.object_type, ia.index_type);
-                self.ty(object_type).flags.intersects(TypeFlags::TYPE_PARAMETER)
-                    && self.ty(index_type).flags.intersects(TypeFlags::TYPE_PARAMETER)
-            };
+            let is_simplifiable = self
+                .ty(constraint_target)
+                .flags
+                .intersects(TypeFlags::INDEXED_ACCESS)
+                && {
+                    let ia = self.ty(constraint_target).as_indexed_access_type();
+                    let (object_type, index_type) = (ia.object_type, ia.index_type);
+                    self.ty(object_type)
+                        .flags
+                        .intersects(TypeFlags::TYPE_PARAMETER)
+                        && self
+                            .ty(index_type)
+                            .flags
+                            .intersects(TypeFlags::TYPE_PARAMETER)
+                };
             if is_simplifiable {
                 // A reverse mapping of `{[K in keyof T[K_1]]: T[K_1]}` is the same as that of `{[K in keyof T]: T}`, since all we care about is
                 // inferring to the "type parameter" (or indexed access) shared by the constraint and template. So, to reduce the number of
                 // type identities produced, we simplify such indexed access occurrences
-                let new_type_param = self.ty(constraint_target).as_indexed_access_type().object_type;
-                let new_mapped_type = self.replace_indexed_access(r_mapped_type, constraint_target, new_type_param);
-                self.reverse_mapped_symbol_links.get(inferred_prop).mapped_type = new_mapped_type;
+                let new_type_param = self
+                    .ty(constraint_target)
+                    .as_indexed_access_type()
+                    .object_type;
+                let new_mapped_type =
+                    self.replace_indexed_access(r_mapped_type, constraint_target, new_type_param);
+                self.reverse_mapped_symbol_links
+                    .get(inferred_prop)
+                    .mapped_type = new_mapped_type;
                 let constraint_type = self.get_index_type(new_type_param);
-                self.reverse_mapped_symbol_links.get(inferred_prop).constraint_type = constraint_type;
+                self.reverse_mapped_symbol_links
+                    .get(inferred_prop)
+                    .constraint_type = constraint_type;
             } else {
                 let links = self.reverse_mapped_symbol_links.get(inferred_prop);
                 links.mapped_type = r_mapped_type;
@@ -238,10 +339,19 @@ impl Checker {
         if self.value_symbol_links.get(symbol).resolved_type.is_nil() {
             let (property_type, mapped_type, constraint_type) = {
                 let reverse_links = self.reverse_mapped_symbol_links.get(symbol);
-                (reverse_links.property_type, reverse_links.mapped_type, reverse_links.constraint_type)
+                (
+                    reverse_links.property_type,
+                    reverse_links.mapped_type,
+                    reverse_links.constraint_type,
+                )
             };
-            let inferred = self.infer_reverse_mapped_type(property_type, mapped_type, constraint_type);
-            let resolved = if inferred.is_some() { inferred } else { self.unknown_type };
+            let inferred =
+                self.infer_reverse_mapped_type(property_type, mapped_type, constraint_type);
+            let resolved = if inferred.is_some() {
+                inferred
+            } else {
+                self.unknown_type
+            };
             self.value_symbol_links.get(symbol).resolved_type = resolved;
         }
         self.value_symbol_links.get(symbol).resolved_type
@@ -256,7 +366,9 @@ impl Checker {
         let mapped_type = self.ty(t).as_reverse_mapped_type().mapped_type;
         let constraint = self.get_constraint_type_from_mapped_type(mapped_type);
         let constraint_flags = self.ty(constraint).flags;
-        if !(constraint_flags.intersects(TypeFlags::UNION) || constraint_flags.intersects(TypeFlags::INTERSECTION)) {
+        if !(constraint_flags.intersects(TypeFlags::UNION)
+            || constraint_flags.intersects(TypeFlags::INTERSECTION))
+        {
             return TypeId::NIL;
         }
         let mut origin = constraint;
@@ -267,7 +379,13 @@ impl Checker {
             return TypeId::NIL;
         }
         let constraint_type = self.ty(t).as_reverse_mapped_type().constraint_type;
-        let filtered: Vec<TypeId> = self.ty(origin).types().iter().copied().filter(|&t| t != constraint_type).collect();
+        let filtered: Vec<TypeId> = self
+            .ty(origin)
+            .types()
+            .iter()
+            .copied()
+            .filter(|&t| t != constraint_type)
+            .collect();
         let limited_constraint = self.get_intersection_type(&filtered);
         if limited_constraint != self.never_type {
             return limited_constraint;
@@ -276,7 +394,12 @@ impl Checker {
     }
 
     // Go: checker/inference.go:1121 replaceIndexedAccess
-    pub fn replace_indexed_access(&mut self, instantiable: TypeId, t: TypeId, replacement: TypeId) -> TypeId {
+    pub fn replace_indexed_access(
+        &mut self,
+        instantiable: TypeId,
+        t: TypeId,
+        replacement: TypeId,
+    ) -> TypeId {
         // map type.indexType to 0
         // map type.objectType to `[TReplacement]`
         // thus making the indexed access `[TReplacement][0]` or `TReplacement`
@@ -297,10 +420,16 @@ impl Checker {
         if self.is_tuple_type(source) && self.is_tuple_type(target) {
             return self.tuple_types_definitely_unrelated(source, target);
         }
-        self.get_unmatched_property(source, target, false /*requireOptionalProperties*/, true /*matchDiscriminantProperties*/)
-            .is_some()
+        self.get_unmatched_property(
+            source, target, false, /*requireOptionalProperties*/
+            true,  /*matchDiscriminantProperties*/
+        )
+        .is_some()
             && self
-                .get_unmatched_property(target, source, false /*requireOptionalProperties*/, false /*matchDiscriminantProperties*/)
+                .get_unmatched_property(
+                    target, source, false, /*requireOptionalProperties*/
+                    false, /*matchDiscriminantProperties*/
+                )
                 .is_some()
     }
 
@@ -311,7 +440,8 @@ impl Checker {
         let t = self.target_tuple_type(target);
         !t.combined_flags.intersects(ElementFlags::VARIADIC) && t.min_length > s.min_length
             || !t.combined_flags.intersects(ElementFlags::VARIABLE)
-                && (s.combined_flags.intersects(ElementFlags::VARIABLE) || t.fixed_length < s.fixed_length)
+                && (s.combined_flags.intersects(ElementFlags::VARIABLE)
+                    || t.fixed_length < s.fixed_length)
     }
 
     // Go: checker/inference.go:1145 isTupleTypeStructureMatching
@@ -335,8 +465,10 @@ impl Checker {
             return s == t;
         }
         self.is_type_identical_to(s, t)
-            || self.ty(t).flags.intersects(TypeFlags::STRING) && self.ty(s).flags.intersects(TypeFlags::STRING_LITERAL)
-            || self.ty(t).flags.intersects(TypeFlags::NUMBER) && self.ty(s).flags.intersects(TypeFlags::NUMBER_LITERAL)
+            || self.ty(t).flags.intersects(TypeFlags::STRING)
+                && self.ty(s).flags.intersects(TypeFlags::STRING_LITERAL)
+            || self.ty(t).flags.intersects(TypeFlags::NUMBER)
+                && self.ty(s).flags.intersects(TypeFlags::NUMBER_LITERAL)
     }
 
     // Go: checker/inference.go:1166 isTypeCloselyMatchedBy
@@ -381,7 +513,13 @@ impl Checker {
         let mut index_infos: Vec<IndexInfoId> = Vec::new();
         if self.ty(t).flags.intersects(TypeFlags::STRING) {
             let (string_type, empty_object_type) = (self.string_type, self.empty_object_type);
-            index_infos = vec![self.new_index_info(string_type, empty_object_type, false /*isReadonly*/, Node::NIL, &[])];
+            index_infos = vec![self.new_index_info(
+                string_type,
+                empty_object_type,
+                false, /*isReadonly*/
+                Node::NIL,
+                &[],
+            )];
         }
         self.new_anonymous_type(SymbolId::NIL, members, &[], &[], &index_infos)
     }
@@ -398,19 +536,29 @@ impl Checker {
             Some(compare_types) => compare_types,
             None => self.compare_types_assignable.clone(),
         };
-        let inferences: Vec<InferenceInfo> = type_parameters.iter().map(|&tp| new_inference_info(tp)).collect();
+        let inferences: Vec<InferenceInfo> = type_parameters
+            .iter()
+            .map(|&tp| new_inference_info(tp))
+            .collect();
         self.new_inference_context_worker(inferences, signature, flags, compare_types)
     }
 
     // Go: checker/inference.go:1201 cloneInferenceContext
-    pub fn clone_inference_context(&mut self, n: InferenceContextId, extra_flags: InferenceFlags) -> InferenceContextId {
+    pub fn clone_inference_context(
+        &mut self,
+        n: InferenceContextId,
+        extra_flags: InferenceFlags,
+    ) -> InferenceContextId {
         if n.is_nil() {
             return InferenceContextId::NIL;
         }
         let (inferences, signature, flags, compare_types) = {
             let ctx = self.inference_context(n);
             (
-                ctx.inferences.iter().map(clone_inference_info).collect::<Vec<_>>(),
+                ctx.inferences
+                    .iter()
+                    .map(clone_inference_info)
+                    .collect::<Vec<_>>(),
                 ctx.signature,
                 ctx.flags | extra_flags,
                 ctx.compare_types.clone(),
@@ -463,8 +611,15 @@ impl Checker {
     }
 
     // Go: checker/inference.go:1228 addIntraExpressionInferenceSite
-    pub fn add_intra_expression_inference_site(&mut self, n: InferenceContextId, node: Node, t: TypeId) {
-        self.inference_context_mut(n).intra_expression_inference_sites.push(IntraExpressionInferenceSite { node, t });
+    pub fn add_intra_expression_inference_site(
+        &mut self,
+        n: InferenceContextId,
+        node: Node,
+        t: TypeId,
+    ) {
+        self.inference_context_mut(n)
+            .intra_expression_inference_sites
+            .push(IntraExpressionInferenceSite { node, t });
     }
 
     // We collect intra-expression inference sites within object and array literals to handle cases where
@@ -484,10 +639,16 @@ impl Checker {
     pub fn infer_from_intra_expression_sites(&mut self, n: InferenceContextId) {
         // PORT: Go ranges over the slice header taken at loop start; the clone
         // keeps that behavior when inference appends new sites.
-        let sites = self.inference_context(n).intra_expression_inference_sites.clone();
+        let sites = self
+            .inference_context(n)
+            .intra_expression_inference_sites
+            .clone();
         for site in sites {
             let contextual_type = if is_method_declaration(site.node) {
-                self.get_contextual_type_for_object_literal_method(site.node, ContextFlags::NO_CONSTRAINTS)
+                self.get_contextual_type_for_object_literal_method(
+                    site.node,
+                    ContextFlags::NO_CONSTRAINTS,
+                )
             } else {
                 self.get_contextual_type(site.node, ContextFlags::NO_CONSTRAINTS)
             };
@@ -495,13 +656,17 @@ impl Checker {
                 self.infer_types(n, site.t, contextual_type, InferencePriority::NONE, false);
             }
         }
-        self.inference_context_mut(n).intra_expression_inference_sites = Vec::new();
+        self.inference_context_mut(n)
+            .intra_expression_inference_sites = Vec::new();
     }
 
     // Go: checker/inference.go:1260 getInferredType
     pub fn get_inferred_type(&mut self, n: InferenceContextId, index: i32) -> TypeId {
         let index = index as usize;
-        if self.inference_context(n).inferences[index].inferred_type.is_nil() {
+        if self.inference_context(n).inferences[index]
+            .inferred_type
+            .is_nil()
+        {
             let type_parameter = self.inference_context(n).inferences[index].type_parameter;
             if type_parameter == self.error_type {
                 return type_parameter;
@@ -512,11 +677,17 @@ impl Checker {
             let n_flags = self.inference_context(n).flags;
             if signature.is_some() {
                 let mut inferred_covariant_type = TypeId::NIL;
-                if !self.inference_context(n).inferences[index].candidates.is_empty() {
+                if !self.inference_context(n).inferences[index]
+                    .candidates
+                    .is_empty()
+                {
                     inferred_covariant_type = self.get_covariant_inference(n, index, signature);
                 }
                 let mut inferred_contravariant_type = TypeId::NIL;
-                if !self.inference_context(n).inferences[index].contra_candidates.is_empty() {
+                if !self.inference_context(n).inferences[index]
+                    .contra_candidates
+                    .is_empty()
+                {
                     inferred_contravariant_type = self.get_contravariant_inference(n, index);
                 }
                 if inferred_covariant_type.is_some() || inferred_contravariant_type.is_some() {
@@ -528,9 +699,15 @@ impl Checker {
                     // and it would spoil the overall inference.
                     let prefer_covariant_type = inferred_covariant_type.is_some()
                         && (inferred_contravariant_type.is_nil()
-                            || !self.ty(inferred_covariant_type).flags.intersects(TypeFlags::NEVER | TypeFlags::ANY)
+                            || !self
+                                .ty(inferred_covariant_type)
+                                .flags
+                                .intersects(TypeFlags::NEVER | TypeFlags::ANY)
                                 && {
-                                    let contra_candidates = self.inference_context(n).inferences[index].contra_candidates.clone();
+                                    let contra_candidates = self.inference_context(n).inferences
+                                        [index]
+                                        .contra_candidates
+                                        .clone();
                                     let mut some = false;
                                     for t in contra_candidates {
                                         if self.is_type_assignable_to(inferred_covariant_type, t) {
@@ -544,14 +721,23 @@ impl Checker {
                                     let count = self.inference_context(n).inferences.len();
                                     let mut every = true;
                                     for j in 0..count {
-                                        let other_type_parameter = self.inference_context(n).inferences[j].type_parameter;
+                                        let other_type_parameter =
+                                            self.inference_context(n).inferences[j].type_parameter;
                                         let ok = j != index
-                                            && self.get_constraint_of_type_parameter(other_type_parameter) != type_parameter
+                                            && self.get_constraint_of_type_parameter(
+                                                other_type_parameter,
+                                            ) != type_parameter
                                             || {
-                                                let other_candidates = self.inference_context(n).inferences[j].candidates.clone();
+                                                let other_candidates =
+                                                    self.inference_context(n).inferences[j]
+                                                        .candidates
+                                                        .clone();
                                                 let mut all = true;
                                                 for t in other_candidates {
-                                                    if !self.is_type_assignable_to(t, inferred_covariant_type) {
+                                                    if !self.is_type_assignable_to(
+                                                        t,
+                                                        inferred_covariant_type,
+                                                    ) {
                                                         all = false;
                                                         break;
                                                     }
@@ -587,7 +773,8 @@ impl Checker {
                         // parameter should be instantiated to the empty object type.
                         let backreference_mapper = self.new_backreference_mapper(n, index as i32);
                         let non_fixing_mapper = self.inference_context(n).non_fixing_mapper;
-                        let mapper = self.merge_type_mappers(backreference_mapper, non_fixing_mapper);
+                        let mapper =
+                            self.merge_type_mappers(backreference_mapper, non_fixing_mapper);
                         inferred_type = self.instantiate_type(default_type, mapper);
                     }
                 }
@@ -595,8 +782,15 @@ impl Checker {
                 inferred_type = self.get_type_from_inference(n, index);
             }
             self.inference_context_mut(n).inferences[index].inferred_type = inferred_type;
-            if self.inference_context(n).inferences[index].inferred_type.is_nil() {
-                let t = if n_flags.intersects(InferenceFlags::ANY_DEFAULT) { self.any_type } else { self.unknown_type };
+            if self.inference_context(n).inferences[index]
+                .inferred_type
+                .is_nil()
+            {
+                let t = if n_flags.intersects(InferenceFlags::ANY_DEFAULT) {
+                    self.any_type
+                } else {
+                    self.unknown_type
+                };
                 self.inference_context_mut(n).inferences[index].inferred_type = t;
             }
             let constraint = self.get_constraint_of_type_parameter(type_parameter);
@@ -605,23 +799,37 @@ impl Checker {
                 let instantiated_constraint = self.instantiate_type(constraint, non_fixing_mapper);
                 let compare_types = self.inference_context(n).compare_types.clone();
                 if inferred_type.is_some() {
-                    let constraint_with_this = self.get_type_with_this_argument(instantiated_constraint, inferred_type, false);
-                    if (*compare_types)(self, inferred_type, constraint_with_this, false) == Ternary::FALSE {
+                    let constraint_with_this = self.get_type_with_this_argument(
+                        instantiated_constraint,
+                        inferred_type,
+                        false,
+                    );
+                    if (*compare_types)(self, inferred_type, constraint_with_this, false)
+                        == Ternary::FALSE
+                    {
                         let mut filtered_by_constraint = TypeId::NIL;
-                        if self.inference_context(n).inferences[index].priority == InferencePriority::RETURN_TYPE {
+                        if self.inference_context(n).inferences[index].priority
+                            == InferencePriority::RETURN_TYPE
+                        {
                             // If we have a pure return type inference, we may succeed by removing constituents of the inferred type
                             // that aren't assignable to the constraint type (pure return type inferences are speculation anyway).
                             let cmp = compare_types.clone();
-                            filtered_by_constraint = self.map_type(inferred_type, &mut |c: &mut Checker, t: TypeId| -> TypeId {
-                                if (*cmp)(c, t, constraint_with_this, false) != Ternary::FALSE {
-                                    t
-                                } else {
-                                    c.never_type
-                                }
-                            });
+                            filtered_by_constraint = self.map_type(
+                                inferred_type,
+                                &mut |c: &mut Checker, t: TypeId| -> TypeId {
+                                    if (*cmp)(c, t, constraint_with_this, false) != Ternary::FALSE {
+                                        t
+                                    } else {
+                                        c.never_type
+                                    }
+                                },
+                            );
                         }
                         inferred_type = if filtered_by_constraint.is_some()
-                            && !self.ty(filtered_by_constraint).flags.intersects(TypeFlags::NEVER)
+                            && !self
+                                .ty(filtered_by_constraint)
+                                .flags
+                                .intersects(TypeFlags::NEVER)
                         {
                             filtered_by_constraint
                         } else {
@@ -632,8 +840,13 @@ impl Checker {
                 if inferred_type.is_nil() {
                     // If the fallback type satisfies the constraint, we pick it. Otherwise, we pick the constraint.
                     let fallback_satisfies = fallback_type.is_some() && {
-                        let fallback_with_this = self.get_type_with_this_argument(instantiated_constraint, fallback_type, false);
-                        (*compare_types)(self, fallback_type, fallback_with_this, false) != Ternary::FALSE
+                        let fallback_with_this = self.get_type_with_this_argument(
+                            instantiated_constraint,
+                            fallback_type,
+                            false,
+                        );
+                        (*compare_types)(self, fallback_type, fallback_with_this, false)
+                            != Ternary::FALSE
                     };
                     inferred_type = if fallback_satisfies {
                         fallback_type
@@ -683,10 +896,21 @@ impl Checker {
     }
 
     // Go: checker/inference.go:1377 getCovariantInference
-    pub fn get_covariant_inference(&mut self, n: InferenceContextId, inference: usize, signature: SignatureId) -> TypeId {
+    pub fn get_covariant_inference(
+        &mut self,
+        n: InferenceContextId,
+        inference: usize,
+        signature: SignatureId,
+    ) -> TypeId {
         let (inference_candidates, type_parameter, top_level, is_fixed, priority) = {
             let info = &self.inference_context(n).inferences[inference];
-            (info.candidates.clone(), info.type_parameter, info.top_level, info.is_fixed, info.priority)
+            (
+                info.candidates.clone(),
+                info.type_parameter,
+                info.top_level,
+                info.is_fixed,
+                info.priority,
+            )
         };
         // Extract all object and array literal types and replace them with a single widened and normalized type.
         let candidates = self.union_object_and_array_literal_candidates(&inference_candidates);
@@ -694,20 +918,29 @@ impl Checker {
         // all inferences were made to top-level occurrences of the type parameter, and
         // the type parameter has no constraint or its constraint includes no primitive or literal types, and
         // the type parameter was fixed during inference or does not occur at top-level in the return type.
-        let primitive_constraint = self.has_primitive_constraint(type_parameter) || self.is_const_type_variable(type_parameter, 0);
+        let primitive_constraint = self.has_primitive_constraint(type_parameter)
+            || self.is_const_type_variable(type_parameter, 0);
         let widen_literal_types = !primitive_constraint
             && top_level
-            && (is_fixed || !self.is_type_parameter_at_top_level_in_return_type(signature, type_parameter));
+            && (is_fixed
+                || !self.is_type_parameter_at_top_level_in_return_type(signature, type_parameter));
         let base_candidates: Vec<TypeId> = if primitive_constraint {
-            candidates.iter().map(|&t| self.get_regular_type_of_literal_type(t)).collect()
+            candidates
+                .iter()
+                .map(|&t| self.get_regular_type_of_literal_type(t))
+                .collect()
         } else if widen_literal_types {
-            candidates.iter().map(|&t| self.get_widened_literal_type(t)).collect()
+            candidates
+                .iter()
+                .map(|&t| self.get_widened_literal_type(t))
+                .collect()
         } else {
             candidates
         };
         // If all inferences were made from a position that implies a combined result, infer a union type.
         // Otherwise, infer a common supertype.
-        let unwidened_type = if priority.intersects(InferencePriority::PRIORITY_IMPLIES_COMBINATION) {
+        let unwidened_type = if priority.intersects(InferencePriority::PRIORITY_IMPLIES_COMBINATION)
+        {
             self.get_union_type_ex(&base_candidates, UnionReduction::SUBTYPE, None, TypeId::NIL)
         } else {
             self.get_common_supertype(&base_candidates)
@@ -716,7 +949,11 @@ impl Checker {
     }
 
     // Go: checker/inference.go:1406 getContravariantInference
-    pub fn get_contravariant_inference(&mut self, n: InferenceContextId, inference: usize) -> TypeId {
+    pub fn get_contravariant_inference(
+        &mut self,
+        n: InferenceContextId,
+        inference: usize,
+    ) -> TypeId {
         let (priority, contra_candidates) = {
             let info = &self.inference_context(n).inferences[inference];
             (info.priority, info.contra_candidates.clone())
@@ -728,14 +965,28 @@ impl Checker {
     }
 
     // Go: checker/inference.go:1413 unionObjectAndArrayLiteralCandidates
-    pub fn union_object_and_array_literal_candidates(&mut self, candidates: &[TypeId]) -> Vec<TypeId> {
+    pub fn union_object_and_array_literal_candidates(
+        &mut self,
+        candidates: &[TypeId],
+    ) -> Vec<TypeId> {
         if candidates.len() > 1 {
-            let object_literals: Vec<TypeId> =
-                candidates.iter().copied().filter(|&t| self.is_object_or_array_literal_type(t)).collect();
+            let object_literals: Vec<TypeId> = candidates
+                .iter()
+                .copied()
+                .filter(|&t| self.is_object_or_array_literal_type(t))
+                .collect();
             if !object_literals.is_empty() {
-                let literals_type = self.get_union_type_ex(&object_literals, UnionReduction::SUBTYPE, None, TypeId::NIL);
-                let mut non_literal_types: Vec<TypeId> =
-                    candidates.iter().copied().filter(|&t| !self.is_object_or_array_literal_type(t)).collect();
+                let literals_type = self.get_union_type_ex(
+                    &object_literals,
+                    UnionReduction::SUBTYPE,
+                    None,
+                    TypeId::NIL,
+                );
+                let mut non_literal_types: Vec<TypeId> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|&t| !self.is_object_or_array_literal_type(t))
+                    .collect();
                 non_literal_types.push(literals_type);
                 return non_literal_types;
             }
@@ -752,7 +1003,10 @@ impl Checker {
             }
             return self.maybe_type_of_kind(
                 constraint,
-                TypeFlags::PRIMITIVE | TypeFlags::INDEX | TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING,
+                TypeFlags::PRIMITIVE
+                    | TypeFlags::INDEX
+                    | TypeFlags::TEMPLATE_LITERAL
+                    | TypeFlags::STRING_MAPPING,
             );
         }
         false
@@ -763,7 +1017,11 @@ impl Checker {
         if t == tp {
             return true;
         }
-        if self.ty(t).flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
+        if self
+            .ty(t)
+            .flags
+            .intersects(TypeFlags::UNION_OR_INTERSECTION)
+        {
             let types = self.ty(t).types().to_vec();
             for u in types {
                 if self.is_type_parameter_at_top_level(u, tp, depth) {
@@ -785,7 +1043,11 @@ impl Checker {
     }
 
     // Go: checker/inference.go:1444 isTypeParameterAtTopLevelInReturnType
-    pub fn is_type_parameter_at_top_level_in_return_type(&mut self, signature: SignatureId, type_parameter: TypeId) -> bool {
+    pub fn is_type_parameter_at_top_level_in_return_type(
+        &mut self,
+        signature: SignatureId,
+        type_parameter: TypeId,
+    ) -> bool {
         let type_predicate = self.get_type_predicate_of_signature(signature);
         if type_predicate.is_some() {
             let pt = self.pred(type_predicate).t;
@@ -820,7 +1082,12 @@ impl Checker {
     // Go: checker/inference.go:1462 getInferenceInfoForType
     pub fn get_inference_info_for_type(&self, n: &InferenceState, t: TypeId) -> Option<usize> {
         if self.ty(t).flags.intersects(TypeFlags::TYPE_VARIABLE) {
-            for (i, inference) in self.inference_context(n.inferences).inferences.iter().enumerate() {
+            for (i, inference) in self
+                .inference_context(n.inferences)
+                .inferences
+                .iter()
+                .enumerate()
+            {
                 if t == inference.type_parameter {
                     return Some(i);
                 }
@@ -839,7 +1106,11 @@ impl Checker {
         if self.strict_null_checks {
             primary_types = types
                 .iter()
-                .map(|&t| self.filter_type(t, &mut |c: &mut Checker, u: TypeId| !c.ty(u).flags.intersects(TypeFlags::NULLABLE)))
+                .map(|&t| {
+                    self.filter_type(t, &mut |c: &mut Checker, u: TypeId| {
+                        !c.ty(u).flags.intersects(TypeFlags::NULLABLE)
+                    })
+                })
                 .collect();
         }
         // When the candidate types are all literal types with the same base type, return a union
@@ -880,7 +1151,11 @@ impl Checker {
     }
 
     // Go: checker/inference.go:1511 findLeftmostType
-    pub fn find_leftmost_type(&mut self, types: &[TypeId], f: fn(&mut Checker, TypeId, TypeId) -> bool) -> TypeId {
+    pub fn find_leftmost_type(
+        &mut self,
+        types: &[TypeId],
+        f: fn(&mut Checker, TypeId, TypeId) -> bool,
+    ) -> TypeId {
         let mut candidate = TypeId::NIL;
         for &t in types {
             if candidate.is_nil() || f(self, candidate, t) {
@@ -935,7 +1210,12 @@ impl Checker {
     // Go: checker/inference.go:1560 isFromInferenceBlockedSource
     pub fn is_from_inference_blocked_source(&self, t: TypeId) -> bool {
         let symbol = self.ty(t).symbol;
-        symbol.is_some() && self.sym(symbol).declarations.iter().any(|&d| self.is_skip_direct_inference_node(d))
+        symbol.is_some()
+            && self
+                .sym(symbol)
+                .declarations
+                .iter()
+                .any(|&d| self.is_skip_direct_inference_node(d))
     }
 
     // Go: checker/inference.go:1564 isSkipDirectInferenceNode
@@ -992,7 +1272,9 @@ impl Checker {
     // Go: checker/inference.go:1597 hasInferenceCandidatesOrDefault
     pub fn has_inference_candidates_or_default(&self, n: InferenceContextId, info: usize) -> bool {
         let info = &self.inference_context(n).inferences[info];
-        !info.candidates.is_empty() || !info.contra_candidates.is_empty() || has_type_parameter_default(self, info.type_parameter)
+        !info.candidates.is_empty()
+            || !info.contra_candidates.is_empty()
+            || has_type_parameter_default(self, info.type_parameter)
     }
 }
 
@@ -1033,7 +1315,8 @@ impl Checker {
     // Go: checker/inference.go:1621 mergeInferences
     pub fn merge_inferences(&mut self, target: InferenceContextId, source: InferenceContextId) {
         for i in 0..self.inference_context(target).inferences.len() {
-            if !self.has_inference_candidates(target, i) && self.has_inference_candidates(source, i) {
+            if !self.has_inference_candidates(target, i) && self.has_inference_candidates(source, i)
+            {
                 let info = self.inference_context(source).inferences[i].clone();
                 self.inference_context_mut(target).inferences[i] = info;
             }

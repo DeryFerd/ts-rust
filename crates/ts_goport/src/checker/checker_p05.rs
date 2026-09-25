@@ -17,7 +17,11 @@ fn or_else_type(t: TypeId, fallback: TypeId) -> TypeId {
 }
 
 // PORT: the Go closure `visit` inside isSymbolUsedInBinaryExpressionChain.
-fn visit_binary_expression_chain_child(c: &mut Checker, child: Node, tested_symbol: SymbolId) -> bool {
+fn visit_binary_expression_chain_child(
+    c: &mut Checker,
+    child: Node,
+    tested_symbol: SymbolId,
+) -> bool {
     if is_identifier(child) {
         let symbol = c.get_symbol_at_location(child, false);
         if symbol.is_some() && symbol == tested_symbol {
@@ -39,7 +43,9 @@ fn visit_condition_body_child(
         let child_symbol = c.get_symbol_at_location(child_node, false);
         if child_symbol.is_some() && child_symbol == tested_symbol {
             // If the test was a simple identifier, the above check is sufficient
-            if is_identifier(expr) || is_identifier(tested_node) && is_binary_expression(tested_node.parent()) {
+            if is_identifier(expr)
+                || is_identifier(tested_node) && is_binary_expression(tested_node.parent())
+            {
                 return true;
             }
             // Otherwise we need to ensure the symbol is called on the same target
@@ -63,7 +69,9 @@ fn visit_condition_body_child(
                     }
                     child_expression = child_expression.expression();
                     tested_expression = tested_expression.expression();
-                } else if is_call_expression(tested_expression) && is_call_expression(child_expression) {
+                } else if is_call_expression(tested_expression)
+                    && is_call_expression(child_expression)
+                {
                     child_expression = child_expression.expression();
                     tested_expression = tested_expression.expression();
                 } else {
@@ -72,17 +80,26 @@ fn visit_condition_body_child(
             }
         }
     }
-    child_node.for_each_child(&mut |n: Node| visit_condition_body_child(c, n, expr, tested_node, tested_symbol))
+    child_node.for_each_child(&mut |n: Node| {
+        visit_condition_body_child(c, n, expr, tested_node, tested_symbol)
+    })
 }
 
 impl Checker {
     // Go: checker/checker.go:3874 isSymbolUsedInBinaryExpressionChain
-    pub fn is_symbol_used_in_binary_expression_chain(&mut self, node: Node, tested_symbol: SymbolId) -> bool {
+    pub fn is_symbol_used_in_binary_expression_chain(
+        &mut self,
+        node: Node,
+        tested_symbol: SymbolId,
+    ) -> bool {
         let mut node = node;
-        while is_binary_expression(node) && node.operator_token().kind() == SyntaxKind::AmpersandAmpersandToken {
+        while is_binary_expression(node)
+            && node.operator_token().kind() == SyntaxKind::AmpersandAmpersandToken
+        {
             let right = node.right();
-            let is_used =
-                right.for_each_child(&mut |child: Node| visit_binary_expression_chain_child(self, child, tested_symbol));
+            let is_used = right.for_each_child(&mut |child: Node| {
+                visit_binary_expression_chain_child(self, child, tested_symbol)
+            });
             if is_used {
                 return true;
             }
@@ -99,7 +116,9 @@ impl Checker {
         tested_node: Node,
         tested_symbol: SymbolId,
     ) -> bool {
-        body.for_each_child(&mut |child: Node| visit_condition_body_child(self, child, expr, tested_node, tested_symbol))
+        body.for_each_child(&mut |child: Node| {
+            visit_condition_body_child(self, child, expr, tested_node, tested_symbol)
+        })
     }
 
     // Go: checker/checker.go:3931 checkDoStatement
@@ -204,7 +223,10 @@ impl Checker {
         // unknownType is returned i.e. if node.expression is identifier whose name cannot be resolved
         // in this case error about missing name is already reported - do not report extra one
         if right_type == self.never_type
-            || !self.is_type_assignable_to_kind(right_type, TypeFlags::NON_PRIMITIVE | TypeFlags::INSTANTIABLE_NON_PRIMITIVE)
+            || !self.is_type_assignable_to_kind(
+                right_type,
+                TypeFlags::NON_PRIMITIVE | TypeFlags::INSTANTIABLE_NON_PRIMITIVE,
+            )
         {
             let type_string = self.type_to_string_exported(right_type);
             self.error(
@@ -223,7 +245,11 @@ impl Checker {
     pub fn get_index_type_or_string(&mut self, t: TypeId) -> TypeId {
         let index = self.get_index_type(t);
         let index_type = self.get_extract_string_type(index);
-        if self.ty(index_type).flags.intersects(TypeFlags::NEVER) { self.string_type } else { index_type }
+        if self.ty(index_type).flags.intersects(TypeFlags::NEVER) {
+            self.string_type
+        } else {
+            index_type
+        }
     }
 
     // Go: checker/checker.go:4016 checkForOfStatement
@@ -241,11 +267,15 @@ impl Checker {
                 );
             } else {
                 let function_flags = get_function_flags(container);
-                if (function_flags & (FunctionFlags::INVALID | FunctionFlags::ASYNC)) == FunctionFlags::ASYNC
+                if (function_flags & (FunctionFlags::INVALID | FunctionFlags::ASYNC))
+                    == FunctionFlags::ASYNC
                     && self.language_version < LANGUAGE_FEATURE_MINIMUM_TARGET.for_await_of
                 {
                     // for..await..of in an async function or async generator function prior to ESNext requires the __asyncValues helper
-                    self.check_external_emit_helpers(node, ExternalEmitHelpers::FOR_AWAIT_OF_INCLUDES);
+                    self.check_external_emit_helpers(
+                        node,
+                        ExternalEmitHelpers::FOR_AWAIT_OF_INCLUDES,
+                    );
                 }
             }
         } // Check the LHS and RHS
@@ -265,7 +295,12 @@ impl Checker {
                 // varExpr, in particular making sure it's a valid LeftHandSideExpression. But we'd like
                 // to short circuit the type relation checking as much as possible, so we pass the unknownType.
                 let source_type = or_else_type(iterated_type, self.error_type);
-                self.check_destructuring_assignment(var_expr, source_type, CheckMode::NORMAL, false);
+                self.check_destructuring_assignment(
+                    var_expr,
+                    source_type,
+                    CheckMode::NORMAL,
+                    false,
+                );
             } else {
                 let left_type = self.check_expression(var_expr);
                 self.check_reference_expression(
@@ -328,7 +363,10 @@ impl Checker {
         let return_type = self.get_return_type_of_signature(signature);
         let function_flags = get_function_flags(container);
         let expr_node = node.expression();
-        if self.strict_null_checks || expr_node.is_some() || self.ty(return_type).flags.intersects(TypeFlags::NEVER) {
+        if self.strict_null_checks
+            || expr_node.is_some()
+            || self.ty(return_type).flags.intersects(TypeFlags::NEVER)
+        {
             let mut expr_type = self.undefined_type;
             if expr_node.is_some() {
                 expr_type = self.check_expression_cached(expr_node);
@@ -357,7 +395,14 @@ impl Checker {
             } else if self.get_return_type_from_annotation(container).is_some() {
                 let unwrapped = self.unwrap_return_type(return_type, function_flags);
                 let unwrapped_return_type = or_else_type(unwrapped, return_type);
-                self.check_return_expression(container, unwrapped_return_type, node, node.expression(), expr_type, false);
+                self.check_return_expression(
+                    container,
+                    unwrapped_return_type,
+                    node,
+                    node.expression(),
+                    expr_type,
+                    false,
+                );
             }
         } else if !is_constructor_declaration(container)
             && self.compiler_options.no_implicit_returns.is_true()
@@ -421,7 +466,11 @@ impl Checker {
         if expr.is_some() {
             effective_expr = self.get_effective_check_node(expr);
         }
-        let error_node = if in_return_statement && !in_conditional_expression { node } else { effective_expr };
+        let error_node = if in_return_statement && !in_conditional_expression {
+            node
+        } else {
+            effective_expr
+        };
         self.check_type_assignable_to_and_optionally_elaborate(
             unwrapped_expr_type,
             unwrapped_return_type,
@@ -484,11 +533,20 @@ impl Checker {
                 let case_type = self.check_expression(clause.expression());
                 if !self.is_type_equality_comparable_to(expression_type, case_type) {
                     // expressionType is not comparable to caseType, try the reversed check and report errors if it fails
-                    self.check_type_comparable_to(case_type, expression_type, clause.expression(), None /*headMessage*/);
+                    self.check_type_comparable_to(
+                        case_type,
+                        expression_type,
+                        clause.expression(),
+                        None, /*headMessage*/
+                    );
                 }
             }
             self.check_source_elements(&clause.statements().to_vec());
-            if self.compiler_options.no_fallthrough_cases_in_switch.is_true() {
+            if self
+                .compiler_options
+                .no_fallthrough_cases_in_switch
+                .is_true()
+            {
                 let flow_node = clause.fallthrough_flow_node();
                 if flow_node.is_some() && self.is_reachable_flow_node(flow_node) {
                     self.error(clause, diag::Fallthrough_case_in_switch, args![]);
@@ -508,7 +566,11 @@ impl Checker {
             let mut current = node.parent();
             while current.is_some() && !is_function_like(current) {
                 if is_labeled_statement(current) && current.label().text() == label_text {
-                    self.grammar_error_on_node(label_node, diag::Duplicate_label_0, args![label_text]);
+                    self.grammar_error_on_node(
+                        label_node,
+                        diag::Duplicate_label_0,
+                        args![label_text],
+                    );
                     break;
                 }
                 current = current.parent();
@@ -584,7 +646,9 @@ impl Checker {
                         if block_local.is_some() {
                             let value_declaration = self.sym(block_local).value_declaration;
                             let flags = self.sym(block_local).flags;
-                            if value_declaration.is_some() && flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE) {
+                            if value_declaration.is_some()
+                                && flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+                            {
                                 self.grammar_error_on_node(
                                     value_declaration,
                                     diag::Cannot_redeclare_identifier_0_in_catch_clause,
@@ -608,15 +672,17 @@ impl Checker {
 
     // Go: checker/checker.go:4259 checkClassDeclaration
     pub fn check_class_declaration(&mut self, node: Node) {
-        let first_decorator =
-            node.modifier_nodes().to_vec().into_iter().find(|&n| is_decorator(n)).unwrap_or(Node::NIL);
+        let first_decorator = node
+            .modifier_nodes()
+            .to_vec()
+            .into_iter()
+            .find(|&n| is_decorator(n))
+            .unwrap_or(Node::NIL);
         if self.legacy_decorators
             && first_decorator.is_some()
-            && node
-                .members()
-                .to_vec()
-                .into_iter()
-                .any(|p| has_static_modifier(p) && is_private_identifier_class_element_declaration(p))
+            && node.members().to_vec().into_iter().any(|p| {
+                has_static_modifier(p) && is_private_identifier_class_element_declaration(p)
+            })
         {
             self.grammar_error_on_node(
                 first_decorator,
@@ -670,9 +736,11 @@ impl Checker {
                 let type_argument_nodes = base_type_node.type_arguments().to_vec();
                 if !type_argument_nodes.is_empty() {
                     self.check_source_elements(&type_argument_nodes);
-                    for constructor in
-                        self.get_constructors_for_type_arguments(static_base_type, &type_argument_nodes, base_type_node)
-                    {
+                    for constructor in self.get_constructors_for_type_arguments(
+                        static_base_type,
+                        &type_argument_nodes,
+                        base_type_node,
+                    ) {
                         let type_parameters = self.sig(constructor).type_parameters.clone();
                         if !self.check_type_argument_constraints(base_type_node, &type_parameters) {
                             break;
@@ -680,7 +748,8 @@ impl Checker {
                     }
                 }
                 let class_this_type = self.ty(class_type).as_interface_type().this_type;
-                let base_with_this = self.get_type_with_this_argument(base_type, class_this_type, false);
+                let base_with_this =
+                    self.get_type_with_this_argument(base_type, class_this_type, false);
                 if !self.check_type_assignable_to(type_with_this, base_with_this, Node::NIL, None) {
                     self.issue_member_specific_error(
                         node,
@@ -695,10 +764,16 @@ impl Checker {
                         static_type,
                         without_signatures,
                         or_else_node(node.name(), node),
-                        Some(diag::Class_static_side_0_incorrectly_extends_base_class_static_side_1),
+                        Some(
+                            diag::Class_static_side_0_incorrectly_extends_base_class_static_side_1,
+                        ),
                     );
                 }
-                if self.ty(base_constructor_type).flags.intersects(TypeFlags::TYPE_VARIABLE) {
+                if self
+                    .ty(base_constructor_type)
+                    .flags
+                    .intersects(TypeFlags::TYPE_VARIABLE)
+                {
                     if !self.is_mixin_constructor_type(static_type) {
                         self.error(
                             or_else_node(node.name(), node),
@@ -706,12 +781,15 @@ impl Checker {
                             args![],
                         );
                     } else {
-                        let construct_signatures =
-                            self.get_signatures_of_type(base_constructor_type, SignatureKind::CONSTRUCT);
-                        if construct_signatures
-                            .iter()
-                            .any(|&signature| self.sig(signature).flags.intersects(SignatureFlags::ABSTRACT))
-                            && !has_syntactic_modifier(node, ModifierFlags::ABSTRACT)
+                        let construct_signatures = self.get_signatures_of_type(
+                            base_constructor_type,
+                            SignatureKind::CONSTRUCT,
+                        );
+                        if construct_signatures.iter().any(|&signature| {
+                            self.sig(signature)
+                                .flags
+                                .intersects(SignatureFlags::ABSTRACT)
+                        }) && !has_syntactic_modifier(node, ModifierFlags::ABSTRACT)
                         {
                             self.error(
                                 or_else_node(node.name(), node),
@@ -722,8 +800,15 @@ impl Checker {
                     }
                 }
                 let static_base_symbol = self.ty(static_base_type).symbol;
-                if !(static_base_symbol.is_some() && self.sym(static_base_symbol).flags.intersects(SymbolFlags::CLASS))
-                    && !self.ty(base_constructor_type).flags.intersects(TypeFlags::TYPE_VARIABLE)
+                if !(static_base_symbol.is_some()
+                    && self
+                        .sym(static_base_symbol)
+                        .flags
+                        .intersects(SymbolFlags::CLASS))
+                    && !self
+                        .ty(base_constructor_type)
+                        .flags
+                        .intersects(TypeFlags::TYPE_VARIABLE)
                 {
                     // When the static base type is a "class-like" constructor function (but not actually a class), we verify
                     // that all instantiated base constructor signatures return the same type.
@@ -768,15 +853,28 @@ impl Checker {
             if !self.is_error_type(t) {
                 if self.is_valid_base_type(t) {
                     let t_symbol = self.ty(t).symbol;
-                    let generic_diag = if t_symbol.is_some() && self.sym(t_symbol).flags.intersects(SymbolFlags::CLASS) {
+                    let generic_diag = if t_symbol.is_some()
+                        && self.sym(t_symbol).flags.intersects(SymbolFlags::CLASS)
+                    {
                         diag::Class_0_incorrectly_implements_class_1_Did_you_mean_to_extend_1_and_inherit_its_members_as_a_subclass
                     } else {
                         diag::Class_0_incorrectly_implements_interface_1
                     };
                     let class_this_type = self.ty(class_type).as_interface_type().this_type;
-                    let base_with_this = self.get_type_with_this_argument(t, class_this_type, false);
-                    if !self.check_type_assignable_to(type_with_this, base_with_this, Node::NIL, None) {
-                        self.issue_member_specific_error(node, type_with_this, base_with_this, generic_diag);
+                    let base_with_this =
+                        self.get_type_with_this_argument(t, class_this_type, false);
+                    if !self.check_type_assignable_to(
+                        type_with_this,
+                        base_with_this,
+                        Node::NIL,
+                        None,
+                    ) {
+                        self.issue_member_specific_error(
+                            node,
+                            type_with_this,
+                            base_with_this,
+                            generic_diag,
+                        );
                     }
                 } else {
                     self.error(
@@ -802,7 +900,8 @@ impl Checker {
             let member_name_node = member.name();
             let is_static_member = is_static(member);
             if is_static_member && member_name_node.is_some() {
-                let (member_name, _) = self.get_effective_property_name_for_property_name_node(member_name_node);
+                let (member_name, _) =
+                    self.get_effective_property_name_for_property_name_node(member_name_node);
                 match member_name.as_str() {
                     "name" | "length" | "caller" | "arguments" => {
                         let class_symbol = self.get_symbol_of_declaration(node);
@@ -833,10 +932,16 @@ impl Checker {
                 return;
             }
             let t = self.get_declared_type_of_symbol(symbol);
-            let local_type_parameters = self.ty(t).as_interface_type().local_type_parameters().to_vec();
-            if !self.are_type_parameters_identical(&declarations, &local_type_parameters, &|n: Node| {
-                n.type_parameters().to_vec()
-            }) {
+            let local_type_parameters = self
+                .ty(t)
+                .as_interface_type()
+                .local_type_parameters()
+                .to_vec();
+            if !self.are_type_parameters_identical(
+                &declarations,
+                &local_type_parameters,
+                &|n: Node| n.type_parameters().to_vec(),
+            ) {
                 // Report an error on every conflicting declaration.
                 let name = self.symbol_to_string(symbol);
                 for declaration in declarations {
@@ -921,10 +1026,15 @@ impl Checker {
             let declaration = self.sig(signatures[0]).declaration;
             if declaration.is_some() && has_modifier(declaration, ModifierFlags::PRIVATE) {
                 let t_symbol = self.ty(t).symbol;
-                let type_class_declaration = get_class_like_declaration_of_symbol(&self.symbols, t_symbol);
+                let type_class_declaration =
+                    get_class_like_declaration_of_symbol(&self.symbols, t_symbol);
                 if !self.is_node_within_class(node, type_class_declaration) {
                     let name = self.get_fully_qualified_name(t_symbol, Node::NIL);
-                    self.error(node, diag::Cannot_extend_a_class_0_Class_constructor_is_marked_as_private, args![name]);
+                    self.error(
+                        node,
+                        diag::Cannot_extend_a_class_0_Class_constructor_is_marked_as_private,
+                        args![name],
+                    );
                 }
             }
         }
@@ -945,7 +1055,9 @@ impl Checker {
                 continue;
             }
             let declared_prop = self.get_symbol_of_declaration(member);
-            if declared_prop.is_some() && self.sym(declared_prop).name != INTERNAL_SYMBOL_NAME_COMPUTED {
+            if declared_prop.is_some()
+                && self.sym(declared_prop).name != INTERNAL_SYMBOL_NAME_COMPUTED
+            {
                 let declared_name = self.sym(declared_prop).name.clone();
                 let prop = self.get_property_of_type(type_with_this, &declared_name);
                 let base_prop = self.get_property_of_type(base_with_this, &declared_name);
@@ -976,7 +1088,12 @@ impl Checker {
         }
         if !issued_member_error {
             // check again with diagnostics to generate a less-specific error
-            self.check_type_assignable_to(type_with_this, base_with_this, or_else_node(node.name(), node), Some(broad_diag));
+            self.check_type_assignable_to(
+                type_with_this,
+                base_with_this,
+                or_else_node(node.name(), node),
+                Some(broad_diag),
+            );
         }
     }
 
@@ -989,7 +1106,11 @@ impl Checker {
             let _ = self.resolve_structured_type_members(t);
             let (has_signatures, members, properties) = {
                 let resolved = self.ty(t).as_structured_type();
-                (!resolved.signatures.is_empty(), resolved.members, resolved.properties.clone())
+                (
+                    !resolved.signatures.is_empty(),
+                    resolved.members,
+                    resolved.properties.clone(),
+                )
             };
             if has_signatures {
                 let symbol = self.ty(t).symbol;
@@ -1057,8 +1178,11 @@ impl Checker {
                     // If there is no declaration for the derived class (as in the case of class expressions),
                     // then the class cannot be declared abstract.
                     let t_symbol = self.ty(t).symbol;
-                    let derived_class_decl = get_class_like_declaration_of_symbol(&self.symbols, t_symbol);
-                    if derived_class_decl.is_nil() || !has_syntactic_modifier(derived_class_decl, ModifierFlags::ABSTRACT) {
+                    let derived_class_decl =
+                        get_class_like_declaration_of_symbol(&self.symbols, t_symbol);
+                    if derived_class_decl.is_nil()
+                        || !has_syntactic_modifier(derived_class_decl, ModifierFlags::ABSTRACT)
+                    {
                         // Searches other base types for a declaration that would satisfy the inherited abstract member.
                         // (The class may have more than one base type via declaration merging with an interface with the
                         // same name.)
@@ -1066,8 +1190,10 @@ impl Checker {
                             if other_base_type == base_type {
                                 continue;
                             }
-                            let base_symbol = self.get_property_of_object_type(other_base_type, &base_name);
-                            if base_symbol.is_some() && base != self.get_target_symbol(base_symbol) {
+                            let base_symbol =
+                                self.get_property_of_object_type(other_base_type, &base_name);
+                            if base_symbol.is_some() && base != self.get_target_symbol(base_symbol)
+                            {
                                 // Derived property exists elsewhere.
                                 continue 'base_property_check;
                             }
@@ -1081,13 +1207,18 @@ impl Checker {
                         missed_properties.push(self.symbol_to_string(base_property));
                         not_implemented_info.insert(
                             derived_class_decl,
-                            MemberInfo { base_type_name, type_name, missed_properties },
+                            MemberInfo {
+                                base_type_name,
+                                type_name,
+                                missed_properties,
+                            },
                         );
                     }
                 }
             } else {
                 // derived overrides base.
-                let derived_declaration_flags = self.get_declaration_modifier_flags_from_symbol(derived);
+                let derived_declaration_flags =
+                    self.get_declaration_modifier_flags_from_symbol(derived);
                 if base_declaration_flags.intersects(ModifierFlags::PRIVATE)
                     || derived_declaration_flags.intersects(ModifierFlags::PRIVATE)
                 {
@@ -1103,7 +1234,8 @@ impl Checker {
                 if !base_property_flags.is_empty() && !derived_property_flags.is_empty() {
                     // property/accessor is overridden with property/accessor
                     if self.sym(base).check_flags.intersects(CheckFlags::MAPPED)
-                        || derived_value_declaration.is_some() && is_binary_expression(derived_value_declaration)
+                        || derived_value_declaration.is_some()
+                            && is_binary_expression(derived_value_declaration)
                         || self.are_properties_abstract_or_interface(base, base_declaration_flags)
                     {
                         // when the base property is abstract or from an interface, base/derived flags don't need to match
@@ -1128,7 +1260,11 @@ impl Checker {
                         let base_string = self.symbol_to_string(base);
                         let base_type_string = self.type_to_string_exported(base_type);
                         let type_string = self.type_to_string_exported(t);
-                        self.error(error_node, error_message, args![base_string, base_type_string, type_string]);
+                        self.error(
+                            error_node,
+                            error_message,
+                            args![base_string, base_type_string, type_string],
+                        );
                     } else if self.compiler_options.get_use_define_for_class_fields() {
                         let derived_declarations = self.sym(derived).declarations.clone();
                         let uninitialized = derived_declarations
@@ -1140,19 +1276,24 @@ impl Checker {
                             && !derived_flags.intersects(SymbolFlags::TRANSIENT)
                             && !base_declaration_flags.intersects(ModifierFlags::ABSTRACT)
                             && !derived_declaration_flags.intersects(ModifierFlags::ABSTRACT)
-                            && !derived_declarations.iter().any(|&d| d.flags().intersects(NodeFlags::AMBIENT))
+                            && !derived_declarations
+                                .iter()
+                                .any(|&d| d.flags().intersects(NodeFlags::AMBIENT))
                         {
                             let t_symbol = self.ty(t).symbol;
-                            let constructor = find_constructor_declaration(get_class_like_declaration_of_symbol(
-                                &self.symbols,
-                                t_symbol,
-                            ));
+                            let constructor = find_constructor_declaration(
+                                get_class_like_declaration_of_symbol(&self.symbols, t_symbol),
+                            );
                             let prop_name = uninitialized.name();
                             if is_exclamation_token(uninitialized.postfix_token())
                                 || constructor.is_nil()
                                 || !is_identifier(prop_name)
                                 || !self.strict_null_checks
-                                || !self.is_property_initialized_in_constructor(prop_name, t, constructor)
+                                || !self.is_property_initialized_in_constructor(
+                                    prop_name,
+                                    t,
+                                    constructor,
+                                )
                             {
                                 let error_message = diag::Property_0_will_overwrite_the_base_property_in_1_If_this_is_intentional_add_an_initializer_Otherwise_add_a_declare_modifier_or_remove_the_redundant_declaration;
                                 let error_node = or_else_node(
@@ -1161,14 +1302,20 @@ impl Checker {
                                 );
                                 let base_string = self.symbol_to_string(base);
                                 let base_type_string = self.type_to_string_exported(base_type);
-                                self.error(error_node, error_message, args![base_string, base_type_string]);
+                                self.error(
+                                    error_node,
+                                    error_message,
+                                    args![base_string, base_type_string],
+                                );
                             }
                         }
                     }
                     // correct case
                     continue;
                 } else if self.is_prototype_property(base) {
-                    if self.is_prototype_property(derived) || derived_flags.intersects(SymbolFlags::PROPERTY) {
+                    if self.is_prototype_property(derived)
+                        || derived_flags.intersects(SymbolFlags::PROPERTY)
+                    {
                         // method is overridden with method or property -- correct case
                         continue;
                     } else {
@@ -1179,12 +1326,18 @@ impl Checker {
                 } else {
                     error_message = diag::Class_0_defines_instance_member_property_1_but_extended_class_2_defines_it_as_instance_member_function;
                 }
-                let error_node =
-                    or_else_node(get_name_of_declaration(derived_value_declaration), derived_value_declaration);
+                let error_node = or_else_node(
+                    get_name_of_declaration(derived_value_declaration),
+                    derived_value_declaration,
+                );
                 let base_type_string = self.type_to_string_exported(base_type);
                 let base_string = self.symbol_to_string(base);
                 let type_string = self.type_to_string_exported(t);
-                self.error(error_node, error_message, args![base_type_string, base_string, type_string]);
+                self.error(
+                    error_node,
+                    error_message,
+                    args![base_type_string, base_string, type_string],
+                );
             }
         }
         for (error_node, member_info) in not_implemented_info {
@@ -1249,16 +1402,30 @@ impl Checker {
     }
 
     // Go: checker/checker.go:4673 arePropertiesAbstractOrInterface
-    pub fn are_properties_abstract_or_interface(&self, base: SymbolId, base_declaration_flags: ModifierFlags) -> bool {
+    pub fn are_properties_abstract_or_interface(
+        &self,
+        base: SymbolId,
+        base_declaration_flags: ModifierFlags,
+    ) -> bool {
         let symbol = self.sym(base);
         if symbol.check_flags.intersects(CheckFlags::SYNTHETIC) {
-            return symbol.declarations.iter().any(|&d| self.is_property_abstract_or_interface(d, base_declaration_flags));
+            return symbol
+                .declarations
+                .iter()
+                .any(|&d| self.is_property_abstract_or_interface(d, base_declaration_flags));
         }
-        symbol.declarations.iter().all(|&d| self.is_property_abstract_or_interface(d, base_declaration_flags))
+        symbol
+            .declarations
+            .iter()
+            .all(|&d| self.is_property_abstract_or_interface(d, base_declaration_flags))
     }
 
     // Go: checker/checker.go:4680 isPropertyAbstractOrInterface
-    pub fn is_property_abstract_or_interface(&self, declaration: Node, base_declaration_flags: ModifierFlags) -> bool {
+    pub fn is_property_abstract_or_interface(
+        &self,
+        declaration: Node,
+        base_declaration_flags: ModifierFlags,
+    ) -> bool {
         is_interface_declaration(declaration.parent())
             || base_declaration_flags.intersects(ModifierFlags::ABSTRACT)
                 && (!is_property_declaration(declaration) || declaration.initializer().is_nil())
@@ -1363,17 +1530,26 @@ impl Checker {
             return;
         }
         let member_is_static = is_static(member);
-        let this_type = if member_is_static { static_type } else { type_with_this };
+        let this_type = if member_is_static {
+            static_type
+        } else {
+            type_with_this
+        };
         let symbol_name_str = self.sym(symbol).name.clone();
         let prop = self.get_property_of_type(this_type, &symbol_name_str);
         if prop.is_nil() {
             return;
         }
-        let base_type = if member_is_static { base_static_type } else { base_with_this };
+        let base_type = if member_is_static {
+            base_static_type
+        } else {
+            base_with_this
+        };
         let base_prop = self.get_property_of_type(base_type, &symbol_name_str);
         if base_prop.is_nil() && member_has_override_modifier {
             let name = symbol_name(&self.symbols, symbol);
-            let suggestion = self.get_suggested_symbol_for_nonexistent_class_member(&name, base_type);
+            let suggestion =
+                self.get_suggested_symbol_for_nonexistent_class_member(&name, base_type);
             if suggestion.is_some() {
                 let message = if is_js {
                     diag::This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_it_is_not_declared_in_the_base_class_0_Did_you_mean_1
@@ -1400,7 +1576,11 @@ impl Checker {
             && self.compiler_options.no_implicit_override.is_true()
             && !node.flags().intersects(NodeFlags::AMBIENT)
         {
-            let base_has_abstract = self.sym(base_prop).declarations.iter().any(|&d| has_abstract_modifier(d));
+            let base_has_abstract = self
+                .sym(base_prop)
+                .declarations
+                .iter()
+                .any(|&d| has_abstract_modifier(d));
             if !base_has_abstract {
                 let message = if is_parameter_declaration(member) {
                     if is_js {
@@ -1429,7 +1609,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:4763 getSuggestedSymbolForNonexistentClassMember
-    pub fn get_suggested_symbol_for_nonexistent_class_member(&mut self, name: &str, base_type: TypeId) -> SymbolId {
+    pub fn get_suggested_symbol_for_nonexistent_class_member(
+        &mut self,
+        name: &str,
+        base_type: TypeId,
+    ) -> SymbolId {
         // PORT: Go passes `slices.Values(props)` (an `iter.Seq`); the Rust callee takes a slice.
         let properties = self.get_properties_of_type(base_type);
         self.get_spelling_suggestion_for_name(name, &properties, SymbolFlags::CLASS_MEMBER)

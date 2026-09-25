@@ -16,11 +16,13 @@ use ts_diagnostics::Message;
 const INTERNAL_SYMBOL_NAME_DEFAULT: &str = "default";
 
 /// Go `func(location, message, args ...any) *ast.Diagnostic`.
-pub type NameResolverErrorFn = Rc<dyn Fn(&mut Checker, Node, &'static Message, Vec<String>) -> Diagnostic>;
+pub type NameResolverErrorFn =
+    Rc<dyn Fn(&mut Checker, Node, &'static Message, Vec<String>) -> Diagnostic>;
 /// Go `func(node *ast.Node) *ast.Symbol`.
 pub type NameResolverGetSymbolOfDeclarationFn = Rc<dyn Fn(&mut Checker, Node) -> SymbolId>;
 /// Go `func(symbols ast.SymbolTable, name string, meaning ast.SymbolFlags) *ast.Symbol`.
-pub type NameResolverLookupFn = Rc<dyn Fn(&mut Checker, SymbolTable, &str, SymbolFlags) -> SymbolId>;
+pub type NameResolverLookupFn =
+    Rc<dyn Fn(&mut Checker, SymbolTable, &str, SymbolFlags) -> SymbolId>;
 /// Go `func(symbol *ast.Symbol, meaning ast.SymbolFlags)`.
 pub type NameResolverSymbolReferencedFn = Rc<dyn Fn(&mut Checker, SymbolId, SymbolFlags)>;
 /// Go `func(node *ast.Node, value core.Tristate)`.
@@ -28,11 +30,14 @@ pub type NameResolverSetRequiresScopeChangeCacheFn = Rc<dyn Fn(&mut Checker, Nod
 /// Go `func(node *ast.Node) core.Tristate`.
 pub type NameResolverGetRequiresScopeChangeCacheFn = Rc<dyn Fn(&mut Checker, Node) -> Tristate>;
 /// Go `func(location *ast.Node, name string, declaration *ast.Node, result *ast.Symbol) bool`.
-pub type NameResolverOnPropertyWithInvalidInitializerFn = Rc<dyn Fn(&mut Checker, Node, &str, Node, SymbolId) -> bool>;
+pub type NameResolverOnPropertyWithInvalidInitializerFn =
+    Rc<dyn Fn(&mut Checker, Node, &str, Node, SymbolId) -> bool>;
 /// Go `func(location *ast.Node, name string, meaning ast.SymbolFlags, nameNotFoundMessage *diagnostics.Message)`.
-pub type NameResolverOnFailedToResolveSymbolFn = Rc<dyn Fn(&mut Checker, Node, &str, SymbolFlags, &'static Message)>;
+pub type NameResolverOnFailedToResolveSymbolFn =
+    Rc<dyn Fn(&mut Checker, Node, &str, SymbolFlags, &'static Message)>;
 /// Go `func(location, result, meaning, lastLocation, associatedDeclarationForContainingInitializerOrBindingName, withinDeferredContext)`.
-pub type NameResolverOnSuccessfullyResolvedSymbolFn = Rc<dyn Fn(&mut Checker, Node, SymbolId, SymbolFlags, Node, Node, bool)>;
+pub type NameResolverOnSuccessfullyResolvedSymbolFn =
+    Rc<dyn Fn(&mut Checker, Node, SymbolId, SymbolFlags, Node, Node, bool)>;
 
 /// Go `binder.NameResolver`. The checker builds one with
 /// `create_name_resolver` / `create_name_resolver_for_suggestion` and calls
@@ -49,7 +54,8 @@ pub struct NameResolver {
     pub symbol_referenced: Option<NameResolverSymbolReferencedFn>,
     pub set_requires_scope_change_cache: Option<NameResolverSetRequiresScopeChangeCacheFn>,
     pub get_requires_scope_change_cache: Option<NameResolverGetRequiresScopeChangeCacheFn>,
-    pub on_property_with_invalid_initializer: Option<NameResolverOnPropertyWithInvalidInitializerFn>,
+    pub on_property_with_invalid_initializer:
+        Option<NameResolverOnPropertyWithInvalidInitializerFn>,
     pub on_failed_to_resolve_symbol: Option<NameResolverOnFailedToResolveSymbolFn>,
     pub on_successfully_resolved_symbol: Option<NameResolverOnSuccessfullyResolvedSymbolFn>,
 }
@@ -75,7 +81,7 @@ impl NameResolver {
         let mut property_with_invalid_initializer = Node::NIL;
         let mut associated_declaration_for_containing_initializer_or_binding_name = Node::NIL;
         let mut within_deferred_context = false;
-        let mut grandparent = Node::NIL;
+        let mut grandparent: Node;
         let original_location = location; // needed for did-you-mean error reporting, which gathers candidates starting from the original location
         let name_is_const = name == "const";
         'loop_: while location.is_some() {
@@ -84,7 +90,10 @@ impl NameResolver {
                 // (it refers to the constant type of the expression instead)
                 return SymbolId::NIL;
             }
-            if is_module_or_enum_declaration(location) && last_location.is_some() && location.name() == last_location {
+            if is_module_or_enum_declaration(location)
+                && last_location.is_some()
+                && location.name() == last_location
+            {
                 // If lastLocation is the name of a namespace or enum, skip the parent since it will have is own locals that could
                 // conflict.
                 last_location = location;
@@ -96,7 +105,10 @@ impl NameResolver {
                 result = self.lookup(c, locals, name, meaning);
                 if result.is_some() {
                     let mut use_result = true;
-                    if is_function_like(location) && last_location.is_some() && last_location != location.body() {
+                    if is_function_like(location)
+                        && last_location.is_some()
+                        && last_location != location.body()
+                    {
                         // symbol lookup restrictions for function-like declarations
                         // - Type parameters of a function are in scope in the entire function declaration, including the parameter
                         //   list and return type. However, local types are only in scope in the function body.
@@ -104,7 +116,9 @@ impl NameResolver {
                         // This restriction does not apply to JSDoc comment types because they are parented
                         // at a higher level than type parameters would normally be
                         let result_flags = c.sym(result).flags;
-                        if (meaning & result_flags).intersects(SymbolFlags::TYPE) && last_location.kind() != SyntaxKind::JsDoc {
+                        if (meaning & result_flags).intersects(SymbolFlags::TYPE)
+                            && last_location.kind() != SyntaxKind::JsDoc
+                        {
                             // type parameters are visible in parameter list, return type and type parameter list.
                             // Synthetic fake scopes are added for signatures so type parameters are accessible from them.
                             use_result = result_flags.intersects(SymbolFlags::TYPE_PARAMETER)
@@ -117,9 +131,15 @@ impl NameResolver {
                         }
                         if (meaning & result_flags).intersects(SymbolFlags::VARIABLE) {
                             // expression inside parameter will lookup as normal variable scope when targeting es2015+
-                            if self.use_outer_variable_scope_in_parameter(c, result, location, last_location) {
+                            if self.use_outer_variable_scope_in_parameter(
+                                c,
+                                result,
+                                location,
+                                last_location,
+                            ) {
                                 use_result = false;
-                            } else if result_flags.intersects(SymbolFlags::FUNCTION_SCOPED_VARIABLE) {
+                            } else if result_flags.intersects(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                            {
                                 // parameters are visible only inside function body, parameter list and return type
                                 // technically for parameter list case here we might mix parameters and variables declared in function,
                                 // however it is detected separately when checking initializers of parameters
@@ -128,7 +148,11 @@ impl NameResolver {
                                 use_result = last_location.kind() == SyntaxKind::Parameter
                                     || last_location.flags().intersects(NodeFlags::SYNTHESIZED)
                                     || last_location == location.type_()
-                                        && find_ancestor(value_declaration, is_parameter_declaration).is_some();
+                                        && find_ancestor(
+                                            value_declaration,
+                                            is_parameter_declaration,
+                                        )
+                                        .is_some();
                             }
                         }
                     } else if location.kind() == SyntaxKind::ConditionalType {
@@ -142,13 +166,16 @@ impl NameResolver {
                     result = SymbolId::NIL;
                 }
             }
-            within_deferred_context = within_deferred_context || get_is_deferred_context(location, last_location);
+            within_deferred_context =
+                within_deferred_context || get_is_deferred_context(location, last_location);
             // PORT: Go `break` inside the switch leaves the switch; `break 'switch_` does the same here.
             'switch_: {
                 match location.kind() {
                     SyntaxKind::SourceFile | SyntaxKind::ModuleDeclaration => {
                         // PORT: Go `case KindSourceFile: if !external { break }; fallthrough`.
-                        if location.kind() == SyntaxKind::SourceFile && !is_external_or_common_js_module(location) {
+                        if location.kind() == SyntaxKind::SourceFile
+                            && !is_external_or_common_js_module(location)
+                        {
                             break 'switch_;
                         }
                         let module_symbol = self.get_symbol_of_declaration(c, location);
@@ -165,7 +192,8 @@ impl NameResolver {
                             // name of that export default matches.
                             result = c.symbols.get(module_exports, INTERNAL_SYMBOL_NAME_DEFAULT);
                             if result.is_some() {
-                                let local_symbol = get_local_symbol_for_export_default(&c.symbols, result);
+                                let local_symbol =
+                                    get_local_symbol_for_export_default(&c.symbols, result);
                                 if local_symbol.is_some()
                                     && c.sym(result).flags.intersects(meaning)
                                     && c.sym(local_symbol).name == name
@@ -188,17 +216,34 @@ impl NameResolver {
                             let module_export = c.symbols.get(module_exports, name);
                             if module_export.is_some()
                                 && c.sym(module_export).flags == SymbolFlags::ALIAS
-                                && (get_declaration_of_kind(&c.symbols, module_export, SyntaxKind::ExportSpecifier).is_some()
-                                    || get_declaration_of_kind(&c.symbols, module_export, SyntaxKind::NamespaceExport).is_some())
+                                && (get_declaration_of_kind(
+                                    &c.symbols,
+                                    module_export,
+                                    SyntaxKind::ExportSpecifier,
+                                )
+                                .is_some()
+                                    || get_declaration_of_kind(
+                                        &c.symbols,
+                                        module_export,
+                                        SyntaxKind::NamespaceExport,
+                                    )
+                                    .is_some())
                             {
                                 break 'switch_;
                             }
                         }
                         if name != INTERNAL_SYMBOL_NAME_DEFAULT {
-                            result = self.lookup(c, module_exports, name, meaning & SymbolFlags::MODULE_MEMBER);
+                            result = self.lookup(
+                                c,
+                                module_exports,
+                                name,
+                                meaning & SymbolFlags::MODULE_MEMBER,
+                            );
                             if result.is_some() {
                                 if is_source_file(location)
-                                    && source_file_info(location).common_js_module_indicator.is_some()
+                                    && source_file_info(location)
+                                        .common_js_module_indicator
+                                        .is_some()
                                     && !c.sym(result).flags.intersects(SymbolFlags::TYPE)
                                 {
                                     result = SymbolId::NIL;
@@ -214,7 +259,8 @@ impl NameResolver {
                             break 'switch_;
                         }
                         let enum_exports = c.sym(enum_symbol).exports;
-                        result = self.lookup(c, enum_exports, name, meaning & SymbolFlags::ENUM_MEMBER);
+                        result =
+                            self.lookup(c, enum_exports, name, meaning & SymbolFlags::ENUM_MEMBER);
                         if result.is_some() {
                             if name_not_found_message.is_some()
                                 && self.compiler_options.get_isolated_modules()
@@ -223,7 +269,9 @@ impl NameResolver {
                                     != get_source_file_of_node(c.sym(result).value_declaration)
                             {
                                 let isolated_modules_like_flag_name =
-                                    if self.compiler_options.verbatim_module_syntax == Tristate::True {
+                                    if self.compiler_options.verbatim_module_syntax
+                                        == Tristate::True
+                                    {
                                         "verbatimModuleSyntax"
                                     } else {
                                         "isolatedModules"
@@ -243,19 +291,26 @@ impl NameResolver {
                         if !is_static(location) {
                             let ctor = find_constructor_declaration(location.parent());
                             if ctor.is_some() && ctor.locals().is_some() {
-                                if self.lookup(c, ctor.locals(), name, meaning & SymbolFlags::VALUE).is_some() {
+                                if self
+                                    .lookup(c, ctor.locals(), name, meaning & SymbolFlags::VALUE)
+                                    .is_some()
+                                {
                                     // Remember the property node, it will be used later to report appropriate error
                                     property_with_invalid_initializer = location;
                                 }
                             }
                         }
                     }
-                    SyntaxKind::ClassDeclaration | SyntaxKind::ClassExpression | SyntaxKind::InterfaceDeclaration => {
+                    SyntaxKind::ClassDeclaration
+                    | SyntaxKind::ClassExpression
+                    | SyntaxKind::InterfaceDeclaration => {
                         let decl_symbol = self.get_symbol_of_declaration(c, location);
                         let members = c.sym(decl_symbol).members;
                         result = self.lookup(c, members, name, meaning & SymbolFlags::TYPE);
                         if result.is_some() {
-                            if !is_type_parameter_symbol_declared_in_container(&c.symbols, result, location) {
+                            if !is_type_parameter_symbol_declared_in_container(
+                                &c.symbols, result, location,
+                            ) {
                                 // ignore type parameters not declared in this container
                                 result = SymbolId::NIL;
                                 break 'switch_;
@@ -265,7 +320,12 @@ impl NameResolver {
                                 // The scope of a type parameter extends over the entire declaration with which the type
                                 // parameter list is associated, with the exception of static member declarations in classes.
                                 if name_not_found_message.is_some() {
-                                    self.error(c, original_location, diag::Static_members_cannot_reference_class_type_parameters, args![]);
+                                    self.error(
+                                        c,
+                                        original_location,
+                                        diag::Static_members_cannot_reference_class_type_parameters,
+                                        args![],
+                                    );
                                 }
                                 return SymbolId::NIL;
                             }
@@ -357,7 +417,9 @@ impl NameResolver {
                         //       method(@y x, y) {} // <-- decorator y should be resolved at the class declaration, not the parameter.
                         //   }
                         //
-                        if location.parent().is_some() && location.parent().kind() == SyntaxKind::Parameter {
+                        if location.parent().is_some()
+                            && location.parent().kind() == SyntaxKind::Parameter
+                        {
                             location = location.parent();
                         }
                         //   function y() {}
@@ -372,7 +434,8 @@ impl NameResolver {
                         //   @param(1 as T) // <-- T should resolve to the type alias outside of class C
                         //   class C<T> {}
                         if location.parent().is_some()
-                            && (is_class_element(location.parent()) || location.parent().kind() == SyntaxKind::ClassDeclaration)
+                            && (is_class_element(location.parent())
+                                || location.parent().kind() == SyntaxKind::ClassDeclaration)
                         {
                             location = location.parent();
                         }
@@ -380,22 +443,29 @@ impl NameResolver {
                     SyntaxKind::Parameter => {
                         if last_location.is_some()
                             && (last_location == location.initializer()
-                                || last_location == location.name() && is_binding_pattern(last_location))
+                                || last_location == location.name()
+                                    && is_binding_pattern(last_location))
                         {
-                            if associated_declaration_for_containing_initializer_or_binding_name.is_nil() {
-                                associated_declaration_for_containing_initializer_or_binding_name = location;
+                            if associated_declaration_for_containing_initializer_or_binding_name
+                                .is_nil()
+                            {
+                                associated_declaration_for_containing_initializer_or_binding_name =
+                                    location;
                             }
                         }
                     }
                     SyntaxKind::BindingElement => {
                         if last_location.is_some()
                             && (last_location == location.initializer()
-                                || last_location == location.name() && is_binding_pattern(last_location))
+                                || last_location == location.name()
+                                    && is_binding_pattern(last_location))
                         {
                             if is_part_of_parameter_declaration(location)
-                                && associated_declaration_for_containing_initializer_or_binding_name.is_nil()
+                                && associated_declaration_for_containing_initializer_or_binding_name
+                                    .is_nil()
                             {
-                                associated_declaration_for_containing_initializer_or_binding_name = location;
+                                associated_declaration_for_containing_initializer_or_binding_name =
+                                    location;
                             }
                         }
                     }
@@ -432,7 +502,11 @@ impl NameResolver {
         // We just climbed up parents looking for the name, meaning that we started in a descendant node of `lastLocation`.
         // If `result === lastSelfReferenceLocation.symbol`, that means that we are somewhere inside `lastSelfReferenceLocation` looking up a name, and resolving to `lastLocation` itself.
         // That means that this is a self-reference of `lastLocation`, and shouldn't count this when considering whether `lastLocation` is used.
-        if is_use && result.is_some() && (last_self_reference_location.is_nil() || result != last_self_reference_location.symbol()) {
+        if is_use
+            && result.is_some()
+            && (last_self_reference_location.is_nil()
+                || result != last_self_reference_location.symbol())
+        {
             if let Some(symbol_referenced) = &self.symbol_referenced {
                 symbol_referenced(c, result, meaning);
             }
@@ -441,25 +515,47 @@ impl NameResolver {
             result = self.lookup(c, self.globals, name, meaning | SymbolFlags::GLOBAL_LOOKUP);
         }
         if result.is_nil() {
-            if original_location.is_some() && is_in_js_file(original_location) && original_location.parent().is_some() {
-                if is_require_call(original_location.parent(), false /*requireStringLiteralLikeArgument*/) {
+            if original_location.is_some()
+                && is_in_js_file(original_location)
+                && original_location.parent().is_some()
+            {
+                if is_require_call(
+                    original_location.parent(),
+                    false, /*requireStringLiteralLikeArgument*/
+                ) {
                     return self.require_symbol;
                 }
             }
         }
         if let Some(name_not_found_message) = name_not_found_message {
             if property_with_invalid_initializer.is_some() {
-                if let Some(on_property_with_invalid_initializer) = &self.on_property_with_invalid_initializer {
-                    if on_property_with_invalid_initializer(c, original_location, name, property_with_invalid_initializer, result) {
+                if let Some(on_property_with_invalid_initializer) =
+                    &self.on_property_with_invalid_initializer
+                {
+                    if on_property_with_invalid_initializer(
+                        c,
+                        original_location,
+                        name,
+                        property_with_invalid_initializer,
+                        result,
+                    ) {
                         return SymbolId::NIL;
                     }
                 }
             }
             if result.is_nil() {
                 if let Some(on_failed_to_resolve_symbol) = &self.on_failed_to_resolve_symbol {
-                    on_failed_to_resolve_symbol(c, original_location, name, meaning, name_not_found_message);
+                    on_failed_to_resolve_symbol(
+                        c,
+                        original_location,
+                        name,
+                        meaning,
+                        name_not_found_message,
+                    );
                 }
-            } else if let Some(on_successfully_resolved_symbol) = &self.on_successfully_resolved_symbol {
+            } else if let Some(on_successfully_resolved_symbol) =
+                &self.on_successfully_resolved_symbol
+            {
                 on_successfully_resolved_symbol(
                     c,
                     original_location,
@@ -475,7 +571,13 @@ impl NameResolver {
     }
 
     // Go: binder/nameresolver.go:346 useOuterVariableScopeInParameter
-    pub fn use_outer_variable_scope_in_parameter(&self, c: &mut Checker, result: SymbolId, location: Node, last_location: Node) -> bool {
+    pub fn use_outer_variable_scope_in_parameter(
+        &self,
+        c: &mut Checker,
+        result: SymbolId,
+        location: Node,
+        last_location: Node,
+    ) -> bool {
         if is_parameter_declaration(last_location) {
             let body = location.body();
             let value_declaration = c.sym(result).value_declaration;
@@ -491,18 +593,29 @@ impl NameResolver {
                 // - spread assignment in binding pattern pre-es2017
                 let function_location = location;
                 let mut declaration_requires_scope_change = Tristate::Unknown;
-                if let Some(get_requires_scope_change_cache) = &self.get_requires_scope_change_cache {
-                    declaration_requires_scope_change = get_requires_scope_change_cache(c, function_location);
+                if let Some(get_requires_scope_change_cache) = &self.get_requires_scope_change_cache
+                {
+                    declaration_requires_scope_change =
+                        get_requires_scope_change_cache(c, function_location);
                 }
                 if declaration_requires_scope_change == Tristate::Unknown {
-                    declaration_requires_scope_change =
-                        if function_location.parameters().iter().any(|p| self.requires_scope_change(p)) {
-                            Tristate::True
-                        } else {
-                            Tristate::False
-                        };
-                    if let Some(set_requires_scope_change_cache) = &self.set_requires_scope_change_cache {
-                        set_requires_scope_change_cache(c, function_location, declaration_requires_scope_change);
+                    declaration_requires_scope_change = if function_location
+                        .parameters()
+                        .iter()
+                        .any(|p| self.requires_scope_change(p))
+                    {
+                        Tristate::True
+                    } else {
+                        Tristate::False
+                    };
+                    if let Some(set_requires_scope_change_cache) =
+                        &self.set_requires_scope_change_cache
+                    {
+                        set_requires_scope_change_cache(
+                            c,
+                            function_location,
+                            declaration_requires_scope_change,
+                        );
                     }
                 }
                 return declaration_requires_scope_change != Tristate::True;
@@ -520,10 +633,14 @@ impl NameResolver {
     // Go: binder/nameresolver.go:377 requiresScopeChangeWorker
     pub fn requires_scope_change_worker(&self, node: Node) -> bool {
         match node.kind() {
-            SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression | SyntaxKind::FunctionDeclaration | SyntaxKind::Constructor => false,
-            SyntaxKind::MethodDeclaration | SyntaxKind::GetAccessor | SyntaxKind::SetAccessor | SyntaxKind::PropertyAssignment => {
-                self.requires_scope_change_worker(node.name())
-            }
+            SyntaxKind::ArrowFunction
+            | SyntaxKind::FunctionExpression
+            | SyntaxKind::FunctionDeclaration
+            | SyntaxKind::Constructor => false,
+            SyntaxKind::MethodDeclaration
+            | SyntaxKind::GetAccessor
+            | SyntaxKind::SetAccessor
+            | SyntaxKind::PropertyAssignment => self.requires_scope_change_worker(node.name()),
             SyntaxKind::PropertyDeclaration => {
                 if has_static_modifier(node) {
                     return !self.compiler_options.get_emit_standard_class_fields();
@@ -534,7 +651,10 @@ impl NameResolver {
                 if is_nullish_coalesce(node) || is_optional_chain(node) {
                     return self.compiler_options.get_emit_script_target() < ScriptTarget::ES2020;
                 }
-                if is_binding_element(node) && node.dot_dot_dot_token().is_some() && is_object_binding_pattern(node.parent()) {
+                if is_binding_element(node)
+                    && node.dot_dot_dot_token().is_some()
+                    && is_object_binding_pattern(node.parent())
+                {
                     return self.compiler_options.get_emit_script_target() < ScriptTarget::ES2017;
                 }
                 if is_type_node(node) {
@@ -546,7 +666,13 @@ impl NameResolver {
     }
 
     // Go: binder/nameresolver.go:402 error
-    pub fn error(&self, c: &mut Checker, location: Node, message: &'static Message, args: Vec<String>) {
+    pub fn error(
+        &self,
+        c: &mut Checker,
+        location: Node,
+        message: &'static Message,
+        args: Vec<String>,
+    ) {
         if let Some(error) = &self.error {
             error(c, location, message, args);
         }
@@ -564,7 +690,13 @@ impl NameResolver {
     }
 
     // Go: binder/nameresolver.go:418 lookup
-    pub fn lookup(&self, c: &mut Checker, symbols: SymbolTable, name: &str, meaning: SymbolFlags) -> SymbolId {
+    pub fn lookup(
+        &self,
+        c: &mut Checker,
+        symbols: SymbolTable,
+        name: &str,
+        meaning: SymbolFlags,
+    ) -> SymbolId {
         if let Some(lookup) = &self.lookup {
             return lookup(c, symbols, name, meaning);
         }
@@ -585,7 +717,9 @@ impl NameResolver {
         if self.arguments_symbol.get().is_nil() {
             // Default implementation synthesizes a transient symbol for `arguments`
             // PORT: Go allocates a free-standing `&ast.Symbol`; here it lives in the checker's arena.
-            let symbol = c.symbols.new_symbol(SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT, "arguments");
+            let symbol = c
+                .symbols
+                .new_symbol(SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT, "arguments");
             self.arguments_symbol.set(symbol);
         }
         self.arguments_symbol.get()
@@ -615,7 +749,9 @@ pub fn is_export_default_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool
 
 // Go: binder/nameresolver.go:459 getIsDeferredContext
 pub fn get_is_deferred_context(location: Node, last_location: Node) -> bool {
-    if location.kind() != SyntaxKind::ArrowFunction && location.kind() != SyntaxKind::FunctionExpression {
+    if location.kind() != SyntaxKind::ArrowFunction
+        && location.kind() != SyntaxKind::FunctionExpression
+    {
         // initializers in instance property declaration of class like entities are executed in constructor and thus deferred
         // A name is evaluated within the enclosing scope - so it shouldn't count as deferred
         return is_type_query_node(location)
@@ -628,14 +764,19 @@ pub fn get_is_deferred_context(location: Node, last_location: Node) -> bool {
     }
     // generator functions and async functions are not inlined in control flow when immediately invoked
     // PORT: Go `location.BodyData().AsteriskToken` -> the `asterisk_token()` field accessor.
-    if location.asterisk_token().is_some() || has_syntactic_modifier(location, ModifierFlags::ASYNC) {
+    if location.asterisk_token().is_some() || has_syntactic_modifier(location, ModifierFlags::ASYNC)
+    {
         return true;
     }
     get_immediately_invoked_function_expression(location).is_nil()
 }
 
 // Go: binder/nameresolver.go:477 isTypeParameterSymbolDeclaredInContainer
-pub fn is_type_parameter_symbol_declared_in_container(symbols: &SymbolArena, symbol: SymbolId, container: Node) -> bool {
+pub fn is_type_parameter_symbol_declared_in_container(
+    symbols: &SymbolArena,
+    symbol: SymbolId,
+    container: Node,
+) -> bool {
     for &decl in &symbols.sym(symbol).declarations {
         if decl.kind() == SyntaxKind::TypeParameter {
             let parent = decl.parent();

@@ -15,14 +15,17 @@ use super::*;
 /// `verify_compiler_options` decides with the final options.
 const REVERIFIED_OPTION_CODES: [i32; 2] = [
     // Go: program.go:1041 inferred rootDir layout check
-    5011,
-    // Go: program.go:1137 allowImportingTsExtensions without noEmit
+    5011, // Go: program.go:1137 allowImportingTsExtensions without noEmit
     5096,
 ];
 
 /// Removes the `ts_compiler` records that `verify_compiler_options` decides.
 pub(super) fn without_reverified_option_diagnostics(diagnostics: &[Diagnostic]) -> Vec<Diagnostic> {
-    diagnostics.iter().filter(|d| !REVERIFIED_OPTION_CODES.contains(&d.code())).cloned().collect()
+    diagnostics
+        .iter()
+        .filter(|d| !REVERIFIED_OPTION_CODES.contains(&d.code()))
+        .cloned()
+        .collect()
 }
 
 // Go: compiler/program.go:724 verifyCompilerOptions
@@ -49,7 +52,11 @@ pub(super) fn verify_compiler_options() -> Vec<Diagnostic> {
             }
         }
         let case_sensitivity = state().case_sensitivity;
-        let dir59 = get_computed_common_source_directory(&emitted_files, get_current_directory(), case_sensitivity);
+        let dir59 = get_computed_common_source_directory(
+            &emitted_files,
+            get_current_directory(),
+            case_sensitivity,
+        );
         if !dir59.is_empty()
             && ts_path::canonical_file_name(dir, case_sensitivity)
                 != ts_path::canonical_file_name(&dir59, case_sensitivity)
@@ -114,8 +121,11 @@ fn get_computed_common_source_directory(
     current_directory: &str,
     case_sensitivity: CaseSensitivity,
 ) -> String {
-    let common_source_directory =
-        compute_common_source_directory_of_filenames(emitted_files, current_directory, case_sensitivity);
+    let common_source_directory = compute_common_source_directory_of_filenames(
+        emitted_files,
+        current_directory,
+        case_sensitivity,
+    );
     if common_source_directory.is_empty() {
         return common_source_directory;
     }
@@ -124,7 +134,11 @@ fn get_computed_common_source_directory(
 
 // Go: tspath/path.go EnsurePathIsNonModuleName
 fn ensure_path_is_non_module_name(path: String) -> String {
-    if ts_path::root_length(&path) == 0 && !path.starts_with("./") && !path.starts_with("../") && path != "." && path != ".."
+    if ts_path::root_length(&path) == 0
+        && !path.starts_with("./")
+        && !path.starts_with("../")
+        && path != "."
+        && path != ".."
     {
         return format!("./{path}");
     }

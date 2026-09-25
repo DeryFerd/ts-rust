@@ -11,12 +11,18 @@ impl Checker {
         }
         if flags.intersects(TypeFlags::UNION) {
             let types = self.ty(t).types().to_vec();
-            let mapped: Vec<TypeId> = types.into_iter().map(|t| self.instantiate_instantiable_types(t, mapper)).collect();
+            let mapped: Vec<TypeId> = types
+                .into_iter()
+                .map(|t| self.instantiate_instantiable_types(t, mapper))
+                .collect();
             return self.get_union_type_ex(&mapped, UnionReduction::NONE, None, TypeId::NIL);
         }
         if flags.intersects(TypeFlags::INTERSECTION) {
             let types = self.ty(t).types().to_vec();
-            let mapped: Vec<TypeId> = types.into_iter().map(|t| self.instantiate_instantiable_types(t, mapper)).collect();
+            let mapped: Vec<TypeId> = types
+                .into_iter()
+                .map(|t| self.instantiate_instantiable_types(t, mapper))
+                .collect();
             return self.get_intersection_type(&mapped);
         }
         t
@@ -30,7 +36,8 @@ impl Checker {
 
     // Go: checker/checker.go:30628 pushContextualType
     pub fn push_contextual_type(&mut self, node: Node, t: TypeId, is_cache: bool) {
-        self.contextual_infos.push(ContextualInfo { node, t, is_cache });
+        self.contextual_infos
+            .push(ContextualInfo { node, t, is_cache });
     }
 
     // Go: checker/checker.go:30632 popContextualType
@@ -60,17 +67,29 @@ impl Checker {
                 return self.is_context_sensitive_function_like_declaration(node);
             }
             SyntaxKind::ObjectLiteralExpression => {
-                return node.properties().to_vec().into_iter().any(|p| self.is_context_sensitive(p));
+                return node
+                    .properties()
+                    .to_vec()
+                    .into_iter()
+                    .any(|p| self.is_context_sensitive(p));
             }
             SyntaxKind::ArrayLiteralExpression => {
-                return node.elements().to_vec().into_iter().any(|e| self.is_context_sensitive(e));
+                return node
+                    .elements()
+                    .to_vec()
+                    .into_iter()
+                    .any(|e| self.is_context_sensitive(e));
             }
             SyntaxKind::ConditionalExpression => {
-                return self.is_context_sensitive(node.when_true()) || self.is_context_sensitive(node.when_false());
+                return self.is_context_sensitive(node.when_true())
+                    || self.is_context_sensitive(node.when_false());
             }
             SyntaxKind::BinaryExpression => {
-                return node_kind_is(node.operator_token(), &[SyntaxKind::BarBarToken, SyntaxKind::QuestionQuestionToken])
-                    && (self.is_context_sensitive(node.left()) || self.is_context_sensitive(node.right()));
+                return node_kind_is(
+                    node.operator_token(),
+                    &[SyntaxKind::BarBarToken, SyntaxKind::QuestionQuestionToken],
+                ) && (self.is_context_sensitive(node.left())
+                    || self.is_context_sensitive(node.right()));
             }
             SyntaxKind::PropertyAssignment => {
                 return self.is_context_sensitive(node.initializer());
@@ -79,7 +98,11 @@ impl Checker {
                 return self.is_context_sensitive(node.expression());
             }
             SyntaxKind::JsxAttributes => {
-                return node.properties().to_vec().into_iter().any(|p| self.is_context_sensitive(p))
+                return node
+                    .properties()
+                    .to_vec()
+                    .into_iter()
+                    .any(|p| self.is_context_sensitive(p))
                     || is_jsx_opening_element(node.parent())
                         && node
                             .parent()
@@ -138,12 +161,15 @@ impl Checker {
     pub fn has_context_sensitive_yield_expression(&mut self, node: Node) -> bool {
         get_function_flags(node).intersects(FunctionFlags::GENERATOR)
             && node.body().is_some()
-            && for_each_yield_expression(node.body(), &mut |e: Node| -> bool { self.is_context_sensitive(e) })
+            && for_each_yield_expression(node.body(), &mut |e: Node| -> bool {
+                self.is_context_sensitive(e)
+            })
     }
 
     // Go: checker/checker.go:30707 pushInferenceContext
     pub fn push_inference_context(&mut self, node: Node, context: InferenceContextId) {
-        self.inference_context_infos.push(InferenceContextInfo { node, context });
+        self.inference_context_infos
+            .push(InferenceContextInfo { node, context });
     }
 
     // Go: checker/checker.go:30711 popInferenceContext
@@ -174,7 +200,11 @@ impl Checker {
     // Go: checker/checker.go:30734 getTypeFactsWorker
     pub fn get_type_facts_worker(&mut self, t: TypeId, caller_only_needs: TypeFacts) -> TypeFacts {
         let mut t = t;
-        if self.ty(t).flags.intersects(TypeFlags::INTERSECTION | TypeFlags::INSTANTIABLE) {
+        if self
+            .ty(t)
+            .flags
+            .intersects(TypeFlags::INTERSECTION | TypeFlags::INSTANTIABLE)
+        {
             t = self.get_base_constraint_of_type(t);
             if t.is_nil() {
                 t = self.unknown_type;
@@ -188,7 +218,8 @@ impl Checker {
             }
             return TypeFacts::STRING_FACTS;
         } else if flags.intersects(TypeFlags::STRING_LITERAL | TypeFlags::TEMPLATE_LITERAL) {
-            let is_empty = flags.intersects(TypeFlags::STRING_LITERAL) && self.get_string_literal_value(t).is_empty();
+            let is_empty = flags.intersects(TypeFlags::STRING_LITERAL)
+                && self.get_string_literal_value(t).is_empty();
             if strict {
                 if is_empty {
                     return TypeFacts::EMPTY_STRING_STRICT_FACTS;
@@ -252,7 +283,9 @@ impl Checker {
             return TypeFacts::TRUE_FACTS;
         } else if flags.intersects(TypeFlags::OBJECT) {
             let possible_facts = if strict {
-                TypeFacts::EMPTY_OBJECT_STRICT_FACTS | TypeFacts::FUNCTION_STRICT_FACTS | TypeFacts::OBJECT_STRICT_FACTS
+                TypeFacts::EMPTY_OBJECT_STRICT_FACTS
+                    | TypeFacts::FUNCTION_STRICT_FACTS
+                    | TypeFacts::OBJECT_STRICT_FACTS
             } else {
                 TypeFacts::EMPTY_OBJECT_FACTS | TypeFacts::FUNCTION_FACTS | TypeFacts::OBJECT_FACTS
             };
@@ -261,7 +294,9 @@ impl Checker {
                 // return zero so we can skip resolving members.
                 return TypeFacts::NONE;
             }
-            if self.ty(t).object_flags.intersects(ObjectFlags::ANONYMOUS) && self.is_empty_object_type(t) {
+            if self.ty(t).object_flags.intersects(ObjectFlags::ANONYMOUS)
+                && self.is_empty_object_type(t)
+            {
                 if strict {
                     return TypeFacts::EMPTY_OBJECT_STRICT_FACTS;
                 }
@@ -309,7 +344,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:30870 getIntersectionTypeFacts
-    pub fn get_intersection_type_facts(&mut self, t: TypeId, caller_only_needs: TypeFacts) -> TypeFacts {
+    pub fn get_intersection_type_facts(
+        &mut self,
+        t: TypeId,
+        caller_only_needs: TypeFacts,
+    ) -> TypeFacts {
         // When an intersection contains a primitive type we ignore object type constituents as they are
         // presumably type tags. For example, in string & { __kind__: "name" } we ignore the object type.
         let ignore_objects = self.maybe_type_of_kind(t, TypeFlags::PRIMITIVE);
@@ -337,7 +376,11 @@ impl Checker {
 
     // Go: checker/checker.go:30892 isFunctionObjectType
     pub fn is_function_object_type(&mut self, t: TypeId) -> bool {
-        if self.ty(t).object_flags.intersects(ObjectFlags::EVOLVING_ARRAY) {
+        if self
+            .ty(t)
+            .object_flags
+            .intersects(ObjectFlags::EVOLVING_ARRAY)
+        {
             return false;
         }
         // We do a quick check for a "bind" property before performing the more expensive subtype
@@ -349,12 +392,15 @@ impl Checker {
             return true;
         }
         let global_function_type = self.global_function_type;
-        self.symbols.get(members, "bind").is_some() && self.is_type_subtype_of(t, global_function_type)
+        self.symbols.get(members, "bind").is_some()
+            && self.is_type_subtype_of(t, global_function_type)
     }
 
     // Go: checker/checker.go:30902 getTypeWithFacts
     pub fn get_type_with_facts(&mut self, t: TypeId, include: TypeFacts) -> TypeId {
-        self.filter_type(t, &mut |c: &mut Checker, t: TypeId| c.has_type_facts(t, include))
+        self.filter_type(t, &mut |c: &mut Checker, t: TypeId| {
+            c.has_type_facts(t, include)
+        })
     }
 
     // Go: checker/checker.go:30911 getAdjustedTypeWithFacts
@@ -411,7 +457,10 @@ impl Checker {
     ) -> TypeId {
         let facts = self.get_type_facts(
             t,
-            TypeFacts::EQ_UNDEFINED | TypeFacts::EQ_NULL | TypeFacts::IS_UNDEFINED | TypeFacts::IS_NULL,
+            TypeFacts::EQ_UNDEFINED
+                | TypeFacts::EQ_NULL
+                | TypeFacts::IS_UNDEFINED
+                | TypeFacts::IS_NULL,
         );
         // Simply return the type if it never compares equal to the target nullable.
         if !facts.intersects(target_facts) {
@@ -510,7 +559,8 @@ impl Checker {
         diagnostic_message: Option<&'static Message>,
         args: Vec<String>,
     ) -> TypeId {
-        let awaited_type = self.get_awaited_type_no_alias_ex(t, error_node, diagnostic_message, args);
+        let awaited_type =
+            self.get_awaited_type_no_alias_ex(t, error_node, diagnostic_message, args);
         if awaited_type.is_some() {
             return self.create_awaited_type_if_needed(awaited_type);
         }
@@ -539,7 +589,10 @@ impl Checker {
             return t;
         }
         // If we've already cached an awaited type, return a possible `Awaited<T>` for it.
-        let key = CachedTypeKey { kind: CachedTypeKind::AWAITED_TYPE, type_id: t };
+        let key = CachedTypeKey {
+            kind: CachedTypeKind::AWAITED_TYPE,
+            type_id: t,
+        };
         if let Some(&awaited_type) = self.cached_types.get(&key) {
             if awaited_type.is_some() {
                 return awaited_type;
@@ -571,7 +624,11 @@ impl Checker {
             return t;
         }
         let mut this_type_for_error = TypeId::NIL;
-        let promised_type = self.get_promised_type_of_promise_ex(t, Node::NIL /*errorNode*/, Some(&mut this_type_for_error));
+        let promised_type = self.get_promised_type_of_promise_ex(
+            t,
+            Node::NIL, /*errorNode*/
+            Some(&mut this_type_for_error),
+        );
         if promised_type.is_some() {
             if t == promised_type || self.awaited_type_stack.contains(&promised_type) {
                 // Verify that we don't have a bad actor in the form of a promise whose
@@ -619,7 +676,12 @@ impl Checker {
             // Keep track of the type we're about to unwrap to avoid bad recursive promise types.
             // See the comments above for more information.
             self.awaited_type_stack.push(t);
-            let awaited_type = self.get_awaited_type_no_alias_ex(promised_type, error_node, diagnostic_message, args);
+            let awaited_type = self.get_awaited_type_no_alias_ex(
+                promised_type,
+                error_node,
+                diagnostic_message,
+                args,
+            );
             self.awaited_type_stack.pop();
             if awaited_type.is_nil() {
                 return TypeId::NIL;
@@ -655,8 +717,11 @@ impl Checker {
                     ));
                 }
                 // PORT: Go passes a possibly nil message; callers that pass an error node always pass one.
-                let message = diagnostic_message.expect("diagnostic message required with error node");
-                self.add_diagnostic(new_diagnostic_chain_for_node(diagnostic, error_node, message, args));
+                let message =
+                    diagnostic_message.expect("diagnostic message required with error node");
+                self.add_diagnostic(new_diagnostic_chain_for_node(
+                    diagnostic, error_node, message, args,
+                ));
             }
             return TypeId::NIL;
         }
@@ -692,9 +757,14 @@ impl Checker {
             // We only need `Awaited<T>` if `T` is a type variable that has no base constraint, or the base constraint of `T` is `any`, `unknown`, `{}`, `object`,
             // or is promise-like.
             if base_constraint.is_some() {
-                return self.ty(base_constraint).flags.intersects(TypeFlags::ANY_OR_UNKNOWN)
+                return self
+                    .ty(base_constraint)
+                    .flags
+                    .intersects(TypeFlags::ANY_OR_UNKNOWN)
                     || self.is_empty_object_type(base_constraint)
-                    || self.some_type(base_constraint, &mut |c: &mut Checker, t: TypeId| c.is_thenable_type(t));
+                    || self.some_type(base_constraint, &mut |c: &mut Checker, t: TypeId| {
+                        c.is_thenable_type(t)
+                    });
             }
             return self.maybe_type_of_kind(t, TypeFlags::TYPE_VARIABLE);
         }
@@ -737,9 +807,16 @@ impl Checker {
     // For a generic `Awaited<T>`, gets `T`.
     pub fn unwrap_awaited_type(&mut self, t: TypeId) -> TypeId {
         if self.ty(t).flags.intersects(TypeFlags::UNION) {
-            return self.map_type(t, &mut |c: &mut Checker, t: TypeId| c.unwrap_awaited_type(t));
+            return self.map_type(t, &mut |c: &mut Checker, t: TypeId| {
+                c.unwrap_awaited_type(t)
+            });
         } else if self.is_awaited_type_instantiation(t) {
-            return self.ty(t).alias.as_ref().expect("awaited alias").type_arguments[0];
+            return self
+                .ty(t)
+                .alias
+                .as_ref()
+                .expect("awaited alias")
+                .type_arguments[0];
         }
         t
     }
@@ -756,7 +833,9 @@ impl Checker {
             return false;
         }
         let then_type = self.get_type_with_facts(then_function, TypeFacts::NE_UNDEFINED_OR_NULL);
-        self.get_signatures_of_type(then_type, SignatureKind::CALL).len() != 0
+        self.get_signatures_of_type(then_type, SignatureKind::CALL)
+            .len()
+            != 0
     }
 
     // Go: checker/checker.go:31210 getAwaitedTypeOfPromise
@@ -810,7 +889,12 @@ impl Checker {
     }
 
     // Go: checker/checker.go:31243 getNarrowableTypeForReference
-    pub fn get_narrowable_type_for_reference(&mut self, t: TypeId, reference: Node, check_mode: CheckMode) -> TypeId {
+    pub fn get_narrowable_type_for_reference(
+        &mut self,
+        t: TypeId,
+        reference: Node,
+        check_mode: CheckMode,
+    ) -> TypeId {
         let mut t = t;
         if self.is_no_infer_type(t) {
             t = self.ty(t).as_substitution_type().base_type;
@@ -823,10 +907,15 @@ impl Checker {
         // parameter type 'T extends string | undefined' with a contextual type 'string', we substitute
         // 'string | undefined' to give control flow analysis the opportunity to narrow to type 'string'.
         let substitute_constraints = !check_mode.intersects(CheckMode::INFERENTIAL)
-            && self.some_type(t, &mut |c: &mut Checker, t: TypeId| c.is_generic_type_with_union_constraint(t))
-            && (self.is_constraint_position(t, reference) || self.has_contextual_type_with_no_generic_types(reference, check_mode));
+            && self.some_type(t, &mut |c: &mut Checker, t: TypeId| {
+                c.is_generic_type_with_union_constraint(t)
+            })
+            && (self.is_constraint_position(t, reference)
+                || self.has_contextual_type_with_no_generic_types(reference, check_mode));
         if substitute_constraints {
-            return self.map_type(t, &mut |c: &mut Checker, t: TypeId| c.get_base_constraint_or_type(t));
+            return self.map_type(t, &mut |c: &mut Checker, t: TypeId| {
+                c.get_base_constraint_or_type(t)
+            });
         }
         t
     }
@@ -840,12 +929,15 @@ impl Checker {
         if is_property_access_expression(parent) || is_qualified_name(parent) {
             return true;
         }
-        if (is_call_expression(parent) || is_new_expression(parent)) && parent.expression() == node {
+        if (is_call_expression(parent) || is_new_expression(parent)) && parent.expression() == node
+        {
             return true;
         }
         is_element_access_expression(parent)
             && parent.expression() == node
-            && !(self.some_type(t, &mut |c: &mut Checker, t: TypeId| c.is_generic_type_without_nullable_constraint(t)) && {
+            && !(self.some_type(t, &mut |c: &mut Checker, t: TypeId| {
+                c.is_generic_type_without_nullable_constraint(t)
+            }) && {
                 let index_type = self.get_type_of_expression(parent.argument_expression());
                 self.is_generic_index_type(index_type)
             })
@@ -855,20 +947,26 @@ impl Checker {
     pub fn is_generic_type_with_union_constraint(&mut self, t: TypeId) -> bool {
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
             let types = self.ty(t).types().to_vec();
-            return types.into_iter().any(|t| self.is_generic_type_with_union_constraint(t));
+            return types
+                .into_iter()
+                .any(|t| self.is_generic_type_with_union_constraint(t));
         }
         if !self.ty(t).flags.intersects(TypeFlags::INSTANTIABLE) {
             return false;
         }
         let constraint = self.get_base_constraint_or_type(t);
-        self.ty(constraint).flags.intersects(TypeFlags::NULLABLE | TypeFlags::UNION)
+        self.ty(constraint)
+            .flags
+            .intersects(TypeFlags::NULLABLE | TypeFlags::UNION)
     }
 
     // Go: checker/checker.go:31278 isGenericTypeWithoutNullableConstraint
     pub fn is_generic_type_without_nullable_constraint(&mut self, t: TypeId) -> bool {
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
             let types = self.ty(t).types().to_vec();
-            return types.into_iter().any(|t| self.is_generic_type_without_nullable_constraint(t));
+            return types
+                .into_iter()
+                .any(|t| self.is_generic_type_without_nullable_constraint(t));
         }
         if !self.ty(t).flags.intersects(TypeFlags::INSTANTIABLE) {
             return false;
@@ -878,13 +976,20 @@ impl Checker {
     }
 
     // Go: checker/checker.go:31285 hasContextualTypeWithNoGenericTypes
-    pub fn has_contextual_type_with_no_generic_types(&mut self, node: Node, check_mode: CheckMode) -> bool {
+    pub fn has_contextual_type_with_no_generic_types(
+        &mut self,
+        node: Node,
+        check_mode: CheckMode,
+    ) -> bool {
         // Computing the contextual type for a child of a JSX element involves resolving the type of the
         // element's tag name, so we exclude that here to avoid circularities.
         // If check mode has `CheckMode.RestBindingElement`, we skip binding pattern contextual types,
         // as we want the type of a rest element to be generic when possible.
-        if (is_identifier(node) || is_property_access_expression(node) || is_element_access_expression(node))
-            && !((is_jsx_opening_element(node.parent()) || is_jsx_self_closing_element(node.parent()))
+        if (is_identifier(node)
+            || is_property_access_expression(node)
+            || is_element_access_expression(node))
+            && !((is_jsx_opening_element(node.parent())
+                || is_jsx_self_closing_element(node.parent()))
                 && node.parent().tag_name() == node)
         {
             let context_flags = if check_mode.intersects(CheckMode::REST_BINDING_ELEMENT) {
@@ -903,7 +1008,9 @@ impl Checker {
     // Go: checker/checker.go:31300 getNonUndefinedType
     pub fn get_non_undefined_type(&mut self, t: TypeId) -> TypeId {
         let mut type_or_constraint = t;
-        if self.some_type(t, &mut |c: &mut Checker, t: TypeId| c.is_generic_type_with_undefined_constraint(t)) {
+        if self.some_type(t, &mut |c: &mut Checker, t: TypeId| {
+            c.is_generic_type_with_undefined_constraint(t)
+        }) {
             type_or_constraint = self.map_type(t, &mut |c: &mut Checker, t: TypeId| {
                 if c.ty(t).flags.intersects(TypeFlags::INSTANTIABLE) {
                     return c.get_base_constraint_or_type(t);
@@ -935,8 +1042,14 @@ impl Checker {
         if flags.intersects(TypeFlags::INDEXED_ACCESS) {
             let object_type = self.ty(t).as_indexed_access_type().object_type;
             let index_type = self.ty(t).as_indexed_access_type().index_type;
-            if self.ty(object_type).flags.intersects(TypeFlags::SUBSTITUTION)
-                || self.ty(index_type).flags.intersects(TypeFlags::SUBSTITUTION)
+            if self
+                .ty(object_type)
+                .flags
+                .intersects(TypeFlags::SUBSTITUTION)
+                || self
+                    .ty(index_type)
+                    .flags
+                    .intersects(TypeFlags::SUBSTITUTION)
             {
                 let object_actual = self.get_actual_type_variable(object_type);
                 let index_actual = self.get_actual_type_variable(index_type);
@@ -990,7 +1103,10 @@ impl Checker {
         if is_identifier(node) {
             if is_in_right_side_of_import_or_export_assignment(node) {
                 return self.get_symbol_of_name_or_property_access_expression(node);
-            } else if is_binding_element(parent) && is_object_binding_pattern(grand_parent) && node == parent.property_name() {
+            } else if is_binding_element(parent)
+                && is_object_binding_pattern(grand_parent)
+                && node == parent.property_name()
+            {
                 let type_of_pattern = self.get_type_of_node(grand_parent);
                 let property_declaration = self.get_property_of_type(type_of_pattern, node.text());
                 if property_declaration.is_some() {
@@ -1046,7 +1162,10 @@ impl Checker {
                     return self.get_symbol_of_name_or_property_access_expression(node);
                 }
                 if kind != SyntaxKind::ThisType {
-                    let container = self.get_this_container(node, false /*includeArrowFunctions*/, false /*includeClassComputedPropertyName*/);
+                    let container = self.get_this_container(
+                        node, false, /*includeArrowFunctions*/
+                        false, /*includeClassComputedPropertyName*/
+                    );
                     if is_function_like(container) {
                         let sig = self.get_signature_from_declaration(container);
                         let this_parameter = self.sig(sig).this_parameter;
@@ -1069,12 +1188,16 @@ impl Checker {
             SyntaxKind::ConstructorKeyword => {
                 // constructor keyword for an overload, should take us to the definition if it exist
                 let constructor_declaration = parent;
-                if constructor_declaration.is_some() && constructor_declaration.kind() == SyntaxKind::Constructor {
+                if constructor_declaration.is_some()
+                    && constructor_declaration.kind() == SyntaxKind::Constructor
+                {
                     return constructor_declaration.parent().symbol();
                 }
                 SymbolId::NIL
             }
-            SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral | SyntaxKind::NumericLiteral => {
+            SyntaxKind::StringLiteral
+            | SyntaxKind::NoSubstitutionTemplateLiteral
+            | SyntaxKind::NumericLiteral => {
                 // PORT: Go `fallthrough` from the string literal kinds into NumericLiteral.
                 if kind != SyntaxKind::NumericLiteral {
                     // 1). import x = require("./mo/*gotToDefinitionHere*/d")
@@ -1082,7 +1205,8 @@ impl Checker {
                     // 3). Require in Javascript
                     // 4). type A = import("./f/*gotToDefinitionHere*/oo")
                     if (is_external_module_import_equals_declaration(grand_parent)
-                        && get_external_module_import_equals_declaration_expression(grand_parent) == node)
+                        && get_external_module_import_equals_declaration_expression(grand_parent)
+                            == node)
                         || ((parent.kind() == SyntaxKind::ImportDeclaration
                             || parent.kind() == SyntaxKind::JsImportDeclaration
                             || parent.kind() == SyntaxKind::ExportDeclaration)
@@ -1095,7 +1219,10 @@ impl Checker {
                     {
                         return self.resolve_external_module_name(node, node, ignore_errors);
                     }
-                    if is_call_expression(parent) && is_bindable_object_define_property_call(parent) && parent.arguments().get(1) == node {
+                    if is_call_expression(parent)
+                        && is_bindable_object_define_property_call(parent)
+                        && parent.arguments().get(1) == node
+                    {
                         return self.get_symbol_of_declaration(parent);
                     }
                 }
@@ -1105,7 +1232,8 @@ impl Checker {
                     if parent.argument_expression() == node {
                         object_type = self.get_type_of_expression(parent.expression());
                     }
-                } else if is_literal_type_node(parent) && is_indexed_access_type_node(grand_parent) {
+                } else if is_literal_type_node(parent) && is_indexed_access_type_node(grand_parent)
+                {
                     object_type = self.get_type_from_type_node(grand_parent.object_type());
                 }
 
@@ -1135,7 +1263,10 @@ impl Checker {
             }
             SyntaxKind::ImportKeyword | SyntaxKind::NewKeyword => {
                 // PORT: Go `fallthrough` from ImportKeyword into NewKeyword.
-                if kind == SyntaxKind::ImportKeyword && is_meta_property(node.parent()) && node.parent().text() == "defer" {
+                if kind == SyntaxKind::ImportKeyword
+                    && is_meta_property(node.parent())
+                    && node.parent().text() == "defer"
+                {
                     return SymbolId::NIL;
                 }
                 if is_meta_property(parent) {
@@ -1147,8 +1278,11 @@ impl Checker {
             SyntaxKind::InstanceOfKeyword => {
                 if is_binary_expression(parent) {
                     let t = self.get_type_of_expression(parent.right());
-                    let has_instance_method_type = self.get_symbol_has_instance_method_of_object_type(t);
-                    if has_instance_method_type.is_some() && self.ty(has_instance_method_type).symbol.is_some() {
+                    let has_instance_method_type =
+                        self.get_symbol_has_instance_method_of_object_type(t);
+                    if has_instance_method_type.is_some()
+                        && self.ty(has_instance_method_type).symbol.is_some()
+                    {
                         return self.ty(has_instance_method_type).symbol;
                     }
                     return self.ty(t).symbol;

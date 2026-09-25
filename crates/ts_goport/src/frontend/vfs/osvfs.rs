@@ -214,7 +214,12 @@ pub fn os_fs_realpath(path: &str) -> String {
 
 impl OsFs {
     // Go: os.go:173 writeFileWithFlag
-    fn write_file_with_flag(&self, path: &str, content: &str, flag: WriteFlag) -> Result<(), FsError> {
+    fn write_file_with_flag(
+        &self,
+        path: &str,
+        content: &str,
+        flag: WriteFlag,
+    ) -> Result<(), FsError> {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).mode(0o666);
         match flag {
@@ -242,7 +247,12 @@ impl OsFs {
     }
 
     // Go: os.go:194 writeFileEnsuringDir
-    fn write_file_ensuring_dir(&self, path: &str, content: &str, flag: WriteFlag) -> Result<(), FsError> {
+    fn write_file_ensuring_dir(
+        &self,
+        path: &str,
+        content: &str,
+        flag: WriteFlag,
+    ) -> Result<(), FsError> {
         let _ = root_length(path); // Assert path is rooted
         if self.write_file_with_flag(path, content, flag).is_ok() {
             return Ok(());
@@ -328,7 +338,9 @@ fn os_string_to_string(s: std::ffi::OsString) -> String {
 // PORT: Go standard library. `os.DirFS(dir)` with the `Stat`, `ReadDir`
 // and `ReadFile` methods that `io/fs` helpers use.
 pub fn os_dir_fs(dir: &str) -> Option<Box<dyn IoFs>> {
-    Some(Box::new(DirFs { dir: dir.to_string() }))
+    Some(Box::new(DirFs {
+        dir: dir.to_string(),
+    }))
 }
 
 // Go: os/file.go dirFS
@@ -546,5 +558,6 @@ pub fn filepath_clean(path: &str) -> String {
         return ".".to_string();
     }
     // The input is valid UTF-8 and the cuts are at ASCII '/' bytes.
-    String::from_utf8(out).unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
+    String::from_utf8(out)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
 }

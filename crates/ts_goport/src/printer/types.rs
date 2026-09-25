@@ -3,8 +3,8 @@
 //! Ports `emitflags.go`, `generatedidentifierflags.go`, `emittextwriter.go`,
 //! `emitresolver.go`, `emithost.go` and `sourcefilemetadataprovider.go`.
 
-use crate::prelude::*;
 use crate::flags_macros::{go_enum, go_flags};
+use crate::prelude::*;
 
 // ──────────────────────────────────────────────────────────────────────
 // emitflags.go
@@ -176,7 +176,7 @@ pub struct SymbolAccessibilityResult {
     pub aliases_to_make_visible: Vec<Node>, // aliases that need to have this symbol visible
     pub error_symbol_name: String,          // Optional - symbol name that results in error
     pub error_node: Node,                   // Optional - node that results in error
-    pub error_module_name: String,          // Optional - If the symbol is not visible from module, module's name
+    pub error_module_name: String, // Optional - If the symbol is not visible from module, module's name
 }
 
 // Go: printer/emitresolver.go:33 TypeReferenceSerializationKind
@@ -247,7 +247,11 @@ pub trait EmitResolver {
     fn get_resolution_mode_override(&self, node: Node) -> ResolutionMode;
 
     // decorator metadata
-    fn get_type_reference_serialization_kind(&self, name: Node, serial_scope: Node) -> TypeReferenceSerializationKind;
+    fn get_type_reference_serialization_kind(
+        &self,
+        name: Node,
+        serial_scope: Node,
+    ) -> TypeReferenceSerializationKind;
 
     // const enum inlining
     fn get_constant_value(&self, node: Node) -> Option<LiteralValue>;
@@ -268,11 +272,20 @@ pub trait EmitResolver {
         should_compute_alias_to_mark_visible: bool,
     ) -> SymbolAccessibilityResult;
     // previously SymbolVisibilityResult in strada - ErrorModuleName never set
-    fn is_entity_name_visible(&self, entity_name: Node, enclosing_declaration: Node) -> SymbolAccessibilityResult;
+    fn is_entity_name_visible(
+        &self,
+        entity_name: Node,
+        enclosing_declaration: Node,
+    ) -> SymbolAccessibilityResult;
     fn is_expando_function_declaration(&self, node: Node) -> bool;
     fn is_expando_function_declaration_unsafe(&self, node: Node) -> bool;
     fn is_literal_const_declaration(&self, node: Node) -> bool;
-    fn requires_adding_implicit_undefined(&self, node: Node, symbol: SymbolId, enclosing_declaration: Node) -> bool;
+    fn requires_adding_implicit_undefined(
+        &self,
+        node: Node,
+        symbol: SymbolId,
+        enclosing_declaration: Node,
+    ) -> bool;
     fn is_declaration_visible(&self, node: Node) -> bool;
     fn is_name_resolvable(&self, location: Node, name: &str) -> bool;
     fn is_import_required_by_augmentation(&self, decl: Node) -> bool;
@@ -285,7 +298,12 @@ pub trait EmitResolver {
 
     // isolatedDeclarations-specific declaration emit
     fn get_properties_of_container_function(&self, node: Node) -> Vec<SymbolId>;
-    fn requires_adding_implicit_undefined_unsafe(&self, node: Node, symbol: SymbolId, enclosing_declaration: Node) -> bool;
+    fn requires_adding_implicit_undefined_unsafe(
+        &self,
+        node: Node,
+        symbol: SymbolId,
+        enclosing_declaration: Node,
+    ) -> bool;
 
     // Node construction for declaration emit
     fn create_type_of_declaration(
@@ -315,7 +333,12 @@ pub trait EmitResolver {
         internal_flags: InternalNodeBuilderFlags,
         tracker: EmitSymbolTracker,
     ) -> Vec<Node>;
-    fn create_literal_const_value(&self, emit_context: &EmitContext, node: Node, tracker: EmitSymbolTracker) -> Node;
+    fn create_literal_const_value(
+        &self,
+        emit_context: &EmitContext,
+        node: Node,
+        tracker: EmitSymbolTracker,
+    ) -> Node;
     fn create_type_of_expression(
         &self,
         emit_context: &EmitContext,

@@ -99,12 +99,17 @@ impl ParseTask {
             }
         }
 
-        loader.total_file_count.set(loader.total_file_count.get() + 1);
+        loader
+            .total_file_count
+            .set(loader.total_file_count.get() + 1);
         if self.lib_file.is_some() {
             loader.lib_file_count.set(loader.lib_file_count.get() + 1);
             // Default lib files are all scripts; we can safely skip looking up their package.json
             // to avoid adding spurious lookups to file watcher tracking.
-            self.metadata = SourceFileMetaData { implied_node_format: ModuleKind::COMMON_JS, ..Default::default() };
+            self.metadata = SourceFileMetaData {
+                implied_node_format: ModuleKind::COMMON_JS,
+                ..Default::default()
+            };
         } else {
             self.metadata = loader.load_source_file_meta_data(&self.normalized_file_path);
         }
@@ -114,19 +119,27 @@ impl ParseTask {
         };
 
         self.file = Some(file.clone());
-        self.sub_tasks =
-            Vec::with_capacity(file.referenced_files.len() + file.imports.len() + file.module_augmentations.len());
+        self.sub_tasks = Vec::with_capacity(
+            file.referenced_files.len() + file.imports.len() + file.module_augmentations.len(),
+        );
 
         let compiler_options = loader.opts.config.compiler_options();
         if !compiler_options.no_resolve.is_true() {
             for (index, ref_) in file.referenced_files.iter().enumerate() {
-                let (resolved_ref, processing_diagnostic) =
-                    loader.resolve_tripleslash_path_reference(&ref_.file_name, &file.file_name(), index as i32);
+                let (resolved_ref, processing_diagnostic) = loader
+                    .resolve_tripleslash_path_reference(
+                        &ref_.file_name,
+                        &file.file_name(),
+                        index as i32,
+                    );
                 if let Some(processing_diagnostic) = processing_diagnostic {
                     self.processing_diagnostics.push(processing_diagnostic);
                     continue;
                 }
-                self.add_sub_task(resolved_ref.expect("resolved reference without a diagnostic"), None);
+                self.add_sub_task(
+                    resolved_ref.expect("resolved reference without a diagnostic"),
+                    None,
+                );
             }
 
             loader.resolve_type_reference_directives(self);
@@ -154,7 +167,8 @@ impl ParseTask {
                         Some(lib_file),
                     );
                 } else {
-                    self.processing_diagnostics.push(new_unknown_reference_processing_diagnostic(include_reason));
+                    self.processing_diagnostics
+                        .push(new_unknown_reference_processing_diagnostic(include_reason));
                 }
             }
         }
@@ -287,14 +301,24 @@ impl FilesParser {
                 }
             };
 
-            self.queue.push(QueuedParseTask { task: task.clone(), data, loaded, depth });
+            self.queue.push(QueuedParseTask {
+                task: task.clone(),
+                data,
+                loaded,
+                depth,
+            });
         }
     }
 
     /// The body of the closure that Go `start` queues.
     // Go: filesparser.go:254 (*filesParser).start (queued func)
     fn run_queued(&mut self, loader: &FileLoader, queued: QueuedParseTask) {
-        let QueuedParseTask { task, data, loaded, depth } = queued;
+        let QueuedParseTask {
+            task,
+            data,
+            loaded,
+            depth,
+        } = queued;
 
         let mut start_subtasks = false;
         if loaded {
@@ -320,7 +344,11 @@ impl FilesParser {
             }
         }
 
-        let current_depth = if task.borrow().increase_depth { depth + 1 } else { depth };
+        let current_depth = if task.borrow().increase_depth {
+            depth + 1
+        } else {
+            depth
+        };
         {
             let mut d = data.borrow_mut();
             if current_depth < d.lowest_depth {
@@ -365,7 +393,8 @@ impl FilesParser {
 
         let mut missing_files: Vec<String> = Vec::new();
         let mut duplicate_source_files: Vec<DuplicateSourceFile> = Vec::new();
-        let mut files: Vec<Rc<ParsedSourceFile>> = Vec::with_capacity(total_file_count - lib_file_count);
+        let mut files: Vec<Rc<ParsedSourceFile>> =
+            Vec::with_capacity(total_file_count - lib_file_count);
         // totalFileCount here since we append files to it later to construct the final list
         let mut lib_files: Vec<Rc<ParsedSourceFile>> = Vec::with_capacity(total_file_count);
 
@@ -373,24 +402,47 @@ impl FilesParser {
         // stores 'filename -> file association' ignoring case
         // used to track cases when two file names differ only in casing
         let mut tasks_seen_by_name_ignore_case: Option<FxHashMap<String, ParseTaskRef>> =
-            if loader.compare_paths_options.use_case_sensitive_file_names { Some(FxHashMap::default()) } else { None };
+            if loader.compare_paths_options.use_case_sensitive_file_names {
+                Some(FxHashMap::default())
+            } else {
+                None
+            };
 
-        let mut include_processor = IncludeProcessor { file_include_reasons: FxHashMap::default(), ..Default::default() };
+        let mut include_processor = IncludeProcessor {
+            file_include_reasons: FxHashMap::default(),
+            ..Default::default()
+        };
         let mut output_file_to_project_reference_source: Option<FxHashMap<Path, String>> =
-            if !loader.opts.can_use_project_reference_source() { Some(FxHashMap::default()) } else { None };
-        let mut resolved_modules: FxHashMap<Path, ModeAwareCache<Rc<ResolvedModule>>> = FxHashMap::default();
-        let mut type_resolutions_in_file: FxHashMap<Path, ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>> =
+            if !loader.opts.can_use_project_reference_source() {
+                Some(FxHashMap::default())
+            } else {
+                None
+            };
+        let mut resolved_modules: FxHashMap<Path, ModeAwareCache<Rc<ResolvedModule>>> =
             FxHashMap::default();
+        let mut type_resolutions_in_file: FxHashMap<
+            Path,
+            ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>,
+        > = FxHashMap::default();
         let mut source_file_meta_datas: FxHashMap<Path, SourceFileMetaData> = FxHashMap::default();
-        let mut jsx_runtime_import_specifiers: Option<FxHashMap<Path, Rc<JsxRuntimeImportSpecifier>>> = None;
+        let mut jsx_runtime_import_specifiers: Option<
+            FxHashMap<Path, Rc<JsxRuntimeImportSpecifier>>,
+        > = None;
         let mut import_helpers_import_specifiers: Option<FxHashMap<Path, Node>> = None;
         let mut source_files_found_searching_node_modules: FxHashSet<Path> = FxHashSet::default();
         let mut lib_files_map: FxHashMap<Path, Rc<LibFile>> = FxHashMap::default();
 
         let mut redirect_targets_map: Option<FxHashMap<Path, Vec<String>>> = None;
         let mut redirect_files_by_path: Option<FxHashMap<Path, RedirectsFile>> = None;
-        let mut package_id_to_source_file: Option<FxHashMap<PackageId, Rc<ParsedSourceFile>>> = None;
-        if !loader.opts.config.compiler_options().deduplicate_packages.is_false() {
+        let mut package_id_to_source_file: Option<FxHashMap<PackageId, Rc<ParsedSourceFile>>> =
+            None;
+        if !loader
+            .opts
+            .config
+            .compiler_options()
+            .deduplicate_packages
+            .is_false()
+        {
             redirect_targets_map = Some(FxHashMap::default());
             package_id_to_source_file = Some(FxHashMap::default());
         }
@@ -414,9 +466,11 @@ impl FilesParser {
             include_processor: &'a mut IncludeProcessor,
             output_file_to_project_reference_source: &'a mut Option<FxHashMap<Path, String>>,
             resolved_modules: &'a mut FxHashMap<Path, ModeAwareCache<Rc<ResolvedModule>>>,
-            type_resolutions_in_file: &'a mut FxHashMap<Path, ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>>,
+            type_resolutions_in_file:
+                &'a mut FxHashMap<Path, ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>>,
             source_file_meta_datas: &'a mut FxHashMap<Path, SourceFileMetaData>,
-            jsx_runtime_import_specifiers: &'a mut Option<FxHashMap<Path, Rc<JsxRuntimeImportSpecifier>>>,
+            jsx_runtime_import_specifiers:
+                &'a mut Option<FxHashMap<Path, Rc<JsxRuntimeImportSpecifier>>>,
             import_helpers_import_specifiers: &'a mut Option<FxHashMap<Path, Node>>,
             source_files_found_searching_node_modules: &'a mut FxHashSet<Path>,
             lib_files_map: &'a mut FxHashMap<Path, Rc<LibFile>>,
@@ -438,16 +492,27 @@ impl FilesParser {
                     // to the reasons for including files.
                     let (has_redirect, is_automatic) = {
                         let t = task.borrow();
-                        (t.redirected_parse_task.is_some(), t.is_for_automatic_type_directive)
+                        (
+                            t.redirected_parse_task.is_some(),
+                            t.is_for_automatic_type_directive,
+                        )
                     };
                     if !has_redirect && !is_automatic {
                         let loaded_task = task.borrow().loaded_task.clone();
                         if let Some(loaded_task) = loaded_task {
                             task = loaded_task;
                         }
-                        self.parser.add_include_reason(self.include_processor, &task, include_reason.clone());
+                        self.parser.add_include_reason(
+                            self.include_processor,
+                            &task,
+                            include_reason.clone(),
+                        );
                     }
-                    let data = self.parser.task_data_by_path.get(&task.borrow().path).cloned();
+                    let data = self
+                        .parser
+                        .task_data_by_path
+                        .get(&task.borrow().path)
+                        .cloned();
                     if !task.borrow().loaded {
                         continue;
                     }
@@ -467,7 +532,13 @@ impl FilesParser {
                                 });
                             }
                         }
-                        if !loader.opts.config.compiler_options().force_consistent_casing_in_file_names.is_false() {
+                        if !loader
+                            .opts
+                            .config
+                            .compiler_options()
+                            .force_consistent_casing_in_file_names
+                            .is_false()
+                        {
                             // Check if it differs only in drive letters its ok to ignore that error:
                             let checked_absolute_path = get_normalized_absolute_path_without_root(
                                 &checked_name,
@@ -478,12 +549,15 @@ impl FilesParser {
                                 &loader.compare_paths_options.current_directory,
                             );
                             if checked_absolute_path != input_absolute_path {
-                                self.include_processor.add_processing_diagnostics_for_file_casing(
-                                    &task_path,
-                                    &checked_name,
-                                    &normalized_file_path,
-                                    include_reason.clone().expect("nil pointer dereference: includeReason"),
-                                );
+                                self.include_processor
+                                    .add_processing_diagnostics_for_file_casing(
+                                        &task_path,
+                                        &checked_name,
+                                        &normalized_file_path,
+                                        include_reason
+                                            .clone()
+                                            .expect("nil pointer dereference: includeReason"),
+                                    );
                             }
                         }
                         continue;
@@ -491,16 +565,23 @@ impl FilesParser {
                         self.seen.insert(data_key, normalized_file_path.clone());
                     }
 
-                    if let Some(tasks_seen_by_name_ignore_case) = self.tasks_seen_by_name_ignore_case.as_mut() {
+                    if let Some(tasks_seen_by_name_ignore_case) =
+                        self.tasks_seen_by_name_ignore_case.as_mut()
+                    {
                         let path_lower_case = to_file_name_lower_case(&task_path);
-                        if let Some(task_by_ignore_case) = tasks_seen_by_name_ignore_case.get(&path_lower_case) {
+                        if let Some(task_by_ignore_case) =
+                            tasks_seen_by_name_ignore_case.get(&path_lower_case)
+                        {
                             let t = task_by_ignore_case.borrow();
-                            self.include_processor.add_processing_diagnostics_for_file_casing(
-                                &t.path,
-                                &t.normalized_file_path,
-                                &normalized_file_path,
-                                include_reason.clone().expect("nil pointer dereference: includeReason"),
-                            );
+                            self.include_processor
+                                .add_processing_diagnostics_for_file_casing(
+                                    &t.path,
+                                    &t.normalized_file_path,
+                                    &normalized_file_path,
+                                    include_reason
+                                        .clone()
+                                        .expect("nil pointer dereference: includeReason"),
+                                );
                         } else {
                             tasks_seen_by_name_ignore_case.insert(path_lower_case, task.clone());
                         }
@@ -519,9 +600,12 @@ impl FilesParser {
                     let file = task.borrow().file.clone();
                     let data_package_id = data.borrow().package_id.clone();
                     let data_lowest_depth = data.borrow().lowest_depth;
-                    if let Some(package_id_to_source_file) = self.package_id_to_source_file.as_mut() {
+                    if let Some(package_id_to_source_file) = self.package_id_to_source_file.as_mut()
+                    {
                         if !data_package_id.name.is_empty() {
-                            if let Some(package_id_file) = package_id_to_source_file.get(&data_package_id).cloned() {
+                            if let Some(package_id_file) =
+                                package_id_to_source_file.get(&data_package_id).cloned()
+                            {
                                 if let Some(file) = &file {
                                     // Package deduplication keeps the first package instance in the
                                     // program, but we still parsed this file and acquired it through
@@ -537,10 +621,15 @@ impl FilesParser {
                                     .entry(package_id_file.path().clone())
                                     .or_default()
                                     .push(normalized_file_path.clone());
-                                let redirect_files_by_path = self
-                                    .redirect_files_by_path
-                                    .get_or_insert_with(|| FxHashMap::with_capacity_and_hasher(self.total_file_count, Default::default()));
-                                let index = (self.files.len() + redirect_files_by_path.len()) as i32;
+                                let redirect_files_by_path =
+                                    self.redirect_files_by_path.get_or_insert_with(|| {
+                                        FxHashMap::with_capacity_and_hasher(
+                                            self.total_file_count,
+                                            Default::default(),
+                                        )
+                                    });
+                                let index =
+                                    (self.files.len() + redirect_files_by_path.len()) as i32;
                                 redirect_files_by_path.insert(
                                     task_path.clone(),
                                     RedirectsFile {
@@ -550,13 +639,16 @@ impl FilesParser {
                                         target: package_id_file.path().clone(),
                                     },
                                 );
-                                self.files_by_path.insert(task_path.clone(), package_id_file);
+                                self.files_by_path
+                                    .insert(task_path.clone(), package_id_file);
                                 if data_lowest_depth > 0 {
-                                    self.source_files_found_searching_node_modules.insert(task_path.clone());
+                                    self.source_files_found_searching_node_modules
+                                        .insert(task_path.clone());
                                 }
                                 continue;
                             } else if let Some(file) = &file {
-                                package_id_to_source_file.insert(data_package_id.clone(), file.clone());
+                                package_id_to_source_file
+                                    .insert(data_package_id.clone(), file.clone());
                             }
                         }
                     }
@@ -581,9 +673,12 @@ impl FilesParser {
                     }
 
                     if t.is_for_automatic_type_directive {
-                        self.type_resolutions_in_file.insert(t.path.clone(), t.type_resolutions_in_file.clone());
+                        self.type_resolutions_in_file
+                            .insert(t.path.clone(), t.type_resolutions_in_file.clone());
                         if !t.processing_diagnostics.is_empty() {
-                            self.include_processor.processing_diagnostics.extend(t.processing_diagnostics.iter().cloned());
+                            self.include_processor
+                                .processing_diagnostics
+                                .extend(t.processing_diagnostics.iter().cloned());
                         }
                         continue;
                     }
@@ -591,7 +686,9 @@ impl FilesParser {
                     let path = t.path.clone();
 
                     if !t.processing_diagnostics.is_empty() {
-                        self.include_processor.processing_diagnostics.extend(t.processing_diagnostics.iter().cloned());
+                        self.include_processor
+                            .processing_diagnostics
+                            .extend(t.processing_diagnostics.iter().cloned());
                     }
 
                     let Some(file) = file else {
@@ -606,9 +703,12 @@ impl FilesParser {
                         self.files.push(file.clone());
                     }
                     self.files_by_path.insert(path.clone(), file);
-                    self.resolved_modules.insert(path.clone(), t.resolutions_in_file.clone());
-                    self.type_resolutions_in_file.insert(path.clone(), t.type_resolutions_in_file.clone());
-                    self.source_file_meta_datas.insert(path.clone(), t.metadata.clone());
+                    self.resolved_modules
+                        .insert(path.clone(), t.resolutions_in_file.clone());
+                    self.type_resolutions_in_file
+                        .insert(path.clone(), t.type_resolutions_in_file.clone());
+                    self.source_file_meta_datas
+                        .insert(path.clone(), t.metadata.clone());
 
                     if let Some(jsx_runtime_import_specifier) = &t.jsx_runtime_import_specifier {
                         self.jsx_runtime_import_specifiers
@@ -644,7 +744,8 @@ impl FilesParser {
             source_file_meta_datas: &mut source_file_meta_datas,
             jsx_runtime_import_specifiers: &mut jsx_runtime_import_specifiers,
             import_helpers_import_specifiers: &mut import_helpers_import_specifiers,
-            source_files_found_searching_node_modules: &mut source_files_found_searching_node_modules,
+            source_files_found_searching_node_modules:
+                &mut source_files_found_searching_node_modules,
             lib_files_map: &mut lib_files_map,
             redirect_targets_map: &mut redirect_targets_map,
             redirect_files_by_path: &mut redirect_files_by_path,
@@ -663,13 +764,26 @@ impl FilesParser {
             }
         }
 
-        let mut keys: Vec<Path> = loader.path_for_lib_file_resolutions.borrow().keys().cloned().collect();
+        let mut keys: Vec<Path> = loader
+            .path_for_lib_file_resolutions
+            .borrow()
+            .keys()
+            .cloned()
+            .collect();
         keys.sort();
         for key in keys {
-            let value = loader.path_for_lib_file_resolutions.borrow().get(&key).cloned().expect("key from the map");
+            let value = loader
+                .path_for_lib_file_resolutions
+                .borrow()
+                .get(&key)
+                .cloned()
+                .expect("key from the map");
             let mut cache: ModeAwareCache<Rc<ResolvedModule>> = ModeAwareCache::default();
             cache.insert(
-                ModeAwareCacheKey { name: value.library_name.clone(), mode: ModuleKind::COMMON_JS },
+                ModeAwareCacheKey {
+                    name: value.library_name.clone(),
+                    mode: ModuleKind::COMMON_JS,
+                },
                 value.resolution.clone(),
             );
             resolved_modules.insert(key, cache);
@@ -720,7 +834,9 @@ impl FilesParser {
             if let Some(existing) = include_processor.file_include_reasons.get_mut(&t.path) {
                 existing.push(reason);
             } else {
-                include_processor.file_include_reasons.insert(t.path.clone(), vec![reason]);
+                include_processor
+                    .file_include_reasons
+                    .insert(t.path.clone(), vec![reason]);
             }
         }
     }
@@ -728,7 +844,12 @@ impl FilesParser {
 
 /// Go `strings.Join(core.Flatten(supportedExtensions), "', '")`.
 pub(crate) fn join_flattened_extensions(extensions: &[Vec<String>]) -> String {
-    extensions.iter().flatten().map(String::as_str).collect::<Vec<_>>().join("', '")
+    extensions
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("', '")
 }
 
 /// Go `&processingDiagnostic{kind: processingDiagnosticKindExplainingFileInclude, data: &includeExplainingDiagnostic{...}}`.
@@ -757,4 +878,3 @@ pub(crate) fn new_unknown_reference_processing_diagnostic(
         data: ProcessingDiagnosticData::FileIncludeReason(include_reason),
     })
 }
-

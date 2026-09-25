@@ -33,7 +33,11 @@ impl Checker {
     // Return true if the given type reference node is directly aliased or if it needs to be deferred
     // because it is possibly contained in a circular chain of eagerly resolved types.
     // Go: checker/checker.go:23138 isDeferredTypeReferenceNode
-    pub fn is_deferred_type_reference_node(&mut self, node: Node, has_default_type_arguments: bool) -> bool {
+    pub fn is_deferred_type_reference_node(
+        &mut self,
+        node: Node,
+        has_default_type_arguments: bool,
+    ) -> bool {
         if self.get_alias_symbol_for_type_node(node).is_some() {
             return true;
         }
@@ -101,11 +105,12 @@ impl Checker {
             }
             SyntaxKind::TypeQuery => true,
             SyntaxKind::TypeOperator => {
-                node.operator() != SyntaxKind::UniqueKeyword && self.may_resolve_type_alias(node.type_())
+                node.operator() != SyntaxKind::UniqueKeyword
+                    && self.may_resolve_type_alias(node.type_())
             }
-            SyntaxKind::ParenthesizedType | SyntaxKind::OptionalType | SyntaxKind::NamedTupleMember => {
-                self.may_resolve_type_alias(node.type_())
-            }
+            SyntaxKind::ParenthesizedType
+            | SyntaxKind::OptionalType
+            | SyntaxKind::NamedTupleMember => self.may_resolve_type_alias(node.type_()),
             SyntaxKind::RestType => {
                 node.type_().kind() != SyntaxKind::ArrayType
                     || self.may_resolve_type_alias(node.type_().element_type())
@@ -119,7 +124,8 @@ impl Checker {
                 false
             }
             SyntaxKind::IndexedAccessType => {
-                self.may_resolve_type_alias(node.object_type()) || self.may_resolve_type_alias(node.index_type())
+                self.may_resolve_type_alias(node.object_type())
+                    || self.may_resolve_type_alias(node.index_type())
             }
             SyntaxKind::ConditionalType => {
                 self.may_resolve_type_alias(node.check_type())
@@ -132,7 +138,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:23198 createNormalizedTypeReference
-    pub fn create_normalized_type_reference(&mut self, target: TypeId, type_arguments: &[TypeId]) -> TypeId {
+    pub fn create_normalized_type_reference(
+        &mut self,
+        target: TypeId,
+        type_arguments: &[TypeId],
+    ) -> TypeId {
         if self.ty(target).object_flags.intersects(ObjectFlags::TUPLE) {
             return self.create_normalized_tuple_type(target, type_arguments);
         }
@@ -158,14 +168,19 @@ impl Checker {
             for (i, &e) in element_types.iter().enumerate() {
                 if i < element_infos.len()
                     && element_infos[i].flags.intersects(ElementFlags::VARIADIC)
-                    && self.ty(e).flags.intersects(TypeFlags::NEVER | TypeFlags::UNION)
+                    && self
+                        .ty(e)
+                        .flags
+                        .intersects(TypeFlags::NEVER | TypeFlags::UNION)
                 {
                     // Transform [A, ...(X | Y | Z)] into [A, ...X] | [A, ...Y] | [A, ...Z]
                     let check_types: Vec<TypeId> = element_types
                         .iter()
                         .enumerate()
                         .map(|(i, &t)| {
-                            if i < element_infos.len() && element_infos[i].flags.intersects(ElementFlags::VARIADIC) {
+                            if i < element_infos.len()
+                                && element_infos[i].flags.intersects(ElementFlags::VARIADIC)
+                            {
                                 t
                             } else {
                                 self.unknown_type
@@ -208,7 +223,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:23253 createNormalizedTupleType
-    pub fn create_normalized_tuple_type(&mut self, target: TypeId, element_types: &[TypeId]) -> TypeId {
+    pub fn create_normalized_tuple_type(
+        &mut self,
+        target: TypeId,
+        element_types: &[TypeId],
+    ) -> TypeId {
         self.create_normalized_tuple_type_ex(target, element_types, ObjectFlags::NONE)
     }
 }
@@ -228,7 +247,12 @@ pub struct TupleNormalizer {
 
 impl TupleNormalizer {
     // Go: checker/checker.go:23266 TupleNormalizer.normalize
-    pub fn normalize(&mut self, c: &mut Checker, element_types: &[TypeId], element_infos: &[TupleElementInfo]) -> bool {
+    pub fn normalize(
+        &mut self,
+        c: &mut Checker,
+        element_types: &[TypeId],
+        element_infos: &[TupleElementInfo],
+    ) -> bool {
         self.last_required_index = -1;
         self.first_rest_index = -1;
         self.last_optional_or_rest_index = -1;
@@ -239,9 +263,17 @@ impl TupleNormalizer {
                     self.add(
                         c,
                         t,
-                        TupleElementInfo { flags: ElementFlags::REST, labeled_declaration: info.labeled_declaration },
+                        TupleElementInfo {
+                            flags: ElementFlags::REST,
+                            labeled_declaration: info.labeled_declaration,
+                        },
                     );
-                } else if c.ty(t).flags.intersects(TypeFlags::INSTANTIABLE_NON_PRIMITIVE) || c.is_generic_mapped_type(t) {
+                } else if c
+                    .ty(t)
+                    .flags
+                    .intersects(TypeFlags::INSTANTIABLE_NON_PRIMITIVE)
+                    || c.is_generic_mapped_type(t)
+                {
                     // Generic variadic elements stay as they are.
                     self.add(c, t, info);
                 } else if c.is_tuple_type(t) {
@@ -274,7 +306,10 @@ impl TupleNormalizer {
                     self.add(
                         c,
                         s,
-                        TupleElementInfo { flags: ElementFlags::REST, labeled_declaration: info.labeled_declaration },
+                        TupleElementInfo {
+                            flags: ElementFlags::REST,
+                            labeled_declaration: info.labeled_declaration,
+                        },
                     );
                 }
             } else {
@@ -316,10 +351,17 @@ impl TupleNormalizer {
         if info.flags.intersects(ElementFlags::REST) && self.first_rest_index < 0 {
             self.first_rest_index = self.types.len() as i32;
         }
-        if info.flags.intersects(ElementFlags::OPTIONAL | ElementFlags::REST) {
+        if info
+            .flags
+            .intersects(ElementFlags::OPTIONAL | ElementFlags::REST)
+        {
             self.last_optional_or_rest_index = self.types.len() as i32;
         }
-        let t = c.add_optionality_ex(t, true /*isProperty*/, info.flags.intersects(ElementFlags::OPTIONAL));
+        let t = c.add_optionality_ex(
+            t,
+            true, /*isProperty*/
+            info.flags.intersects(ElementFlags::OPTIONAL),
+        );
         self.types.push(t);
         self.infos.push(info);
     }
@@ -374,13 +416,15 @@ impl Checker {
     pub fn is_array_type(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
         ty.object_flags.intersects(ObjectFlags::REFERENCE)
-            && (ty.target() == self.global_array_type || ty.target() == self.global_readonly_array_type)
+            && (ty.target() == self.global_array_type
+                || ty.target() == self.global_readonly_array_type)
     }
 
     // Go: checker/checker.go:23387 isReadonlyArrayType
     pub fn is_readonly_array_type(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
-        ty.object_flags.intersects(ObjectFlags::REFERENCE) && ty.target() == self.global_readonly_array_type
+        ty.object_flags.intersects(ObjectFlags::REFERENCE)
+            && ty.target() == self.global_readonly_array_type
     }
 
     // PORT: Go package function `isTupleType` reads type data, so it is a
@@ -389,14 +433,16 @@ impl Checker {
     pub fn is_tuple_type(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
         ty.object_flags.intersects(ObjectFlags::REFERENCE)
-            && self.ty(ty.target()).object_flags.intersects(ObjectFlags::TUPLE)
+            && self
+                .ty(ty.target())
+                .object_flags
+                .intersects(ObjectFlags::TUPLE)
     }
 
     // Go: checker/checker.go:23395 isMutableTupleType
     pub fn is_mutable_tuple_type(&self, t: TypeId) -> bool {
         self.is_tuple_type(t) && !self.target_tuple_type(t).readonly
     }
-
 
     // Go: checker/checker.go:23403 isSingleElementGenericTupleType
     pub fn is_single_element_generic_tuple_type(&self, t: TypeId) -> bool {
@@ -443,7 +489,11 @@ impl Checker {
         if self.is_mutable_array_or_tuple(t) {
             return true;
         }
-        if self.ty(t).flags.intersects(TypeFlags::ANY | TypeFlags::NULLABLE) {
+        if self
+            .ty(t)
+            .flags
+            .intersects(TypeFlags::ANY | TypeFlags::NULLABLE)
+        {
             return false;
         }
         let any_array_type = self.any_array_type;
@@ -488,7 +538,8 @@ impl Checker {
     // Go: checker/checker.go:23462 isArrayOrTupleOrIntersection
     pub fn is_array_or_tuple_or_intersection(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
-        ty.flags.intersects(TypeFlags::INTERSECTION) && ty.types().iter().all(|&t| self.is_array_or_tuple_type(t))
+        ty.flags.intersects(TypeFlags::INTERSECTION)
+            && ty.types().iter().all(|&t| self.is_array_or_tuple_type(t))
     }
 
     // Go: checker/checker.go:23466 getTupleElementType
@@ -498,12 +549,17 @@ impl Checker {
             return prop_type;
         }
         if self.every_type(t, &mut |c: &mut Checker, t: TypeId| c.is_tuple_type(t)) {
-            let undefined_like_type = if self.compiler_options.no_unchecked_indexed_access == Tristate::True {
-                self.undefined_type
-            } else {
-                TypeId::NIL
-            };
-            return self.get_tuple_element_type_out_of_start_count(t, Number::new(index as f64), undefined_like_type);
+            let undefined_like_type =
+                if self.compiler_options.no_unchecked_indexed_access == Tristate::True {
+                    self.undefined_type
+                } else {
+                    TypeId::NIL
+                };
+            return self.get_tuple_element_type_out_of_start_count(
+                t,
+                Number::new(index as f64),
+                undefined_like_type,
+            );
         }
         TypeId::NIL
     }
@@ -516,12 +572,19 @@ impl Checker {
     // Go: checker/checker.go:23482 getTypeFromTypeAliasReference
     pub fn get_type_from_type_alias_reference(&mut self, node: Node, symbol: SymbolId) -> TypeId {
         let type_arguments = node.type_arguments().to_vec();
-        if self.sym(symbol).check_flags.intersects(CheckFlags::UNRESOLVED) {
+        if self
+            .sym(symbol)
+            .check_flags
+            .intersects(CheckFlags::UNRESOLVED)
+        {
             let mut alias_type_arguments = Vec::new();
             for a in &type_arguments {
                 alias_type_arguments.push(self.get_type_from_type_node(*a));
             }
-            let alias = Rc::new(TypeAlias { symbol, type_arguments: alias_type_arguments });
+            let alias = Rc::new(TypeAlias {
+                symbol,
+                type_arguments: alias_type_arguments,
+            });
             let key = get_alias_key(&self.symbols, Some(&*alias));
             let mut error_type = self.error_types.get(&key).copied().unwrap_or_default();
             if error_type.is_nil() {
@@ -536,14 +599,24 @@ impl Checker {
         if type_parameters.len() != 0 {
             let num_type_arguments = type_arguments.len() as i32;
             let min_type_argument_count = self.get_min_type_argument_count(&type_parameters);
-            if num_type_arguments < min_type_argument_count || num_type_arguments > type_parameters.len() as i32 {
+            if num_type_arguments < min_type_argument_count
+                || num_type_arguments > type_parameters.len() as i32
+            {
                 let message = if min_type_argument_count == type_parameters.len() as i32 {
                     diag::Generic_type_0_requires_1_type_argument_s
                 } else {
                     diag::Generic_type_0_requires_between_1_and_2_type_arguments
                 };
                 let symbol_string = self.symbol_to_string(symbol);
-                self.error(node, message, args![symbol_string, min_type_argument_count, type_parameters.len()]);
+                self.error(
+                    node,
+                    message,
+                    args![
+                        symbol_string,
+                        min_type_argument_count,
+                        type_parameters.len()
+                    ],
+                );
                 return self.error_type;
             }
             // We refrain from associating a local type alias with an instantiation of a top-level type alias
@@ -552,19 +625,27 @@ impl Checker {
             // a .d.ts file. See #43622 for an example.
             let alias_symbol = self.get_alias_symbol_for_type_node(node);
             let mut new_alias_symbol = SymbolId::NIL;
-            if alias_symbol.is_some() && (self.is_local_type_alias(symbol) || !self.is_local_type_alias(alias_symbol)) {
+            if alias_symbol.is_some()
+                && (self.is_local_type_alias(symbol) || !self.is_local_type_alias(alias_symbol))
+            {
                 new_alias_symbol = alias_symbol;
             }
             let mut alias_type_arguments = Vec::new();
             if new_alias_symbol.is_some() {
                 alias_type_arguments = self.get_type_arguments_for_alias_symbol(new_alias_symbol);
             } else if is_type_reference_type(node) {
-                let alias_symbol = self.resolve_type_reference_name(node, SymbolFlags::ALIAS, true /*ignoreErrors*/);
+                let alias_symbol = self.resolve_type_reference_name(
+                    node,
+                    SymbolFlags::ALIAS,
+                    true, /*ignoreErrors*/
+                );
                 // refers to an alias import/export/reexport - by making sure we use the target as an aliasSymbol,
                 // we ensure the exported symbol is used to refer to the type when it is reserialized later
                 if alias_symbol.is_some() && alias_symbol != self.unknown_symbol {
                     let resolved = self.resolve_alias(alias_symbol);
-                    if resolved.is_some() && self.sym(resolved).flags.intersects(SymbolFlags::TYPE_ALIAS) {
+                    if resolved.is_some()
+                        && self.sym(resolved).flags.intersects(SymbolFlags::TYPE_ALIAS)
+                    {
                         new_alias_symbol = resolved;
                         alias_type_arguments = self.get_type_arguments_from_node(node);
                     }
@@ -572,7 +653,10 @@ impl Checker {
             }
             let mut new_alias = None;
             if new_alias_symbol.is_some() {
-                new_alias = Some(Rc::new(TypeAlias { symbol: new_alias_symbol, type_arguments: alias_type_arguments }));
+                new_alias = Some(Rc::new(TypeAlias {
+                    symbol: new_alias_symbol,
+                    type_arguments: alias_type_arguments,
+                }));
             }
             let args_from_node = self.get_type_arguments_from_node(node);
             return self.get_type_alias_instantiation(symbol, &args_from_node, new_alias);
@@ -641,8 +725,13 @@ impl Checker {
     // is a `Checker` method.
     // Go: checker/checker.go:23567 isLocalTypeAlias
     pub fn is_local_type_alias(&self, symbol: SymbolId) -> bool {
-        let declaration =
-            self.sym(symbol).declarations.iter().copied().find(|&d| is_type_alias(d)).unwrap_or_default();
+        let declaration = self
+            .sym(symbol)
+            .declarations
+            .iter()
+            .copied()
+            .find(|&d| is_type_alias(d))
+            .unwrap_or_default();
         declaration.is_some() && get_containing_function(declaration).is_some()
     }
 
@@ -700,7 +789,10 @@ impl Checker {
         let symbol = self.get_alias_symbol_for_type_node(node);
         if symbol.is_some() {
             let type_arguments = self.get_type_arguments_for_alias_symbol(symbol);
-            return Some(Rc::new(TypeAlias { symbol, type_arguments }));
+            return Some(Rc::new(TypeAlias {
+                symbol,
+                type_arguments,
+            }));
         }
         None
     }
@@ -728,9 +820,16 @@ impl Checker {
     }
 
     // Go: checker/checker.go:23639 getOuterTypeParametersOfClassOrInterface
-    pub fn get_outer_type_parameters_of_class_or_interface(&mut self, symbol: SymbolId) -> Vec<TypeId> {
+    pub fn get_outer_type_parameters_of_class_or_interface(
+        &mut self,
+        symbol: SymbolId,
+    ) -> Vec<TypeId> {
         let mut declaration = self.sym(symbol).value_declaration;
-        if !self.sym(symbol).flags.intersects(SymbolFlags::CLASS | SymbolFlags::FUNCTION) {
+        if !self
+            .sym(symbol)
+            .flags
+            .intersects(SymbolFlags::CLASS | SymbolFlags::FUNCTION)
+        {
             declaration = self
                 .sym(symbol)
                 .declarations
@@ -757,7 +856,11 @@ impl Checker {
 
     // Return the outer type parameters of a node or undefined if the node has no outer type parameters.
     // Go: checker/checker.go:23658 getOuterTypeParameters
-    pub fn get_outer_type_parameters(&mut self, node: Node, include_this_types: bool) -> Vec<TypeId> {
+    pub fn get_outer_type_parameters(
+        &mut self,
+        node: Node,
+        include_this_types: bool,
+    ) -> Vec<TypeId> {
         let mut node = node;
         loop {
             node = node.parent();
@@ -782,7 +885,8 @@ impl Checker {
                 | SyntaxKind::JsTypeAliasDeclaration
                 | SyntaxKind::MappedType
                 | SyntaxKind::ConditionalType => {
-                    let mut outer_type_parameters = self.get_outer_type_parameters(node, include_this_types);
+                    let mut outer_type_parameters =
+                        self.get_outer_type_parameters(node, include_this_types);
                     if (kind == SyntaxKind::FunctionExpression
                         || kind == SyntaxKind::ArrowFunction
                         || is_object_literal_method(node))
@@ -796,7 +900,8 @@ impl Checker {
                             .copied()
                             .unwrap_or_default();
                         if signature.is_some() && self.sig(signature).type_parameters.len() != 0 {
-                            outer_type_parameters.extend(self.sig(signature).type_parameters.iter().copied());
+                            outer_type_parameters
+                                .extend(self.sig(signature).type_parameters.iter().copied());
                             return outer_type_parameters;
                         }
                     }
@@ -811,8 +916,10 @@ impl Checker {
                         outer_type_parameters.extend(infer_type_parameters);
                         return outer_type_parameters;
                     }
-                    let mut outer_and_own_type_parameters =
-                        self.append_type_parameters(outer_type_parameters, &node.type_parameters().to_vec());
+                    let mut outer_and_own_type_parameters = self.append_type_parameters(
+                        outer_type_parameters,
+                        &node.type_parameters().to_vec(),
+                    );
                     let mut this_type = TypeId::NIL;
                     if include_this_types
                         && (kind == SyntaxKind::ClassDeclaration
@@ -840,7 +947,11 @@ impl Checker {
         // PORT: Go ranges over the locals map (random order). We use the
         // symbol table insertion order, which is declaration order.
         for symbol in self.symbols.values(node.locals()) {
-            if self.sym(symbol).flags.intersects(SymbolFlags::TYPE_PARAMETER) {
+            if self
+                .sym(symbol)
+                .flags
+                .intersects(SymbolFlags::TYPE_PARAMETER)
+            {
                 let t = self.get_declared_type_of_symbol(symbol);
                 result.push(t);
             }
@@ -851,7 +962,10 @@ impl Checker {
     // The local type parameters are the combined set of type parameters from all declarations of the class,
     // interface, or type alias.
     // Go: checker/checker.go:23708 getLocalTypeParametersOfClassOrInterfaceOrTypeAlias
-    pub fn get_local_type_parameters_of_class_or_interface_or_type_alias(&mut self, symbol: SymbolId) -> Vec<TypeId> {
+    pub fn get_local_type_parameters_of_class_or_interface_or_type_alias(
+        &mut self,
+        symbol: SymbolId,
+    ) -> Vec<TypeId> {
         self.append_local_type_parameters_of_class_or_interface_or_type_alias(Vec::new(), symbol)
     }
 
@@ -865,7 +979,11 @@ impl Checker {
         for node in self.sym(symbol).declarations.clone() {
             if node_kind_is(
                 node,
-                &[SyntaxKind::InterfaceDeclaration, SyntaxKind::ClassDeclaration, SyntaxKind::ClassExpression],
+                &[
+                    SyntaxKind::InterfaceDeclaration,
+                    SyntaxKind::ClassDeclaration,
+                    SyntaxKind::ClassExpression,
+                ],
             ) || is_type_alias(node)
             {
                 types = self.append_type_parameters(types, &node.type_parameters().to_vec());
@@ -878,7 +996,11 @@ impl Checker {
     // The function allocates a new array if the input type parameter set is undefined, but otherwise it modifies the set
     // in-place and returns the same array.
     // Go: checker/checker.go:23724 appendTypeParameters
-    pub fn append_type_parameters(&mut self, type_parameters: Vec<TypeId>, declarations: &[Node]) -> Vec<TypeId> {
+    pub fn append_type_parameters(
+        &mut self,
+        type_parameters: Vec<TypeId>,
+        declarations: &[Node],
+    ) -> Vec<TypeId> {
         let mut type_parameters = type_parameters;
         for &declaration in declarations {
             let symbol = self.get_symbol_of_declaration(declaration);
@@ -905,7 +1027,10 @@ impl Checker {
         if self.type_alias_links.get(symbol).declared_type.is_nil() {
             // Note that we use the links object as the target here because the symbol object is used as the unique
             // identity for resolution of the 'type' property in SymbolLinks.
-            if !self.push_type_resolution(TypeSystemEntity::Symbol(symbol), TypeSystemPropertyName::DECLARED_TYPE) {
+            if !self.push_type_resolution(
+                TypeSystemEntity::Symbol(symbol),
+                TypeSystemPropertyName::DECLARED_TYPE,
+            ) {
                 return self.error_type;
             }
             let declaration = self
@@ -918,7 +1043,8 @@ impl Checker {
             let type_node = declaration.type_();
             let mut t = self.get_type_from_type_node(type_node);
             if self.pop_type_resolution() {
-                let type_parameters = self.get_local_type_parameters_of_class_or_interface_or_type_alias(symbol);
+                let type_parameters =
+                    self.get_local_type_parameters_of_class_or_interface_or_type_alias(symbol);
                 if type_parameters.len() != 0 {
                     // Initialize the instantiation cache for generic type aliases. The declared type corresponds to
                     // an instantiation of the type alias with the type parameters supplied as type arguments.
@@ -929,7 +1055,9 @@ impl Checker {
                     instantiations.insert(key, t);
                     links.instantiations = Some(instantiations);
                 }
-                if t == self.intrinsic_marker_type && self.sym(symbol).name == "BuiltinIteratorReturn" {
+                if t == self.intrinsic_marker_type
+                    && self.sym(symbol).name == "BuiltinIteratorReturn"
+                {
                     t = self.get_builtin_iterator_return_type();
                 }
             } else {
@@ -938,7 +1066,11 @@ impl Checker {
                     error_node = declaration;
                 }
                 let symbol_string = self.symbol_to_string(symbol);
-                self.error(error_node, diag::Type_alias_0_circularly_references_itself, args![symbol_string]);
+                self.error(
+                    error_node,
+                    diag::Type_alias_0_circularly_references_itself,
+                    args![symbol_string],
+                );
                 t = self.error_type;
             }
             let links = self.type_alias_links.get(symbol);
@@ -975,7 +1107,10 @@ impl Checker {
                 self.get_union_type_ex(
                     &member_type_list,
                     UnionReduction::LITERAL,
-                    Some(Rc::new(TypeAlias { symbol, type_arguments: Vec::new() })),
+                    Some(Rc::new(TypeAlias {
+                        symbol,
+                        type_arguments: Vec::new(),
+                    })),
                     TypeId::NIL, /*origin*/
                 )
             } else {
@@ -1024,7 +1159,10 @@ impl Checker {
     // Go: checker/checker.go:23840 computeEnumMemberValues
     pub fn compute_enum_member_values(&mut self, node: Node) {
         let node_links = self.node_links.get(node);
-        if !(node_links.flags.intersects(NodeCheckFlags::ENUM_VALUES_COMPUTED)) {
+        if !(node_links
+            .flags
+            .intersects(NodeCheckFlags::ENUM_VALUES_COMPUTED))
+        {
             node_links.flags |= NodeCheckFlags::ENUM_VALUES_COMPUTED;
             let mut auto_value: Option<Number> = Some(Number::new(0.0));
             let mut previous = Node::NIL;
@@ -1054,13 +1192,25 @@ impl Checker {
         previous: Node,
     ) -> EvaluatorResult {
         if is_computed_non_literal_name(member.name()) {
-            self.error(member.name(), diag::Computed_property_names_are_not_allowed_in_enums, vec![]);
+            self.error(
+                member.name(),
+                diag::Computed_property_names_are_not_allowed_in_enums,
+                vec![],
+            );
         } else if is_big_int_literal(member.name()) {
-            self.error(member.name(), diag::An_enum_member_cannot_have_a_numeric_name, vec![]);
+            self.error(
+                member.name(),
+                diag::An_enum_member_cannot_have_a_numeric_name,
+                vec![],
+            );
         } else {
             let text = get_text_of_property_name(member.name());
             if is_numeric_literal_name(&text) && !is_infinity_or_nan_string(&text) {
-                self.error(member.name(), diag::An_enum_member_cannot_have_a_numeric_name, vec![]);
+                self.error(
+                    member.name(),
+                    diag::An_enum_member_cannot_have_a_numeric_name,
+                    vec![],
+                );
             }
         }
         if member.initializer().is_some() {
@@ -1068,7 +1218,8 @@ impl Checker {
         }
         // In ambient non-const numeric enum declarations, enum members without initializers are
         // considered computed members (as opposed to having auto-incremented values).
-        if member.parent().flags().intersects(NodeFlags::AMBIENT) && !is_enum_const(member.parent()) {
+        if member.parent().flags().intersects(NodeFlags::AMBIENT) && !is_enum_const(member.parent())
+        {
             return new_result(None, false, false, false);
         }
         // If the member declaration specifies no value, the member is considered a constant enum member.
@@ -1076,10 +1227,17 @@ impl Checker {
         // Otherwise, it is assigned the value of the immediately preceding member plus one, and an error
         // occurs if the immediately preceding member is not a constant enum member.
         let Some(auto_value) = auto_value else {
-            self.error(member.name(), diag::Enum_member_must_have_initializer, vec![]);
+            self.error(
+                member.name(),
+                diag::Enum_member_must_have_initializer,
+                vec![],
+            );
             return new_result(None, false, false, false);
         };
-        if self.compiler_options.get_isolated_modules() && previous.is_some() && previous.initializer().is_some() {
+        if self.compiler_options.get_isolated_modules()
+            && previous.is_some()
+            && previous.initializer().is_some()
+        {
             let prev_value = self.get_enum_member_value(previous);
             let prev_is_num = matches!(prev_value.value, Some(LiteralValue::Number(_)));
             if !prev_is_num || prev_value.resolved_other_files {
@@ -1117,8 +1275,11 @@ impl Checker {
                 }
             }
             if self.compiler_options.get_isolated_modules() {
-                if matches!(result.value, Some(LiteralValue::String(_))) && !result.is_syntactically_string {
-                    let member_name = format!("{}.{}", member.parent().name().text(), member.name().text());
+                if matches!(result.value, Some(LiteralValue::String(_)))
+                    && !result.is_syntactically_string
+                {
+                    let member_name =
+                        format!("{}.{}", member.parent().name().text(), member.name().text());
                     self.error(
                         initializer,
                         diag::X_0_has_a_string_type_but_must_have_syntactically_recognizable_string_syntax_when_isolatedModules_is_enabled,
@@ -1127,7 +1288,11 @@ impl Checker {
                 }
             }
         } else if is_const_enum {
-            self.error(initializer, diag::X_const_enum_member_initializers_must_be_constant_expressions, vec![]);
+            self.error(
+                initializer,
+                diag::X_const_enum_member_initializers_must_be_constant_expressions,
+                vec![],
+            );
         } else if member.parent().flags().intersects(NodeFlags::AMBIENT) {
             self.error(
                 initializer,
@@ -1151,13 +1316,24 @@ impl Checker {
     pub fn evaluate_entity(&mut self, expr: Node, location: Node) -> EvaluatorResult {
         match expr.kind() {
             SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression => {
-                let symbol = self.resolve_entity_name(expr, SymbolFlags::VALUE, true /*ignoreErrors*/, false, Node::NIL);
+                let symbol = self.resolve_entity_name(
+                    expr,
+                    SymbolFlags::VALUE,
+                    true, /*ignoreErrors*/
+                    false,
+                    Node::NIL,
+                );
                 if symbol.is_nil() {
                     return new_result(None, false, false, false);
                 }
                 if expr.kind() == SyntaxKind::Identifier {
                     if is_infinity_or_nan_string(expr.text())
-                        && (symbol == self.get_global_symbol(expr.text(), SymbolFlags::VALUE, None /*diagnostic*/))
+                        && (symbol
+                            == self.get_global_symbol(
+                                expr.text(),
+                                SymbolFlags::VALUE,
+                                None, /*diagnostic*/
+                            ))
                     {
                         // Technically we resolved a global lib file here, but the decision to treat this as numeric
                         // is more predicated on the fact that the single-file resolution *didn't* resolve to a
@@ -1185,11 +1361,17 @@ impl Checker {
                         && declaration.initializer().is_some()
                         && (location.is_nil()
                             || declaration != location
-                                && self.is_block_scoped_name_declared_before_use(declaration, location))
+                                && self.is_block_scoped_name_declared_before_use(
+                                    declaration,
+                                    location,
+                                ))
                     {
                         let ev = self.evaluate.clone();
                         let result = ev(self, declaration.initializer(), declaration);
-                        if location.is_some() && get_source_file_of_node(location) != get_source_file_of_node(declaration) {
+                        if location.is_some()
+                            && get_source_file_of_node(location)
+                                != get_source_file_of_node(declaration)
+                        {
                             return new_result(result.value, false, true, true);
                         }
                         return new_result(
@@ -1204,10 +1386,19 @@ impl Checker {
             }
             SyntaxKind::ElementAccessExpression => {
                 let root = expr.expression();
-                if is_entity_name_expression(root) && is_string_literal_like(expr.argument_expression()) {
-                    let root_symbol =
-                        self.resolve_entity_name(root, SymbolFlags::VALUE, true /*ignoreErrors*/, false, Node::NIL);
-                    if root_symbol.is_some() && self.sym(root_symbol).flags.intersects(SymbolFlags::ENUM) {
+                if is_entity_name_expression(root)
+                    && is_string_literal_like(expr.argument_expression())
+                {
+                    let root_symbol = self.resolve_entity_name(
+                        root,
+                        SymbolFlags::VALUE,
+                        true, /*ignoreErrors*/
+                        false,
+                        Node::NIL,
+                    );
+                    if root_symbol.is_some()
+                        && self.sym(root_symbol).flags.intersects(SymbolFlags::ENUM)
+                    {
                         let name = expr.argument_expression().text();
                         let exports = self.sym(root_symbol).exports;
                         let member = self.symbols.get(exports, name);
@@ -1227,11 +1418,20 @@ impl Checker {
     }
 
     // Go: checker/checker.go:23979 evaluateEnumMember
-    pub fn evaluate_enum_member(&mut self, expr: Node, symbol: SymbolId, location: Node) -> EvaluatorResult {
+    pub fn evaluate_enum_member(
+        &mut self,
+        expr: Node,
+        symbol: SymbolId,
+        location: Node,
+    ) -> EvaluatorResult {
         let declaration = self.sym(symbol).value_declaration;
         if declaration.is_nil() || declaration == location {
             let symbol_string = self.symbol_to_string(symbol);
-            self.error(expr, diag::Property_0_is_used_before_being_assigned, args![symbol_string]);
+            self.error(
+                expr,
+                diag::Property_0_is_used_before_being_assigned,
+                args![symbol_string],
+            );
             return new_result(None, false, false, false);
         }
         if !self.is_block_scoped_name_declared_before_use(declaration, location) {
@@ -1240,7 +1440,12 @@ impl Checker {
                 diag::A_member_initializer_in_a_enum_declaration_cannot_reference_members_declared_after_it_including_members_defined_in_other_enums,
                 vec![],
             );
-            return new_result(Some(LiteralValue::Number(Number::new(0.0))), false, false, false);
+            return new_result(
+                Some(LiteralValue::Number(Number::new(0.0))),
+                false,
+                false,
+                false,
+            );
         }
         let value = self.get_enum_member_value(declaration);
         if location.parent() != declaration.parent() {
@@ -1300,7 +1505,12 @@ impl Checker {
                 if node.kind() == SyntaxKind::TupleType && node.elements().len() == 0 {
                     resolved_type = target;
                 } else {
-                    resolved_type = self.create_deferred_type_reference(target, node, MapperId::NIL /*mapper*/, None /*alias*/);
+                    resolved_type = self.create_deferred_type_reference(
+                        target,
+                        node,
+                        MapperId::NIL, /*mapper*/
+                        None,          /*alias*/
+                    );
                 }
             } else {
                 let element_types = if node.kind() == SyntaxKind::ArrayType {
@@ -1313,9 +1523,17 @@ impl Checker {
                     types
                 };
                 if self.ty(target).object_flags.intersects(ObjectFlags::TUPLE) {
-                    resolved_type = self.create_normalized_tuple_type_ex(target, &element_types, ObjectFlags::FROM_TYPE_NODE);
+                    resolved_type = self.create_normalized_tuple_type_ex(
+                        target,
+                        &element_types,
+                        ObjectFlags::FROM_TYPE_NODE,
+                    );
                 } else {
-                    resolved_type = self.create_type_reference_ex(target, &element_types, ObjectFlags::FROM_TYPE_NODE);
+                    resolved_type = self.create_type_reference_ex(
+                        target,
+                        &element_types,
+                        ObjectFlags::FROM_TYPE_NODE,
+                    );
                 }
             }
             self.type_node_links.get(node).resolved_type = resolved_type;

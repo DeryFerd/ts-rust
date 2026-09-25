@@ -181,7 +181,10 @@ impl JsonValueElement for ExportsOrImports {
 }
 
 // Go: jsonvalue.go:125 unmarshalJSONValueV2
-fn unmarshal_json_value_v2<T: JsonValueElement>(v: &mut JSONValue, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+fn unmarshal_json_value_v2<T: JsonValueElement>(
+    v: &mut JSONValue,
+    dec: &mut JsonDecoder<'_>,
+) -> Result<(), JsonError> {
     match dec.peek_kind() {
         b'n' => {
             // json.Null.Kind()
@@ -260,17 +263,24 @@ fn unmarshal_any(dec: &mut JsonDecoder<'_>, value: &mut JsonAny) -> Result<(), J
             _ => {
                 // An invalid kind: ReadValue reports the syntax error.
                 dec.read_value()?;
-                Err(JsonError { message: "invalid JSON value".to_string() })
+                Err(JsonError {
+                    message: "invalid JSON value".to_string(),
+                })
             }
         },
         JsonAny::String(s) => s.unmarshal_json_from(dec),
         JsonAny::Bool(b) => b.unmarshal_json_from(dec),
         JsonAny::Number(n) => n.unmarshal_json_from(dec),
-        JsonAny::Array(_) | JsonAny::ExportsArray(_) | JsonAny::Object(_) | JsonAny::ExportsObject(_) => {
+        JsonAny::Array(_)
+        | JsonAny::ExportsArray(_)
+        | JsonAny::Object(_)
+        | JsonAny::ExportsObject(_) => {
             // The slice arshaler and `OrderedMap.UnmarshalJSONFrom` both
             // reject a scalar after they consume it.
             dec.skip_value()?;
-            Err(JsonError { message: "cannot unmarshal JSON scalar into existing array or object".to_string() })
+            Err(JsonError {
+                message: "cannot unmarshal JSON scalar into existing array or object".to_string(),
+            })
         }
     }
 }
@@ -288,7 +298,9 @@ impl<V: UnmarshalerFrom + Default> UnmarshalerFrom for IndexMap<String, V> {
             return Ok(());
         }
         if token.kind() != b'{' {
-            return Err(JsonError { message: "cannot unmarshal non-object JSON value into Map".to_string() });
+            return Err(JsonError {
+                message: "cannot unmarshal non-object JSON value into Map".to_string(),
+            });
         }
         while dec.peek_kind() != b'}' {
             let mut key = String::new();
@@ -356,7 +368,12 @@ impl<T: UnmarshalerFrom + ExpectedJsonKind + Default + Clone> Expected<T> {
     // PORT: never fails, like Go. `data` is one complete JSON value.
     pub fn unmarshal_json(&mut self, data: &[u8]) {
         if data == b"null" {
-            *self = Expected { null: true, actual_json_type: "null", valid: false, value: T::default() };
+            *self = Expected {
+                null: true,
+                actual_json_type: "null",
+                valid: false,
+                value: T::default(),
+            };
             return;
         }
         if json_unmarshal(data, &mut self.value, &[]).is_ok() {
@@ -415,7 +432,12 @@ impl<T: UnmarshalerFrom + ExpectedJsonKind + Default + Clone> UnmarshalerFrom fo
 // Go: expected.go:73 ExpectedOf
 #[must_use]
 pub fn expected_of<T: ExpectedJsonKind>(value: T) -> Expected<T> {
-    Expected { value, valid: true, actual_json_type: T::JSON_TYPE, null: false }
+    Expected {
+        value,
+        valid: true,
+        actual_json_type: T::JSON_TYPE,
+        null: false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +531,8 @@ impl ExportsOrImports {
 
     // Go: exportsorimports.go:58 initObjectKind
     fn init_object_kind(&mut self) {
-        if self.object_kind == ObjectKind::Unknown && self.json_value.type_ == JSONValueType::OBJECT {
+        if self.object_kind == ObjectKind::Unknown && self.json_value.type_ == JSONValueType::OBJECT
+        {
             let obj = self.as_object();
             if !obj.is_empty() {
                 let (mut seen_dot, mut seen_hash, mut seen_other) = (false, false, false);
@@ -708,8 +731,11 @@ impl UnmarshalerFrom for Fields {
             b'{' => {
                 dec.read_token()?;
                 dec.disable_namespace();
-                let mut seen: Option<FxHashSet<String>> =
-                    if dec.options.allow_duplicate_names { None } else { Some(FxHashSet::default()) };
+                let mut seen: Option<FxHashSet<String>> = if dec.options.allow_duplicate_names {
+                    None
+                } else {
+                    Some(FxHashSet::default())
+                };
                 while dec.peek_kind() != b'}' {
                     let JsonToken::String(name) = dec.read_token()? else {
                         unreachable!("the decoder only reads strings as object names")
@@ -717,7 +743,9 @@ impl UnmarshalerFrom for Fields {
                     if let Some(seen) = &mut seen
                         && !seen.insert(name.clone())
                     {
-                        return Err(JsonError { message: format!("duplicate object member name {name:?}") });
+                        return Err(JsonError {
+                            message: format!("duplicate object member name {name:?}"),
+                        });
                     }
                     match name.as_str() {
                         "name" => json_unmarshal_decode(dec, &mut self.header_fields.name)?,
@@ -727,14 +755,27 @@ impl UnmarshalerFrom for Fields {
                         "main" => json_unmarshal_decode(dec, &mut self.path_fields.main)?,
                         "types" => json_unmarshal_decode(dec, &mut self.path_fields.types)?,
                         "typings" => json_unmarshal_decode(dec, &mut self.path_fields.typings)?,
-                        "typesVersions" => json_unmarshal_decode(dec, &mut self.path_fields.types_versions)?,
+                        "typesVersions" => {
+                            json_unmarshal_decode(dec, &mut self.path_fields.types_versions)?
+                        }
                         "imports" => json_unmarshal_decode(dec, &mut self.path_fields.imports)?,
                         "exports" => json_unmarshal_decode(dec, &mut self.path_fields.exports)?,
-                        "dependencies" => json_unmarshal_decode(dec, &mut self.dependency_fields.dependencies)?,
-                        "devDependencies" => json_unmarshal_decode(dec, &mut self.dependency_fields.dev_dependencies)?,
-                        "peerDependencies" => json_unmarshal_decode(dec, &mut self.dependency_fields.peer_dependencies)?,
+                        "dependencies" => {
+                            json_unmarshal_decode(dec, &mut self.dependency_fields.dependencies)?
+                        }
+                        "devDependencies" => json_unmarshal_decode(
+                            dec,
+                            &mut self.dependency_fields.dev_dependencies,
+                        )?,
+                        "peerDependencies" => json_unmarshal_decode(
+                            dec,
+                            &mut self.dependency_fields.peer_dependencies,
+                        )?,
                         "optionalDependencies" => {
-                            json_unmarshal_decode(dec, &mut self.dependency_fields.optional_dependencies)?;
+                            json_unmarshal_decode(
+                                dec,
+                                &mut self.dependency_fields.optional_dependencies,
+                            )?;
                         }
                         _ => dec.skip_value()?,
                     }
@@ -744,7 +785,9 @@ impl UnmarshalerFrom for Fields {
             }
             _ => {
                 dec.skip_value()?;
-                Err(JsonError { message: "cannot unmarshal JSON value into Go packagejson.Fields".to_string() })
+                Err(JsonError {
+                    message: "cannot unmarshal JSON value into Go packagejson.Fields".to_string(),
+                })
             }
         }
     }
@@ -764,7 +807,8 @@ pub fn parse(data: &[u8]) -> Result<Fields, JsonError> {
 // ---------------------------------------------------------------------------
 
 // Go: cache.go:13 typeScriptVersion
-static TYPE_SCRIPT_VERSION: LazyLock<Version> = LazyLock::new(|| must_parse_version(crate::core::version()));
+static TYPE_SCRIPT_VERSION: LazyLock<Version> =
+    LazyLock::new(|| must_parse_version(crate::core::version()));
 
 // Go: cache.go:15 PackageJson
 // PORT: Go `sync.Once` plus the `versionPaths` and `versionTraces` fields is
@@ -794,8 +838,13 @@ pub struct DiagnosticAndArgs {
 impl PackageJson {
     // Go: cache.go:28 GetVersionPaths
     // PORT: Go `trace func(m, args ...any)` is an optional boxed closure.
-    pub fn get_version_paths(&self, trace: Option<Box<dyn Fn(&'static Message, Vec<String>)>>) -> VersionPaths {
-        let (version_paths, version_traces) = self.version_paths.get_or_init(|| self.compute_version_paths());
+    pub fn get_version_paths(
+        &self,
+        trace: Option<Box<dyn Fn(&'static Message, Vec<String>)>>,
+    ) -> VersionPaths {
+        let (version_paths, version_traces) = self
+            .version_paths
+            .get_or_init(|| self.compute_version_paths());
         if let Some(trace) = trace {
             for msg in version_traces {
                 trace(msg.message, msg.args.clone());
@@ -824,7 +873,8 @@ impl PackageJson {
         }
 
         version_traces.push(DiagnosticAndArgs {
-            message: diag::X_package_json_has_a_typesVersions_field_with_version_specific_path_mappings,
+            message:
+                diag::X_package_json_has_a_typesVersions_field_with_version_specific_path_mappings,
             args: args!["typesVersions"],
         });
 
@@ -841,21 +891,29 @@ impl PackageJson {
                 if value.type_ != JSONValueType::OBJECT {
                     version_traces.push(DiagnosticAndArgs {
                         message: diag::Expected_type_of_0_field_in_package_json_to_be_1_got_2,
-                        args: args![format!("typesVersions['{key}']"), "object", value.type_.string()],
+                        args: args![
+                            format!("typesVersions['{key}']"),
+                            "object",
+                            value.type_.string()
+                        ],
                     });
                     return (VersionPaths::default(), version_traces);
                 }
                 let JsonAny::Object(paths_json) = &value.value else {
                     unreachable!("an object JSONValue holds an object")
                 };
-                let version_paths =
-                    VersionPaths { version: key.clone(), paths_json: Some(paths_json.clone()), paths: OnceCell::new() };
+                let version_paths = VersionPaths {
+                    version: key.clone(),
+                    paths_json: Some(paths_json.clone()),
+                    paths: OnceCell::new(),
+                };
                 return (version_paths, version_traces);
             }
         }
 
         version_traces.push(DiagnosticAndArgs {
-            message: diag::X_package_json_does_not_have_a_typesVersions_entry_that_matches_version_0,
+            message:
+                diag::X_package_json_does_not_have_a_typesVersions_entry_that_matches_version_0,
             args: args![crate::core::version_major_minor()],
         });
         (VersionPaths::default(), version_traces)
@@ -985,14 +1043,22 @@ impl InfoCache {
     // Go: cache.go:182 Get
     #[must_use]
     pub fn get(&self, package_json_path: &str) -> Option<Rc<InfoCacheEntry>> {
-        let key = to_path(package_json_path, &self.current_directory, self.use_case_sensitive_file_names);
+        let key = to_path(
+            package_json_path,
+            &self.current_directory,
+            self.use_case_sensitive_file_names,
+        );
         self.cache.borrow().get(&key).cloned()
     }
 
     // Go: cache.go:190 Set
     // PORT: Go `LoadOrStore`: the first stored entry wins and is returned.
     pub fn set(&self, package_json_path: &str, info: Rc<InfoCacheEntry>) -> Rc<InfoCacheEntry> {
-        let key = to_path(package_json_path, &self.current_directory, self.use_case_sensitive_file_names);
+        let key = to_path(
+            package_json_path,
+            &self.current_directory,
+            self.use_case_sensitive_file_names,
+        );
         self.cache.borrow_mut().entry(key).or_insert(info).clone()
     }
 }

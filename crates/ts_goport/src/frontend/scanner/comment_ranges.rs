@@ -17,7 +17,12 @@ pub fn get_trailing_comment_ranges(f: &NodeFactory, text: &str, pos: i32) -> Vec
 }
 
 // Go: scanner/scanner.go:2827 iterateCommentRanges
-fn iterate_comment_ranges(f: &NodeFactory, text: &str, pos: i32, trailing: bool) -> Vec<CommentRange> {
+fn iterate_comment_ranges(
+    f: &NodeFactory,
+    text: &str,
+    pos: i32,
+    trailing: bool,
+) -> Vec<CommentRange> {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
     let len = bytes.len() as i32;
@@ -57,7 +62,11 @@ fn iterate_comment_ranges(f: &NodeFactory, text: &str, pos: i32, trailing: bool)
                 continue;
             }
             0x2F => {
-                let next_char = if pos + 1 < len { bytes[(pos + 1) as usize] } else { 0 };
+                let next_char = if pos + 1 < len {
+                    bytes[(pos + 1) as usize]
+                } else {
+                    0
+                };
                 let mut has_trailing_new_line = false;
                 if next_char == b'/' || next_char == b'*' {
                     let kind = if next_char == b'/' {
@@ -113,7 +122,12 @@ fn iterate_comment_ranges(f: &NodeFactory, text: &str, pos: i32, trailing: bool)
         }
     }
     if has_pending_comment_range {
-        out.push(f.new_comment_range(pending_kind, pending_pos, pending_end, pending_has_trailing_new_line));
+        out.push(f.new_comment_range(
+            pending_kind,
+            pending_pos,
+            pending_end,
+            pending_has_trailing_new_line,
+        ));
     }
     out
 }

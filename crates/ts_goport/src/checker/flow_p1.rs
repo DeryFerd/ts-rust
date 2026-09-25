@@ -71,7 +71,11 @@ impl Checker {
             let mut fb = f.borrow_mut();
             let mut reduce_labels = std::mem::take(&mut fb.reduce_labels);
             reduce_labels.clear();
-            *fb = FlowState { reduce_labels, next: self.free_flow_state.take(), ..FlowState::default() };
+            *fb = FlowState {
+                reduce_labels,
+                next: self.free_flow_state.take(),
+                ..FlowState::default()
+            };
         }
         self.free_flow_state = Some(f.clone());
     }
@@ -87,7 +91,13 @@ pub fn get_flow_node_of_node(node: Node) -> FlowNodeId {
 impl Checker {
     // Go: checker/flow.go:77 getFlowTypeOfReference
     pub fn get_flow_type_of_reference(&mut self, reference: Node, declared_type: TypeId) -> TypeId {
-        self.get_flow_type_of_reference_ex(reference, declared_type, declared_type, Node::NIL, FlowNodeId::NIL)
+        self.get_flow_type_of_reference_ex(
+            reference,
+            declared_type,
+            declared_type,
+            Node::NIL,
+            FlowNodeId::NIL,
+        )
     }
 
     // Go: checker/flow.go:81 getFlowTypeOfReferenceEx
@@ -114,7 +124,11 @@ impl Checker {
             let mut fb = f.borrow_mut();
             fb.reference = reference;
             fb.declared_type = declared_type;
-            fb.initial_type = if initial_type.is_some() { initial_type } else { declared_type };
+            fb.initial_type = if initial_type.is_some() {
+                initial_type
+            } else {
+                declared_type
+            };
             fb.flow_container = flow_container;
             fb.shared_flow_start = self.shared_flows.len() as i32;
         }
@@ -127,7 +141,10 @@ impl Checker {
         // we give type 'any[]' to 'x' instead of using the type determined by control flow analysis such that operations
         // on empty arrays are possible without implicit any errors and new element types can be inferred without
         // type mismatch errors.
-        let result_type = if self.ty(evolved_type).object_flags.intersects(ObjectFlags::EVOLVING_ARRAY)
+        let result_type = if self
+            .ty(evolved_type)
+            .object_flags
+            .intersects(ObjectFlags::EVOLVING_ARRAY)
             && self.is_evolving_array_operation_target(reference)
         {
             self.auto_array_type
@@ -139,7 +156,8 @@ impl Checker {
                 && is_non_null_expression(reference.parent())
                 && !self.ty(result_type).flags.intersects(TypeFlags::NEVER)
                 && {
-                    let with_facts = self.get_type_with_facts(result_type, TypeFacts::NE_UNDEFINED_OR_NULL);
+                    let with_facts =
+                        self.get_type_with_facts(result_type, TypeFacts::NE_UNDEFINED_OR_NULL);
                     self.ty(with_facts).flags.intersects(TypeFlags::NEVER)
                 }
         {
@@ -149,7 +167,11 @@ impl Checker {
     }
 
     // Go: checker/flow.go:118 getTypeAtFlowNode
-    pub fn get_type_at_flow_node(&mut self, f: &Rc<RefCell<FlowState>>, flow: FlowNodeId) -> FlowType {
+    pub fn get_type_at_flow_node(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow: FlowNodeId,
+    ) -> FlowType {
         let mut flow = flow;
         if f.borrow().depth == 2000 {
             // We have made 2000 recursive invocations. To avoid overflowing the call stack we report an error
@@ -157,7 +179,10 @@ impl Checker {
             self.flow_analysis_disabled = true;
             let reference = f.borrow().reference;
             self.report_flow_control_error(reference);
-            return FlowType { t: self.error_type, incomplete: false };
+            return FlowType {
+                t: self.error_type,
+                incomplete: false,
+            };
         }
         f.borrow_mut().depth += 1;
         let mut shared_flow = FlowNodeId::NIL;
@@ -215,7 +240,9 @@ impl Checker {
                     continue;
                 }
             } else if flags.intersects(FlowFlags::REDUCE_LABEL) {
-                f.borrow_mut().reduce_labels.push(flow_data.as_flow_reduce_label_data());
+                f.borrow_mut()
+                    .reduce_labels
+                    .push(flow_data.as_flow_reduce_label_data());
                 t = self.get_type_at_flow_node(f, flow_data.antecedent);
                 f.borrow_mut().reduce_labels.pop();
             } else if flags.intersects(FlowFlags::START) {
@@ -229,22 +256,32 @@ impl Checker {
                     && container != flow_container
                     && !is_property_access_expression(reference)
                     && !is_element_access_expression(reference)
-                    && !(reference.kind() == SyntaxKind::ThisKeyword && !is_arrow_function(container))
+                    && !(reference.kind() == SyntaxKind::ThisKeyword
+                        && !is_arrow_function(container))
                 {
                     flow = container.flow_node();
                     continue;
                 }
                 // At the top of the flow we have the initial type.
-                t = FlowType { t: initial_type, incomplete: false };
+                t = FlowType {
+                    t: initial_type,
+                    incomplete: false,
+                };
             } else {
                 // Unreachable code errors are reported in the binding phase. Here we
                 // simply return the non-auto declared type to reduce follow-on errors.
                 let declared_type = f.borrow().declared_type;
-                t = FlowType { t: self.convert_auto_to_any(declared_type), incomplete: false };
+                t = FlowType {
+                    t: self.convert_auto_to_any(declared_type),
+                    incomplete: false,
+                };
             }
             if shared_flow.is_some() {
                 // Record visited node and the associated type in the cache.
-                self.shared_flows.push(SharedFlow { flow: shared_flow, flow_type: t });
+                self.shared_flows.push(SharedFlow {
+                    flow: shared_flow,
+                    flow_type: t,
+                });
             }
             f.borrow_mut().depth -= 1;
             return t;
@@ -255,7 +292,10 @@ impl Checker {
 // Go: checker/flow.go:204 getBranchLabelAntecedents
 // PORT: Go returns the `*ast.FlowList`; the list is a `Vec<FlowNodeId>` here
 // (see `core::FlowNode::antecedents`), so a copy is returned.
-pub fn get_branch_label_antecedents(flow: FlowNodeId, reduce_labels: &[FlowReduceLabelData]) -> Vec<FlowNodeId> {
+pub fn get_branch_label_antecedents(
+    flow: FlowNodeId,
+    reduce_labels: &[FlowReduceLabelData],
+) -> Vec<FlowNodeId> {
     let mut i = reduce_labels.len();
     while i != 0 {
         i -= 1;
@@ -269,7 +309,11 @@ pub fn get_branch_label_antecedents(flow: FlowNodeId, reduce_labels: &[FlowReduc
 
 impl Checker {
     // Go: checker/flow.go:216 getTypeAtFlowAssignment
-    pub fn get_type_at_flow_assignment(&mut self, f: &Rc<RefCell<FlowState>>, flow: FlowNodeId) -> FlowType {
+    pub fn get_type_at_flow_assignment(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow: FlowNodeId,
+    ) -> FlowType {
         let flow_data = flow.get_flow();
         let node = flow_data.node;
         let (reference, declared_type) = {
@@ -280,7 +324,10 @@ impl Checker {
         // only need to evaluate the assigned type if the declared type is a union type.
         if self.is_matching_reference(reference, node) {
             if !self.is_reachable_flow_node(flow) {
-                return FlowType { t: self.unreachable_never_type, incomplete: false };
+                return FlowType {
+                    t: self.unreachable_never_type,
+                    incomplete: false,
+                };
             }
             if get_assignment_target_kind(node) == AssignmentKind::COMPOUND {
                 let flow_type = self.get_type_at_flow_node(f, flow_data.antecedent);
@@ -290,14 +337,23 @@ impl Checker {
             if declared_type == self.auto_type || declared_type == self.auto_array_type {
                 if self.is_empty_array_assignment(node) {
                     let never_type = self.never_type;
-                    return FlowType { t: self.get_evolving_array_type(never_type), incomplete: false };
+                    return FlowType {
+                        t: self.get_evolving_array_type(never_type),
+                        incomplete: false,
+                    };
                 }
                 let initial_or_assigned = self.get_initial_or_assigned_type(f, flow);
                 let assigned_type = self.get_widened_literal_type(initial_or_assigned);
                 if self.is_type_assignable_to(assigned_type, declared_type) {
-                    return FlowType { t: assigned_type, incomplete: false };
+                    return FlowType {
+                        t: assigned_type,
+                        incomplete: false,
+                    };
                 }
-                return FlowType { t: self.any_array_type, incomplete: false };
+                return FlowType {
+                    t: self.any_array_type,
+                    incomplete: false,
+                };
             }
             let mut t = declared_type;
             if is_in_compound_like_assignment(node) {
@@ -305,9 +361,15 @@ impl Checker {
             }
             if self.ty(t).flags.intersects(TypeFlags::UNION) {
                 let assigned = self.get_initial_or_assigned_type(f, flow);
-                return FlowType { t: self.get_assignment_reduced_type(t, assigned), incomplete: false };
+                return FlowType {
+                    t: self.get_assignment_reduced_type(t, assigned),
+                    incomplete: false,
+                };
             }
-            return FlowType { t, incomplete: false };
+            return FlowType {
+                t,
+                incomplete: false,
+            };
         }
         // We didn't have a direct match. However, if the reference is a dotted name, this
         // may be an assignment to a left hand part of the reference. For example, for a
@@ -315,7 +377,10 @@ impl Checker {
         // return the declared type.
         if self.contains_matching_reference(reference, node) {
             if !self.is_reachable_flow_node(flow) {
-                return FlowType { t: self.unreachable_never_type, incomplete: false };
+                return FlowType {
+                    t: self.unreachable_never_type,
+                    incomplete: false,
+                };
             }
             // A matching dotted name might also be an expando property on a function *expression*,
             // in which case we continue control flow analysis back to the function's declaration
@@ -325,29 +390,46 @@ impl Checker {
                     return self.get_type_at_flow_node(f, flow_data.antecedent);
                 }
             }
-            return FlowType { t: declared_type, incomplete: false };
+            return FlowType {
+                t: declared_type,
+                incomplete: false,
+            };
         }
         // for (const _ in ref) acts as a nonnull on ref
         if is_variable_declaration(node)
             && is_for_in_statement(node.parent().parent())
             && (self.is_matching_reference(reference, node.parent().parent().expression())
-                || self.optional_chain_contains_reference(node.parent().parent().expression(), reference))
+                || self.optional_chain_contains_reference(
+                    node.parent().parent().expression(),
+                    reference,
+                ))
         {
             let antecedent_type = self.get_type_at_flow_node(f, flow_data.antecedent).t;
             let finalized = self.finalize_evolving_array_type(antecedent_type);
-            return FlowType { t: self.get_non_nullable_type_if_needed(finalized), incomplete: false };
+            return FlowType {
+                t: self.get_non_nullable_type_if_needed(finalized),
+                incomplete: false,
+            };
         }
         // Assignment doesn't affect reference
         FlowType::default()
     }
 
     // Go: checker/flow.go:280 getInitialOrAssignedType
-    pub fn get_initial_or_assigned_type(&mut self, f: &Rc<RefCell<FlowState>>, flow: FlowNodeId) -> TypeId {
+    pub fn get_initial_or_assigned_type(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow: FlowNodeId,
+    ) -> TypeId {
         let node = flow.get_flow().node;
         let reference = f.borrow().reference;
         if is_variable_declaration(node) || is_binding_element(node) {
             let initial_type = self.get_initial_type(node);
-            return self.get_narrowable_type_for_reference(initial_type, reference, CheckMode::NORMAL);
+            return self.get_narrowable_type_for_reference(
+                initial_type,
+                reference,
+                CheckMode::NORMAL,
+            );
         }
         let assigned_type = self.get_assigned_type(node);
         self.get_narrowable_type_for_reference(assigned_type, reference, CheckMode::NORMAL)
@@ -355,12 +437,20 @@ impl Checker {
 
     // Go: checker/flow.go:287 isEmptyArrayAssignment
     pub fn is_empty_array_assignment(&self, node: Node) -> bool {
-        is_variable_declaration(node) && node.initializer().is_some() && is_empty_array_literal(node.initializer())
-            || !is_binding_element(node) && is_binary_expression(node.parent()) && is_empty_array_literal(node.parent().right())
+        is_variable_declaration(node)
+            && node.initializer().is_some()
+            && is_empty_array_literal(node.initializer())
+            || !is_binding_element(node)
+                && is_binary_expression(node.parent())
+                && is_empty_array_literal(node.parent().right())
     }
 
     // Go: checker/flow.go:292 getTypeAtFlowCall
-    pub fn get_type_at_flow_call(&mut self, f: &Rc<RefCell<FlowState>>, flow: FlowNodeId) -> FlowType {
+    pub fn get_type_at_flow_call(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow: FlowNodeId,
+    ) -> FlowType {
         let flow_data = flow.get_flow();
         let signature = self.get_effects_signature(flow_data.node);
         if signature.is_some() {
@@ -377,12 +467,22 @@ impl Checker {
                 };
                 let arguments = flow_data.node.arguments();
                 let narrowed_type = if pred_t.is_some() {
-                    self.narrow_type_by_type_predicate(f, t, predicate, flow_data.node, true /*assumeTrue*/)
+                    self.narrow_type_by_type_predicate(
+                        f,
+                        t,
+                        predicate,
+                        flow_data.node,
+                        true, /*assumeTrue*/
+                    )
                 } else if pred_kind == TypePredicateKind::ASSERTS_IDENTIFIER
                     && pred_parameter_index >= 0
                     && (pred_parameter_index as usize) < arguments.len()
                 {
-                    self.narrow_type_by_assertion(f, t, arguments.get(pred_parameter_index as usize))
+                    self.narrow_type_by_assertion(
+                        f,
+                        t,
+                        arguments.get(pred_parameter_index as usize),
+                    )
                 } else {
                     t
                 };
@@ -393,7 +493,10 @@ impl Checker {
             }
             let return_type = self.get_return_type_of_signature(signature);
             if self.ty(return_type).flags.intersects(TypeFlags::NEVER) {
-                return FlowType { t: self.unreachable_never_type, incomplete: false };
+                return FlowType {
+                    t: self.unreachable_never_type,
+                    incomplete: false,
+                };
             }
         }
         FlowType::default()
@@ -412,25 +515,38 @@ impl Checker {
         let predicate_t = self.pred(predicate).t;
         // Don't narrow from 'any' if the predicate type is exactly 'Object' or 'Function'
         if predicate_t.is_some()
-            && !(self.is_type_any(t) && (predicate_t == self.global_object_type || predicate_t == self.global_function_type))
+            && !(self.is_type_any(t)
+                && (predicate_t == self.global_object_type
+                    || predicate_t == self.global_function_type))
         {
             let predicate_argument = self.get_type_predicate_argument(predicate, call_expression);
             if predicate_argument.is_some() {
                 let reference = f.borrow().reference;
                 if self.is_matching_reference(reference, predicate_argument) {
-                    return self.get_narrowed_type(t, predicate_t, assume_true, false /*checkDerived*/);
+                    return self.get_narrowed_type(
+                        t,
+                        predicate_t,
+                        assume_true,
+                        false, /*checkDerived*/
+                    );
                 }
                 if self.strict_null_checks
                     && self.optional_chain_contains_reference(predicate_argument, reference)
                     && (assume_true && !self.has_type_facts(predicate_t, TypeFacts::EQ_UNDEFINED)
-                        || !assume_true && self.every_type(predicate_t, &mut |c, t| c.is_nullable_type(t)))
+                        || !assume_true
+                            && self.every_type(predicate_t, &mut |c, t| c.is_nullable_type(t)))
                 {
                     t = self.get_adjusted_type_with_facts(t, TypeFacts::NE_UNDEFINED_OR_NULL);
                 }
                 let access = self.get_discriminant_property_access(f, predicate_argument, t);
                 if access.is_some() {
                     return self.narrow_type_by_discriminant(t, access, &mut |c, t| {
-                        c.get_narrowed_type(t, predicate_t, assume_true, false /*checkDerived*/)
+                        c.get_narrowed_type(
+                            t,
+                            predicate_t,
+                            assume_true,
+                            false, /*checkDerived*/
+                        )
                     });
                 }
             }
@@ -439,7 +555,12 @@ impl Checker {
     }
 
     // Go: checker/flow.go:338 narrowTypeByAssertion
-    pub fn narrow_type_by_assertion(&mut self, f: &Rc<RefCell<FlowState>>, t: TypeId, expr: Node) -> TypeId {
+    pub fn narrow_type_by_assertion(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        t: TypeId,
+        expr: Node,
+    ) -> TypeId {
         let node = skip_parentheses(expr);
         if node.kind() == SyntaxKind::FalseKeyword {
             return self.unreachable_never_type;
@@ -459,7 +580,11 @@ impl Checker {
     }
 
     // Go: checker/flow.go:353 getTypeAtFlowCondition
-    pub fn get_type_at_flow_condition(&mut self, f: &Rc<RefCell<FlowState>>, flow: FlowNodeId) -> FlowType {
+    pub fn get_type_at_flow_condition(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow: FlowNodeId,
+    ) -> FlowType {
         let flow_data = flow.get_flow();
         let flow_type = self.get_type_at_flow_node(f, flow_data.antecedent);
         if self.ty(flow_type.t).flags.intersects(TypeFlags::NEVER) {
@@ -484,12 +609,19 @@ impl Checker {
     // Go: checker/flow.go:376 narrowType
     // Narrow the given type based on the given expression having the assumed boolean value. The returned type
     // will be a subtype or the same type as the argument.
-    pub fn narrow_type(&mut self, f: &Rc<RefCell<FlowState>>, t: TypeId, expr: Node, assume_true: bool) -> TypeId {
+    pub fn narrow_type(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        t: TypeId,
+        expr: Node,
+        assume_true: bool,
+    ) -> TypeId {
         // for `a?.b`, we emulate a synthetic `a !== null && a !== undefined` condition for `a`
         if is_expression_of_optional_chain_root(expr)
             || is_binary_expression(expr.parent())
                 && (expr.parent().operator_token().kind() == SyntaxKind::QuestionQuestionToken
-                    || expr.parent().operator_token().kind() == SyntaxKind::QuestionQuestionEqualsToken)
+                    || expr.parent().operator_token().kind()
+                        == SyntaxKind::QuestionQuestionEqualsToken)
                 && expr.parent().left() == expr
         {
             return self.narrow_type_by_optionality(f, t, expr, assume_true);
@@ -515,7 +647,8 @@ impl Checker {
                                 && self.is_constant_reference(reference)
                             {
                                 self.inline_level += 1;
-                                let result = self.narrow_type(f, t, declaration.initializer(), assume_true);
+                                let result =
+                                    self.narrow_type(f, t, declaration.initializer(), assume_true);
                                 self.inline_level -= 1;
                                 return result;
                             }
@@ -528,7 +661,9 @@ impl Checker {
             SyntaxKind::CallExpression => {
                 return self.narrow_type_by_call_expression(f, t, expr, assume_true);
             }
-            SyntaxKind::ParenthesizedExpression | SyntaxKind::NonNullExpression | SyntaxKind::SatisfiesExpression => {
+            SyntaxKind::ParenthesizedExpression
+            | SyntaxKind::NonNullExpression
+            | SyntaxKind::SatisfiesExpression => {
                 return self.narrow_type(f, t, expr.expression(), assume_true);
             }
             SyntaxKind::BinaryExpression => {
@@ -556,7 +691,11 @@ impl Checker {
         if self.is_matching_reference(reference, expr) {
             return self.get_adjusted_type_with_facts(
                 t,
-                if assume_present { TypeFacts::NE_UNDEFINED_OR_NULL } else { TypeFacts::EQ_UNDEFINED_OR_NULL },
+                if assume_present {
+                    TypeFacts::NE_UNDEFINED_OR_NULL
+                } else {
+                    TypeFacts::EQ_UNDEFINED_OR_NULL
+                },
             );
         }
         let access = self.get_discriminant_property_access(f, expr, t);
@@ -564,7 +703,11 @@ impl Checker {
             return self.narrow_type_by_discriminant(t, access, &mut |c, t| {
                 c.get_type_with_facts(
                     t,
-                    if assume_present { TypeFacts::NE_UNDEFINED_OR_NULL } else { TypeFacts::EQ_UNDEFINED_OR_NULL },
+                    if assume_present {
+                        TypeFacts::NE_UNDEFINED_OR_NULL
+                    } else {
+                        TypeFacts::EQ_UNDEFINED_OR_NULL
+                    },
                 )
             });
         }
@@ -572,19 +715,42 @@ impl Checker {
     }
 
     // Go: checker/flow.go:431 narrowTypeByTruthiness
-    pub fn narrow_type_by_truthiness(&mut self, f: &Rc<RefCell<FlowState>>, t: TypeId, expr: Node, assume_true: bool) -> TypeId {
+    pub fn narrow_type_by_truthiness(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        t: TypeId,
+        expr: Node,
+        assume_true: bool,
+    ) -> TypeId {
         let mut t = t;
         let reference = f.borrow().reference;
         if self.is_matching_reference(reference, expr) {
-            return self.get_adjusted_type_with_facts(t, if assume_true { TypeFacts::TRUTHY } else { TypeFacts::FALSY });
+            return self.get_adjusted_type_with_facts(
+                t,
+                if assume_true {
+                    TypeFacts::TRUTHY
+                } else {
+                    TypeFacts::FALSY
+                },
+            );
         }
-        if self.strict_null_checks && assume_true && self.optional_chain_contains_reference(expr, reference) {
+        if self.strict_null_checks
+            && assume_true
+            && self.optional_chain_contains_reference(expr, reference)
+        {
             t = self.get_adjusted_type_with_facts(t, TypeFacts::NE_UNDEFINED_OR_NULL);
         }
         let access = self.get_discriminant_property_access(f, expr, t);
         if access.is_some() {
             return self.narrow_type_by_discriminant(t, access, &mut |c, t| {
-                c.get_type_with_facts(t, if assume_true { TypeFacts::TRUTHY } else { TypeFacts::FALSY })
+                c.get_type_with_facts(
+                    t,
+                    if assume_true {
+                        TypeFacts::TRUTHY
+                    } else {
+                        TypeFacts::FALSY
+                    },
+                )
             });
         }
         t
@@ -611,7 +777,13 @@ impl Checker {
                 && (self.pred(predicate).kind == TypePredicateKind::THIS
                     || self.pred(predicate).kind == TypePredicateKind::IDENTIFIER)
             {
-                return self.narrow_type_by_type_predicate(f, t, predicate, call_expression, assume_true);
+                return self.narrow_type_by_type_predicate(
+                    f,
+                    t,
+                    predicate,
+                    call_expression,
+                    assume_true,
+                );
             }
         }
         if self.contains_missing_type(t)
@@ -628,7 +800,14 @@ impl Checker {
                 let argument = call_expression.arguments().get(0);
                 let (accessed_name, ok) = self.get_accessed_property_name(reference);
                 if ok && is_string_literal_like(argument) && accessed_name == argument.text() {
-                    return self.get_type_with_facts(t, if assume_true { TypeFacts::NE_UNDEFINED } else { TypeFacts::EQ_UNDEFINED });
+                    return self.get_type_with_facts(
+                        t,
+                        if assume_true {
+                            TypeFacts::NE_UNDEFINED
+                        } else {
+                            TypeFacts::EQ_UNDEFINED
+                        },
+                    );
                 }
             }
         }
@@ -675,18 +854,42 @@ impl Checker {
                 }
                 if self.strict_null_checks {
                     if self.optional_chain_contains_reference(left, reference) {
-                        t = self.narrow_type_by_optional_chain_containment(f, t, operator, right, assume_true);
+                        t = self.narrow_type_by_optional_chain_containment(
+                            f,
+                            t,
+                            operator,
+                            right,
+                            assume_true,
+                        );
                     } else if self.optional_chain_contains_reference(right, reference) {
-                        t = self.narrow_type_by_optional_chain_containment(f, t, operator, left, assume_true);
+                        t = self.narrow_type_by_optional_chain_containment(
+                            f,
+                            t,
+                            operator,
+                            left,
+                            assume_true,
+                        );
                     }
                 }
                 let left_access = self.get_discriminant_property_access(f, left, t);
                 if left_access.is_some() {
-                    return self.narrow_type_by_discriminant_property(t, left_access, operator, right, assume_true);
+                    return self.narrow_type_by_discriminant_property(
+                        t,
+                        left_access,
+                        operator,
+                        right,
+                        assume_true,
+                    );
                 }
                 let right_access = self.get_discriminant_property_access(f, right, t);
                 if right_access.is_some() {
-                    return self.narrow_type_by_discriminant_property(t, right_access, operator, left, assume_true);
+                    return self.narrow_type_by_discriminant_property(
+                        t,
+                        right_access,
+                        operator,
+                        left,
+                        assume_true,
+                    );
                 }
                 if self.is_matching_constructor_reference(f, left) {
                     return self.narrow_type_by_constructor(t, operator, right, assume_true);
@@ -695,10 +898,24 @@ impl Checker {
                     return self.narrow_type_by_constructor(t, operator, left, assume_true);
                 }
                 if is_boolean_literal(right) && !is_access_expression(left) {
-                    return self.narrow_type_by_boolean_comparison(f, t, left, right, operator, assume_true);
+                    return self.narrow_type_by_boolean_comparison(
+                        f,
+                        t,
+                        left,
+                        right,
+                        operator,
+                        assume_true,
+                    );
                 }
                 if is_boolean_literal(left) && !is_access_expression(right) {
-                    return self.narrow_type_by_boolean_comparison(f, t, right, left, operator, assume_true);
+                    return self.narrow_type_by_boolean_comparison(
+                        f,
+                        t,
+                        right,
+                        left,
+                        operator,
+                        assume_true,
+                    );
                 }
             }
             SyntaxKind::InstanceOfKeyword => {
@@ -706,7 +923,12 @@ impl Checker {
             }
             SyntaxKind::InKeyword => {
                 if is_private_identifier(expr.left()) {
-                    return self.narrow_type_by_private_identifier_in_in_expression(f, t, expr, assume_true);
+                    return self.narrow_type_by_private_identifier_in_in_expression(
+                        f,
+                        t,
+                        expr,
+                        assume_true,
+                    );
                 }
                 let target = self.get_reference_candidate(expr.right());
                 if self.contains_missing_type(t)
@@ -719,7 +941,11 @@ impl Checker {
                         if ok && accessed_name == self.get_property_name_from_type(left_type) {
                             return self.get_type_with_facts(
                                 t,
-                                if assume_true { TypeFacts::NE_UNDEFINED } else { TypeFacts::EQ_UNDEFINED },
+                                if assume_true {
+                                    TypeFacts::NE_UNDEFINED
+                                } else {
+                                    TypeFacts::EQ_UNDEFINED
+                                },
                             );
                         }
                     }
@@ -763,25 +989,42 @@ impl Checker {
 
 impl Checker {
     // Go: checker/flow.go:563 narrowTypeByEquality
-    pub fn narrow_type_by_equality(&mut self, t: TypeId, operator: SyntaxKind, value: Node, assume_true: bool) -> TypeId {
+    pub fn narrow_type_by_equality(
+        &mut self,
+        t: TypeId,
+        operator: SyntaxKind,
+        value: Node,
+        assume_true: bool,
+    ) -> TypeId {
         let mut assume_true = assume_true;
         if self.ty(t).flags.intersects(TypeFlags::ANY) {
             return t;
         }
-        if operator == SyntaxKind::ExclamationEqualsToken || operator == SyntaxKind::ExclamationEqualsEqualsToken {
+        if operator == SyntaxKind::ExclamationEqualsToken
+            || operator == SyntaxKind::ExclamationEqualsEqualsToken
+        {
             assume_true = !assume_true;
         }
         let value_type = self.get_type_of_expression(value);
-        let double_equals = operator == SyntaxKind::EqualsEqualsToken || operator == SyntaxKind::ExclamationEqualsToken;
+        let double_equals = operator == SyntaxKind::EqualsEqualsToken
+            || operator == SyntaxKind::ExclamationEqualsToken;
         let value_flags = self.ty(value_type).flags;
         if value_flags.intersects(TypeFlags::NULLABLE) {
             if !self.strict_null_checks {
                 return t;
             }
             let facts = if double_equals {
-                if assume_true { TypeFacts::EQ_UNDEFINED_OR_NULL } else { TypeFacts::NE_UNDEFINED_OR_NULL }
+                if assume_true {
+                    TypeFacts::EQ_UNDEFINED_OR_NULL
+                } else {
+                    TypeFacts::NE_UNDEFINED_OR_NULL
+                }
             } else if value_flags.intersects(TypeFlags::NULL) {
-                if assume_true { TypeFacts::EQ_NULL } else { TypeFacts::NE_NULL }
+                if assume_true {
+                    TypeFacts::EQ_NULL
+                } else {
+                    TypeFacts::NE_NULL
+                }
             } else if assume_true {
                 TypeFacts::EQ_UNDEFINED
             } else {
@@ -804,12 +1047,15 @@ impl Checker {
                 }
             }
             let filtered_type = self.filter_type(t, &mut |c, t| {
-                c.are_types_comparable(t, value_type) || double_equals && c.is_coercible_under_double_equals(t, value_type)
+                c.are_types_comparable(t, value_type)
+                    || double_equals && c.is_coercible_under_double_equals(t, value_type)
             });
             return self.replace_primitives_with_literals(filtered_type, value_type);
         }
         if self.is_unit_type(value_type) {
-            return self.filter_type(t, &mut |c, t| !(c.is_unit_like_type(t) && c.are_types_comparable(t, value_type)));
+            return self.filter_type(t, &mut |c, t| {
+                !(c.is_unit_like_type(t) && c.are_types_comparable(t, value_type))
+            });
         }
         t
     }
@@ -828,7 +1074,9 @@ impl Checker {
         let mut t = t;
         let mut assume_true = assume_true;
         // We have '==', '!=', '===', or !==' operator with 'typeof xxx' and string literal operands
-        if operator == SyntaxKind::ExclamationEqualsToken || operator == SyntaxKind::ExclamationEqualsEqualsToken {
+        if operator == SyntaxKind::ExclamationEqualsToken
+            || operator == SyntaxKind::ExclamationEqualsEqualsToken
+        {
             assume_true = !assume_true;
         }
         let reference = f.borrow().reference;
@@ -869,7 +1117,12 @@ pub static TYPEOF_NE_FACTS: LazyLock<FxHashMap<&'static str, TypeFacts>> = LazyL
 
 impl Checker {
     // Go: checker/flow.go:634 narrowTypeByLiteralExpression
-    pub fn narrow_type_by_literal_expression(&mut self, t: TypeId, literal: Node, assume_true: bool) -> TypeId {
+    pub fn narrow_type_by_literal_expression(
+        &mut self,
+        t: TypeId,
+        literal: Node,
+        assume_true: bool,
+    ) -> TypeId {
         if assume_true {
             return self.narrow_type_by_type_name(t, literal.text());
         }
@@ -909,7 +1162,11 @@ impl Checker {
                 }
                 let non_primitive_type = self.non_primitive_type;
                 let null_type = self.null_type;
-                let object_part = self.narrow_type_by_type_facts(t, non_primitive_type, TypeFacts::TYPEOF_EQ_OBJECT);
+                let object_part = self.narrow_type_by_type_facts(
+                    t,
+                    non_primitive_type,
+                    TypeFacts::TYPEOF_EQ_OBJECT,
+                );
                 let null_part = self.narrow_type_by_type_facts(t, null_type, TypeFacts::EQ_NULL);
                 return self.get_union_type(&[object_part, null_part]);
             }
@@ -931,7 +1188,12 @@ impl Checker {
     }
 
     // Go: checker/flow.go:673 narrowTypeByTypeFacts
-    pub fn narrow_type_by_type_facts(&mut self, t: TypeId, implied_type: TypeId, facts: TypeFacts) -> TypeId {
+    pub fn narrow_type_by_type_facts(
+        &mut self,
+        t: TypeId,
+        implied_type: TypeId,
+        facts: TypeFacts,
+    ) -> TypeId {
         let strict_subtype_relation = self.strict_subtype_relation.clone();
         self.map_type(t, &mut |c, t| {
             if c.is_type_related_to(t, implied_type, &strict_subtype_relation) {
@@ -957,7 +1219,8 @@ impl Checker {
         value: Node,
         assume_true: bool,
     ) -> TypeId {
-        if (operator == SyntaxKind::EqualsEqualsEqualsToken || operator == SyntaxKind::ExclamationEqualsEqualsToken)
+        if (operator == SyntaxKind::EqualsEqualsEqualsToken
+            || operator == SyntaxKind::ExclamationEqualsEqualsToken)
             && self.ty(t).flags.intersects(TypeFlags::UNION)
         {
             let key_property_name = self.get_key_property_name(t);
@@ -972,7 +1235,8 @@ impl Checker {
                         {
                             return candidate;
                         }
-                        let prop_type = self.get_type_of_property_of_type(candidate, &key_property_name);
+                        let prop_type =
+                            self.get_type_of_property_of_type(candidate, &key_property_name);
                         if prop_type.is_some() && self.is_unit_type(prop_type) {
                             return self.remove_type(t, candidate);
                         }
@@ -981,7 +1245,9 @@ impl Checker {
                 }
             }
         }
-        self.narrow_type_by_discriminant(t, access, &mut |c, t| c.narrow_type_by_equality(t, operator, value, assume_true))
+        self.narrow_type_by_discriminant(t, access, &mut |c, t| {
+            c.narrow_type_by_equality(t, operator, value, assume_true)
+        })
     }
 
     // Go: checker/flow.go:715 narrowTypeByDiscriminant
@@ -1012,7 +1278,8 @@ impl Checker {
         }
         let narrowed_prop_type = narrow_type(self, prop_type);
         self.filter_type(t, &mut |c, t| {
-            let mut discriminant_type = c.get_type_of_property_or_index_signature_of_type(t, &prop_name);
+            let mut discriminant_type =
+                c.get_type_of_property_or_index_signature_of_type(t, &prop_name);
             if discriminant_type.is_nil() {
                 discriminant_type = c.unknown_type;
             }
@@ -1023,11 +1290,18 @@ impl Checker {
     }
 
     // Go: checker/flow.go:740 isMatchingConstructorReference
-    pub fn is_matching_constructor_reference(&mut self, f: &Rc<RefCell<FlowState>>, expr: Node) -> bool {
+    pub fn is_matching_constructor_reference(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        expr: Node,
+    ) -> bool {
         if is_access_expression(expr) {
             let (accessed_name, ok) = self.get_accessed_property_name(expr);
             let reference = f.borrow().reference;
-            if ok && accessed_name == "constructor" && self.is_matching_reference(reference, expr.expression()) {
+            if ok
+                && accessed_name == "constructor"
+                && self.is_matching_reference(reference, expr.expression())
+            {
                 return true;
             }
         }
@@ -1035,9 +1309,17 @@ impl Checker {
     }
 
     // Go: checker/flow.go:749 narrowTypeByConstructor
-    pub fn narrow_type_by_constructor(&mut self, t: TypeId, operator: SyntaxKind, identifier: Node, assume_true: bool) -> TypeId {
+    pub fn narrow_type_by_constructor(
+        &mut self,
+        t: TypeId,
+        operator: SyntaxKind,
+        identifier: Node,
+        assume_true: bool,
+    ) -> TypeId {
         // Do not narrow when checking inequality.
-        if assume_true && operator != SyntaxKind::EqualsEqualsToken && operator != SyntaxKind::EqualsEqualsEqualsToken
+        if assume_true
+            && operator != SyntaxKind::EqualsEqualsToken
+            && operator != SyntaxKind::EqualsEqualsEqualsToken
             || !assume_true
                 && operator != SyntaxKind::ExclamationEqualsToken
                 && operator != SyntaxKind::ExclamationEqualsEqualsToken
@@ -1060,7 +1342,10 @@ impl Checker {
         if !self.is_type_any(prototype_type) {
             candidate = prototype_type;
         }
-        if candidate.is_nil() || candidate == self.global_object_type || candidate == self.global_function_type {
+        if candidate.is_nil()
+            || candidate == self.global_object_type
+            || candidate == self.global_function_type
+        {
             return t;
         }
         // If the type that is being narrowed is `any` then just return the `candidate` type since every type is a subtype of `any`.
@@ -1085,8 +1370,10 @@ impl Checker {
             let t = self.ty(target);
             (t.flags, t.object_flags, t.symbol)
         };
-        if source_flags.intersects(TypeFlags::OBJECT) && source_object_flags.intersects(ObjectFlags::CLASS)
-            || target_flags.intersects(TypeFlags::OBJECT) && target_object_flags.intersects(ObjectFlags::CLASS)
+        if source_flags.intersects(TypeFlags::OBJECT)
+            && source_object_flags.intersects(ObjectFlags::CLASS)
+            || target_flags.intersects(TypeFlags::OBJECT)
+                && target_object_flags.intersects(ObjectFlags::CLASS)
         {
             return source_symbol == target_symbol;
         }
@@ -1105,17 +1392,27 @@ impl Checker {
         assume_true: bool,
     ) -> TypeId {
         let assume_true = (assume_true != (bool_value.kind() == SyntaxKind::TrueKeyword))
-            != (operator != SyntaxKind::ExclamationEqualsEqualsToken && operator != SyntaxKind::ExclamationEqualsToken);
+            != (operator != SyntaxKind::ExclamationEqualsEqualsToken
+                && operator != SyntaxKind::ExclamationEqualsToken);
         self.narrow_type(f, t, expr, assume_true)
     }
 
     // Go: checker/flow.go:802 narrowTypeByInstanceof
     // PORT: Go takes `*ast.BinaryExpression`; this takes the node.
-    pub fn narrow_type_by_instanceof(&mut self, f: &Rc<RefCell<FlowState>>, t: TypeId, expr: Node, assume_true: bool) -> TypeId {
+    pub fn narrow_type_by_instanceof(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        t: TypeId,
+        expr: Node,
+        assume_true: bool,
+    ) -> TypeId {
         let reference = f.borrow().reference;
         let left = self.get_reference_candidate(expr.left());
         if !self.is_matching_reference(reference, left) {
-            if assume_true && self.strict_null_checks && self.optional_chain_contains_reference(left, reference) {
+            if assume_true
+                && self.strict_null_checks
+                && self.optional_chain_contains_reference(left, reference)
+            {
                 return self.get_adjusted_type_with_facts(t, TypeFacts::NE_UNDEFINED_OR_NULL);
             }
             return t;
@@ -1148,7 +1445,9 @@ impl Checker {
         let instance_type = self.map_type(right_type, &mut |c, t| c.get_instance_type(t));
         // Don't narrow from `any` if the target type is exactly `Object` or `Function`, and narrow
         // in the false branch only if the target is a non-empty object type.
-        if self.is_type_any(t) && (instance_type == self.global_object_type || instance_type == self.global_function_type)
+        if self.is_type_any(t)
+            && (instance_type == self.global_object_type
+                || instance_type == self.global_function_type)
             || !assume_true
                 && !(self.ty(instance_type).flags.intersects(TypeFlags::OBJECT)
                     && !self.is_empty_anonymous_object_type(instance_type))
@@ -1159,11 +1458,22 @@ impl Checker {
     }
 
     // Go: checker/flow.go:837 getNarrowedType
-    pub fn get_narrowed_type(&mut self, t: TypeId, candidate: TypeId, assume_true: bool, check_derived: bool) -> TypeId {
+    pub fn get_narrowed_type(
+        &mut self,
+        t: TypeId,
+        candidate: TypeId,
+        assume_true: bool,
+        check_derived: bool,
+    ) -> TypeId {
         if !self.ty(t).flags.intersects(TypeFlags::UNION) {
             return self.get_narrowed_type_worker(t, candidate, assume_true, check_derived);
         }
-        let key = NarrowedTypeKey { t, candidate, assume_true, check_derived };
+        let key = NarrowedTypeKey {
+            t,
+            candidate,
+            assume_true,
+            check_derived,
+        };
         if let Some(narrowed_type) = self.narrowed_types.get(&key) {
             return *narrowed_type;
         }
@@ -1173,7 +1483,13 @@ impl Checker {
     }
 
     // Go: checker/flow.go:850 getNarrowedTypeWorker
-    pub fn get_narrowed_type_worker(&mut self, t: TypeId, candidate: TypeId, assume_true: bool, check_derived: bool) -> TypeId {
+    pub fn get_narrowed_type_worker(
+        &mut self,
+        t: TypeId,
+        candidate: TypeId,
+        assume_true: bool,
+        check_derived: bool,
+    ) -> TypeId {
         let mut t = t;
         if !assume_true {
             if t == candidate {
@@ -1185,7 +1501,10 @@ impl Checker {
             if self.ty(t).flags.intersects(TypeFlags::UNKNOWN) {
                 t = self.unknown_union_type;
             }
-            let true_type = self.get_narrowed_type(t, candidate, true /*assumeTrue*/, false /*checkDerived*/);
+            let true_type = self.get_narrowed_type(
+                t, candidate, true,  /*assumeTrue*/
+                false, /*checkDerived*/
+            );
             let filtered = self.filter_type(t, &mut |c, t| !c.is_type_subset_of(t, true_type));
             return self.recombine_unknown_type(filtered);
         }

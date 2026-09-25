@@ -32,12 +32,18 @@ pub fn new_symbol_tracker_impl(
         }
     }
 
-    Rc::new(SymbolTrackerImpl { context: Rc::downgrade(&context), inner: tracker, disable_track_symbol: Cell::new(false) })
+    Rc::new(SymbolTrackerImpl {
+        context: Rc::downgrade(&context),
+        inner: tracker,
+        disable_track_symbol: Cell::new(false),
+    })
 }
 
 impl SymbolTrackerImpl {
     fn context(&self) -> Rc<RefCell<NodeBuilderContext>> {
-        self.context.upgrade().expect("SymbolTrackerImpl context is gone")
+        self.context
+            .upgrade()
+            .expect("SymbolTrackerImpl context is gone")
     }
 
     // Go: checker/symboltracker.go:106 SymbolTrackerImpl.onDiagnosticReported
@@ -48,7 +54,13 @@ impl SymbolTrackerImpl {
 
 impl SymbolTracker for SymbolTrackerImpl {
     // Go: checker/symboltracker.go:28 SymbolTrackerImpl.TrackSymbol
-    fn track_symbol(&self, c: &mut Checker, symbol: SymbolId, enclosing_declaration: Node, meaning: SymbolFlags) -> bool {
+    fn track_symbol(
+        &self,
+        c: &mut Checker,
+        symbol: SymbolId,
+        enclosing_declaration: Node,
+        meaning: SymbolFlags,
+    ) -> bool {
         if !self.disable_track_symbol.get() {
             if let Some(inner) = &self.inner {
                 if inner.track_symbol(c, symbol, enclosing_declaration, meaning) {
@@ -58,7 +70,14 @@ impl SymbolTracker for SymbolTrackerImpl {
             }
             // Skip recording type parameters as they dont contribute to late painted statements
             if !c.sym(symbol).flags.intersects(SymbolFlags::TYPE_PARAMETER) {
-                self.context().borrow_mut().tracked_symbols.push(TrackedSymbolArgs { symbol, enclosing_declaration, meaning });
+                self.context()
+                    .borrow_mut()
+                    .tracked_symbols
+                    .push(TrackedSymbolArgs {
+                        symbol,
+                        enclosing_declaration,
+                        meaning,
+                    });
             }
         }
         false
@@ -93,7 +112,12 @@ impl SymbolTracker for SymbolTrackerImpl {
     }
 
     // Go: checker/symboltracker.go:74 SymbolTrackerImpl.ReportLikelyUnsafeImportRequiredError
-    fn report_likely_unsafe_import_required_error(&self, c: &mut Checker, specifier: &str, symbol_name: &str) {
+    fn report_likely_unsafe_import_required_error(
+        &self,
+        c: &mut Checker,
+        specifier: &str,
+        symbol_name: &str,
+    ) {
         self.on_diagnostic_reported();
         let Some(inner) = &self.inner else { return };
         inner.report_likely_unsafe_import_required_error(c, specifier, symbol_name);
@@ -107,7 +131,13 @@ impl SymbolTracker for SymbolTrackerImpl {
     }
 
     // Go: checker/symboltracker.go:90 SymbolTrackerImpl.ReportNonlocalAugmentation
-    fn report_nonlocal_augmentation(&self, c: &mut Checker, containing_file: Node, parent_symbol: SymbolId, augmenting_symbol: SymbolId) {
+    fn report_nonlocal_augmentation(
+        &self,
+        c: &mut Checker,
+        containing_file: Node,
+        parent_symbol: SymbolId,
+        augmenting_symbol: SymbolId,
+    ) {
         self.on_diagnostic_reported();
         let Some(inner) = &self.inner else { return };
         inner.report_nonlocal_augmentation(c, containing_file, parent_symbol, augmenting_symbol);

@@ -97,13 +97,13 @@ impl ActiveLabel {
     }
 }
 
-
-
-
 impl FlowNode {
     /// Go `flow.Node.AsFlowSwitchClauseData()`.
     pub fn as_flow_switch_clause_data(&self) -> FlowSwitchClauseData {
-        assert!(self.flags.intersects(FlowFlags::SWITCH_CLAUSE), "not a switch clause flow node");
+        assert!(
+            self.flags.intersects(FlowFlags::SWITCH_CLAUSE),
+            "not a switch clause flow node"
+        );
         FlowSwitchClauseData {
             switch_statement: self.node,
             clause_start: self.antecedents[0].0 as u32 as i32,
@@ -113,8 +113,14 @@ impl FlowNode {
 
     /// Go `flow.Node.AsFlowReduceLabelData()`.
     pub fn as_flow_reduce_label_data(&self) -> FlowReduceLabelData {
-        assert!(self.flags.intersects(FlowFlags::REDUCE_LABEL), "not a reduce label flow node");
-        FlowReduceLabelData { target: self.antecedents[0], antecedents: self.antecedents[1..].to_vec() }
+        assert!(
+            self.flags.intersects(FlowFlags::REDUCE_LABEL),
+            "not a reduce label flow node"
+        );
+        FlowReduceLabelData {
+            target: self.antecedents[0],
+            antecedents: self.antecedents[1..].to_vec(),
+        }
     }
 }
 
@@ -145,10 +151,24 @@ pub fn bind_source_file(file: Node, symbols: &mut SymbolArena) {
     b.file_bind.symbol_count = b.symbol_count;
     b.file_bind.classifiable_names = std::mem::take(&mut b.classifiable_names);
     *symbols = std::mem::take(&mut b.symbols);
-    let Binder { node_bind, file_bind, flow_nodes, .. } = b;
-    assert!(go_file.node_bind.set(node_bind).is_ok(), "file already bound");
-    assert!(go_file.flow_nodes.set(flow_nodes).is_ok(), "file already bound");
-    assert!(go_file.file_bind.set(file_bind).is_ok(), "file already bound");
+    let Binder {
+        node_bind,
+        file_bind,
+        flow_nodes,
+        ..
+    } = b;
+    assert!(
+        go_file.node_bind.set(node_bind).is_ok(),
+        "file already bound"
+    );
+    assert!(
+        go_file.flow_nodes.set(flow_nodes).is_ok(),
+        "file already bound"
+    );
+    assert!(
+        go_file.file_bind.set(file_bind).is_ok(),
+        "file already bound"
+    );
 }
 
 /// Rust-only accessors for data Go stores on nodes, symbols and flow nodes.
@@ -250,14 +270,22 @@ impl Binder {
     /// Go `*ast.FlowNode` field reads.
     pub fn flow(&self, flow: FlowNodeId) -> &FlowNode {
         debug_assert!(flow.is_some(), "nil flow node dereference");
-        debug_assert_eq!(flow.file_index(), self.file_index, "flow node from another file");
+        debug_assert_eq!(
+            flow.file_index(),
+            self.file_index,
+            "flow node from another file"
+        );
         &self.flow_nodes[flow.local_index()]
     }
 
     /// Go `*ast.FlowNode` field writes.
     pub fn flow_mut(&mut self, flow: FlowNodeId) -> &mut FlowNode {
         debug_assert!(flow.is_some(), "nil flow node dereference");
-        debug_assert_eq!(flow.file_index(), self.file_index, "flow node from another file");
+        debug_assert_eq!(
+            flow.file_index(),
+            self.file_index,
+            "flow node from another file"
+        );
         &mut self.flow_nodes[flow.local_index()]
     }
 
@@ -297,7 +325,15 @@ impl Binder {
         includes: SymbolFlags,
         excludes: SymbolFlags,
     ) -> SymbolId {
-        self.declare_symbol_ex(symbol_table, parent, node, includes, excludes, false /*isReplaceableByMethod*/, false /*isComputedName*/)
+        self.declare_symbol_ex(
+            symbol_table,
+            parent,
+            node,
+            includes,
+            excludes,
+            false, /*isReplaceableByMethod*/
+            false, /*isComputedName*/
+        )
     }
 
     // Go: binder/binder.go:154 declareSymbolEx
@@ -359,7 +395,12 @@ impl Binder {
                 if is_replaceable_by_method {
                     self.sym_mut(symbol).flags |= SymbolFlags::REPLACEABLE_BY_METHOD;
                 }
-            } else if is_replaceable_by_method && !self.sym(symbol).flags.intersects(SymbolFlags::REPLACEABLE_BY_METHOD) {
+            } else if is_replaceable_by_method
+                && !self
+                    .sym(symbol)
+                    .flags
+                    .intersects(SymbolFlags::REPLACEABLE_BY_METHOD)
+            {
                 // A symbol already exists, so don't add this as a declaration.
                 return symbol;
             } else if self.sym(symbol).flags.intersects(excludes) {
@@ -369,19 +410,24 @@ impl Binder {
                     // prototype symbols like methods.
                     symbol = self.new_symbol(SymbolFlags::NONE, name.clone());
                     self.symbols.set(symbol_table, name.clone(), symbol);
-                } else if !(includes.intersects(SymbolFlags::VARIABLE) && symbol_flags.intersects(SymbolFlags::ASSIGNMENT)
-                    || includes.intersects(SymbolFlags::ASSIGNMENT) && symbol_flags.intersects(SymbolFlags::VARIABLE))
+                } else if !(includes.intersects(SymbolFlags::VARIABLE)
+                    && symbol_flags.intersects(SymbolFlags::ASSIGNMENT)
+                    || includes.intersects(SymbolFlags::ASSIGNMENT)
+                        && symbol_flags.intersects(SymbolFlags::VARIABLE))
                 {
                     // Assignment declarations are allowed to merge with variables, no matter what other flags they have.
                     // Report errors every position with duplicate declaration
                     // Report errors on previous encountered declarations
-                    let mut message: &'static ts_diagnostics::Message = if symbol_flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE) {
-                        diag::Cannot_redeclare_block_scoped_variable_0
-                    } else {
-                        diag::Duplicate_identifier_0
-                    };
+                    let mut message: &'static ts_diagnostics::Message =
+                        if symbol_flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE) {
+                            diag::Cannot_redeclare_block_scoped_variable_0
+                        } else {
+                            diag::Duplicate_identifier_0
+                        };
                     let mut message_needs_name = true;
-                    if symbol_flags.intersects(SymbolFlags::ENUM) || includes.intersects(SymbolFlags::ENUM) {
+                    if symbol_flags.intersects(SymbolFlags::ENUM)
+                        || includes.intersects(SymbolFlags::ENUM)
+                    {
                         message = diag::Enum_declarations_can_only_merge_with_namespace_or_other_enum_declarations;
                         message_needs_name = false;
                     }
@@ -400,7 +446,10 @@ impl Binder {
                             // Error on multiple export default in the following case:
                             // 1. multiple export default of class declaration or function declaration by checking NodeFlags.Default
                             // 2. multiple export default of export assignment. This one doesn't have NodeFlags.Default on (as export default doesn't considered as modifiers)
-                            if !declarations.is_empty() && is_export_assignment(node) && !node.is_export_equals() {
+                            if !declarations.is_empty()
+                                && is_export_assignment(node)
+                                && !node.is_export_equals()
+                            {
                                 message = diag::A_module_cannot_have_multiple_default_exports;
                                 message_needs_name = false;
                                 multiple_default_exports = true;
@@ -413,14 +462,20 @@ impl Binder {
                     }
                     let mut diagnostic = if message_needs_name {
                         let display_name = self.get_display_name(node);
-                        self.create_diagnostic_for_node(declaration_name, message, args![display_name])
+                        self.create_diagnostic_for_node(
+                            declaration_name,
+                            message,
+                            args![display_name],
+                        )
                     } else {
                         self.create_diagnostic_for_node(declaration_name, message, vec![])
                     };
                     if is_type_alias_declaration(node)
                         && node_is_missing(node.type_())
                         && has_syntactic_modifier(node, ModifierFlags::EXPORT)
-                        && symbol_flags.intersects(SymbolFlags::ALIAS | SymbolFlags::TYPE | SymbolFlags::NAMESPACE)
+                        && symbol_flags.intersects(
+                            SymbolFlags::ALIAS | SymbolFlags::TYPE | SymbolFlags::NAMESPACE,
+                        )
                     {
                         // export type T; - may have meant export type { T }?
                         let related = self.create_diagnostic_for_node(
@@ -444,14 +499,22 @@ impl Binder {
                         if multiple_default_exports {
                             let related = self.create_diagnostic_for_node(
                                 declaration_name,
-                                if index == 0 { diag::Another_export_default_is_here } else { diag::X_and_here },
+                                if index == 0 {
+                                    diag::Another_export_default_is_here
+                                } else {
+                                    diag::X_and_here
+                                },
                                 vec![],
                             );
                             d.related_information.push(related);
                         }
                         self.add_diagnostic(d);
                         if multiple_default_exports {
-                            let related = self.create_diagnostic_for_node(decl, diag::The_first_export_default_is_here, vec![]);
+                            let related = self.create_diagnostic_for_node(
+                                decl,
+                                diag::The_first_export_default_is_here,
+                                vec![],
+                            );
                             diagnostic.related_information.push(related);
                         }
                     }
@@ -462,7 +525,8 @@ impl Binder {
                     // same name are all marked as duplicates.
                     let symbol_flags = self.sym(symbol).flags;
                     if symbol_flags.intersects(SymbolFlags::ACCESSOR)
-                        && (symbol_flags & SymbolFlags::ACCESSOR) != (includes & SymbolFlags::ACCESSOR)
+                        && (symbol_flags & SymbolFlags::ACCESSOR)
+                            != (includes & SymbolFlags::ACCESSOR)
                     {
                         self.sym_mut(symbol).flags |= SymbolFlags::ACCESSOR;
                     }
@@ -535,8 +599,12 @@ impl Binder {
         }
         match node.kind() {
             SyntaxKind::Constructor => return INTERNAL_SYMBOL_NAME_CONSTRUCTOR.to_string(),
-            SyntaxKind::FunctionType | SyntaxKind::CallSignature => return INTERNAL_SYMBOL_NAME_CALL.to_string(),
-            SyntaxKind::ConstructorType | SyntaxKind::ConstructSignature => return INTERNAL_SYMBOL_NAME_NEW.to_string(),
+            SyntaxKind::FunctionType | SyntaxKind::CallSignature => {
+                return INTERNAL_SYMBOL_NAME_CALL.to_string();
+            }
+            SyntaxKind::ConstructorType | SyntaxKind::ConstructSignature => {
+                return INTERNAL_SYMBOL_NAME_NEW.to_string();
+            }
             SyntaxKind::IndexSignature => return INTERNAL_SYMBOL_NAME_INDEX.to_string(),
             SyntaxKind::ExportDeclaration => return INTERNAL_SYMBOL_NAME_EXPORT_STAR.to_string(),
             SyntaxKind::SourceFile | SyntaxKind::BinaryExpression => {
@@ -572,14 +640,23 @@ pub fn get_symbol_name_for_private_identifier(
     description: &str,
 ) -> String {
     let _ = symbols;
-    format!("{}#{}@{}", INTERNAL_SYMBOL_NAME_PREFIX, containing_class_symbol.0, description)
+    format!(
+        "{}#{}@{}",
+        INTERNAL_SYMBOL_NAME_PREFIX, containing_class_symbol.0, description
+    )
 }
 
 impl Binder {
     // Go: binder/binder.go:378 declareModuleMember
-    pub fn declare_module_member(&mut self, node: Node, symbol_flags: SymbolFlags, symbol_excludes: SymbolFlags) -> SymbolId {
+    pub fn declare_module_member(
+        &mut self,
+        node: Node,
+        symbol_flags: SymbolFlags,
+        symbol_excludes: SymbolFlags,
+    ) -> SymbolId {
         let container = self.container;
-        let has_export_modifier = get_combined_modifier_flags(node).intersects(ModifierFlags::EXPORT)
+        let has_export_modifier = get_combined_modifier_flags(node)
+            .intersects(ModifierFlags::EXPORT)
             || is_implicitly_exported_js_doc_declaration(node);
         if symbol_flags.intersects(SymbolFlags::ALIAS) {
             if node.kind() == SyntaxKind::ExportSpecifier
@@ -587,10 +664,22 @@ impl Binder {
             {
                 let container_symbol = self.node_symbol(container);
                 let exports = get_exports(&mut self.symbols, container_symbol);
-                return self.declare_symbol(exports, container_symbol, node, symbol_flags, symbol_excludes);
+                return self.declare_symbol(
+                    exports,
+                    container_symbol,
+                    node,
+                    symbol_flags,
+                    symbol_excludes,
+                );
             }
             let locals = self.get_locals(container);
-            return self.declare_symbol(locals, SymbolId::NIL /*parent*/, node, symbol_flags, symbol_excludes);
+            return self.declare_symbol(
+                locals,
+                SymbolId::NIL, /*parent*/
+                node,
+                symbol_flags,
+                symbol_excludes,
+            );
         }
         // Exported module members are given 2 symbols: A local symbol that is classified with an ExportValue flag,
         // and an associated export symbol with all the correct flags set on it. There are 2 main reasons:
@@ -608,7 +697,10 @@ impl Binder {
         //       and this case is specially handled. Module augmentations should only be merged with original module definition
         //       and should never be merged directly with other augmentation, and the latter case would be possible if automatic merge is allowed.
         if !is_ambient_module(node)
-            && (has_export_modifier || self.node_flags(container).intersects(NodeFlags::EXPORT_CONTEXT))
+            && (has_export_modifier
+                || self
+                    .node_flags(container)
+                    .intersects(NodeFlags::EXPORT_CONTEXT))
         {
             if !is_locals_container(container)
                 || (has_syntactic_modifier(node, ModifierFlags::DEFAULT)
@@ -616,7 +708,13 @@ impl Binder {
             {
                 let container_symbol = self.node_symbol(container);
                 let exports = get_exports(&mut self.symbols, container_symbol);
-                return self.declare_symbol(exports, container_symbol, node, symbol_flags, symbol_excludes);
+                return self.declare_symbol(
+                    exports,
+                    container_symbol,
+                    node,
+                    symbol_flags,
+                    symbol_excludes,
+                );
                 // No local symbol for an unnamed default!
             }
             let export_kind = if symbol_flags.intersects(SymbolFlags::VALUE) {
@@ -625,36 +723,82 @@ impl Binder {
                 SymbolFlags::NONE
             };
             let locals = self.get_locals(container);
-            let local = self.declare_symbol(locals, SymbolId::NIL /*parent*/, node, export_kind, symbol_excludes);
+            let local = self.declare_symbol(
+                locals,
+                SymbolId::NIL, /*parent*/
+                node,
+                export_kind,
+                symbol_excludes,
+            );
             let container_symbol = self.node_symbol(container);
             let exports = get_exports(&mut self.symbols, container_symbol);
-            let export_symbol = self.declare_symbol(exports, container_symbol, node, symbol_flags, symbol_excludes);
+            let export_symbol = self.declare_symbol(
+                exports,
+                container_symbol,
+                node,
+                symbol_flags,
+                symbol_excludes,
+            );
             self.sym_mut(local).export_symbol = export_symbol;
             self.set_node_local_symbol(node, local);
             return local;
         }
         let locals = self.get_locals(container);
-        self.declare_symbol(locals, SymbolId::NIL /*parent*/, node, symbol_flags, symbol_excludes)
+        self.declare_symbol(
+            locals,
+            SymbolId::NIL, /*parent*/
+            node,
+            symbol_flags,
+            symbol_excludes,
+        )
     }
 
     // Go: binder/binder.go:419 declareClassMember
-    pub fn declare_class_member(&mut self, node: Node, symbol_flags: SymbolFlags, symbol_excludes: SymbolFlags) -> SymbolId {
+    pub fn declare_class_member(
+        &mut self,
+        node: Node,
+        symbol_flags: SymbolFlags,
+        symbol_excludes: SymbolFlags,
+    ) -> SymbolId {
         let container_symbol = self.node_symbol(self.container);
         if is_static(node) {
             let exports = get_exports(&mut self.symbols, container_symbol);
-            return self.declare_symbol(exports, container_symbol, node, symbol_flags, symbol_excludes);
+            return self.declare_symbol(
+                exports,
+                container_symbol,
+                node,
+                symbol_flags,
+                symbol_excludes,
+            );
         }
         let members = get_members(&mut self.symbols, container_symbol);
-        self.declare_symbol(members, container_symbol, node, symbol_flags, symbol_excludes)
+        self.declare_symbol(
+            members,
+            container_symbol,
+            node,
+            symbol_flags,
+            symbol_excludes,
+        )
     }
 
     // Go: binder/binder.go:426 declareSourceFileMember
-    pub fn declare_source_file_member(&mut self, node: Node, symbol_flags: SymbolFlags, symbol_excludes: SymbolFlags) -> SymbolId {
+    pub fn declare_source_file_member(
+        &mut self,
+        node: Node,
+        symbol_flags: SymbolFlags,
+        symbol_excludes: SymbolFlags,
+    ) -> SymbolId {
         if is_external_module(self.file) {
             return self.declare_module_member(node, symbol_flags, symbol_excludes);
         }
         let locals = self.get_locals(self.file);
-        self.declare_symbol(locals, SymbolId::NIL /*parent*/, node, symbol_flags, symbol_excludes)
+        self.declare_symbol(
+            locals,
+            SymbolId::NIL, /*parent*/
+            node,
+            symbol_flags,
+            symbol_excludes,
+        )
     }
 
     // Go: binder/binder.go:433 declareSymbolAndAddToSymbolTable
@@ -677,7 +821,13 @@ impl Binder {
             SyntaxKind::EnumDeclaration => {
                 let container_symbol = self.node_symbol(self.container);
                 let exports = get_exports(&mut self.symbols, container_symbol);
-                return self.declare_symbol(exports, container_symbol, node, symbol_flags, symbol_excludes);
+                return self.declare_symbol(
+                    exports,
+                    container_symbol,
+                    node,
+                    symbol_flags,
+                    symbol_excludes,
+                );
             }
             SyntaxKind::TypeLiteral
             | SyntaxKind::ObjectLiteralExpression
@@ -685,7 +835,13 @@ impl Binder {
             | SyntaxKind::JsxAttributes => {
                 let container_symbol = self.node_symbol(self.container);
                 let members = get_members(&mut self.symbols, container_symbol);
-                return self.declare_symbol(members, container_symbol, node, symbol_flags, symbol_excludes);
+                return self.declare_symbol(
+                    members,
+                    container_symbol,
+                    node,
+                    symbol_flags,
+                    symbol_excludes,
+                );
             }
             SyntaxKind::FunctionType
             | SyntaxKind::ConstructorType
@@ -705,7 +861,13 @@ impl Binder {
             | SyntaxKind::JsTypeAliasDeclaration
             | SyntaxKind::MappedType => {
                 let locals = self.get_locals(self.container);
-                return self.declare_symbol(locals, SymbolId::NIL /*parent*/, node, symbol_flags, symbol_excludes);
+                return self.declare_symbol(
+                    locals,
+                    SymbolId::NIL, /*parent*/
+                    node,
+                    symbol_flags,
+                    symbol_excludes,
+                );
             }
             _ => {}
         }
@@ -715,12 +877,20 @@ impl Binder {
     // Go: binder/binder.go:454 newFlowNode
     pub fn new_flow_node(&mut self, flags: FlowFlags) -> FlowNodeId {
         let id = FlowNodeId::new(self.file_index, self.flow_nodes.len());
-        self.flow_nodes.push(FlowNode { flags, ..FlowNode::default() });
+        self.flow_nodes.push(FlowNode {
+            flags,
+            ..FlowNode::default()
+        });
         id
     }
 
     // Go: binder/binder.go:460 newFlowNodeEx
-    pub fn new_flow_node_ex(&mut self, flags: FlowFlags, node: Node, antecedent: FlowNodeId) -> FlowNodeId {
+    pub fn new_flow_node_ex(
+        &mut self,
+        flags: FlowFlags,
+        node: Node,
+        antecedent: FlowNodeId,
+    ) -> FlowNodeId {
         let result = self.new_flow_node(flags);
         let flow = self.flow_mut(result);
         flow.node = node;
@@ -742,7 +912,12 @@ impl Binder {
     //
     // PORT: the Go `FlowReduceLabelData` node is stored in the flow node's
     // `antecedents` as `[target, antecedents...]`; see `FlowReduceLabelData`.
-    pub fn create_reduce_label(&mut self, target: FlowNodeId, antecedents: &[FlowNodeId], antecedent: FlowNodeId) -> FlowNodeId {
+    pub fn create_reduce_label(
+        &mut self,
+        target: FlowNodeId,
+        antecedents: &[FlowNodeId],
+        antecedent: FlowNodeId,
+    ) -> FlowNodeId {
         let result = self.new_flow_node_ex(FlowFlags::REDUCE_LABEL, Node::NIL, antecedent);
         let mut data = Vec::with_capacity(antecedents.len() + 1);
         data.push(target);
@@ -752,8 +927,17 @@ impl Binder {
     }
 
     // Go: binder/binder.go:479 createFlowCondition
-    pub fn create_flow_condition(&mut self, flags: FlowFlags, antecedent: FlowNodeId, expression: Node) -> FlowNodeId {
-        if self.flow(antecedent).flags.intersects(FlowFlags::UNREACHABLE) {
+    pub fn create_flow_condition(
+        &mut self,
+        flags: FlowFlags,
+        antecedent: FlowNodeId,
+        expression: Node,
+    ) -> FlowNodeId {
+        if self
+            .flow(antecedent)
+            .flags
+            .intersects(FlowFlags::UNREACHABLE)
+        {
             return antecedent;
         }
         if expression.is_nil() {
@@ -762,8 +946,10 @@ impl Binder {
             }
             return self.unreachable_flow;
         }
-        if (expression.kind() == SyntaxKind::TrueKeyword && flags.intersects(FlowFlags::FALSE_CONDITION)
-            || expression.kind() == SyntaxKind::FalseKeyword && flags.intersects(FlowFlags::TRUE_CONDITION))
+        if (expression.kind() == SyntaxKind::TrueKeyword
+            && flags.intersects(FlowFlags::FALSE_CONDITION)
+            || expression.kind() == SyntaxKind::FalseKeyword
+                && flags.intersects(FlowFlags::TRUE_CONDITION))
             && !is_expression_of_optional_chain_root(expression)
             && !is_nullish_coalesce(expression.parent())
         {
@@ -777,7 +963,12 @@ impl Binder {
     }
 
     // Go: binder/binder.go:499 createFlowMutation
-    pub fn create_flow_mutation(&mut self, flags: FlowFlags, antecedent: FlowNodeId, node: Node) -> FlowNodeId {
+    pub fn create_flow_mutation(
+        &mut self,
+        flags: FlowFlags,
+        antecedent: FlowNodeId,
+        node: Node,
+    ) -> FlowNodeId {
         self.set_flow_node_referenced(antecedent);
         self.has_flow_effects = true;
         let result = self.new_flow_node_ex(flags, node, antecedent);
@@ -802,8 +993,10 @@ impl Binder {
     ) -> FlowNodeId {
         self.set_flow_node_referenced(antecedent);
         let result = self.new_flow_node_ex(FlowFlags::SWITCH_CLAUSE, switch_statement, antecedent);
-        self.flow_mut(result).antecedents =
-            vec![FlowNodeId(u64::from(clause_start as u32)), FlowNodeId(u64::from(clause_end as u32))];
+        self.flow_mut(result).antecedents = vec![
+            FlowNodeId(u64::from(clause_start as u32)),
+            FlowNodeId(u64::from(clause_end as u32)),
+        ];
         result
     }
 
@@ -825,7 +1018,11 @@ impl Binder {
     }
 
     // Go: binder/binder.go:527 combineFlowLists
-    pub fn combine_flow_lists(&mut self, head: &[FlowNodeId], tail: &[FlowNodeId]) -> Vec<FlowNodeId> {
+    pub fn combine_flow_lists(
+        &mut self,
+        head: &[FlowNodeId],
+        tail: &[FlowNodeId],
+    ) -> Vec<FlowNodeId> {
         if head.is_empty() {
             return tail.to_vec();
         }
@@ -854,7 +1051,11 @@ impl Binder {
 
     // Go: binder/binder.go:547 addAntecedent
     pub fn add_antecedent(&mut self, label: FlowNodeId, antecedent: FlowNodeId) {
-        if self.flow(antecedent).flags.intersects(FlowFlags::UNREACHABLE) {
+        if self
+            .flow(antecedent)
+            .flags
+            .intersects(FlowFlags::UNREACHABLE)
+        {
             return;
         }
         // If antecedent isn't already on the Antecedents list, add it to the end of the list
@@ -939,7 +1140,9 @@ impl Binder {
             SyntaxKind::BinaryExpression => {
                 match get_assignment_declaration_kind(node) {
                     JSDeclarationKind::MODULE_EXPORTS => self.bind_module_exports_assignment(node),
-                    JSDeclarationKind::EXPORTS_PROPERTY => self.bind_exports_or_object_define_property(node),
+                    JSDeclarationKind::EXPORTS_PROPERTY => {
+                        self.bind_exports_or_object_define_property(node)
+                    }
                     JSDeclarationKind::PROPERTY => self.bind_expando_property_assignment(node),
                     JSDeclarationKind::THIS_PROPERTY => self.bind_this_property_assignment(node),
                     _ => {}
@@ -985,13 +1188,27 @@ impl Binder {
                 self.bind_property_worker(node);
             }
             SyntaxKind::PropertyAssignment | SyntaxKind::ShorthandPropertyAssignment => {
-                self.bind_property_or_method_or_accessor(node, SymbolFlags::PROPERTY, SymbolFlags::PROPERTY_EXCLUDES);
+                self.bind_property_or_method_or_accessor(
+                    node,
+                    SymbolFlags::PROPERTY,
+                    SymbolFlags::PROPERTY_EXCLUDES,
+                );
             }
             SyntaxKind::EnumMember => {
-                self.bind_property_or_method_or_accessor(node, SymbolFlags::ENUM_MEMBER, SymbolFlags::ENUM_MEMBER_EXCLUDES);
+                self.bind_property_or_method_or_accessor(
+                    node,
+                    SymbolFlags::ENUM_MEMBER,
+                    SymbolFlags::ENUM_MEMBER_EXCLUDES,
+                );
             }
-            SyntaxKind::CallSignature | SyntaxKind::ConstructSignature | SyntaxKind::IndexSignature => {
-                self.declare_symbol_and_add_to_symbol_table(node, SymbolFlags::SIGNATURE, SymbolFlags::NONE);
+            SyntaxKind::CallSignature
+            | SyntaxKind::ConstructSignature
+            | SyntaxKind::IndexSignature => {
+                self.declare_symbol_and_add_to_symbol_table(
+                    node,
+                    SymbolFlags::SIGNATURE,
+                    SymbolFlags::NONE,
+                );
             }
             SyntaxKind::MethodDeclaration | SyntaxKind::MethodSignature => {
                 let excludes = if is_object_literal_method(node) {
@@ -1009,22 +1226,42 @@ impl Binder {
                 self.bind_function_declaration(node);
             }
             SyntaxKind::Constructor => {
-                self.declare_symbol_and_add_to_symbol_table(node, SymbolFlags::CONSTRUCTOR, SymbolFlags::NONE);
+                self.declare_symbol_and_add_to_symbol_table(
+                    node,
+                    SymbolFlags::CONSTRUCTOR,
+                    SymbolFlags::NONE,
+                );
             }
             SyntaxKind::GetAccessor => {
-                self.bind_property_or_method_or_accessor(node, SymbolFlags::GET_ACCESSOR, SymbolFlags::GET_ACCESSOR_EXCLUDES);
+                self.bind_property_or_method_or_accessor(
+                    node,
+                    SymbolFlags::GET_ACCESSOR,
+                    SymbolFlags::GET_ACCESSOR_EXCLUDES,
+                );
             }
             SyntaxKind::SetAccessor => {
-                self.bind_property_or_method_or_accessor(node, SymbolFlags::SET_ACCESSOR, SymbolFlags::SET_ACCESSOR_EXCLUDES);
+                self.bind_property_or_method_or_accessor(
+                    node,
+                    SymbolFlags::SET_ACCESSOR,
+                    SymbolFlags::SET_ACCESSOR_EXCLUDES,
+                );
             }
             SyntaxKind::FunctionType | SyntaxKind::ConstructorType => {
                 self.bind_function_or_constructor_type(node);
             }
             SyntaxKind::TypeLiteral | SyntaxKind::MappedType => {
-                self.bind_anonymous_declaration(node, SymbolFlags::TYPE_LITERAL, INTERNAL_SYMBOL_NAME_TYPE);
+                self.bind_anonymous_declaration(
+                    node,
+                    SymbolFlags::TYPE_LITERAL,
+                    INTERNAL_SYMBOL_NAME_TYPE,
+                );
             }
             SyntaxKind::ObjectLiteralExpression => {
-                self.bind_anonymous_declaration(node, SymbolFlags::OBJECT_LITERAL, INTERNAL_SYMBOL_NAME_OBJECT);
+                self.bind_anonymous_declaration(
+                    node,
+                    SymbolFlags::OBJECT_LITERAL,
+                    INTERNAL_SYMBOL_NAME_OBJECT,
+                );
             }
             SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction => {
                 self.bind_function_expression(node);
@@ -1033,12 +1270,20 @@ impl Binder {
                 self.bind_class_like_declaration(node);
             }
             SyntaxKind::InterfaceDeclaration => {
-                self.bind_block_scoped_declaration(node, SymbolFlags::INTERFACE, SymbolFlags::INTERFACE_EXCLUDES);
+                self.bind_block_scoped_declaration(
+                    node,
+                    SymbolFlags::INTERFACE,
+                    SymbolFlags::INTERFACE_EXCLUDES,
+                );
             }
             SyntaxKind::CallExpression => {
                 match get_assignment_declaration_kind(node) {
-                    JSDeclarationKind::OBJECT_DEFINE_PROPERTY_VALUE => self.bind_expando_property_assignment(node),
-                    JSDeclarationKind::OBJECT_DEFINE_PROPERTY_EXPORTS => self.bind_exports_or_object_define_property(node),
+                    JSDeclarationKind::OBJECT_DEFINE_PROPERTY_VALUE => {
+                        self.bind_expando_property_assignment(node)
+                    }
+                    JSDeclarationKind::OBJECT_DEFINE_PROPERTY_EXPORTS => {
+                        self.bind_exports_or_object_define_property(node)
+                    }
                     _ => {}
                 }
                 if is_in_js_file(node) {
@@ -1046,12 +1291,20 @@ impl Binder {
                 }
             }
             SyntaxKind::TypeAliasDeclaration => {
-                self.bind_block_scoped_declaration(node, SymbolFlags::TYPE_ALIAS, SymbolFlags::TYPE_ALIAS_EXCLUDES);
+                self.bind_block_scoped_declaration(
+                    node,
+                    SymbolFlags::TYPE_ALIAS,
+                    SymbolFlags::TYPE_ALIAS_EXCLUDES,
+                );
             }
             SyntaxKind::JsTypeAliasDeclaration => {
                 // Top-level JSTypeAliasDeclaration nodes are processed in bindContainer
                 if !is_source_file(self.block_scope_container) {
-                    self.bind_block_scoped_declaration(node, SymbolFlags::TYPE_ALIAS, SymbolFlags::TYPE_ALIAS_EXCLUDES);
+                    self.bind_block_scoped_declaration(
+                        node,
+                        SymbolFlags::TYPE_ALIAS,
+                        SymbolFlags::TYPE_ALIAS_EXCLUDES,
+                    );
                 }
             }
             SyntaxKind::EnumDeclaration => {
@@ -1064,7 +1317,11 @@ impl Binder {
             | SyntaxKind::NamespaceImport
             | SyntaxKind::ImportSpecifier
             | SyntaxKind::ExportSpecifier => {
-                self.declare_symbol_and_add_to_symbol_table(node, SymbolFlags::ALIAS, SymbolFlags::ALIAS_EXCLUDES);
+                self.declare_symbol_and_add_to_symbol_table(
+                    node,
+                    SymbolFlags::ALIAS,
+                    SymbolFlags::ALIAS_EXCLUDES,
+                );
             }
             SyntaxKind::NamespaceExportDeclaration => {
                 self.bind_namespace_export_declaration(node);
@@ -1085,7 +1342,11 @@ impl Binder {
                 self.bind_jsx_attributes(node);
             }
             SyntaxKind::JsxAttribute => {
-                self.bind_jsx_attribute(node, SymbolFlags::PROPERTY, SymbolFlags::PROPERTY_EXCLUDES);
+                self.bind_jsx_attribute(
+                    node,
+                    SymbolFlags::PROPERTY,
+                    SymbolFlags::PROPERTY_EXCLUDES,
+                );
             }
             _ => {}
         }
@@ -1094,7 +1355,9 @@ impl Binder {
         // the current 'container' node when it changes. This helps us know which symbol table
         // a local should go into for example. Since terminal nodes are known not to have
         // children, as an optimization we don't process those.
-        let mut this_node_or_any_subnodes_has_error = self.node_flags(node).intersects(NodeFlags::THIS_NODE_HAS_ERROR);
+        let mut this_node_or_any_subnodes_has_error = self
+            .node_flags(node)
+            .intersects(NodeFlags::THIS_NODE_HAS_ERROR);
         if (node.kind() as u16) > (SyntaxKind::LAST_TOKEN as u16) {
             let save_seen_parse_error = self.seen_parse_error;
             self.seen_parse_error = false;
@@ -1119,13 +1382,21 @@ impl Binder {
     // Go: binder/binder.go:752 bindPropertyWorker
     pub fn bind_property_worker(&mut self, node: Node) {
         let is_auto_accessor = is_auto_accessor_property_declaration(node);
-        let includes = if is_auto_accessor { SymbolFlags::ACCESSOR } else { SymbolFlags::PROPERTY };
+        let includes = if is_auto_accessor {
+            SymbolFlags::ACCESSOR
+        } else {
+            SymbolFlags::PROPERTY
+        };
         let excludes = if is_auto_accessor {
             SymbolFlags::ACCESSOR_EXCLUDES
         } else {
             SymbolFlags::PROPERTY_EXCLUDES
         };
-        self.bind_property_or_method_or_accessor(node, includes | get_optional_symbol_flag_for_node(node), excludes);
+        self.bind_property_or_method_or_accessor(
+            node,
+            includes | get_optional_symbol_flag_for_node(node),
+            excludes,
+        );
     }
 
     // Go: binder/binder.go:759 bindSourceFileIfExternalModule
@@ -1139,14 +1410,23 @@ impl Binder {
             // Create symbol equivalent for the module.exports = {}
             let original_symbol = self.node_symbol(file);
             let exports = get_exports(&mut self.symbols, original_symbol);
-            self.declare_symbol(exports, original_symbol, file, SymbolFlags::PROPERTY, SymbolFlags::ALL);
+            self.declare_symbol(
+                exports,
+                original_symbol,
+                file,
+                SymbolFlags::PROPERTY,
+                SymbolFlags::ALL,
+            );
             self.set_node_symbol(file, original_symbol);
         }
     }
 
     // Go: binder/binder.go:772 bindSourceFileAsExternalModule
     pub fn bind_source_file_as_external_module(&mut self) {
-        let name = format!("\"{}\"", remove_file_extension(source_file_file_name(self.file)));
+        let name = format!(
+            "\"{}\"",
+            remove_file_extension(source_file_file_name(self.file))
+        );
         self.bind_anonymous_declaration(self.file, SymbolFlags::VALUE_MODULE, &name);
     }
 
@@ -1182,11 +1462,13 @@ impl Binder {
                         );
                     } else if pattern.star_index >= 0 {
                         let star = pattern.star_index as usize;
-                        self.file_bind.pattern_ambient_modules.push(PatternAmbientModule {
-                            pattern_prefix: pattern.text[..star].to_string(),
-                            pattern_suffix: pattern.text[star + 1..].to_string(),
-                            symbol,
-                        });
+                        self.file_bind
+                            .pattern_ambient_modules
+                            .push(PatternAmbientModule {
+                                pattern_prefix: pattern.text[..star].to_string(),
+                                pattern_suffix: pattern.text[star + 1..].to_string(),
+                                symbol,
+                            });
                     }
                 }
             }
@@ -1219,7 +1501,11 @@ impl Binder {
         let instantiated = state != ModuleInstanceState::NON_INSTANTIATED;
         self.declare_symbol_and_add_to_symbol_table(
             node,
-            if instantiated { SymbolFlags::VALUE_MODULE } else { SymbolFlags::NAMESPACE_MODULE },
+            if instantiated {
+                SymbolFlags::VALUE_MODULE
+            } else {
+                SymbolFlags::NAMESPACE_MODULE
+            },
             if instantiated {
                 SymbolFlags::VALUE_MODULE_EXCLUDES
             } else {
@@ -1236,22 +1522,44 @@ impl Binder {
         }
         let parent = node.parent();
         if !is_source_file(parent) {
-            self.error_on_node(node, diag::Global_module_exports_may_only_appear_at_top_level, vec![]);
+            self.error_on_node(
+                node,
+                diag::Global_module_exports_may_only_appear_at_top_level,
+                vec![],
+            );
         } else if !is_external_module(parent) {
-            self.error_on_node(node, diag::Global_module_exports_may_only_appear_in_module_files, vec![]);
+            self.error_on_node(
+                node,
+                diag::Global_module_exports_may_only_appear_in_module_files,
+                vec![],
+            );
         } else if !source_file_info(parent).is_declaration_file {
-            self.error_on_node(node, diag::Global_module_exports_may_only_appear_in_declaration_files, vec![]);
+            self.error_on_node(
+                node,
+                diag::Global_module_exports_may_only_appear_in_declaration_files,
+                vec![],
+            );
         } else {
             let global_exports = self.get_global_exports();
             let file_symbol = self.node_symbol(self.file);
-            self.declare_symbol(global_exports, file_symbol, node, SymbolFlags::ALIAS, SymbolFlags::ALIAS_EXCLUDES);
+            self.declare_symbol(
+                global_exports,
+                file_symbol,
+                node,
+                SymbolFlags::ALIAS,
+                SymbolFlags::ALIAS_EXCLUDES,
+            );
         }
     }
 
     // Go: binder/binder.go:841 bindImportClause
     pub fn bind_import_clause(&mut self, node: Node) {
         if node.name().is_some() {
-            self.declare_symbol_and_add_to_symbol_table(node, SymbolFlags::ALIAS, SymbolFlags::ALIAS_EXCLUDES);
+            self.declare_symbol_and_add_to_symbol_table(
+                node,
+                SymbolFlags::ALIAS,
+                SymbolFlags::ALIAS_EXCLUDES,
+            );
         }
     }
 
@@ -1266,10 +1574,22 @@ impl Binder {
         } else if export_clause.is_nil() {
             // All export * declarations are collected in an __export symbol
             let exports = get_exports(&mut self.symbols, container_symbol);
-            self.declare_symbol(exports, container_symbol, node, SymbolFlags::EXPORT_STAR, SymbolFlags::NONE);
+            self.declare_symbol(
+                exports,
+                container_symbol,
+                node,
+                SymbolFlags::EXPORT_STAR,
+                SymbolFlags::NONE,
+            );
         } else if is_namespace_export(export_clause) {
             let exports = get_exports(&mut self.symbols, container_symbol);
-            self.declare_symbol(exports, container_symbol, export_clause, SymbolFlags::ALIAS, SymbolFlags::ALIAS_EXCLUDES);
+            self.declare_symbol(
+                exports,
+                container_symbol,
+                export_clause,
+                SymbolFlags::ALIAS,
+                SymbolFlags::ALIAS_EXCLUDES,
+            );
         }
     }
 
@@ -1290,7 +1610,8 @@ impl Binder {
                 SymbolFlags::PROPERTY
             };
             let exports = get_exports(&mut self.symbols, container_symbol);
-            let symbol = self.declare_symbol(exports, container_symbol, node, flags, SymbolFlags::ALL);
+            let symbol =
+                self.declare_symbol(exports, container_symbol, node, flags, SymbolFlags::ALL);
             if node.is_export_equals() {
                 // Ensure export assignments have a ValueDeclaration set.
                 set_value_declaration(&mut self.symbols, symbol, node);
@@ -1300,11 +1621,20 @@ impl Binder {
 
     // Go: binder/binder.go:877 bindJsxAttributes
     pub fn bind_jsx_attributes(&mut self, node: Node) {
-        self.bind_anonymous_declaration(node, SymbolFlags::OBJECT_LITERAL, INTERNAL_SYMBOL_NAME_JSX_ATTRIBUTES);
+        self.bind_anonymous_declaration(
+            node,
+            SymbolFlags::OBJECT_LITERAL,
+            INTERNAL_SYMBOL_NAME_JSX_ATTRIBUTES,
+        );
     }
 
     // Go: binder/binder.go:881 bindJsxAttribute
-    pub fn bind_jsx_attribute(&mut self, node: Node, symbol_flags: SymbolFlags, symbol_excludes: SymbolFlags) {
+    pub fn bind_jsx_attribute(
+        &mut self,
+        node: Node,
+        symbol_flags: SymbolFlags,
+        symbol_excludes: SymbolFlags,
+    ) {
         self.declare_symbol_and_add_to_symbol_table(node, symbol_flags, symbol_excludes);
     }
 
@@ -1312,7 +1642,9 @@ impl Binder {
     pub fn set_export_context_flag(&mut self, node: Node) {
         // A declaration source file or ambient module declaration that contains no export declarations (but possibly regular
         // declarations with export modifiers) is an export context in which declarations are implicitly exported.
-        if self.node_flags(node).intersects(NodeFlags::AMBIENT) && !self.has_export_declarations(node) {
+        if self.node_flags(node).intersects(NodeFlags::AMBIENT)
+            && !self.has_export_declarations(node)
+        {
             self.add_node_flags(node, NodeFlags::EXPORT_CONTEXT);
         } else {
             self.remove_node_flags(node, NodeFlags::EXPORT_CONTEXT);
@@ -1334,7 +1666,9 @@ impl Binder {
             }
             _ => {}
         }
-        statements.iter().any(|&s| is_export_declaration(s) || is_export_assignment(s))
+        statements
+            .iter()
+            .any(|&s| is_export_declaration(s) || is_export_assignment(s))
     }
 }
 
@@ -1359,9 +1693,18 @@ impl Pattern {
 fn try_parse_pattern(pattern: &str) -> Pattern {
     let star_index = pattern.find('*');
     match star_index {
-        None => Pattern { text: pattern.to_string(), star_index: -1 },
-        Some(i) if !pattern[i + 1..].contains('*') => Pattern { text: pattern.to_string(), star_index: i as i32 },
-        Some(_) => Pattern { text: String::new(), star_index: 0 },
+        None => Pattern {
+            text: pattern.to_string(),
+            star_index: -1,
+        },
+        Some(i) if !pattern[i + 1..].contains('*') => Pattern {
+            text: pattern.to_string(),
+            star_index: i as i32,
+        },
+        Some(_) => Pattern {
+            text: String::new(),
+            star_index: 0,
+        },
     }
 }
 
@@ -1370,8 +1713,10 @@ fn try_parse_pattern(pattern: &str) -> Pattern {
 // PORT: private copy; the contract names no crate module for Go `tspath`.
 fn remove_file_extension(path: &str) -> &str {
     // Go: tspath/extension.go:43 extensionsToRemove
-    const EXTENSIONS_TO_REMOVE: [&str; 12] =
-        [".d.ts", ".d.mts", ".d.cts", ".mjs", ".mts", ".cjs", ".cts", ".ts", ".js", ".tsx", ".jsx", ".json"];
+    const EXTENSIONS_TO_REMOVE: [&str; 12] = [
+        ".d.ts", ".d.mts", ".d.cts", ".mjs", ".mts", ".cjs", ".cts", ".ts", ".js", ".tsx", ".jsx",
+        ".json",
+    ];
     // Remove any known extension even if it has more than one dot
     for ext in EXTENSIONS_TO_REMOVE {
         if let Some(stripped) = path.strip_suffix(ext) {
