@@ -39,13 +39,13 @@ pub fn parse_string_array(value: &CompilerOptionsValue) -> Option<Vec<String>> {
 }
 
 // Go: tsoptions/parsinghelpers.go:44 parseStringMap
-// PORT: the Go map values are `[]string`; the Rust `paths` values are
-// `Vec<String>`, so a nil element slice becomes an empty `Vec`.
-fn parse_string_map(value: &CompilerOptionsValue) -> Option<IndexMap<String, Vec<String>>> {
+// PORT: the Go map values are `[]string`; a nil slice (a non-array value)
+// is `None`, so `verifyCompilerOptions` can tell nil from empty.
+fn parse_string_map(value: &CompilerOptionsValue) -> Option<IndexMap<String, Option<Vec<String>>>> {
     if let CompilerOptionsValue::Map(m) = value {
         let mut result = IndexMap::with_capacity(m.len());
         for (k, v) in m {
-            result.insert(k.clone(), parse_string_array(v).unwrap_or_default());
+            result.insert(k.clone(), parse_string_array(v));
         }
         return Some(result);
     }

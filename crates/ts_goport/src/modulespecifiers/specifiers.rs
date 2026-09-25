@@ -1406,7 +1406,7 @@ struct SpecPair {
 // Go: modulespecifiers/specifiers.go:1098 tryGetModuleNameFromPaths
 fn try_get_module_name_from_paths(
     relative_to_base_url: &str,
-    paths: &IndexMap<String, Vec<String>>,
+    paths: &IndexMap<String, Option<Vec<String>>>,
     allowed_endings: &[ModuleSpecifierEnding],
     base_directory: &str,
     host: &dyn ModuleSpecifierGenerationHost,
@@ -1414,7 +1414,8 @@ fn try_get_module_name_from_paths(
 ) -> String {
     let case_sensitive = host.use_case_sensitive_file_names();
     for (key, values) in paths {
-        for pattern_text in values {
+        // Go ranges over a nil slice as zero items.
+        for pattern_text in values.iter().flatten() {
             let normalized = tspath::normalize_path(pattern_text);
             let mut pattern =
                 get_relative_path_if_in_same_volume(&normalized, base_directory, case_sensitive);

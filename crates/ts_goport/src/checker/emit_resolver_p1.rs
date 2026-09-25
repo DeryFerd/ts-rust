@@ -485,6 +485,23 @@ impl EmitResolver {
         })
     }
 
+    // Go: checker/emitresolver.go:573 EmitResolver.RequiresAddingImplicitUndefinedUnsafe
+    // PORT: body of Go `RequiresAddingImplicitUndefinedUnsafe` with the
+    // checker passed in, for callers inside a node builder call.
+    pub fn requires_adding_implicit_undefined_unsafe_worker(
+        &self,
+        c: &mut Checker,
+        declaration: Node,
+        symbol: SymbolId,
+        enclosing_declaration: Node,
+    ) -> bool {
+        if !is_parse_tree_node(declaration) {
+            return false;
+        }
+        // NO LOCKING - only should be called in contexts that already have a checker lock
+        self.requires_adding_implicit_undefined(c, declaration, symbol, enclosing_declaration)
+    }
+
     // Go: checker/emitresolver.go:581 EmitResolver.requiresAddingImplicitUndefined
     pub fn requires_adding_implicit_undefined(
         &self,
@@ -930,18 +947,21 @@ impl crate::printer::EmitResolver for EmitResolver {
     // Go: checker/emitresolver.go:573 EmitResolver.RequiresAddingImplicitUndefinedUnsafe
     // PORT: Go takes no lock because its callers already hold it. The trait
     // method has no checker argument, so it borrows the checker from the pool.
+    // It must not be called while a checker is lent out. Callers that hold
+    // the checker use `requires_adding_implicit_undefined_unsafe_worker`.
     fn requires_adding_implicit_undefined_unsafe(
         &self,
         node: Node,
         symbol: SymbolId,
         enclosing_declaration: Node,
     ) -> bool {
-        if !is_parse_tree_node(node) {
-            return false;
-        }
-        // NO LOCKING - only should be called in contexts that already have a checker lock
         self.with_checker(|c| {
-            self.requires_adding_implicit_undefined(c, node, symbol, enclosing_declaration)
+            self.requires_adding_implicit_undefined_unsafe_worker(
+                c,
+                node,
+                symbol,
+                enclosing_declaration,
+            )
         })
     }
 

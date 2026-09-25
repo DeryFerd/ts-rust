@@ -58,7 +58,7 @@ pub enum CompilerOptionsValue {
     List(Vec<CompilerOptionsValue>),
     Map(IndexMap<String, CompilerOptionsValue>),
     StringList(Vec<String>),
-    Paths(Option<IndexMap<String, Vec<String>>>),
+    Paths(Option<IndexMap<String, Option<Vec<String>>>>),
     IntPtr(Option<i32>),
     /// Go `struct{}{}`, returned by `convertToJson` for a missing root.
     EmptyStruct,

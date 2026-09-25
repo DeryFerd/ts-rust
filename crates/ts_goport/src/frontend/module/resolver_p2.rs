@@ -218,7 +218,7 @@ impl ResolutionState<'_> {
         extensions: Extensions,
         module_name: &str,
         containing_directory: &str,
-        paths: Option<&IndexMap<String, Vec<String>>>,
+        paths: Option<&IndexMap<String, Option<Vec<String>>>>,
         path_patterns: &ParsedPatterns,
         loader: &mut dyn FnMut(&mut Self, Extensions, &str) -> Option<Resolved>,
     ) -> Option<Resolved> {
@@ -232,9 +232,11 @@ impl ResolutionState<'_> {
                 matched_pattern.text
             );
             // Go `paths.GetOrZero(text)`: nil for a missing key or a nil map.
+            // Go ranges over a nil slice as zero items.
             let substitutions = paths
                 .and_then(|p| p.get(&matched_pattern.text))
                 .cloned()
+                .flatten()
                 .unwrap_or_default();
             for subst in &substitutions {
                 let path = subst.replacen('*', matched_star, 1);
@@ -816,13 +818,13 @@ impl ResolutionState<'_> {
                 version(),
                 module_name
             );
-            let paths = version_paths.get_paths().cloned();
-            let path_patterns = try_parse_patterns(paths.as_ref());
+            let paths = version_paths.get_paths();
+            let path_patterns = try_parse_patterns(paths);
             let result = self.try_load_module_using_paths(
                 ext,
                 &module_name,
                 candidate,
-                paths.as_ref(),
+                paths,
                 &path_patterns,
                 &mut loader,
             );
@@ -1354,7 +1356,9 @@ impl Resolver {
 
 // Go: module/resolver.go:1988 TryParsePatterns
 // PORT: a nil `*OrderedMap` is `None`.
-pub fn try_parse_patterns(path_mappings: Option<&IndexMap<String, Vec<String>>>) -> ParsedPatterns {
+pub fn try_parse_patterns(
+    path_mappings: Option<&IndexMap<String, Option<Vec<String>>>>,
+) -> ParsedPatterns {
     let empty = IndexMap::new();
     let path_mappings = path_mappings.unwrap_or(&empty);
     let paths = path_mappings.keys();

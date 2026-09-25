@@ -58,6 +58,7 @@ impl SymbolTrackerImpl {
                     .collect()
             });
         }
+        self.add_diagnostic((self.get_isolated_declaration_error)(None, node));
     }
 
     // Go: transformers/declarations/tracker.go:27 SymbolTrackerImpl.PopErrorFallbackNode
@@ -255,7 +256,7 @@ impl SymbolTracker for SymbolTrackerImpl {
                     .collect()
             });
         }
-        self.add_diagnostic((self.get_isolated_declaration_error)(node));
+        self.add_diagnostic((self.get_isolated_declaration_error)(Some(c), node));
     }
 
     // Go: transformers/declarations/tracker.go:75 SymbolTrackerImpl.ReportLikelyUnsafeImportRequiredError

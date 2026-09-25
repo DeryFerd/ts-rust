@@ -165,7 +165,9 @@ pub struct ParsedPatterns {
 }
 
 // Go: module/resolver.go:1988 TryParsePatterns
-pub fn try_parse_patterns(path_mappings: Option<&IndexMap<String, Vec<String>>>) -> ParsedPatterns {
+pub fn try_parse_patterns(
+    path_mappings: Option<&IndexMap<String, Option<Vec<String>>>>,
+) -> ParsedPatterns {
     let mut result = ParsedPatterns::default();
     let Some(path_mappings) = path_mappings else {
         return result;

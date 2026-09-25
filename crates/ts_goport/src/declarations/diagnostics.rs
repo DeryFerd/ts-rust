@@ -845,19 +845,35 @@ fn create_expression_error_ex(
 }
 
 /// Go `func(node *ast.Node) *ast.Diagnostic` returned by createGetIsolatedDeclarationErrors.
-pub type GetIsolatedDeclarationError = Box<dyn Fn(Node) -> Diagnostic>;
+/// PORT: the first argument is the checker that the caller already holds
+/// (inside a node builder call), or `None` when no checker is lent out.
+pub type GetIsolatedDeclarationError = Box<dyn Fn(Option<&mut Checker>, Node) -> Diagnostic>;
 
 // Go: transformers/declarations/diagnostics.go:682 createGetIsolatedDeclarationErrors
 pub fn create_get_isolated_declaration_errors(
     resolver: Rc<dyn EmitResolver>,
 ) -> GetIsolatedDeclarationError {
-    let create_parameter_error = move |node: Node| -> Diagnostic {
+    let create_parameter_error = move |c: Option<&mut Checker>, node: Node| -> Diagnostic {
         if is_set_accessor_declaration(node.parent()) {
             return create_accessor_type_error(node.parent());
         }
         // skip checker lock - node builder will already have one
-        let add_undefined =
-            resolver.requires_adding_implicit_undefined_unsafe(node, SymbolId::NIL, Node::NIL);
+        // PORT: Go always skips the lock. Here a caller inside the node
+        // builder passes its checker, which is used directly. Without one,
+        // the trait method borrows the resolver's checker, which is free.
+        let add_undefined = match c {
+            Some(c) => c
+                .get_emit_resolver()
+                .requires_adding_implicit_undefined_unsafe_worker(
+                    c,
+                    node,
+                    SymbolId::NIL,
+                    Node::NIL,
+                ),
+            None => {
+                resolver.requires_adding_implicit_undefined_unsafe(node, SymbolId::NIL, Node::NIL)
+            }
+        };
         if !add_undefined && node.initializer().is_some() {
             return create_expression_error(node);
         }
@@ -875,7 +891,7 @@ pub fn create_get_isolated_declaration_errors(
         diag
     };
 
-    Box::new(move |node: Node| -> Diagnostic {
+    Box::new(move |c: Option<&mut Checker>, node: Node| -> Diagnostic {
         let heritage_clause = find_ancestor(node, is_heritage_clause);
         if heritage_clause.is_some() {
             return create_diagnostic_for_node(
@@ -907,7 +923,7 @@ pub fn create_get_isolated_declaration_errors(
             SyntaxKind::PropertyDeclaration | SyntaxKind::VariableDeclaration => {
                 create_variable_or_property_error(node)
             }
-            SyntaxKind::Parameter => create_parameter_error(node),
+            SyntaxKind::Parameter => create_parameter_error(c, node),
             SyntaxKind::PropertyAssignment => create_expression_error(node.initializer()),
             SyntaxKind::ClassExpression => create_class_expression_error(node),
             _ => create_expression_error(node),

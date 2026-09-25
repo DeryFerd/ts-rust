@@ -257,12 +257,8 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
     }
 
     // Go: compiler/program.go:157 GetRedirectTargets
-    // PORT: the program in this crate does not build `redirectTargetsMap`
-    // (it does not deduplicate packages by name@version), so no file has
-    // redirect targets.
     fn get_redirect_targets(&self, path: &tspath::Path) -> Vec<String> {
-        let _ = path;
-        Vec::new()
+        crate::program::get_redirect_targets(path)
     }
 
     // Go: compiler/program.go:165 GetSourceOfProjectReferenceIfOutputIncluded

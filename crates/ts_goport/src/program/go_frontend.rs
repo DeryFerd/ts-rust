@@ -9,14 +9,16 @@ use super::*;
 use crate::ast::store::{file_store_count, file_store_file_name, file_store_parser_flags};
 use crate::frontend::bundled;
 use crate::frontend::compiler::{
-    NewProgram, ProgramOptions, new_cached_fs_compiler_host, new_program,
+    NewProgram, ProgramOptions, TraceFn, new_cached_fs_compiler_host, new_program,
 };
 use crate::frontend::module::ModeAwareCacheKey;
 use crate::frontend::parser::{ParsedSourceFile, SourceFileParseOptions};
 use crate::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
 use crate::frontend::tspath::Path as GoPath;
 use crate::frontend::vfs::{Fs, osvfs_fs};
+use std::io::Write;
 use std::rc::Rc;
+use ts_diagnostics::Message;
 
 /// The Go frontend program. It is not thread-safe, so only the loading
 /// thread holds it (`GO_FRONTEND`). The checker reads `GoSharedState`.
@@ -144,7 +146,8 @@ pub(super) fn try_load_with(
     let config = config.ok_or_else(|| format!("cannot parse {config_abs}"))?;
 
     // Go: tsc.go:293 NewCachedFSCompilerHost, tsc.go:301 NewProgram.
-    let host = new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, None);
+    let host =
+        new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, Some(trace_from_sys()));
     let new_program: &'static NewProgram = Box::leak(Box::new(new_program(ProgramOptions {
         host,
         config: Rc::new(config),
@@ -187,6 +190,13 @@ pub(super) fn try_load_with(
         });
     }
 
+    // Go: filesparser.go:425 `filesByPath[task.path] = packageIdFile`. A
+    // package dedup redirect path maps to the first file with the same
+    // package id, so `GetSourceFileByPath` finds that file.
+    for (path, file) in new_program.files_by_path() {
+        file_by_path.entry(path.0.clone()).or_insert(file.store);
+    }
+
     let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
         program: None,
         files,
@@ -219,6 +229,19 @@ pub(super) fn try_load_with(
     }));
     set_state(program_state);
     Ok(program)
+}
+
+/// Go `getTraceFromSys` (tsc.go:280) with no testing hooks:
+/// `tsc.GetTraceWithWriterFromSys` (tsc/emit.go:20) writes each localized
+/// trace message and a newline to `sys.Writer()`, which is stdout.
+fn trace_from_sys() -> TraceFn {
+    Rc::new(|msg: &'static Message, args: Vec<String>| {
+        let text = match msg.format(&args) {
+            Ok(text) => text,
+            Err(_) => panic!("Invalid formatting placeholder"),
+        };
+        let _ = writeln!(std::io::stdout().lock(), "{text}");
+    })
 }
 
 /// `SourceFileInfo` of a program file, from the Go parser fields and the

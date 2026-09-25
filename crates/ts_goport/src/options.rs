@@ -189,7 +189,8 @@ pub struct CompilerOptions {
     pub no_implicit_override: Tristate,
     pub no_unchecked_side_effect_imports: Tristate,
     pub out_dir: String,
-    pub paths: Option<IndexMap<String, Vec<String>>>,
+    /// Go `*OrderedMap[string, []string]`; a nil substitution slice is `None`.
+    pub paths: Option<IndexMap<String, Option<Vec<String>>>>,
     pub preserve_const_enums: Tristate,
     pub preserve_symlinks: Tristate,
     pub project: String,
@@ -989,7 +990,7 @@ pub fn from_ts_options(opts: &ts_options::CompilerOptions) -> CompilerOptions {
         Some(
             opts.paths
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(k, v)| (k.clone(), Some(v.clone())))
                 .collect::<IndexMap<_, _>>(),
         )
     };

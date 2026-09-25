@@ -1940,13 +1940,13 @@ impl ResolutionState<'_> {
                         version(),
                         rest
                     );
-                    let paths = version_paths.get_paths().cloned();
-                    let path_patterns = try_parse_patterns(paths.as_ref());
+                    let paths = version_paths.get_paths();
+                    let path_patterns = try_parse_patterns(paths);
                     let from_paths = self.try_load_module_using_paths(
                         ext,
                         &rest,
                         &package_directory,
-                        paths.as_ref(),
+                        paths,
                         &path_patterns,
                         &mut loader,
                     );
