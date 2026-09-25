@@ -172,6 +172,7 @@ pub(super) fn enabled() -> bool {
 pub(super) fn try_load_with(
     config_path: &str,
     edit_options: impl FnOnce(&mut CompilerOptions),
+    times: &mut CompileTimes,
 ) -> Result<&'static GoProgram, String> {
     let legacy_fs = ts_vfs::OsFileSystem::default();
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
@@ -198,6 +199,7 @@ pub(super) fn try_load_with(
         fs: fs.clone(),
         current_directory: cwd.clone(),
     };
+    let config_start = std::time::Instant::now();
     let (config, errors) = get_parsed_command_line_of_config_file(
         &config_abs,
         Some(&command_line_options),
@@ -205,6 +207,7 @@ pub(super) fn try_load_with(
         &sys,
         None,
     );
+    times.config_time = config_start.elapsed();
     if !errors.is_empty() {
         // Go reports these unrecoverable errors and exits.
         let messages: Vec<String> = errors
@@ -218,6 +221,7 @@ pub(super) fn try_load_with(
     // Go: tsc.go:293 NewCachedFSCompilerHost, tsc.go:301 NewProgram.
     let host =
         new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, Some(trace_from_sys()));
+    let parse_start = std::time::Instant::now();
     let new_program: &'static NewProgram = Box::leak(Box::new(new_program(ProgramOptions {
         host,
         config: Rc::new(config),
@@ -226,6 +230,7 @@ pub(super) fn try_load_with(
         typings_location: String::new(),
         project_name: String::new(),
     })));
+    times.parse_time = parse_start.elapsed();
     let options = new_program.options().clone();
 
     let mut parsed = FxHashMap::default();

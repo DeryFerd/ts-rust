@@ -607,7 +607,7 @@ impl Checker {
             }
             SyntaxKind::ArrayLiteralExpression => {
                 let t = self.get_apparent_type_of_contextual_type(parent, context_flags);
-                let element_index = index_of_node(&parent.elements().to_vec(), node);
+                let element_index = index_of_node(parent.elements(), node);
                 if element_index < 0 {
                     return TypeId::NIL;
                 }

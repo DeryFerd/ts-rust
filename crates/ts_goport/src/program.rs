@@ -12,6 +12,7 @@
 //! functions below. `load` installs the program for the process; the
 //! loading thread also keeps the frontend program and the checker pool.
 
+use crate::execute::tsc::statistics::CompileTimes;
 use crate::prelude::*;
 use std::cell::OnceCell;
 use std::ops::Deref;
@@ -331,9 +332,32 @@ pub fn try_load_with(
     config_path: &str,
     edit_options: impl FnOnce(&mut CompilerOptions),
 ) -> Result<&'static GoProgram, String> {
+    try_load_timed(config_path, edit_options, &mut CompileTimes::default())
+}
+
+/// `try_load_with` that also records the Go `CompileTimes.ConfigTime` and
+/// `ParseTime` (execute/tsc.go:214 and :306) in `times`.
+// PORT: the legacy loader reads the config graph and parses the files in
+// one call, so all of its time is parse time.
+pub fn try_load_timed(
+    config_path: &str,
+    edit_options: impl FnOnce(&mut CompilerOptions),
+    times: &mut CompileTimes,
+) -> Result<&'static GoProgram, String> {
     if go_frontend::enabled() {
-        return go_frontend::try_load_with(config_path, edit_options);
+        return go_frontend::try_load_with(config_path, edit_options, times);
     }
+    let parse_start = std::time::Instant::now();
+    let result = try_load_legacy(config_path, edit_options);
+    times.parse_time = parse_start.elapsed();
+    result
+}
+
+/// `try_load_with` for the legacy ts_compiler loader.
+fn try_load_legacy(
+    config_path: &str,
+    edit_options: impl FnOnce(&mut CompilerOptions),
+) -> Result<&'static GoProgram, String> {
     let fs = ts_vfs::OsFileSystem::default();
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let cwd = ts_path::normalize_path(&cwd.to_string_lossy().replace('\\', "/"));
@@ -1822,6 +1846,15 @@ pub fn get_redirect_for_resolution(file: Node) -> Option<&'static ResolvedProjec
     state().go.as_ref()?.get_redirect_for_resolution(file)
 }
 
+// Go: compiler/projectreferencefilemapper.go:76 getCompilerOptionsForFile
+// Go: module/resolver.go:145 GetCompilerOptionsWithRedirect
+// The options of the project reference that owns the file, else the root
+// options. The per-file checker queries below use it.
+fn compiler_options_for_file(file: Node) -> &'static CompilerOptions {
+    get_redirect_for_resolution(file)
+        .map_or(&prog().options, ResolvedProjectReference::compiler_options)
+}
+
 // Go: compiler/program.go:199 GetResolvedProjectReferences
 // PORT: see `get_project_reference_from_source`. A reference that did not
 // load is None (Go nil).
@@ -2009,7 +2042,7 @@ pub fn get_emit_module_format_of_file(source_file: Node) -> ModuleKind {
     let info = source_file_info(source_file);
     get_emit_module_format_of_file_worker(
         &info.file_name,
-        &prog().options,
+        compiler_options_for_file(source_file),
         &get_source_file_meta_data(&info.path),
     )
 }
@@ -2021,7 +2054,7 @@ pub fn get_emit_syntax_for_usage_location(source_file: Node, location: Node) -> 
         &info.file_name,
         &get_source_file_meta_data(&info.path),
         location,
-        &prog().options,
+        compiler_options_for_file(source_file),
     )
 }
 
@@ -2030,7 +2063,7 @@ pub fn get_implied_node_format_for_emit(source_file: Node) -> ResolutionMode {
     let info = source_file_info(source_file);
     get_implied_node_format_for_emit_worker(
         &info.file_name,
-        prog().options.get_emit_module_kind(),
+        compiler_options_for_file(source_file).get_emit_module_kind(),
         &get_source_file_meta_data(&info.path),
     )
 }
@@ -2042,7 +2075,7 @@ pub fn get_mode_for_usage_location(source_file: Node, location: Node) -> Resolut
         &info.file_name,
         &get_source_file_meta_data(&info.path),
         location,
-        &prog().options,
+        compiler_options_for_file(source_file),
     )
 }
 
@@ -2052,7 +2085,7 @@ pub fn get_default_resolution_mode_for_file(source_file: Node) -> ResolutionMode
     get_default_resolution_mode_for_file_worker(
         &info.file_name,
         &get_source_file_meta_data(&info.path),
-        &prog().options,
+        compiler_options_for_file(source_file),
     )
 }
 
@@ -3406,6 +3439,63 @@ fn compact_and_merge_related_infos(diagnostics: Vec<Diagnostic>) -> Vec<Diagnost
         i += n;
     }
     result
+}
+
+// Go: compiler/program.go:1470 LineCount
+pub fn line_count() -> i32 {
+    let mut count = 0;
+    for file in prog().source_files() {
+        count += get_ecma_line_starts(file.root).len() as i32;
+    }
+    count
+}
+
+// Go: compiler/program.go:1478 IdentifierCount
+// PORT: the legacy loader does not count identifiers.
+pub fn identifier_count() -> i32 {
+    let Some(go) = go_frontend() else {
+        unported!("IdentifierCount");
+    };
+    let mut count = 0;
+    for file in go.program.source_files() {
+        count += file.identifier_count;
+    }
+    count
+}
+
+// Go: compiler/program.go:1486 SymbolCount
+// PORT: an unbound file (the program had syntactic errors) has the Go zero
+// value.
+pub fn symbol_count() -> i32 {
+    let mut count: u32 = 0;
+    for file in prog().source_files() {
+        count += file
+            .file_bind
+            .get()
+            .map_or(0, |data| data.symbol_count as u32);
+    }
+    for value in for_each_checker_parallel(|_, c| c.symbol_count) {
+        count = count.wrapping_add(value);
+    }
+    count as i32
+}
+
+// Go: compiler/program.go:1499 TypeCount
+pub fn type_count() -> i32 {
+    let mut val: u32 = 0;
+    for value in for_each_checker_parallel(|_, c| c.type_count) {
+        val = val.wrapping_add(value);
+    }
+    val as i32
+}
+
+// Go: compiler/program.go:1507 InstantiationCount
+pub fn instantiation_count() -> i32 {
+    let mut val: u32 = 0;
+    for value in for_each_checker_parallel(|_, c| c.total_instantiation_count) {
+        val = val.wrapping_add(value);
+    }
+    val as i32
 }
 
 // Go: compiler/program.go:1750 GetDiagnosticsOfAnyProgram

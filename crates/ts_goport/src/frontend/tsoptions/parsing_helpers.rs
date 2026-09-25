@@ -222,8 +222,8 @@ pub fn parse_compiler_options(
 
 // Go: tsoptions/parsinghelpers.go:203 parseCompilerOptions
 // PORT: renamed, because the snake_case form of the Go name is the same as
-// `ParseCompilerOptions`. Go `[]string` results go to `Vec<String>` fields
-// (nil and empty are the same there); `type_roots` keeps the nil state.
+// `ParseCompilerOptions`. Go `[]string` results go to `Option<Vec<String>>`
+// fields, so an explicit empty list stays different from nil.
 fn parse_compiler_options_worker(
     key: &str,
     value: &CompilerOptionsValue,
@@ -256,9 +256,7 @@ fn parse_compiler_options_worker(
         "baseUrl" => all_options.base_url = parse_string(value),
         "build" => all_options.build = parse_tristate(value),
         "checkJs" => all_options.check_js = parse_tristate(value),
-        "customConditions" => {
-            all_options.custom_conditions = parse_string_array(value).unwrap_or_default()
-        }
+        "customConditions" => all_options.custom_conditions = parse_string_array(value),
         "composite" => all_options.composite = parse_tristate(value),
         "declarationDir" => all_options.declaration_dir = parse_string(value),
         "deduplicatePackages" => all_options.deduplicate_packages = parse_tristate(value),
@@ -327,9 +325,7 @@ fn parse_compiler_options_worker(
             all_options.module_resolution =
                 float_or_int32_to_flag(value, as_module_resolution_kind, ModuleResolutionKind);
         }
-        "moduleSuffixes" => {
-            all_options.module_suffixes = parse_string_array(value).unwrap_or_default()
-        }
+        "moduleSuffixes" => all_options.module_suffixes = parse_string_array(value),
         "moduleDetection" => {
             all_options.module_detection =
                 float_or_int32_to_flag(value, as_module_detection_kind, ModuleDetectionKind);
@@ -378,7 +374,7 @@ fn parse_compiler_options_worker(
             all_options.rewrite_relative_import_extensions = parse_tristate(value)
         }
         "rootDir" => all_options.root_dir = parse_string(value),
-        "rootDirs" => all_options.root_dirs = parse_string_array(value).unwrap_or_default(),
+        "rootDirs" => all_options.root_dirs = parse_string_array(value),
         "removeComments" => all_options.remove_comments = parse_tristate(value),
         "stableTypeOrdering" => all_options.stable_type_ordering = parse_tristate(value),
         "strict" => all_options.strict = parse_tristate(value),
@@ -402,7 +398,7 @@ fn parse_compiler_options_worker(
         "traceResolution" => all_options.trace_resolution = parse_tristate(value),
         "tsBuildInfoFile" => all_options.ts_build_info_file = parse_string(value),
         "typeRoots" => all_options.type_roots = parse_string_array(value),
-        "types" => all_options.types = parse_string_array(value).unwrap_or_default(),
+        "types" => all_options.types = parse_string_array(value),
         "useDefineForClassFields" => {
             all_options.use_define_for_class_fields = parse_tristate(value)
         }
@@ -539,9 +535,9 @@ pub fn parse_type_acquisition(
 // including when they are explicitly set to null in the raw configuration (if rawSource is provided).
 // PORT: Go loops over the struct fields by reflection. The Rust port lists
 // each field with its Go json name, in Go field order. Go `IsZero` is
-// `== Default::default()`: a nil or empty Rust `Vec` is zero, while a Go
-// empty non-nil slice is not zero. `lib` is an `Option`, so it keeps that
-// difference. Go `rawSource any` is the map it must
+// `== Default::default()`. Go `[]string` fields are `Option<Vec<String>>`,
+// so `None` (nil) is zero and `Some(vec![])` (empty non-nil) is not, as in
+// Go. Go `rawSource any` is the map it must
 // hold to have an effect, so it is `Option<&IndexMap>`. The Go merge
 // copies the `Paths` pointer, so a later in-place change of `paths` also
 // changes the source options; the Rust clone does not share it.
@@ -798,4 +794,28 @@ pub fn convert_option_to_absolute_path(
         }
     }
     (CompilerOptionsValue::Nil, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Go keeps an explicit `[]` as a non-nil slice, so it overrides the
+    // extended config in `mergeCompilerOptions`.
+    #[test]
+    fn empty_string_array_overrides_extended_config() {
+        let mut target = CompilerOptions {
+            custom_conditions: Some(vec!["@tanstack/custom-condition".to_string()]),
+            types: Some(vec!["node".to_string()]),
+            ..Default::default()
+        };
+        let mut source = CompilerOptions::default();
+        let empty = CompilerOptionsValue::List(Vec::new());
+        parse_compiler_options_worker("customConditions", &empty, &mut source);
+        parse_compiler_options_worker("types", &empty, &mut source);
+        merge_compiler_options(&mut target, Some(&source), None);
+        assert_eq!(target.custom_conditions, Some(Vec::new()));
+        assert_eq!(target.types, Some(Vec::new()));
+        assert_eq!(target.root_dirs, None);
+    }
 }

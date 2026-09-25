@@ -596,7 +596,7 @@ fn get_local_module_specifier(
     paths_only: bool,
 ) -> String {
     let paths = compiler_options.paths.as_ref();
-    let root_dirs = &compiler_options.root_dirs;
+    let root_dirs = compiler_options.root_dirs.as_deref().unwrap_or_default();
 
     if paths_only && paths.is_none() {
         return String::new();
