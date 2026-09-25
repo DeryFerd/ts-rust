@@ -9,7 +9,9 @@ use std::any::Any;
 use std::fmt::Write as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::baseline::util::{is_default_library_file, remove_line_delimiters, remove_test_path_prefixes};
+use crate::baseline::util::{
+    is_default_library_file, remove_line_delimiters, remove_test_path_prefixes,
+};
 use crate::frontend::tspath::path::get_base_file_name;
 use crate::prelude::*;
 
@@ -41,7 +43,8 @@ pub fn is_bracket_line(line: &str) -> bool {
 /// the next line is a bracket line or is empty after `strings.TrimSpace`.
 /// Rust `trim` uses Unicode White_Space, the same set as Go `unicode.IsSpace`.
 fn next_line_needs_no_blank(code_lines: &[&str], next: usize) -> bool {
-    next < code_lines.len() && (is_bracket_line(code_lines[next]) || code_lines[next].trim().is_empty())
+    next < code_lines.len()
+        && (is_bracket_line(code_lines[next]) || code_lines[next].trim().is_empty())
 }
 
 // Go: type_symbol_baseline.go:143 generateBaseline
@@ -61,7 +64,10 @@ pub fn generate_baseline(
     // PORT: the commented-out Go perf stats block is not ported; perfLines
     // stays empty.
     if !result.is_empty() {
-        return format!("//// [{header}] ////\r\n\r\n{}{result}", perf_lines.join("\n"));
+        return format!(
+            "//// [{header}] ////\r\n\r\n{}{result}",
+            perf_lines.join("\n")
+        );
     }
     NO_CONTENT.to_string()
 }
@@ -104,7 +110,11 @@ pub fn iterate_baseline(
                 type_lines.push_str("\r\n");
             }
             last_index_written = line as i64;
-            let type_or_symbol_string = if is_symbol_baseline { &result.symbol } else { &result.typ };
+            let type_or_symbol_string = if is_symbol_baseline {
+                &result.symbol
+            } else {
+                &result.typ
+            };
             let line_text = remove_line_delimiters(&result.source_text);
             type_lines.push('>');
             let _ = write!(type_lines, "{line_text} : {type_or_symbol_string}");
@@ -129,7 +139,10 @@ pub fn iterate_baseline(
         }
         type_lines.push_str("\r\n");
 
-        baselines.push(remove_test_path_prefixes(&type_lines, false /*retainTrailingDirectorySeparator*/));
+        baselines.push(remove_test_path_prefixes(
+            &type_lines,
+            false, /*retainTrailingDirectorySeparator*/
+        ));
     }
 
     baselines
@@ -185,8 +198,12 @@ fn payload_message(payload: &(dyn Any + Send)) -> String {
 impl TypeWriterWalker {
     // Go: type_symbol_baseline.go:286 getTypeCheckerForCurrentFile
     // PORT: Go returns the checker and a release func. The Rust pool lends
-    // the same checker (`GetTypeCheckerForFile`) to a closure.
-    fn with_type_checker_for_current_file<R>(&self, f: impl FnOnce(&mut Checker) -> R) -> R {
+    // the same checker (`GetTypeCheckerForFile`) to a closure on the
+    // checker's own thread, so the closure and its result must be `Send`.
+    fn with_type_checker_for_current_file<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Checker) -> R + Send + 'static,
+    ) -> R {
         with_type_checker_for_file(self.current_source_file, f)
     }
 
@@ -209,7 +226,8 @@ impl TypeWriterWalker {
         let nodes = for_each_ast_node(node);
         let mut results = Vec::new();
         for n in nodes {
-            if is_expression_node(n) || n.kind() == SyntaxKind::Identifier || is_declaration_name(n) {
+            if is_expression_node(n) || n.kind() == SyntaxKind::Identifier || is_declaration_name(n)
+            {
                 let result = if self.catch_panics {
                     self.write_type_or_symbol_guarded(n, is_symbol_walk)
                 } else {
@@ -227,8 +245,14 @@ impl TypeWriterWalker {
     /// kept after a panic, because a new checker would change the type ids
     /// of every later node. Panics that are not unported hits are recorded
     /// as `panic` in the unported report.
-    fn write_type_or_symbol_guarded(&mut self, node: Node, is_symbol_walk: bool) -> Option<TypeWriterResult> {
-        match catch_unwind(AssertUnwindSafe(|| self.write_type_or_symbol(node, is_symbol_walk))) {
+    fn write_type_or_symbol_guarded(
+        &mut self,
+        node: Node,
+        is_symbol_walk: bool,
+    ) -> Option<TypeWriterResult> {
+        match catch_unwind(AssertUnwindSafe(|| {
+            self.write_type_or_symbol(node, is_symbol_walk)
+        })) {
             Ok(result) => result,
             Err(payload) => {
                 let message = payload_message(payload.as_ref());
@@ -258,14 +282,22 @@ impl TypeWriterWalker {
     }
 
     // Go: type_symbol_baseline.go:357 writeTypeOrSymbol
-    pub fn write_type_or_symbol(&mut self, node: Node, is_symbol_walk: bool) -> Option<TypeWriterResult> {
+    pub fn write_type_or_symbol(
+        &mut self,
+        node: Node,
+        is_symbol_walk: bool,
+    ) -> Option<TypeWriterResult> {
         let current_source_file = self.current_source_file;
         let actual_pos = skip_trivia(source_file_text(current_source_file), node.pos());
         let line = get_ecma_line_of_position(current_source_file, actual_pos);
-        let source_text = get_source_text_of_node_from_source_file(current_source_file, node, false /*includeTrivia*/);
+        let source_text = get_source_text_of_node_from_source_file(
+            current_source_file,
+            node,
+            false, /*includeTrivia*/
+        );
         let had_error_baseline = self.had_error_baseline;
 
-        self.with_type_checker_for_current_file(|file_checker| {
+        self.with_type_checker_for_current_file(move |file_checker| {
             let (ctx, put_ctx) = get_emit_context();
             let result = write_type_or_symbol_with_checker(
                 file_checker,
@@ -301,11 +333,13 @@ fn write_type_or_symbol_with_checker(
         // Don't try to get the type of something that's already a type.
         // Exception for `T` in `type T = something` because that may evaluate to some interesting type.
         if is_part_of_type_node(node)
-            || (node.kind() == SyntaxKind::AsExpression || node.kind() == SyntaxKind::SatisfiesExpression)
+            || (node.kind() == SyntaxKind::AsExpression
+                || node.kind() == SyntaxKind::SatisfiesExpression)
                 && node.type_().flags().intersects(NodeFlags::REPARSED)
             || is_identifier(node)
                 && !get_meaning_from_declaration(node.parent()).intersects(SemanticMeaning::VALUE)
-                && !(is_type_or_js_type_alias_declaration(node.parent()) && node == node.parent().name())
+                && !(is_type_or_js_type_alias_declaration(node.parent())
+                    && node == node.parent().name())
         {
             return None;
         }
@@ -334,7 +368,11 @@ fn write_type_or_symbol_with_checker(
             && !is_export_statement_name(node)
             && !is_intrinsic_jsx_tag(node, current_source_file)
         {
-            type_string = file_checker.ty(t).as_intrinsic_type().intrinsic_name().to_string();
+            type_string = file_checker
+                .ty(t)
+                .as_intrinsic_type()
+                .intrinsic_name()
+                .to_string();
         } else {
             ctx.reset();
             let builder = Rc::new(RefCell::new(new_node_builder(file_checker, Rc::clone(ctx))));
@@ -397,17 +435,23 @@ fn write_type_or_symbol_with_checker(
 
     let mut symbol_string = String::with_capacity(256);
     symbol_string.push_str("Symbol(");
-    symbol_string.push_str(&escape_all_internal_symbol_names(&file_checker.symbol_to_string_ex(
-        symbol,
-        node.parent(),
-        SymbolFlags::NONE,
-        SymbolFormatFlags::ALLOW_ANY_NODE_KIND,
-    )));
+    symbol_string.push_str(&escape_all_internal_symbol_names(
+        &file_checker.symbol_to_string_ex(
+            symbol,
+            node.parent(),
+            SymbolFlags::NONE,
+            SymbolFormatFlags::ALLOW_ANY_NODE_KIND,
+        ),
+    ));
     let declarations = file_checker.sym(symbol).declarations.clone();
     let mut count = 0;
     for declaration in &declarations {
         if count >= 5 {
-            let _ = write!(symbol_string, " ... and {} more", declarations.len() - count);
+            let _ = write!(
+                symbol_string,
+                " ... and {} more",
+                declarations.len() - count
+            );
             break;
         }
         count += 1;
@@ -500,13 +544,17 @@ pub fn is_export_statement_name(node: Node) -> bool {
 // Go: type_symbol_baseline.go:490 isIntrinsicJsxTag
 pub fn is_intrinsic_jsx_tag(node: Node, source_file: Node) -> bool {
     let parent = node.parent();
-    if !(is_jsx_opening_element(parent) || is_jsx_closing_element(parent) || is_jsx_self_closing_element(parent)) {
+    if !(is_jsx_opening_element(parent)
+        || is_jsx_closing_element(parent)
+        || is_jsx_self_closing_element(parent))
+    {
         return false;
     }
     if parent.tag_name() != node {
         return false;
     }
-    let text = get_source_text_of_node_from_source_file(source_file, node, false /*includeTrivia*/);
+    let text =
+        get_source_text_of_node_from_source_file(source_file, node, false /*includeTrivia*/);
     is_intrinsic_jsx_name(&text)
 }
 
@@ -517,7 +565,10 @@ mod tests {
     #[test]
     fn text_matchers() {
         // CRLF gives an extra empty line (RE2 leftmost-first takes `\r` alone).
-        assert_eq!(split_code_lines("a\r\nb\nc\u{2028}d"), vec!["a", "", "b", "c", "d"]);
+        assert_eq!(
+            split_code_lines("a\r\nb\nc\u{2028}d"),
+            vec!["a", "", "b", "c", "d"]
+        );
         assert_eq!(split_code_lines(""), vec![""]);
         // A lone `\r` stays in the line text.
         assert_eq!(remove_line_delimiters("x\r\ny\rz\n"), "xy\rz");

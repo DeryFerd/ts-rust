@@ -48,7 +48,8 @@ fn main() {
         std::process::exit(1);
     };
     install_panic_hook();
-    // All program state is thread-local, so the whole run stays on one thread.
+    // The loading thread keeps the frontend program and the checker pool, so
+    // the whole run stays on it. The checkers run on their own threads.
     let worker = std::thread::Builder::new()
         .name("goport_typesyms".to_string())
         .stack_size(STACK_SIZE)
@@ -68,7 +69,10 @@ fn install_panic_hook() {
         let message = payload_message(info.payload());
         if message.starts_with(UNPORTED_PREFIX) {
             if std::env::var_os("GOPORT_TRACE").is_some() {
-                eprintln!("trace: {message}\n{}", std::backtrace::Backtrace::force_capture());
+                eprintln!(
+                    "trace: {message}\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                );
             }
             return;
         }
@@ -116,14 +120,16 @@ fn collect_all_diagnostics() -> Vec<Diagnostic> {
         Node::NIL,
         false,
         &mut |file| guard(|| get_bind_diagnostics(file)),
-        &mut |file| collect_checker_diagnostics_with(file, &mut check_file_guarded),
+        &mut |file| collect_checker_diagnostics_with(file, check_file_guarded),
         &mut || guard(get_global_diagnostics),
         &mut |file| guard(|| get_declaration_diagnostics(file)),
     )
 }
 
 fn check_file_guarded(checker: &mut Checker, file: Node) -> Vec<Diagnostic> {
-    match catch_unwind(AssertUnwindSafe(|| get_semantic_diagnostics_with_checker(checker, file))) {
+    match catch_unwind(AssertUnwindSafe(|| {
+        get_semantic_diagnostics_with_checker(checker, file)
+    })) {
         Ok(diagnostics) => diagnostics,
         Err(payload) => {
             note_panic(payload.as_ref());
@@ -227,7 +233,12 @@ fn run(project: &str, out_dir: &str) -> i32 {
     for is_symbol in [false, true] {
         let ext = if is_symbol { ".symbols" } else { ".types" };
         for unit in &units {
-            let text = generate_baseline(std::slice::from_ref(&unit.file), &mut walker, &unit.header, is_symbol);
+            let text = generate_baseline(
+                std::slice::from_ref(&unit.file),
+                &mut walker,
+                &unit.header,
+                is_symbol,
+            );
             std::fs::write(format!("{out_dir}/{}{ext}", unit.name), text).expect("write baseline");
         }
     }
@@ -237,7 +248,9 @@ fn run(project: &str, out_dir: &str) -> i32 {
         list.push_str(&unit.file.unit_name);
         list.push('\n');
     }
-    list.push_str(&format!("hadErrorBaseline {had_error_baseline}\n"));
+    list.push_str("hadErrorBaseline ");
+    list.push_str(if had_error_baseline { "true" } else { "false" });
+    list.push('\n');
     std::fs::write(format!("{out_dir}/files.txt"), list).expect("write files.txt");
 
     let unported = unported_report();
@@ -252,5 +265,9 @@ fn run(project: &str, out_dir: &str) -> i32 {
     for (name, count) in &unported {
         let _ = writeln!(stderr, "unported: {name} {count}");
     }
-    if unported.is_empty() && walker.panic_count == 0 { 0 } else { 2 }
+    if unported.is_empty() && walker.panic_count == 0 {
+        0
+    } else {
+        2
+    }
 }
