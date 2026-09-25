@@ -1290,9 +1290,11 @@ impl Discriminator for ObjectLiteralDiscriminator {
     fn name(&self, c: &Checker, index: i32) -> String {
         let index = index as usize;
         if index < self.props.len() {
-            return c.sym(self.props[index].symbol()).name.clone();
+            return c.sym(self.props[index].symbol()).name.to_string();
         }
-        c.sym(self.members[index - self.props.len()]).name.clone()
+        c.sym(self.members[index - self.props.len()])
+            .name
+            .to_string()
     }
 
     // Go: checker/checker.go:30482 ObjectLiteralDiscriminator.matches

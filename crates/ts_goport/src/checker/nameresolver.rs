@@ -276,7 +276,7 @@ impl NameResolver {
                                     } else {
                                         "isolatedModules"
                                     };
-                                let qualified = c.sym(enum_symbol).name.clone() + "." + name;
+                                let qualified = c.sym(enum_symbol).name.to_string() + "." + name;
                                 self.error(
                                     c,
                                     original_location,

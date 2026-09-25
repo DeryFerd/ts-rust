@@ -258,7 +258,7 @@ impl Checker {
         for (i, &source_property) in source_properties_filtered.iter().enumerate() {
             let source_property_type = self.get_non_missing_type_of_symbol(source_property);
             source_discriminant_types[i] = self.ty(source_property_type).distributed();
-            excluded_properties.insert(self.sym(source_property).name.clone());
+            excluded_properties.insert(self.sym(source_property).name.to_string());
         }
         // Build the cartesian product
         let mut discriminant_combinations: Vec<Vec<TypeId>> =

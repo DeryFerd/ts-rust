@@ -219,7 +219,7 @@ impl Checker {
             return TypeFacts::STRING_FACTS;
         } else if flags.intersects(TypeFlags::STRING_LITERAL | TypeFlags::TEMPLATE_LITERAL) {
             let is_empty = flags.intersects(TypeFlags::STRING_LITERAL)
-                && self.get_string_literal_value(t).is_empty();
+                && self.get_string_literal_value_ref(t).is_empty();
             if strict {
                 if is_empty {
                     return TypeFacts::EMPTY_STRING_STRICT_FACTS;

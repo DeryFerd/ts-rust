@@ -705,7 +705,7 @@ pub(crate) fn bound_symbol_declarations(symbol: SymbolId) -> Vec<Node> {
         .expect("program not bound")
         .sym(symbol)
         .declarations
-        .clone()
+        .to_vec()
 }
 
 // Go: transformers/declarations/diagnostics.go:603 createObjectLiteralError

@@ -156,7 +156,7 @@ impl Checker {
     }
 
     // Go: checker/checker.go:13994 newSymbol
-    pub fn new_symbol(&mut self, flags: SymbolFlags, name: &str) -> SymbolId {
+    pub fn new_symbol(&mut self, flags: SymbolFlags, name: impl Into<Name>) -> SymbolId {
         self.symbol_count += 1;
         self.symbols
             .new_symbol(flags | SymbolFlags::TRANSIENT, name)
@@ -166,7 +166,7 @@ impl Checker {
     pub fn new_symbol_ex(
         &mut self,
         flags: SymbolFlags,
-        name: &str,
+        name: impl Into<Name>,
         check_flags: CheckFlags,
     ) -> SymbolId {
         let result = self.new_symbol(flags, name);
@@ -604,14 +604,7 @@ pub fn get_excluded_symbol_flags(flags: SymbolFlags) -> SymbolFlags {
 // PORT: Go `maps.Clone(table)` on an `ast.SymbolTable`. A nil map clones to
 // nil; otherwise a new table with the same entries.
 fn maps_clone_symbol_table(symbols: &mut SymbolArena, table: SymbolTable) -> SymbolTable {
-    if table.is_nil() {
-        return SymbolTable::NIL;
-    }
-    let result = symbols.new_table();
-    for (name, symbol) in symbols.entries(table) {
-        symbols.set(result, name, symbol);
-    }
-    result
+    symbols.clone_table(table)
 }
 
 impl Checker {

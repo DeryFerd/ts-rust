@@ -462,7 +462,7 @@ impl Checker {
                         let s = self.sym_mut(symbol);
                         s.check_flags = s.check_flags | CheckFlags::INDEX_SYMBOL;
                         s.value_declaration = declarations[0];
-                        s.declarations = declarations;
+                        s.declarations = declarations.into();
                         s.parent = type_symbol;
                     }
                     let value_type = self.index_info(info).value_type;

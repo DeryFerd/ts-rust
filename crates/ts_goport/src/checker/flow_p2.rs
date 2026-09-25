@@ -200,7 +200,7 @@ impl Checker {
                         &mut |c: &mut Checker, t: TypeId| {
                             !(c.ty(t).flags.intersects(TypeFlags::NEVER)
                                 || c.ty(t).flags.intersects(TypeFlags::STRING_LITERAL)
-                                    && c.get_string_literal_value(t) == "undefined")
+                                    && c.get_string_literal_value_ref(t) == "undefined")
                         },
                     );
                 }

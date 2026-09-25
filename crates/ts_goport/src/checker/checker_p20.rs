@@ -1245,7 +1245,7 @@ impl Checker {
                         .intersects(ObjectFlags::CONTAINS_SPREAD)
                 {
                     for prop in self.get_properties_of_type(t) {
-                        let name = self.sym(prop).name.clone();
+                        let name = self.sym(prop).name.to_string();
                         names.insert(name, prop);
                     }
                 }
@@ -1290,7 +1290,7 @@ impl Checker {
 
     // Go: checker/checker.go:18400 getUndefinedProperty
     pub fn get_undefined_property(&mut self, prop: SymbolId) -> SymbolId {
-        let name = self.sym(prop).name.clone();
+        let name = self.sym(prop).name.to_string();
         if let Some(&cached) = self.undefined_properties.get(&name) {
             if cached.is_some() {
                 return cached;

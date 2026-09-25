@@ -1215,7 +1215,7 @@ impl Checker {
                 let exports = self.get_exports_of_symbol(parent);
                 if exports.is_some() {
                     // avoid exhaustive iteration in the common case
-                    let name = self.sym(symbol).name.clone();
+                    let name = self.sym(symbol).name.to_string();
                     let res = self.symbols.get(exports, &name);
                     if name != INTERNAL_SYMBOL_NAME_EXPORT_EQUALS
                         && !is_late_bound_name(&name)
@@ -1233,7 +1233,7 @@ impl Checker {
                                 && !is_late_bound_name(&name)
                                 && name != INTERNAL_SYMBOL_NAME_EXPORT_EQUALS
                             {
-                                results.insert(ex, name);
+                                results.insert(ex, name.to_string());
                                 // break // must collect all results and sort them - exports are randomly iterated
                             }
                         }
@@ -1570,7 +1570,7 @@ impl Checker {
         if self.sym(symbol).name == INTERNAL_SYMBOL_NAME_MISSING {
             return "__missing".to_string();
         }
-        self.sym(symbol).name.clone()
+        self.sym(symbol).name.to_string()
     }
 
     // Go: checker/nodebuilderimpl.go:1012 getTypeParametersOfClassOrInterface

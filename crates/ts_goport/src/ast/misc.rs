@@ -80,7 +80,7 @@ pub fn symbol_name(symbols: &SymbolArena, symbol: SymbolId) -> String {
     {
         return s.value_declaration.name().text().to_string();
     }
-    s.name.clone()
+    s.name.to_string()
 }
 
 // Go: ast/symbol.go:80 EscapeAllInternalSymbolNames

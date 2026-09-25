@@ -482,7 +482,7 @@ impl Checker {
         let properties = self.get_properties_of_type(containing_type);
         let symbol = self.get_spelling_suggestion_for_name(name, &properties, SymbolFlags::VALUE);
         if symbol.is_some() {
-            return self.sym(symbol).name.clone();
+            return self.sym(symbol).name.to_string();
         }
         String::new()
     }

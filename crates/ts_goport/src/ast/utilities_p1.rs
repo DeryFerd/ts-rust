@@ -13,7 +13,50 @@ thread_local! {
     static NEXT_NODE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static NEXT_SYMBOL_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static NODE_IDS: RefCell<FxHashMap<Node, u64>> = RefCell::new(FxHashMap::default());
-    static SYMBOL_IDS: RefCell<FxHashMap<SymbolId, u64>> = RefCell::new(FxHashMap::default());
+    // Dense: indexed by `SymbolId::index()`; 0 means no id yet (Go ids start at 1).
+    static SYMBOL_IDS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The node and symbol ids of one thread (see `id_seed`).
+#[derive(Clone, Debug, Default)]
+pub struct IdSeed {
+    next_node_id: u64,
+    next_symbol_id: u64,
+    node_ids: FxHashMap<Node, u64>,
+    symbol_ids: Vec<u64>,
+}
+
+/// The ids assigned on this thread so far. A checker worker starts from
+/// the ids of the loading thread (`install_id_seed`), so a node or symbol
+/// that got an id before the checkers started keeps it on every thread.
+// PORT: Go shares one atomic counter between checker goroutines, so ids
+// that checkers assign race. Here each checker thread counts on its own
+// from the same start, which keeps its ids deterministic.
+#[must_use]
+pub fn id_seed() -> IdSeed {
+    IdSeed {
+        next_node_id: NEXT_NODE_ID.with(std::cell::Cell::get),
+        next_symbol_id: NEXT_SYMBOL_ID.with(std::cell::Cell::get),
+        node_ids: NODE_IDS.with(|ids| ids.borrow().clone()),
+        symbol_ids: SYMBOL_IDS.with(|ids| ids.borrow().clone()),
+    }
+}
+
+/// The next node and symbol ids of this thread.
+#[must_use]
+pub fn next_ids() -> (u64, u64) {
+    (
+        NEXT_NODE_ID.with(std::cell::Cell::get),
+        NEXT_SYMBOL_ID.with(std::cell::Cell::get),
+    )
+}
+
+/// Makes `seed` the id state of this thread.
+pub fn install_id_seed(seed: IdSeed) {
+    NEXT_NODE_ID.with(|next| next.set(seed.next_node_id));
+    NEXT_SYMBOL_ID.with(|next| next.set(seed.next_symbol_id));
+    NODE_IDS.with(|ids| *ids.borrow_mut() = seed.node_ids);
+    SYMBOL_IDS.with(|ids| *ids.borrow_mut() = seed.symbol_ids);
 }
 
 // Go: ast/utilities.go:22 GetNodeId
@@ -41,15 +84,19 @@ pub fn get_symbol_id(symbols: &SymbolArena, symbol: SymbolId) -> u64 {
     let _ = symbols;
     SYMBOL_IDS.with(|ids| {
         let mut ids = ids.borrow_mut();
-        if let Some(id) = ids.get(&symbol) {
-            return *id;
+        let index = symbol.index();
+        if index >= ids.len() {
+            ids.resize(index + 1, 0);
+        }
+        if ids[index] != 0 {
+            return ids[index];
         }
         let id = NEXT_SYMBOL_ID.with(|next| {
             let id = next.get() + 1;
             next.set(id);
             id
         });
-        ids.insert(symbol, id);
+        ids[index] = id;
         id
     })
 }
@@ -1084,7 +1131,19 @@ pub fn walk_up_parenthesized_types(node: Node) -> Node {
 
 // Walks up the parents of a node to find the containing SourceFile
 // Go: ast/utilities.go:861 GetSourceFileOfNode
+// PORT: a frozen store node whose parent walk ends at its store root gets
+// that root in O(1) (`ast::store::frozen_source_file_of_node`). Other nodes
+// (synthetic nodes, nodes before the freeze) walk the parents like Go.
 pub fn get_source_file_of_node(node: Node) -> Node {
+    if let Some(root) = frozen_source_file_of_node(node) {
+        debug_assert_eq!(root, walk_to_source_file(node));
+        return root;
+    }
+    walk_to_source_file(node)
+}
+
+/// The Go `GetSourceFileOfNode` parent walk.
+fn walk_to_source_file(node: Node) -> Node {
     let mut node = node;
     while node.is_some() {
         if node.kind() == SyntaxKind::SourceFile {

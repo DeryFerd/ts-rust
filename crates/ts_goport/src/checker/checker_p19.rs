@@ -954,25 +954,14 @@ impl Checker {
 // PORT: Go is generic over `~int32 | ~uint32`; callers pass the value as
 // `u32` (`TypeId.0`, flag `.0`, or `as u32`).
 pub fn hash_write32(h: &mut KeyHasher, value: u32) {
-    let v = value;
-    h.write(&[v as u8, (v >> 8) as u8, (v >> 16) as u8, (v >> 24) as u8]);
+    h.write(&value.to_le_bytes());
 }
 
 // Go: checker/checker.go:17293 hashWrite64
 // PORT: Go is generic over `~int | ~uint | ~int64 | ~uint64`; callers pass
 // the value as `u64` (Go `uint64(value)` conversion, so negative ints wrap).
 pub fn hash_write64(h: &mut KeyHasher, value: u64) {
-    let v = value;
-    h.write(&[
-        v as u8,
-        (v >> 8) as u8,
-        (v >> 16) as u8,
-        (v >> 24) as u8,
-        (v >> 32) as u8,
-        (v >> 40) as u8,
-        (v >> 48) as u8,
-        (v >> 56) as u8,
-    ]);
+    h.write(&value.to_le_bytes());
 }
 
 // Go: checker/checker.go:17307 CacheHashKey
@@ -992,41 +981,292 @@ impl CacheHashKey {
 
 /// Go `xxh3.Hasher` as used by `keyBuilder`.
 ///
-/// PORT: the crate has no xxh3 dependency and the contract forbids new ones.
-/// Go only uses the 128-bit result as a map key (never for ordering or
-/// output), so any well-mixed 128-bit hash of the same byte stream gives the
-/// same checker behavior. This uses two std SipHash streams (the second one
-/// domain-separated by a prefix byte) for the high and low halves. Writes are
-/// a plain byte stream, so split writes hash the same as one write, like Go.
+/// PORT: the crate has no xxh3 dependency and the contract forbids new ones,
+/// so `xxh3_hash128` below is a hand port of `zeebo/xxh3` `Hash128` (seed 0).
+/// Go's streaming `Hasher` buffers the bytes and gives the same result as
+/// `Hash128` over all written bytes, so this hasher buffers them too: short
+/// keys stay in an inline buffer, longer keys spill to the heap. Split writes
+/// hash the same as one write, like Go.
 #[derive(Clone, Debug)]
 pub struct KeyHasher {
-    hi: std::collections::hash_map::DefaultHasher,
-    lo: std::collections::hash_map::DefaultHasher,
+    len: usize,
+    inline: [u8; KEY_HASHER_INLINE],
+    // Holds every byte once the key is longer than the inline buffer.
+    spill: Vec<u8>,
 }
+
+const KEY_HASHER_INLINE: usize = 120;
 
 impl Default for KeyHasher {
     fn default() -> Self {
-        let hi = std::collections::hash_map::DefaultHasher::new();
-        let mut lo = std::collections::hash_map::DefaultHasher::new();
-        lo.write(&[0x5a]);
-        Self { hi, lo }
+        Self {
+            len: 0,
+            inline: [0; KEY_HASHER_INLINE],
+            spill: Vec::new(),
+        }
     }
 }
 
 impl KeyHasher {
     /// Go `h.Write(bytes)`.
+    #[inline]
     pub fn write(&mut self, bytes: &[u8]) {
-        self.hi.write(bytes);
-        self.lo.write(bytes);
+        let end = self.len + bytes.len();
+        if end <= KEY_HASHER_INLINE {
+            self.inline[self.len..end].copy_from_slice(bytes);
+        } else {
+            if self.len <= KEY_HASHER_INLINE {
+                self.spill.reserve(end.max(2 * KEY_HASHER_INLINE));
+                self.spill.extend_from_slice(&self.inline[..self.len]);
+            }
+            self.spill.extend_from_slice(bytes);
+        }
+        self.len = end;
     }
 
     /// Go `h.Sum128()`.
     pub fn sum128(&self) -> CacheHashKey {
-        CacheHashKey {
-            hi: self.hi.finish(),
-            lo: self.lo.finish(),
-        }
+        let bytes = if self.len <= KEY_HASHER_INLINE {
+            &self.inline[..self.len]
+        } else {
+            &self.spill[..]
+        };
+        let (hi, lo) = xxh3_hash128(bytes);
+        CacheHashKey { hi, lo }
     }
+}
+
+/// xxh3 default secret (`zeebo/xxh3` `key`, the XXH3 kSecret).
+const XXH3_SECRET: [u8; 192] = [
+    0xb8, 0xfe, 0x6c, 0x39, 0x23, 0xa4, 0x4b, 0xbe, 0x7c, 0x01, 0x81, 0x2c, 0xf7, 0x21, 0xad, 0x1c,
+    0xde, 0xd4, 0x6d, 0xe9, 0x83, 0x90, 0x97, 0xdb, 0x72, 0x40, 0xa4, 0xa4, 0xb7, 0xb3, 0x67, 0x1f,
+    0xcb, 0x79, 0xe6, 0x4e, 0xcc, 0xc0, 0xe5, 0x78, 0x82, 0x5a, 0xd0, 0x7d, 0xcc, 0xff, 0x72, 0x21,
+    0xb8, 0x08, 0x46, 0x74, 0xf7, 0x43, 0x24, 0x8e, 0xe0, 0x35, 0x90, 0xe6, 0x81, 0x3a, 0x26, 0x4c,
+    0x3c, 0x28, 0x52, 0xbb, 0x91, 0xc3, 0x00, 0xcb, 0x88, 0xd0, 0x65, 0x8b, 0x1b, 0x53, 0x2e, 0xa3,
+    0x71, 0x64, 0x48, 0x97, 0xa2, 0x0d, 0xf9, 0x4e, 0x38, 0x19, 0xef, 0x46, 0xa9, 0xde, 0xac, 0xd8,
+    0xa8, 0xfa, 0x76, 0x3f, 0xe3, 0x9c, 0x34, 0x3f, 0xf9, 0xdc, 0xbb, 0xc7, 0xc7, 0x0b, 0x4f, 0x1d,
+    0x8a, 0x51, 0xe0, 0x4b, 0xcd, 0xb4, 0x59, 0x31, 0xc8, 0x9f, 0x7e, 0xc9, 0xd9, 0x78, 0x73, 0x64,
+    0xea, 0xc5, 0xac, 0x83, 0x34, 0xd3, 0xeb, 0xc3, 0xc5, 0x81, 0xa0, 0xff, 0xfa, 0x13, 0x63, 0xeb,
+    0x17, 0x0d, 0xdd, 0x51, 0xb7, 0xf0, 0xda, 0x49, 0xd3, 0x16, 0x55, 0x26, 0x29, 0xd4, 0x68, 0x9e,
+    0x2b, 0x16, 0xbe, 0x58, 0x7d, 0x47, 0xa1, 0xfc, 0x8f, 0xf8, 0xb8, 0xd1, 0x7a, 0xd0, 0x31, 0xce,
+    0x45, 0xcb, 0x3a, 0x8f, 0x95, 0x16, 0x04, 0x28, 0xaf, 0xd7, 0xfb, 0xca, 0xbb, 0x4b, 0x40, 0x7e,
+];
+
+const XXH_PRIME32_1: u64 = 2654435761;
+const XXH_PRIME32_2: u64 = 2246822519;
+const XXH_PRIME32_3: u64 = 3266489917;
+const XXH_PRIME64_1: u64 = 11400714785074694791;
+const XXH_PRIME64_2: u64 = 14029467366897019727;
+const XXH_PRIME64_3: u64 = 1609587929392839161;
+const XXH_PRIME64_4: u64 = 9650029242287828579;
+const XXH_PRIME64_5: u64 = 2870177450012600261;
+const XXH_STRIPE: usize = 64;
+const XXH_BLOCK: usize = 1024;
+
+#[inline(always)]
+fn xxh_read32(b: &[u8], o: usize) -> u64 {
+    u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as u64
+}
+
+#[inline(always)]
+fn xxh_read64(b: &[u8], o: usize) -> u64 {
+    u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+}
+
+#[inline(always)]
+fn xxh_key64(o: usize) -> u64 {
+    xxh_read64(&XXH3_SECRET, o)
+}
+
+#[inline(always)]
+fn xxh_mul_fold64(x: u64, y: u64) -> u64 {
+    let p = (x as u128).wrapping_mul(y as u128);
+    (p >> 64) as u64 ^ p as u64
+}
+
+#[inline(always)]
+fn xxh3_avalanche(mut x: u64) -> u64 {
+    x ^= x >> 37;
+    x = x.wrapping_mul(0x165667919e3779f9);
+    x ^ (x >> 32)
+}
+
+#[inline(always)]
+fn xxh64_avalanche_small(mut x: u64) -> u64 {
+    x = x.wrapping_mul(XXH_PRIME64_2);
+    x ^= x >> 29;
+    x = x.wrapping_mul(XXH_PRIME64_3);
+    x ^ (x >> 32)
+}
+
+/// One 32-byte round of the 17..240 byte paths: `lo`/`hi` mix `a` and `b`
+/// (two 16-byte halves) with the secret at `ka` and `kb`.
+#[inline(always)]
+fn xxh3_mix32(acc: &mut (u64, u64), p: &[u8], a: usize, b: usize, ka: usize, kb: usize) {
+    let (a0, a1) = (xxh_read64(p, a), xxh_read64(p, a + 8));
+    let (b0, b1) = (xxh_read64(p, b), xxh_read64(p, b + 8));
+    acc.0 = acc
+        .0
+        .wrapping_add(xxh_mul_fold64(a0 ^ xxh_key64(ka), a1 ^ xxh_key64(ka + 8)));
+    acc.0 ^= b0.wrapping_add(b1);
+    acc.1 = acc
+        .1
+        .wrapping_add(xxh_mul_fold64(b0 ^ xxh_key64(kb), b1 ^ xxh_key64(kb + 8)));
+    acc.1 ^= a0.wrapping_add(a1);
+}
+
+/// XXH3 accumulate over one 64-byte stripe at `p[o..]` with the secret at `k`.
+#[inline(always)]
+fn xxh3_accumulate_stripe(accs: &mut [u64; 8], p: &[u8], o: usize, k: usize) {
+    for i in 0..8 {
+        let dv = xxh_read64(p, o + 8 * i);
+        let dk = dv ^ xxh_key64(k + 8 * i);
+        accs[i ^ 1] = accs[i ^ 1].wrapping_add(dv);
+        accs[i] = accs[i].wrapping_add((dk & 0xffff_ffff).wrapping_mul(dk >> 32));
+    }
+}
+
+#[inline(always)]
+fn xxh3_scramble(accs: &mut [u64; 8]) {
+    for (i, acc) in accs.iter_mut().enumerate() {
+        *acc ^= *acc >> 47;
+        *acc ^= xxh_key64(128 + 8 * i);
+        *acc = acc.wrapping_mul(XXH_PRIME32_1);
+    }
+}
+
+/// Go `zeebo/xxh3.Hash128` (seed 0). Returns `(hi, lo)`.
+fn xxh3_hash128(p: &[u8]) -> (u64, u64) {
+    let l = p.len();
+    let lu = l as u64;
+    if l <= 16 {
+        let (lo, hi);
+        if l > 8 {
+            let bitflipl = xxh_key64(32) ^ xxh_key64(40);
+            let bitfliph = xxh_key64(48) ^ xxh_key64(56);
+            let input_lo = xxh_read64(p, 0);
+            let mut input_hi = xxh_read64(p, l - 8);
+            let m = ((input_lo ^ input_hi ^ bitflipl) as u128).wrapping_mul(XXH_PRIME64_1 as u128);
+            let mut m_h = (m >> 64) as u64;
+            let mut m_l = m as u64;
+            m_l = m_l.wrapping_add((lu - 1) << 54);
+            input_hi ^= bitfliph;
+            m_h = m_h.wrapping_add(
+                input_hi.wrapping_add((input_hi & 0xffff_ffff).wrapping_mul(XXH_PRIME32_2 - 1)),
+            );
+            m_l ^= m_h.swap_bytes();
+            let r = (m_l as u128).wrapping_mul(XXH_PRIME64_2 as u128);
+            let r_hi = ((r >> 64) as u64).wrapping_add(m_h.wrapping_mul(XXH_PRIME64_2));
+            return (xxh3_avalanche(r_hi), xxh3_avalanche(r as u64));
+        } else if l > 3 {
+            let bitflip = xxh_key64(16) ^ xxh_key64(24);
+            let input_64 = xxh_read32(p, 0) + (xxh_read32(p, l - 4) << 32);
+            let keyed = input_64 ^ bitflip;
+            let r = (keyed as u128).wrapping_mul(XXH_PRIME64_1.wrapping_add(lu << 2) as u128);
+            let mut r_hi = (r >> 64) as u64;
+            let mut r_lo = r as u64;
+            r_hi = r_hi.wrapping_add(r_lo << 1);
+            r_lo ^= r_hi >> 3;
+            r_lo ^= r_lo >> 35;
+            r_lo = r_lo.wrapping_mul(0x9fb21c651e98df25);
+            r_lo ^= r_lo >> 28;
+            return (xxh3_avalanche(r_hi), r_lo);
+        } else if l == 3 {
+            let c12 = p[0] as u64 | (p[1] as u64) << 8;
+            lo = (c12 << 16) + p[2] as u64 + (3 << 8);
+        } else if l == 2 {
+            let c12 = p[0] as u64 | (p[1] as u64) << 8;
+            lo = (c12 * ((1 << 24) + 1) >> 8) + (2 << 8);
+        } else if l == 1 {
+            lo = (p[0] as u64) * ((1 << 24) + (1 << 16) + 1) + (1 << 8);
+        } else {
+            return (0x99aa06d3014798d8, 0x6001c324468d497f);
+        }
+        hi = (lo as u32).swap_bytes().rotate_left(13) as u64;
+        let lo = lo ^ (xxh_read32(&XXH3_SECRET, 0) ^ xxh_read32(&XXH3_SECRET, 4));
+        let hi = hi ^ (xxh_read32(&XXH3_SECRET, 8) ^ xxh_read32(&XXH3_SECRET, 12));
+        return (xxh64_avalanche_small(hi), xxh64_avalanche_small(lo));
+    }
+    if l <= 240 {
+        // acc.0 = hi, acc.1 = lo
+        let mut acc = (0u64, lu.wrapping_mul(XXH_PRIME64_1));
+        if l <= 128 {
+            if l > 32 {
+                if l > 64 {
+                    if l > 96 {
+                        xxh3_mix32(&mut acc, p, l - 64, 48, 112, 96);
+                    }
+                    xxh3_mix32(&mut acc, p, l - 48, 32, 80, 64);
+                }
+                xxh3_mix32(&mut acc, p, l - 32, 16, 48, 32);
+            }
+            xxh3_mix32(&mut acc, p, l - 16, 0, 16, 0);
+        } else {
+            for i in 0..4 {
+                xxh3_mix32(&mut acc, p, 32 * i + 16, 32 * i, 32 * i + 16, 32 * i);
+            }
+            acc.0 = xxh3_avalanche(acc.0);
+            acc.1 = xxh3_avalanche(acc.1);
+            let top = l & !31;
+            let mut i = 128;
+            while i < top {
+                xxh3_mix32(&mut acc, p, i + 16, i, i - 109, i - 125);
+                i += 32;
+            }
+            // last 32 bytes: hi mixes the first half, lo the second.
+            xxh3_mix32(&mut acc, p, l - 32, l - 16, 119, 103);
+        }
+        let (hi, lo) = acc;
+        let new_hi = lo
+            .wrapping_mul(XXH_PRIME64_1)
+            .wrapping_add(hi.wrapping_mul(XXH_PRIME64_4))
+            .wrapping_add(lu.wrapping_mul(XXH_PRIME64_2));
+        let new_lo = hi.wrapping_add(lo);
+        return (
+            xxh3_avalanche(new_hi).wrapping_neg(),
+            xxh3_avalanche(new_lo),
+        );
+    }
+    // Long input: stripes of 64 bytes, blocks of 1024 bytes.
+    let mut accs: [u64; 8] = [
+        XXH_PRIME32_3,
+        XXH_PRIME64_1,
+        XXH_PRIME64_2,
+        XXH_PRIME64_3,
+        XXH_PRIME64_4,
+        XXH_PRIME32_2,
+        XXH_PRIME64_5,
+        XXH_PRIME32_1,
+    ];
+    let mut o = 0;
+    let mut rest = l;
+    while rest > XXH_BLOCK {
+        for s in 0..XXH_BLOCK / XXH_STRIPE {
+            xxh3_accumulate_stripe(&mut accs, p, o + s * XXH_STRIPE, 8 * s);
+        }
+        xxh3_scramble(&mut accs);
+        o += XXH_BLOCK;
+        rest -= XXH_BLOCK;
+    }
+    let stripes = (rest - 1) / XXH_STRIPE;
+    for s in 0..stripes {
+        xxh3_accumulate_stripe(&mut accs, p, o + s * XXH_STRIPE, 8 * s);
+    }
+    xxh3_accumulate_stripe(&mut accs, p, l - XXH_STRIPE, 121);
+    let mut lo = lu.wrapping_mul(XXH_PRIME64_1);
+    let mut hi = !lu.wrapping_mul(XXH_PRIME64_2);
+    for i in 0..4 {
+        let (a, b) = (accs[2 * i], accs[2 * i + 1]);
+        lo = lo.wrapping_add(xxh_mul_fold64(
+            a ^ xxh_key64(11 + 16 * i),
+            b ^ xxh_key64(19 + 16 * i),
+        ));
+        hi = hi.wrapping_add(xxh_mul_fold64(
+            a ^ xxh_key64(117 + 16 * i),
+            b ^ xxh_key64(125 + 16 * i),
+        ));
+    }
+    (xxh3_avalanche(hi), xxh3_avalanche(lo))
 }
 
 // Go: checker/checker.go:17313 keyBuilder

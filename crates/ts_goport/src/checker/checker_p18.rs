@@ -363,11 +363,11 @@ impl Checker {
                     // If we have an existing early-bound member, combine its declarations so that we can
                     // report an error at each declaration.
                     let declarations: Vec<Node> = if early_symbol.is_some() {
-                        let mut d = self.sym(early_symbol).declarations.clone();
+                        let mut d = self.sym(early_symbol).declarations.to_vec();
                         d.extend(self.sym(late_symbol).declarations.iter().copied());
                         d
                     } else {
-                        self.sym(late_symbol).declarations.clone()
+                        self.sym(late_symbol).declarations.to_vec()
                     };
                     let mut name = member_name.clone();
                     if self.ty(t).flags.intersects(TypeFlags::UNIQUE_ES_SYMBOL) {
@@ -496,7 +496,7 @@ impl Checker {
                 flags |= SymbolFlags::ACCESSOR;
             }
             let s = self.sym_mut(symbol);
-            s.declarations = declarations;
+            s.declarations = declarations.into();
             s.flags = flags;
         }
         if symbol_flags.intersects(SymbolFlags::VALUE) {
@@ -618,7 +618,7 @@ impl Checker {
             // because we might have visited it via an 'export type *', and visiting
             // again with 'export *' will override the type-onlyness of its exports.
             for (name, _) in self.symbols.entries(self.sym(symbol).exports) {
-                state.non_type_only_names.insert(name);
+                state.non_type_only_names.insert(name.to_string());
             }
         }
         if symbol.is_nil()
@@ -629,10 +629,8 @@ impl Checker {
         }
         state.visited_symbols.push(symbol);
         let symbol_exports = self.sym(symbol).exports;
-        let symbols = self.symbols.new_table();
-        for (name, s) in self.symbols.entries(symbol_exports) {
-            self.symbols.set(symbols, name, s);
-        }
+        // Go: `symbols := maps.Clone(symbol.Exports)`. Exports is not nil here.
+        let symbols = self.symbols.clone_table(symbol_exports);
         // All export * declarations are collected in an __export symbol by the binder
         let export_stars = self
             .symbols
@@ -681,7 +679,9 @@ impl Checker {
         }
         if export_star.is_some() && export_star.is_type_only() {
             for (name, _) in self.symbols.entries(symbols) {
-                state.type_only_export_star_map.insert(name, export_star);
+                state
+                    .type_only_export_star_map
+                    .insert(name.to_string(), export_star);
             }
         }
         symbols
@@ -707,7 +707,7 @@ impl Checker {
                 if let Some(table) = lookup_table.as_deref_mut() {
                     if export_node.is_some() {
                         table.insert(
-                            id,
+                            id.to_string(),
                             ExportCollision {
                                 specifier_text: get_text_of_node(export_node.module_specifier()),
                                 exports_with_duplicate: Vec::new(),
@@ -722,7 +722,7 @@ impl Checker {
                 let table = lookup_table.as_deref_mut().unwrap();
                 // PORT: Go dereferences the map entry; a missing entry is a nil
                 // pointer panic there.
-                let s = table.get_mut(&id).expect("nil ExportCollision");
+                let s = table.get_mut(id.as_str()).expect("nil ExportCollision");
                 s.exports_with_duplicate.push(export_node);
             }
         }

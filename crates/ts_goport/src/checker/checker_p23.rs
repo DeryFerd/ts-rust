@@ -445,13 +445,7 @@ impl Checker {
                 .intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION | TypeFlags::TYPE_VARIABLE)
             {
                 // PORT: Go `maps.Clone(members)` (nil stays nil).
-                if members.is_some() {
-                    let cloned = self.symbols.new_table();
-                    for (name, s) in self.symbols.entries(members) {
-                        self.symbols.set(cloned, name, s);
-                    }
-                    members = cloned;
-                }
+                members = self.symbols.clone_table(members);
                 let base_properties = self.get_properties_of_type(base_constructor_type);
                 self.add_inherited_members(members, &base_properties);
                 self.set_structured_type_members(t, members, &[], &[], &[]);
@@ -524,7 +518,7 @@ impl Checker {
         if symbols.is_empty() {
             return SymbolTable::NIL;
         }
-        let result = self.symbols.new_table();
+        let result = self.symbols.new_table_with_capacity(symbols.len());
         for &symbol in symbols {
             let name = self.sym(symbol).name.clone();
             let instantiated = self.instantiate_symbol(symbol, m);
@@ -538,7 +532,9 @@ impl Checker {
         if self.symbols.len(symbols) == 0 {
             return SymbolTable::NIL;
         }
-        let result = self.symbols.new_table();
+        let result = self
+            .symbols
+            .new_table_with_capacity(self.symbols.len(symbols));
         for (id, symbol) in self.symbols.entries(symbols) {
             if self.is_named_member(symbol, &id) {
                 let instantiated = self.instantiate_symbol(symbol, m);
@@ -604,7 +600,7 @@ impl Checker {
                 s.value_declaration,
             )
         };
-        let result = self.new_symbol(s_flags, s_name.as_str());
+        let result = self.new_symbol(s_flags, s_name);
         {
             let r = self.sym_mut(result);
             r.check_flags = CheckFlags::INSTANTIATED
@@ -1140,7 +1136,7 @@ impl Checker {
                 return Vec::new();
             }
             if i == 0 {
-                member_name = self.sym(u_symbol).name.clone();
+                member_name = self.sym(u_symbol).name.to_string();
             } else if member_name != self.sym(u_symbol).name {
                 return Vec::new();
             }

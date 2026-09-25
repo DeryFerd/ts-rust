@@ -228,7 +228,7 @@ impl Checker {
         let mut reduced: Vec<SymbolId> = Vec::new();
         let mut excluded = false;
         for (i, &prop) in properties.iter().enumerate() {
-            if !excluded_properties.contains(&self.sym(prop).name) {
+            if !excluded_properties.contains(self.sym(prop).name.as_str()) {
                 if excluded {
                     reduced.push(prop);
                 }
@@ -274,7 +274,7 @@ impl<'a> Discriminator for TypeDiscriminator<'a> {
 
     // Go: checker/relater.go:1045 TypeDiscriminator.name
     fn name(&self, c: &Checker, index: i32) -> String {
-        c.sym(self.props[index as usize]).name.clone()
+        c.sym(self.props[index as usize]).name.to_string()
     }
 
     // Go: checker/relater.go:1049 TypeDiscriminator.matches
@@ -483,7 +483,7 @@ impl Checker {
                 for p in self.get_properties_of_type(t) {
                     let p_type = self.get_type_of_symbol(p);
                     if self.is_unit_type(p_type) {
-                        return self.sym(p).name.clone();
+                        return self.sym(p).name.to_string();
                     }
                 }
             }

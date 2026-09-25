@@ -9,16 +9,17 @@
 //! diagnostics pipeline and non-pretty formatter.
 //!
 //! Use: `let program = load(config_path); bind_all();` then the diagnostics
-//! functions below. `load` installs the program for the current thread.
+//! functions below. `load` installs the program for the process; the
+//! loading thread also keeps the frontend program and the checker pool.
 
 use crate::prelude::*;
 use std::cell::OnceCell;
 use std::ops::Deref;
+use std::sync::{Arc, Mutex, OnceLock};
 use ts_path::CaseSensitivity;
 use ts_vfs::FileSystem;
 
 mod go_frontend;
-type ParsedSourceFileRef = crate::frontend::parser::ParsedSourceFile;
 mod verify_options;
 
 // ---------------------------------------------------------------------------
@@ -160,7 +161,7 @@ pub struct SourceFileInfo {
     /// Trivia runs of the text. They map the Rust token-start ranges to Go
     /// full-start ranges (see `ast::go_view`).
     pub trivia: crate::ast::go_view::TriviaRuns,
-    late: OnceCell<LateSourceFileInfo>,
+    late: OnceLock<LateSourceFileInfo>,
 }
 
 impl Deref for SourceFileInfo {
@@ -184,7 +185,7 @@ pub struct LateSourceFileInfo {
     pub uses_uri_style_node_core_modules: Tristate,
     /// Go `SourceFile.jsdocCache`: parsed JSDoc nodes by host node.
     pub jsdoc_cache: FxHashMap<Node, Vec<Node>>,
-    post_bind: OnceCell<PostBindInfo>,
+    post_bind: OnceLock<PostBindInfo>,
 }
 
 /// Go `ast.SourceFile` fields that the binder sets but that live on the
@@ -231,11 +232,18 @@ impl Deref for LateSourceFileInfo {
 }
 
 /// Go `checkerPool` (compiler pool). Checkers are created on first use.
+/// Each checker lives on its own worker thread; the pool holds the job
+/// queue of each worker. Only the loading thread has a pool.
 struct CheckerPool {
-    checkers: Vec<Checker>,
-    /// Checker index for each file index (Go `fileAssociations`).
-    file_associations: Vec<usize>,
+    workers: Vec<std::sync::mpsc::Sender<Job>>,
 }
+
+/// Work for one checker worker. It runs on the worker thread, where
+/// `with_checker_at` reaches that worker's checker.
+type Job = Box<dyn FnOnce() + Send>;
+
+/// The result of a job, or the payload of its panic.
+type JobResult<R> = std::thread::Result<R>;
 
 /// A located diagnostic whose file is not a program source file (for example
 /// the tsconfig). Go keeps a SourceFile for it; we keep the printed location.
@@ -259,21 +267,45 @@ struct ProgramState {
     program_diagnostics: Vec<Diagnostic>,
     external_locations: Vec<ExternalLocation>,
     resolved_modules:
-        OnceCell<IndexMap<String, IndexMap<(String, ResolutionMode), ResolvedModule>>>,
-    common_source_directory: OnceCell<String>,
-    pool: RefCell<Option<CheckerPool>>,
+        OnceLock<IndexMap<String, IndexMap<(String, ResolutionMode), ResolvedModule>>>,
+    common_source_directory: OnceLock<String>,
+    /// Checker index for each file index (Go `fileAssociations`). Set when
+    /// the checker pool is made.
+    file_associations: OnceLock<Vec<usize>>,
     /// Go `Program.declarationDiagnosticCache`.
-    declaration_diagnostic_cache: RefCell<FxHashMap<Node, Vec<Diagnostic>>>,
-    /// The Go frontend program (`GOPORT_FRONTEND=go`). None on the legacy path.
-    go: Option<go_frontend::GoFrontendState>,
+    declaration_diagnostic_cache: Mutex<FxHashMap<Node, Vec<Diagnostic>>>,
+    /// The thread-safe copy of the Go frontend data that the checker reads
+    /// (`GOPORT_FRONTEND=go`). None on the legacy path. The frontend program
+    /// itself is in `GO_FRONTEND`, on the loading thread only.
+    go: Option<go_frontend::GoSharedState>,
 }
 
+/// The program state of the process. Every thread reads it.
+static STATE: OnceLock<&'static ProgramState> = OnceLock::new();
+
 thread_local! {
-    static STATE: OnceCell<&'static ProgramState> = const { OnceCell::new() };
+    /// The Go frontend program. Only the thread that loaded the program has
+    /// it: the frontend data is not thread-safe.
+    static GO_FRONTEND: OnceCell<&'static go_frontend::GoFrontendState> = const { OnceCell::new() };
 }
 
 fn state() -> &'static ProgramState {
-    STATE.with(|cell| *cell.get().expect("program not loaded"))
+    STATE.get().copied().expect("program not loaded")
+}
+
+fn set_state(program_state: &'static ProgramState) {
+    assert!(STATE.set(program_state).is_ok(), "program already loaded");
+}
+
+/// The Go frontend program, or None on the legacy path. Panics on a checker
+/// worker thread, which must use the copies in `ProgramState::go`.
+fn go_frontend() -> Option<&'static go_frontend::GoFrontendState> {
+    state().go.as_ref()?;
+    Some(GO_FRONTEND.with(|cell| {
+        *cell
+            .get()
+            .expect("the Go frontend program is read on the loading thread only")
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +313,7 @@ fn state() -> &'static ProgramState {
 // ---------------------------------------------------------------------------
 
 /// Loads the config graph at `config_path`, builds the Go files and
-/// installs the program for this thread. Panics on a load error.
+/// installs the program for the process. Panics on a load error.
 pub fn load(config_path: &str) -> &'static GoProgram {
     match try_load(config_path) {
         Ok(program) => program,
@@ -354,9 +386,9 @@ pub fn try_load_with(
             root,
             parser_flags,
             info,
-            node_bind: OnceCell::new(),
-            file_bind: OnceCell::new(),
-            flow_nodes: OnceCell::new(),
+            node_bind: OnceLock::new(),
+            file_bind: OnceLock::new(),
+            flow_nodes: OnceLock::new(),
         });
     }
 
@@ -381,7 +413,7 @@ pub fn try_load_with(
         files,
         source_file_order,
         options,
-        bound_symbols: OnceCell::new(),
+        bound_symbols: OnceLock::new(),
     }));
     let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
         cwd,
@@ -391,20 +423,18 @@ pub fn try_load_with(
         config_diagnostics,
         program_diagnostics,
         external_locations,
-        resolved_modules: OnceCell::new(),
-        common_source_directory: OnceCell::new(),
-        pool: RefCell::new(None),
-        declaration_diagnostic_cache: RefCell::new(FxHashMap::default()),
+        resolved_modules: OnceLock::new(),
+        common_source_directory: OnceLock::new(),
+        file_associations: OnceLock::new(),
+        declaration_diagnostic_cache: Mutex::new(FxHashMap::default()),
         go: None,
     }));
-    STATE.with(|cell| {
-        assert!(cell.set(program_state).is_ok(), "program already loaded");
-    });
+    set_state(program_state);
     install(program);
     Ok(program)
 }
 
-/// Installs `program` for this thread (`core::set_prog`) and computes the
+/// Installs `program` for the process (`core::set_prog`) and computes the
 /// Go SourceFile fields that need the tree: Go `finishSourceFile`
 /// (reparsed clones, external module indicator) and
 /// `collectExternalModuleReferences`.
@@ -423,15 +453,107 @@ pub fn install(program: &'static GoProgram) {
 // PORT: Go binds files in parallel into per-file symbol tables. Here every
 // file binds into the shared `prog().bound_symbols` arena, with the same
 // initializer that `Checker::new` uses, so the first of the two to run binds.
+// Files bind in parallel, each into its own arena (`bind_files_parallel`),
+// and join the program arena in file order with the ids a serial bind gives.
 pub fn bind_all() {
     let program = prog();
     program.bound_symbols.get_or_init(|| {
         let mut symbols = SymbolArena::new();
+        bind_files_parallel(&mut symbols);
         for file in program.source_files() {
             bind_source_file(file.root, &mut symbols);
         }
         symbols
     });
+}
+
+/// The state of this thread that binding must not change: synthetic nodes,
+/// ids and lazy JSDoc. A bind thread starts from a copy of the loading
+/// thread's state, so anything it adds would be lost.
+fn bind_thread_fingerprint() -> (usize, (u64, u64), usize) {
+    (
+        synthetic_slot_count(),
+        next_ids(),
+        go_frontend::lazy_jsdoc_count(),
+    )
+}
+
+/// One file bound on a bind thread, or None when binding it made
+/// thread-local state or panicked.
+type ParallelBind = (usize, Option<(BoundFile, SymbolArena)>);
+
+/// Binds the program files on several threads, each file into its own
+/// arena, and joins the arenas into `symbols` in file order. It stops at the
+/// first file that made thread-local state while binding (for example a
+/// lazy JSDoc parse) or panicked; `bind_all` binds that file and the rest
+/// serially, which gives the same result as a serial bind of every file.
+fn bind_files_parallel(symbols: &mut SymbolArena) {
+    let files: Vec<Node> = prog().source_files().map(|file| file.root).collect();
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(files.len());
+    if single_threaded()
+        || threads < 2
+        || prog()
+            .source_files()
+            .any(|file| file.file_bind.get().is_some())
+    {
+        return;
+    }
+    let unported = unported_report();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (sender, receiver) = std::sync::mpsc::channel::<ParallelBind>();
+    let complete = std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let seed = WorkerSeed::take();
+            let (files, next, stop, sender) = (&files, &next, &stop, sender.clone());
+            std::thread::Builder::new()
+                .stack_size(CHECKER_STACK_SIZE)
+                .spawn_scoped(scope, move || {
+                    seed.install();
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&file) = files.get(i) else { break };
+                        let before = bind_thread_fingerprint();
+                        let result = std::panic::catch_unwind(|| {
+                            let mut file_symbols = SymbolArena::new();
+                            let bound = bind_source_file_detached(file, &mut file_symbols);
+                            (bound, file_symbols)
+                        })
+                        .ok()
+                        .filter(|_| bind_thread_fingerprint() == before);
+                        let failed = result.is_none();
+                        let _ = sender.send((i, result));
+                        if failed {
+                            break;
+                        }
+                    }
+                })
+                .expect("cannot start a bind thread");
+        }
+        drop(sender);
+        // Join the files in order as they arrive.
+        let mut pending = FxHashMap::default();
+        let mut joined = 0;
+        for (i, result) in &receiver {
+            pending.insert(i, result);
+            while let Some(result) = pending.remove(&joined) {
+                let Some((mut bound, file_symbols)) = result else {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                };
+                bound.remap(symbols.append_file_arena(file_symbols));
+                bound.install();
+                joined += 1;
+            }
+        }
+        true
+    });
+    if !complete {
+        // The serial bind counts the hits of the file that stopped here.
+        restore_unported(&unported);
+    }
 }
 
 // Go: parser/parser.go finishSourceFile (text part) and
@@ -533,7 +655,7 @@ fn build_early_info(
         is_default_library: source.is_default_library,
         meta_data,
         trivia: crate::ast::go_view::TriviaRuns::compute(&source.parse.arena, text),
-        late: OnceCell::new(),
+        late: OnceLock::new(),
     }
 }
 
@@ -580,7 +702,7 @@ fn build_late_info(index: usize, file: &'static GoFile) -> LateSourceFileInfo {
         } else {
             crate::ast::build_jsdoc_cache(root)
         },
-        post_bind: OnceCell::new(),
+        post_bind: OnceLock::new(),
     }
 }
 
@@ -1642,7 +1764,7 @@ pub fn resolve_lazy_js_doc(file: Node, node: Node) -> Option<&'static [Node]> {
 // Go: compiler/program.go:122 FileExists
 pub fn file_exists(path: &str) -> bool {
     if let Some(go) = &state().go {
-        return go.program.file_exists(path);
+        return go.file_exists(path);
     }
     state().fs.file_exists(path)
 }
@@ -1713,7 +1835,7 @@ pub fn options() -> &'static CompilerOptions {
 // PORT: `ts_compiler` records of the option checks in `verify_options` are
 // removed. Go reports those as program diagnostics.
 pub fn get_config_file_parsing_diagnostics() -> Vec<Diagnostic> {
-    if let Some(go) = &state().go {
+    if let Some(go) = go_frontend() {
         return go.program.get_config_file_parsing_diagnostics();
     }
     verify_options::without_reverified_option_diagnostics(&state().config_diagnostics)
@@ -1737,11 +1859,7 @@ pub fn get_resolved_module(
     mode: ResolutionMode,
 ) -> Option<ResolvedModule> {
     if let Some(go) = &state().go {
-        let parsed: &ParsedSourceFileRef = &**go.parsed_file(file);
-        return go
-            .program
-            .get_resolved_module(parsed, module_reference, mode)
-            .map(|r| (*r).clone());
+        return go.get_resolved_module(file, module_reference, mode);
     }
     let program = prog();
     let go_file = &program.files[file.file_index()];
@@ -2155,9 +2273,7 @@ pub fn get_source_file_for_resolved_module(file_name: &str) -> Node {
 // nil and callers fall back to their own location node.
 pub fn get_jsx_runtime_import_specifier(path: &str) -> (String, Node) {
     if let Some(go) = &state().go {
-        return go
-            .program
-            .get_jsx_runtime_import_specifier(&crate::frontend::tspath::Path(path.to_string()));
+        return go.get_jsx_runtime_import_specifier(path);
     }
     let Some(info) = file_info_by_path(path) else {
         return (String::new(), Node::NIL);
@@ -2180,9 +2296,7 @@ pub fn get_jsx_runtime_import_specifier(path: &str) -> (String, Node) {
 // path `createSyntheticImport` is not ported.
 pub fn get_import_helpers_import_specifier(path: &str) -> Node {
     if let Some(go) = &state().go {
-        return go
-            .program
-            .get_import_helpers_import_specifier(&crate::frontend::tspath::Path(path.to_string()));
+        return go.get_import_helpers_import_specifier(path);
     }
     let Some(info) = file_info_by_path(path) else {
         return Node::NIL;
@@ -2233,11 +2347,50 @@ pub fn get_packages_map() -> FxHashMap<String, bool> {
 
 // ---------------------------------------------------------------------------
 // Checker pool (Go compiler/checkerpool.go)
-// PORT: Go runs one task per checker on a work group. Rust checkers are not
-// Send (they hold Rc and thread-local state), so the tasks run one after the
-// other on this thread in checker order. Each checker still sees only its own
-// files, in file order, so results match the Go grouping.
+// PORT: Go runs one goroutine task per checker on a work group. A Rust
+// checker is not Send (it holds Rc and thread-local state), so each checker
+// is made on its own worker thread and stays there. The loading thread
+// sends jobs to the workers and waits for the results, which it merges in
+// file order. Each checker sees only its own files, in file order, so the
+// results match the Go grouping and do not depend on thread timing.
 // ---------------------------------------------------------------------------
+
+/// Stack size of a checker worker thread. The checker recurses deeply on
+/// large projects.
+const CHECKER_STACK_SIZE: usize = 1 << 30;
+
+thread_local! {
+    /// The checker pool of the loading thread.
+    static POOL: RefCell<Option<CheckerPool>> = const { RefCell::new(None) };
+    /// The checker of a worker thread.
+    static WORKER_CHECKER: RefCell<Option<Checker>> = const { RefCell::new(None) };
+    /// The pool index of the checker of a worker thread.
+    static WORKER_INDEX: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The thread-local state that a checker worker starts from: the synthetic
+/// nodes, ids and lazy JSDoc of the loading thread when the pool is made.
+struct WorkerSeed {
+    synthetic: SyntheticSeed,
+    ids: IdSeed,
+    lazy_jsdoc: FxHashMap<Node, &'static [Node]>,
+}
+
+impl WorkerSeed {
+    fn take() -> Self {
+        Self {
+            synthetic: synthetic_seed(),
+            ids: id_seed(),
+            lazy_jsdoc: go_frontend::lazy_jsdoc_seed(),
+        }
+    }
+
+    fn install(self) {
+        install_synthetic_seed(self.synthetic);
+        install_id_seed(self.ids);
+        go_frontend::install_lazy_jsdoc_seed(self.lazy_jsdoc);
+    }
+}
 
 // Go: compiler/checkerpool.go:40 newCheckerPoolWithTracing (the count)
 fn checker_count() -> usize {
@@ -2255,72 +2408,188 @@ fn checker_count() -> usize {
 }
 
 // Go: compiler/checkerpool.go:98 createCheckers
+// PORT: binding runs first on this thread, so no worker binds and every
+// worker starts from the same bound program and thread-local state.
 fn create_checkers() -> CheckerPool {
+    bind_all();
     let count = checker_count();
-    let checkers = (0..count).map(Checker::new).collect();
     let program = prog();
     let mut file_associations = vec![0; program.files.len()];
     for (i, &file_index) in program.source_file_order.iter().enumerate() {
         file_associations[file_index] = i % count;
     }
-    CheckerPool {
-        checkers,
-        file_associations,
+    assert!(
+        state().file_associations.set(file_associations).is_ok(),
+        "checker pool made twice"
+    );
+    let workers = (0..count)
+        .map(|index| {
+            let (sender, receiver) = std::sync::mpsc::channel::<Job>();
+            let seed = WorkerSeed::take();
+            std::thread::Builder::new()
+                .name(format!("checker-{index}"))
+                .stack_size(CHECKER_STACK_SIZE)
+                .spawn(move || {
+                    seed.install();
+                    let checker = Checker::new(index);
+                    WORKER_CHECKER.with(|slot| *slot.borrow_mut() = Some(checker));
+                    WORKER_INDEX.with(|slot| slot.set(Some(index)));
+                    for job in receiver {
+                        job();
+                    }
+                })
+                .expect("cannot start a checker thread");
+            sender
+        })
+        .collect();
+    CheckerPool { workers }
+}
+
+/// Starts `f` with checker `index` on its thread and returns where the
+/// result arrives. Jobs for one checker run in the order they are sent.
+fn send_job<R: Send + 'static>(
+    index: usize,
+    f: impl FnOnce(&mut Checker) -> R + Send + 'static,
+) -> std::sync::mpsc::Receiver<JobResult<R>> {
+    send_thread_job(index, move || with_checker_at(index, f))
+}
+
+/// `send_job` for work that borrows the checker itself (`with_checker_at`)
+/// when it needs it.
+fn send_thread_job<R: Send + 'static>(
+    index: usize,
+    f: impl FnOnce() -> R + Send + 'static,
+) -> std::sync::mpsc::Receiver<JobResult<R>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let job: Job = Box::new(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        let _ = sender.send(result);
+    });
+    POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let pool = pool.get_or_insert_with(create_checkers);
+        pool.workers[index]
+            .send(job)
+            .expect("checker thread stopped");
+    });
+    receiver
+}
+
+/// Waits for a job result. A panic in the job continues on this thread.
+fn wait_job<R>(receiver: &std::sync::mpsc::Receiver<JobResult<R>>) -> R {
+    match receiver.recv().expect("checker thread stopped") {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
     }
 }
 
-/// Runs `f` with the program's checker pool, creating the checkers on first
-/// use. The pool is borrowed for the call, so `f` must not use the pool again.
-fn with_pool<R>(f: impl FnOnce(&mut CheckerPool) -> R) -> R {
-    let mut slot = state().pool.borrow_mut();
-    let pool = slot.get_or_insert_with(create_checkers);
-    f(pool)
+/// Waits for every job, then returns the results in order. The first
+/// panic, in job order, continues on this thread after all jobs end.
+fn wait_jobs<R>(receivers: Vec<std::sync::mpsc::Receiver<JobResult<R>>>) -> Vec<R> {
+    let results: Vec<JobResult<R>> = receivers
+        .iter()
+        .map(|receiver| receiver.recv().expect("checker thread stopped"))
+        .collect();
+    results
+        .into_iter()
+        .map(|result| result.unwrap_or_else(|payload| std::panic::resume_unwind(payload)))
+        .collect()
+}
+
+/// The pool index of this thread's checker, or None off the worker threads.
+fn worker_index() -> Option<usize> {
+    WORKER_INDEX.with(std::cell::Cell::get)
+}
+
+/// The checker index of `file` (Go `fileAssociations[file]`).
+fn checker_index_for_file(file: Node) -> usize {
+    if state().file_associations.get().is_none() {
+        POOL.with(|pool| {
+            pool.borrow_mut().get_or_insert_with(create_checkers);
+        });
+    }
+    state()
+        .file_associations
+        .get()
+        .expect("checker pool not made")[file.file_index()]
 }
 
 // Go: compiler/checkerpool.go:77 getCheckerForFileNonExclusive
 // PORT: Go returns the checker and a release function. Here the checker is
-// lent to `f` for the call.
-pub fn with_type_checker_for_file<R>(file: Node, f: impl FnOnce(&mut Checker) -> R) -> R {
-    with_pool(|pool| {
-        let index = pool.file_associations[file.file_index()];
-        f(&mut pool.checkers[index])
-    })
+// lent to `f` for the call, on the checker's own thread.
+pub fn with_type_checker_for_file<R: Send + 'static>(
+    file: Node,
+    f: impl FnOnce(&mut Checker) -> R + Send + 'static,
+) -> R {
+    let index = checker_index_for_file(file);
+    if worker_index().is_some() {
+        return with_checker_at(index, f);
+    }
+    wait_job(&send_job(index, f))
 }
 
-// PORT: replaces EmitResolver.checkerMu; borrows pool checker by index.
+// PORT: replaces EmitResolver.checkerMu. Lends checker `index` to `f`. Only
+// the worker thread of that checker can do this; the checker is borrowed
+// for the call, so `f` must not ask for it again.
 pub fn with_checker_at<R>(index: usize, f: impl FnOnce(&mut Checker) -> R) -> R {
-    with_pool(|pool| f(&mut pool.checkers[index]))
+    let Some(worker) = worker_index() else {
+        panic!("checker {index} used off its worker thread");
+    };
+    assert!(
+        worker == index,
+        "checker {index} used on the thread of checker {worker}"
+    );
+    WORKER_CHECKER.with(|slot| f(slot.borrow_mut().as_mut().expect("worker checker")))
 }
 
 // Go: compiler/checkerpool.go:123 forEachCheckerParallel
-pub fn for_each_checker_parallel(cb: &mut dyn FnMut(usize, &mut Checker)) {
-    with_pool(|pool| {
-        for (index, checker) in pool.checkers.iter_mut().enumerate() {
-            cb(index, checker);
-        }
-    });
+pub fn for_each_checker_parallel<R: Send + 'static>(cb: fn(usize, &mut Checker) -> R) -> Vec<R> {
+    let count = checker_count();
+    let receivers = (0..count)
+        .map(|index| send_job(index, move |checker| cb(index, checker)))
+        .collect();
+    wait_jobs(receivers)
 }
 
 // Go: compiler/checkerpool.go:136 GetGlobalDiagnostics
 fn pool_get_global_diagnostics() -> Vec<Diagnostic> {
-    let mut global_diagnostics = Vec::new();
-    for_each_checker_parallel(&mut |_, checker| {
-        global_diagnostics.extend(checker.get_global_diagnostics())
-    });
-    sort_and_deduplicate_diagnostics(global_diagnostics)
+    let global_diagnostics =
+        for_each_checker_parallel(|_, checker| checker.get_global_diagnostics());
+    sort_and_deduplicate_diagnostics(global_diagnostics.into_iter().flatten().collect())
 }
 
 // Go: compiler/checkerpool.go:148 forEachCheckerGroupDo
-fn for_each_checker_group_do(files: &[Node], cb: &mut dyn FnMut(&mut Checker, usize, Node)) {
-    with_pool(|pool| {
-        for checker_index in 0..pool.checkers.len() {
-            for (i, &file) in files.iter().enumerate() {
-                if pool.file_associations[file.file_index()] == checker_index {
-                    cb(&mut pool.checkers[checker_index], i, file);
+// PORT: returns the results of `cb` by file position instead of passing the
+// position to `cb`. A file with no result keeps an empty list.
+fn for_each_checker_group_do(
+    files: &[Node],
+    cb: fn(&mut Checker, Node) -> Vec<Diagnostic>,
+) -> Vec<Vec<Diagnostic>> {
+    let count = checker_count();
+    let files: Arc<Vec<Node>> = Arc::new(files.to_vec());
+    let receivers = (0..count)
+        .map(|checker_index| {
+            let files = Arc::clone(&files);
+            send_job(checker_index, move |checker| {
+                let associations = state()
+                    .file_associations
+                    .get()
+                    .expect("checker pool not made");
+                let mut results = Vec::new();
+                for (i, &file) in files.iter().enumerate() {
+                    if associations[file.file_index()] == checker_index {
+                        results.push((i, cb(checker, file)));
+                    }
                 }
-            }
-        }
-    });
+                results
+            })
+        })
+        .collect();
+    let mut diagnostics = vec![Vec::new(); files.len()];
+    for (i, result) in wait_jobs(receivers).into_iter().flatten() {
+        diagnostics[i] = result;
+    }
+    diagnostics
 }
 
 // ---------------------------------------------------------------------------
@@ -2349,13 +2618,13 @@ fn collect_diagnostics(
 /// the checker that owns each file. The bin uses this to guard each file.
 pub fn collect_checker_diagnostics_with(
     file: Node,
-    collect: &mut dyn FnMut(&mut Checker, Node) -> Vec<Diagnostic>,
+    collect: fn(&mut Checker, Node) -> Vec<Diagnostic>,
 ) -> Vec<Diagnostic> {
     if file.is_some() {
         if skip_type_checking(file, false) {
             return Vec::new();
         }
-        let result = with_type_checker_for_file(file, |c| collect(c, file));
+        let result = with_type_checker_for_file(file, move |c| collect(c, file));
         return sort_and_deduplicate_diagnostics(result);
     }
     let files = source_files();
@@ -2366,13 +2635,9 @@ pub fn collect_checker_diagnostics_with(
 // Go: compiler/program.go:576 collectCheckerDiagnosticsFromFiles
 fn collect_checker_diagnostics_from_files(
     source_files: &[Node],
-    collect: &mut dyn FnMut(&mut Checker, Node) -> Vec<Diagnostic>,
+    collect: fn(&mut Checker, Node) -> Vec<Diagnostic>,
 ) -> Vec<Vec<Diagnostic>> {
-    let mut diagnostics = vec![Vec::new(); source_files.len()];
-    for_each_checker_group_do(source_files, &mut |c, file_index, file| {
-        diagnostics[file_index] = collect(c, file);
-    });
-    diagnostics
+    for_each_checker_group_do(source_files, collect)
 }
 
 // Go: compiler/program.go:599 GetSyntacticDiagnostics
@@ -2443,7 +2708,7 @@ pub fn get_bind_diagnostics(source_file: Node) -> Vec<Diagnostic> {
 
 // Go: compiler/program.go:654 GetSemanticDiagnostics
 pub fn get_semantic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
-    collect_checker_diagnostics_with(source_file, &mut get_semantic_diagnostics_with_checker)
+    collect_checker_diagnostics_with(source_file, get_semantic_diagnostics_with_checker)
 }
 
 // Go: compiler/program.go:658 GetSemanticDiagnosticsWithoutNoEmitFiltering
@@ -2452,7 +2717,7 @@ pub fn get_semantic_diagnostics_without_no_emit_filtering(
 ) -> FxHashMap<Node, Vec<Diagnostic>> {
     let all_diags = collect_checker_diagnostics_from_files(
         source_files,
-        &mut get_bind_and_check_diagnostics_with_checker,
+        get_bind_and_check_diagnostics_with_checker,
     );
     source_files
         .iter()
@@ -2463,14 +2728,14 @@ pub fn get_semantic_diagnostics_without_no_emit_filtering(
 
 // Go: compiler/program.go:667 GetSuggestionDiagnostics
 pub fn get_suggestion_diagnostics(source_file: Node) -> Vec<Diagnostic> {
-    collect_checker_diagnostics_with(source_file, &mut get_suggestion_diagnostics_with_checker)
+    collect_checker_diagnostics_with(source_file, get_suggestion_diagnostics_with_checker)
 }
 
 // Go: compiler/program.go:671 GetProgramDiagnostics
 // PORT: the include processor diagnostics are part of the converted
 // `ts_compiler` program diagnostics.
 pub fn get_program_diagnostics() -> Vec<Diagnostic> {
-    if let Some(go) = &state().go {
+    if let Some(go) = go_frontend() {
         let mut diagnostics = go.program.program_diagnostics.clone();
         diagnostics.extend(
             go.program
@@ -2495,12 +2760,7 @@ pub fn get_include_processor_diagnostics(source_file: Node) -> Vec<Diagnostic> {
         return Vec::new();
     }
     let diagnostics = match &state().go {
-        Some(go) => go
-            .program
-            .include_processor
-            .get_diagnostics(go.program)
-            .borrow_mut()
-            .get_diagnostics_for_file(&source_file_info(source_file).file_name),
+        Some(go) => go.get_include_processor_diagnostics(source_file),
         None => Vec::new(),
     };
     let (filtered, _) = get_diagnostics_with_preceding_directives(source_file, diagnostics);
@@ -2550,8 +2810,31 @@ pub fn get_global_diagnostics() -> Vec<Diagnostic> {
 }
 
 // Go: compiler/program.go:1302 GetDeclarationDiagnostics
+// PORT: each file's work runs on the thread of the file's checker, where its
+// emit resolver can reach that checker. Files of different checkers run in
+// parallel; the results merge in file order.
 pub fn get_declaration_diagnostics(source_file: Node) -> Vec<Diagnostic> {
-    collect_diagnostics(source_file, &mut get_declaration_diagnostics_for_file)
+    let files = if source_file.is_some() {
+        vec![source_file]
+    } else {
+        source_files()
+    };
+    if worker_index().is_some() {
+        let result = files
+            .into_iter()
+            .flat_map(get_declaration_diagnostics_for_file)
+            .collect();
+        return sort_and_deduplicate_diagnostics(result);
+    }
+    let receivers = files
+        .into_iter()
+        .map(|file| {
+            send_thread_job(checker_index_for_file(file), move || {
+                get_declaration_diagnostics_for_file(file)
+            })
+        })
+        .collect();
+    sort_and_deduplicate_diagnostics(wait_jobs(receivers).into_iter().flatten().collect())
 }
 
 // Go: compiler/program.go:1394 getDeclarationDiagnosticsForFile
@@ -2560,23 +2843,26 @@ fn get_declaration_diagnostics_for_file(source_file: Node) -> Vec<Diagnostic> {
         return Vec::new();
     }
 
-    if let Some(cached) = state()
-        .declaration_diagnostic_cache
-        .borrow()
-        .get(&source_file)
-    {
+    if let Some(cached) = declaration_diagnostic_cache().get(&source_file) {
         return cached.clone();
     }
 
     let host = new_emit_host(source_file);
     let diagnostics = get_declaration_diagnostics_worker(host, source_file);
     // Go `LoadOrStore`: keep the first stored value.
-    state()
-        .declaration_diagnostic_cache
-        .borrow_mut()
+    declaration_diagnostic_cache()
         .entry(source_file)
         .or_insert(diagnostics)
         .clone()
+}
+
+/// Go `Program.declarationDiagnosticCache`, locked.
+fn declaration_diagnostic_cache() -> std::sync::MutexGuard<'static, FxHashMap<Node, Vec<Diagnostic>>>
+{
+    state()
+        .declaration_diagnostic_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 // Go: compiler/emitter.go:506 getSourceFilesToEmit
@@ -2632,7 +2918,7 @@ pub struct EmitHost {
 // must reach its checker itself.
 fn new_emit_host(file: Node) -> Rc<EmitHost> {
     let emit_resolver: Rc<dyn crate::printer::EmitResolver> =
-        with_type_checker_for_file(file, |c| c.get_emit_resolver());
+        with_checker_at(checker_index_for_file(file), Checker::get_emit_resolver);
     Rc::new(EmitHost { emit_resolver })
 }
 

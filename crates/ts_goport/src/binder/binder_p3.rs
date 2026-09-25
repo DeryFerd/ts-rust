@@ -1006,7 +1006,7 @@ impl Binder {
         self.p3_node_bind_mut(node).symbol = symbol;
         if self.symbols.sym(symbol).declarations.is_empty() {
             let declarations = self.new_single_declaration(node);
-            self.symbols.sym_mut(symbol).declarations = declarations;
+            self.symbols.sym_mut(symbol).declarations = declarations.into();
         } else {
             // Go core.AppendIfUnique
             let declarations = &mut self.symbols.sym_mut(symbol).declarations;

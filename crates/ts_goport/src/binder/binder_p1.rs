@@ -132,11 +132,26 @@ impl FlowNode {
 // binding ends. The binder output is stored in the file's `GoFile`
 // `OnceCell`s (Go `file.BindOnce`). A file that is already bound is skipped.
 pub fn bind_source_file(file: Node, symbols: &mut SymbolArena) {
-    let file_index = file.file_index();
-    let go_file = &prog().files[file_index];
-    if go_file.file_bind.get().is_some() {
+    if prog().files[file.file_index()].file_bind.get().is_some() {
         return;
     }
+    bind_source_file_detached(file, symbols).install();
+}
+
+/// The binder output of one file before it is stored in its `GoFile`.
+pub struct BoundFile {
+    pub file: Node,
+    pub node_bind: Vec<NodeBindData>,
+    pub flow_nodes: Vec<FlowNode>,
+    pub file_bind: FileBindData,
+}
+
+/// Binds `file` into `symbols` and returns the output without storing it.
+/// Parallel binding binds each file into its own arena with this, then
+/// moves the symbols into the program arena (`BoundFile::remap`).
+pub fn bind_source_file_detached(file: Node, symbols: &mut SymbolArena) -> BoundFile {
+    let file_index = file.file_index();
+    let go_file = &prog().files[file_index];
     let node_count = go_file.parser_flags.len();
     let mut b = Binder {
         file,
@@ -157,18 +172,49 @@ pub fn bind_source_file(file: Node, symbols: &mut SymbolArena) {
         flow_nodes,
         ..
     } = b;
-    assert!(
-        go_file.node_bind.set(node_bind).is_ok(),
-        "file already bound"
-    );
-    assert!(
-        go_file.flow_nodes.set(flow_nodes).is_ok(),
-        "file already bound"
-    );
-    assert!(
-        go_file.file_bind.set(file_bind).is_ok(),
-        "file already bound"
-    );
+    BoundFile {
+        file,
+        node_bind,
+        flow_nodes,
+        file_bind,
+    }
+}
+
+impl BoundFile {
+    /// Stores the output in the file's `GoFile` `OnceLock`s (Go
+    /// `file.BindOnce`).
+    pub fn install(self) {
+        let go_file = &prog().files[self.file.file_index()];
+        assert!(
+            go_file.node_bind.set(self.node_bind).is_ok(),
+            "file already bound"
+        );
+        assert!(
+            go_file.flow_nodes.set(self.flow_nodes).is_ok(),
+            "file already bound"
+        );
+        assert!(
+            go_file.file_bind.set(self.file_bind).is_ok(),
+            "file already bound"
+        );
+    }
+
+    /// Moves the symbol and table ids of a file that was bound into its own
+    /// arena to their place in the program arena (see
+    /// `SymbolArena::append_file_arena`).
+    pub fn remap(&mut self, offsets: ArenaOffsets) {
+        for data in &mut self.node_bind {
+            data.symbol = offsets.symbol(data.symbol);
+            data.local_symbol = offsets.symbol(data.local_symbol);
+            data.locals = offsets.table(data.locals);
+        }
+        let file_bind = &mut self.file_bind;
+        file_bind.global_exports = offsets.table(file_bind.global_exports);
+        file_bind.js_global_augmentations = offsets.table(file_bind.js_global_augmentations);
+        for module in &mut file_bind.pattern_ambient_modules {
+            module.symbol = offsets.symbol(module.symbol);
+        }
+    }
 }
 
 /// Rust-only accessors for data Go stores on nodes, symbols and flow nodes.
@@ -303,7 +349,7 @@ impl Binder {
 
 impl Binder {
     // Go: binder/binder.go:134 newSymbol
-    pub fn new_symbol(&mut self, flags: SymbolFlags, name: impl Into<String>) -> SymbolId {
+    pub fn new_symbol(&mut self, flags: SymbolFlags, name: impl Into<Name>) -> SymbolId {
         self.symbol_count += 1;
         self.symbols.new_symbol(flags, name)
     }

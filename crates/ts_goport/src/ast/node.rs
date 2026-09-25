@@ -721,11 +721,12 @@ impl Node {
     /// Go `node.Kind`.
     #[must_use]
     pub fn kind(self) -> SyntaxKind {
-        let r = raw(self);
-        // A store node holds the Go kind.
+        // A store node holds the Go kind in its header.
         if has_file_store(self.file_index()) {
-            return r.kind;
+            assert!(self.is_some(), "nil node dereference");
+            return store_header(self).kind;
         }
+        let r = raw(self);
         match r.kind {
             SyntaxKind::PropertyDeclaration
             | SyntaxKind::QualifiedName
@@ -742,7 +743,11 @@ impl Node {
         }
         if has_file_store(self.file_index()) {
             // The parser reads flags before the program exists.
+            // After the freeze every store file is a program file.
             let flags = store_header(self).flags;
+            if file_stores_frozen() {
+                return flags | self.bind().added_flags;
+            }
             return match crate::core::try_prog() {
                 Some(p) if self.file_index() < p.files.len() => flags | self.bind().added_flags,
                 _ => flags,

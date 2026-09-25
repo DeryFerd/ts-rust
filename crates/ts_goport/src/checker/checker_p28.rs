@@ -22,19 +22,19 @@ impl Checker {
     // Go: checker/checker.go:24965 newObjectType
     pub fn new_object_type(&mut self, object_flags: ObjectFlags, symbol: SymbolId) -> TypeId {
         let data = if object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE) {
-            TypeData::Interface(InterfaceType::default())
+            TypeData::Interface(Box::default())
         } else if object_flags.intersects(ObjectFlags::TUPLE) {
-            TypeData::Tuple(TupleType::default())
+            TypeData::Tuple(Box::default())
         } else if object_flags.intersects(ObjectFlags::REFERENCE) {
             TypeData::TypeReference(TypeReference::default())
         } else if object_flags.intersects(ObjectFlags::MAPPED) {
-            TypeData::Mapped(MappedType::default())
+            TypeData::Mapped(Box::default())
         } else if object_flags.intersects(ObjectFlags::REVERSE_MAPPED) {
-            TypeData::ReverseMapped(ReverseMappedType::default())
+            TypeData::ReverseMapped(Box::default())
         } else if object_flags.intersects(ObjectFlags::EVOLVING_ARRAY) {
-            TypeData::EvolvingArray(EvolvingArrayType::default())
+            TypeData::EvolvingArray(Box::default())
         } else if object_flags.intersects(ObjectFlags::INSTANTIATION_EXPRESSION_TYPE) {
-            TypeData::InstantiationExpression(InstantiationExpressionType::default())
+            TypeData::InstantiationExpression(Box::default())
         } else if object_flags.intersects(ObjectFlags::ANONYMOUS) {
             TypeData::Object(ObjectType::default())
         } else {
@@ -249,7 +249,11 @@ impl Checker {
     pub fn new_union_type(&mut self, object_flags: ObjectFlags, types: &[TypeId]) -> TypeId {
         let mut data = UnionType::default();
         data.union_or_intersection.types = types.to_vec();
-        self.new_type(TypeFlags::UNION, object_flags, TypeData::Union(data))
+        self.new_type(
+            TypeFlags::UNION,
+            object_flags,
+            TypeData::Union(Box::new(data)),
+        )
     }
 
     // Go: checker/checker.go:25096 newIntersectionType
@@ -259,7 +263,7 @@ impl Checker {
         self.new_type(
             TypeFlags::INTERSECTION,
             object_flags,
-            TypeData::Intersection(data),
+            TypeData::Intersection(Box::new(data)),
         )
     }
 
@@ -292,8 +296,8 @@ impl Checker {
     // Go: checker/checker.go:25117 newTemplateLiteralType
     pub fn new_template_literal_type(&mut self, texts: &[String], types: &[TypeId]) -> TypeId {
         let mut data = TemplateLiteralType::default();
-        data.texts = texts.to_vec();
-        data.types = types.to_vec();
+        data.texts = texts.into();
+        data.types = types.into();
         self.new_type(
             TypeFlags::TEMPLATE_LITERAL,
             ObjectFlags::NONE,
@@ -525,8 +529,15 @@ impl Checker {
 
     // Go: checker/checker.go:25248 getStringLiteralValue
     pub fn get_string_literal_value(&self, t: TypeId) -> String {
+        self.get_string_literal_value_ref(t).to_string()
+    }
+
+    // PORT: borrowing form of `getStringLiteralValue`. Callers that only read
+    // the value use it to skip the `String` clone.
+    // Go: checker/checker.go:25248 getStringLiteralValue
+    pub fn get_string_literal_value_ref(&self, t: TypeId) -> &str {
         match self.ty(t).as_literal_type().value.as_ref() {
-            Some(LiteralValue::String(s)) => s.clone(),
+            Some(LiteralValue::String(s)) => s,
             _ => panic!("interface conversion: interface {{}} is not string"),
         }
     }

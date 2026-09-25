@@ -319,7 +319,7 @@ impl Checker {
                     return self
                         .sym(properties_of_jsx_element_attrib_prop_interface[0])
                         .name
-                        .clone();
+                        .to_string();
                 }
                 if properties_of_jsx_element_attrib_prop_interface.len() > 1
                     && !self

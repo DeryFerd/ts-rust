@@ -5,30 +5,39 @@
 //! `GoProgram::files`, so a store node is a normal `Node` handle: high 32
 //! bits are the store id, low 32 bits are the slot index + 1.
 //!
-//! Each slot holds a leaked `ts_ast::Node` (Go kind and `NodeData`) plus the
-//! mutable Go `NodeBase` header (parent, flags, loc). Child ids inside that
-//! data are slot indexes of the same store:
+//! Each slot has a header (Go kind plus the mutable Go `NodeBase` fields:
+//! parent, flags, loc) and, for a node slot, a leaked `ts_ast::Node` that
+//! holds the node data. Child ids inside that data are slot indexes of the
+//! same store:
 //! - a child in the same file uses its own slot index;
 //! - a child from another file or a synthetic child (Go shares the pointer)
 //!   uses an alias slot, which `Node::new` resolves to that node;
 //! - Go `nil` in a field that ts_ast stores as a required `NodeId` uses
 //!   slot 0, which resolves to `Node::NIL`.
 //!
-//! `node.rs` reads kind, loc, flags and parent from here for files that have
-//! a store. Files of the legacy loader (ts_parser) never have a store, so
-//! their reads do not change.
+//! `node.rs` reads kind, loc, flags and parent from the header for files that
+//! have a store. Files of the legacy loader (ts_parser) never have a store,
+//! so their reads do not change.
 //!
-//! The header and the data can change until the parser finishes the file
-//! (`finishNode`, parent setting, JSDoc flags, reparser.go writes). Then the
-//! loader freezes the store. Binder data is not stored here: it stays in
-//! `GoFile::node_bind`, indexed by slot index.
+//! Two phases:
+//! - Build: the parser runs on one thread and writes the stores of that
+//!   thread (`BUILD`). The header and the data can change until the parser
+//!   finishes the file (`finishNode`, parent setting, JSDoc flags,
+//!   reparser.go writes). Then the parser freezes the file.
+//! - Frozen: `core::set_prog` calls `freeze_file_stores`, which moves every
+//!   store into one leaked, read-only, process-wide slice (`FROZEN`). Node
+//!   reads then need no thread-local and no `RefCell` borrow, and the slice
+//!   can be read from any thread. Writes and new stores panic after this.
+//!
+//! Binder data is not stored here: it stays in `GoFile::node_bind`, indexed
+//! by slot index.
 //!
 //! PORT: a program is either all legacy files or all store files. File ids
 //! are store ids, so a store can only be made while no legacy program is
-//! installed on this thread.
+//! installed on this thread. One process installs one program.
 
 use crate::prelude::*;
-use std::cell::Cell;
+use std::sync::OnceLock;
 use ts_ast::NodeData;
 
 /// Slot 0: Go `nil` stored in a ts_ast field that has no `Option`.
@@ -42,46 +51,67 @@ const NIL_SLOT: u32 = 0;
 // and `NodeList::is_nil` reads it back as nil (plan risk 1).
 pub const NIL_LIST_POS: u32 = u32::MAX - 1;
 
-/// The mutable Go `NodeBase` fields of a store node.
+/// The Go kind and the mutable Go `NodeBase` fields of a store node.
+///
+/// A nil or alias slot has kind `Unknown`, no flags, an undefined loc, and
+/// its target (nil for slot 0) in `parent`.
 #[derive(Clone, Copy, Debug)]
 pub struct NodeHeader {
     pub parent: Node,
-    pub flags: NodeFlags,
     pub loc: TextRange,
+    pub flags: NodeFlags,
+    pub kind: SyntaxKind,
+    /// Set by `freeze_file_stores`: Go `GetSourceFileOfNode(node)` is the
+    /// root of this store (`FileStore::root`). False means "walk the parents".
+    source_file_is_root: bool,
 }
 
-/// One store slot.
-enum StoreSlot {
-    /// Go `nil`. Only slot 0.
-    Nil,
-    /// A node of another file (or a synthetic node) used as a child.
-    Alias(Node),
-    /// A node the factory created in this file.
-    Node {
-        node: &'static ts_ast::Node,
-        header: NodeHeader,
-    },
+impl NodeHeader {
+    /// The header of a nil (`target` nil) or alias slot.
+    const fn target(target: Node) -> Self {
+        Self {
+            parent: target,
+            loc: TextRange::undefined(),
+            flags: NodeFlags::NONE,
+            kind: SyntaxKind::Unknown,
+            source_file_is_root: false,
+        }
+    }
 }
 
-/// The Go nodes of one parsed file.
+/// The Go nodes of one parsed file. Slot `i` is `headers[i]` and `nodes[i]`.
 struct FileStore {
     file_name: &'static str,
     text: &'static str,
-    slots: Vec<StoreSlot>,
-    /// Alias slot of each foreign node, so one node gets one slot.
+    headers: Vec<NodeHeader>,
+    /// The ts_ast node (kind and data) of each node slot. `None` for the nil
+    /// slot and alias slots.
+    nodes: Vec<Option<&'static ts_ast::Node>>,
+    /// Alias slot of each foreign node, so one node gets one slot. Emptied
+    /// by `freeze_file_stores`.
     aliases: FxHashMap<Node, u32>,
     /// Set when the parser has finished the file.
     frozen: bool,
     /// Go `file.jsdocCache`, set by `finishSourceFile`. Node reads use it
-    /// until the program that holds this file is installed.
+    /// until the program that holds this file is installed, so
+    /// `freeze_file_stores` empties it.
     jsdoc_cache: FxHashMap<Node, &'static [Node]>,
+    /// The SourceFile node of this store, set by `freeze_file_stores`.
+    root: Node,
 }
 
 thread_local! {
-    static STORES: RefCell<Vec<FileStore>> = const { RefCell::new(Vec::new()) };
-    /// `STORES.len()`, readable without a `RefCell` borrow. `node.rs` checks
-    /// it on every read, so the legacy path stays cheap.
-    static STORE_COUNT: Cell<usize> = const { Cell::new(0) };
+    /// The stores of this thread, while the parser runs.
+    static BUILD: RefCell<Vec<FileStore>> = const { RefCell::new(Vec::new()) };
+}
+
+/// All stores, read-only, after `freeze_file_stores`.
+static FROZEN: OnceLock<&'static [FileStore]> = OnceLock::new();
+
+/// The frozen stores, or `None` while the parser runs.
+#[inline]
+fn frozen() -> Option<&'static [FileStore]> {
+    FROZEN.get().copied()
 }
 
 /// The handle of slot `index` in store `file`. Does not resolve aliases.
@@ -90,24 +120,24 @@ const fn handle(file: usize, index: u32) -> Node {
 }
 
 /// Slot index of a store handle.
+#[inline]
 fn slot_index(n: Node) -> usize {
     ((n.0 & 0xffff_ffff) - 1) as usize
 }
 
 fn with_store<R>(file: usize, f: impl FnOnce(&FileStore) -> R) -> R {
-    STORES.with(|s| f(&s.borrow()[file]))
+    if let Some(stores) = frozen() {
+        return f(&stores[file]);
+    }
+    BUILD.with(|s| f(&s.borrow()[file]))
 }
 
 fn with_store_mut<R>(file: usize, f: impl FnOnce(&mut FileStore) -> R) -> R {
-    STORES.with(|s| f(&mut s.borrow_mut()[file]))
-}
-
-/// Reads the node slot of a store handle.
-fn with_slot<R>(n: Node, f: impl FnOnce(&'static ts_ast::Node, &NodeHeader) -> R) -> R {
-    with_store(n.file_index(), |s| match &s.slots[slot_index(n)] {
-        StoreSlot::Node { node, header } => f(node, header),
-        _ => panic!("store handle does not name a node slot"),
-    })
+    assert!(
+        frozen().is_none(),
+        "cannot change a node store after freeze"
+    );
+    BUILD.with(|s| f(&mut s.borrow_mut()[file]))
 }
 
 /// Writes the node slot of a store handle. Panics on a frozen store.
@@ -117,9 +147,10 @@ fn with_slot_mut<R>(
 ) -> R {
     with_store_mut(n.file_index(), |s| {
         assert!(!s.frozen, "cannot mutate a node of a finished file");
-        match &mut s.slots[slot_index(n)] {
-            StoreSlot::Node { node, header } => f(node, header),
-            _ => panic!("store handle does not name a node slot"),
+        let index = slot_index(n);
+        match &mut s.nodes[index] {
+            Some(node) => f(node, &mut s.headers[index]),
+            None => panic!("store handle does not name a node slot"),
         }
     })
 }
@@ -131,37 +162,52 @@ fn with_slot_mut<R>(
 /// Makes the store of the next parsed file and returns its id. Ids follow
 /// parse order and are the file indexes in `GoProgram::files`.
 pub fn new_file_store(file_name: &'static str, text: &'static str) -> usize {
-    let count = STORE_COUNT.get();
-    assert!(
-        crate::core::try_prog().is_none_or(|p| p.files.len() <= count),
-        "a legacy program is installed; file ids would collide with store ids"
-    );
-    STORES.with(|s| {
+    assert!(frozen().is_none(), "cannot make a node store after freeze");
+    BUILD.with(|s| {
         let mut s = s.borrow_mut();
+        assert!(
+            crate::core::try_prog().is_none_or(|p| p.files.len() <= s.len()),
+            "a legacy program is installed; file ids would collide with store ids"
+        );
         s.push(FileStore {
             file_name,
             text,
-            slots: vec![StoreSlot::Nil],
+            headers: vec![NodeHeader::target(Node::NIL)],
+            nodes: vec![None],
             aliases: FxHashMap::default(),
             frozen: false,
             jsdoc_cache: FxHashMap::default(),
+            root: Node::NIL,
         });
-        STORE_COUNT.set(s.len());
         s.len() - 1
     })
 }
 
-/// Number of stores on this thread.
+/// Number of stores (on this thread while the parser runs).
 #[must_use]
 pub fn file_store_count() -> usize {
-    STORE_COUNT.get()
+    match frozen() {
+        Some(stores) => stores.len(),
+        None => BUILD.with(|s| s.borrow().len()),
+    }
+}
+
+/// True after `freeze_file_stores`. The program is installed then, and it
+/// holds every store file.
+#[inline]
+#[must_use]
+pub fn file_stores_frozen() -> bool {
+    frozen().is_some()
 }
 
 /// True when file `file` was parsed by the ported parser.
 #[inline]
 #[must_use]
 pub fn has_file_store(file: usize) -> bool {
-    file < STORE_COUNT.get()
+    match frozen() {
+        Some(stores) => file < stores.len(),
+        None => BUILD.with(|s| file < s.borrow().len()),
+    }
 }
 
 /// True when `n` is a node of a store file.
@@ -205,7 +251,9 @@ pub fn file_store_js_doc(file: usize, node: Node) -> Option<&'static [Node]> {
 /// no installed program holds the file yet (the parser is still running).
 #[must_use]
 pub fn is_file_store_before_program(file: usize) -> bool {
-    has_file_store(file) && crate::core::try_prog().is_none_or(|p| p.files.len() <= file)
+    frozen().is_none()
+        && has_file_store(file)
+        && crate::core::try_prog().is_none_or(|p| p.files.len() <= file)
 }
 
 /// Ends the parse of a file. Header and data writes panic after this.
@@ -215,14 +263,14 @@ pub fn freeze_file_store(file: usize) {
 
 #[must_use]
 pub fn is_file_store_frozen(file: usize) -> bool {
-    with_store(file, |s| s.frozen)
+    frozen().is_some() || with_store(file, |s| s.frozen)
 }
 
 /// Number of slots (nil, alias and node slots). Per-node vectors that are
 /// indexed by `NodeId::index()` (`GoFile::node_bind`) need this length.
 #[must_use]
 pub fn file_store_slot_count(file: usize) -> usize {
-    with_store(file, |s| s.slots.len())
+    with_store(file, |s| s.headers.len())
 }
 
 /// The parser `node.Flags` of every slot, indexed by slot index. Nil and
@@ -230,15 +278,82 @@ pub fn file_store_slot_count(file: usize) -> usize {
 /// this, so the binder reads the same flags as for a legacy file.
 #[must_use]
 pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
-    with_store(file, |s| {
-        s.slots
-            .iter()
-            .map(|slot| match slot {
-                StoreSlot::Node { header, .. } => header.flags,
-                _ => NodeFlags::NONE,
-            })
-            .collect()
-    })
+    with_store(file, |s| s.headers.iter().map(|h| h.flags).collect())
+}
+
+/// Moves every store of this thread into the process-wide read-only slice.
+/// `core::set_prog` calls this once, when the program is installed. After
+/// this, store writes and new stores panic.
+// PORT: Go needs no freeze; its nodes are heap objects. The freeze also
+// computes `NodeHeader::source_file_is_root` for `get_source_file_of_node`.
+pub fn freeze_file_stores() {
+    let mut stores = BUILD.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    for (file, store) in stores.iter_mut().enumerate() {
+        store.frozen = true;
+        store.aliases = FxHashMap::default();
+        store.jsdoc_cache = FxHashMap::default();
+        store.headers.shrink_to_fit();
+        store.nodes.shrink_to_fit();
+        mark_source_file_roots(file, store);
+    }
+    let stores: &'static [FileStore] = Box::leak(stores.into_boxed_slice());
+    assert!(
+        FROZEN.set(stores).is_ok(),
+        "node stores are already frozen; one process installs one program"
+    );
+}
+
+/// Sets `store.root` and `NodeHeader::source_file_is_root` of each node
+/// slot whose Go parent walk (`GetSourceFileOfNode`) ends at that root.
+/// Headers are frozen, so the walk result cannot change. A walk that leaves
+/// the store (a synthetic or foreign parent) stays unmarked and is walked
+/// at read time.
+fn mark_source_file_roots(file: usize, store: &mut FileStore) {
+    // PORT: the parser makes the SourceFile node last, so the root is the
+    // last SourceFile slot. Any other SourceFile node stays unmarked.
+    let Some(root) = (0..store.headers.len())
+        .rev()
+        .find(|&i| store.nodes[i].is_some() && store.headers[i].kind == SyntaxKind::SourceFile)
+    else {
+        return;
+    };
+    store.root = handle(file, root as u32);
+
+    const UNSEEN: u8 = 0;
+    const ON_PATH: u8 = 1;
+    const ROOT: u8 = 2;
+    const NOT_ROOT: u8 = 3;
+    let mut state = vec![UNSEEN; store.headers.len()];
+    let mut path = Vec::new();
+    for start in 1..store.headers.len() {
+        if store.nodes[start].is_none() {
+            continue;
+        }
+        let mut cur = start;
+        let result = loop {
+            match state[cur] {
+                ROOT | NOT_ROOT => break state[cur],
+                // A parent cycle: Go never returns. Leave it to the walk.
+                ON_PATH => break NOT_ROOT,
+                _ => {}
+            }
+            state[cur] = ON_PATH;
+            path.push(cur);
+            let header = &store.headers[cur];
+            if header.kind == SyntaxKind::SourceFile {
+                break if cur == root { ROOT } else { NOT_ROOT };
+            }
+            let parent = header.parent;
+            if parent.is_nil() || parent.file_index() != file {
+                break NOT_ROOT;
+            }
+            cur = slot_index(parent);
+        };
+        for i in path.drain(..) {
+            state[i] = result;
+            store.headers[i].source_file_is_root = result == ROOT;
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -247,25 +362,63 @@ pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
 
 /// Hook for `Node::new(file, id)` on a store file: the Go node that a child
 /// id inside store `NodeData` stands for.
+#[inline]
 #[must_use]
 pub fn resolve_store_id(file: usize, id: ts_ast::NodeId) -> Node {
-    with_store(file, |s| match &s.slots[id.index()] {
-        StoreSlot::Nil => Node::NIL,
-        StoreSlot::Alias(target) => *target,
-        StoreSlot::Node { .. } => handle(file, id.index() as u32),
-    })
+    let index = id.index();
+    let resolve = |s: &FileStore| match s.nodes[index] {
+        Some(_) => handle(file, index as u32),
+        // The nil slot or an alias slot: the target is in the header.
+        None => s.headers[index].parent,
+    };
+    if let Some(stores) = frozen() {
+        return resolve(&stores[file]);
+    }
+    BUILD.with(|s| resolve(&s.borrow()[file]))
 }
 
 /// Hook for `raw(n)`: the ts_ast node (Go kind and data) of a store node.
+#[inline]
 #[must_use]
 pub fn store_ast_node(n: Node) -> &'static ts_ast::Node {
-    with_slot(n, |node, _| node)
+    let get =
+        |s: &FileStore| s.nodes[slot_index(n)].expect("store handle does not name a node slot");
+    if let Some(stores) = frozen() {
+        return get(&stores[n.file_index()]);
+    }
+    BUILD.with(|s| get(&s.borrow()[n.file_index()]))
 }
 
-/// Hook for `Node::flags`, `parent` and `loc` on a store node.
+/// Hook for `Node::kind`, `flags`, `parent` and `loc` on a store node.
+#[inline]
 #[must_use]
 pub fn store_header(n: Node) -> NodeHeader {
-    with_slot(n, |_, header| *header)
+    let get = |s: &FileStore| {
+        let index = slot_index(n);
+        debug_assert!(
+            s.nodes[index].is_some(),
+            "store handle does not name a node slot"
+        );
+        s.headers[index]
+    };
+    if let Some(stores) = frozen() {
+        return get(&stores[n.file_index()]);
+    }
+    BUILD.with(|s| get(&s.borrow()[n.file_index()]))
+}
+
+/// Go `GetSourceFileOfNode(n)` in O(1), when `n` is a frozen store node
+/// whose parent walk ends at its store root. `None` means "walk".
+#[inline]
+#[must_use]
+pub fn frozen_source_file_of_node(n: Node) -> Option<Node> {
+    if n.is_nil() {
+        return None;
+    }
+    let store = frozen()?.get(n.file_index())?;
+    store.headers[slot_index(n)]
+        .source_file_is_root
+        .then_some(store.root)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -326,15 +479,15 @@ pub fn alloc_store_node(file: usize, kind: SyntaxKind, data: NodeData) -> Node {
     let node = leak_ast_node(kind, data);
     with_store_mut(file, |s| {
         assert!(!s.frozen, "cannot create a node in a finished file");
-        let index = s.slots.len() as u32;
-        s.slots.push(StoreSlot::Node {
-            node,
-            header: NodeHeader {
-                parent: Node::NIL,
-                flags: NodeFlags::NONE,
-                loc: TextRange::undefined(),
-            },
+        let index = s.headers.len() as u32;
+        s.headers.push(NodeHeader {
+            parent: Node::NIL,
+            loc: TextRange::undefined(),
+            flags: NodeFlags::NONE,
+            kind,
+            source_file_is_root: false,
         });
+        s.nodes.push(Some(node));
         handle(file, index)
     })
 }
@@ -354,8 +507,9 @@ pub fn store_child_id(file: usize, n: Node) -> ts_ast::NodeId {
         if let Some(&index) = s.aliases.get(&n) {
             return ts_ast::NodeId::new(index);
         }
-        let index = s.slots.len() as u32;
-        s.slots.push(StoreSlot::Alias(n));
+        let index = s.headers.len() as u32;
+        s.headers.push(NodeHeader::target(n));
+        s.nodes.push(None);
         s.aliases.insert(n, index);
         ts_ast::NodeId::new(index)
     })

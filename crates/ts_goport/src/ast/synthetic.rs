@@ -35,6 +35,7 @@ pub const SYNTHETIC_NODE_FILE: usize = 0xffff_fffe;
 const NIL_SLOT: u32 = 0;
 
 /// One synthetic slot.
+#[derive(Clone)]
 enum Slot {
     /// Go `nil`. Only slot 0.
     Nil,
@@ -45,6 +46,7 @@ enum Slot {
 }
 
 /// The mutable Go `NodeBase` fields of a factory node.
+#[derive(Clone)]
 struct SyntheticNode {
     node: &'static ts_ast::Node,
     parent: Node,
@@ -95,6 +97,7 @@ pub struct SyntheticSourceFileData {
     pub external_module_indicator: Node,
 }
 
+#[derive(Clone)]
 struct SyntheticArena {
     slots: Vec<Slot>,
     /// Alias slot of each parsed node, so one parsed node gets one slot.
@@ -123,6 +126,34 @@ static EMPTY_BIND: NodeBindData = NodeBindData {
 
 thread_local! {
     static ARENA: RefCell<SyntheticArena> = RefCell::new(SyntheticArena::new());
+}
+
+/// A copy of the synthetic nodes of one thread (see `synthetic_seed`).
+#[derive(Clone)]
+pub struct SyntheticSeed(SyntheticArena);
+
+/// A copy of the synthetic nodes made on this thread so far. A checker
+/// worker starts from the nodes of the loading thread
+/// (`install_synthetic_seed`), so the nodes that the parser and the binder
+/// made keep their handles on every thread.
+// PORT: Go factory nodes are shared pointers. Each checker thread owns a
+// copy of the nodes made before the checkers started, and the nodes it
+// makes itself.
+#[must_use]
+pub fn synthetic_seed() -> SyntheticSeed {
+    ARENA.with(|a| SyntheticSeed(a.borrow().clone()))
+}
+
+/// The number of synthetic slots on this thread. Work that must not make
+/// synthetic nodes compares it before and after.
+#[must_use]
+pub fn synthetic_slot_count() -> usize {
+    ARENA.with(|a| a.borrow().slots.len())
+}
+
+/// Makes `seed` the synthetic nodes of this thread.
+pub fn install_synthetic_seed(seed: SyntheticSeed) {
+    ARENA.with(|a| *a.borrow_mut() = seed.0);
 }
 
 /// The handle of slot `index`. Does not resolve aliases.

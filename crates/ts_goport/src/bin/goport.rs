@@ -32,7 +32,8 @@ fn main() {
         }
     };
     install_panic_hook();
-    // All program state is thread-local, so the whole run stays on one thread.
+    // The loading thread keeps the frontend program and the checker pool, so
+    // the whole run stays on it. The checkers run on their own threads.
     let worker = std::thread::Builder::new()
         .name("goport".to_string())
         .stack_size(STACK_SIZE)
@@ -169,7 +170,7 @@ fn collect_all_diagnostics() -> Vec<Diagnostic> {
         Node::NIL,
         false,
         &mut |file| guard(|| get_bind_diagnostics(file)),
-        &mut |file| collect_checker_diagnostics_with(file, &mut check_file_guarded),
+        &mut |file| collect_checker_diagnostics_with(file, check_file_guarded),
         &mut || guard(get_global_diagnostics),
         &mut |file| guard(|| get_declaration_diagnostics(file)),
     );

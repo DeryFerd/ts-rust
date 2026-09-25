@@ -574,7 +574,7 @@ impl Checker {
         let declared_members = self.ty(t).as_interface_type().declared_members;
         for (id, p) in self.symbols.entries(declared_members) {
             if self.is_named_member(p, &id) {
-                let name = self.sym(p).name.clone();
+                let name = self.sym(p).name.to_string();
                 seen.insert(
                     name,
                     InheritanceInfo {
@@ -590,7 +590,7 @@ impl Checker {
             let base_with_this = self.get_type_with_this_argument(base, this_type, false);
             let properties = self.get_properties_of_type(base_with_this);
             for prop in properties {
-                let prop_name = self.sym(prop).name.clone();
+                let prop_name = self.sym(prop).name.to_string();
                 match seen.get(&prop_name).copied() {
                     None => {
                         seen.insert(

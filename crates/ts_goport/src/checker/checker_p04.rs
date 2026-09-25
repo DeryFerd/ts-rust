@@ -340,7 +340,7 @@ impl Checker {
                 } else {
                     instance_names.get_or_insert_with(FxHashMap::default)
                 };
-                let symbol_name = c.sym(symbol).name.clone();
+                let symbol_name = c.sym(symbol).name.to_string();
                 let state = names.get(&symbol_name).copied().unwrap_or(0);
                 if state == 0 {
                     // On first occurrence just record the kind
@@ -386,7 +386,7 @@ impl Checker {
                     && symbol.is_some()
                     && self.sym(symbol).name == "prototype"
                 {
-                    let symbol_name = self.sym(symbol).name.clone();
+                    let symbol_name = self.sym(symbol).name.to_string();
                     let node_symbol = self.get_symbol_of_declaration(node);
                     let node_symbol_string = self.symbol_to_string(node_symbol);
                     self.error(
@@ -428,7 +428,7 @@ impl Checker {
                     && member.name().is_some()
                     && is_private_identifier(member.name())
                 {
-                    let symbol_name = self.sym(symbol).name.clone();
+                    let symbol_name = self.sym(symbol).name.to_string();
                     let mut flags = private_names
                         .as_ref()
                         .and_then(|m| m.get(&symbol_name).copied())

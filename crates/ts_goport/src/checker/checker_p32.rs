@@ -186,7 +186,7 @@ impl Checker {
                     | TypeFlags::ANY_OR_UNKNOWN,
             )
             || flags.intersects(TypeFlags::STRING_LITERAL)
-                && self.get_string_literal_value(t).is_empty()
+                && self.get_string_literal_value_ref(t).is_empty()
             || flags.intersects(TypeFlags::NUMBER_LITERAL)
                 && self.get_number_literal_value(t).0 == 0.0
             || flags.intersects(TypeFlags::BIG_INT_LITERAL) && self.is_zero_big_int(t)

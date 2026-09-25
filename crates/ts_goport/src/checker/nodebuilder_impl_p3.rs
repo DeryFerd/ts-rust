@@ -540,7 +540,7 @@ impl Checker {
         if let Some(rest) = name.strip_prefix(private_name_prefix.as_str()) {
             // symbol IDs are unstable - replace #nnn# with #private#
             let rest = rest.trim_start_matches(is_digit);
-            name = format!("__#private{rest}");
+            name = format!("__#private{rest}").into();
         }
 
         self.create_property_name_node_for_identifier_or_literal(

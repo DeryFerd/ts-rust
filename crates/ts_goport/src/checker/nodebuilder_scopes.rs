@@ -175,10 +175,13 @@ impl Checker {
                     // are the same here.
                     if !original_parameters.is_empty() && original_param != param {
                         // Can't reference parameters that come from an expansion
-                        adds.push((self.sym(param).name.clone(), self.unknown_symbol));
+                        adds.push((self.sym(param).name.to_string(), self.unknown_symbol));
                         // Can't reference the original expanded parameter either
                         if original_param.is_some() {
-                            adds.push((self.sym(original_param).name.clone(), self.unknown_symbol));
+                            adds.push((
+                                self.sym(original_param).name.to_string(),
+                                self.unknown_symbol,
+                            ));
                         }
                     } else {
                         let declarations = self.sym(param).declarations.clone();
@@ -194,7 +197,7 @@ impl Checker {
                             }
                         }
                         if !some {
-                            adds.push((self.sym(param).name.clone(), param));
+                            adds.push((self.sym(param).name.to_string(), param));
                         }
                     }
                 }
@@ -258,7 +261,7 @@ impl Checker {
         let symbol = self.get_symbol_of_declaration(e);
         if symbol.is_some() {
             // omitted expressions are now parsed as nameless binding patterns and also have no symbol
-            adds.push((self.sym(symbol).name.clone(), symbol));
+            adds.push((self.sym(symbol).name.to_string(), symbol));
         }
     }
 
