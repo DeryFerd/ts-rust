@@ -265,7 +265,7 @@ impl Checker {
                 }
                 self.add_diagnostic(diagnostic);
             } else {
-                let mut identifier_text = self.sym(symbol).name.clone();
+                let mut identifier_text = self.sym(symbol).name.to_string();
                 if is_identifier(error_node) {
                     identifier_text = error_node.text().to_string();
                 }

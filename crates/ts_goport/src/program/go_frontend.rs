@@ -11,21 +11,68 @@ use crate::frontend::bundled;
 use crate::frontend::compiler::{
     NewProgram, ProgramOptions, new_cached_fs_compiler_host, new_program,
 };
-use crate::frontend::parser::ParsedSourceFile;
+use crate::frontend::module::ModeAwareCacheKey;
+use crate::frontend::parser::{ParsedSourceFile, SourceFileParseOptions};
 use crate::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
 use crate::frontend::tspath::Path as GoPath;
 use crate::frontend::vfs::{Fs, osvfs_fs};
 use std::rc::Rc;
 
-/// Go frontend data that the program functions dispatch to.
+/// The Go frontend program. It is not thread-safe, so only the loading
+/// thread holds it (`GO_FRONTEND`). The checker reads `GoSharedState`.
 pub(super) struct GoFrontendState {
     pub(super) program: &'static NewProgram,
-    /// Parsed program files by file index (store id).
-    pub(super) parsed: FxHashMap<usize, Rc<ParsedSourceFile>>,
-    /// Go `SourceFile.jsdocCache` entries added by lazy JSDoc parses.
-    /// PORT: the parsed file is shared and read only, so the lazy entries
-    /// live here. The slices are leaked to give `NodeSlice` a static borrow.
-    pub(super) lazy_jsdoc: RefCell<FxHashMap<Node, &'static [Node]>>,
+}
+
+/// Thread-safe copies of the Go frontend data that checker code reads.
+/// Built once on the loading thread, before any checker exists.
+// PORT: Go shares the frontend program between checker goroutines. The
+// Rust frontend uses `Rc` and `RefCell`, so the values the checker asks for
+// are copied here instead.
+pub(super) struct GoSharedState {
+    /// Go `processedFiles.resolvedModules`, by file path.
+    resolved_modules: FxHashMap<String, FxHashMap<ModeAwareCacheKey, ResolvedModule>>,
+    /// Go `processedFiles.jsxRuntimeImportSpecifiers`, by file path.
+    jsx_runtime_import_specifiers: FxHashMap<String, (String, Node)>,
+    /// Go `processedFiles.importHelpersImportSpecifiers`, by file path.
+    import_helpers_import_specifiers: FxHashMap<String, Node>,
+    /// Go include processor diagnostics of each program file, by file index.
+    include_diagnostics: FxHashMap<usize, Vec<Diagnostic>>,
+    /// Parser inputs of each program file, by file index, for lazy JSDoc.
+    parse_inputs: FxHashMap<usize, LazyJsDocInput>,
+}
+
+/// What `parse_js_doc_for_node` needs from a parsed file.
+struct LazyJsDocInput {
+    parse_options: SourceFileParseOptions,
+    text: &'static str,
+    script_kind: ScriptKind,
+}
+
+thread_local! {
+    /// Go `SourceFile.jsdocCache` entries added by lazy JSDoc parses on this
+    /// thread. PORT: the parsed file is shared and read only, so the lazy
+    /// entries live here. The slices are leaked to give `NodeSlice` a static
+    /// borrow. The parsed nodes are synthetic nodes of this thread, so each
+    /// thread keeps its own entries (see `WorkerSeed`).
+    static LAZY_JSDOC: RefCell<FxHashMap<Node, &'static [Node]>> = RefCell::new(FxHashMap::default());
+    /// The file system of a checker worker thread (Go `host.FS()`, without the cache).
+    static WORKER_FS: Rc<dyn Fs> = bundled::wrap_fs(osvfs_fs());
+}
+
+/// The lazy JSDoc entries of this thread, to seed a checker worker.
+pub(super) fn lazy_jsdoc_seed() -> FxHashMap<Node, &'static [Node]> {
+    LAZY_JSDOC.with(|cache| cache.borrow().clone())
+}
+
+/// The number of lazy JSDoc entries on this thread.
+pub(super) fn lazy_jsdoc_count() -> usize {
+    LAZY_JSDOC.with(|cache| cache.borrow().len())
+}
+
+/// Installs the entries of `lazy_jsdoc_seed` on a new checker worker.
+pub(super) fn install_lazy_jsdoc_seed(seed: FxHashMap<Node, &'static [Node]>) {
+    LAZY_JSDOC.with(|cache| *cache.borrow_mut() = seed);
 }
 
 /// Go `tsc.System` as `ParseConfigHost` (FS and current directory).
@@ -134,9 +181,9 @@ pub(super) fn try_load_with(
             root,
             parser_flags: file_store_parser_flags(store),
             info,
-            node_bind: OnceCell::new(),
-            file_bind: OnceCell::new(),
-            flow_nodes: OnceCell::new(),
+            node_bind: OnceLock::new(),
+            file_bind: OnceLock::new(),
+            flow_nodes: OnceLock::new(),
         });
     }
 
@@ -145,8 +192,17 @@ pub(super) fn try_load_with(
         files,
         source_file_order,
         options,
-        bound_symbols: OnceCell::new(),
+        bound_symbols: OnceLock::new(),
     }));
+    let frontend: &'static GoFrontendState = Box::leak(Box::new(GoFrontendState {
+        program: new_program,
+    }));
+    GO_FRONTEND.with(|cell| {
+        assert!(cell.set(frontend).is_ok(), "program already loaded");
+    });
+    set_prog(program);
+    // After `set_prog`, like the lazy Go reads it replaces.
+    let shared = GoSharedState::new(new_program, &parsed);
     let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
         cwd,
         case_sensitivity,
@@ -155,20 +211,13 @@ pub(super) fn try_load_with(
         config_diagnostics: Vec::new(),
         program_diagnostics: Vec::new(),
         external_locations: Vec::new(),
-        resolved_modules: OnceCell::new(),
-        common_source_directory: OnceCell::new(),
-        pool: RefCell::new(None),
-        declaration_diagnostic_cache: RefCell::new(FxHashMap::default()),
-        go: Some(GoFrontendState {
-            program: new_program,
-            parsed,
-            lazy_jsdoc: RefCell::new(FxHashMap::default()),
-        }),
+        resolved_modules: OnceLock::new(),
+        common_source_directory: OnceLock::new(),
+        file_associations: OnceLock::new(),
+        declaration_diagnostic_cache: Mutex::new(FxHashMap::default()),
+        go: Some(shared),
     }));
-    STATE.with(|cell| {
-        assert!(cell.set(program_state).is_ok(), "program already loaded");
-    });
-    set_prog(program);
+    set_state(program_state);
     Ok(program)
 }
 
@@ -199,7 +248,7 @@ fn program_file_info(
         is_default_library: p.is_source_file_default_library(path),
         meta_data: p.get_source_file_meta_data(path),
         trivia: crate::ast::go_view::TriviaRuns::default(),
-        late: OnceCell::new(),
+        late: OnceLock::new(),
     };
     let late = LateSourceFileInfo {
         file_index: store,
@@ -210,7 +259,7 @@ fn program_file_info(
         ambient_module_names: file.ambient_module_names.clone(),
         uses_uri_style_node_core_modules: file.uses_uri_style_node_core_modules,
         jsdoc_cache: file.jsdoc_cache.clone(),
-        post_bind: OnceCell::new(),
+        post_bind: OnceLock::new(),
     };
     assert!(info.late.set(late).is_ok());
     info
@@ -240,7 +289,7 @@ fn other_store_info(store: usize, cwd: &str, case_sensitivity: CaseSensitivity) 
         is_default_library: false,
         meta_data: SourceFileMetaData::default(),
         trivia: crate::ast::go_view::TriviaRuns::default(),
-        late: OnceCell::new(),
+        late: OnceLock::new(),
     };
     let late = LateSourceFileInfo {
         file_index: store,
@@ -251,37 +300,142 @@ fn other_store_info(store: usize, cwd: &str, case_sensitivity: CaseSensitivity) 
         ambient_module_names: Vec::new(),
         uses_uri_style_node_core_modules: Tristate::Unknown,
         jsdoc_cache: FxHashMap::default(),
-        post_bind: OnceCell::new(),
+        post_bind: OnceLock::new(),
     };
     assert!(info.late.set(late).is_ok());
     info
 }
 
-impl GoFrontendState {
+impl GoSharedState {
+    /// Copies what the checker reads from the frontend program.
+    fn new(p: &NewProgram, parsed: &FxHashMap<usize, Rc<ParsedSourceFile>>) -> Self {
+        let files = &p.processed_files;
+        let resolved_modules = files
+            .resolved_modules
+            .iter()
+            .map(|(path, cache)| {
+                let cache = cache
+                    .iter()
+                    .map(|(key, resolved)| (key.clone(), (**resolved).clone()))
+                    .collect();
+                (path.0.clone(), cache)
+            })
+            .collect();
+        let jsx_runtime_import_specifiers = files
+            .jsx_runtime_import_specifiers
+            .iter()
+            .flatten()
+            .map(|(path, s)| (path.0.clone(), (s.module_reference.clone(), s.specifier)))
+            .collect();
+        let import_helpers_import_specifiers = files
+            .import_helpers_import_specifiers
+            .iter()
+            .flatten()
+            .map(|(path, &specifier)| (path.0.clone(), specifier))
+            .collect();
+        let include_diagnostics = parsed
+            .iter()
+            .map(|(&store, file)| {
+                let diagnostics = p
+                    .include_processor
+                    .get_diagnostics(p)
+                    .borrow_mut()
+                    .get_diagnostics_for_file(file.file_name());
+                (store, diagnostics)
+            })
+            .collect();
+        let parse_inputs = parsed
+            .iter()
+            .map(|(&store, file)| {
+                let input = LazyJsDocInput {
+                    parse_options: file.parse_options.clone(),
+                    text: file.text,
+                    script_kind: file.script_kind,
+                };
+                (store, input)
+            })
+            .collect();
+        Self {
+            resolved_modules,
+            jsx_runtime_import_specifiers,
+            import_helpers_import_specifiers,
+            include_diagnostics,
+            parse_inputs,
+        }
+    }
+
     // Go: ast/ast.go:2614 (*SourceFile).resolveJSDoc (slow path; the caller
     // has checked the parser cache).
     pub(super) fn resolve_js_doc(&self, file: Node, node: Node) -> &'static [Node] {
-        if let Some(jsdocs) = self.lazy_jsdoc.borrow().get(&node) {
+        if let Some(jsdocs) = LAZY_JSDOC.with(|cache| cache.borrow().get(&node).copied()) {
             return jsdocs;
         }
-        let parsed = self.parsed_file(file);
+        let input = self
+            .parse_inputs
+            .get(&file.file_index())
+            .expect("not a Go frontend program file");
         let jsdocs: &'static [Node] = Box::leak(
             crate::frontend::parser::parse_js_doc_for_node(
-                &parsed.parse_options,
-                parsed.text,
-                parsed.script_kind,
+                &input.parse_options,
+                input.text,
+                input.script_kind,
                 node,
             )
             .into_boxed_slice(),
         );
-        self.lazy_jsdoc.borrow_mut().insert(node, jsdocs);
+        LAZY_JSDOC.with(|cache| cache.borrow_mut().insert(node, jsdocs));
         jsdocs
     }
 
-    /// The parsed program file of `file`.
-    pub(super) fn parsed_file(&self, file: Node) -> &Rc<ParsedSourceFile> {
-        self.parsed
+    // Go: compiler/program.go:122 FileExists
+    // PORT: the loading thread asks the program host (with its cache). A
+    // checker worker asks its own uncached copy of the same file system.
+    pub(super) fn file_exists(&self, path: &str) -> bool {
+        if let Some(go) = GO_FRONTEND.with(|cell| cell.get().copied()) {
+            return go.program.file_exists(path);
+        }
+        WORKER_FS.with(|fs| fs.file_exists(path))
+    }
+
+    // Go: compiler/program.go:494 GetResolvedModule
+    pub(super) fn get_resolved_module(
+        &self,
+        file: Node,
+        module_reference: &str,
+        mode: ResolutionMode,
+    ) -> Option<ResolvedModule> {
+        let path = &source_file_info(file).path;
+        self.resolved_modules
+            .get(path)?
+            .get(&ModeAwareCacheKey {
+                name: module_reference.to_string(),
+                mode,
+            })
+            .cloned()
+    }
+
+    // Go: compiler/program.go:1916 GetJSXRuntimeImportSpecifier
+    pub(super) fn get_jsx_runtime_import_specifier(&self, path: &str) -> (String, Node) {
+        self.jsx_runtime_import_specifiers
+            .get(path)
+            .cloned()
+            .unwrap_or((String::new(), Node::NIL))
+    }
+
+    // Go: compiler/program.go:1922 GetImportHelpersImportSpecifier
+    pub(super) fn get_import_helpers_import_specifier(&self, path: &str) -> Node {
+        self.import_helpers_import_specifiers
+            .get(path)
+            .copied()
+            .unwrap_or(Node::NIL)
+    }
+
+    // Go: compiler/program.go:678 GetIncludeProcessorDiagnostics (the
+    // include processor part)
+    pub(super) fn get_include_processor_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
+        self.include_diagnostics
             .get(&file.file_index())
-            .expect("not a Go frontend program file")
+            .cloned()
+            .unwrap_or_default()
     }
 }

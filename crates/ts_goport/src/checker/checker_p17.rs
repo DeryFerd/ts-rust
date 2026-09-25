@@ -1077,7 +1077,7 @@ impl Checker {
     pub fn get_ambient_modules(&mut self) -> Vec<SymbolId> {
         if !self.ambient_modules_once {
             self.ambient_modules_once = true;
-            for (sym, global) in self.symbols.entries(self.globals) {
+            for (sym, global) in self.symbols.iter(self.globals) {
                 if sym.starts_with('"') && sym.ends_with('"') {
                     self.ambient_modules.push(global);
                 }
@@ -1624,14 +1624,7 @@ impl Checker {
 // PORT: Go `maps.Clone(table)` on an `ast.SymbolTable`. A nil map clones to
 // nil; otherwise a new table with the same entries.
 fn maps_clone_p17(symbols: &mut SymbolArena, table: SymbolTable) -> SymbolTable {
-    if table.is_nil() {
-        return SymbolTable::NIL;
-    }
-    let result = symbols.new_table();
-    for (name, symbol) in symbols.entries(table) {
-        symbols.set(result, name, symbol);
-    }
-    result
+    symbols.clone_table(table)
 }
 
 /// Private copies of Go `tspath` functions used by this unit. tspath has no

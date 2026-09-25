@@ -1271,7 +1271,7 @@ impl Binder {
             let value_declaration = declarations[0];
             {
                 let s = self.symbols.sym_mut(symbol);
-                s.declarations = declarations.clone();
+                s.declarations = declarations.clone().into();
                 s.value_declaration = value_declaration;
             }
             if name == "module" {
@@ -1281,7 +1281,7 @@ impl Binder {
                 );
                 {
                     let p = self.symbols.sym_mut(exports_property);
-                    p.declarations = declarations;
+                    p.declarations = declarations.into();
                     p.value_declaration = value_declaration;
                     p.parent = symbol;
                 }

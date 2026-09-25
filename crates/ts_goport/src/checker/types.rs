@@ -940,6 +940,9 @@ impl Checker {
 // below. Here it is an enum that owns the concrete struct. The Go interface
 // methods `AsConstrainedType` ... `AsUnionOrIntersectionType` return `None`
 // where Go returns nil. Go `AsType()` has no port: `Type` owns its data.
+// PORT: the large variants are boxed so `Type` stays small in the arena.
+// Interface, tuple, mapped, reverse mapped, evolving array and instantiation
+// expression types are rare; union and intersection data is large.
 // Go: checker/types.go:841 TypeData
 #[derive(Clone)]
 pub enum TypeData {
@@ -955,14 +958,14 @@ pub enum TypeData {
     Conditional(ConditionalType),
     Object(ObjectType),
     TypeReference(TypeReference),
-    Interface(InterfaceType),
-    Tuple(TupleType),
-    InstantiationExpression(InstantiationExpressionType),
-    Mapped(MappedType),
-    ReverseMapped(ReverseMappedType),
-    EvolvingArray(EvolvingArrayType),
-    Union(UnionType),
-    Intersection(IntersectionType),
+    Interface(Box<InterfaceType>),
+    Tuple(Box<TupleType>),
+    InstantiationExpression(Box<InstantiationExpressionType>),
+    Mapped(Box<MappedType>),
+    ReverseMapped(Box<ReverseMappedType>),
+    EvolvingArray(Box<EvolvingArrayType>),
+    Union(Box<UnionType>),
+    Intersection(Box<IntersectionType>),
 }
 
 // PORT: the arena keeps a dummy `Type` at index 0, so `TypeData` needs a
@@ -1558,12 +1561,14 @@ impl IndexedAccessType {
     }
 }
 
+// PORT: Go shares the `texts` and `types` slices; `Rc<[_]>` makes the
+// clones cheap. The contents never change after creation.
 // Go: checker/types.go:1197 TemplateLiteralType
 #[derive(Clone, Debug, Default)]
 pub struct TemplateLiteralType {
     pub constrained: ConstrainedType,
-    pub texts: Vec<String>, // Always one element longer than types
-    pub types: Vec<TypeId>, // Always at least one element
+    pub texts: Rc<[String]>, // Always one element longer than types
+    pub types: Rc<[TypeId]>, // Always at least one element
 }
 
 impl TemplateLiteralType {
@@ -1896,3 +1901,62 @@ pub const LANGUAGE_FEATURE_MINIMUM_TARGET: LanguageFeatureMinimumTargetMap =
 // Aliases for types
 // Go: checker/types.go:1459 StringLiteralType
 pub type StringLiteralType = Type;
+
+// PORT: no Go counterpart. Go allocates each `Type` and `TypeMapper` on its
+// own; the port keeps them in index arenas. A plain `Vec` arena doubles and
+// copies every entry when it grows, and keeps up to half its capacity unused.
+// `ChunkedArena` stores entries in fixed-size chunks, so growing it never
+// moves an entry. Index 0 is the nil dummy, like the other arenas.
+pub struct ChunkedArena<T> {
+    chunks: Vec<Vec<T>>,
+    len: usize,
+}
+
+const ARENA_CHUNK_SHIFT: usize = 12;
+const ARENA_CHUNK_LEN: usize = 1 << ARENA_CHUNK_SHIFT;
+const ARENA_CHUNK_MASK: usize = ARENA_CHUNK_LEN - 1;
+
+impl<T> ChunkedArena<T> {
+    /// Creates an arena that holds only `nil`, the dummy entry at index 0.
+    pub fn with_nil(nil: T) -> Self {
+        let mut arena = ChunkedArena {
+            chunks: Vec::new(),
+            len: 0,
+        };
+        arena.push(nil);
+        arena
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn push(&mut self, value: T) {
+        if self.len & ARENA_CHUNK_MASK == 0 {
+            self.chunks.push(Vec::with_capacity(ARENA_CHUNK_LEN));
+        }
+        let chunk = self.chunks.last_mut().expect("arena chunk");
+        chunk.push(value);
+        self.len += 1;
+    }
+}
+
+impl<T> std::ops::Index<usize> for ChunkedArena<T> {
+    type Output = T;
+
+    #[inline]
+    fn index(&self, i: usize) -> &T {
+        &self.chunks[i >> ARENA_CHUNK_SHIFT][i & ARENA_CHUNK_MASK]
+    }
+}
+
+impl<T> std::ops::IndexMut<usize> for ChunkedArena<T> {
+    #[inline]
+    fn index_mut(&mut self, i: usize) -> &mut T {
+        &mut self.chunks[i >> ARENA_CHUNK_SHIFT][i & ARENA_CHUNK_MASK]
+    }
+}

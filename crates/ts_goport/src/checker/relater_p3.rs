@@ -164,7 +164,7 @@ impl Checker {
                 0
             };
         if pos < param_count {
-            return self.sym(parameters[pos as usize]).name.clone();
+            return self.sym(parameters[pos as usize]).name.to_string();
         }
         let rest_parameter = parameters[param_count as usize];
         let rest_type = self.get_type_of_symbol(rest_parameter);
@@ -173,7 +173,7 @@ impl Checker {
             let element_info = self.target_tuple_type(rest_type).element_infos[index as usize];
             return self.get_tuple_element_label(element_info, rest_parameter, index);
         }
-        self.sym(rest_parameter).name.clone()
+        self.sym(rest_parameter).name.to_string()
     }
 
     // Go: checker/relater.go:1943 getTupleElementLabel
@@ -197,7 +197,7 @@ impl Checker {
             }
         }
         let root_name = if rest_symbol.is_some() {
-            self.sym(rest_symbol).name.clone()
+            self.sym(rest_symbol).name.to_string()
         } else {
             "arg".to_string()
         };

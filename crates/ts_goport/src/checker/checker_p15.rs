@@ -637,7 +637,7 @@ impl Checker {
                 .get_declaration_modifier_flags_from_symbol(right_prop)
                 .intersects(ModifierFlags::PRIVATE | ModifierFlags::PROTECTED)
             {
-                let name = self.sym(right_prop).name.clone();
+                let name = self.sym(right_prop).name.to_string();
                 skipped_private_members.insert(name);
             } else if self.is_spreadable_property(right_prop) {
                 let name = self.sym(right_prop).name.clone();
@@ -647,7 +647,7 @@ impl Checker {
         }
 
         for left_prop in self.get_properties_of_type(left) {
-            let left_name = self.sym(left_prop).name.clone();
+            let left_name = self.sym(left_prop).name.to_string();
             if skipped_private_members.contains(&left_name)
                 || !self.is_spreadable_property(left_prop)
             {

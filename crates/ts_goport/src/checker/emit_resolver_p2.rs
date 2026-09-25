@@ -1118,7 +1118,7 @@ impl EmitResolver {
             for b in bases {
                 let base_prop = c.get_property_of_object_type(b, &name);
                 if base_prop.is_some() {
-                    return c.sym(base_prop).declarations.clone();
+                    return c.sym(base_prop).declarations.to_vec();
                     // TODO: return base declarations from all base types if any callers actually look at the list
                 }
             }

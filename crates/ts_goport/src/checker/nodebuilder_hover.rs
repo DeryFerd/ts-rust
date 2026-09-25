@@ -929,7 +929,7 @@ impl Checker {
         // Build a lookup from property name to symbol for parent-identity comparison.
         let mut props_by_name: FxHashMap<String, SymbolId> = FxHashMap::default();
         for &p in &properties {
-            props_by_name.insert(self.sym(p).name.clone(), p);
+            props_by_name.insert(self.sym(p).name.to_string(), p);
         }
         // Collect names of properties inherited unchanged from base types.
         let mut inherited: FxHashSet<String> = FxHashSet::default();
@@ -939,9 +939,9 @@ impl Checker {
             let base_with_this = self.get_type_with_this_argument(base, this_type, false);
             for prop in self.get_properties_of_type(base_with_this) {
                 let prop_name = &self.sym(prop).name;
-                if let Some(&existing) = props_by_name.get(prop_name) {
+                if let Some(&existing) = props_by_name.get(prop_name.as_str()) {
                     if self.sym(prop).parent == self.sym(existing).parent {
-                        inherited.insert(prop_name.clone());
+                        inherited.insert(prop_name.to_string());
                     }
                 }
             }
@@ -951,7 +951,7 @@ impl Checker {
         }
         properties
             .into_iter()
-            .filter(|&p| !inherited.contains(&self.sym(p).name))
+            .filter(|&p| !inherited.contains(self.sym(p).name.as_str()))
             .collect()
     }
 

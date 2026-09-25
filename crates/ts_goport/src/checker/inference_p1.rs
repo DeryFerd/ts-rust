@@ -970,7 +970,7 @@ impl Checker {
                                     } else if left_flags.intersects(TypeFlags::STRING_LITERAL) {
                                         left
                                     } else if right_flags.intersects(TypeFlags::STRING_LITERAL)
-                                        && c.get_string_literal_value(right) == str
+                                        && c.get_string_literal_value_ref(right) == str
                                     {
                                         right
                                     } else if left_flags.intersects(TypeFlags::NUMBER) {

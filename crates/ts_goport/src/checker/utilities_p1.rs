@@ -460,7 +460,7 @@ impl Checker {
         if symbols.is_empty() {
             return SymbolTable::NIL;
         }
-        let result = self.symbols.new_table();
+        let result = self.symbols.new_table_with_capacity(symbols.len());
         for &symbol in symbols {
             let name = self.sym(symbol).name.clone();
             self.symbols.set(result, name, symbol);
@@ -470,12 +470,98 @@ impl Checker {
 
     // Go: checker/utilities.go:339 sortSymbols
     // PORT: Go sorts with `c.compareSymbols`, which is always
-    // `c.compareSymbolsWorker` ("closure optimization"), so this calls the
-    // worker directly and needs only `&self`. Go `slices.SortFunc` is not
-    // stable, but the comparator is a total order (it falls back to symbol
-    // ids), so a stable sort gives the same result.
+    // `c.compareSymbolsWorker` ("closure optimization"), so this needs only
+    // `&self`. Go `slices.SortFunc` is not stable, but the comparator is a
+    // total order (it falls back to symbol ids), so a stable sort gives the
+    // same result. Each symbol's first declaration, file index and position
+    // are read once into a `SymbolSortKey`; `compare_symbol_sort_keys` is
+    // `compareSymbolsWorker` on those cached values.
     pub fn sort_symbols(&self, symbols: &mut [SymbolId]) {
-        symbols.sort_by(|&a, &b| self.compare_symbols_worker(a, b).cmp(&0));
+        if symbols.len() < 2 {
+            return;
+        }
+        let mut keys: Vec<SymbolSortKey<'_>> =
+            symbols.iter().map(|&s| self.symbol_sort_key(s)).collect();
+        keys.sort_by(|a, b| self.compare_symbol_sort_keys(a, b).cmp(&0));
+        for (slot, key) in symbols.iter_mut().zip(&keys) {
+            *slot = key.symbol;
+        }
+    }
+
+    /// The `compareSymbolsWorker` inputs of one symbol.
+    fn symbol_sort_key(&self, symbol: SymbolId) -> SymbolSortKey<'_> {
+        if symbol.is_nil() {
+            return SymbolSortKey {
+                symbol,
+                has_declaration: false,
+                declaration: Node::NIL,
+                file: Node::NIL,
+                file_index: 0,
+                pos: 0,
+                name: "",
+            };
+        }
+        let sym = self.sym(symbol);
+        let has_declaration = !sym.declarations.is_empty();
+        let declaration = sym.declarations.first().copied().unwrap_or(Node::NIL);
+        let (file, file_index, pos) = if declaration.is_some() {
+            let file = get_source_file_of_node(declaration);
+            let file_index = self.file_index_map.get(&file).copied().unwrap_or(0);
+            (file, file_index, declaration.pos())
+        } else {
+            (Node::NIL, 0, 0)
+        };
+        SymbolSortKey {
+            symbol,
+            has_declaration,
+            declaration,
+            file,
+            file_index,
+            pos,
+            name: &sym.name,
+        }
+    }
+
+    /// `compare_symbols_worker` on cached keys. The symbol id fallback stays
+    /// lazy so ids are assigned in the same order as before.
+    fn compare_symbol_sort_keys(&self, k1: &SymbolSortKey<'_>, k2: &SymbolSortKey<'_>) -> i32 {
+        if k1.symbol == k2.symbol {
+            return 0;
+        }
+        if k1.symbol.is_nil() {
+            return 1;
+        }
+        if k2.symbol.is_nil() {
+            return -1;
+        }
+        if k1.has_declaration && k2.has_declaration {
+            // compare_nodes
+            let r = if k1.declaration == k2.declaration {
+                0
+            } else if k1.declaration.is_nil() {
+                1
+            } else if k2.declaration.is_nil() {
+                -1
+            } else if k1.file != k2.file {
+                k1.file_index - k2.file_index
+            } else {
+                k1.pos - k2.pos
+            };
+            if r != 0 {
+                return r;
+            }
+        } else if k1.has_declaration {
+            return -1;
+        } else if k2.has_declaration {
+            return 1;
+        }
+        let r = compare_strings(k1.name, k2.name);
+        if r != 0 {
+            return r;
+        }
+        let id1 = get_symbol_id(&self.symbols, k1.symbol) as i64;
+        let id2 = get_symbol_id(&self.symbols, k2.symbol) as i64;
+        clamp_compare(id1 - id2)
     }
 
     // Go: checker/utilities.go:343 compareSymbolsWorker
@@ -534,6 +620,20 @@ impl Checker {
         // In the same file, order by source position
         n1.pos() - n2.pos()
     }
+}
+
+/// Cached `compareSymbolsWorker` inputs for `sort_symbols`.
+struct SymbolSortKey<'a> {
+    symbol: SymbolId,
+    has_declaration: bool,
+    /// First declaration, or nil.
+    declaration: Node,
+    /// Source file of `declaration`.
+    file: Node,
+    /// `file_index_map[file]`, zero when absent (Go map miss).
+    file_index: i32,
+    pos: i32,
+    name: &'a str,
 }
 
 // PORT: Go `strings.Compare` (byte order, returns -1/0/1).

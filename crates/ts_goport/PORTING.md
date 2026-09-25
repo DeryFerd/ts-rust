@@ -206,6 +206,22 @@ fields, `get_source_file_for_resolved_module(name) -> Node`, ...), the
 checker pool, and diagnostic sorting. `options.rs` defines Go-shaped
 `CompilerOptions`; read it from `prog().options`.
 
+## Threads
+
+- `prog()` and the program state are process-wide and read only after
+  load, so they hold only thread-safe data (`Arc`, `OnceLock`, `Mutex`).
+- Files bind in parallel, each into its own arena, and join the program
+  arena in file order (`program::bind_all`). The ids equal a serial bind.
+- Each checker is made on its own worker thread and stays there (Go
+  `checkerPool`: 4 checkers, file `i` goes to checker `i % 4`). The loading
+  thread sends jobs and merges the results in file order.
+- Thread-local state (synthetic nodes, node and symbol ids, lazy JSDoc,
+  caches) is per thread. A worker starts from a copy of the loading
+  thread's state (`WorkerSeed`), so each checker's results depend only on
+  its own files, not on thread timing.
+- The Go frontend program is not thread-safe. Only the loading thread reads
+  it; checker code reads the copies in `program::go_frontend::GoSharedState`.
+
 ## Style
 
 - No `unsafe`. No new dependencies. Lints are relaxed crate-wide; still write

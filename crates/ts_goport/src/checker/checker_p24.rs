@@ -2,6 +2,7 @@
 //! intersection properties, apparent and reduced types, type arguments and
 //! defaults, named members, and the core of type instantiation.
 
+use crate::core::FxIndexSet;
 use crate::prelude::*;
 
 impl Checker {
@@ -163,7 +164,7 @@ impl Checker {
     ) -> SymbolId {
         let mut prop_flags = SymbolFlags::NONE;
         let mut single_prop = SymbolId::NIL;
-        let mut prop_set: IndexSet<SymbolId> = IndexSet::new();
+        let mut prop_set: FxIndexSet<SymbolId> = FxIndexSet::default();
         let mut index_types: Vec<TypeId> = Vec::new();
         let is_union = self.ty(containing_type).flags.intersects(TypeFlags::UNION);
         // Flags we want to propagate to the result if they exist in all source symbols
@@ -400,7 +401,7 @@ impl Checker {
             name,
             check_flags | synthetic_flag,
         );
-        self.sym_mut(result).declarations = declarations;
+        self.sym_mut(result).declarations = declarations.into();
         if !has_non_uniform_value_declaration && first_value_declaration.is_some() {
             self.sym_mut(result).value_declaration = first_value_declaration;
             // Inherit information about parent type.
@@ -461,7 +462,7 @@ impl Checker {
     }
 
     // Go: checker/checker.go:21578 hasCommonDeclaration
-    pub fn has_common_declaration(&self, symbols: &IndexSet<SymbolId>) -> bool {
+    pub fn has_common_declaration(&self, symbols: &FxIndexSet<SymbolId>) -> bool {
         // PORT: Go `collections.Set[*ast.Node]`; only its size is observed, so
         // iteration order does not matter.
         let mut common_declarations: FxHashSet<Node> = FxHashSet::default();
@@ -1146,7 +1147,14 @@ impl Checker {
         // For classes and interfaces, we store explicitly declared members ahead of inherited members. This ensures we process
         // explicitly declared members first in type relations, which is beneficial because explicitly declared members are more
         // likely to contain discriminating differences. See for example https://github.com/microsoft/typescript-go/issues/1968.
-        let entries = self.symbols.entries(members);
+        // PORT: `is_named_member` only reads the name for
+        // `is_reserved_member_name`, so the snapshot keeps that result, not a
+        // copy of the name.
+        let entries: Vec<(bool, SymbolId)> = self
+            .symbols
+            .iter(members)
+            .map(|(id, symbol)| (is_reserved_member_name(id), symbol))
+            .collect();
         let mut result: Vec<SymbolId> = Vec::with_capacity(entries.len());
         let mut contained_count = 0usize;
         let is_class_or_interface_container = container.is_some()
@@ -1155,21 +1163,23 @@ impl Checker {
                 .flags
                 .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE);
         if is_class_or_interface_container {
-            for (id, symbol) in &entries {
-                if self.is_named_member(*symbol, id)
-                    && self.is_declaration_contained_by(*symbol, container)
+            for &(reserved, symbol) in &entries {
+                if !reserved
+                    && self.symbol_is_value(symbol)
+                    && self.is_declaration_contained_by(symbol, container)
                 {
-                    result.push(*symbol);
+                    result.push(symbol);
                 }
             }
             contained_count = result.len();
         }
-        for (id, symbol) in &entries {
-            if self.is_named_member(*symbol, id)
+        for &(reserved, symbol) in &entries {
+            if !reserved
+                && self.symbol_is_value(symbol)
                 && (!is_class_or_interface_container
-                    || !self.is_declaration_contained_by(*symbol, container))
+                    || !self.is_declaration_contained_by(symbol, container))
             {
-                result.push(*symbol);
+                result.push(symbol);
             }
         }
         self.sort_symbols(&mut result[..contained_count]);

@@ -364,7 +364,7 @@ impl Checker {
             let t_flags = self.ty(t).flags;
             for current in types {
                 for prop in self.get_properties_of_type(current) {
-                    let prop_name = self.sym(prop).name.clone();
+                    let prop_name = self.sym(prop).name.to_string();
                     if !checked.contains(&prop_name) {
                         checked.insert(prop_name.clone());
                         let combined_prop = self.get_property_of_union_or_intersection_type(
@@ -653,7 +653,7 @@ impl Checker {
         target == self.number_type
             && (source == self.numeric_string_type
                 || self.ty(source).flags.intersects(TypeFlags::STRING_LITERAL)
-                    && is_numeric_literal_name(&self.get_string_literal_value(source)))
+                    && is_numeric_literal_name(self.get_string_literal_value_ref(source)))
     }
 
     // Go: checker/checker.go:18961 resolveStructuredTypeMembers
@@ -757,14 +757,7 @@ impl Checker {
         if !base_types.is_empty() {
             if !instantiated {
                 // PORT: Go `maps.Clone(members)`; a nil map clones to nil.
-                if members.is_some() {
-                    let entries = self.symbols.entries(members);
-                    let cloned = self.symbols.new_table();
-                    for (name, symbol) in entries {
-                        self.symbols.set(cloned, name, symbol);
-                    }
-                    members = cloned;
-                }
+                members = self.symbols.clone_table(members);
             }
             self.set_structured_type_members(
                 t,

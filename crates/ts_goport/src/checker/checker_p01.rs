@@ -914,11 +914,11 @@ pub struct Checker {
     // Arenas (PORTING.md "Checker data"). Index 0 of each is a dummy entry
     // so handle value 0 stays nil.
     pub symbols: SymbolArena,
-    pub types: Vec<Type>,
+    pub types: ChunkedArena<Type>,
     pub signatures: Vec<Signature>,
     pub index_infos: Vec<IndexInfo>,
     pub type_predicates: Vec<TypePredicate>,
-    pub mappers: Vec<TypeMapper>,
+    pub mappers: ChunkedArena<TypeMapper>,
     pub inference_contexts: Vec<InferenceContext>,
 }
 
@@ -1008,23 +1008,16 @@ impl Checker {
 // checkers from 1 in creation order; the pool creates them in index order,
 // so `id = checker_index + 1`.
 // PORT: Go binds every file (`program.BindSourceFiles`) before it creates
-// checkers. Here the first checker binds any unbound file into the shared
-// `prog().bound_symbols`, then clones it as its own symbol arena.
+// checkers. Here the checker binds the program first if nothing has
+// (`program::bind_all`), then clones `prog().bound_symbols` as its own
+// symbol arena.
 // PORT: Go `make(map...)` initializations are the `Default` values in the
 // struct literal; Go nil fields not set here keep their nil value.
 impl Checker {
     pub fn new(checker_index: usize) -> Checker {
         let program = prog();
-        let bound_symbols = program
-            .bound_symbols
-            .get_or_init(|| {
-                let mut symbols = SymbolArena::new();
-                for file in program.source_files() {
-                    bind_source_file(file.root, &mut symbols);
-                }
-                symbols
-            })
-            .clone();
+        bind_all();
+        let bound_symbols = program.bound_symbols.get().expect("program bound").clone();
         let compiler_options = &program.options;
         let files: Vec<Node> = program.source_files().map(|f| f.root).collect();
         let file_index_map = create_file_index_map(&files);
@@ -1351,11 +1344,11 @@ impl Checker {
             deferred_diagnostic_callbacks: Vec::new(),
             type_to_string_nodebuilder: None,
             symbols: bound_symbols,
-            types: vec![Type::default()],
+            types: ChunkedArena::with_nil(Type::default()),
             signatures: vec![Signature::default()],
             index_infos: vec![IndexInfo::default()],
             type_predicates: vec![TypePredicate::default()],
-            mappers: vec![TypeMapper::default()],
+            mappers: ChunkedArena::with_nil(TypeMapper::default()),
             inference_contexts: vec![InferenceContext::default()],
         };
         // Closure optimization
@@ -1372,8 +1365,7 @@ impl Checker {
         // `Checker` method because it reads the symbol arena.
         let global_symbol_count =
             usize::try_from(c.count_global_symbols(&c.files)).expect("negative symbol count");
-        c.globals = c.symbols.new_table();
-        c.symbols.tables[c.globals.index()].reserve(global_symbol_count);
+        c.globals = c.symbols.new_table_with_capacity(global_symbol_count);
         c.evaluate = new_evaluator(
             Rc::new(
                 |c: &mut Checker, expr: Node, location: Node| -> EvaluatorResult {

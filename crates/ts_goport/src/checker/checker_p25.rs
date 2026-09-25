@@ -1337,7 +1337,7 @@ impl Checker {
         if parent.is_some() {
             return format!("{}.{}", self.get_symbol_path(parent), self.sym(symbol).name);
         }
-        self.sym(symbol).name.clone()
+        self.sym(symbol).name.to_string()
     }
 
     // Go: checker/checker.go:23048 getTypeReferenceType
