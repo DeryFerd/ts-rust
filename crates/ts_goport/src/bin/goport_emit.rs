@@ -3,17 +3,23 @@
 //!
 //! Go: execute/tsc/emit.go `EmitFilesAndReportErrors` (the non-pretty path).
 //!
-//! Safety: every output goes under `<dir>`. The run stops before it writes
-//! anything when `<dir>` is inside the project directory or a source
-//! directory, and each write checks that its path is under `<dir>`. The
-//! project inputs are never written.
+//! Output paths are the Go paths. A config `declarationDir`, or a `.js`
+//! file of a source outside the common source directory, can put an output
+//! outside `--outDir`.
+//!
+//! Safety: every write must be under the write root, and no write may
+//! replace a program source file. By default the write root is `--outDir`,
+//! and the run stops before it writes anything when `--outDir` is inside the
+//! project directory or a source directory. A write outside the root is
+//! refused and reported as TS5033, so the project inputs are never written.
 //!
 //! Options:
 //! - `--outDir <dir>` (required) replaces the config `outDir`.
-//! - `--declarationDir <dir>` replaces the config `declarationDir`. When the
-//!   config sets `declarationDir` and this flag is absent, it moves to
-//!   `<outDir>/<declarationDir relative to the config directory>`, and the
-//!   new path is printed to stderr so the oracle can get the same flag.
+//! - `--writeRoot <dir>` sets the write root. Use it when Go writes outside
+//!   `--outDir` (for example a config `declarationDir`) and every such path
+//!   is in a scratch copy under `<dir>`. The `--outDir` location checks are
+//!   then skipped.
+//! - `--declarationDir <dir>` replaces the config `declarationDir`, as in tsgo.
 //!
 //! - `--declaration`, `--declarationMap`, `--emitDeclarationOnly`,
 //!   `--sourceMap`, `--inlineSourceMap`, `--inlineSources`,
@@ -28,6 +34,7 @@
 //! on stderr.
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
@@ -45,6 +52,8 @@ const STACK_SIZE: usize = 1 << 30;
 struct Config {
     project: String,
     out_dir: String,
+    /// `--writeRoot`, or `None` for the default root `out_dir`.
+    write_root: Option<String>,
     declaration_dir: Option<String>,
     /// Boolean compiler options set on the command line, like tsgo `--flag`
     /// or `--flag false`.
@@ -89,7 +98,7 @@ fn main() {
         Err(message) => {
             eprintln!("goport_emit: {message}");
             eprintln!(
-                "usage: goport_emit -p <tsconfig.json | project dir> --outDir <dir> [--declarationDir <dir>] [--declaration ...]"
+                "usage: goport_emit -p <tsconfig.json | project dir> --outDir <dir> [--writeRoot <dir>] [--declarationDir <dir>] [--declaration ...]"
             );
             std::process::exit(1);
         }
@@ -111,6 +120,7 @@ fn main() {
 fn parse_args(args: Vec<String>) -> Result<Config, String> {
     let mut project = None;
     let mut out_dir = None;
+    let mut write_root = None;
     let mut declaration_dir = None;
     let mut flags = Vec::new();
     let mut iter = args.into_iter().peekable();
@@ -130,6 +140,7 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
         match name.as_str() {
             "-p" | "--project" => project = Some(value(&name)?),
             "--outDir" => out_dir = Some(value(&name)?),
+            "--writeRoot" => write_root = Some(value(&name)?),
             "--declarationDir" => declaration_dir = Some(value(&name)?),
             "--pretty" => {
                 if inline.is_none() {
@@ -155,6 +166,7 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
     Ok(Config {
         project: project.unwrap_or_else(|| ".".to_string()),
         out_dir: absolute(&out_dir),
+        write_root: write_root.map(|d| absolute(&d)),
         declaration_dir: declaration_dir.map(|d| absolute(&d)),
         flags,
     })
@@ -236,32 +248,20 @@ fn config_directory(project: &str) -> String {
 // Go: execute/tsc/emit.go:72 EmitFilesAndReportErrors
 fn run(config: &Config) -> i32 {
     let config_dir = config_directory(&config.project);
-    if is_inside(&config.out_dir, &config_dir) {
+    if config.write_root.is_none() && is_inside(&config.out_dir, &config_dir) {
         eprintln!(
             "goport_emit: refusing --outDir {} inside the project directory {config_dir}",
             config.out_dir
         );
         return 1;
     }
-    let out_dir = config.out_dir.clone();
-    let declaration_dir = config.declaration_dir.clone();
     let loaded = catch_unwind(AssertUnwindSafe(|| {
+        // `options` are the command line options, applied over the config.
         try_load_with(&config.project, |options| {
-            if let Some(dir) = declaration_dir.clone() {
-                options.declaration_dir = dir;
-            } else if !options.declaration_dir.is_empty() {
-                let original = absolute_in(&config_dir, &options.declaration_dir);
-                let relative = original
-                    .strip_prefix(&format!("{}/", config_dir.trim_end_matches('/')))
-                    .unwrap_or("declarations")
-                    .to_string();
-                options.declaration_dir = ts_path::combine_paths(&out_dir, &[&relative]);
-                eprintln!(
-                    "goport_emit: declarationDir moved to {}",
-                    options.declaration_dir
-                );
+            if let Some(dir) = &config.declaration_dir {
+                options.declaration_dir.clone_from(dir);
             }
-            options.out_dir.clone_from(&out_dir);
+            options.out_dir.clone_from(&config.out_dir);
             for (flag, value) in &config.flags {
                 apply_flag(options, flag, *value);
             }
@@ -280,9 +280,16 @@ fn run(config: &Config) -> i32 {
     }
 
     // Refuse before any write when the out dir is inside a source directory.
+    let inputs: HashSet<String> = source_files()
+        .into_iter()
+        .map(|file| ts_path::normalize_path(source_file_file_name(file)))
+        .collect();
     for file in source_files() {
         let dir = ts_path::directory_path(source_file_file_name(file)).clone();
-        if !source_file_info(file).is_declaration_file && is_inside(&config.out_dir, &dir) {
+        if config.write_root.is_none()
+            && !source_file_info(file).is_declaration_file
+            && is_inside(&config.out_dir, &dir)
+        {
             eprintln!(
                 "goport_emit: refusing --outDir {} inside the source directory {dir}",
                 config.out_dir
@@ -294,7 +301,8 @@ fn run(config: &Config) -> i32 {
     let mut all_diagnostics = guard(collect_all_diagnostics);
 
     let refused: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let write_file = new_write_file(config.out_dir.clone(), refused.clone());
+    let write_root = config.write_root.as_ref().unwrap_or(&config.out_dir);
+    let write_file = new_write_file(write_root.clone(), inputs, refused.clone());
     let emit_result = guard(|| {
         emit(EmitOptions {
             target_source_file: Node::NIL,
@@ -308,23 +316,26 @@ fn run(config: &Config) -> i32 {
 
     let refused = refused.lock().map(|r| r.clone()).unwrap_or_default();
     for path in &refused {
-        eprintln!("goport_emit: refused to write {path} (outside --outDir)");
+        eprintln!("goport_emit: refused to write {path} (outside {write_root} or an input file)");
     }
     // A refused write is also a TS5033 diagnostic, so the status is the tsc one.
     report(&all_diagnostics, emit_skipped)
 }
 
-/// `path` made absolute against `dir` and normalized.
-fn absolute_in(dir: &str, path: &str) -> String {
-    ts_path::normalize_path(&ts_path::resolve_path(dir, &[path]))
-}
-
-/// The Go `WriteFile` callback: writes only under `out_dir`.
-fn new_write_file(out_dir: String, refused: Arc<Mutex<Vec<String>>>) -> WriteFile {
+/// The Go `WriteFile` callback: writes only under `root`, and never over a
+/// program source file (`inputs`).
+fn new_write_file(
+    root: String,
+    inputs: HashSet<String>,
+    refused: Arc<Mutex<Vec<String>>>,
+) -> WriteFile {
     Arc::new(
         move |file_name: &str, text: &str, _data: &mut WriteFileData| -> Result<(), String> {
             let path = ts_path::normalize_path(file_name);
-            if !is_inside(&path, &out_dir) || path == out_dir.trim_end_matches('/') {
+            if !is_inside(&path, &root)
+                || path == root.trim_end_matches('/')
+                || inputs.contains(&path)
+            {
                 if let Ok(mut refused) = refused.lock() {
                     refused.push(path.clone());
                 }
