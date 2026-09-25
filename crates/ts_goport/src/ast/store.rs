@@ -72,6 +72,9 @@ struct FileStore {
     aliases: FxHashMap<Node, u32>,
     /// Set when the parser has finished the file.
     frozen: bool,
+    /// Go `file.jsdocCache`, set by `finishSourceFile`. Node reads use it
+    /// until the program that holds this file is installed.
+    jsdoc_cache: FxHashMap<Node, &'static [Node]>,
 }
 
 thread_local! {
@@ -141,6 +144,7 @@ pub fn new_file_store(file_name: &'static str, text: &'static str) -> usize {
             slots: vec![StoreSlot::Nil],
             aliases: FxHashMap::default(),
             frozen: false,
+            jsdoc_cache: FxHashMap::default(),
         });
         STORE_COUNT.set(s.len());
         s.len() - 1
@@ -177,6 +181,31 @@ pub fn file_store_file_name(file: usize) -> &'static str {
 #[must_use]
 pub fn file_store_text(file: usize) -> &'static str {
     with_store(file, |s| s.text)
+}
+
+/// Go `result.jsdocCache = p.createJSDocCache()` in `finishSourceFile`.
+// PORT: the lists are leaked so reads can return `&'static` slices, like
+// `GoFile::info.jsdoc_cache` after the program is installed.
+pub fn set_file_store_js_doc_cache(file: usize, cache: &FxHashMap<Node, Vec<Node>>) {
+    let cache = cache
+        .iter()
+        .map(|(node, jsdocs)| (*node, &*Box::leak(jsdocs.clone().into_boxed_slice())))
+        .collect();
+    with_store_mut(file, |s| s.jsdoc_cache = cache);
+}
+
+/// Go `file.jsdocCache[node]` of a store file whose program is not
+/// installed yet.
+#[must_use]
+pub fn file_store_js_doc(file: usize, node: Node) -> Option<&'static [Node]> {
+    with_store(file, |s| s.jsdoc_cache.get(&node).copied())
+}
+
+/// True when node reads of store file `file` must use the store, because
+/// no installed program holds the file yet (the parser is still running).
+#[must_use]
+pub fn is_file_store_before_program(file: usize) -> bool {
+    has_file_store(file) && crate::core::try_prog().is_none_or(|p| p.files.len() <= file)
 }
 
 /// Ends the parse of a file. Header and data writes panic after this.

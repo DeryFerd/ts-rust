@@ -222,6 +222,8 @@ pub fn unquote_string(str: &str) -> String {
     result
 }
 
+/// First surrogate code point. It maps to `LONE_SURROGATE_SENTINEL_BASE`.
+const SURROGATE_HIGH_START: u32 = 0xD800;
 /// Go `SurrogateLowStart`.
 pub const SURROGATE_LOW_START: u32 = 0xDC00;
 
@@ -255,15 +257,30 @@ pub fn surrogate_pair_to_code_point(high: u32, low: u32) -> u32 {
     }
 }
 
-// Go `surrogateUTF8Lead`: byte0 of the WTF-8 sentinel for U+D000..U+DFFF.
-const SURROGATE_UTF8_LEAD: u8 = 0xED;
+// PORT: Go stores a lone surrogate (U+D800..U+DFFF) as the 3-byte WTF-8
+// sentinel 0xED 0xA0..0xBF 0x80..0xBF. Those bytes are not valid UTF-8, so a
+// Rust `String` cannot hold them. This port stores a lone surrogate `cp` as
+// the plane-16 private-use code point U+10F800 + (cp - 0xD800) instead. It is
+// valid UTF-8 (4 bytes, lead byte 0xF4), and the range U+10F800..U+10FFFF has
+// exactly one code point per surrogate. The divergence: a real U+10F800..
+// U+10FFFF character in source text decodes as a lone surrogate here. Byte
+// sizes of a sentinel also differ (4, not 3), but callers only use them to
+// slice the same string.
+const LONE_SURROGATE_SENTINEL_BASE: u32 = 0x10F800;
+
+// UTF-8 lead byte of every code point in U+100000..U+10FFFF, which includes
+// the whole sentinel range. `combine_surrogate_pairs` uses it as a fast check.
+const LONE_SURROGATE_SENTINEL_LEAD: u8 = 0xF4;
 
 // Go: stringutil/util.go:323 EncodeJSStringRune
 pub fn encode_js_string_rune(ch: u32) -> String {
     if is_surrogate(ch) {
-        // PORT: Go writes the 3-byte WTF-8 sentinel, which is not valid UTF-8
-        // and cannot live in a Rust String. Lone surrogates become U+FFFD.
-        return char::REPLACEMENT_CHARACTER.to_string();
+        // PORT: the sentinel is U+10F800 + (ch - 0xD800), not WTF-8. See
+        // LONE_SURROGATE_SENTINEL_BASE.
+        let sentinel = LONE_SURROGATE_SENTINEL_BASE + (ch - SURROGATE_HIGH_START);
+        return char::from_u32(sentinel)
+            .unwrap_or(char::REPLACEMENT_CHARACTER)
+            .to_string();
     }
     char::from_u32(ch)
         .unwrap_or(char::REPLACEMENT_CHARACTER)
@@ -271,12 +288,34 @@ pub fn encode_js_string_rune(ch: u32) -> String {
 }
 
 // Go: stringutil/util.go:334 DecodeJSStringRune
-pub fn decode_js_string_rune(s: &str) -> (char, i32) {
-    // PORT: Go first checks for a 3-byte WTF-8 lone-surrogate sentinel
-    // (0xED 0xA0..0xBF 0x80..0xBF). Those bytes are invalid UTF-8, so a Rust
-    // &str never holds one and only the `utf8.DecodeRuneInString` path remains.
+// PORT: returns the Go `rune` as `u32`, because a lone surrogate is not a
+// valid Rust `char`. The sentinel check matches the plane-16 sentinel (see
+// LONE_SURROGATE_SENTINEL_BASE) instead of the WTF-8 bytes. Invalid UTF-8
+// cannot occur in a `&str`, so the other results come from the first `char`
+// (U+FFFD with size 0 for an empty string, as `utf8.DecodeRuneInString`).
+pub fn decode_js_string_rune(s: &str) -> (u32, i32) {
     let (ch, size) = decode_rune_at(s, 0);
-    (ch, size as i32)
+    let code = ch as u32;
+    if code >= LONE_SURROGATE_SENTINEL_BASE {
+        return (
+            code - LONE_SURROGATE_SENTINEL_BASE + SURROGATE_HIGH_START,
+            size as i32,
+        );
+    }
+    (code, size as i32)
+}
+
+// PORT: converts a legacy `ts_scanner` UTF-16 token value to the Go string
+// form. A valid pair becomes one code point and a lone surrogate becomes the
+// `encode_js_string_rune` sentinel, as the Go scanner writes it.
+// `JsString::to_string_lossy` would turn a lone surrogate into U+FFFD instead.
+pub(crate) fn js_string_to_token_value(value: &ts_core::JsString) -> String {
+    char::decode_utf16(value.as_units().iter().copied())
+        .map(|result| match result {
+            Ok(ch) => ch.to_string(),
+            Err(err) => encode_js_string_rune(u32::from(err.unpaired_surrogate())),
+        })
+        .collect()
 }
 
 // Go: stringutil/util.go:352 CombineSurrogatePairs
@@ -286,7 +325,7 @@ pub fn decode_js_string_rune(s: &str) -> (char, i32) {
 // represent. Strings without a lone-surrogate sentinel (the common case) are
 // returned unchanged.
 pub fn combine_surrogate_pairs(s: &str) -> String {
-    if !s.as_bytes().contains(&SURROGATE_UTF8_LEAD) {
+    if !s.as_bytes().contains(&LONE_SURROGATE_SENTINEL_LEAD) {
         return s.to_string();
     }
     let mut b = String::with_capacity(s.len());
@@ -294,10 +333,10 @@ pub fn combine_surrogate_pairs(s: &str) -> String {
     while i < s.len() {
         let (r, size) = decode_js_string_rune(&s[i..]);
         let size = size as usize;
-        if is_high_surrogate(r as u32) {
+        if is_high_surrogate(r) {
             let (low, low_size) = decode_js_string_rune(&s[i + size..]);
-            if is_low_surrogate(low as u32) {
-                let combined = surrogate_pair_to_code_point(r as u32, low as u32);
+            if is_low_surrogate(low) {
+                let combined = surrogate_pair_to_code_point(r, low);
                 b.push(char::from_u32(combined).unwrap_or(char::REPLACEMENT_CHARACTER));
                 i += size + low_size as usize;
                 continue;
@@ -372,12 +411,15 @@ pub fn to_lower_js(str: &str) -> String {
     let mut cased_before = false;
     let mut i = 0usize;
     while i < str.len() {
-        let (r, size) = decode_js_string_rune(&str[i..]);
+        let (code, size) = decode_js_string_rune(&str[i..]);
         i += size as usize;
-        if is_surrogate(r as u32) {
+        // PORT: a non-surrogate rune from `decode_js_string_rune` is always a
+        // valid `char`; the Go body works on `rune` directly.
+        let r = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
+        if is_surrogate(code) {
             // A lone surrogate has no case mapping; preserve it verbatim, matching
             // String.prototype.toLowerCase.
-            builder.push_str(&encode_js_string_rune(r as u32));
+            builder.push_str(&encode_js_string_rune(code));
         } else if let Some((lower, _upper, conditional_lower, condition)) =
             special_casing_mapping(r)
         {
@@ -407,9 +449,11 @@ pub fn to_upper_js(str: &str) -> String {
     let mut builder = String::with_capacity(str.len());
     let mut i = 0usize;
     while i < str.len() {
-        let (r, size) = decode_js_string_rune(&str[i..]);
+        let (code, size) = decode_js_string_rune(&str[i..]);
         let size = size as usize;
-        if is_surrogate(r as u32) {
+        // PORT: a non-surrogate rune is always a valid `char` (see to_lower_js).
+        let r = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
+        if is_surrogate(code) {
             // A lone surrogate has no case mapping; preserve it verbatim, matching
             // String.prototype.toUpperCase.
             builder.push_str(&str[i..i + size]);
@@ -469,8 +513,11 @@ fn is_final_sigma_context(cased_before: bool, str: &str, after_offset: usize) ->
 fn has_sigma_cased_after(str: &str, start: usize) -> bool {
     let mut i = start;
     while i < str.len() {
-        let (r, size) = decode_js_string_rune(&str[i..]);
+        let (code, size) = decode_js_string_rune(&str[i..]);
         i += size as usize;
+        // PORT: a lone surrogate becomes U+FFFD, which is neither case
+        // ignorable nor cased, the same as the surrogate rune in Go.
+        let r = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
         if is_unicode_case_ignorable(r) {
             continue;
         }
@@ -1466,7 +1513,7 @@ impl RsScanner {
         self.token_value = token
             .value
             .as_ref()
-            .map(ts_core::JsString::to_string_lossy)
+            .map(js_string_to_token_value)
             .unwrap_or_default();
         self.token_flags = go_token_flags(token.flags);
         let checkpoint = inner.mark();

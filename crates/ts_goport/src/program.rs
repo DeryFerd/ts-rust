@@ -2150,10 +2150,15 @@ pub fn get_source_file_for_resolved_module(file_name: &str) -> Node {
 
 // Go: compiler/program.go:1916 GetJSXRuntimeImportSpecifier
 // Go: compiler/fileloader.go:550 (the value the loader records)
-// PORT: Go creates a synthetic string literal import as the specifier. The
-// parsed tree is immutable here, so the specifier is nil and callers fall
-// back to their own location node.
+// PORT: on the Go frontend the loader records the value and its synthetic
+// import (Go `createSyntheticImport`). On the legacy path the specifier is
+// nil and callers fall back to their own location node.
 pub fn get_jsx_runtime_import_specifier(path: &str) -> (String, Node) {
+    if let Some(go) = &state().go {
+        return go
+            .program
+            .get_jsx_runtime_import_specifier(&crate::frontend::tspath::Path(path.to_string()));
+    }
     let Some(info) = file_info_by_path(path) else {
         return (String::new(), Node::NIL);
     };
@@ -2171,7 +2176,14 @@ pub fn get_jsx_runtime_import_specifier(path: &str) -> (String, Node) {
 
 // Go: compiler/program.go:1923 GetImportHelpersImportSpecifier
 // Go: compiler/fileloader.go:541 (the value the loader records)
+// PORT: the Go frontend loader records the synthetic import. On the legacy
+// path `createSyntheticImport` is not ported.
 pub fn get_import_helpers_import_specifier(path: &str) -> Node {
+    if let Some(go) = &state().go {
+        return go
+            .program
+            .get_import_helpers_import_specifier(&crate::frontend::tspath::Path(path.to_string()));
+    }
     let Some(info) = file_info_by_path(path) else {
         return Node::NIL;
     };
@@ -2726,15 +2738,27 @@ impl crate::printer::EmitHost for EmitHost {
     }
 }
 
+// Go: compiler/program.go:1306 FilterNoEmitSemanticDiagnostics
+pub fn filter_no_emit_semantic_diagnostics(
+    mut diagnostics: Vec<Diagnostic>,
+    options: &CompilerOptions,
+) -> Vec<Diagnostic> {
+    if !options.no_emit.is_true() {
+        return diagnostics;
+    }
+    diagnostics.retain(|d| !d.skipped_on_no_emit());
+    diagnostics
+}
+
 // Go: compiler/program.go:1315 getSemanticDiagnosticsWithChecker
-// PORT: Go `FilterNoEmitSemanticDiagnostics` drops diagnostics marked
-// SkippedOnNoEmit when noEmit is set. The port has no field for that mark
-// (see `Diagnostic::set_skipped_on_no_emit`), so nothing is dropped.
 pub fn get_semantic_diagnostics_with_checker(
     c: &mut Checker,
     source_file: Node,
 ) -> Vec<Diagnostic> {
-    let mut diags = get_bind_and_check_diagnostics_with_checker(c, source_file);
+    let mut diags = filter_no_emit_semantic_diagnostics(
+        get_bind_and_check_diagnostics_with_checker(c, source_file),
+        &prog().options,
+    );
     diags.extend(get_include_processor_diagnostics(source_file));
     diags
 }

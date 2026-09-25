@@ -203,7 +203,7 @@ impl Diagnostic {
     // Go: ast/diagnostic.go:63 SkippedOnNoEmit
     #[must_use]
     pub fn skipped_on_no_emit(&self) -> bool {
-        unported!("Diagnostic.SkippedOnNoEmit")
+        self.skipped_on_no_emit
     }
 
     // Go: ast/diagnostic.go:64 RepopulateInfo
@@ -229,8 +229,9 @@ impl Diagnostic {
     }
 
     // Go: ast/diagnostic.go:69 SetSkippedOnNoEmit
-    // PORT: no field to store it in (see the impl comment); the flag is dropped.
-    pub fn set_skipped_on_no_emit(&mut self) {}
+    pub fn set_skipped_on_no_emit(&mut self) {
+        self.skipped_on_no_emit = true;
+    }
 
     // Go: ast/diagnostic.go:70 SetRepopulateInfo
     // PORT: no field to store it in (see the impl comment); the info is dropped.
@@ -299,7 +300,7 @@ fn localize_message(message: &'static ts_diagnostics::Message, args: &[String]) 
 // Go: ast/diagnostic.go:110 NewDiagnosticFromSerialized
 // PORT: Go keeps `message` nil and resolves the key lazily in `Localize`
 // (panicking on an unknown key). `core::Diagnostic` needs the message, so it
-// is resolved here with the same panic. `skippedOnNoEmit` has no field.
+// is resolved here with the same panic.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn new_diagnostic_from_serialized(
@@ -331,6 +332,7 @@ pub fn new_diagnostic_from_serialized(
         related_information,
         reports_unnecessary,
         reports_deprecated,
+        skipped_on_no_emit,
     }
 }
 
@@ -354,6 +356,7 @@ pub fn new_diagnostic(
         related_information: Vec::new(),
         reports_unnecessary: message.reports_unnecessary(),
         reports_deprecated: message.reports_deprecated(),
+        skipped_on_no_emit: false,
     }
 }
 

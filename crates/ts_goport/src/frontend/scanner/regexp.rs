@@ -2,12 +2,13 @@
 //! `Scanner.ReScanSlashToken` runs when it reports errors.
 //!
 //! PORT: Go strings are byte strings. The values that this checker returns
-//! (`scanClassAtom`, `scanClassSetOperand`, ...) can hold WTF-8 lone-surrogate
-//! sentinels from `stringutil.EncodeJSStringRune`, which a Rust `String`
-//! cannot hold. These values are only compared (empty check, length and
+//! (`scanClassAtom`, `scanClassSetOperand`, ...) hold WTF-8 lone-surrogate
+//! sentinels in Go. These values are only compared (empty check, length and
 //! `DecodeJSStringRune`), so they are `Vec<u8>` here, and the private
 //! `encode_js_string_rune_bytes`, `decode_js_string_rune_bytes` and
-//! `decode_rune_in_bytes` helpers do the Go byte math on them.
+//! `decode_rune_in_bytes` helpers do the Go byte math on them. Lone
+//! surrogates use the valid-UTF-8 plane-16 sentinel from
+//! `scanner_util::encode_js_string_rune` instead of Go's WTF-8 bytes.
 //!
 //! Go `rune` values from `Scanner.char()` and `Scanner.charAt()` are `i32`
 //! (a raw byte, or -1 at the end). `match rune(ch)` stands in for a Go
@@ -1718,33 +1719,29 @@ fn code_point_to_surrogate_pair_i32(ch: i32) -> (i32, i32) {
 }
 
 // Go: stringutil/util.go:323 EncodeJSStringRune
-// PORT: byte-string copy of `scanner_util::encode_js_string_rune`, which
-// cannot keep the lone-surrogate sentinel in a Rust `String`.
+// PORT: byte form of `scanner_util::encode_js_string_rune`. A lone surrogate
+// becomes the same plane-16 sentinel (see its PORT note), so these bytes match
+// what `scan_escape_sequence` returns.
 fn encode_js_string_rune_bytes(ch: i32) -> Vec<u8> {
-    if (0xD800..0xE000).contains(&ch) {
-        return vec![
-            0xED,
-            (0x80 | ((ch >> 6) & 0x3F)) as u8,
-            (0x80 | (ch & 0x3F)) as u8,
-        ];
+    match u32::try_from(ch) {
+        Ok(code) if crate::scanner_util::is_surrogate(code) => {
+            crate::scanner_util::encode_js_string_rune(code).into_bytes()
+        }
+        _ => rune_to_bytes(ch),
     }
-    rune_to_bytes(ch)
 }
 
 // Go: stringutil/util.go:334 DecodeJSStringRune
-// PORT: byte-string copy of `scanner_util::decode_js_string_rune`, which
-// cannot see the lone-surrogate sentinel in a Rust `&str`.
+// PORT: byte form of `scanner_util::decode_js_string_rune`. It maps the
+// plane-16 sentinel back to the lone surrogate, and keeps the Go
+// `utf8.DecodeRuneInString` results for invalid bytes.
 fn decode_js_string_rune_bytes(s: &[u8]) -> (i32, usize) {
-    if s.len() >= 3
-        && s[0] == 0xED
-        && (0xA0..=0xBF).contains(&s[1])
-        && (0x80..=0xBF).contains(&s[2])
-    {
-        return (
-            0xD000 | (i32::from(s[1] & 0x3F) << 6) | i32::from(s[2] & 0x3F),
-            3,
-        );
-    }
     let (ch, size) = decode_rune_in_bytes(s);
+    if ch != RUNE_ERROR && size > 0 {
+        let (code, _) = crate::scanner_util::decode_js_string_rune(
+            std::str::from_utf8(&s[..size as usize]).unwrap_or_default(),
+        );
+        return (code as i32, size as usize);
+    }
     (ch, size as usize)
 }

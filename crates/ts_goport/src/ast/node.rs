@@ -3476,6 +3476,12 @@ impl Node {
         if file.is_nil() {
             return NodeSlice::NIL;
         }
+        // PORT: during the parse (Go `collectExternalModuleReferences`) the
+        // store file is not in a program yet; its cache is in the store.
+        if is_file_store_before_program(file.file_index()) {
+            return file_store_js_doc(file.file_index(), self)
+                .map_or(NodeSlice::NIL, NodeSlice::from_nodes);
+        }
         let info = source_file_info(file);
         match info.jsdoc_cache.get(&self) {
             Some(jsdocs) => NodeSlice::from_nodes(jsdocs),
@@ -3501,6 +3507,10 @@ impl Node {
         };
         if file.is_nil() {
             return NodeSlice::NIL;
+        }
+        if is_file_store_before_program(file.file_index()) {
+            return file_store_js_doc(file.file_index(), self)
+                .map_or(NodeSlice::NIL, NodeSlice::from_nodes);
         }
         source_file_info(file)
             .jsdoc_cache

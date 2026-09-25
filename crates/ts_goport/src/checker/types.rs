@@ -1167,6 +1167,16 @@ impl LiteralType {
         self.regular_type
     }
 
+    // Formats the raw value like Go `%v` on `LiteralType.value`. A nil value
+    // (computed enum) prints as Go's `<nil>`.
+    // Go: checker/checker.go:26996 indexType.AsLiteralType().value
+    pub fn value_arg(&self) -> String {
+        match &self.value {
+            Some(value) => value.to_string(),
+            None => "<nil>".to_string(),
+        }
+    }
+
     // PORT: Go `ValueToString(nil)` panics; unwrapping here panics the same way.
     // Go: checker/types.go:895 LiteralType.String
     pub fn string(&self) -> String {
@@ -1175,6 +1185,22 @@ impl LiteralType {
                 .as_ref()
                 .expect("unhandled value type in valueToString"),
         )
+    }
+}
+
+// PORT: Go passes a literal type's raw `value` (an `any`) as a diagnostic
+// argument, and diagnostics format arguments with `%v`. This `Display` impl
+// gives the same text: a string prints raw (no quotes), a number uses its
+// `String()`, a bool prints true/false and a bigint prints with no `n`.
+// Go: diagnostics/diagnostics.go:146 fmt.Sprintf("%v", arg)
+impl std::fmt::Display for LiteralValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiteralValue::String(value) => f.write_str(value),
+            LiteralValue::Number(value) => write!(f, "{value}"),
+            LiteralValue::Bool(value) => write!(f, "{value}"),
+            LiteralValue::PseudoBigInt(value) => write!(f, "{value}"),
+        }
     }
 }
 

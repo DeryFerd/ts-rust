@@ -80,9 +80,12 @@ fn encode_utf16_escape_sequence(b: &mut String, char_code: u32) {
 // Based heavily on the abstract 'Quote'/'QuoteJSONString' operation from ECMA-262 (24.3.2.2),
 // but augmented for a few select characters (e.g. lineSeparator, paragraphSeparator, nextLine)
 // Note that this doesn't actually wrap the input in double quotes.
-// PORT: a Rust `&str` is valid UTF-8 and cannot hold Go's WTF-8 lone
-// surrogate sentinels or stray bytes, so the surrogate and invalid-byte
-// branches are kept but never trigger.
+// PORT: a Rust `&str` is valid UTF-8, so the invalid-byte branch is kept but
+// never triggers. Lone surrogates use the plane-16 sentinel from
+// `encode_js_string_rune` (see scanner_util.rs), which `decode_js_string_rune`
+// maps back to the surrogate, so they print as `\uD800` like Go. `ch` is the
+// `char` form of `code`. For a surrogate it is U+FFFD, which matches no `ch`
+// case, the same as the surrogate rune in Go.
 fn escape_string_worker(
     s: &str,
     quote_char: QuoteChar,
@@ -93,9 +96,9 @@ fn escape_string_worker(
     let mut pos = 0usize;
     let mut i = 0usize;
     while i < s.len() {
-        let (ch, size) = decode_js_string_rune(&s[i..]);
+        let (code, size) = decode_js_string_rune(&s[i..]);
         let mut size = size as usize;
-        let code = ch as u32;
+        let ch = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
 
         let mut escape = false;
         if (0xD800..=0xDFFF).contains(&code) {

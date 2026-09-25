@@ -1096,15 +1096,33 @@ pub fn get_source_file_of_node(node: Node) -> Node {
 }
 
 // Go: ast/utilities.go:877 newParentInChildrenSetter
-// PORT: Go writes `node.Parent`. Parents in the installed program are
-// immutable parser data, and only node cloning (`deepclone.go`, part of the
-// node factory) calls this, so it is unported.
-fn new_parent_in_children_setter() -> Box<dyn FnMut(Node) -> bool> {
-    unported!("newParentInChildrenSetter")
+// PORT: Go keeps `parent` in a closure state and recurses through
+// `node.ForEachChild(state.visit)`. Rust carries the same state in a
+// struct. Go pools the closure with `sync.Pool`; that is only an
+// allocation cache, so it is not ported.
+struct ParentInChildrenSetter {
+    parent: Node,
+}
+
+impl ParentInChildrenSetter {
+    fn visit(&mut self, node: Node) -> bool {
+        if self.parent.is_some() {
+            crate::ast::synthetic::set_node_parent(node, self.parent);
+        }
+        let save_parent = self.parent;
+        self.parent = node;
+        node.for_each_child(|child| self.visit(child));
+        self.parent = save_parent;
+        false
+    }
+}
+
+fn new_parent_in_children_setter() -> ParentInChildrenSetter {
+    ParentInChildrenSetter { parent: Node::NIL }
 }
 
 // Go: ast/utilities.go:899 SetParentInChildren
 pub fn set_parent_in_children(node: Node) {
     let mut f = new_parent_in_children_setter();
-    f(node);
+    f.visit(node);
 }

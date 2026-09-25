@@ -1291,101 +1291,13 @@ impl Checker {
 // over the four handled types, so the panic case cannot happen.
 pub fn value_to_string(value: &LiteralValue) -> String {
     match value {
-        LiteralValue::String(value) => format!("\"{}\"", escape_string(value, '"')),
+        LiteralValue::String(value) => {
+            format!("\"{}\"", escape_string(value, QuoteChar::DOUBLE_QUOTE))
+        }
         LiteralValue::Number(value) => value.to_string(),
         LiteralValue::Bool(value) => if *value { "true" } else { "false" }.to_string(),
         LiteralValue::PseudoBigInt(value) => format!("{value}n"),
     }
-}
-
-// Go: printer/utilities.go:178 EscapeString (with escapeStringWorker and
-// encodeUtf16EscapeSequence, flags = getLiteralTextFlagsNeverAsciiEscape)
-// PORT: private copy of the printer helper, which has no port in this crate.
-// Only the NeverAsciiEscape path is used, so the JSX branch is left out. A
-// Rust `&str` is always valid UTF-8 and cannot hold lone surrogates, so Go's
-// surrogate and invalid-byte cases never trigger here.
-fn escape_string(s: &str, quote_char: char) -> String {
-    fn encode_utf16_escape_sequence(b: &mut String, char_code: u32) {
-        let hex_char_code = format!("{char_code:X}");
-        b.push_str("\\u");
-        for _ in hex_char_code.len()..4 {
-            b.push('0');
-        }
-        b.push_str(&hex_char_code);
-    }
-    fn escaped_char(ch: char) -> Option<&'static str> {
-        Some(match ch {
-            '\t' => "\\t",
-            '\u{000B}' => "\\v",
-            '\u{000C}' => "\\f",
-            '\u{0008}' => "\\b",
-            '\r' => "\\r",
-            '\n' => "\\n",
-            '\\' => "\\\\",
-            '"' => "\\\"",
-            '\'' => "\\'",
-            '`' => "\\`",
-            '$' => "\\$",            // when quoteChar == '`'
-            '\u{2028}' => "\\u2028", // lineSeparator
-            '\u{2029}' => "\\u2029", // paragraphSeparator
-            '\u{0085}' => "\\u0085", // nextLine
-            _ => return None,
-        })
-    }
-
-    let bytes = s.as_bytes();
-    let mut b = String::with_capacity(s.len() + 2);
-    let mut pos = 0;
-    for (i, ch) in s.char_indices() {
-        let mut size = ch.len_utf8();
-        let escape = match ch {
-            '\\' => true,
-            '$' => quote_char == '`' && i + 1 < bytes.len() && bytes[i + 1] == b'{',
-            '\u{2028}' | '\u{2029}' | '\u{0085}' | '\r' => true,
-            '\n' => quote_char != '`', // Template strings preserve simple LF newlines, still encode CRLF (or CR).
-            _ if ch == quote_char => true,
-            _ => ch <= '\u{001f}',
-        };
-
-        if escape {
-            if pos < i {
-                // Write string up to this point
-                b.push_str(&s[pos..i]);
-            }
-            if ch == '\r' && quote_char == '`' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                // Template strings preserve simple LF newlines, but still must escape CRLF.
-                size += 1;
-                b.push_str("\\r\\n");
-            } else if (ch as u32) > 0xffff {
-                // encode as surrogate pair
-                let code = ch as u32 - 0x10000;
-                encode_utf16_escape_sequence(
-                    &mut b,
-                    ((code & 0b11111111110000000000) >> 10) + 0xD800,
-                );
-                encode_utf16_escape_sequence(&mut b, (code & 0b00000000001111111111) + 0xDC00);
-            } else if ch == '\0' {
-                if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
-                    // If the null character is followed by digits, print as a hex escape to prevent the result from
-                    // parsing as an octal (which is forbidden in strict mode)
-                    b.push_str("\\x00");
-                } else {
-                    // Otherwise, keep printing a literal \0 for the null character
-                    b.push_str("\\0");
-                }
-            } else if let Some(m) = escaped_char(ch) {
-                b.push_str(m);
-            } else {
-                encode_utf16_escape_sequence(&mut b, ch as u32);
-            }
-            pos = i + size;
-        }
-    }
-
-    if pos < s.len() {
-        b.push_str(&s[pos..]);
-    }
-    b
 }
 
 // PORT: shared body of Go `Checker.getPackagesMap` (utilities.go:1645) and

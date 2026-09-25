@@ -815,11 +815,12 @@ impl Checker {
     }
 
     // Go: checker/jsx.go:1439 parseIsolatedEntityName
-    pub fn parse_isolated_entity_name(&mut self, _name: &str) -> Node {
-        // PORT: Go calls `parser.ParseIsolatedEntityName(name)`, which parses a
-        // new detached node tree, then `markAsSynthetic(result)`. Detached parser
-        // nodes cannot be represented by `Node` handles yet.
-        unported!("ParseIsolatedEntityName")
+    pub fn parse_isolated_entity_name(&mut self, name: &str) -> Node {
+        let result = crate::frontend::parser::parse_isolated_entity_name(name);
+        if result.is_some() {
+            mark_as_synthetic(result);
+        }
+        result
     }
 
     // Go: checker/jsx.go:1453 getJsxNamespaceContainerForImplicitImport
@@ -890,10 +891,10 @@ impl Checker {
 }
 
 // Go: checker/jsx.go:1447 markAsSynthetic
+// PORT: the isolated parse has no file store, so its nodes are factory
+// nodes and `set_node_loc` can write them.
 pub fn mark_as_synthetic(node: Node) -> bool {
-    // PORT: Go sets `node.Loc = core.NewTextRange(-1, -1)` on every node of a
-    // detached parsed tree. Parsed AST nodes are immutable here, and the only
-    // caller (parseIsolatedEntityName) is unported.
-    let _ = node;
-    unported!("markAsSynthetic")
+    set_node_loc(node, TextRange::new(-1, -1));
+    node.for_each_child(mark_as_synthetic);
+    false
 }

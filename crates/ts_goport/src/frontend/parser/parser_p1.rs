@@ -709,6 +709,7 @@ impl Parser {
         result.text_count = self.factory.text_count();
         result.identifier_count = self.identifier_count;
         result.jsdoc_cache = self.create_js_doc_cache();
+        set_file_store_js_doc_cache(result.store, &result.jsdoc_cache);
         // For non-JS files, enable lazy JSDoc parsing on demand
         if !self.is_javascript() {
             result.has_lazy_js_doc = true;

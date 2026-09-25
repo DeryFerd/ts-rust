@@ -657,7 +657,7 @@ impl Binder {
         let container = self.container;
         let has_export_modifier = get_combined_modifier_flags(node)
             .intersects(ModifierFlags::EXPORT)
-            || is_implicitly_exported_js_doc_declaration(node);
+            || self.is_implicitly_exported_js_doc_declaration(node);
         if symbol_flags.intersects(SymbolFlags::ALIAS) {
             if node.kind() == SyntaxKind::ExportSpecifier
                 || (node.kind() == SyntaxKind::ImportEqualsDeclaration && has_export_modifier)

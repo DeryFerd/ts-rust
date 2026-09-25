@@ -261,7 +261,7 @@ impl Checker {
                         && index_flags
                             .intersects(TypeFlags::STRING_LITERAL | TypeFlags::NUMBER_LITERAL)
                     {
-                        let value_string = self.ty(index_type).as_literal_type().string();
+                        let value_string = self.ty(index_type).as_literal_type().value_arg();
                         let type_string = self.type_to_string_exported(object_type);
                         self.add_diagnostic(create_diagnostic_for_node(
                             access_expression,
@@ -369,7 +369,7 @@ impl Checker {
                                     ));
                                 } else if index_flags.intersects(TypeFlags::STRING_LITERAL) {
                                     let value_string =
-                                        self.ty(index_type).as_literal_type().string();
+                                        self.ty(index_type).as_literal_type().value_arg();
                                     let type_string = self.type_to_string_exported(object_type);
                                     diagnostic = Some(new_diagnostic_for_node(
                                         access_expression,
@@ -378,7 +378,7 @@ impl Checker {
                                     ));
                                 } else if index_flags.intersects(TypeFlags::NUMBER_LITERAL) {
                                     let value_string =
-                                        self.ty(index_type).as_literal_type().string();
+                                        self.ty(index_type).as_literal_type().value_arg();
                                     let type_string = self.type_to_string_exported(object_type);
                                     diagnostic = Some(new_diagnostic_for_node(
                                         access_expression,
@@ -426,7 +426,7 @@ impl Checker {
             if index_node.kind() != SyntaxKind::BigIntLiteral
                 && index_flags.intersects(TypeFlags::STRING_LITERAL | TypeFlags::NUMBER_LITERAL)
             {
-                let value_string = self.ty(index_type).as_literal_type().string();
+                let value_string = self.ty(index_type).as_literal_type().value_arg();
                 let type_string = self.type_to_string_exported(object_type);
                 self.error(
                     index_node,

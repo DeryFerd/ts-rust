@@ -88,6 +88,29 @@ fn binder_is_external_or_common_js_module(b: &Binder) -> bool {
         || b.common_js_module_indicator.is_some()
 }
 
+impl Binder {
+    // Go: ast/utilities.go:4164 IsImplicitlyExportedJSDocDeclaration
+    // PORT: while binding, the CommonJS indicator of the file is binder
+    // state, so the Go `ast.IsExternalOrCommonJSModule(node.Parent)` test
+    // reads it from the binder. The parent is always the file being bound.
+    pub(super) fn is_implicitly_exported_js_doc_declaration(&self, node: Node) -> bool {
+        let parent = node.parent();
+        if !is_source_file(parent) {
+            return false;
+        }
+        debug_assert!(parent == self.file);
+        if !binder_is_external_or_common_js_module(self) {
+            return false;
+        }
+        if is_js_type_alias_declaration(node) {
+            return true;
+        }
+        // A reparsed ModuleDeclaration synthesized from a JSDoc @typedef/@callback
+        // dotted name should also be treated as implicitly exported in modules.
+        is_module_declaration(node) && node.flags().intersects(NodeFlags::REPARSED)
+    }
+}
+
 /// Go `node.BodyData() != nil`: kinds that embed `ast.BodyBase`.
 fn has_body_data(node: Node) -> bool {
     matches!(

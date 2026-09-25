@@ -633,7 +633,8 @@ impl Scanner {
     // Go: scanner/scanner.go:1702 scanEscapeSequence
     // PORT: Go returns strings that can hold a CESU-8 lone surrogate
     // (`EncodeJSStringRune`). A Rust `String` cannot; `encode_js_string_rune`
-    // writes U+FFFD instead (see its PORT note in scanner_util.rs).
+    // writes a valid-UTF-8 plane-16 sentinel instead (see its PORT note in
+    // scanner_util.rs).
     pub(crate) fn scan_escape_sequence(&mut self, flags: EscapeSequenceScanningFlags) -> String {
         let start = self.scanner_state.pos;
         self.scanner_state.pos += 1;

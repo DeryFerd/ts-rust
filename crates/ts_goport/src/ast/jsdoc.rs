@@ -129,7 +129,7 @@ impl Sc {
         self.st.flags = flags;
         self.st.token = t.kind;
         if let Some(v) = &t.value {
-            self.st.value = v.to_string_lossy();
+            self.st.value = crate::scanner_util::js_string_to_token_value(v);
         } else if token_is_identifier_or_keyword(t.kind) {
             self.st.value = t.text.to_string();
         }
@@ -317,7 +317,7 @@ impl Sc {
         self.st.flags = self.st.flags | go_token_flags(t.flags);
         self.st.token = t.kind;
         if let Some(v) = &t.value {
-            self.st.value = v.to_string_lossy();
+            self.st.value = crate::scanner_util::js_string_to_token_value(v);
         }
         self.st.token
     }
