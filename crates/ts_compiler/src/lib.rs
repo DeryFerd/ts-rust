@@ -3970,6 +3970,8 @@ impl Program {
     /// # Errors
     ///
     /// Returns an error when the config uses project references.
+    // The error type is shared with the existing canonical loaders.
+    #[allow(clippy::result_large_err)]
     pub fn load_config_graph_unchecked(
         file_system: &dyn FileSystem,
         config_path: &str,
@@ -8647,9 +8649,15 @@ const LIB_MAP: &[(&str, &str)] = &[
     ("dom.iterable", "lib.dom.iterable.d.ts"),
     ("dom.asynciterable", "lib.dom.asynciterable.d.ts"),
     ("webworker", "lib.webworker.d.ts"),
-    ("webworker.importscripts", "lib.webworker.importscripts.d.ts"),
+    (
+        "webworker.importscripts",
+        "lib.webworker.importscripts.d.ts",
+    ),
     ("webworker.iterable", "lib.webworker.iterable.d.ts"),
-    ("webworker.asynciterable", "lib.webworker.asynciterable.d.ts"),
+    (
+        "webworker.asynciterable",
+        "lib.webworker.asynciterable.d.ts",
+    ),
     ("scripthost", "lib.scripthost.d.ts"),
     // ES2015 and later By-feature options
     ("es2015.core", "lib.es2015.core.d.ts"),
@@ -8660,7 +8668,10 @@ const LIB_MAP: &[(&str, &str)] = &[
     ("es2015.proxy", "lib.es2015.proxy.d.ts"),
     ("es2015.reflect", "lib.es2015.reflect.d.ts"),
     ("es2015.symbol", "lib.es2015.symbol.d.ts"),
-    ("es2015.symbol.wellknown", "lib.es2015.symbol.wellknown.d.ts"),
+    (
+        "es2015.symbol.wellknown",
+        "lib.es2015.symbol.wellknown.d.ts",
+    ),
     ("es2016.array.include", "lib.es2016.array.include.d.ts"),
     ("es2016.intl", "lib.es2016.intl.d.ts"),
     ("es2017.arraybuffer", "lib.es2017.arraybuffer.d.ts"),
@@ -8685,7 +8696,10 @@ const LIB_MAP: &[(&str, &str)] = &[
     ("es2020.promise", "lib.es2020.promise.d.ts"),
     ("es2020.sharedmemory", "lib.es2020.sharedmemory.d.ts"),
     ("es2020.string", "lib.es2020.string.d.ts"),
-    ("es2020.symbol.wellknown", "lib.es2020.symbol.wellknown.d.ts"),
+    (
+        "es2020.symbol.wellknown",
+        "lib.es2020.symbol.wellknown.d.ts",
+    ),
     ("es2020.intl", "lib.es2020.intl.d.ts"),
     ("es2020.number", "lib.es2020.number.d.ts"),
     ("es2021.promise", "lib.es2021.promise.d.ts"),
