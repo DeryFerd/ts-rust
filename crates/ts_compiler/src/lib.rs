@@ -1080,6 +1080,9 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::GenericAliasConstraintUnsupported { .. }
         | TypeNodeUnavailable::GenericAliasInstantiationUnsupported { .. }
         | TypeNodeUnavailable::GenericAliasDefaultReferenceUnsupported { .. }
+        | TypeNodeUnavailable::SourceMappedMembersDemand { .. }
+        | TypeNodeUnavailable::SourceMappedValueDemand { .. }
+        | TypeNodeUnavailable::SourceIndexedDiagnosticDemand { .. }
         | TypeNodeUnavailable::CircularGenericAliasDefault { .. }
         | TypeNodeUnavailable::JsDocTypeAlias(_)
         | TypeNodeUnavailable::UnsupportedUnionConstituent(_)
@@ -1180,6 +1183,9 @@ fn relation_error_is_unsupported(error: &RelationUnavailable) -> bool {
         | RelationUnavailable::SourceInterfaceHeaderDemand { .. }
         | RelationUnavailable::SourceInterfaceAliasDemand { .. }
         | RelationUnavailable::SourceSignatureReturnDemand { .. }
+        | RelationUnavailable::SourceSignatureInstantiationDemand(_)
+        | RelationUnavailable::SourceMappedMembersDemand { .. }
+        | RelationUnavailable::SourceMappedValueDemand { .. }
         | RelationUnavailable::StructuralRelation { .. } => true,
         RelationUnavailable::CanonicalGlobalType(error) => {
             global_type_initialization_error_is_unsupported(error)
@@ -3957,6 +3963,73 @@ impl Program {
             .flatten()
     }
 
+    /// Loads a config Program graph (roots, default libraries and automatic
+    /// type roots) and runs no checker. The `ts_goport` crate binds and
+    /// checks this graph itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the config uses project references.
+    pub fn load_config_graph_unchecked(
+        file_system: &dyn FileSystem,
+        config_path: &str,
+    ) -> Result<Self, CanonicalProgramCheckError> {
+        Self::load_canonical_config_program(file_system, config_path).map(|(program, _)| program)
+    }
+
+    /// Returns file identities in the pinned Go `Program.SourceFiles()` order:
+    /// default libraries by priority, then files in dependency order.
+    #[must_use]
+    pub fn semantic_source_order(&self) -> Vec<FileId> {
+        self.canonical_semantic_sources()
+            .into_iter()
+            .map(|source| source.id)
+            .collect()
+    }
+
+    /// Returns the Node module format implied for one source file.
+    #[must_use]
+    pub fn implied_node_format(&self, file: FileId) -> Option<ModuleKind> {
+        self.source_file_by_id(file)
+            .map(|source| source.implied_node_format)
+    }
+
+    /// Returns the default module resolution mode for imports in one file.
+    #[must_use]
+    pub fn default_module_resolution_mode(&self, file: FileId) -> Option<ModuleFormat> {
+        let source = self.source_file_by_id(file)?;
+        match self.canonical_emit_module_mode(source) {
+            CanonicalModuleResolutionMode::CommonJs => Some(ModuleFormat::CommonJs),
+            CanonicalModuleResolutionMode::Esm => Some(ModuleFormat::Esm),
+            CanonicalModuleResolutionMode::None => None,
+        }
+    }
+
+    /// Returns the loaded target of one module specifier, keyed like the
+    /// graph loader: canonical containing file, specifier text and mode.
+    #[must_use]
+    pub fn resolved_module_file(
+        &self,
+        containing_file: FileId,
+        specifier: &str,
+        mode: Option<ModuleFormat>,
+    ) -> Option<&SourceFile> {
+        let source = self.source_file_by_id(containing_file)?;
+        let key = ResolvedModuleKey {
+            containing_file: canonicalize(
+                &source.file_name,
+                &self.current_directory,
+                self.case_sensitivity,
+            ),
+            specifier: specifier.to_owned(),
+            mode,
+        };
+        let target = self.resolved_modules.get(&key)?;
+        self.file_index
+            .get(target)
+            .and_then(|index| self.source_files.get(*index))
+    }
+
     /// Emits modern JavaScript for all implementation source files currently
     /// supported by the printer.
     #[must_use]
@@ -5940,9 +6013,21 @@ impl Program {
         } else {
             CanonicalJsxRuntimeEvidence::Preserve
         };
+        let query_observation = ts_checker::semantic::CanonicalTypeMapperStore::current_query_producer_scope(
+            &source.file_name,
+            || NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file),
+            |node| {
+                let file = self.source_file_by_id(node.file)?;
+                let record = self.node(node)?;
+                Some((file.file_name.as_str(), record.kind, record.range))
+            },
+        );
         context
             .check_source_file_with_jsx_runtime(source.id, runtime)
             .map_err(|error| {
+                if let Some(observation) = &query_observation {
+                    observation.escaping(&error, context.store());
+                }
                 if let SourceCheckError::DeclaredType(DeclaredTypeError::NameResolution(
                     CanonicalNameResolutionError::AliasResolutionUnavailable(alias),
                 )) = &error
@@ -7978,9 +8063,11 @@ impl Program {
         }
         let roots = match &self.options.lib {
             None => vec![ts_bundled::default_library_name(self.options.target).to_owned()],
+            // Go: compiler/fileloader.go:164 unknown names are skipped
+            // ("!!! error on unknown name").
             Some(libraries) => libraries
                 .iter()
-                .map(|name| bundled_library_name(name))
+                .filter_map(|name| tsoptions_get_lib_file_name(name))
                 .collect(),
         };
         for root in roots {
@@ -8126,8 +8213,16 @@ impl Program {
                     }
                 }
                 ReferenceKind::Lib => {
-                    let library_name = bundled_library_name(&directive.value);
-                    let dependencies = ts_bundled::library_closure(&library_name);
+                    // Go: compiler/filesparser.go:143 GetLibFileName maps
+                    // names through LibMap (`esnext.float16` ->
+                    // `lib.es2025.float16.d.ts`).
+                    // PORT: an unknown name loads nothing and records a
+                    // reference with no targets. Go also adds a
+                    // processingDiagnosticKindUnknownReference diagnostic;
+                    // that is not ported here.
+                    let dependencies = tsoptions_get_lib_file_name(&directive.value)
+                        .map(|library_name| ts_bundled::library_closure(&library_name))
+                        .unwrap_or_default();
                     self.graph_references.push(ProgramGraphReference {
                         containing_file: containing_file.clone(),
                         range: directive.range,
@@ -8539,13 +8634,141 @@ fn reference_attribute_value<'source>(
     None
 }
 
-fn bundled_library_name(name: &str) -> String {
-    let name = name.to_ascii_lowercase();
-    if name.starts_with("lib.") && name.ends_with(".d.ts") {
-        name
-    } else {
-        format!("lib.{name}.d.ts")
+// Go: tsoptions/enummaps.go:11 LibMap
+const LIB_MAP: &[(&str, &str)] = &[
+    // JavaScript only
+    ("es5", "lib.es5.d.ts"),
+    ("es6", "lib.es2015.d.ts"),
+    ("es2015", "lib.es2015.d.ts"),
+    ("es7", "lib.es2016.d.ts"),
+    ("es2016", "lib.es2016.d.ts"),
+    ("es2017", "lib.es2017.d.ts"),
+    ("es2018", "lib.es2018.d.ts"),
+    ("es2019", "lib.es2019.d.ts"),
+    ("es2020", "lib.es2020.d.ts"),
+    ("es2021", "lib.es2021.d.ts"),
+    ("es2022", "lib.es2022.d.ts"),
+    ("es2023", "lib.es2023.d.ts"),
+    ("es2024", "lib.es2024.d.ts"),
+    ("es2025", "lib.es2025.d.ts"),
+    ("esnext", "lib.esnext.d.ts"),
+    // Host only
+    ("dom", "lib.dom.d.ts"),
+    ("dom.iterable", "lib.dom.iterable.d.ts"),
+    ("dom.asynciterable", "lib.dom.asynciterable.d.ts"),
+    ("webworker", "lib.webworker.d.ts"),
+    ("webworker.importscripts", "lib.webworker.importscripts.d.ts"),
+    ("webworker.iterable", "lib.webworker.iterable.d.ts"),
+    ("webworker.asynciterable", "lib.webworker.asynciterable.d.ts"),
+    ("scripthost", "lib.scripthost.d.ts"),
+    // ES2015 and later By-feature options
+    ("es2015.core", "lib.es2015.core.d.ts"),
+    ("es2015.collection", "lib.es2015.collection.d.ts"),
+    ("es2015.generator", "lib.es2015.generator.d.ts"),
+    ("es2015.iterable", "lib.es2015.iterable.d.ts"),
+    ("es2015.promise", "lib.es2015.promise.d.ts"),
+    ("es2015.proxy", "lib.es2015.proxy.d.ts"),
+    ("es2015.reflect", "lib.es2015.reflect.d.ts"),
+    ("es2015.symbol", "lib.es2015.symbol.d.ts"),
+    ("es2015.symbol.wellknown", "lib.es2015.symbol.wellknown.d.ts"),
+    ("es2016.array.include", "lib.es2016.array.include.d.ts"),
+    ("es2016.intl", "lib.es2016.intl.d.ts"),
+    ("es2017.arraybuffer", "lib.es2017.arraybuffer.d.ts"),
+    ("es2017.date", "lib.es2017.date.d.ts"),
+    ("es2017.object", "lib.es2017.object.d.ts"),
+    ("es2017.sharedmemory", "lib.es2017.sharedmemory.d.ts"),
+    ("es2017.string", "lib.es2017.string.d.ts"),
+    ("es2017.intl", "lib.es2017.intl.d.ts"),
+    ("es2017.typedarrays", "lib.es2017.typedarrays.d.ts"),
+    ("es2018.asyncgenerator", "lib.es2018.asyncgenerator.d.ts"),
+    ("es2018.asynciterable", "lib.es2018.asynciterable.d.ts"),
+    ("es2018.intl", "lib.es2018.intl.d.ts"),
+    ("es2018.promise", "lib.es2018.promise.d.ts"),
+    ("es2018.regexp", "lib.es2018.regexp.d.ts"),
+    ("es2019.array", "lib.es2019.array.d.ts"),
+    ("es2019.object", "lib.es2019.object.d.ts"),
+    ("es2019.string", "lib.es2019.string.d.ts"),
+    ("es2019.symbol", "lib.es2019.symbol.d.ts"),
+    ("es2019.intl", "lib.es2019.intl.d.ts"),
+    ("es2020.bigint", "lib.es2020.bigint.d.ts"),
+    ("es2020.date", "lib.es2020.date.d.ts"),
+    ("es2020.promise", "lib.es2020.promise.d.ts"),
+    ("es2020.sharedmemory", "lib.es2020.sharedmemory.d.ts"),
+    ("es2020.string", "lib.es2020.string.d.ts"),
+    ("es2020.symbol.wellknown", "lib.es2020.symbol.wellknown.d.ts"),
+    ("es2020.intl", "lib.es2020.intl.d.ts"),
+    ("es2020.number", "lib.es2020.number.d.ts"),
+    ("es2021.promise", "lib.es2021.promise.d.ts"),
+    ("es2021.string", "lib.es2021.string.d.ts"),
+    ("es2021.weakref", "lib.es2021.weakref.d.ts"),
+    ("es2021.intl", "lib.es2021.intl.d.ts"),
+    ("es2022.array", "lib.es2022.array.d.ts"),
+    ("es2022.error", "lib.es2022.error.d.ts"),
+    ("es2022.intl", "lib.es2022.intl.d.ts"),
+    ("es2022.object", "lib.es2022.object.d.ts"),
+    ("es2022.string", "lib.es2022.string.d.ts"),
+    ("es2022.regexp", "lib.es2022.regexp.d.ts"),
+    ("es2023.array", "lib.es2023.array.d.ts"),
+    ("es2023.collection", "lib.es2023.collection.d.ts"),
+    ("es2023.intl", "lib.es2023.intl.d.ts"),
+    ("es2024.arraybuffer", "lib.es2024.arraybuffer.d.ts"),
+    ("es2024.collection", "lib.es2024.collection.d.ts"),
+    ("es2024.object", "lib.es2024.object.d.ts"),
+    ("es2024.promise", "lib.es2024.promise.d.ts"),
+    ("es2024.regexp", "lib.es2024.regexp.d.ts"),
+    ("es2024.sharedmemory", "lib.es2024.sharedmemory.d.ts"),
+    ("es2024.string", "lib.es2024.string.d.ts"),
+    ("es2025.collection", "lib.es2025.collection.d.ts"),
+    ("es2025.float16", "lib.es2025.float16.d.ts"),
+    ("es2025.intl", "lib.es2025.intl.d.ts"),
+    ("es2025.iterator", "lib.es2025.iterator.d.ts"),
+    ("es2025.promise", "lib.es2025.promise.d.ts"),
+    ("es2025.regexp", "lib.es2025.regexp.d.ts"),
+    // Fallback for backward compatibility
+    ("esnext.asynciterable", "lib.es2018.asynciterable.d.ts"),
+    ("esnext.symbol", "lib.es2019.symbol.d.ts"),
+    ("esnext.bigint", "lib.es2020.bigint.d.ts"),
+    ("esnext.weakref", "lib.es2021.weakref.d.ts"),
+    ("esnext.object", "lib.es2024.object.d.ts"),
+    ("esnext.regexp", "lib.es2024.regexp.d.ts"),
+    ("esnext.string", "lib.es2024.string.d.ts"),
+    ("esnext.float16", "lib.es2025.float16.d.ts"),
+    ("esnext.iterator", "lib.es2025.iterator.d.ts"),
+    ("esnext.promise", "lib.es2025.promise.d.ts"),
+    // ESNext By-feature options
+    ("esnext.array", "lib.esnext.array.d.ts"),
+    ("esnext.collection", "lib.esnext.collection.d.ts"),
+    ("esnext.date", "lib.esnext.date.d.ts"),
+    ("esnext.decorators", "lib.esnext.decorators.d.ts"),
+    ("esnext.disposable", "lib.esnext.disposable.d.ts"),
+    ("esnext.error", "lib.esnext.error.d.ts"),
+    ("esnext.intl", "lib.esnext.intl.d.ts"),
+    ("esnext.sharedmemory", "lib.esnext.sharedmemory.d.ts"),
+    ("esnext.temporal", "lib.esnext.temporal.d.ts"),
+    ("esnext.typedarrays", "lib.esnext.typedarrays.d.ts"),
+    // Decorators
+    ("decorators", "lib.decorators.d.ts"),
+    ("decorators.legacy", "lib.decorators.legacy.d.ts"),
+];
+
+// Go: tsoptions/enummaps.go:132 GetLibFileName
+// Checks if `lib_name` is a valid lib name or lib file name and converts a lib
+// name to its file name. Used for `compilerOptions.lib` entries and for
+// `/// <reference lib="..." />` directives.
+// PORT: Go returns `(string, bool)`; this returns `Option<String>`. Go
+// `tspath.ToFileNameLowerCase` is approximated by `to_lowercase`; lib names
+// are ASCII.
+#[must_use]
+pub fn tsoptions_get_lib_file_name(lib_name: &str) -> Option<String> {
+    let lib_name = lib_name.to_lowercase();
+    // Go: LibFilesSet.Has(libName)
+    if LIB_MAP.iter().any(|(_, file)| *file == lib_name) {
+        return Some(lib_name);
     }
+    LIB_MAP
+        .iter()
+        .find(|(key, _)| *key == lib_name)
+        .map(|(_, file)| (*file).to_owned())
 }
 
 fn serialize_source_map(source_map: &SourceMap, source_root: Option<&str>) -> String {

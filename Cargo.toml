@@ -29,6 +29,7 @@ members = [
     "crates/ts_evaluator",
     "crates/ts_vfs",
     "crates/ts_watch",
+    "crates/ts_goport",
     "tools/ts_ast_codegen",
     "tools/ts_compare",
     "tools/ts_diagnostics_codegen",

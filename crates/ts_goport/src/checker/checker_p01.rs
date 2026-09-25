@@ -1,0 +1,1568 @@
+//! Port of `checker/checker.go` lines 1-1115: checker-wide key and state
+//! types, `Checker` itself (with the arenas from `PORTING.md`), and
+//! `NewChecker` as `Checker::new`.
+//!
+//! PORT: Go consts in this range (`CheckMode`, `TypeSystemPropertyName`,
+//! `WideningKind`, `CachedTypeKind`, `InferenceFlags`, `InferencePriority`,
+//! `DeclarationMeaning`, `DeclarationSpaces`, `IntrinsicTypeKind`,
+//! `MappedTypeModifiers`, `MappedTypeNameTypeKind`, `ReferenceHint`,
+//! `TypeFacts`, `IterationUse`, `IterationTypeKind`) are generated in
+//! `crate::flags` and are not repeated here.
+
+use crate::prelude::*;
+use std::sync::LazyLock;
+use ts_diagnostics::Message;
+use ts_jsnum::{Number, PseudoBigInt};
+
+// Go: checker/checker.go:51 TypeSystemEntity
+// PORT: Go `TypeSystemEntity any`. The Go callers of `pushTypeResolution`
+// pass a declaration node, a symbol, a type or a signature, so the Rust type
+// is an enum over those four handles. Go compares targets with `==` on the
+// interface value, which is handle equality here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TypeSystemEntity {
+    Node(Node),
+    Symbol(SymbolId),
+    Type(TypeId),
+    Signature(SignatureId),
+}
+
+impl From<Node> for TypeSystemEntity {
+    fn from(node: Node) -> Self {
+        TypeSystemEntity::Node(node)
+    }
+}
+
+impl From<SymbolId> for TypeSystemEntity {
+    fn from(symbol: SymbolId) -> Self {
+        TypeSystemEntity::Symbol(symbol)
+    }
+}
+
+impl From<TypeId> for TypeSystemEntity {
+    fn from(t: TypeId) -> Self {
+        TypeSystemEntity::Type(t)
+    }
+}
+
+impl From<SignatureId> for TypeSystemEntity {
+    fn from(sig: SignatureId) -> Self {
+        TypeSystemEntity::Signature(sig)
+    }
+}
+
+// Go: checker/checker.go:67 TypeResolution
+#[derive(Clone, Copy, Debug)]
+pub struct TypeResolution {
+    pub target: TypeSystemEntity,
+    pub property_name: TypeSystemPropertyName,
+    pub result: bool,
+}
+
+// ContextualInfo
+
+// Go: checker/checker.go:75 ContextualInfo
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ContextualInfo {
+    pub node: Node,
+    pub t: TypeId,
+    pub is_cache: bool,
+}
+
+// InferenceContextInfo
+
+// Go: checker/checker.go:83 InferenceContextInfo
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InferenceContextInfo {
+    pub node: Node,
+    pub context: InferenceContextId,
+}
+
+// EnumLiteralKey
+
+// Go: checker/checker.go:101 EnumLiteralKey
+// PORT: Go `value any` holds a `LiteralValue`. `LiteralValue` is not `Hash`
+// (it holds `f64`), so the key stores `LiteralValueKey`, which compares like
+// Go interface `==` (numbers as floats, -0 == +0). Build it with
+// `LiteralValueKey::from(&value)`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EnumLiteralKey {
+    pub enum_symbol: SymbolId,
+    pub value: LiteralValueKey,
+}
+
+// PORT: hashable form of `LiteralValue` for Go map keys of type `any`.
+// NaN cannot match in Go; Go callers keep NaN out of these keys.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LiteralValueKey {
+    String(String),
+    Number(NumberKey),
+    Bool(bool),
+    PseudoBigInt(PseudoBigIntKey),
+}
+
+impl From<&LiteralValue> for LiteralValueKey {
+    fn from(v: &LiteralValue) -> Self {
+        match v {
+            LiteralValue::String(s) => LiteralValueKey::String(s.clone()),
+            LiteralValue::Number(n) => LiteralValueKey::Number(NumberKey::from(Number(n.0))),
+            LiteralValue::Bool(b) => LiteralValueKey::Bool(*b),
+            LiteralValue::PseudoBigInt(p) => LiteralValueKey::PseudoBigInt(PseudoBigIntKey::from(p)),
+        }
+    }
+}
+
+// EnumRelationKey
+
+// Go: checker/checker.go:108 EnumRelationKey
+// PORT: Go `ast.SymbolId` values are symbol handles here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct EnumRelationKey {
+    pub source_id: SymbolId,
+    pub target_id: SymbolId,
+}
+
+// CachedTypeKey
+
+// Go: checker/checker.go:141 CachedTypeKey
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CachedTypeKey {
+    pub kind: CachedTypeKind,
+    pub type_id: TypeId,
+}
+
+// NarrowedTypeKey
+
+// Go: checker/checker.go:148 NarrowedTypeKey
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct NarrowedTypeKey {
+    pub t: TypeId,
+    pub candidate: TypeId,
+    pub assume_true: bool,
+    pub check_derived: bool,
+}
+
+// UnionOfUnionKey
+
+// Go: checker/checker.go:157 UnionOfUnionKey
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnionOfUnionKey {
+    pub id1: TypeId,
+    pub id2: TypeId,
+    pub r: UnionReduction,
+    pub a: CacheHashKey,
+}
+
+// CachedSignatureKey
+
+// Go: checker/checker.go:166 CachedSignatureKey
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CachedSignatureKey {
+    pub sig: SignatureId,
+    /// Type list key or one of the special keys below
+    pub key: CacheHashKey,
+}
+
+// PORT: Go `CacheHashKey(xxh3.HashString128(s))`. A streaming xxh3 hash of
+// the same bytes equals the one-shot hash, so this goes through the Go
+// `keyBuilder` port (`KeyBuilder`) that owns the hashing.
+fn signature_key_of(s: &str) -> CacheHashKey {
+    let mut b = KeyBuilder::default();
+    b.write_string(s);
+    b.hash()
+}
+
+// Go: checker/checker.go:171 SignatureKeyErased
+// PORT: Go package vars become lazily computed statics. Read with
+// `*SIGNATURE_KEY_ERASED`.
+pub static SIGNATURE_KEY_ERASED: LazyLock<CacheHashKey> = LazyLock::new(|| signature_key_of("-"));
+// Go: checker/checker.go:172 SignatureKeyCanonical
+pub static SIGNATURE_KEY_CANONICAL: LazyLock<CacheHashKey> = LazyLock::new(|| signature_key_of("*"));
+// Go: checker/checker.go:173 SignatureKeyBase
+pub static SIGNATURE_KEY_BASE: LazyLock<CacheHashKey> = LazyLock::new(|| signature_key_of("#"));
+// Go: checker/checker.go:174 SignatureKeyInner
+pub static SIGNATURE_KEY_INNER: LazyLock<CacheHashKey> = LazyLock::new(|| signature_key_of("<"));
+// Go: checker/checker.go:175 SignatureKeyOuter
+pub static SIGNATURE_KEY_OUTER: LazyLock<CacheHashKey> = LazyLock::new(|| signature_key_of(">"));
+
+// StringMappingKey
+
+// Go: checker/checker.go:180 StringMappingKey
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StringMappingKey {
+    pub s: SymbolId,
+    pub t: TypeId,
+}
+
+// AssignmentReducedKey
+
+// Go: checker/checker.go:187 AssignmentReducedKey
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct AssignmentReducedKey {
+    pub id1: TypeId,
+    pub id2: TypeId,
+}
+
+// DiscriminatedContextualTypeKey
+
+// Go: checker/checker.go:194 DiscriminatedContextualTypeKey
+// PORT: Go `ast.NodeId` is the node handle here (a `Node` is unique per
+// node, like a Go node id).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DiscriminatedContextualTypeKey {
+    pub node_id: Node,
+    pub type_id: TypeId,
+}
+
+// InstantiationExpressionKey
+
+// Go: checker/checker.go:201 InstantiationExpressionKey
+// PORT: Go `ast.NodeId` is the node handle here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct InstantiationExpressionKey {
+    pub node_id: Node,
+    pub type_id: TypeId,
+}
+
+// SubstitutionTypeKey
+
+// Go: checker/checker.go:208 SubstitutionTypeKey
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SubstitutionTypeKey {
+    pub base_id: TypeId,
+    pub constraint_id: TypeId,
+}
+
+// ReverseMappedTypeKey
+
+// Go: checker/checker.go:215 ReverseMappedTypeKey
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ReverseMappedTypeKey {
+    pub source_id: TypeId,
+    pub target_id: TypeId,
+    pub constraint_id: TypeId,
+}
+
+// IterationTypesKey
+
+// Go: checker/checker.go:223 IterationTypesKey
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct IterationTypesKey {
+    pub type_id: TypeId,
+    pub use_: IterationUse,
+}
+
+// PropertiesTypesKey
+
+// Go: checker/checker.go:230 PropertiesTypesKey
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PropertiesTypesKey {
+    pub type_id: TypeId,
+    pub include: TypeFlags,
+    pub include_origin: bool,
+    pub unresolved_members: bool,
+}
+
+// NonExistentPropertyKey
+
+// Go: checker/checker.go:239 NonExistentPropertyKey
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct NonExistentPropertyKey {
+    pub prop_node: Node,
+    pub containing_type: TypeId,
+    pub is_unchecked_js: bool,
+}
+
+// FlowLoopKey
+
+// Go: checker/checker.go:247 FlowLoopKey
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FlowLoopKey {
+    pub flow_node: FlowNodeId,
+    pub ref_key: CacheHashKey,
+}
+
+// Go: checker/checker.go:252 FlowLoopInfo
+#[derive(Clone)]
+pub struct FlowLoopInfo {
+    pub key: FlowLoopKey,
+    pub types: Vec<TypeId>,
+}
+
+// InferenceContext
+
+// Go: checker/checker.go:269 InferenceContext
+#[derive(Clone)]
+pub struct InferenceContext {
+    /// Inferences made for each type parameter
+    pub inferences: Vec<InferenceInfo>,
+    /// Generic signature for which inferences are made (if any)
+    pub signature: SignatureId,
+    /// Inference flags
+    pub flags: InferenceFlags,
+    /// Type comparer function
+    pub compare_types: TypeComparer,
+    /// Mapper that fixes inferences
+    pub mapper: MapperId,
+    /// Mapper that doesn't fix inferences
+    pub non_fixing_mapper: MapperId,
+    /// Type mapper for inferences from return types (if any)
+    pub return_mapper: MapperId,
+    /// Type mapper for inferences from return types of outer function (if any)
+    pub outer_return_mapper: MapperId,
+    /// Inferred type parameters for function result
+    pub inferred_type_parameters: Vec<TypeId>,
+    pub intra_expression_inference_sites: Vec<IntraExpressionInferenceSite>,
+}
+
+// PORT: `Default` exists only for the dummy entry at index 0 of
+// `Checker::inference_contexts`. Go never has a nil `compareTypes`, so the
+// placeholder comparer panics like a call of a nil Go func.
+impl Default for InferenceContext {
+    fn default() -> Self {
+        InferenceContext {
+            inferences: Vec::new(),
+            signature: SignatureId::NIL,
+            flags: InferenceFlags::NONE,
+            compare_types: nil_type_comparer(),
+            mapper: MapperId::NIL,
+            non_fixing_mapper: MapperId::NIL,
+            return_mapper: MapperId::NIL,
+            outer_return_mapper: MapperId::NIL,
+            inferred_type_parameters: Vec::new(),
+            intra_expression_inference_sites: Vec::new(),
+        }
+    }
+}
+
+// Go: checker/checker.go:282 InferenceInfo
+// PORT: Go `*InferenceInfo` is an index into `InferenceContext::inferences`.
+#[derive(Clone, Debug, Default)]
+pub struct InferenceInfo {
+    /// Type parameter for which inferences are being made
+    pub type_parameter: TypeId,
+    /// Candidates in covariant positions
+    pub candidates: Vec<TypeId>,
+    /// Candidates in contravariant positions
+    pub contra_candidates: Vec<TypeId>,
+    /// Cache for resolved inferred type
+    pub inferred_type: TypeId,
+    /// Priority of current inference set
+    pub priority: InferencePriority,
+    /// True if all inferences are to top level occurrences
+    pub top_level: bool,
+    /// True if inferences are fixed
+    pub is_fixed: bool,
+    /// Implied arity (or -1)
+    pub implied_arity: i32,
+}
+
+// Go: checker/checker.go:314 IntraExpressionInferenceSite
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IntraExpressionInferenceSite {
+    pub node: Node,
+    pub t: TypeId,
+}
+
+// Go: checker/checker.go:348 intrinsicTypeKinds
+// PORT: Go package map var; read with `INTRINSIC_TYPE_KINDS.get(name)`.
+pub static INTRINSIC_TYPE_KINDS: LazyLock<FxHashMap<&'static str, IntrinsicTypeKind>> = LazyLock::new(|| {
+    let mut m = FxHashMap::default();
+    m.insert("Uppercase", IntrinsicTypeKind::UPPERCASE);
+    m.insert("Lowercase", IntrinsicTypeKind::LOWERCASE);
+    m.insert("Capitalize", IntrinsicTypeKind::CAPITALIZE);
+    m.insert("Uncapitalize", IntrinsicTypeKind::UNCAPITALIZE);
+    m.insert("NoInfer", IntrinsicTypeKind::NO_INFER);
+    m
+});
+
+// Go: checker/checker.go:514 IterationTypes
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct IterationTypes {
+    pub yield_type: TypeId,
+    pub return_type: TypeId,
+    pub next_type: TypeId,
+}
+
+// Go: checker/checker.go:528 IterationTypesResolver
+// PORT: Go func fields are `Rc<dyn Fn(&mut Checker, ...)>`. Go
+// `*diagnostics.Message` fields are always set by
+// `initializeIterationResolvers`, so they are plain `&'static Message`.
+#[derive(Clone)]
+pub struct IterationTypesResolver {
+    pub iterator_symbol_name: String,
+    pub get_global_iterator_type: GlobalTypeFn,
+    pub get_global_iterable_type: GlobalTypeFn,
+    pub get_global_iterable_type_checked: GlobalTypeFn,
+    pub get_global_iterable_iterator_type: GlobalTypeFn,
+    pub get_global_iterable_iterator_type_checked: GlobalTypeFn,
+    pub get_global_iterator_object_type: GlobalTypeFn,
+    pub get_global_generator_type: GlobalTypeFn,
+    pub get_global_builtin_iterator_types: GlobalTypesFn,
+    pub resolve_iteration_type: Rc<dyn Fn(&mut Checker, TypeId, Node) -> TypeId>,
+    pub must_have_a_next_method_diagnostic: &'static Message,
+    pub must_be_a_method_diagnostic: &'static Message,
+    pub must_have_a_value_diagnostic: &'static Message,
+}
+
+// Go: checker/checker.go:544 WideningContext
+// PORT: Go `*WideningContext` links become `Rc<RefCell<WideningContext>>`;
+// a nil parent is `None`.
+#[derive(Clone, Default)]
+pub struct WideningContext {
+    /// Parent context
+    pub parent: Option<Rc<RefCell<WideningContext>>>,
+    /// Name of property in parent
+    pub property_name: String,
+    /// Types of siblings
+    pub siblings: Vec<TypeId>,
+    /// Properties occurring in sibling object literals
+    pub resolved_properties: Vec<SymbolId>,
+    pub child_contexts: FxHashMap<String, Rc<RefCell<WideningContext>>>,
+    pub widened_types: FxHashMap<TypeId, TypeId>,
+}
+
+// Go: checker/checker.go:553 maxSerializationLevel
+pub const MAX_SERIALIZATION_LEVEL: i32 = 2;
+
+// PORT: Go `Program` and `Host` interfaces (checker.go:555-583) are not
+// ported as types. The checker reads the installed program through
+// `prog()` and the free functions in `program.rs`.
+
+// PORT: Go `map[jsnum.Number]*Type` key. `ts_jsnum::Number` is not `Hash`.
+// Go compares float map keys with `==`, so -0 and +0 are one key. NaN never
+// matches in Go; `getNumberLiteralType` caches NaN separately, so NaN never
+// reaches this key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct NumberKey(pub u64);
+
+impl From<Number> for NumberKey {
+    fn from(n: Number) -> Self {
+        let v = if n.0 == 0.0 { 0.0 } else { n.0 };
+        NumberKey(v.to_bits())
+    }
+}
+
+// PORT: Go `map[jsnum.PseudoBigInt]*Type` key. `ts_jsnum::PseudoBigInt` is
+// not `Hash`. Go compares the struct fields, like this key.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PseudoBigIntKey {
+    pub negative: bool,
+    pub base10_value: String,
+}
+
+impl From<&PseudoBigInt> for PseudoBigIntKey {
+    fn from(v: &PseudoBigInt) -> Self {
+        PseudoBigIntKey { negative: v.negative, base10_value: v.base10_value.clone() }
+    }
+}
+
+impl From<PseudoBigInt> for PseudoBigIntKey {
+    fn from(v: PseudoBigInt) -> Self {
+        PseudoBigIntKey { negative: v.negative, base10_value: v.base10_value }
+    }
+}
+
+// PORT: Go `symbolTableID` (symbolaccessibility.go:402) is used as a map key
+// in a `Checker` field, so its Rust type name is fixed here. The owner of
+// symbolaccessibility.go defines its constants and constructors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SymbolTableID(pub u64);
+
+// PORT: type aliases for the Go func-typed `Checker` fields. They are plain
+// aliases, so code that spells out the `Rc<dyn Fn ...>` type still matches.
+/// Go `func() *Type`.
+pub type GlobalTypeFn = Rc<dyn Fn(&mut Checker) -> TypeId>;
+/// Go `func() *ast.Symbol`.
+pub type GlobalSymbolFn = Rc<dyn Fn(&mut Checker) -> SymbolId>;
+/// Go `func() []*Type`.
+pub type GlobalTypesFn = Rc<dyn Fn(&mut Checker) -> Vec<TypeId>>;
+/// Go `func(*Type) bool`.
+pub type TypeTestFn = Rc<dyn Fn(&mut Checker, TypeId) -> bool>;
+/// Go `func(*ast.Node) bool`.
+pub type NodeTestFn = Rc<dyn Fn(&mut Checker, Node) -> bool>;
+/// Go `func(location, name, meaning, nameNotFoundMessage, isUse, excludeGlobals) *ast.Symbol`.
+/// A nil Go message is `None`.
+pub type ResolveNameFn = Rc<dyn Fn(&mut Checker, Node, &str, SymbolFlags, Option<&'static Message>, bool, bool) -> SymbolId>;
+/// Go `func(*ast.Symbol, *ast.Symbol) int`.
+pub type CompareSymbolsFn = Rc<dyn Fn(&mut Checker, SymbolId, SymbolId) -> i32>;
+/// Go `func([]*ast.Symbol, []*ast.Symbol) int`.
+pub type CompareSymbolChainsFn = Rc<dyn Fn(&mut Checker, &[SymbolId], &[SymbolId]) -> i32>;
+
+// PORT: placeholders for Go func fields before `NewChecker` assigns them.
+// Calling one panics, like calling a nil Go func.
+fn nil_global_type_fn() -> GlobalTypeFn {
+    Rc::new(|_: &mut Checker| -> TypeId { panic!("call of nil func") })
+}
+
+fn nil_global_symbol_fn() -> GlobalSymbolFn {
+    Rc::new(|_: &mut Checker| -> SymbolId { panic!("call of nil func") })
+}
+
+fn nil_type_test_fn() -> TypeTestFn {
+    Rc::new(|_: &mut Checker, _: TypeId| -> bool { panic!("call of nil func") })
+}
+
+fn nil_node_test_fn() -> NodeTestFn {
+    Rc::new(|_: &mut Checker, _: Node| -> bool { panic!("call of nil func") })
+}
+
+fn nil_resolve_name_fn() -> ResolveNameFn {
+    Rc::new(|_: &mut Checker, _: Node, _: &str, _: SymbolFlags, _: Option<&'static Message>, _: bool, _: bool| -> SymbolId {
+        panic!("call of nil func")
+    })
+}
+
+fn nil_compare_symbols_fn() -> CompareSymbolsFn {
+    Rc::new(|_: &mut Checker, _: SymbolId, _: SymbolId| -> i32 { panic!("call of nil func") })
+}
+
+fn nil_compare_symbol_chains_fn() -> CompareSymbolChainsFn {
+    Rc::new(|_: &mut Checker, _: &[SymbolId], _: &[SymbolId]| -> i32 { panic!("call of nil func") })
+}
+
+fn nil_type_comparer() -> TypeComparer {
+    Rc::new(|_: &mut Checker, _: TypeId, _: TypeId, _: bool| -> Ternary { panic!("call of nil func") })
+}
+
+fn nil_evaluator() -> Evaluator {
+    Rc::new(|_: &mut Checker, _: Node, _: Node| -> EvaluatorResult { panic!("call of nil func") })
+}
+
+// PORT: stands for a nil `*IterationTypesResolver`. Every func field panics.
+// The message fields need some `&'static Message`; Go never reads them from
+// a nil resolver, so the values are never observed.
+fn nil_iteration_types_resolver() -> Rc<IterationTypesResolver> {
+    Rc::new(IterationTypesResolver {
+        iterator_symbol_name: String::new(),
+        get_global_iterator_type: nil_global_type_fn(),
+        get_global_iterable_type: nil_global_type_fn(),
+        get_global_iterable_type_checked: nil_global_type_fn(),
+        get_global_iterable_iterator_type: nil_global_type_fn(),
+        get_global_iterable_iterator_type_checked: nil_global_type_fn(),
+        get_global_iterator_object_type: nil_global_type_fn(),
+        get_global_generator_type: nil_global_type_fn(),
+        get_global_builtin_iterator_types: Rc::new(|_: &mut Checker| -> Vec<TypeId> { panic!("call of nil func") }),
+        resolve_iteration_type: Rc::new(|_: &mut Checker, _: TypeId, _: Node| -> TypeId { panic!("call of nil func") }),
+        must_have_a_next_method_diagnostic: diag::An_iterator_must_have_a_next_method,
+        must_be_a_method_diagnostic: diag::The_0_property_of_an_iterator_must_be_a_method,
+        must_have_a_value_diagnostic: diag::The_type_returned_by_the_0_method_of_an_iterator_must_have_a_value_property,
+    })
+}
+
+// Checker
+
+// Go: checker/checker.go:590 Checker
+// PORT: Go fields keep their order and snake names. Differences:
+// - `program Program` is `&'static GoProgram` (the installed `prog()`).
+// - `symbolArena`, `signatureArena`, `indexInfoArena` are replaced by the
+//   arenas at the end (`symbols`, `types`, `signatures`, `index_infos`,
+//   `type_predicates`, `mappers`, `inference_contexts`), see `PORTING.md`.
+// - `regExpScanner` (Go scanner), `emitResolver`, `emitResolverOnce`,
+//   `ctx`, `mu` and `tracer` are out of scope (scanner object, emit
+//   resolver, cancellation, concurrency, tracing) and are not fields.
+// - `sync.Once` fields become `bool` "done" flags.
+// - `*T` pools and shared structs (`*Relation`, `*Relater`, `*FlowState`,
+//   `*InferenceState`) are `Rc<RefCell<T>>`; nil-able ones are `Option`.
+// - `ast.NodeId` map keys are `Node` handles.
+pub struct Checker {
+    pub id: u32,
+    pub program: &'static GoProgram,
+    pub compiler_options: &'static CompilerOptions,
+    pub files: Vec<Node>,
+    pub file_index_map: FxHashMap<Node, i32>,
+    pub compare_symbols: CompareSymbolsFn,
+    pub compare_symbol_chains: CompareSymbolChainsFn,
+    pub type_count: u32,
+    pub symbol_count: u32,
+    pub signature_count: u32,
+    pub total_instantiation_count: u32,
+    pub instantiation_count: u32,
+    pub instantiation_depth: u32,
+    pub inline_level: i32,
+    pub serialization_level: i32,
+    pub current_node: Node,
+    pub variance_type_parameter: TypeId,
+    pub language_version: ScriptTarget,
+    pub module_kind: ModuleKind,
+    pub module_resolution_kind: ModuleResolutionKind,
+    pub is_inference_partially_blocked: bool,
+    pub legacy_decorators: bool,
+    pub emit_standard_class_fields: bool,
+    pub strict_null_checks: bool,
+    pub strict_function_types: bool,
+    pub strict_bind_call_apply: bool,
+    pub strict_property_initialization: bool,
+    pub strict_builtin_iterator_return: bool,
+    pub no_implicit_any: bool,
+    pub no_implicit_this: bool,
+    pub use_unknown_in_catch_variables: bool,
+    pub exact_optional_property_types: bool,
+    pub can_collect_symbol_alias_accessibility_data: bool,
+    pub was_canceled: bool,
+    pub save_deferred_diagnostics: bool,
+    pub array_variances: Vec<VarianceFlags>,
+    pub globals: SymbolTable,
+    pub evaluate: Evaluator,
+    pub string_literal_types: FxHashMap<String, TypeId>,
+    pub number_literal_types: FxHashMap<NumberKey, TypeId>,
+    pub nan_type: TypeId,
+    pub bigint_literal_types: FxHashMap<PseudoBigIntKey, TypeId>,
+    pub enum_literal_types: FxHashMap<EnumLiteralKey, TypeId>,
+    pub enum_nan_literal_types: FxHashMap<SymbolId, TypeId>,
+    pub indexed_access_types: FxHashMap<CacheHashKey, TypeId>,
+    pub template_literal_types: FxHashMap<CacheHashKey, TypeId>,
+    pub string_mapping_types: FxHashMap<StringMappingKey, TypeId>,
+    pub unique_es_symbol_types: FxHashMap<SymbolId, TypeId>,
+    pub this_expando_kinds: FxHashMap<SymbolId, ThisAssignmentDeclarationKind>,
+    pub this_expando_locations: FxHashMap<SymbolId, Node>,
+    pub subtype_reduction_cache: FxHashMap<CacheHashKey, Vec<TypeId>>,
+    pub cached_types: FxHashMap<CachedTypeKey, TypeId>,
+    pub cached_signatures: FxHashMap<CachedSignatureKey, SignatureId>,
+    pub undefined_properties: FxHashMap<String, SymbolId>,
+    pub narrowed_types: FxHashMap<NarrowedTypeKey, TypeId>,
+    pub assignment_reduced_types: FxHashMap<AssignmentReducedKey, TypeId>,
+    pub discriminated_contextual_types: FxHashMap<DiscriminatedContextualTypeKey, TypeId>,
+    pub instantiation_expression_types: FxHashMap<InstantiationExpressionKey, TypeId>,
+    pub substitution_types: FxHashMap<SubstitutionTypeKey, TypeId>,
+    pub reverse_mapped_cache: FxHashMap<ReverseMappedTypeKey, TypeId>,
+    pub reverse_homomorphic_mapped_cache: FxHashMap<ReverseMappedTypeKey, TypeId>,
+    pub iteration_types_cache: FxHashMap<IterationTypesKey, IterationTypes>,
+    pub marker_types: FxHashSet<TypeId>,
+    pub undefined_symbol: SymbolId,
+    pub arguments_symbol: SymbolId,
+    pub require_symbol: SymbolId,
+    pub unknown_symbol: SymbolId,
+    pub unresolved_symbols: FxHashMap<String, SymbolId>,
+    pub error_types: FxHashMap<CacheHashKey, TypeId>,
+    pub module_symbols: FxHashMap<Node, SymbolId>,
+    pub global_this_symbol: SymbolId,
+    pub symbol_table_alias_cache: FxHashMap<SymbolTableID, Vec<SymbolId>>,
+    pub class_expression_name_tables: FxHashMap<Node, SymbolTable>,
+    pub resolve_name: ResolveNameFn,
+    pub resolve_name_for_symbol_suggestion: ResolveNameFn,
+    pub tuple_types: FxHashMap<CacheHashKey, TypeId>,
+    pub union_types: FxHashMap<CacheHashKey, TypeId>,
+    pub union_of_union_types: FxHashMap<UnionOfUnionKey, TypeId>,
+    pub intersection_types: FxHashMap<CacheHashKey, TypeId>,
+    pub properties_types: FxHashMap<PropertiesTypesKey, TypeId>,
+    pub diagnostics: DiagnosticsCollection,
+    pub suggestion_diagnostics: DiagnosticsCollection,
+    pub merged_symbols: FxHashMap<SymbolId, SymbolId>,
+    pub factory: NodeFactory,
+    pub node_links: LinkStore<Node, NodeLinks>,
+    pub signature_links: LinkStore<Node, SignatureLinks>,
+    pub symbol_node_links: LinkStore<Node, SymbolNodeLinks>,
+    pub type_node_links: LinkStore<Node, TypeNodeLinks>,
+    pub enum_member_links: LinkStore<Node, EnumMemberLinks>,
+    pub assertion_links: LinkStore<Node, AssertionLinks>,
+    pub array_literal_links: LinkStore<Node, ArrayLiteralLinks>,
+    pub switch_statement_links: LinkStore<Node, SwitchStatementLinks>,
+    pub jsx_element_links: LinkStore<Node, JsxElementLinks>,
+    pub symbol_reference_links: LinkStore<SymbolId, SymbolReferenceLinks>,
+    pub value_symbol_links: LinkStore<SymbolId, ValueSymbolLinks>,
+    pub mapped_symbol_links: LinkStore<SymbolId, MappedSymbolLinks>,
+    pub deferred_symbol_links: LinkStore<SymbolId, DeferredSymbolLinks>,
+    pub alias_symbol_links: LinkStore<SymbolId, AliasSymbolLinks>,
+    pub module_symbol_links: LinkStore<SymbolId, ModuleSymbolLinks>,
+    pub late_bound_links: LinkStore<SymbolId, LateBoundLinks>,
+    pub export_type_links: LinkStore<SymbolId, ExportTypeLinks>,
+    pub members_and_exports_links: LinkStore<SymbolId, MembersAndExportsLinks>,
+    pub type_alias_links: LinkStore<SymbolId, TypeAliasLinks>,
+    pub declared_type_links: LinkStore<SymbolId, DeclaredTypeLinks>,
+    pub spread_links: LinkStore<SymbolId, SpreadLinks>,
+    pub variance_links: LinkStore<SymbolId, VarianceLinks>,
+    /// Go `ReverseMappedSymbolLinks` (exported field name).
+    pub reverse_mapped_symbol_links: LinkStore<SymbolId, ReverseMappedSymbolLinks>,
+    pub marked_assignment_symbol_links: LinkStore<SymbolId, MarkedAssignmentSymbolLinks>,
+    pub symbol_container_links: LinkStore<SymbolId, ContainingSymbolLinks>,
+    pub source_file_links: LinkStore<Node, SourceFileLinks>,
+    pub pattern_for_type: FxHashMap<TypeId, Node>,
+    pub context_free_types: FxHashMap<Node, TypeId>,
+    pub any_type: TypeId,
+    pub auto_type: TypeId,
+    pub wildcard_type: TypeId,
+    pub blocked_string_type: TypeId,
+    pub error_type: TypeId,
+    pub unresolved_type: TypeId,
+    pub non_inferrable_any_type: TypeId,
+    pub intrinsic_marker_type: TypeId,
+    pub unknown_type: TypeId,
+    pub undefined_type: TypeId,
+    pub undefined_widening_type: TypeId,
+    pub missing_type: TypeId,
+    pub undefined_or_missing_type: TypeId,
+    pub optional_type: TypeId,
+    pub null_type: TypeId,
+    pub null_widening_type: TypeId,
+    pub string_type: TypeId,
+    pub number_type: TypeId,
+    pub bigint_type: TypeId,
+    pub regular_false_type: TypeId,
+    pub false_type: TypeId,
+    pub regular_true_type: TypeId,
+    pub true_type: TypeId,
+    pub boolean_type: TypeId,
+    pub es_symbol_type: TypeId,
+    pub void_type: TypeId,
+    pub never_type: TypeId,
+    pub silent_never_type: TypeId,
+    pub implicit_never_type: TypeId,
+    pub unreachable_never_type: TypeId,
+    pub non_primitive_type: TypeId,
+    pub string_or_number_type: TypeId,
+    pub string_number_symbol_type: TypeId,
+    pub number_or_big_int_type: TypeId,
+    pub template_constraint_type: TypeId,
+    pub numeric_string_type: TypeId,
+    pub unique_literal_type: TypeId,
+    pub unique_literal_mapper: MapperId,
+    pub reliability_flags: RelationComparisonResult,
+    pub report_unreliable_mapper: MapperId,
+    pub report_unmeasurable_mapper: MapperId,
+    pub restrictive_mapper: MapperId,
+    pub permissive_mapper: MapperId,
+    pub empty_object_type: TypeId,
+    pub empty_jsx_object_type: TypeId,
+    pub empty_fresh_jsx_object_type: TypeId,
+    pub empty_type_literal_type: TypeId,
+    pub unknown_empty_object_type: TypeId,
+    pub unknown_union_type: TypeId,
+    pub empty_generic_type: TypeId,
+    pub any_function_type: TypeId,
+    pub no_constraint_type: TypeId,
+    pub circular_constraint_type: TypeId,
+    pub resolving_default_type: TypeId,
+    pub marker_super_type: TypeId,
+    pub marker_sub_type: TypeId,
+    pub marker_other_type: TypeId,
+    pub marker_super_type_for_check: TypeId,
+    pub marker_sub_type_for_check: TypeId,
+    pub no_type_predicate: TypePredicateId,
+    pub any_signature: SignatureId,
+    pub unknown_signature: SignatureId,
+    pub resolving_signature: SignatureId,
+    pub silent_never_signature: SignatureId,
+    pub cached_arguments_referenced: FxHashMap<Node, bool>,
+    pub enum_number_index_info: IndexInfoId,
+    pub any_base_type_index_info: IndexInfoId,
+    pub pattern_ambient_modules: Vec<PatternAmbientModule>,
+    pub pattern_ambient_module_augmentations: SymbolTable,
+    pub global_object_type: TypeId,
+    pub global_function_type: TypeId,
+    pub global_callable_function_type: TypeId,
+    pub global_newable_function_type: TypeId,
+    pub global_array_type: TypeId,
+    pub global_readonly_array_type: TypeId,
+    pub global_string_type: TypeId,
+    pub global_number_type: TypeId,
+    pub global_boolean_type: TypeId,
+    pub global_reg_exp_type: TypeId,
+    pub global_this_type: TypeId,
+    pub any_array_type: TypeId,
+    pub auto_array_type: TypeId,
+    pub any_readonly_array_type: TypeId,
+    pub deferred_global_import_meta_expression_type: TypeId,
+    pub contextual_binding_patterns: Vec<Node>,
+    pub empty_string_type: TypeId,
+    pub zero_type: TypeId,
+    pub zero_big_int_type: TypeId,
+    pub typeof_type: TypeId,
+    pub type_resolutions: Vec<TypeResolution>,
+    pub resolution_start: i32,
+    pub in_variance_computation: bool,
+    /// Go `*int`; nil is `None`.
+    pub apparent_argument_count: Option<i32>,
+    pub last_get_combined_node_flags_node: Node,
+    pub last_get_combined_node_flags_result: NodeFlags,
+    pub last_get_combined_modifier_flags_node: Node,
+    pub last_get_combined_modifier_flags_result: ModifierFlags,
+    pub freeinference_state: Option<Rc<RefCell<InferenceState>>>,
+    pub free_flow_state: Option<Rc<RefCell<FlowState>>>,
+    pub flow_loop_cache: FxHashMap<FlowLoopKey, TypeId>,
+    pub flow_loop_stack: Vec<FlowLoopInfo>,
+    pub shared_flows: Vec<SharedFlow>,
+    pub antecedent_types: Vec<TypeId>,
+    pub flow_analysis_disabled: bool,
+    pub flow_invocation_count: i32,
+    pub flow_type_cache: FxHashMap<Node, TypeId>,
+    pub last_flow_node: FlowNodeId,
+    pub last_flow_node_reachable: bool,
+    pub flow_node_reachable: FxHashMap<FlowNodeId, bool>,
+    pub flow_node_post_super: FxHashMap<FlowNodeId, bool>,
+    pub renamed_binding_elements_in_types: Vec<Node>,
+    pub contextual_infos: Vec<ContextualInfo>,
+    pub inference_context_infos: Vec<InferenceContextInfo>,
+    pub awaited_type_stack: Vec<TypeId>,
+    pub reverse_mapped_source_stack: Vec<TypeId>,
+    pub reverse_mapped_target_stack: Vec<TypeId>,
+    pub reverse_expanding_flags: ExpandingFlags,
+    pub free_relater: Option<Rc<RefCell<Relater>>>,
+    pub subtype_relation: Rc<RefCell<Relation>>,
+    pub strict_subtype_relation: Rc<RefCell<Relation>>,
+    pub assignable_relation: Rc<RefCell<Relation>>,
+    pub comparable_relation: Rc<RefCell<Relation>>,
+    pub identity_relation: Rc<RefCell<Relation>>,
+    pub enum_relation: FxHashMap<EnumRelationKey, RelationComparisonResult>,
+    pub get_global_es_symbol_type: GlobalTypeFn,
+    pub get_global_big_int_type: GlobalTypeFn,
+    pub get_global_import_meta_type: GlobalTypeFn,
+    pub get_global_import_attributes_type: GlobalTypeFn,
+    pub get_global_import_attributes_type_checked: GlobalTypeFn,
+    pub get_global_non_nullable_type_alias_or_nil: GlobalSymbolFn,
+    pub get_global_extract_symbol: GlobalSymbolFn,
+    pub get_global_disposable_type: GlobalTypeFn,
+    pub get_global_async_disposable_type: GlobalTypeFn,
+    pub get_global_awaited_symbol: GlobalSymbolFn,
+    pub get_global_awaited_symbol_or_nil: GlobalSymbolFn,
+    pub get_global_na_n_symbol_or_nil: GlobalSymbolFn,
+    pub get_global_record_symbol: GlobalSymbolFn,
+    pub get_global_template_strings_array_type: GlobalTypeFn,
+    pub get_global_es_symbol_constructor_symbol_or_nil: GlobalSymbolFn,
+    pub get_global_es_symbol_constructor_type_symbol_or_nil: GlobalSymbolFn,
+    pub get_global_import_call_options_type: GlobalTypeFn,
+    pub get_global_import_call_options_type_checked: GlobalTypeFn,
+    pub get_global_promise_type: GlobalTypeFn,
+    pub get_global_promise_type_checked: GlobalTypeFn,
+    pub get_global_promise_like_type: GlobalTypeFn,
+    pub get_global_promise_constructor_symbol: GlobalSymbolFn,
+    pub get_global_promise_constructor_symbol_or_nil: GlobalSymbolFn,
+    pub get_global_omit_symbol: GlobalSymbolFn,
+    pub get_global_no_infer_symbol_or_nil: GlobalSymbolFn,
+    pub get_global_iterator_type: GlobalTypeFn,
+    pub get_global_iterable_type: GlobalTypeFn,
+    pub get_global_iterable_type_checked: GlobalTypeFn,
+    pub get_global_iterable_iterator_type: GlobalTypeFn,
+    pub get_global_iterable_iterator_type_checked: GlobalTypeFn,
+    pub get_global_iterator_object_type: GlobalTypeFn,
+    pub get_global_generator_type: GlobalTypeFn,
+    pub get_global_async_iterator_type: GlobalTypeFn,
+    pub get_global_async_iterable_type: GlobalTypeFn,
+    pub get_global_async_iterable_type_checked: GlobalTypeFn,
+    pub get_global_async_iterable_iterator_type: GlobalTypeFn,
+    pub get_global_async_iterable_iterator_type_checked: GlobalTypeFn,
+    pub get_global_async_iterator_object_type: GlobalTypeFn,
+    pub get_global_async_generator_type: GlobalTypeFn,
+    pub get_global_iterator_yield_result_type: GlobalTypeFn,
+    pub get_global_iterator_return_result_type: GlobalTypeFn,
+    pub get_global_typed_property_descriptor_type: GlobalTypeFn,
+    pub get_global_class_decorator_context_type: GlobalTypeFn,
+    pub get_global_class_method_decorator_context_type: GlobalTypeFn,
+    pub get_global_class_getter_decorator_context_type: GlobalTypeFn,
+    pub get_global_class_setter_decorator_context_type: GlobalTypeFn,
+    /// Go field with a typo; Go never assigns it.
+    pub get_global_class_accessor_decorator_contxt_type: GlobalTypeFn,
+    pub get_global_class_accessor_decorator_context_type: GlobalTypeFn,
+    pub get_global_class_accessor_decorator_target_type: GlobalTypeFn,
+    pub get_global_class_accessor_decorator_result_type: GlobalTypeFn,
+    pub get_global_class_field_decorator_context_type: GlobalTypeFn,
+    /// Go `*IterationTypesResolver`. PORT: not an `Option`; Go reads these
+    /// only after `initializeIterationResolvers`, so a placeholder whose func
+    /// fields panic (see `nil_iteration_types_resolver`) stands for nil.
+    pub sync_iteration_types_resolver: Rc<IterationTypesResolver>,
+    pub async_iteration_types_resolver: Rc<IterationTypesResolver>,
+    pub is_primitive_or_object_or_empty_type: TypeTestFn,
+    pub contains_missing_type: TypeTestFn,
+    pub could_contain_type_variables: TypeTestFn,
+    pub is_string_index_signature_only_type: TypeTestFn,
+    pub mark_node_assignments: NodeTestFn,
+    pub compare_types_assignable: TypeComparer,
+    pub _jsx_namespace: String,
+    pub _jsx_factory_entity: Node,
+    pub skip_direct_inference_nodes: FxHashSet<Node>,
+    pub packages_map: FxHashMap<String, bool>,
+    pub active_mappers: Vec<MapperId>,
+    pub active_type_mappers_caches: Vec<FxHashMap<CacheHashKey, TypeId>>,
+    /// Go `ambientModulesOnce sync.Once`: true once the Go `Do` body ran.
+    pub ambient_modules_once: bool,
+    pub ambient_modules: Vec<SymbolId>,
+    pub within_unreachable_code: bool,
+    pub reported_unreachable_nodes: FxHashSet<Node>,
+    pub non_existent_properties: FxHashSet<NonExistentPropertyKey>,
+    pub deferred_diagnostic_callbacks: Vec<Rc<dyn Fn(&mut Checker)>>,
+    /// Go `typeToStringNodeBuilder` (`getNodeBuilder` caches it).
+    pub type_to_string_nodebuilder: Option<Rc<RefCell<NodeBuilder>>>,
+
+    // Arenas (PORTING.md "Checker data"). Index 0 of each is a dummy entry
+    // so handle value 0 stays nil.
+    pub symbols: SymbolArena,
+    pub types: Vec<Type>,
+    pub signatures: Vec<Signature>,
+    pub index_infos: Vec<IndexInfo>,
+    pub type_predicates: Vec<TypePredicate>,
+    pub mappers: Vec<TypeMapper>,
+    pub inference_contexts: Vec<InferenceContext>,
+}
+
+// Arena accessors (PORTING.md "Checker data"). Handles index their arena
+// directly; index 0 is the nil dummy.
+impl Checker {
+    #[must_use]
+    pub fn sym(&self, s: SymbolId) -> &Symbol {
+        self.symbols.sym(s)
+    }
+
+    pub fn sym_mut(&mut self, s: SymbolId) -> &mut Symbol {
+        self.symbols.sym_mut(s)
+    }
+
+    #[must_use]
+    pub fn ty(&self, t: TypeId) -> &Type {
+        debug_assert!(t.is_some(), "nil type dereference");
+        &self.types[t.index()]
+    }
+
+    pub fn ty_mut(&mut self, t: TypeId) -> &mut Type {
+        debug_assert!(t.is_some(), "nil type dereference");
+        &mut self.types[t.index()]
+    }
+
+    #[must_use]
+    pub fn sig(&self, s: SignatureId) -> &Signature {
+        debug_assert!(s.is_some(), "nil signature dereference");
+        &self.signatures[s.index()]
+    }
+
+    pub fn sig_mut(&mut self, s: SignatureId) -> &mut Signature {
+        debug_assert!(s.is_some(), "nil signature dereference");
+        &mut self.signatures[s.index()]
+    }
+
+    #[must_use]
+    pub fn index_info(&self, i: IndexInfoId) -> &IndexInfo {
+        debug_assert!(i.is_some(), "nil index info dereference");
+        &self.index_infos[i.index()]
+    }
+
+    pub fn index_info_mut(&mut self, i: IndexInfoId) -> &mut IndexInfo {
+        debug_assert!(i.is_some(), "nil index info dereference");
+        &mut self.index_infos[i.index()]
+    }
+
+    #[must_use]
+    pub fn pred(&self, p: TypePredicateId) -> &TypePredicate {
+        debug_assert!(p.is_some(), "nil type predicate dereference");
+        &self.type_predicates[p.index()]
+    }
+
+    pub fn pred_mut(&mut self, p: TypePredicateId) -> &mut TypePredicate {
+        debug_assert!(p.is_some(), "nil type predicate dereference");
+        &mut self.type_predicates[p.index()]
+    }
+
+    #[must_use]
+    pub fn mapper(&self, m: MapperId) -> &TypeMapper {
+        debug_assert!(m.is_some(), "nil mapper dereference");
+        &self.mappers[m.index()]
+    }
+
+    pub fn mapper_mut(&mut self, m: MapperId) -> &mut TypeMapper {
+        debug_assert!(m.is_some(), "nil mapper dereference");
+        &mut self.mappers[m.index()]
+    }
+
+    #[must_use]
+    pub fn inference_context(&self, c: InferenceContextId) -> &InferenceContext {
+        debug_assert!(c.is_some(), "nil inference context dereference");
+        &self.inference_contexts[c.index()]
+    }
+
+    pub fn inference_context_mut(&mut self, c: InferenceContextId) -> &mut InferenceContext {
+        debug_assert!(c.is_some(), "nil inference context dereference");
+        &mut self.inference_contexts[c.index()]
+    }
+}
+
+// Go: checker/checker.go:902 NewChecker
+// PORT: Go `NewChecker(program) (*Checker, *sync.Mutex)` becomes
+// `Checker::new(checker_index)`. The program is the installed `prog()`; the
+// mutex and tracer are dropped. Go `c.id = nextCheckerID.Add(1)` numbers
+// checkers from 1 in creation order; the pool creates them in index order,
+// so `id = checker_index + 1`.
+// PORT: Go binds every file (`program.BindSourceFiles`) before it creates
+// checkers. Here the first checker binds any unbound file into the shared
+// `prog().bound_symbols`, then clones it as its own symbol arena.
+// PORT: Go `make(map...)` initializations are the `Default` values in the
+// struct literal; Go nil fields not set here keep their nil value.
+impl Checker {
+    pub fn new(checker_index: usize) -> Checker {
+        let program = prog();
+        let bound_symbols = program
+            .bound_symbols
+            .get_or_init(|| {
+                let mut symbols = SymbolArena::new();
+                for file in &program.files {
+                    bind_source_file(file.root, &mut symbols);
+                }
+                symbols
+            })
+            .clone();
+        let compiler_options = &program.options;
+        let files: Vec<Node> = program.files.iter().map(|f| f.root).collect();
+        let file_index_map = create_file_index_map(&files);
+        let mut c = Checker {
+            id: u32::try_from(checker_index + 1).expect("checker id overflow"),
+            program,
+            compiler_options,
+            files,
+            file_index_map,
+            compare_symbols: nil_compare_symbols_fn(),
+            compare_symbol_chains: nil_compare_symbol_chains_fn(),
+            type_count: 0,
+            symbol_count: 0,
+            signature_count: 0,
+            total_instantiation_count: 0,
+            instantiation_count: 0,
+            instantiation_depth: 0,
+            inline_level: 0,
+            serialization_level: 0,
+            current_node: Node::NIL,
+            variance_type_parameter: TypeId::NIL,
+            language_version: compiler_options.get_emit_script_target(),
+            module_kind: compiler_options.get_emit_module_kind(),
+            module_resolution_kind: compiler_options.get_module_resolution_kind(),
+            is_inference_partially_blocked: false,
+            legacy_decorators: compiler_options.experimental_decorators == Tristate::True,
+            emit_standard_class_fields: compiler_options.get_emit_standard_class_fields(),
+            strict_null_checks: compiler_options.get_strict_option_value(compiler_options.strict_null_checks),
+            strict_function_types: compiler_options.get_strict_option_value(compiler_options.strict_function_types),
+            strict_bind_call_apply: compiler_options.get_strict_option_value(compiler_options.strict_bind_call_apply),
+            strict_property_initialization: compiler_options
+                .get_strict_option_value(compiler_options.strict_property_initialization),
+            strict_builtin_iterator_return: compiler_options
+                .get_strict_option_value(compiler_options.strict_builtin_iterator_return),
+            no_implicit_any: compiler_options.get_strict_option_value(compiler_options.no_implicit_any),
+            no_implicit_this: compiler_options.get_strict_option_value(compiler_options.no_implicit_this),
+            use_unknown_in_catch_variables: compiler_options
+                .get_strict_option_value(compiler_options.use_unknown_in_catch_variables),
+            exact_optional_property_types: compiler_options.exact_optional_property_types == Tristate::True,
+            can_collect_symbol_alias_accessibility_data: compiler_options.verbatim_module_syntax.is_false_or_unknown(),
+            was_canceled: false,
+            save_deferred_diagnostics: false,
+            array_variances: vec![VarianceFlags::COVARIANT],
+            globals: SymbolTable::NIL,
+            evaluate: nil_evaluator(),
+            string_literal_types: FxHashMap::default(),
+            number_literal_types: FxHashMap::default(),
+            nan_type: TypeId::NIL,
+            bigint_literal_types: FxHashMap::default(),
+            enum_literal_types: FxHashMap::default(),
+            enum_nan_literal_types: FxHashMap::default(),
+            indexed_access_types: FxHashMap::default(),
+            template_literal_types: FxHashMap::default(),
+            string_mapping_types: FxHashMap::default(),
+            unique_es_symbol_types: FxHashMap::default(),
+            this_expando_kinds: FxHashMap::default(),
+            this_expando_locations: FxHashMap::default(),
+            subtype_reduction_cache: FxHashMap::default(),
+            cached_types: FxHashMap::default(),
+            cached_signatures: FxHashMap::default(),
+            undefined_properties: FxHashMap::default(),
+            narrowed_types: FxHashMap::default(),
+            assignment_reduced_types: FxHashMap::default(),
+            discriminated_contextual_types: FxHashMap::default(),
+            instantiation_expression_types: FxHashMap::default(),
+            substitution_types: FxHashMap::default(),
+            reverse_mapped_cache: FxHashMap::default(),
+            reverse_homomorphic_mapped_cache: FxHashMap::default(),
+            iteration_types_cache: FxHashMap::default(),
+            marker_types: FxHashSet::default(),
+            undefined_symbol: SymbolId::NIL,
+            arguments_symbol: SymbolId::NIL,
+            require_symbol: SymbolId::NIL,
+            unknown_symbol: SymbolId::NIL,
+            unresolved_symbols: FxHashMap::default(),
+            error_types: FxHashMap::default(),
+            module_symbols: FxHashMap::default(),
+            global_this_symbol: SymbolId::NIL,
+            symbol_table_alias_cache: FxHashMap::default(),
+            class_expression_name_tables: FxHashMap::default(),
+            resolve_name: nil_resolve_name_fn(),
+            resolve_name_for_symbol_suggestion: nil_resolve_name_fn(),
+            tuple_types: FxHashMap::default(),
+            union_types: FxHashMap::default(),
+            union_of_union_types: FxHashMap::default(),
+            intersection_types: FxHashMap::default(),
+            properties_types: FxHashMap::default(),
+            diagnostics: DiagnosticsCollection::default(),
+            suggestion_diagnostics: DiagnosticsCollection::default(),
+            merged_symbols: FxHashMap::default(),
+            // Go leaves `factory` as the zero `ast.NodeFactory`.
+            factory: NodeFactory::new(),
+            node_links: LinkStore::default(),
+            signature_links: LinkStore::default(),
+            symbol_node_links: LinkStore::default(),
+            type_node_links: LinkStore::default(),
+            enum_member_links: LinkStore::default(),
+            assertion_links: LinkStore::default(),
+            array_literal_links: LinkStore::default(),
+            switch_statement_links: LinkStore::default(),
+            jsx_element_links: LinkStore::default(),
+            symbol_reference_links: LinkStore::default(),
+            value_symbol_links: LinkStore::default(),
+            mapped_symbol_links: LinkStore::default(),
+            deferred_symbol_links: LinkStore::default(),
+            alias_symbol_links: LinkStore::default(),
+            module_symbol_links: LinkStore::default(),
+            late_bound_links: LinkStore::default(),
+            export_type_links: LinkStore::default(),
+            members_and_exports_links: LinkStore::default(),
+            type_alias_links: LinkStore::default(),
+            declared_type_links: LinkStore::default(),
+            spread_links: LinkStore::default(),
+            variance_links: LinkStore::default(),
+            reverse_mapped_symbol_links: LinkStore::default(),
+            marked_assignment_symbol_links: LinkStore::default(),
+            symbol_container_links: LinkStore::default(),
+            source_file_links: LinkStore::default(),
+            pattern_for_type: FxHashMap::default(),
+            context_free_types: FxHashMap::default(),
+            any_type: TypeId::NIL,
+            auto_type: TypeId::NIL,
+            wildcard_type: TypeId::NIL,
+            blocked_string_type: TypeId::NIL,
+            error_type: TypeId::NIL,
+            unresolved_type: TypeId::NIL,
+            non_inferrable_any_type: TypeId::NIL,
+            intrinsic_marker_type: TypeId::NIL,
+            unknown_type: TypeId::NIL,
+            undefined_type: TypeId::NIL,
+            undefined_widening_type: TypeId::NIL,
+            missing_type: TypeId::NIL,
+            undefined_or_missing_type: TypeId::NIL,
+            optional_type: TypeId::NIL,
+            null_type: TypeId::NIL,
+            null_widening_type: TypeId::NIL,
+            string_type: TypeId::NIL,
+            number_type: TypeId::NIL,
+            bigint_type: TypeId::NIL,
+            regular_false_type: TypeId::NIL,
+            false_type: TypeId::NIL,
+            regular_true_type: TypeId::NIL,
+            true_type: TypeId::NIL,
+            boolean_type: TypeId::NIL,
+            es_symbol_type: TypeId::NIL,
+            void_type: TypeId::NIL,
+            never_type: TypeId::NIL,
+            silent_never_type: TypeId::NIL,
+            implicit_never_type: TypeId::NIL,
+            unreachable_never_type: TypeId::NIL,
+            non_primitive_type: TypeId::NIL,
+            string_or_number_type: TypeId::NIL,
+            string_number_symbol_type: TypeId::NIL,
+            number_or_big_int_type: TypeId::NIL,
+            template_constraint_type: TypeId::NIL,
+            numeric_string_type: TypeId::NIL,
+            unique_literal_type: TypeId::NIL,
+            unique_literal_mapper: MapperId::NIL,
+            reliability_flags: RelationComparisonResult::default(),
+            report_unreliable_mapper: MapperId::NIL,
+            report_unmeasurable_mapper: MapperId::NIL,
+            restrictive_mapper: MapperId::NIL,
+            permissive_mapper: MapperId::NIL,
+            empty_object_type: TypeId::NIL,
+            empty_jsx_object_type: TypeId::NIL,
+            empty_fresh_jsx_object_type: TypeId::NIL,
+            empty_type_literal_type: TypeId::NIL,
+            unknown_empty_object_type: TypeId::NIL,
+            unknown_union_type: TypeId::NIL,
+            empty_generic_type: TypeId::NIL,
+            any_function_type: TypeId::NIL,
+            no_constraint_type: TypeId::NIL,
+            circular_constraint_type: TypeId::NIL,
+            resolving_default_type: TypeId::NIL,
+            marker_super_type: TypeId::NIL,
+            marker_sub_type: TypeId::NIL,
+            marker_other_type: TypeId::NIL,
+            marker_super_type_for_check: TypeId::NIL,
+            marker_sub_type_for_check: TypeId::NIL,
+            no_type_predicate: TypePredicateId::NIL,
+            any_signature: SignatureId::NIL,
+            unknown_signature: SignatureId::NIL,
+            resolving_signature: SignatureId::NIL,
+            silent_never_signature: SignatureId::NIL,
+            cached_arguments_referenced: FxHashMap::default(),
+            enum_number_index_info: IndexInfoId::NIL,
+            any_base_type_index_info: IndexInfoId::NIL,
+            pattern_ambient_modules: Vec::new(),
+            pattern_ambient_module_augmentations: SymbolTable::NIL,
+            global_object_type: TypeId::NIL,
+            global_function_type: TypeId::NIL,
+            global_callable_function_type: TypeId::NIL,
+            global_newable_function_type: TypeId::NIL,
+            global_array_type: TypeId::NIL,
+            global_readonly_array_type: TypeId::NIL,
+            global_string_type: TypeId::NIL,
+            global_number_type: TypeId::NIL,
+            global_boolean_type: TypeId::NIL,
+            global_reg_exp_type: TypeId::NIL,
+            global_this_type: TypeId::NIL,
+            any_array_type: TypeId::NIL,
+            auto_array_type: TypeId::NIL,
+            any_readonly_array_type: TypeId::NIL,
+            deferred_global_import_meta_expression_type: TypeId::NIL,
+            contextual_binding_patterns: Vec::new(),
+            empty_string_type: TypeId::NIL,
+            zero_type: TypeId::NIL,
+            zero_big_int_type: TypeId::NIL,
+            typeof_type: TypeId::NIL,
+            type_resolutions: Vec::new(),
+            resolution_start: 0,
+            in_variance_computation: false,
+            apparent_argument_count: None,
+            last_get_combined_node_flags_node: Node::NIL,
+            last_get_combined_node_flags_result: NodeFlags::default(),
+            last_get_combined_modifier_flags_node: Node::NIL,
+            last_get_combined_modifier_flags_result: ModifierFlags::default(),
+            freeinference_state: None,
+            free_flow_state: None,
+            flow_loop_cache: FxHashMap::default(),
+            flow_loop_stack: Vec::new(),
+            shared_flows: Vec::new(),
+            antecedent_types: Vec::new(),
+            flow_analysis_disabled: false,
+            flow_invocation_count: 0,
+            flow_type_cache: FxHashMap::default(),
+            last_flow_node: FlowNodeId::NIL,
+            last_flow_node_reachable: false,
+            flow_node_reachable: FxHashMap::default(),
+            flow_node_post_super: FxHashMap::default(),
+            renamed_binding_elements_in_types: Vec::new(),
+            contextual_infos: Vec::new(),
+            inference_context_infos: Vec::new(),
+            awaited_type_stack: Vec::new(),
+            reverse_mapped_source_stack: Vec::new(),
+            reverse_mapped_target_stack: Vec::new(),
+            reverse_expanding_flags: ExpandingFlags::default(),
+            free_relater: None,
+            subtype_relation: Rc::new(RefCell::new(Relation::default())),
+            strict_subtype_relation: Rc::new(RefCell::new(Relation::default())),
+            assignable_relation: Rc::new(RefCell::new(Relation::default())),
+            comparable_relation: Rc::new(RefCell::new(Relation::default())),
+            identity_relation: Rc::new(RefCell::new(Relation::default())),
+            enum_relation: FxHashMap::default(),
+            get_global_es_symbol_type: nil_global_type_fn(),
+            get_global_big_int_type: nil_global_type_fn(),
+            get_global_import_meta_type: nil_global_type_fn(),
+            get_global_import_attributes_type: nil_global_type_fn(),
+            get_global_import_attributes_type_checked: nil_global_type_fn(),
+            get_global_non_nullable_type_alias_or_nil: nil_global_symbol_fn(),
+            get_global_extract_symbol: nil_global_symbol_fn(),
+            get_global_disposable_type: nil_global_type_fn(),
+            get_global_async_disposable_type: nil_global_type_fn(),
+            get_global_awaited_symbol: nil_global_symbol_fn(),
+            get_global_awaited_symbol_or_nil: nil_global_symbol_fn(),
+            get_global_na_n_symbol_or_nil: nil_global_symbol_fn(),
+            get_global_record_symbol: nil_global_symbol_fn(),
+            get_global_template_strings_array_type: nil_global_type_fn(),
+            get_global_es_symbol_constructor_symbol_or_nil: nil_global_symbol_fn(),
+            get_global_es_symbol_constructor_type_symbol_or_nil: nil_global_symbol_fn(),
+            get_global_import_call_options_type: nil_global_type_fn(),
+            get_global_import_call_options_type_checked: nil_global_type_fn(),
+            get_global_promise_type: nil_global_type_fn(),
+            get_global_promise_type_checked: nil_global_type_fn(),
+            get_global_promise_like_type: nil_global_type_fn(),
+            get_global_promise_constructor_symbol: nil_global_symbol_fn(),
+            get_global_promise_constructor_symbol_or_nil: nil_global_symbol_fn(),
+            get_global_omit_symbol: nil_global_symbol_fn(),
+            get_global_no_infer_symbol_or_nil: nil_global_symbol_fn(),
+            get_global_iterator_type: nil_global_type_fn(),
+            get_global_iterable_type: nil_global_type_fn(),
+            get_global_iterable_type_checked: nil_global_type_fn(),
+            get_global_iterable_iterator_type: nil_global_type_fn(),
+            get_global_iterable_iterator_type_checked: nil_global_type_fn(),
+            get_global_iterator_object_type: nil_global_type_fn(),
+            get_global_generator_type: nil_global_type_fn(),
+            get_global_async_iterator_type: nil_global_type_fn(),
+            get_global_async_iterable_type: nil_global_type_fn(),
+            get_global_async_iterable_type_checked: nil_global_type_fn(),
+            get_global_async_iterable_iterator_type: nil_global_type_fn(),
+            get_global_async_iterable_iterator_type_checked: nil_global_type_fn(),
+            get_global_async_iterator_object_type: nil_global_type_fn(),
+            get_global_async_generator_type: nil_global_type_fn(),
+            get_global_iterator_yield_result_type: nil_global_type_fn(),
+            get_global_iterator_return_result_type: nil_global_type_fn(),
+            get_global_typed_property_descriptor_type: nil_global_type_fn(),
+            get_global_class_decorator_context_type: nil_global_type_fn(),
+            get_global_class_method_decorator_context_type: nil_global_type_fn(),
+            get_global_class_getter_decorator_context_type: nil_global_type_fn(),
+            get_global_class_setter_decorator_context_type: nil_global_type_fn(),
+            get_global_class_accessor_decorator_contxt_type: nil_global_type_fn(),
+            get_global_class_accessor_decorator_context_type: nil_global_type_fn(),
+            get_global_class_accessor_decorator_target_type: nil_global_type_fn(),
+            get_global_class_accessor_decorator_result_type: nil_global_type_fn(),
+            get_global_class_field_decorator_context_type: nil_global_type_fn(),
+            sync_iteration_types_resolver: nil_iteration_types_resolver(),
+            async_iteration_types_resolver: nil_iteration_types_resolver(),
+            is_primitive_or_object_or_empty_type: nil_type_test_fn(),
+            contains_missing_type: nil_type_test_fn(),
+            could_contain_type_variables: nil_type_test_fn(),
+            is_string_index_signature_only_type: nil_type_test_fn(),
+            mark_node_assignments: nil_node_test_fn(),
+            compare_types_assignable: nil_type_comparer(),
+            _jsx_namespace: String::new(),
+            _jsx_factory_entity: Node::NIL,
+            skip_direct_inference_nodes: FxHashSet::default(),
+            packages_map: FxHashMap::default(),
+            active_mappers: Vec::new(),
+            active_type_mappers_caches: Vec::new(),
+            ambient_modules_once: false,
+            ambient_modules: Vec::new(),
+            within_unreachable_code: false,
+            reported_unreachable_nodes: FxHashSet::default(),
+            non_existent_properties: FxHashSet::default(),
+            deferred_diagnostic_callbacks: Vec::new(),
+            type_to_string_nodebuilder: None,
+            symbols: bound_symbols,
+            types: vec![Type::default()],
+            signatures: vec![Signature::default()],
+            index_infos: vec![IndexInfo::default()],
+            type_predicates: vec![TypePredicate::default()],
+            mappers: vec![TypeMapper::default()],
+            inference_contexts: vec![InferenceContext::default()],
+        };
+        // Closure optimization
+        c.compare_symbols = Rc::new(|c: &mut Checker, s1: SymbolId, s2: SymbolId| -> i32 { c.compare_symbols_worker(s1, s2) });
+        // Closure optimization
+        c.compare_symbol_chains = Rc::new(|c: &mut Checker, a: &[SymbolId], b: &[SymbolId]| -> i32 {
+            c.compare_symbol_chains_worker(a, b)
+        });
+        // PORT: Go `make(ast.SymbolTable, n)` sizes the map; the arena table
+        // reserves the same capacity. `countGlobalSymbols` (checker_p02) is a
+        // `Checker` method because it reads the symbol arena.
+        let global_symbol_count = usize::try_from(c.count_global_symbols(&c.files)).expect("negative symbol count");
+        c.globals = c.symbols.new_table();
+        c.symbols.tables[c.globals.index()].reserve(global_symbol_count);
+        c.evaluate = new_evaluator(
+            Rc::new(|c: &mut Checker, expr: Node, location: Node| -> EvaluatorResult { c.evaluate_entity(expr, location) }),
+            OuterExpressionKinds::OEK_PARENTHESES,
+        );
+        c.undefined_symbol = c.new_symbol(SymbolFlags::PROPERTY, "undefined");
+        c.arguments_symbol = c.new_symbol(SymbolFlags::PROPERTY, "arguments");
+        c.require_symbol = c.new_symbol(SymbolFlags::PROPERTY, "require");
+        c.unknown_symbol = c.new_symbol(SymbolFlags::PROPERTY, "unknown");
+        c.global_this_symbol = c.new_symbol_ex(SymbolFlags::MODULE, "globalThis", CheckFlags::READONLY);
+        let globals = c.globals;
+        let global_this_symbol = c.global_this_symbol;
+        c.sym_mut(global_this_symbol).exports = globals;
+        let global_this_name = c.sym(global_this_symbol).name.clone();
+        c.symbols.set(globals, global_this_name, global_this_symbol);
+        // PORT: Go stores the bound method `resolver.Resolve`. The resolver is
+        // moved into the closure, which forwards the checker.
+        let resolver = c.create_name_resolver();
+        c.resolve_name = Rc::new(
+            move |c: &mut Checker,
+                  location: Node,
+                  name: &str,
+                  meaning: SymbolFlags,
+                  name_not_found_message: Option<&'static Message>,
+                  is_use: bool,
+                  exclude_globals: bool|
+                  -> SymbolId { resolver.resolve(c, location, name, meaning, name_not_found_message, is_use, exclude_globals) },
+        );
+        let suggestion_resolver = c.create_name_resolver_for_suggestion();
+        c.resolve_name_for_symbol_suggestion = Rc::new(
+            move |c: &mut Checker,
+                  location: Node,
+                  name: &str,
+                  meaning: SymbolFlags,
+                  name_not_found_message: Option<&'static Message>,
+                  is_use: bool,
+                  exclude_globals: bool|
+                  -> SymbolId {
+                suggestion_resolver.resolve(c, location, name, meaning, name_not_found_message, is_use, exclude_globals)
+            },
+        );
+        c.any_type = c.new_intrinsic_type(TypeFlags::ANY, "any");
+        c.auto_type = c.new_intrinsic_type_ex(TypeFlags::ANY, "any", ObjectFlags::NON_INFERRABLE_TYPE);
+        c.wildcard_type = c.new_intrinsic_type(TypeFlags::ANY, "any");
+        c.blocked_string_type = c.new_intrinsic_type(TypeFlags::ANY, "any");
+        c.error_type = c.new_intrinsic_type(TypeFlags::ANY, "error");
+        c.unresolved_type = c.new_intrinsic_type(TypeFlags::ANY, "unresolved");
+        c.non_inferrable_any_type = c.new_intrinsic_type_ex(TypeFlags::ANY, "any", ObjectFlags::CONTAINS_WIDENING_TYPE);
+        c.intrinsic_marker_type = c.new_intrinsic_type(TypeFlags::ANY, "intrinsic");
+        c.unknown_type = c.new_intrinsic_type(TypeFlags::UNKNOWN, "unknown");
+        c.undefined_type = c.new_intrinsic_type(TypeFlags::UNDEFINED, "undefined");
+        c.undefined_widening_type = c.create_widening_type(c.undefined_type);
+        c.missing_type = c.new_intrinsic_type(TypeFlags::UNDEFINED, "undefined");
+        c.undefined_or_missing_type = if c.exact_optional_property_types { c.missing_type } else { c.undefined_type };
+        c.optional_type = c.new_intrinsic_type(TypeFlags::UNDEFINED, "undefined");
+        c.null_type = c.new_intrinsic_type(TypeFlags::NULL, "null");
+        c.null_widening_type = c.create_widening_type(c.null_type);
+        c.string_type = c.new_intrinsic_type(TypeFlags::STRING, "string");
+        c.number_type = c.new_intrinsic_type(TypeFlags::NUMBER, "number");
+        c.bigint_type = c.new_intrinsic_type(TypeFlags::BIG_INT, "bigint");
+        // PORT: Go `value any` is `Option<LiteralValue>` (see `LiteralType`).
+        c.regular_false_type = c.new_literal_type(TypeFlags::BOOLEAN_LITERAL, Some(LiteralValue::Bool(false)), TypeId::NIL);
+        c.false_type = c.new_literal_type(TypeFlags::BOOLEAN_LITERAL, Some(LiteralValue::Bool(false)), c.regular_false_type);
+        let (regular_false_type, false_type) = (c.regular_false_type, c.false_type);
+        c.ty_mut(regular_false_type).as_literal_type_mut().fresh_type = false_type;
+        c.ty_mut(false_type).as_literal_type_mut().fresh_type = false_type;
+        c.regular_true_type = c.new_literal_type(TypeFlags::BOOLEAN_LITERAL, Some(LiteralValue::Bool(true)), TypeId::NIL);
+        c.true_type = c.new_literal_type(TypeFlags::BOOLEAN_LITERAL, Some(LiteralValue::Bool(true)), c.regular_true_type);
+        let (regular_true_type, true_type) = (c.regular_true_type, c.true_type);
+        c.ty_mut(regular_true_type).as_literal_type_mut().fresh_type = true_type;
+        c.ty_mut(true_type).as_literal_type_mut().fresh_type = true_type;
+        c.boolean_type = c.get_union_type(&[c.regular_false_type, c.regular_true_type]);
+        c.es_symbol_type = c.new_intrinsic_type(TypeFlags::ES_SYMBOL, "symbol");
+        c.void_type = c.new_intrinsic_type(TypeFlags::VOID, "void");
+        c.never_type = c.new_intrinsic_type(TypeFlags::NEVER, "never");
+        c.silent_never_type = c.new_intrinsic_type_ex(TypeFlags::NEVER, "never", ObjectFlags::NON_INFERRABLE_TYPE);
+        c.implicit_never_type = c.new_intrinsic_type(TypeFlags::NEVER, "never");
+        c.unreachable_never_type = c.new_intrinsic_type(TypeFlags::NEVER, "never");
+        c.non_primitive_type = c.new_intrinsic_type(TypeFlags::NON_PRIMITIVE, "object");
+        c.string_or_number_type = c.get_union_type(&[c.string_type, c.number_type]);
+        c.string_number_symbol_type = c.get_union_type(&[c.string_type, c.number_type, c.es_symbol_type]);
+        c.number_or_big_int_type = c.get_union_type(&[c.number_type, c.bigint_type]);
+        // The `${number}` type
+        c.numeric_string_type = c.get_template_literal_type(&[String::new(), String::new()], &[c.number_type]);
+        c.template_constraint_type =
+            c.get_union_type(&[c.string_type, c.number_type, c.boolean_type, c.bigint_type, c.null_type, c.undefined_type]);
+        // Special `never` flagged by union reduction to behave as a literal
+        c.unique_literal_type = c.new_intrinsic_type(TypeFlags::NEVER, "never");
+        c.unique_literal_mapper =
+            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId { c.get_unique_literal_type_for_type_parameter(t) }));
+        c.report_unreliable_mapper =
+            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId { c.report_unreliable_worker(t) }));
+        c.report_unmeasurable_mapper =
+            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId { c.report_unmeasurable_worker(t) }));
+        c.restrictive_mapper =
+            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId { c.restrictive_mapper_worker(t) }));
+        c.permissive_mapper =
+            c.new_function_type_mapper(Rc::new(|c: &mut Checker, t: TypeId| -> TypeId { c.permissive_mapper_worker(t) }));
+        c.empty_object_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
+        c.empty_jsx_object_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
+        c.empty_fresh_jsx_object_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
+        let type_literal_symbol = c.new_symbol(SymbolFlags::TYPE_LITERAL, INTERNAL_SYMBOL_NAME_TYPE);
+        c.empty_type_literal_type = c.new_anonymous_type(type_literal_symbol, SymbolTable::NIL, &[], &[], &[]);
+        c.unknown_empty_object_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
+        c.unknown_union_type = c.create_unknown_union_type();
+        c.empty_generic_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
+        let empty_generic_type = c.empty_generic_type;
+        c.ty_mut(empty_generic_type).as_object_type_mut().instantiations = Some(FxHashMap::default());
+        c.any_function_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
+        let any_function_type = c.any_function_type;
+        c.ty_mut(any_function_type).object_flags |= ObjectFlags::NON_INFERRABLE_TYPE;
+        c.no_constraint_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
+        c.circular_constraint_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
+        c.resolving_default_type = c.new_anonymous_type(SymbolId::NIL /*symbol*/, SymbolTable::NIL, &[], &[], &[]);
+        c.marker_super_type = c.new_type_parameter(SymbolId::NIL);
+        c.marker_sub_type = c.new_type_parameter(SymbolId::NIL);
+        let (marker_sub_type, marker_super_type) = (c.marker_sub_type, c.marker_super_type);
+        c.ty_mut(marker_sub_type).as_type_parameter_mut().constraint = marker_super_type;
+        c.marker_other_type = c.new_type_parameter(SymbolId::NIL);
+        c.marker_super_type_for_check = c.new_type_parameter(SymbolId::NIL);
+        c.marker_sub_type_for_check = c.new_type_parameter(SymbolId::NIL);
+        let (marker_sub_type_for_check, marker_super_type_for_check) = (c.marker_sub_type_for_check, c.marker_super_type_for_check);
+        c.ty_mut(marker_sub_type_for_check).as_type_parameter_mut().constraint = marker_super_type_for_check;
+        // PORT: Go builds `&TypePredicate{...}` directly (no constructor), so
+        // it is pushed into the arena here.
+        c.no_type_predicate = TypePredicateId(u32::try_from(c.type_predicates.len()).expect("type predicate overflow"));
+        let any_type = c.any_type;
+        c.type_predicates.push(TypePredicate {
+            kind: TypePredicateKind::IDENTIFIER,
+            parameter_index: 0,
+            parameter_name: "<<unresolved>>".to_string(),
+            t: any_type,
+        });
+        c.any_signature = c.new_signature(SignatureFlags::NONE, Node::NIL, &[], SymbolId::NIL, &[], c.any_type, TypePredicateId::NIL, 0);
+        c.unknown_signature =
+            c.new_signature(SignatureFlags::NONE, Node::NIL, &[], SymbolId::NIL, &[], c.error_type, TypePredicateId::NIL, 0);
+        c.resolving_signature =
+            c.new_signature(SignatureFlags::NONE, Node::NIL, &[], SymbolId::NIL, &[], c.any_type, TypePredicateId::NIL, 0);
+        c.silent_never_signature =
+            c.new_signature(SignatureFlags::NONE, Node::NIL, &[], SymbolId::NIL, &[], c.silent_never_type, TypePredicateId::NIL, 0);
+        // PORT: Go builds `&IndexInfo{...}` directly (no constructor), so they
+        // are pushed into the arena here.
+        c.enum_number_index_info = IndexInfoId(u32::try_from(c.index_infos.len()).expect("index info overflow"));
+        let (number_type, string_type) = (c.number_type, c.string_type);
+        c.index_infos.push(IndexInfo { key_type: number_type, value_type: string_type, is_readonly: true, ..IndexInfo::default() });
+        c.any_base_type_index_info = IndexInfoId(u32::try_from(c.index_infos.len()).expect("index info overflow"));
+        c.index_infos.push(IndexInfo { key_type: string_type, value_type: any_type, is_readonly: false, ..IndexInfo::default() });
+        c.empty_string_type = c.get_string_literal_type("");
+        c.zero_type = c.get_number_literal_type(Number(0.0));
+        c.zero_big_int_type = c.get_big_int_literal_type(PseudoBigInt::default());
+        // PORT: Go `slices.Sorted(maps.Keys(typeofNEFacts))` (flow.go:623).
+        // The sorted keys are written out; they must match that map.
+        let typeof_types: Vec<TypeId> = ["bigint", "boolean", "function", "number", "object", "string", "symbol", "undefined"]
+            .iter()
+            .map(|s| c.get_string_literal_type(s))
+            .collect();
+        c.typeof_type = c.get_union_type(&typeof_types);
+        c.get_global_es_symbol_type = c.get_global_type_resolver("Symbol", 0 /*arity*/, false /*reportErrors*/);
+        c.get_global_big_int_type = c.get_global_type_resolver("BigInt", 0 /*arity*/, false /*reportErrors*/);
+        c.get_global_import_meta_type = c.get_global_type_resolver("ImportMeta", 0 /*arity*/, true /*reportErrors*/);
+        c.get_global_import_attributes_type = c.get_global_type_resolver("ImportAttributes", 0 /*arity*/, false /*reportErrors*/);
+        c.get_global_import_attributes_type_checked =
+            c.get_global_type_resolver("ImportAttributes", 0 /*arity*/, true /*reportErrors*/);
+        c.get_global_non_nullable_type_alias_or_nil =
+            c.get_global_type_alias_resolver("NonNullable", 1 /*arity*/, false /*reportErrors*/);
+        c.get_global_extract_symbol = c.get_global_type_alias_resolver("Extract", 2 /*arity*/, true /*reportErrors*/);
+        c.get_global_disposable_type = c.get_global_type_resolver("Disposable", 0 /*arity*/, true /*reportErrors*/);
+        c.get_global_async_disposable_type = c.get_global_type_resolver("AsyncDisposable", 0 /*arity*/, true /*reportErrors*/);
+        c.get_global_awaited_symbol = c.get_global_type_alias_resolver("Awaited", 1 /*arity*/, true /*reportErrors*/);
+        c.get_global_awaited_symbol_or_nil = c.get_global_type_alias_resolver("Awaited", 1 /*arity*/, false /*reportErrors*/);
+        c.get_global_na_n_symbol_or_nil = c.get_global_value_symbol_resolver("NaN", false /*reportErrors*/);
+        c.get_global_record_symbol = c.get_global_type_alias_resolver("Record", 2 /*arity*/, true /*reportErrors*/);
+        c.get_global_template_strings_array_type =
+            c.get_global_type_resolver("TemplateStringsArray", 0 /*arity*/, true /*reportErrors*/);
+        c.get_global_es_symbol_constructor_symbol_or_nil = c.get_global_value_symbol_resolver("Symbol", false /*reportErrors*/);
+        c.get_global_es_symbol_constructor_type_symbol_or_nil =
+            c.get_global_type_symbol_resolver("SymbolConstructor", false /*reportErrors*/);
+        c.get_global_import_call_options_type = c.get_global_type_resolver("ImportCallOptions", 0 /*arity*/, false /*reportErrors*/);
+        c.get_global_import_call_options_type_checked =
+            c.get_global_type_resolver("ImportCallOptions", 0 /*arity*/, true /*reportErrors*/);
+        c.get_global_promise_type = c.get_global_type_resolver("Promise", 1 /*arity*/, false /*reportErrors*/);
+        c.get_global_promise_type_checked = c.get_global_type_resolver("Promise", 1 /*arity*/, true /*reportErrors*/);
+        c.get_global_promise_like_type = c.get_global_type_resolver("PromiseLike", 1 /*arity*/, true /*reportErrors*/);
+        c.get_global_promise_constructor_symbol = c.get_global_value_symbol_resolver("Promise", true /*reportErrors*/);
+        c.get_global_promise_constructor_symbol_or_nil = c.get_global_value_symbol_resolver("Promise", false /*reportErrors*/);
+        c.get_global_omit_symbol = c.get_global_type_alias_resolver("Omit", 2 /*arity*/, true /*reportErrors*/);
+        c.get_global_no_infer_symbol_or_nil = c.get_global_type_alias_resolver("NoInfer", 1 /*arity*/, false /*reportErrors*/);
+        c.get_global_iterator_type = c.get_global_type_resolver("Iterator", 3 /*arity*/, false /*reportErrors*/);
+        c.get_global_iterable_type = c.get_global_type_resolver("Iterable", 3 /*arity*/, false /*reportErrors*/);
+        c.get_global_iterable_type_checked = c.get_global_type_resolver("Iterable", 3 /*arity*/, true /*reportErrors*/);
+        c.get_global_iterable_iterator_type = c.get_global_type_resolver("IterableIterator", 3 /*arity*/, false /*reportErrors*/);
+        c.get_global_iterable_iterator_type_checked =
+            c.get_global_type_resolver("IterableIterator", 3 /*arity*/, true /*reportErrors*/);
+        c.get_global_iterator_object_type = c.get_global_type_resolver("IteratorObject", 3 /*arity*/, false /*reportErrors*/);
+        c.get_global_generator_type = c.get_global_type_resolver("Generator", 3 /*arity*/, false /*reportErrors*/);
+        c.get_global_async_iterator_type = c.get_global_type_resolver("AsyncIterator", 3 /*arity*/, false /*reportErrors*/);
+        c.get_global_async_iterable_type = c.get_global_type_resolver("AsyncIterable", 3 /*arity*/, false /*reportErrors*/);
+        c.get_global_async_iterable_type_checked = c.get_global_type_resolver("AsyncIterable", 3 /*arity*/, true /*reportErrors*/);
+        c.get_global_async_iterable_iterator_type =
+            c.get_global_type_resolver("AsyncIterableIterator", 3 /*arity*/, false /*reportErrors*/);
+        c.get_global_async_iterable_iterator_type_checked =
+            c.get_global_type_resolver("AsyncIterableIterator", 3 /*arity*/, true /*reportErrors*/);
+        c.get_global_async_iterator_object_type =
+            c.get_global_type_resolver("AsyncIteratorObject", 3 /*arity*/, false /*reportErrors*/);
+        c.get_global_async_generator_type = c.get_global_type_resolver("AsyncGenerator", 3 /*arity*/, false /*reportErrors*/);
+        c.get_global_iterator_yield_result_type =
+            c.get_global_type_resolver("IteratorYieldResult", 1 /*arity*/, false /*reportErrors*/);
+        c.get_global_iterator_return_result_type =
+            c.get_global_type_resolver("IteratorReturnResult", 1 /*arity*/, false /*reportErrors*/);
+        c.get_global_typed_property_descriptor_type =
+            c.get_global_type_resolver("TypedPropertyDescriptor", 1 /*arity*/, true /*reportErrors*/);
+        c.get_global_class_decorator_context_type =
+            c.get_global_type_resolver("ClassDecoratorContext", 1 /*arity*/, true /*reportErrors*/);
+        c.get_global_class_method_decorator_context_type =
+            c.get_global_type_resolver("ClassMethodDecoratorContext", 2 /*arity*/, true /*reportErrors*/);
+        c.get_global_class_getter_decorator_context_type =
+            c.get_global_type_resolver("ClassGetterDecoratorContext", 2 /*arity*/, true /*reportErrors*/);
+        c.get_global_class_setter_decorator_context_type =
+            c.get_global_type_resolver("ClassSetterDecoratorContext", 2 /*arity*/, true /*reportErrors*/);
+        c.get_global_class_accessor_decorator_context_type =
+            c.get_global_type_resolver("ClassAccessorDecoratorContext", 2 /*arity*/, true /*reportErrors*/);
+        c.get_global_class_accessor_decorator_target_type =
+            c.get_global_type_resolver("ClassAccessorDecoratorTarget", 2 /*arity*/, true /*reportErrors*/);
+        c.get_global_class_accessor_decorator_result_type =
+            c.get_global_type_resolver("ClassAccessorDecoratorResult", 2 /*arity*/, true /*reportErrors*/);
+        c.get_global_class_field_decorator_context_type =
+            c.get_global_type_resolver("ClassFieldDecoratorContext", 2 /*arity*/, true /*reportErrors*/);
+        c.initialize_closures();
+        c.initialize_iteration_resolvers();
+        c.initialize_checker();
+        c
+    }
+}
+

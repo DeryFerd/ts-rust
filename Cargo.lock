@@ -195,6 +195,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc-hash"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
+
+[[package]]
 name = "ryu-js"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -436,6 +442,26 @@ name = "ts_glob"
 version = "7.0.0-dev"
 dependencies = [
  "ts_path",
+ "ts_vfs",
+]
+
+[[package]]
+name = "ts_goport"
+version = "7.0.0-dev"
+dependencies = [
+ "indexmap",
+ "rustc-hash",
+ "ts_ast",
+ "ts_compiler",
+ "ts_core",
+ "ts_diagnostic_writer",
+ "ts_diagnostics",
+ "ts_jsnum",
+ "ts_module",
+ "ts_options",
+ "ts_parser",
+ "ts_path",
+ "ts_scanner",
  "ts_vfs",
 ]
 

@@ -1,0 +1,916 @@
+//! Port of typescript-go `internal/ast/utilities.go` lines 2729-3631.
+
+use crate::prelude::*;
+
+// Go: ast/utilities.go:2729 IsRequireCall
+pub fn is_require_call(node: Node, require_string_literal_like_argument: bool) -> bool {
+    if !is_call_expression(node) {
+        return false;
+    }
+    let call = node;
+    if !is_identifier(call.expression()) || call.expression().text() != "require" {
+        return false;
+    }
+    if call.arguments().len() != 1 {
+        return false;
+    }
+    !require_string_literal_like_argument || is_string_literal_like(call.arguments().get(0))
+}
+
+// Go: ast/utilities.go:2743 IsRequireVariableStatement
+pub fn is_require_variable_statement(node: Node) -> bool {
+    if is_variable_statement(node) {
+        let declarations = node.declaration_list().declarations().nodes();
+        if declarations.len() > 0 {
+            return declarations.iter().all(|d| is_variable_declaration_initialized_to_require(d));
+        }
+    }
+    false
+}
+
+// Go: ast/utilities.go:2752 GetJSXImplicitImportBase
+pub fn get_jsx_implicit_import_base(compiler_options: &CompilerOptions, file: Node) -> String {
+    let jsx_import_source_pragma = get_pragma_from_source_file(file, "jsximportsource");
+    let jsx_runtime_pragma = get_pragma_from_source_file(file, "jsxruntime");
+    if get_pragma_argument(jsx_runtime_pragma, "factory") == "classic" {
+        return String::new();
+    }
+    if compiler_options.jsx == JsxEmit::REACT_JSX
+        || compiler_options.jsx == JsxEmit::REACT_JSX_DEV
+        || !compiler_options.jsx_import_source.is_empty()
+        || jsx_import_source_pragma.is_some()
+        || get_pragma_argument(jsx_runtime_pragma, "factory") == "automatic"
+    {
+        let mut result = get_pragma_argument(jsx_import_source_pragma, "factory");
+        if result.is_empty() {
+            result = compiler_options.jsx_import_source.clone();
+        }
+        if result.is_empty() {
+            result = "react".to_string();
+        }
+        return result;
+    }
+    String::new()
+}
+
+// Go: ast/utilities.go:2775 GetJSXRuntimeImport
+pub fn get_jsx_runtime_import(base: &str, options: &CompilerOptions) -> String {
+    if base.is_empty() {
+        return base.to_string();
+    }
+    format!(
+        "{}/{}",
+        base,
+        if options.jsx == JsxEmit::REACT_JSX_DEV { "jsx-dev-runtime" } else { "jsx-runtime" }
+    )
+}
+
+// Go: ast/utilities.go:2782 GetPragmaFromSourceFile
+// PORT: Go `*Pragma` (nil when absent) -> `Option<&'static Pragma>`, pointing
+// into `source_file_info(file).pragmas`.
+pub fn get_pragma_from_source_file(file: Node, name: &str) -> Option<&'static Pragma> {
+    let mut result: Option<&'static Pragma> = None;
+    if file.is_some() {
+        let pragmas: &'static [Pragma] = &source_file_info(file).pragmas;
+        for pragma in pragmas {
+            if pragma.name == name {
+                result = Some(pragma); // Last one wins
+            }
+        }
+    }
+    result
+}
+
+// Go: ast/utilities.go:2794 GetPragmaArgument
+pub fn get_pragma_argument(pragma: Option<&Pragma>, name: &str) -> String {
+    if let Some(pragma) = pragma {
+        if let Some(arg) = pragma.args.get(name) {
+            return arg.value.clone();
+        }
+    }
+    String::new()
+}
+
+// Go: ast/utilities.go:2806 IsVariableDeclarationInitializedToRequire
+// Of the form: `const x = require("x")` or `const { x } = require("x")` or with `var` or `let`
+// The variable must not be exported and must not have a type annotation, even a jsdoc one.
+// The initializer must be a call to `require` with a string literal or a string literal-like argument.
+pub fn is_variable_declaration_initialized_to_require(node: Node) -> bool {
+    let mut node = node;
+    if node.kind() == SyntaxKind::BindingElement {
+        node = node.parent().parent();
+    }
+    is_variable_declaration_initialized_with_require_helper(node, false /*allowAccessedRequire*/)
+}
+
+// Go: ast/utilities.go:2813 IsVariableDeclarationInitializedToBareOrAccessedRequire
+pub fn is_variable_declaration_initialized_to_bare_or_accessed_require(node: Node) -> bool {
+    is_variable_declaration_initialized_with_require_helper(node, true /*allowAccessedRequire*/)
+}
+
+// Go: ast/utilities.go:2817 isVariableDeclarationInitializedWithRequireHelper
+pub fn is_variable_declaration_initialized_with_require_helper(node: Node, allow_accessed_require: bool) -> bool {
+    if !is_in_js_file(node) {
+        return false;
+    }
+    if node.kind() != SyntaxKind::VariableDeclaration {
+        return false;
+    }
+    let mut initializer = node.initializer();
+    if initializer.is_nil() {
+        return false;
+    }
+    if allow_accessed_require {
+        initializer = get_leftmost_access_expression(initializer);
+    }
+
+    !node.parent().parent().modifier_flags().intersects(ModifierFlags::EXPORT)
+        && node.type_().is_nil()
+        && is_require_call(initializer, true /*requireStringLiteralLikeArgument*/)
+}
+
+// Go: ast/utilities.go:2837 GetModuleSpecifierOfBareOrAccessedRequire
+pub fn get_module_specifier_of_bare_or_accessed_require(node: Node) -> Node {
+    if is_variable_declaration_initialized_with_require_helper(node, false /*allowAccessedRequire*/) {
+        return node.initializer().arguments().get(0);
+    }
+    if is_variable_declaration_initialized_with_require_helper(node, true /*allowAccessedRequire*/) {
+        let leftmost = get_leftmost_access_expression(node.initializer());
+        if is_require_call(leftmost, true /*requireStringLiteralLikeArgument*/) {
+            return leftmost.arguments().get(0);
+        }
+    }
+    Node::NIL
+}
+
+// Go: ast/utilities.go:2850 IsModuleExportsAccessExpression
+pub fn is_module_exports_access_expression(node: Node) -> bool {
+    if is_access_expression(node) && is_module_identifier(node.expression()) {
+        let name = get_element_or_property_access_name(node);
+        if name.is_some() {
+            return name.text() == "exports";
+        }
+    }
+    false
+}
+
+// Go: ast/utilities.go:2859 IsModuleExportsQualifiedName
+pub fn is_module_exports_qualified_name(node: Node) -> bool {
+    is_qualified_name(node) && is_module_identifier(node.left()) && node.right().text() == "exports"
+}
+
+// Go: ast/utilities.go:2863 IsCheckJSEnabledForFile
+pub fn is_check_js_enabled_for_file(source_file: Node, compiler_options: &CompilerOptions) -> bool {
+    if let Some(directive) = &source_file_info(source_file).check_js_directive {
+        return directive.enabled;
+    }
+    compiler_options.check_js == Tristate::True
+}
+
+// Go: ast/utilities.go:2870 IsPlainJSFile
+pub fn is_plain_js_file(file: Node, check_js: Tristate) -> bool {
+    file.is_some()
+        && (source_file_info(file).script_kind == ScriptKind::JS || source_file_info(file).script_kind == ScriptKind::JSX)
+        && source_file_info(file).check_js_directive.is_none()
+        && check_js == Tristate::Unknown
+}
+
+// Go: ast/utilities.go:2874 GetLeftmostAccessExpression
+pub fn get_leftmost_access_expression(expr: Node) -> Node {
+    let mut expr = expr;
+    while is_access_expression(expr) {
+        expr = expr.expression();
+    }
+    expr
+}
+
+// Go: ast/utilities.go:2881 IsTypeOnlyImportDeclaration
+pub fn is_type_only_import_declaration(node: Node) -> bool {
+    match node.kind() {
+        SyntaxKind::ImportSpecifier => node.is_type_only() || node.parent().parent().is_type_only(),
+        SyntaxKind::NamespaceImport => node.parent().is_type_only(),
+        SyntaxKind::ImportClause | SyntaxKind::ImportEqualsDeclaration => node.is_type_only(),
+        _ => false,
+    }
+}
+
+// Go: ast/utilities.go:2893 isTypeOnlyExportDeclaration
+pub fn is_type_only_export_declaration(node: Node) -> bool {
+    match node.kind() {
+        SyntaxKind::ExportSpecifier => node.is_type_only() || node.parent().parent().is_type_only(),
+        SyntaxKind::ExportDeclaration => {
+            let d = node;
+            d.is_type_only() && d.module_specifier().is_some() && d.export_clause().is_nil()
+        }
+        SyntaxKind::NamespaceExport => node.parent().is_type_only(),
+        _ => false,
+    }
+}
+
+// Go: ast/utilities.go:2906 IsTypeOnlyImportOrExportDeclaration
+pub fn is_type_only_import_or_export_declaration(node: Node) -> bool {
+    is_type_only_import_declaration(node) || is_type_only_export_declaration(node)
+}
+
+// Go: ast/utilities.go:2910 IsExclusivelyTypeOnlyImportOrExport
+pub fn is_exclusively_type_only_import_or_export(node: Node) -> bool {
+    match node.kind() {
+        SyntaxKind::ExportDeclaration => {
+            return node.is_type_only();
+        }
+        SyntaxKind::ImportDeclaration | SyntaxKind::JsImportDeclaration => {
+            let import_clause = node.import_clause();
+            if import_clause.is_some() {
+                return import_clause.is_type_only();
+            }
+        }
+        SyntaxKind::JsDocImportTag => {
+            let import_clause = node.import_clause();
+            if import_clause.is_some() {
+                return import_clause.is_type_only();
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+// Go: ast/utilities.go:2926 GetClassLikeDeclarationOfSymbol
+pub fn get_class_like_declaration_of_symbol(symbols: &SymbolArena, symbol: SymbolId) -> Node {
+    symbols.sym(symbol).declarations.iter().copied().find(|&d| is_class_like(d)).unwrap_or(Node::NIL)
+}
+
+// Go: ast/utilities.go:2930 IsCallLikeExpression
+pub fn is_call_like_expression(node: Node) -> bool {
+    match node.kind() {
+        SyntaxKind::JsxOpeningElement
+        | SyntaxKind::JsxSelfClosingElement
+        | SyntaxKind::JsxOpeningFragment
+        | SyntaxKind::CallExpression
+        | SyntaxKind::NewExpression
+        | SyntaxKind::TaggedTemplateExpression
+        | SyntaxKind::Decorator => true,
+        SyntaxKind::BinaryExpression => node.operator_token().kind() == SyntaxKind::InstanceOfKeyword,
+        _ => false,
+    }
+}
+
+// Go: ast/utilities.go:2941 IsJsxCallLike
+pub fn is_jsx_call_like(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        SyntaxKind::JsxOpeningElement | SyntaxKind::JsxSelfClosingElement | SyntaxKind::JsxOpeningFragment
+    )
+}
+
+// Go: ast/utilities.go:2949 IsCallLikeOrFunctionLikeExpression
+pub fn is_call_like_or_function_like_expression(node: Node) -> bool {
+    is_call_like_expression(node) || is_function_expression_or_arrow_function(node)
+}
+
+// Go: ast/utilities.go:2953 NodeHasKind
+pub fn node_has_kind(node: Node, kind: SyntaxKind) -> bool {
+    if node.is_nil() {
+        return false;
+    }
+    node.kind() == kind
+}
+
+// Go: ast/utilities.go:2960 IsContextualKeyword
+pub fn is_contextual_keyword(token: SyntaxKind) -> bool {
+    // PORT: compare discriminants; ts_ast::SyntaxKind does not derive Ord.
+    SyntaxKind::FIRST_CONTEXTUAL_KEYWORD as u16 <= token as u16 && token as u16 <= SyntaxKind::LAST_CONTEXTUAL_KEYWORD as u16
+}
+
+// Go: ast/utilities.go:2964 IsThisInTypeQuery
+pub fn is_this_in_type_query(node: Node) -> bool {
+    if !is_this_identifier(node) {
+        return false;
+    }
+    let mut node = node;
+    while is_qualified_name(node.parent()) && node.parent().left() == node {
+        node = node.parent();
+    }
+    node.parent().kind() == SyntaxKind::TypeQuery
+}
+
+// Go: ast/utilities.go:2975 IsLet
+// Gets whether a bound `VariableDeclaration` or `VariableDeclarationList` is part of a `let` declaration.
+pub fn is_let(node: Node) -> bool {
+    (get_combined_node_flags(node) & NodeFlags::BLOCK_SCOPED) == NodeFlags::LET
+}
+
+// Go: ast/utilities.go:2979 IsClassMemberModifier
+pub fn is_class_member_modifier(token: SyntaxKind) -> bool {
+    is_parameter_property_modifier(token)
+        || token == SyntaxKind::StaticKeyword
+        || token == SyntaxKind::OverrideKeyword
+        || token == SyntaxKind::AccessorKeyword
+}
+
+// Go: ast/utilities.go:2984 IsParameterPropertyModifier
+pub fn is_parameter_property_modifier(kind: SyntaxKind) -> bool {
+    modifier_to_flag(kind).intersects(ModifierFlags::PARAMETER_PROPERTY_MODIFIER)
+}
+
+// Go: ast/utilities.go:2988 ForEachChildAndJSDoc
+// PORT: Go `Visitor` (`func(*Node) bool`) -> `&mut dyn FnMut(Node) -> bool`.
+// `visitNodes` is inlined as a loop over `node.js_doc(file)`.
+pub fn for_each_child_and_js_doc(node: Node, source_file: Node, v: &mut dyn FnMut(Node) -> bool) -> bool {
+    for js_doc in node.js_doc(source_file).iter() {
+        if v(js_doc) {
+            return true;
+        }
+    }
+    node.for_each_child(v)
+}
+
+// Go: ast/utilities.go:2995 HasTypeArguments
+pub fn has_type_arguments(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        SyntaxKind::CallExpression
+            | SyntaxKind::NewExpression
+            | SyntaxKind::TaggedTemplateExpression
+            | SyntaxKind::TypeReference
+            | SyntaxKind::ExpressionWithTypeArguments
+            | SyntaxKind::ImportType
+            | SyntaxKind::TypeQuery
+            | SyntaxKind::JsxOpeningElement
+            | SyntaxKind::JsxSelfClosingElement
+    )
+}
+
+// Go: ast/utilities.go:3005 IsTypeReferenceType
+pub fn is_type_reference_type(node: Node) -> bool {
+    node.kind() == SyntaxKind::TypeReference || node.kind() == SyntaxKind::ExpressionWithTypeArguments
+}
+
+// Go: ast/utilities.go:3009 IsVariableLike
+pub fn is_variable_like(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        SyntaxKind::BindingElement
+            | SyntaxKind::EnumMember
+            | SyntaxKind::Parameter
+            | SyntaxKind::PropertyAssignment
+            | SyntaxKind::PropertyDeclaration
+            | SyntaxKind::PropertySignature
+            | SyntaxKind::ShorthandPropertyAssignment
+            | SyntaxKind::VariableDeclaration
+    )
+}
+
+// Go: ast/utilities.go:3018 HasInitializer
+pub fn has_initializer(node: Node) -> bool {
+    match node.kind() {
+        SyntaxKind::VariableDeclaration
+        | SyntaxKind::Parameter
+        | SyntaxKind::BindingElement
+        | SyntaxKind::PropertyDeclaration
+        | SyntaxKind::PropertyAssignment
+        | SyntaxKind::EnumMember
+        | SyntaxKind::ForStatement
+        | SyntaxKind::ForInStatement
+        | SyntaxKind::ForOfStatement
+        | SyntaxKind::JsxAttribute => node.initializer().is_some(),
+        _ => false,
+    }
+}
+
+// Go: ast/utilities.go:3029 IsVariableParameterOrProperty
+pub fn is_variable_parameter_or_property(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        SyntaxKind::VariableDeclaration
+            | SyntaxKind::Parameter
+            | SyntaxKind::PropertySignature
+            | SyntaxKind::PropertyDeclaration
+    )
+}
+
+// PORT: Go `node.FunctionLikeData() != nil`. These are exactly the node kinds
+// whose Go data embeds `FunctionLikeBase` (directly, through
+// `FunctionLikeWithBodyBase`, `AccessorDeclarationBase` or
+// `FunctionOrConstructorTypeNodeBase`). For them Go `node.Type()` returns
+// `FunctionLikeData().Type`.
+fn has_function_like_data_p4(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        SyntaxKind::FunctionDeclaration
+            | SyntaxKind::CallSignature
+            | SyntaxKind::ConstructSignature
+            | SyntaxKind::Constructor
+            | SyntaxKind::IndexSignature
+            | SyntaxKind::MethodSignature
+            | SyntaxKind::MethodDeclaration
+            | SyntaxKind::GetAccessor
+            | SyntaxKind::SetAccessor
+            | SyntaxKind::FunctionType
+            | SyntaxKind::ConstructorType
+            | SyntaxKind::ArrowFunction
+            | SyntaxKind::FunctionExpression
+            | SyntaxKind::JsDocSignature
+    )
+}
+
+// Go: ast/utilities.go:3038 GetTypeAnnotationNode
+pub fn get_type_annotation_node(node: Node) -> Node {
+    match node.kind() {
+        SyntaxKind::VariableDeclaration
+        | SyntaxKind::Parameter
+        | SyntaxKind::PropertySignature
+        | SyntaxKind::PropertyDeclaration
+        | SyntaxKind::TypePredicate
+        | SyntaxKind::ParenthesizedType
+        | SyntaxKind::TypeOperator
+        | SyntaxKind::MappedType
+        | SyntaxKind::TypeAssertionExpression
+        | SyntaxKind::AsExpression
+        | SyntaxKind::SatisfiesExpression
+        | SyntaxKind::TypeAliasDeclaration
+        | SyntaxKind::JsTypeAliasDeclaration
+        | SyntaxKind::NamedTupleMember
+        | SyntaxKind::OptionalType
+        | SyntaxKind::RestType
+        | SyntaxKind::TemplateLiteralTypeSpan
+        | SyntaxKind::JsDocTypeExpression
+        | SyntaxKind::JsDocPropertyTag
+        | SyntaxKind::JsDocNullableType
+        | SyntaxKind::JsDocNonNullableType
+        | SyntaxKind::JsDocOptionalType => node.type_(),
+        _ => {
+            if has_function_like_data_p4(node) {
+                // Go: funcLike.Type
+                return node.type_();
+            }
+            Node::NIL
+        }
+    }
+}
+
+// Go: ast/utilities.go:3055 IsObjectTypeDeclaration
+pub fn is_object_type_declaration(node: Node) -> bool {
+    is_class_like(node) || is_interface_declaration(node) || is_type_literal_node(node)
+}
+
+// Go: ast/utilities.go:3059 IsClassOrTypeElement
+pub fn is_class_or_type_element(node: Node) -> bool {
+    is_class_element(node) || is_type_element(node)
+}
+
+// Go: ast/utilities.go:3063 GetClassExtendsHeritageElement
+pub fn get_class_extends_heritage_element(node: Node) -> Node {
+    let heritage_elements = get_heritage_elements(node, SyntaxKind::ExtendsKeyword);
+    if heritage_elements.len() > 0 {
+        return heritage_elements[0];
+    }
+    Node::NIL
+}
+
+// Go: ast/utilities.go:3071 GetImplementsTypeNodes
+pub fn get_implements_type_nodes(node: Node) -> Vec<Node> {
+    get_heritage_elements(node, SyntaxKind::ImplementsKeyword)
+}
+
+// Go: ast/utilities.go:3075 IsTypeKeywordToken
+pub fn is_type_keyword_token(node: Node) -> bool {
+    node.kind() == SyntaxKind::TypeKeyword
+}
+
+// Go: ast/utilities.go:3080 IsJSDocSingleCommentNodeList
+// See `IsJSDocSingleCommentNode`.
+pub fn is_js_doc_single_comment_node_list(node_list: NodeList) -> bool {
+    if node_list.is_nil() || node_list.nodes().len() == 0 {
+        return false;
+    }
+    let parent = node_list.nodes().get(0).parent();
+    if parent.is_nil() {
+        return false;
+    }
+    // PORT: Go compares `*NodeList` pointers (`nodeList == parent.CommentList()`).
+    // A node belongs to exactly one list, so the lists are the same list iff
+    // both are non-nil and share the same first node handle.
+    is_js_doc_single_comment_node(parent) && {
+        let comment_list = parent.comment_list();
+        !comment_list.is_nil() && comment_list.nodes().get(0) == node_list.nodes().get(0)
+    }
+}
+
+// Go: ast/utilities.go:3092 IsJSDocSingleCommentNodeComment
+// See `IsJSDocSingleCommentNode`.
+pub fn is_js_doc_single_comment_node_comment(node: Node) -> bool {
+    if node.is_nil() || node.parent().is_nil() {
+        return false;
+    }
+    is_js_doc_single_comment_node(node.parent()) && node == node.parent().comment_list().nodes().get(0)
+}
+
+// Go: ast/utilities.go:3101 IsJSDocSingleCommentNode
+// In Strada, if a JSDoc node has a single comment, that comment is represented as a string property
+// as a simplification, and therefore that comment is not visited by `forEachChild`.
+pub fn is_js_doc_single_comment_node(node: Node) -> bool {
+    has_comment(node.kind()) && !node.comment_list().is_nil() && node.comment_list().nodes().len() == 1
+}
+
+// Go: ast/utilities.go:3105 IsValidTypeOnlyAliasUseSite
+pub fn is_valid_type_only_alias_use_site(use_site: Node) -> bool {
+    use_site.flags().intersects(NodeFlags::AMBIENT | NodeFlags::JS_DOC)
+        || is_part_of_type_query(use_site)
+        || is_identifier_in_non_emitting_heritage_clause(use_site)
+        || is_part_of_possibly_valid_type_or_abstract_computed_property_name(use_site)
+        || !(is_expression_node(use_site) || is_shorthand_property_name_use_site(use_site))
+}
+
+// Go: ast/utilities.go:3113 isIdentifierInNonEmittingHeritageClause
+pub fn is_identifier_in_non_emitting_heritage_clause(node: Node) -> bool {
+    if !is_identifier(node) {
+        return false;
+    }
+    let mut parent = node.parent();
+    while is_property_access_expression(parent) || is_expression_with_type_arguments(parent) {
+        parent = parent.parent();
+    }
+    is_heritage_clause(parent)
+        && (parent.token() == SyntaxKind::ImplementsKeyword || is_interface_declaration(parent.parent()))
+}
+
+// Go: ast/utilities.go:3124 isPartOfPossiblyValidTypeOrAbstractComputedPropertyName
+pub fn is_part_of_possibly_valid_type_or_abstract_computed_property_name(node: Node) -> bool {
+    let mut node = node;
+    while node_kind_is(node, &[SyntaxKind::Identifier, SyntaxKind::PropertyAccessExpression]) {
+        node = node.parent();
+    }
+    if node.kind() != SyntaxKind::ComputedPropertyName {
+        return false;
+    }
+    if has_syntactic_modifier(node.parent(), ModifierFlags::ABSTRACT) {
+        return true;
+    }
+    node_kind_is(node.parent().parent(), &[SyntaxKind::InterfaceDeclaration, SyntaxKind::TypeLiteral])
+}
+
+// Go: ast/utilities.go:3137 isShorthandPropertyNameUseSite
+pub fn is_shorthand_property_name_use_site(use_site: Node) -> bool {
+    is_identifier(use_site) && is_shorthand_property_assignment(use_site.parent()) && use_site.parent().name() == use_site
+}
+
+// Go: ast/utilities.go:3141 GetPropertyNameForPropertyNameNode
+pub fn get_property_name_for_property_name_node(name: Node) -> String {
+    match name.kind() {
+        SyntaxKind::Identifier
+        | SyntaxKind::PrivateIdentifier
+        | SyntaxKind::StringLiteral
+        | SyntaxKind::NoSubstitutionTemplateLiteral
+        | SyntaxKind::NumericLiteral
+        | SyntaxKind::BigIntLiteral
+        | SyntaxKind::JsxNamespacedName => {
+            return name.text().to_string();
+        }
+        SyntaxKind::ComputedPropertyName => {
+            let name_expression = name.expression();
+            if is_string_or_numeric_literal_like(name_expression) {
+                return name_expression.text().to_string();
+            }
+            if is_signed_numeric_literal(name_expression) {
+                let mut text = name_expression.operand().text().to_string();
+                if name_expression.operator() == SyntaxKind::MinusToken {
+                    text = format!("-{text}");
+                }
+                return text;
+            }
+            return INTERNAL_SYMBOL_NAME_MISSING.to_string();
+        }
+        _ => {}
+    }
+    panic!("Unhandled case in getPropertyNameForPropertyNameNode")
+}
+
+// Go: ast/utilities.go:3163 IsPartOfTypeOnlyImportOrExportDeclaration
+pub fn is_part_of_type_only_import_or_export_declaration(node: Node) -> bool {
+    find_ancestor(node, &mut is_type_only_import_or_export_declaration).is_some()
+}
+
+// Go: ast/utilities.go:3167 IsPartOfExclusivelyTypeOnlyImportOrExportDeclaration
+pub fn is_part_of_exclusively_type_only_import_or_export_declaration(node: Node) -> bool {
+    find_ancestor(node, &mut is_exclusively_type_only_import_or_export).is_some()
+}
+
+// Go: ast/utilities.go:3171 IsEmittableImport
+pub fn is_emittable_import(node: Node) -> bool {
+    match node.kind() {
+        SyntaxKind::ImportDeclaration => node.import_clause().is_some() && !node.import_clause().is_type_only(),
+        SyntaxKind::ExportDeclaration | SyntaxKind::ImportEqualsDeclaration => !node.is_type_only(),
+        SyntaxKind::CallExpression => is_import_call(node),
+        _ => false,
+    }
+}
+
+// Go: ast/utilities.go:3183 IsResolutionModeOverrideHost
+pub fn is_resolution_mode_override_host(node: Node) -> bool {
+    if node.is_nil() {
+        return false;
+    }
+    matches!(
+        node.kind(),
+        SyntaxKind::ImportType
+            | SyntaxKind::ExportDeclaration
+            | SyntaxKind::ImportDeclaration
+            | SyntaxKind::JsImportDeclaration
+    )
+}
+
+// PORT: Go reads the `Attributes` field of ImportTypeNode, ImportDeclaration
+// and ExportDeclaration. In Rust `node.attributes()` is the Go `Node.Attributes()`
+// method (JSX only), and fields.rs does not generate a clashing field accessor.
+// The `Attributes` field is the only child of kind `ImportAttributes` on these
+// kinds, so we find it with `for_each_child`.
+fn import_attributes_field_p4(node: Node) -> Node {
+    let mut attributes = Node::NIL;
+    node.for_each_child(&mut |child: Node| {
+        if child.kind() == SyntaxKind::ImportAttributes {
+            attributes = child;
+            return true;
+        }
+        false
+    });
+    attributes
+}
+
+// Go: ast/utilities.go:3194 HasResolutionModeOverride
+pub fn has_resolution_mode_override(node: Node) -> bool {
+    if node.is_nil() {
+        return false;
+    }
+    let mut attributes = Node::NIL;
+    match node.kind() {
+        SyntaxKind::ImportType => {
+            attributes = import_attributes_field_p4(node);
+        }
+        SyntaxKind::ImportDeclaration | SyntaxKind::JsImportDeclaration => {
+            attributes = import_attributes_field_p4(node);
+        }
+        SyntaxKind::ExportDeclaration => {
+            attributes = import_attributes_field_p4(node);
+        }
+        _ => {}
+    }
+    if attributes.is_some() {
+        let (_, ok) = attributes.get_resolution_mode_override();
+        return ok;
+    }
+    false
+}
+
+// Go: ast/utilities.go:3214 IsStringTextContainingNode
+pub fn is_string_text_containing_node(node: Node) -> bool {
+    node.kind() == SyntaxKind::StringLiteral || is_template_literal_kind(node.kind())
+}
+
+// Go: ast/utilities.go:3218 IsTemplateLiteralKind
+pub fn is_template_literal_kind(kind: SyntaxKind) -> bool {
+    // PORT: compare discriminants; ts_ast::SyntaxKind does not derive Ord.
+    SyntaxKind::FIRST_TEMPLATE_TOKEN as u16 <= kind as u16 && kind as u16 <= SyntaxKind::LAST_TEMPLATE_TOKEN as u16
+}
+
+// Go: ast/utilities.go:3222 IsTemplateLiteralToken
+pub fn is_template_literal_token(node: Node) -> bool {
+    is_template_literal_kind(node.kind())
+}
+
+// Go: ast/utilities.go:3226 GetExternalModuleImportEqualsDeclarationExpression
+pub fn get_external_module_import_equals_declaration_expression(node: Node) -> Node {
+    debug_assert!(is_external_module_import_equals_declaration(node));
+    node.module_reference().expression()
+}
+
+// Go: ast/utilities.go:3231 CreateModifiersFromModifierFlags
+pub fn create_modifiers_from_modifier_flags(
+    flags: ModifierFlags,
+    create_modifier: &mut dyn FnMut(SyntaxKind) -> Node,
+) -> Vec<Node> {
+    let mut result: Vec<Node> = Vec::new();
+    if flags.intersects(ModifierFlags::EXPORT) {
+        result.push(create_modifier(SyntaxKind::ExportKeyword));
+    }
+    if flags.intersects(ModifierFlags::AMBIENT) {
+        result.push(create_modifier(SyntaxKind::DeclareKeyword));
+    }
+    if flags.intersects(ModifierFlags::DEFAULT) {
+        result.push(create_modifier(SyntaxKind::DefaultKeyword));
+    }
+    if flags.intersects(ModifierFlags::CONST) {
+        result.push(create_modifier(SyntaxKind::ConstKeyword));
+    }
+    if flags.intersects(ModifierFlags::PUBLIC) {
+        result.push(create_modifier(SyntaxKind::PublicKeyword));
+    }
+    if flags.intersects(ModifierFlags::PRIVATE) {
+        result.push(create_modifier(SyntaxKind::PrivateKeyword));
+    }
+    if flags.intersects(ModifierFlags::PROTECTED) {
+        result.push(create_modifier(SyntaxKind::ProtectedKeyword));
+    }
+    if flags.intersects(ModifierFlags::ABSTRACT) {
+        result.push(create_modifier(SyntaxKind::AbstractKeyword));
+    }
+    if flags.intersects(ModifierFlags::STATIC) {
+        result.push(create_modifier(SyntaxKind::StaticKeyword));
+    }
+    if flags.intersects(ModifierFlags::OVERRIDE) {
+        result.push(create_modifier(SyntaxKind::OverrideKeyword));
+    }
+    if flags.intersects(ModifierFlags::READONLY) {
+        result.push(create_modifier(SyntaxKind::ReadonlyKeyword));
+    }
+    if flags.intersects(ModifierFlags::ACCESSOR) {
+        result.push(create_modifier(SyntaxKind::AccessorKeyword));
+    }
+    if flags.intersects(ModifierFlags::ASYNC) {
+        result.push(create_modifier(SyntaxKind::AsyncKeyword));
+    }
+    if flags.intersects(ModifierFlags::IN) {
+        result.push(create_modifier(SyntaxKind::InKeyword));
+    }
+    if flags.intersects(ModifierFlags::OUT) {
+        result.push(create_modifier(SyntaxKind::OutKeyword));
+    }
+    result
+}
+
+// Go: ast/utilities.go:3281 GetThisParameter
+pub fn get_this_parameter(signature: Node) -> Node {
+    // callback tags do not currently support this parameters
+    if signature.parameters().len() != 0 {
+        let this_parameter = signature.parameters().get(0);
+        if is_this_parameter(this_parameter) {
+            return this_parameter;
+        }
+    }
+    Node::NIL
+}
+
+// Go: ast/utilities.go:3292 ReplaceModifiers
+// PORT: the Go `factory *NodeFactory` parameter is dropped because the node
+// factory is not ported. Every branch calls the matching factory `UpdateX`
+// method in Go, so every branch is `unported!`. The final panic is kept.
+pub fn replace_modifiers(node: Node, modifier_array: ModifierList) -> Node {
+    match node.kind() {
+        SyntaxKind::TypeParameter => unported!("UpdateTypeParameterDeclaration"),
+        SyntaxKind::Parameter => unported!("UpdateParameterDeclaration"),
+        SyntaxKind::ConstructorType => unported!("UpdateConstructorTypeNode"),
+        SyntaxKind::PropertySignature => unported!("UpdatePropertySignatureDeclaration"),
+        SyntaxKind::PropertyDeclaration => unported!("UpdatePropertyDeclaration"),
+        SyntaxKind::MethodSignature => unported!("UpdateMethodSignatureDeclaration"),
+        SyntaxKind::MethodDeclaration => unported!("UpdateMethodDeclaration"),
+        SyntaxKind::Constructor => unported!("UpdateConstructorDeclaration"),
+        SyntaxKind::GetAccessor => unported!("UpdateGetAccessorDeclaration"),
+        SyntaxKind::SetAccessor => unported!("UpdateSetAccessorDeclaration"),
+        SyntaxKind::IndexSignature => unported!("UpdateIndexSignatureDeclaration"),
+        SyntaxKind::FunctionExpression => unported!("UpdateFunctionExpression"),
+        SyntaxKind::ArrowFunction => unported!("UpdateArrowFunction"),
+        SyntaxKind::ClassExpression => unported!("UpdateClassExpression"),
+        SyntaxKind::VariableStatement => unported!("UpdateVariableStatement"),
+        SyntaxKind::FunctionDeclaration => unported!("UpdateFunctionDeclaration"),
+        SyntaxKind::ClassDeclaration => unported!("UpdateClassDeclaration"),
+        SyntaxKind::InterfaceDeclaration => unported!("UpdateInterfaceDeclaration"),
+        SyntaxKind::TypeAliasDeclaration => unported!("UpdateTypeAliasDeclaration"),
+        SyntaxKind::EnumDeclaration => unported!("UpdateEnumDeclaration"),
+        SyntaxKind::ModuleDeclaration => unported!("UpdateModuleDeclaration"),
+        SyntaxKind::ImportEqualsDeclaration => unported!("UpdateImportEqualsDeclaration"),
+        SyntaxKind::ImportDeclaration => unported!("UpdateImportDeclaration"),
+        SyntaxKind::ExportAssignment => unported!("UpdateExportAssignment"),
+        SyntaxKind::ExportDeclaration => unported!("UpdateExportDeclaration"),
+        _ => {}
+    }
+    panic!(
+        "Node that does not have modifiers tried to have modifier replaced: {}",
+        node.kind() as i32
+    )
+}
+
+// Go: ast/utilities.go:3529 IsLateVisibilityPaintedStatement
+pub fn is_late_visibility_painted_statement(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        SyntaxKind::ImportDeclaration
+            | SyntaxKind::JsImportDeclaration
+            | SyntaxKind::ImportEqualsDeclaration
+            | SyntaxKind::VariableStatement
+            | SyntaxKind::ClassDeclaration
+            | SyntaxKind::FunctionDeclaration
+            | SyntaxKind::ModuleDeclaration
+            | SyntaxKind::TypeAliasDeclaration
+            | SyntaxKind::JsTypeAliasDeclaration
+            | SyntaxKind::InterfaceDeclaration
+            | SyntaxKind::EnumDeclaration
+    )
+}
+
+// Go: ast/utilities.go:3548 IsExternalModuleAugmentation
+pub fn is_external_module_augmentation(node: Node) -> bool {
+    is_ambient_module(node) && is_module_augmentation_external(node)
+}
+
+// Go: ast/utilities.go:3552 GetSourceFileOfModule
+pub fn get_source_file_of_module(symbols: &SymbolArena, module: SymbolId) -> Node {
+    let mut declaration = symbols.sym(module).value_declaration;
+    if declaration.is_nil() {
+        declaration = get_non_augmentation_declaration(symbols, module);
+    }
+    get_source_file_of_node(declaration)
+}
+
+// Go: ast/utilities.go:3560 GetNonAugmentationDeclaration
+pub fn get_non_augmentation_declaration(symbols: &SymbolArena, symbol: SymbolId) -> Node {
+    symbols
+        .sym(symbol)
+        .declarations
+        .iter()
+        .copied()
+        .find(|&d| !is_external_module_augmentation(d) && !is_global_scope_augmentation(d))
+        .unwrap_or(Node::NIL)
+}
+
+// Go: ast/utilities.go:3566 IsTypeDeclaration
+pub fn is_type_declaration(node: Node) -> bool {
+    match node.kind() {
+        SyntaxKind::TypeParameter
+        | SyntaxKind::ClassDeclaration
+        | SyntaxKind::InterfaceDeclaration
+        | SyntaxKind::TypeAliasDeclaration
+        | SyntaxKind::JsTypeAliasDeclaration
+        | SyntaxKind::EnumDeclaration => true,
+        SyntaxKind::ImportClause => node.is_type_only(),
+        SyntaxKind::ImportSpecifier | SyntaxKind::ExportSpecifier => node.parent().parent().is_type_only(),
+        _ => false,
+    }
+}
+
+// Go: ast/utilities.go:3579 IsTypeDeclarationName
+pub fn is_type_declaration_name(name: Node) -> bool {
+    name.kind() == SyntaxKind::Identifier && is_type_declaration(name.parent()) && get_name_of_declaration(name.parent()) == name
+}
+
+// Go: ast/utilities.go:3585 IsRightSideOfPropertyAccess
+pub fn is_right_side_of_property_access(node: Node) -> bool {
+    node.parent().kind() == SyntaxKind::PropertyAccessExpression && node.parent().name() == node
+}
+
+// Go: ast/utilities.go:3589 IsArgumentExpressionOfElementAccess
+pub fn is_argument_expression_of_element_access(node: Node) -> bool {
+    node.parent().is_some()
+        && node.parent().kind() == SyntaxKind::ElementAccessExpression
+        && node.parent().argument_expression() == node
+}
+
+// Go: ast/utilities.go:3593 ClimbPastPropertyAccess
+pub fn climb_past_property_access(node: Node) -> Node {
+    if is_right_side_of_property_access(node) {
+        return node.parent();
+    }
+    node
+}
+
+// Go: ast/utilities.go:3600 climbPastPropertyOrElementAccess
+pub fn climb_past_property_or_element_access(node: Node) -> Node {
+    if is_right_side_of_property_access(node) || is_argument_expression_of_element_access(node) {
+        return node.parent();
+    }
+    node
+}
+
+// Go: ast/utilities.go:3607 selectExpressionOfCallOrNewExpressionOrDecorator
+pub fn select_expression_of_call_or_new_expression_or_decorator(node: Node) -> Node {
+    if is_call_expression(node) || is_new_expression(node) || is_decorator(node) {
+        return node.expression();
+    }
+    Node::NIL
+}
+
+// Go: ast/utilities.go:3614 selectTagOfTaggedTemplateExpression
+pub fn select_tag_of_tagged_template_expression(node: Node) -> Node {
+    if is_tagged_template_expression(node) {
+        return node.tag();
+    }
+    Node::NIL
+}
+
+// Go: ast/utilities.go:3621 selectTagNameOfJsxOpeningLikeElement
+pub fn select_tag_name_of_jsx_opening_like_element(node: Node) -> Node {
+    if is_jsx_opening_element(node) || is_jsx_self_closing_element(node) {
+        return node.tag_name();
+    }
+    Node::NIL
+}
+
+// Go: ast/utilities.go:3628 IsCallExpressionTarget
+pub fn is_call_expression_target(node: Node, include_element_access: bool, skip_past_outer_expressions: bool) -> bool {
+    is_callee_worker(
+        node,
+        is_call_expression,
+        select_expression_of_call_or_new_expression_or_decorator,
+        include_element_access,
+        skip_past_outer_expressions,
+    )
+}
