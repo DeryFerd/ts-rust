@@ -166,12 +166,21 @@ pub fn is_call_or_new_expression(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:3722 IndexOfNode
-pub fn index_of_node(nodes: &[Node], node: Node) -> i32 {
+pub fn index_of_node(nodes: NodeSlice, node: Node) -> i32 {
     // PORT: Go slices.BinarySearchFunc returns the first position whose element
-    // compares >= target; partition_point keeps that exact position.
-    let index = nodes.partition_point(|n| compare_node_positions(*n, node) < 0);
-    if index < nodes.len() && compare_node_positions(nodes[index], node) == 0 {
-        return index as i32;
+    // compares >= target. This lower-bound search keeps that exact position
+    // without copying the list.
+    let (mut lo, mut hi) = (0, nodes.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if compare_node_positions(nodes.get(mid), node) < 0 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo < nodes.len() && compare_node_positions(nodes.get(lo), node) == 0 {
+        return lo as i32;
     }
     -1
 }

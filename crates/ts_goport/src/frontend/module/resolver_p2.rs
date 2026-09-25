@@ -277,7 +277,13 @@ impl ResolutionState<'_> {
 
     // Go: module/resolver.go:1304 tryLoadModuleUsingRootDirs
     pub fn try_load_module_using_root_dirs(&mut self) -> Option<Resolved> {
-        if self.compiler_options.root_dirs.is_empty() {
+        if self
+            .compiler_options
+            .root_dirs
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+        {
             return continue_searching();
         }
 
@@ -289,7 +295,7 @@ impl ResolutionState<'_> {
 
         let candidate = normalize_path(&combine_paths(&self.containing_directory, &[&self.name]));
 
-        let root_dirs = self.compiler_options.root_dirs.clone();
+        let root_dirs = self.compiler_options.root_dirs.clone().unwrap_or_default();
         let mut matched_root_dir = String::new();
         let mut matched_normalized_prefix = String::new();
         for root_dir in &root_dirs {
@@ -669,13 +675,23 @@ impl ResolutionState<'_> {
 
     // Go: module/resolver.go:1587 tryFile
     pub fn try_file(&mut self, file_name: &str) -> (String, bool) {
-        if self.compiler_options.module_suffixes.is_empty() {
+        if self
+            .compiler_options
+            .module_suffixes
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+        {
             return (file_name.to_string(), self.try_file_lookup(file_name));
         }
 
         let ext = try_get_extension_from_path(file_name);
         let file_name_no_extension = remove_extension(file_name, ext).to_string();
-        let module_suffixes = self.compiler_options.module_suffixes.clone();
+        let module_suffixes = self
+            .compiler_options
+            .module_suffixes
+            .clone()
+            .unwrap_or_default();
         for suffix in &module_suffixes {
             let path = format!("{file_name_no_extension}{suffix}{ext}");
             if self.try_file_lookup(&path) {
@@ -1202,7 +1218,8 @@ pub fn get_conditions(options: &CompilerOptions, resolution_mode: ResolutionMode
     if resolution_mode == ModuleKind::NONE && module_resolution == ModuleResolutionKind::BUNDLER {
         resolution_mode = ModuleKind::ES_NEXT;
     }
-    let mut conditions: Vec<String> = Vec::with_capacity(3 + options.custom_conditions.len());
+    let custom_conditions = options.custom_conditions.as_deref().unwrap_or_default();
+    let mut conditions: Vec<String> = Vec::with_capacity(3 + custom_conditions.len());
     if resolution_mode == ModuleKind::ES_NEXT {
         conditions.push("import".to_string());
     } else {
@@ -1215,7 +1232,7 @@ pub fn get_conditions(options: &CompilerOptions, resolution_mode: ResolutionMode
     if module_resolution != ModuleResolutionKind::BUNDLER {
         conditions.push("node".to_string());
     }
-    conditions.extend(options.custom_conditions.iter().cloned());
+    conditions.extend(custom_conditions.iter().cloned());
     conditions
 }
 
@@ -1477,13 +1494,13 @@ pub fn resolve_config(
 }
 
 // Go: module/resolver.go:2075 GetAutomaticTypeDirectiveNames
-// PORT: Go `options.Types` nil and empty are both an empty `Vec`; both return `[]string{}`.
+// PORT: Go returns `[]string{}` for nil `Types`; `unwrap_or_default` does the same.
 pub fn get_automatic_type_directive_names(
     options: &CompilerOptions,
     host: &dyn ResolutionHost,
 ) -> Vec<String> {
     if !options.uses_wildcard_types() {
-        return options.types.clone();
+        return options.types.clone().unwrap_or_default();
     }
 
     // Walk the primary type lookup locations
@@ -1518,7 +1535,7 @@ pub fn get_automatic_type_directive_names(
     // Order potentially matters in program construction, so substitute
     // in the wildcard in the position it was specified in the types array
     let mut result: Vec<String> = Vec::new();
-    for t in &options.types {
+    for t in options.types.iter().flatten() {
         if t == "*" {
             result.extend(wildcard_matches.iter().cloned());
         } else {

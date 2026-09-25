@@ -84,7 +84,8 @@ pub fn get_conditions(
     if resolution_mode == ModuleKind::NONE && module_resolution == ModuleResolutionKind::BUNDLER {
         resolution_mode = ModuleKind::ES_NEXT;
     }
-    let mut conditions: Vec<String> = Vec::with_capacity(3 + options.custom_conditions.len());
+    let custom_conditions = options.custom_conditions.as_deref().unwrap_or_default();
+    let mut conditions: Vec<String> = Vec::with_capacity(3 + custom_conditions.len());
     if resolution_mode == ModuleKind::ES_NEXT {
         conditions.push("import".to_string());
     } else {
@@ -97,7 +98,7 @@ pub fn get_conditions(
     if module_resolution != ModuleResolutionKind::BUNDLER {
         conditions.push("node".to_string());
     }
-    conditions.extend(options.custom_conditions.iter().cloned());
+    conditions.extend(custom_conditions.iter().cloned());
     conditions
 }
 

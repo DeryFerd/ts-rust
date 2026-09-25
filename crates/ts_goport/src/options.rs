@@ -116,11 +116,12 @@ pub fn bool_to_tristate(b: bool) -> Tristate {
 
 /// Go `core.CompilerOptions`. Field names are the Go names in snake case.
 // Go: core/compileroptions.go:16 CompilerOptions
-// PORT: Go `noCopy` is dropped. Go `[]string` fields are `Vec<String>`
-// (nil and empty are the same for every reader) except `type_roots`, where
-// `GetEffectiveTypeRoots` tests `TypeRoots != nil`, so it is
-// `Option<Vec<String>>`. Go `*collections.OrderedMap` is `Option<IndexMap>`
-// and Go `*int` is `Option<i32>`.
+// PORT: Go `noCopy` is dropped. Go `[]string` fields are
+// `Option<Vec<String>>`: a nil slice is `None` and an empty non-nil slice is
+// `Some(vec![])`. `mergeCompilerOptions` copies an empty non-nil slice (so
+// `"types": []` overrides the parent), and some readers test `!= nil`.
+// Go `*collections.OrderedMap` is `Option<IndexMap>` and Go `*int` is
+// `Option<i32>`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompilerOptions {
     pub allow_js: Tristate,
@@ -132,7 +133,7 @@ pub struct CompilerOptions {
     pub allow_unused_labels: Tristate,
     pub assume_changes_only_affect_direct_dependencies: Tristate,
     pub check_js: Tristate,
-    pub custom_conditions: Vec<String>,
+    pub custom_conditions: Option<Vec<String>>,
     pub composite: Tristate,
     pub emit_declaration_only: Tristate,
     pub emit_bom: Tristate,
@@ -168,7 +169,7 @@ pub struct CompilerOptions {
     pub map_root: String,
     pub module: ModuleKind,
     pub module_resolution: ModuleResolutionKind,
-    pub module_suffixes: Vec<String>,
+    pub module_suffixes: Option<Vec<String>>,
     pub module_detection: ModuleDetectionKind,
     pub new_line: NewLineKind,
     pub no_emit: Tristate,
@@ -201,7 +202,7 @@ pub struct CompilerOptions {
     pub rewrite_relative_import_extensions: Tristate,
     pub react_namespace: String,
     pub root_dir: String,
-    pub root_dirs: Vec<String>,
+    pub root_dirs: Option<Vec<String>>,
     pub skip_lib_check: Tristate,
     pub stable_type_ordering: Tristate,
     pub strict: Tristate,
@@ -219,7 +220,7 @@ pub struct CompilerOptions {
     pub trace_resolution: Tristate,
     pub ts_build_info_file: String,
     pub type_roots: Option<Vec<String>>,
-    pub types: Vec<String>,
+    pub types: Option<Vec<String>>,
     pub use_define_for_class_fields: Tristate,
     pub use_unknown_in_catch_variables: Tristate,
     pub verbatim_module_syntax: Tristate,
@@ -446,7 +447,7 @@ impl CompilerOptions {
     // UsesWildcardTypes returns true if this option's types array includes "*"
     #[must_use]
     pub fn uses_wildcard_types(&self) -> bool {
-        self.types.iter().any(|t| t == "*")
+        self.types.iter().flatten().any(|t| t == "*")
     }
 
     // Go: core/compileroptions.go:328 GetIsolatedModules
@@ -1015,7 +1016,7 @@ pub fn from_ts_options(opts: &ts_options::CompilerOptions) -> CompilerOptions {
         // PORT: `ts_options` has no "specified" flag for checkJs, so an
         // explicit `checkJs: false` reads as Go `TSUnknown` here.
         check_js: ts_default_tristate(opts.check_js, d.check_js),
-        custom_conditions: opts.custom_conditions.clone().unwrap_or_default(),
+        custom_conditions: opts.custom_conditions.clone(),
         composite: ts_default_tristate(opts.composite, d.composite),
         emit_declaration_only: ts_default_tristate(
             opts.emit_declaration_only,
@@ -1081,7 +1082,7 @@ pub fn from_ts_options(opts: &ts_options::CompilerOptions) -> CompilerOptions {
         module_resolution: opts
             .module_resolution_configured
             .map_or(ModuleResolutionKind::UNKNOWN, ts_module_resolution_kind),
-        module_suffixes: opts.module_suffixes.clone().unwrap_or_default(),
+        module_suffixes: opts.module_suffixes.clone(),
         module_detection: if opts.module_detection_specified {
             ts_module_detection_kind(opts.module_detection)
         } else {
@@ -1156,7 +1157,9 @@ pub fn from_ts_options(opts: &ts_options::CompilerOptions) -> CompilerOptions {
         ),
         react_namespace: opts.react_namespace.clone().unwrap_or_default(),
         root_dir: opts.root_dir.clone().unwrap_or_default(),
-        root_dirs: opts.root_dirs.clone(),
+        // PORT: `ts_options` keeps `rootDirs` as a `Vec`, so nil and empty are
+        // lost there; an empty list is treated as nil.
+        root_dirs: (!opts.root_dirs.is_empty()).then(|| opts.root_dirs.clone()),
         skip_lib_check: ts_default_tristate(opts.skip_lib_check, d.skip_lib_check),
         stable_type_ordering: ts_default_tristate(
             opts.stable_type_ordering,
@@ -1195,7 +1198,7 @@ pub fn from_ts_options(opts: &ts_options::CompilerOptions) -> CompilerOptions {
         trace_resolution: ts_default_tristate(opts.trace_resolution, d.trace_resolution),
         ts_build_info_file: opts.ts_build_info_file.clone().unwrap_or_default(),
         type_roots: opts.type_roots.clone(),
-        types: opts.types.clone().unwrap_or_default(),
+        types: opts.types.clone(),
         use_define_for_class_fields: ts_option_tristate(opts.use_define_for_class_fields),
         use_unknown_in_catch_variables: ts_specified_tristate(
             opts.use_unknown_in_catch_variables,

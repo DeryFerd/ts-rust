@@ -30,8 +30,8 @@
 //!
 //! Exit codes are the tsc ones: 0, 1 when there are diagnostics and the
 //! emit was skipped, 2 when there are diagnostics and outputs were written.
-//! A run that hit unported code (or another panic) also exits 2, and says so
-//! on stderr.
+//! A run that hit unported code (or another panic) exits `EXIT_UNPORTED`
+//! (70), a code tsgo never returns (Go uses 0 to 5), and says so on stderr.
 
 use std::any::Any;
 use std::collections::HashSet;
@@ -40,10 +40,15 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 use ts_goport::emitter::emitter::EmitOnly;
-use ts_goport::emitter::program_emit::{EmitOptions, WriteFile, WriteFileData, emit};
+use ts_goport::emitter::program_emit::{EmitOptions, EmitResult, WriteFile, WriteFileData, emit};
 use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
+
+/// Exit code when unported code or another panic was hit. It is outside the
+/// Go `ExitStatus` range (execute/tsc/compile.go:32, 0 to 5), so it never
+/// looks like a tsgo status. 70 is `EX_SOFTWARE` (internal software error).
+const EXIT_UNPORTED: i32 = 70;
 
 /// Stack size for the worker thread. The checker recurses deeply on large
 /// projects.
@@ -112,7 +117,7 @@ fn main() {
         code
     } else {
         eprintln!("goport_emit: worker thread failed");
-        2
+        EXIT_UNPORTED
     };
     std::process::exit(code);
 }
@@ -303,13 +308,20 @@ fn run(config: &Config) -> i32 {
     let refused: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let write_root = config.write_root.as_ref().unwrap_or(&config.out_dir);
     let write_file = new_write_file(write_root.clone(), inputs, refused.clone());
-    let emit_result = guard(|| {
-        emit(EmitOptions {
-            target_source_file: Node::NIL,
-            emit_only: EmitOnly::All,
-            write_file: Some(write_file),
-        })
-    });
+    // Go: execute/tsc/emit.go:103 listFilesOnly skips the emit.
+    let mut emit_result = EmitResult {
+        emit_skipped: true,
+        ..EmitResult::default()
+    };
+    if !options().list_files_only.is_true() {
+        emit_result = guard(|| {
+            emit(EmitOptions {
+                target_source_file: Node::NIL,
+                emit_only: EmitOnly::All,
+                write_file: Some(write_file),
+            })
+        });
+    }
     let emit_skipped = emit_result.emit_skipped;
     all_diagnostics.extend(emit_result.diagnostics);
     let all_diagnostics = sort_and_deduplicate_diagnostics(all_diagnostics);
@@ -352,7 +364,7 @@ fn new_write_file(
 
 /// Prints the diagnostics and unported counts and returns the exit code:
 /// the Go tsc status (0, 1 when outputs were skipped, 2 when generated with
-/// diagnostics), or 2 when something was unported.
+/// diagnostics), or `EXIT_UNPORTED` when something was unported.
 // Go: execute/tsc/emit.go:65 (the exit status)
 fn report(diagnostics: &[Diagnostic], emit_skipped: bool) -> i32 {
     let mut output = String::new();
@@ -368,7 +380,7 @@ fn report(diagnostics: &[Diagnostic], emit_skipped: bool) -> i32 {
     }
 
     if !unported.is_empty() {
-        2
+        EXIT_UNPORTED
     } else if diagnostics.is_empty() {
         0
     } else if emit_skipped {

@@ -206,6 +206,17 @@ fields, `get_source_file_for_resolved_module(name) -> Node`, ...), the
 checker pool, and diagnostic sorting. `options.rs` defines Go-shaped
 `CompilerOptions`; read it from `prog().options`.
 
+## Exit codes
+
+`goport` and `goport_emit` return the tsc status (Go
+execute/tsc/emit.go:65): 0 success, 1 diagnostics with emit skipped, 2
+diagnostics with emit not skipped. Under noEmit, a program with no
+emittable file (no inputs, or only `.d.ts` files) exits 2. Unported code,
+any other panic and a worker-thread failure exit 70 (`EX_SOFTWARE`). Go
+uses 0 to 5 (3 in cmd/tsgo/sys.go:66, 4 in build mode, 5 NotImplemented),
+so a harness must treat a goport exit outside 0 to 2 as a crash, never as
+a tsgo status.
+
 ## Threads
 
 - `prog()` and the program state are process-wide and read only after

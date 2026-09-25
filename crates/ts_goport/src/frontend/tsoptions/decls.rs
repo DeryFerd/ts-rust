@@ -1361,10 +1361,9 @@ pub fn compiler_options_field_values(
     o: &CompilerOptions,
 ) -> Vec<(&'static str, CompilerOptionsValue)> {
     use CompilerOptionsValue as V;
-    // PORT: Go `TypeRoots` and `Lib` are `[]string`; Rust keeps
-    // `Option<Vec<String>>` for them and lists `None` as empty here.
-    // Go nil and empty slices differ under `reflect.DeepEqual`; the Rust
-    // `Vec<String>` fields cannot keep that difference.
+    // PORT: Go `[]string` fields are `Option<Vec<String>>` in Rust and
+    // `None` is listed as empty here, so nil and empty compare equal. Go
+    // nil and empty slices differ under `reflect.DeepEqual`.
     vec![
         ("AllowJs", V::Tristate(o.allow_js)),
         (
@@ -1395,7 +1394,7 @@ pub fn compiler_options_field_values(
         ("CheckJs", V::Tristate(o.check_js)),
         (
             "CustomConditions",
-            V::StringList(o.custom_conditions.clone()),
+            V::StringList(o.custom_conditions.clone().unwrap_or_default()),
         ),
         ("Composite", V::Tristate(o.composite)),
         ("EmitDeclarationOnly", V::Tristate(o.emit_declaration_only)),
@@ -1462,7 +1461,10 @@ pub fn compiler_options_field_values(
             "ModuleResolution",
             V::ModuleResolutionKind(o.module_resolution),
         ),
-        ("ModuleSuffixes", V::StringList(o.module_suffixes.clone())),
+        (
+            "ModuleSuffixes",
+            V::StringList(o.module_suffixes.clone().unwrap_or_default()),
+        ),
         (
             "ModuleDetection",
             V::ModuleDetectionKind(o.module_detection),
@@ -1518,7 +1520,10 @@ pub fn compiler_options_field_values(
         ),
         ("ReactNamespace", V::String(o.react_namespace.clone())),
         ("RootDir", V::String(o.root_dir.clone())),
-        ("RootDirs", V::StringList(o.root_dirs.clone())),
+        (
+            "RootDirs",
+            V::StringList(o.root_dirs.clone().unwrap_or_default()),
+        ),
         ("SkipLibCheck", V::Tristate(o.skip_lib_check)),
         ("StableTypeOrdering", V::Tristate(o.stable_type_ordering)),
         ("Strict", V::Tristate(o.strict)),
@@ -1548,7 +1553,7 @@ pub fn compiler_options_field_values(
             "TypeRoots",
             V::StringList(o.type_roots.clone().unwrap_or_default()),
         ),
-        ("Types", V::StringList(o.types.clone())),
+        ("Types", V::StringList(o.types.clone().unwrap_or_default())),
         (
             "UseDefineForClassFields",
             V::Tristate(o.use_define_for_class_fields),

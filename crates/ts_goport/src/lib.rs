@@ -20,6 +20,7 @@ pub mod declarations;
 pub mod diag;
 pub mod emitter;
 pub mod evaluator;
+pub mod execute;
 pub mod flags;
 mod flags_macros;
 pub mod frontend;

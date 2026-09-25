@@ -890,9 +890,7 @@ impl NewProgram {
                 &[],
             );
         }
-        // PORT: Go `options.CustomConditions != nil`. `custom_conditions` is
-        // a `Vec`, so an explicit empty list is taken as nil here.
-        if !options.custom_conditions.is_empty()
+        if options.custom_conditions.is_some()
             && !module_resolution_supports_package_json_exports_and_imports(module_resolution)
         {
             self.create_diagnostic_for_option_name(

@@ -1237,11 +1237,11 @@ fn handle_option_config_dir_template_substitution(
         }
     }
 
-    if let Some(root_dirs) = get_substituted_string_array_with_config_dir_template(
-        &compiler_options.root_dirs,
-        base_path,
-    ) {
-        compiler_options.root_dirs = root_dirs;
+    if let Some(root_dirs) = compiler_options.root_dirs.as_deref()
+        && let Some(root_dirs) =
+            get_substituted_string_array_with_config_dir_template(root_dirs, base_path)
+    {
+        compiler_options.root_dirs = Some(root_dirs);
     }
     if let Some(type_roots) = compiler_options.type_roots.as_deref()
         && let Some(type_roots) =
