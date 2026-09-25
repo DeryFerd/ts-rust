@@ -1823,42 +1823,49 @@ pub fn compute_line_of_position(line_starts: &[i32], pos: i32) -> i32 {
 }
 
 thread_local! {
-    /// Go `SourceFile.ECMALineMap()` cache, keyed by `Node::file_index`.
-    static ECMA_LINE_MAPS: RefCell<FxHashMap<usize, Rc<Vec<i32>>>> = RefCell::new(FxHashMap::default());
+    /// Go `SourceFile.ECMALineMap()` cache for files without a frozen store,
+    /// keyed by `Node::file_index`.
+    static ECMA_LINE_MAPS: RefCell<FxHashMap<usize, &'static [i32]>> = RefCell::new(FxHashMap::default());
     /// The same cache for synthetic (transformed) source files, keyed by node.
-    static SYNTHETIC_ECMA_LINE_MAPS: RefCell<FxHashMap<Node, Rc<Vec<i32>>>> = RefCell::new(FxHashMap::default());
+    static SYNTHETIC_ECMA_LINE_MAPS: RefCell<FxHashMap<Node, &'static [i32]>> = RefCell::new(FxHashMap::default());
 }
 
 // Go: scanner/scanner.go:2686 GetECMALineStarts
-// PORT: Go reads the lazily computed `sourceFile.ECMALineMap()`; this port
-// keeps the same lazy map in a per-thread cache keyed by the file index.
-pub fn get_ecma_line_starts(source_file: Node) -> Rc<Vec<i32>> {
+// PORT: Go reads the lazily computed `sourceFile.ECMALineMap()`. A frozen
+// store file has one shared map for all threads. Other files use a
+// per-thread cache keyed by the file index. A synthetic (transformed) source
+// file uses a per-thread cache keyed by its node.
+pub fn get_ecma_line_starts(source_file: Node) -> &'static [i32] {
     // All synthetic nodes share one file index, so a transformed (synthetic)
     // source file must not use the file index cache.
     if is_synthetic_node(source_file) {
         if let Some(line_map) =
-            SYNTHETIC_ECMA_LINE_MAPS.with(|maps| maps.borrow().get(&source_file).cloned())
+            SYNTHETIC_ECMA_LINE_MAPS.with(|maps| maps.borrow().get(&source_file).copied())
         {
             return line_map;
         }
-        let line_map = Rc::new(compute_ecma_line_starts(source_file_text(source_file)));
-        SYNTHETIC_ECMA_LINE_MAPS
-            .with(|maps| maps.borrow_mut().insert(source_file, line_map.clone()));
+        let line_map: &'static [i32] =
+            Vec::leak(compute_ecma_line_starts(source_file_text(source_file)));
+        SYNTHETIC_ECMA_LINE_MAPS.with(|maps| maps.borrow_mut().insert(source_file, line_map));
         return line_map;
     }
     let file_index = source_file.file_index();
-    if let Some(line_map) = ECMA_LINE_MAPS.with(|maps| maps.borrow().get(&file_index).cloned()) {
+    if let Some(line_map) = crate::ast::store::frozen_file_ecma_line_starts(file_index) {
         return line_map;
     }
-    let line_map = Rc::new(compute_ecma_line_starts(source_file_text(source_file)));
-    ECMA_LINE_MAPS.with(|maps| maps.borrow_mut().insert(file_index, line_map.clone()));
+    if let Some(line_map) = ECMA_LINE_MAPS.with(|maps| maps.borrow().get(&file_index).copied()) {
+        return line_map;
+    }
+    let line_map: &'static [i32] =
+        Vec::leak(compute_ecma_line_starts(source_file_text(source_file)));
+    ECMA_LINE_MAPS.with(|maps| maps.borrow_mut().insert(file_index, line_map));
     line_map
 }
 
 // Go: scanner/scanner.go:2690 GetECMALineOfPosition
 pub fn get_ecma_line_of_position(source_file: Node, pos: i32) -> i32 {
     let line_map = get_ecma_line_starts(source_file);
-    compute_line_of_position(&line_map, pos)
+    compute_line_of_position(line_map, pos)
 }
 
 // Go: scanner/scanner.go:2698 GetECMALineAndUTF16CharacterOfPosition
@@ -1867,7 +1874,7 @@ pub fn get_ecma_line_of_position(source_file: Node, pos: i32) -> i32 {
 // Uses ECMAScript line separators (LF, CR, CRLF, LS, PS).
 pub fn get_ecma_line_and_utf16_character_of_position(source_file: Node, pos: i32) -> (i32, i32) {
     let line_map = get_ecma_line_starts(source_file);
-    let line = compute_line_of_position(&line_map, pos);
+    let line = compute_line_of_position(line_map, pos);
     let character =
         utf16_len(&source_file_text(source_file)[line_map[line as usize] as usize..pos as usize]);
     (line, character)
@@ -1878,7 +1885,7 @@ pub fn get_ecma_line_and_utf16_character_of_position(source_file: Node, pos: i32
 // raw UTF-8 byte offset from the start of that line for the given byte position.
 pub fn get_ecma_line_and_byte_offset_of_position(source_file: Node, pos: i32) -> (i32, i32) {
     let line_map = get_ecma_line_starts(source_file);
-    let line = compute_line_of_position(&line_map, pos);
+    let line = compute_line_of_position(line_map, pos);
     let byte_offset = pos - line_map[line as usize];
     (line, byte_offset)
 }

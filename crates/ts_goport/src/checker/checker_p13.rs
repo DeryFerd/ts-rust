@@ -992,7 +992,7 @@ impl Checker {
                     && self.has_matching_argument(parent, node);
             }
             let declarations = self.sym(symbol).declarations.clone();
-            for d in declarations {
+            for &d in declarations.iter() {
                 if !(!is_function_like(d) || self.is_deprecated_declaration(d)) {
                     return false;
                 }

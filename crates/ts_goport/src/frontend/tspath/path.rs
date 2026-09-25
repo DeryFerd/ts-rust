@@ -548,15 +548,26 @@ pub fn get_normalized_absolute_path(file_name: &str, current_directory: &str) ->
     };
     let root_length = get_root_length(&file_name);
 
-    if let Some(simple_normalized) = simple_normalize_path(&file_name) {
+    // The `simpleNormalizePath` result, with the trailing separator fixed.
+    let finish = |mut simple_normalized: String| {
         let length = simple_normalized.len();
         if length > root_length {
-            return remove_trailing_directory_separator(&simple_normalized).to_string();
+            let trimmed = remove_trailing_directory_separator(&simple_normalized).len();
+            simple_normalized.truncate(trimmed);
+            return simple_normalized;
         }
         if length == root_length && root_length != 0 {
             return ensure_trailing_directory_separator(&simple_normalized);
         }
-        return simple_normalized;
+        simple_normalized
+    };
+    // PORT: `simpleNormalizePath` returns the path itself when it has no
+    // relative segment. Reuse `file_name` then instead of copying it.
+    if !has_relative_path_segment(&file_name) {
+        return finish(file_name);
+    }
+    if let Some(simple_normalized) = simple_normalize_path(&file_name) {
+        return finish(simple_normalized);
     }
 
     let fb = file_name.as_bytes();
@@ -692,6 +703,15 @@ fn has_relative_path_segment(p: &str) -> bool {
     if n == 0 {
         return false;
     }
+    // PORT: fast path. Every relative segment starts the path with '.' or
+    // contains "/." or "//", so a path with none of these has no segment.
+    if b[0] != b'.'
+        && !b
+            .windows(2)
+            .any(|w| w[0] == b'/' && (w[1] == b'.' || w[1] == b'/'))
+    {
+        return false;
+    }
 
     if p == "." || p == ".." {
         return true;
@@ -757,6 +777,10 @@ fn has_relative_path_segment(p: &str) -> bool {
 // Go: tspath/path.go:599 NormalizePath
 pub fn normalize_path(path: &str) -> String {
     let path = normalize_slashes(path);
+    // PORT: the common case of `simpleNormalizePath` with no copy.
+    if !has_relative_path_segment(&path) {
+        return path;
+    }
     if let Some(normalized) = simple_normalize_path(&path) {
         return normalized;
     }

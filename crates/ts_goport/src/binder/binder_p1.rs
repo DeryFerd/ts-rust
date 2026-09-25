@@ -53,7 +53,7 @@ pub struct Binder {
     pub in_assignment_pattern: bool,
     pub seen_parse_error: bool,
     pub symbol_count: i32,
-    pub classifiable_names: FxHashSet<String>,
+    pub classifiable_names: FxHashSet<Name>,
     pub not_const_enum_only_modules: FxHashSet<SymbolId>,
     /// Go `symbolArena`. The program-wide symbol arena, moved in while binding.
     pub symbols: SymbolArena,
@@ -140,7 +140,9 @@ pub fn bind_source_file(file: Node, symbols: &mut SymbolArena) {
 /// The binder output of one file before it is stored in its `GoFile`.
 pub struct BoundFile {
     pub file: Node,
-    pub node_bind: Vec<NodeBindData>,
+    /// Compacted on the bind thread, so the dense per-node array is freed
+    /// (and reused) there.
+    pub node_bind: FileNodeBind,
     pub flow_nodes: Vec<FlowNode>,
     pub file_bind: FileBindData,
 }
@@ -174,7 +176,7 @@ pub fn bind_source_file_detached(file: Node, symbols: &mut SymbolArena) -> Bound
     } = b;
     BoundFile {
         file,
-        node_bind,
+        node_bind: FileNodeBind::new(&node_bind),
         flow_nodes,
         file_bind,
     }
@@ -203,7 +205,7 @@ impl BoundFile {
     /// arena to their place in the program arena (see
     /// `SymbolArena::append_file_arena`).
     pub fn remap(&mut self, offsets: ArenaOffsets) {
-        for data in &mut self.node_bind {
+        for data in self.node_bind.entries_mut() {
             data.symbol = offsets.symbol(data.symbol);
             data.local_symbol = offsets.symbol(data.local_symbol);
             data.locals = offsets.table(data.locals);
@@ -433,7 +435,7 @@ impl Binder {
             // just add this node into the declarations list of the symbol.
             symbol = self.symbols.get(symbol_table, &name);
             if includes.intersects(SymbolFlags::CLASSIFIABLE) {
-                self.classifiable_names.insert(name.clone());
+                self.classifiable_names.insert(Name::from(&name));
             }
             if symbol.is_nil() {
                 symbol = self.new_symbol(SymbolFlags::NONE, name.clone());

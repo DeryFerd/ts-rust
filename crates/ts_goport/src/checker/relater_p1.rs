@@ -1469,18 +1469,14 @@ impl Checker {
     // and no required properties, call/construct signatures or index signatures
     pub fn is_weak_type(&mut self, t: TypeId) -> bool {
         if self.ty(t).flags.intersects(TypeFlags::OBJECT) {
-            let (signature_count, index_info_count, properties) = {
-                let resolved = self.resolve_structured_type_members(t);
-                (
-                    resolved.signatures.len(),
-                    resolved.index_infos.len(),
-                    resolved.properties.clone(),
-                )
-            };
-            return signature_count == 0
-                && index_info_count == 0
-                && !properties.is_empty()
-                && properties
+            // PORT: the resolved members are read in place, not copied.
+            self.resolve_structured_type_members(t);
+            let resolved = self.ty(t).as_structured_type();
+            return resolved.signatures.is_empty()
+                && resolved.index_infos.is_empty()
+                && !resolved.properties.is_empty()
+                && resolved
+                    .properties
                     .iter()
                     .all(|&p| self.sym(p).flags.intersects(SymbolFlags::OPTIONAL));
         }
@@ -1637,7 +1633,7 @@ impl Checker {
                 if self.has_matching_recursion_identity(t, identity) {
                     // We only count occurrences with a higher type id than the previous occurrence, since higher
                     // type ids are an indicator of newer instantiations caused by recursion.
-                    let id = self.ty(t).id;
+                    let id = t;
                     if id >= last_type_id {
                         count += 1;
                         if count >= max_depth {

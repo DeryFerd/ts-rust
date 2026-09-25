@@ -1825,8 +1825,7 @@ impl Parser {
         expression: Node,
         question_dot_token: Node,
     ) -> Node {
-        let argument_expression;
-        if self.token == SyntaxKind::CloseBracketToken {
+        let argument_expression = if self.token == SyntaxKind::CloseBracketToken {
             let node_pos = self.node_pos();
             self.parse_error_at(
                 node_pos,
@@ -1834,22 +1833,14 @@ impl Parser {
                 diag::An_element_access_expression_should_take_an_argument,
                 args![],
             );
-            argument_expression = self.create_missing_identifier();
+            self.create_missing_identifier()
         } else {
-            let argument = self.parse_expression_allow_in();
-            match argument.kind() {
-                // PORT: Go writes `Text = p.internIdentifier(Text)`. Interning keeps the
-                // same string value, so the node data does not change. Only the
-                // identifiers table update is kept.
-                SyntaxKind::StringLiteral
-                | SyntaxKind::NoSubstitutionTemplateLiteral
-                | SyntaxKind::NumericLiteral => {
-                    self.intern_identifier(argument.text());
-                }
-                _ => {}
-            }
-            argument_expression = argument;
-        }
+            // PORT: Go also writes `Text = p.internIdentifier(Text)` for a
+            // string, template or numeric literal. The value does not change
+            // and the identifiers table is not kept (see `internIdentifier`
+            // in parser_p5.rs).
+            self.parse_expression_allow_in()
+        };
         self.parse_expected(SyntaxKind::CloseBracketToken);
         let is_optional_chain =
             question_dot_token.is_some() || self.try_reparse_optional_chain(expression);

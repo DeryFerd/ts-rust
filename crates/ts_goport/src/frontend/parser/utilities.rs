@@ -159,6 +159,20 @@ pub fn set_external_module_indicator(
     file.external_module_indicator = get_external_module_indicator(file, opts);
 }
 
+thread_local! {
+    /// Set when `get_external_module_indicator` reads its options. A
+    /// detached parse reports it (`parse_source_file_detached`).
+    static MODULE_INDICATOR_OPTIONS_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn reset_module_indicator_options_read() {
+    MODULE_INDICATOR_OPTIONS_READ.with(|read| read.set(false));
+}
+
+pub(crate) fn module_indicator_options_read() -> bool {
+    MODULE_INDICATOR_OPTIONS_READ.with(std::cell::Cell::get)
+}
+
 // Go: ast/parseoptions.go:60 getExternalModuleIndicator
 fn get_external_module_indicator(
     file: &ParsedSourceFile,
@@ -177,6 +191,7 @@ fn get_external_module_indicator(
         return Node::NIL;
     }
 
+    MODULE_INDICATOR_OPTIONS_READ.with(|read| read.set(true));
     if opts.jsx {
         let node = is_file_module_from_using_jsx_tag(file.root);
         if node.is_some() {

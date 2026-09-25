@@ -580,7 +580,7 @@ impl Checker {
         }
         let key = CachedTypeKey {
             kind: CachedTypeKind::PERMISSIVE_INSTANTIATION,
-            type_id: self.ty(t).id,
+            type_id: t,
         };
         let cached = self.cached_types.get(&key).copied().unwrap_or_default();
         if cached.is_some() {
@@ -603,7 +603,7 @@ impl Checker {
         }
         let key = CachedTypeKey {
             kind: CachedTypeKind::RESTRICTIVE_INSTANTIATION,
-            type_id: self.ty(t).id,
+            type_id: t,
         };
         let cached = self.cached_types.get(&key).copied().unwrap_or_default();
         if cached.is_some() {
@@ -617,7 +617,7 @@ impl Checker {
         // This also gives us a way to detect restrictive instances upon comparisons and _disable_ the "distributeive constraint"
         // assignability check for them, which is distinctly unsafe, as once you have a restrctive instance, all the type parameters
         // are constrained to `unknown` and produce tons of false positives/negatives!
-        let result_id = self.ty(result).id;
+        let result_id = result;
         self.cached_types.insert(
             CachedTypeKey {
                 kind: CachedTypeKind::RESTRICTIVE_INSTANTIATION,
@@ -638,7 +638,7 @@ impl Checker {
         }
         let key = CachedTypeKey {
             kind: CachedTypeKind::RESTRICTIVE_TYPE_PARAMETER,
-            type_id: self.ty(t).id,
+            type_id: t,
         };
         let cached = self.cached_types.get(&key).copied().unwrap_or_default();
         if cached.is_some() {

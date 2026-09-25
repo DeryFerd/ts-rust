@@ -91,11 +91,14 @@ impl Checker {
         // We are instantiating an anonymous type that has one or more type parameters in scope. Apply the
         // mapper to the type parameters to produce the effective list of type arguments, and compute the
         // instantiation cache key from the type IDs of the type arguments.
+        // PORT: Go maps through `c.combineTypeMappers(t.Mapper(), m)`. The
+        // composite mapper is used only here, so its `Map` is inlined instead
+        // of adding a mapper to the arena on every call. Mapper ids never
+        // affect output.
         let t_mapper = self.ty(t).mapper();
-        let combined_mapper = self.combine_type_mappers(t_mapper, m);
         let mut type_arguments: Vec<TypeId> = Vec::with_capacity(type_parameters.len());
         for &tp in &type_parameters {
-            type_arguments.push(self.mapper_map(combined_mapper, tp));
+            type_arguments.push(self.map_with_combined_mappers(t_mapper, m, tp));
         }
         let new_alias = if alias.is_none() {
             let t_alias = self.ty(t).alias.clone();
@@ -343,6 +346,26 @@ impl Checker {
         for_constraint: bool,
         alias: Option<Rc<TypeAlias>>,
     ) -> TypeId {
+        self.get_conditional_type_instantiation_combined(
+            t,
+            MapperId::NIL,
+            mapper,
+            for_constraint,
+            alias,
+        )
+    }
+
+    /// Go `getConditionalTypeInstantiation(t, c.combineTypeMappers(m1, m2), ...)`.
+    /// PORT: the mapper is only used to map the outer type parameters, so
+    /// the combined mapper is applied without adding it to the arena.
+    pub fn get_conditional_type_instantiation_combined(
+        &mut self,
+        t: TypeId,
+        m1: MapperId,
+        m2: MapperId,
+        for_constraint: bool,
+        alias: Option<Rc<TypeAlias>>,
+    ) -> TypeId {
         let root = self.ty(t).as_conditional_type().root.clone();
         let outer_type_parameters = root.borrow().outer_type_parameters.clone();
         if !outer_type_parameters.is_empty() {
@@ -351,7 +374,7 @@ impl Checker {
             // instantiation cache key from the type IDs of the type arguments.
             let mut type_arguments: Vec<TypeId> = Vec::with_capacity(outer_type_parameters.len());
             for &tp in &outer_type_parameters {
-                type_arguments.push(self.mapper_map(mapper, tp));
+                type_arguments.push(self.map_with_combined_mappers(m1, m2, tp));
             }
             let key = get_conditional_type_key(
                 &self.symbols,
@@ -410,6 +433,19 @@ impl Checker {
             return result;
         }
         t
+    }
+
+    /// Go `c.combineTypeMappers(m1, m2).Map(t)`, without adding a composite
+    /// mapper to the arena. Mapper ids never affect output.
+    pub fn map_with_combined_mappers(&mut self, m1: MapperId, m2: MapperId, t: TypeId) -> TypeId {
+        if m1.is_some() {
+            // Go: checker/mapper.go:265 (*CompositeTypeMapper).Map
+            let t1 = self.mapper_map(m1, t);
+            if t1 != t {
+                return self.instantiate_type(t1, m2);
+            }
+        }
+        self.mapper_map(m2, t)
     }
 
     // Go: checker/checker.go:22418 cloneTypeParameter
@@ -909,6 +945,29 @@ impl Checker {
             }
         }
         values.to_vec()
+    }
+
+    /// Go `instantiateList` for callers that only test `core.Same` on the
+    /// result: `None` when no element changes (Go returns the input slice).
+    pub fn instantiate_list_if_changed<T: Copy + PartialEq>(
+        &mut self,
+        values: &[T],
+        m: MapperId,
+        instantiator: fn(&mut Checker, T, MapperId) -> T,
+    ) -> Option<Vec<T>> {
+        for (i, &value) in values.iter().enumerate() {
+            let mapped = instantiator(self, value, m);
+            if mapped != value {
+                let mut result: Vec<T> = Vec::with_capacity(values.len());
+                result.extend_from_slice(&values[..i]);
+                result.push(mapped);
+                for &rest in &values[i + 1..] {
+                    result.push(instantiator(self, rest, m));
+                }
+                return Some(result);
+            }
+        }
+        None
     }
 
     // Go: checker/checker.go:22699 tryGetTypeFromTypeNode

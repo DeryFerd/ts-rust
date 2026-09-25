@@ -1232,7 +1232,11 @@ impl Checker {
     pub fn put_relater(&mut self, r: Rc<RefCell<Relater>>) {
         {
             let mut rb = r.borrow_mut();
-            rb.maybe_keys_set.clear();
+            // PORT: resetMaybeStack already removed every key, and clearing
+            // an empty set still costs time in its capacity.
+            if !rb.maybe_keys_set.is_empty() {
+                rb.maybe_keys_set.clear();
+            }
             let mut maybe_keys = std::mem::take(&mut rb.maybe_keys);
             maybe_keys.clear();
             let maybe_keys_set = std::mem::take(&mut rb.maybe_keys_set);

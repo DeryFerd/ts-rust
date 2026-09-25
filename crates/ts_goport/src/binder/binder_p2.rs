@@ -186,7 +186,7 @@ impl Binder {
                 let mut name_text: String = INTERNAL_SYMBOL_NAME_CLASS.to_string();
                 if name.is_some() {
                     name_text = name.text().to_string();
-                    self.classifiable_names.insert(name_text.clone());
+                    self.classifiable_names.insert(Name::from(&name_text));
                 }
                 self.bind_anonymous_declaration(node, SymbolFlags::CLASS, &name_text);
             }

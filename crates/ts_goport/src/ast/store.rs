@@ -24,6 +24,12 @@
 //!   thread (`BUILD`). The header and the data can change until the parser
 //!   finishes the file (`finishNode`, parent setting, JSDoc flags,
 //!   reparser.go writes). Then the parser freezes the file.
+//! - Detached: a parse worker (`files_parser.rs` prefetch) parses one file
+//!   into a store with a provisional id (`DETACHED_STORE_BASE` + job) that
+//!   only its thread sees (`DETACHED`). The loading thread adopts the
+//!   finished store when the loader asks for that file
+//!   (`adopt_detached_store`). The store then gets the next real id, so ids
+//!   still follow the serial parse order.
 //! - Frozen: `core::set_prog` calls `freeze_file_stores`, which moves every
 //!   store into one leaked, read-only, process-wide slice (`FROZEN`). Node
 //!   reads then need no thread-local and no `RefCell` borrow, and the slice
@@ -57,6 +63,8 @@ pub const NIL_LIST_POS: u32 = u32::MAX - 1;
 /// its target (nil for slot 0) in `parent`.
 #[derive(Clone, Copy, Debug)]
 pub struct NodeHeader {
+    /// Go `node.Parent`. Inside a store a parent in the same store is kept
+    /// as a `LOCAL_STORE` handle; the read hooks return the real handle.
     pub parent: Node,
     pub loc: TextRange,
     pub flags: NodeFlags,
@@ -67,6 +75,26 @@ pub struct NodeHeader {
 }
 
 impl NodeHeader {
+    /// The header as the node reads see it: a parent in the same store (see
+    /// `LOCAL_STORE`) becomes a handle of store `file`.
+    #[inline]
+    fn read(mut self, file: usize) -> Self {
+        if self.parent.file_index() == LOCAL_STORE {
+            self.parent = handle(file, slot_index(self.parent) as u32);
+        }
+        self
+    }
+
+    /// The stored form of `parent` for a node of store `file`.
+    #[inline]
+    fn stored_parent(file: usize, parent: Node) -> Node {
+        if parent.is_some() && parent.file_index() == file {
+            handle(LOCAL_STORE, slot_index(parent) as u32)
+        } else {
+            parent
+        }
+    }
+
     /// The header of a nil (`target` nil) or alias slot.
     const fn target(target: Node) -> Self {
         Self {
@@ -92,26 +120,60 @@ struct FileStore {
     aliases: FxHashMap<Node, u32>,
     /// Set when the parser has finished the file.
     frozen: bool,
+    /// Slot of the SourceFile node that `mark_source_file_roots` found when
+    /// the file was frozen, or 0 (the nil slot).
+    root_slot: u32,
+    /// `file_store_parser_flags`, made on the parsing thread when the file
+    /// is frozen. The loader takes it once.
+    parser_flags: Option<Vec<NodeFlags>>,
     /// Go `file.jsdocCache`, set by `finishSourceFile`. Node reads use it
     /// until the program that holds this file is installed, so
     /// `freeze_file_stores` empties it.
     jsdoc_cache: FxHashMap<Node, &'static [Node]>,
     /// The SourceFile node of this store, set by `freeze_file_stores`.
     root: Node,
+    /// Go `SourceFile.ECMALineMap()`, computed on first use after freeze
+    /// and shared by every thread.
+    ecma_line_starts: OnceLock<Box<[i32]>>,
 }
 
 thread_local! {
     /// The stores of this thread, while the parser runs.
     static BUILD: RefCell<Vec<FileStore>> = const { RefCell::new(Vec::new()) };
+    /// The detached store of a parse worker and its provisional id.
+    static DETACHED: RefCell<Option<(usize, FileStore)>> = const { RefCell::new(None) };
 }
 
-/// All stores, read-only, after `freeze_file_stores`.
-static FROZEN: OnceLock<&'static [FileStore]> = OnceLock::new();
+/// File index that marks a parent in the same store inside a stored
+/// header. Reads give the handle of the store (`NodeHeader::read`), so a
+/// store keeps its headers when its id changes (`adopt_detached_store`).
+const LOCAL_STORE: usize = 0x7fff_ffff;
+
+/// First provisional store id. Real store ids are file indexes and stay far
+/// below it; synthetic node and flow ids are above every provisional id.
+pub const DETACHED_STORE_BASE: usize = 0x8000_0000;
+/// Number of provisional ids.
+pub const DETACHED_STORE_LIMIT: usize = 0x4000_0000;
+
+#[inline]
+fn is_detached_id(file: usize) -> bool {
+    (DETACHED_STORE_BASE..DETACHED_STORE_BASE + DETACHED_STORE_LIMIT).contains(&file)
+}
+
+/// All stores, read-only, after `freeze_file_stores`, with dense per-store
+/// header and node tables for the hot node reads.
+struct Frozen {
+    stores: &'static [FileStore],
+    headers: Box<[&'static [NodeHeader]]>,
+    nodes: Box<[&'static [Option<&'static ts_ast::Node>]]>,
+}
+
+static FROZEN: OnceLock<Frozen> = OnceLock::new();
 
 /// The frozen stores, or `None` while the parser runs.
 #[inline]
 fn frozen() -> Option<&'static [FileStore]> {
-    FROZEN.get().copied()
+    FROZEN.get().map(|f| f.stores)
 }
 
 /// The handle of slot `index` in store `file`. Does not resolve aliases.
@@ -129,6 +191,12 @@ fn with_store<R>(file: usize, f: impl FnOnce(&FileStore) -> R) -> R {
     if let Some(stores) = frozen() {
         return f(&stores[file]);
     }
+    if is_detached_id(file) {
+        return DETACHED.with(|d| match &*d.borrow() {
+            Some((id, store)) if *id == file => f(store),
+            _ => panic!("store {file:#x} is not the detached store of this thread"),
+        });
+    }
     BUILD.with(|s| f(&s.borrow()[file]))
 }
 
@@ -137,6 +205,12 @@ fn with_store_mut<R>(file: usize, f: impl FnOnce(&mut FileStore) -> R) -> R {
         frozen().is_none(),
         "cannot change a node store after freeze"
     );
+    if is_detached_id(file) {
+        return DETACHED.with(|d| match &mut *d.borrow_mut() {
+            Some((id, store)) if *id == file => f(store),
+            _ => panic!("store {file:#x} is not the detached store of this thread"),
+        });
+    }
     BUILD.with(|s| f(&mut s.borrow_mut()[file]))
 }
 
@@ -169,17 +243,139 @@ pub fn new_file_store(file_name: &'static str, text: &'static str) -> usize {
             crate::core::try_prog().is_none_or(|p| p.files.len() <= s.len()),
             "a legacy program is installed; file ids would collide with store ids"
         );
-        s.push(FileStore {
+        s.push(FileStore::new(file_name, text));
+        s.len() - 1
+    })
+}
+
+impl FileStore {
+    fn new(file_name: &'static str, text: &'static str) -> Self {
+        Self {
             file_name,
             text,
             headers: vec![NodeHeader::target(Node::NIL)],
             nodes: vec![None],
             aliases: FxHashMap::default(),
             frozen: false,
+            root_slot: NIL_SLOT,
+            parser_flags: None,
             jsdoc_cache: FxHashMap::default(),
             root: Node::NIL,
-        });
-        s.len() - 1
+            ecma_line_starts: OnceLock::new(),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Detached stores (parse workers)
+// ──────────────────────────────────────────────────────────────────────
+
+/// A finished store that a parse worker made with a provisional id. Only
+/// `adopt_detached_store` can make it part of the program.
+pub struct DetachedStore {
+    id: usize,
+    store: FileStore,
+}
+
+impl DetachedStore {
+    /// The provisional id of the store.
+    #[must_use]
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    /// True when every node the store names is its own. A store that names
+    /// a node of another store (an alias slot, for example a synthetic
+    /// node of the worker) cannot be adopted.
+    #[must_use]
+    pub fn is_self_contained(&self) -> bool {
+        self.store.frozen && self.store.aliases.is_empty()
+    }
+}
+
+/// Makes the detached store of this thread with provisional id
+/// `DETACHED_STORE_BASE + job` and returns that id. A parse worker parses
+/// one file at a time; the store stays until `take_detached_file_store`.
+pub fn new_detached_file_store(job: usize, file_name: &'static str, text: &'static str) -> usize {
+    assert!(frozen().is_none(), "cannot make a node store after freeze");
+    assert!(job < DETACHED_STORE_LIMIT, "too many detached stores");
+    let id = DETACHED_STORE_BASE + job;
+    DETACHED.with(|d| {
+        let mut d = d.borrow_mut();
+        assert!(d.is_none(), "this thread already has a detached store");
+        *d = Some((id, FileStore::new(file_name, text)));
+    });
+    id
+}
+
+/// Removes the detached store of this thread, if any.
+pub fn take_detached_file_store() -> Option<DetachedStore> {
+    DETACHED
+        .with(|d| d.borrow_mut().take())
+        .map(|(id, store)| DetachedStore { id, store })
+}
+
+/// Maps the node handles of an adopted detached store to its real id.
+#[derive(Clone, Copy, Debug)]
+pub struct StoreRemap {
+    from: usize,
+    to: usize,
+}
+
+impl StoreRemap {
+    /// The real store id.
+    #[must_use]
+    pub fn store(self) -> usize {
+        self.to
+    }
+
+    /// `n` with the provisional store id replaced by the real one. Other
+    /// handles (nil, other stores) do not change.
+    #[inline]
+    #[must_use]
+    pub fn node(self, n: Node) -> Node {
+        if n.is_some() && n.file_index() == self.from {
+            handle(self.to, slot_index(n) as u32)
+        } else {
+            n
+        }
+    }
+}
+
+/// Gives a self-contained detached store the next real store id on this
+/// thread, as `new_file_store` would have at this point, and returns the
+/// handle map for the values the parse returned with it.
+pub fn adopt_detached_store(detached: DetachedStore) -> StoreRemap {
+    assert!(frozen().is_none(), "cannot adopt a node store after freeze");
+    assert!(
+        detached.is_self_contained(),
+        "cannot adopt a store that names other stores"
+    );
+    let DetachedStore { id, mut store } = detached;
+    BUILD.with(|s| {
+        let mut s = s.borrow_mut();
+        assert!(
+            crate::core::try_prog().is_none_or(|p| p.files.len() <= s.len()),
+            "a legacy program is installed; file ids would collide with store ids"
+        );
+        let remap = StoreRemap {
+            from: id,
+            to: s.len(),
+        };
+        store.jsdoc_cache = store
+            .jsdoc_cache
+            .iter()
+            .map(|(&node, &jsdocs)| {
+                let jsdocs: &'static [Node] = if jsdocs.iter().any(|&n| remap.node(n) != n) {
+                    Box::leak(jsdocs.iter().map(|&n| remap.node(n)).collect())
+                } else {
+                    jsdocs
+                };
+                (remap.node(node), jsdocs)
+            })
+            .collect();
+        s.push(store);
+        remap
     })
 }
 
@@ -204,8 +400,11 @@ pub fn file_stores_frozen() -> bool {
 #[inline]
 #[must_use]
 pub fn has_file_store(file: usize) -> bool {
-    match frozen() {
-        Some(stores) => file < stores.len(),
+    match FROZEN.get() {
+        Some(f) => file < f.headers.len(),
+        None if is_detached_id(file) => {
+            DETACHED.with(|d| d.borrow().as_ref().is_some_and(|(id, _)| *id == file))
+        }
         None => BUILD.with(|s| file < s.borrow().len()),
     }
 }
@@ -257,8 +456,16 @@ pub fn is_file_store_before_program(file: usize) -> bool {
 }
 
 /// Ends the parse of a file. Header and data writes panic after this.
+/// Headers cannot change after this, so it also marks the source file roots
+/// (`mark_source_file_roots`) on the parsing thread.
 pub fn freeze_file_store(file: usize) {
-    with_store_mut(file, |s| s.frozen = true);
+    with_store_mut(file, |s| {
+        s.frozen = true;
+        s.headers.shrink_to_fit();
+        s.nodes.shrink_to_fit();
+        mark_source_file_roots(s);
+        s.parser_flags = Some(s.headers.iter().map(|h| h.flags).collect());
+    });
 }
 
 #[must_use]
@@ -278,7 +485,13 @@ pub fn file_store_slot_count(file: usize) -> usize {
 /// this, so the binder reads the same flags as for a legacy file.
 #[must_use]
 pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
-    with_store(file, |s| s.headers.iter().map(|h| h.flags).collect())
+    let computed = |s: &FileStore| s.headers.iter().map(|h| h.flags).collect();
+    if frozen().is_some() {
+        return with_store(file, computed);
+    }
+    with_store_mut(file, |s| {
+        s.parser_flags.take().unwrap_or_else(|| computed(s))
+    })
 }
 
 /// Moves every store of this thread into the process-wide read-only slice.
@@ -289,26 +502,38 @@ pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
 pub fn freeze_file_stores() {
     let mut stores = BUILD.with(|s| std::mem::take(&mut *s.borrow_mut()));
     for (file, store) in stores.iter_mut().enumerate() {
-        store.frozen = true;
+        if !store.frozen {
+            // PORT: a store whose parse did not finish (a parse panic).
+            store.frozen = true;
+            store.headers.shrink_to_fit();
+            store.nodes.shrink_to_fit();
+            mark_source_file_roots(store);
+        }
         store.aliases = FxHashMap::default();
         store.jsdoc_cache = FxHashMap::default();
-        store.headers.shrink_to_fit();
-        store.nodes.shrink_to_fit();
-        mark_source_file_roots(file, store);
+        store.parser_flags = None;
+        if store.root_slot != NIL_SLOT {
+            store.root = handle(file, store.root_slot);
+        }
     }
     let stores: &'static [FileStore] = Box::leak(stores.into_boxed_slice());
+    let frozen = Frozen {
+        stores,
+        headers: stores.iter().map(|s| &s.headers[..]).collect(),
+        nodes: stores.iter().map(|s| &s.nodes[..]).collect(),
+    };
     assert!(
-        FROZEN.set(stores).is_ok(),
+        FROZEN.set(frozen).is_ok(),
         "node stores are already frozen; one process installs one program"
     );
 }
 
-/// Sets `store.root` and `NodeHeader::source_file_is_root` of each node
+/// Sets `store.root_slot` and `NodeHeader::source_file_is_root` of each node
 /// slot whose Go parent walk (`GetSourceFileOfNode`) ends at that root.
 /// Headers are frozen, so the walk result cannot change. A walk that leaves
 /// the store (a synthetic or foreign parent) stays unmarked and is walked
 /// at read time.
-fn mark_source_file_roots(file: usize, store: &mut FileStore) {
+fn mark_source_file_roots(store: &mut FileStore) {
     // PORT: the parser makes the SourceFile node last, so the root is the
     // last SourceFile slot. Any other SourceFile node stays unmarked.
     let Some(root) = (0..store.headers.len())
@@ -317,7 +542,7 @@ fn mark_source_file_roots(file: usize, store: &mut FileStore) {
     else {
         return;
     };
-    store.root = handle(file, root as u32);
+    store.root_slot = root as u32;
 
     const UNSEEN: u8 = 0;
     const ON_PATH: u8 = 1;
@@ -325,8 +550,21 @@ fn mark_source_file_roots(file: usize, store: &mut FileStore) {
     const NOT_ROOT: u8 = 3;
     let mut state = vec![UNSEEN; store.headers.len()];
     let mut path = Vec::new();
-    for start in 1..store.headers.len() {
+    // The parser makes a parent after its children, so most parents have a
+    // higher slot. Walking the slots down finds them already marked.
+    for start in (1..store.headers.len()).rev() {
         if store.nodes[start].is_none() {
+            continue;
+        }
+        let header = &store.headers[start];
+        let parent = header.parent;
+        if header.kind != SyntaxKind::SourceFile
+            && parent.file_index() == LOCAL_STORE
+            && matches!(state[slot_index(parent)], ROOT | NOT_ROOT)
+        {
+            let result = state[slot_index(parent)];
+            state[start] = result;
+            store.headers[start].source_file_is_root = result == ROOT;
             continue;
         }
         let mut cur = start;
@@ -344,7 +582,7 @@ fn mark_source_file_roots(file: usize, store: &mut FileStore) {
                 break if cur == root { ROOT } else { NOT_ROOT };
             }
             let parent = header.parent;
-            if parent.is_nil() || parent.file_index() != file {
+            if parent.file_index() != LOCAL_STORE {
                 break NOT_ROOT;
             }
             cur = slot_index(parent);
@@ -371,10 +609,13 @@ pub fn resolve_store_id(file: usize, id: ts_ast::NodeId) -> Node {
         // The nil slot or an alias slot: the target is in the header.
         None => s.headers[index].parent,
     };
-    if let Some(stores) = frozen() {
-        return resolve(&stores[file]);
+    if let Some(f) = FROZEN.get() {
+        return match f.nodes[file][index] {
+            Some(_) => handle(file, index as u32),
+            None => f.headers[file][index].parent,
+        };
     }
-    BUILD.with(|s| resolve(&s.borrow()[file]))
+    with_store(file, resolve)
 }
 
 /// Hook for `raw(n)`: the ts_ast node (Go kind and data) of a store node.
@@ -383,10 +624,11 @@ pub fn resolve_store_id(file: usize, id: ts_ast::NodeId) -> Node {
 pub fn store_ast_node(n: Node) -> &'static ts_ast::Node {
     let get =
         |s: &FileStore| s.nodes[slot_index(n)].expect("store handle does not name a node slot");
-    if let Some(stores) = frozen() {
-        return get(&stores[n.file_index()]);
+    if let Some(f) = FROZEN.get() {
+        return f.nodes[n.file_index()][slot_index(n)]
+            .expect("store handle does not name a node slot");
     }
-    BUILD.with(|s| get(&s.borrow()[n.file_index()]))
+    with_store(n.file_index(), get)
 }
 
 /// Hook for `Node::kind`, `flags`, `parent` and `loc` on a store node.
@@ -399,12 +641,109 @@ pub fn store_header(n: Node) -> NodeHeader {
             s.nodes[index].is_some(),
             "store handle does not name a node slot"
         );
-        s.headers[index]
+        s.headers[index].read(n.file_index())
     };
-    if let Some(stores) = frozen() {
-        return get(&stores[n.file_index()]);
+    if let Some(f) = FROZEN.get() {
+        let (file, index) = (n.file_index(), slot_index(n));
+        debug_assert!(
+            f.nodes[file][index].is_some(),
+            "store handle does not name a node slot"
+        );
+        return f.headers[file][index].read(file);
     }
-    BUILD.with(|s| get(&s.borrow()[n.file_index()]))
+    with_store(n.file_index(), get)
+}
+
+/// The header of `n` when it is a store node (kind, parser flags, parent,
+/// loc): one table lookup after freeze, one thread-local access before.
+/// `None` for nil, synthetic and legacy nodes. With it a node read needs no
+/// separate `has_file_store` call.
+#[inline]
+#[must_use]
+pub fn try_store_header(n: Node) -> Option<NodeHeader> {
+    if n.is_nil() {
+        return None;
+    }
+    let (file, index) = (n.file_index(), slot_index(n));
+    if let Some(f) = FROZEN.get() {
+        return f.headers.get(file).map(|headers| headers[index].read(file));
+    }
+    if is_detached_id(file) {
+        return DETACHED.with(|d| match &*d.borrow() {
+            Some((id, store)) if *id == file => Some(store.headers[index].read(file)),
+            _ => None,
+        });
+    }
+    BUILD.with(|s| {
+        s.borrow()
+            .get(file)
+            .map(|store| store.headers[index].read(file))
+    })
+}
+
+/// `store_ast_node(n)` when `n` is a store node, in one lookup (see
+/// `try_store_header`). `None` for nil, synthetic and legacy nodes.
+#[inline]
+#[must_use]
+pub fn try_store_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
+    if n.is_nil() {
+        return None;
+    }
+    let (file, index) = (n.file_index(), slot_index(n));
+    let node =
+        |slot: Option<&'static ts_ast::Node>| slot.expect("store handle does not name a node slot");
+    if let Some(f) = FROZEN.get() {
+        return f.nodes.get(file).map(|nodes| node(nodes[index]));
+    }
+    if is_detached_id(file) {
+        return DETACHED.with(|d| match &*d.borrow() {
+            Some((id, store)) if *id == file => Some(node(store.nodes[index])),
+            _ => None,
+        });
+    }
+    BUILD.with(|s| s.borrow().get(file).map(|store| node(store.nodes[index])))
+}
+
+/// `resolve_store_id(file, id)` when `file` has a store, in one lookup (see
+/// `try_store_header`). `None` when it has none.
+#[inline]
+#[must_use]
+pub fn try_resolve_store_id(file: usize, id: ts_ast::NodeId) -> Option<Node> {
+    let index = id.index();
+    let resolve = |nodes: &[Option<&'static ts_ast::Node>], headers: &[NodeHeader]| {
+        Some(match nodes[index] {
+            Some(_) => handle(file, index as u32),
+            None => headers[index].parent,
+        })
+    };
+    if let Some(f) = FROZEN.get() {
+        return match (f.nodes.get(file), f.headers.get(file)) {
+            (Some(nodes), Some(headers)) => resolve(nodes, headers),
+            _ => None,
+        };
+    }
+    if is_detached_id(file) {
+        return DETACHED.with(|d| match &*d.borrow() {
+            Some((id, store)) if *id == file => resolve(&store.nodes, &store.headers),
+            _ => None,
+        });
+    }
+    BUILD.with(|s| {
+        s.borrow()
+            .get(file)
+            .and_then(|store| resolve(&store.nodes, &store.headers))
+    })
+}
+
+/// Go `SourceFile.ECMALineMap()` of store file `file` after freeze. It is
+/// computed once and shared by every thread. `None` before freeze or for a
+/// file without a store.
+#[must_use]
+pub fn frozen_file_ecma_line_starts(file: usize) -> Option<&'static [i32]> {
+    let store = frozen()?.get(file)?;
+    Some(store.ecma_line_starts.get_or_init(|| {
+        crate::scanner_util::compute_ecma_line_starts(store.text).into_boxed_slice()
+    }))
 }
 
 /// Go `GetSourceFileOfNode(n)` in O(1), when `n` is a frozen store node
@@ -415,18 +754,74 @@ pub fn frozen_source_file_of_node(n: Node) -> Option<Node> {
     if n.is_nil() {
         return None;
     }
-    let store = frozen()?.get(n.file_index())?;
-    store.headers[slot_index(n)]
+    let f = FROZEN.get()?;
+    let file = n.file_index();
+    f.headers.get(file)?[slot_index(n)]
         .source_file_is_root
-        .then_some(store.root)
+        .then(|| f.stores[file].root)
 }
 
 // ──────────────────────────────────────────────────────────────────────
 // Go field writes during the parse
 // ──────────────────────────────────────────────────────────────────────
 
+/// Runs `f` on the header of `n` when `n` is a node slot of a store of this
+/// thread (built or detached), with one thread-local access. False when
+/// `n` is not a store node of this thread (for example a synthetic node).
+/// Panics on a finished store, like `with_slot_mut`.
+fn try_with_build_header(n: Node, f: impl FnOnce(&mut NodeHeader)) -> bool {
+    if n.is_nil() || FROZEN.get().is_some() {
+        return false;
+    }
+    let file = n.file_index();
+    let write = |s: &mut FileStore| {
+        assert!(!s.frozen, "cannot mutate a node of a finished file");
+        let index = slot_index(n);
+        assert!(
+            s.nodes[index].is_some(),
+            "store handle does not name a node slot"
+        );
+        f(&mut s.headers[index]);
+    };
+    if is_detached_id(file) {
+        return DETACHED.with(|d| match &mut *d.borrow_mut() {
+            Some((id, store)) if *id == file => {
+                write(store);
+                true
+            }
+            _ => false,
+        });
+    }
+    BUILD.with(|s| match s.borrow_mut().get_mut(file) {
+        Some(store) => {
+            write(store);
+            true
+        }
+        None => false,
+    })
+}
+
+/// Go `finishNode` writes `node.Loc = loc` and `node.Flags |= flags` on a
+/// node of an unfinished store, in one store access. False (nothing
+/// written) when `n` is not a store node of this thread.
+pub fn finish_store_node(n: Node, loc: TextRange, flags: NodeFlags) -> bool {
+    try_with_build_header(n, |h| {
+        h.loc = loc;
+        h.flags |= flags;
+    })
+}
+
+/// Go `node.Parent = parent` on a node of an unfinished store, in one store
+/// access. False (nothing written) when `n` is not a store node of this
+/// thread.
+pub fn try_set_store_node_parent(n: Node, parent: Node) -> bool {
+    let parent = NodeHeader::stored_parent(n.file_index(), parent);
+    try_with_build_header(n, |h| h.parent = parent)
+}
+
 /// Go `node.Parent = parent` on a node of an unfrozen file.
 pub fn set_store_node_parent(n: Node, parent: Node) {
+    let parent = NodeHeader::stored_parent(n.file_index(), parent);
     with_slot_mut(n, |_, h| h.parent = parent);
 }
 
@@ -658,5 +1053,55 @@ mod tests {
 
         freeze_file_store(file);
         assert!(std::panic::catch_unwind(|| set_node_parent(b, q)).is_err());
+    }
+
+    #[test]
+    fn adopted_detached_parse_equals_a_serial_parse() {
+        use crate::frontend::parser::{
+            ParsedSourceFile, SourceFileParseOptions, adopt_detached_parse, parse_source_file,
+            parse_source_file_detached,
+        };
+        let text =
+            "/** doc */\nexport function f(a: number) { return a + 1; }\nlet x = <T>(y: T) => y;\n";
+        let opts = SourceFileParseOptions {
+            file_name: "/a.ts".to_string(),
+            ..Default::default()
+        };
+        let serial = parse_source_file(&opts, text, ScriptKind::TS);
+        let worker_opts = opts.clone();
+        let detached = std::thread::spawn(move || {
+            parse_source_file_detached(7, &worker_opts, text, ScriptKind::TS)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(detached.store.id(), DETACHED_STORE_BASE + 7);
+        let adopted: ParsedSourceFile = adopt_detached_parse(detached, &opts);
+
+        assert_eq!(adopted.store, serial.store + 1);
+        let slots = file_store_slot_count(serial.store);
+        assert_eq!(file_store_slot_count(adopted.store), slots);
+        let to_serial = |n: Node| {
+            if n.is_some() && n.file_index() == adopted.store {
+                handle(serial.store, slot_index(n) as u32)
+            } else {
+                n
+            }
+        };
+        for index in 1..slots as u32 {
+            let (a, b) = (handle(serial.store, index), handle(adopted.store, index));
+            let (ha, hb) = (store_header(a), store_header(b));
+            assert_eq!(ha.kind, hb.kind);
+            assert_eq!(ha.flags, hb.flags);
+            assert_eq!(ha.loc, hb.loc);
+            assert_eq!(ha.parent, to_serial(hb.parent));
+        }
+        assert_eq!(serial.root, to_serial(adopted.root));
+        assert_eq!(serial.imports.len(), adopted.imports.len());
+        assert_eq!(serial.jsdoc_cache.len(), adopted.jsdoc_cache.len());
+        for (node, jsdocs) in &adopted.jsdoc_cache {
+            let expected: Vec<Node> = jsdocs.iter().map(|&n| to_serial(n)).collect();
+            assert_eq!(serial.jsdoc_cache[&to_serial(*node)], expected);
+            assert_eq!(file_store_js_doc(adopted.store, *node), Some(&jsdocs[..]));
+        }
     }
 }

@@ -482,7 +482,7 @@ pub fn get_lines_between_positions(source_file: Node, pos1: i32, pos2: i32) -> i
     let lower = if pos1 < pos2 { pos1 } else { pos2 };
     let is_negative = lower == pos2;
     let upper = if is_negative { pos1 } else { pos2 };
-    let lower_line = compute_line_of_position(&line_starts, lower);
+    let lower_line = compute_line_of_position(line_starts, lower);
     let upper_line =
         lower_line + compute_line_of_position(&line_starts[lower_line as usize..], upper);
     if is_negative {
@@ -1329,7 +1329,7 @@ pub(crate) fn calculate_indent(text: &str, mut pos: i32, end: i32) -> i32 {
 //
 // Character offsets are measured in UTF-16 code units per the source map specification.
 pub(crate) struct LineCharacterCache {
-    line_map: Rc<Vec<i32>>,
+    line_map: &'static [i32],
     text: &'static str,
     cached_line: i32,
     cached_pos: i32,
@@ -1357,7 +1357,7 @@ impl LineCharacterCache {
     // getLineAndCharacter returns the 0-based line number and UTF-16 code unit
     // offset from the start of that line for the given byte position.
     pub(crate) fn get_line_and_character(&mut self, pos: i32) -> (i32, i32) {
-        let line = compute_line_of_position(&self.line_map, pos);
+        let line = compute_line_of_position(self.line_map, pos);
         let line_start = self.line_map[line as usize];
         // When pos is beyond the source text (e.g., for error-recovery tokens like
         // missing closing braces), we can't slice past the text end. Compute the

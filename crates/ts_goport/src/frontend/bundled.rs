@@ -50,6 +50,14 @@ pub fn lib_path() -> String {
     format!("{SCHEME}libs")
 }
 
+/// The embedded text of bundled path `path` (for example
+/// `bundled:///libs/lib.dom.d.ts`), with no copy. `None` for other paths.
+// PORT: Go's `ReadFile` returns this string directly; the `Fs` trait copies it.
+#[must_use]
+pub fn bundled_text(path: &str) -> Option<&'static str> {
+    embedded_contents(split_path(path)?)
+}
+
 // Go: embed.go:25 IsBundled
 pub fn is_bundled(path: &str) -> bool {
     split_path(path).is_some()

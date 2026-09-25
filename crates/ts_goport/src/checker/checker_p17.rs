@@ -1258,7 +1258,7 @@ impl Checker {
         if has_default_only && t.is_some() && !self.is_error_type(t) {
             let key = CachedTypeKey {
                 kind: CachedTypeKind::DEFAULT_ONLY_TYPE,
-                type_id: self.ty(t).id,
+                type_id: t,
             };
             if let Some(&cached) = self.cached_types.get(&key) {
                 if cached.is_some() {
@@ -1287,7 +1287,7 @@ impl Checker {
         if t.is_some() && !self.is_error_type(t) {
             let key = CachedTypeKey {
                 kind: CachedTypeKind::SYNTHETIC_TYPE,
-                type_id: self.ty(t).id,
+                type_id: t,
             };
             if let Some(&cached) = self.cached_types.get(&key) {
                 if cached.is_some() {

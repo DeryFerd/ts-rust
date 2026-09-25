@@ -193,7 +193,7 @@ impl Checker {
         let mut readonly_computed_symbol_property = true;
         let mut property_symbols: Vec<SymbolId> = Vec::new();
         let declarations = self.sym(index_symbol).declarations.clone();
-        for declaration in declarations {
+        for &declaration in declarations.iter() {
             if is_index_signature_declaration(declaration) {
                 let parameters = declaration.parameters();
                 let return_type_node = declaration.type_();

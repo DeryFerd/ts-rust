@@ -250,7 +250,7 @@ impl Checker {
             // fill in any as-yet-unresolved late-bound members.
             let mut late_symbols = SymbolTable::NIL;
             let declarations = self.sym(symbol).declarations.clone();
-            for decl in declarations {
+            for &decl in declarations.iter() {
                 for member in get_members_of_declaration(decl) {
                     if is_static == has_static_modifier(member) {
                         if self.has_late_bindable_name(member) {
@@ -274,7 +274,7 @@ impl Checker {
                     .get(exports, INTERNAL_SYMBOL_NAME_ASSIGNMENT_DECLARATION);
                 if assignment_symbol.is_some() {
                     let members = self.sym(assignment_symbol).declarations.clone();
-                    for member in members {
+                    for &member in members.iter() {
                         if self.has_late_bindable_name(member) {
                             if late_symbols.is_nil() {
                                 late_symbols = self.symbols.new_table();
@@ -639,7 +639,7 @@ impl Checker {
             let nested_symbols = self.symbols.new_table();
             let mut lookup_table: ExportCollisionTable = IndexMap::new();
             let declarations = self.sym(export_stars).declarations.clone();
-            for node in declarations {
+            for &node in declarations.iter() {
                 let resolved_module = self.resolve_external_module_name(
                     node,
                     node.module_specifier(),
