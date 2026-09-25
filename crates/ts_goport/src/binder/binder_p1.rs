@@ -69,9 +69,8 @@ pub struct Binder {
     /// Rust-only: binder fields of `ast.SourceFile` (`BindDiagnostics`,
     /// `EndFlowNode`, `PatternAmbientModules`, `GlobalExports`, ...).
     pub file_bind: FileBindData,
-    /// Rust-only: Go `file.CommonJSModuleIndicator`, which only the binder
-    /// sets. PORT: `FileBindData` has no field for it, so it does not leave
-    /// the binder.
+    /// Go `file.CommonJSModuleIndicator` while binding. It is copied to
+    /// `file_bind` when the bind ends.
     pub common_js_module_indicator: Node,
 }
 
@@ -165,6 +164,7 @@ pub fn bind_source_file_detached(file: Node, symbols: &mut SymbolArena) -> Bound
     b.bind_deferred_expando_assignments();
     b.file_bind.symbol_count = b.symbol_count;
     b.file_bind.classifiable_names = std::mem::take(&mut b.classifiable_names);
+    b.file_bind.common_js_module_indicator = b.common_js_module_indicator;
     *symbols = std::mem::take(&mut b.symbols);
     let Binder {
         node_bind,

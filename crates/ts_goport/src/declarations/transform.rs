@@ -28,6 +28,7 @@ use crate::prelude::*;
 use crate::printer::{
     CommentRange, EmitContext, EmitResolver, SymbolAccessibilityResult, new_emit_context,
 };
+use crate::transformers::utilities::is_original_node_single_line;
 
 // Go: transformers/declarations/transform.go:23 ReferencedFilePair
 #[derive(Clone)]
@@ -956,25 +957,6 @@ fn retained_references(refs: &[FileReference]) -> Vec<FileReference> {
         });
     }
     result
-}
-
-// Go: transformers/utilities.go:248 IsOriginalNodeSingleLine
-// PORT: there is no `transformers` utilities module yet, so it lives here.
-fn is_original_node_single_line(emit_context: &EmitContext, node: Node) -> bool {
-    if node.is_nil() {
-        return false;
-    }
-    let original = emit_context.most_original(node);
-    if original.is_nil() {
-        return false;
-    }
-    let source = get_source_file_of_node(original);
-    if source.is_nil() {
-        return false;
-    }
-    let start_line = get_ecma_line_of_position(source, original.loc().pos());
-    let end_line = get_ecma_line_of_position(source, original.loc().end());
-    start_line == end_line
 }
 
 // Go: tspath/path.go:793 GetRelativePathToDirectoryOrUrl

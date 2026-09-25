@@ -201,32 +201,19 @@ static NOT_BOUND: PostBindInfo = PostBindInfo {
 impl Deref for LateSourceFileInfo {
     type Target = PostBindInfo;
 
-    // PORT: Go `SourceFile.CommonJSModuleIndicator` is set by the binder. The
-    // Rust binder keeps its indicator on the Binder struct. A bound file with
-    // no ES module indicator whose root got a symbol was bound as a CommonJS
-    // module (JSON files excluded), so the root is the indicator. Before the
-    // file is bound the value is nil and not cached.
+    // PORT: Go `SourceFile.CommonJSModuleIndicator` is set by the binder.
+    // The Rust binder stores it in `FileBindData`. Before the file is bound
+    // the value is nil and not cached.
     fn deref(&self) -> &PostBindInfo {
         if let Some(info) = self.post_bind.get() {
             return info;
         }
         let file = &prog().files[self.file_index];
-        if file.file_bind.get().is_none() {
+        let Some(file_bind) = file.file_bind.get() else {
             return &NOT_BOUND;
-        }
-        self.post_bind.get_or_init(|| {
-            let root = file.root;
-            let indicator = if self.external_module_indicator.is_nil()
-                && file.info.script_kind != ScriptKind::JSON
-                && root.symbol().is_some()
-            {
-                root
-            } else {
-                Node::NIL
-            };
-            PostBindInfo {
-                common_js_module_indicator: indicator,
-            }
+        };
+        self.post_bind.get_or_init(|| PostBindInfo {
+            common_js_module_indicator: file_bind.common_js_module_indicator,
         })
     }
 }
@@ -2160,10 +2147,25 @@ fn compute_common_source_directory_of_filenames(
 }
 
 // Go: compiler/program.go:1912 IsSourceFileFromExternalLibrary
-// PORT: Go records files found while searching node_modules. The Rust
-// loader does not; a path inside node_modules stands in for it.
+// PORT: the Go frontend loader records files found while searching
+// node_modules. The legacy loader does not; a path inside node_modules
+// stands in for it there.
 pub fn is_source_file_from_external_library(file: Node) -> bool {
-    source_file_info(file).path.contains("/node_modules/")
+    let path = &source_file_info(file).path;
+    if let Some(go) = &state().go {
+        return go.is_source_file_from_external_library(path);
+    }
+    path.contains("/node_modules/")
+}
+
+// Go: compiler/program.go:1225 IsEmitBlocked
+// PORT: the legacy loader does not verify output paths, so nothing is
+// blocked there.
+pub fn is_emit_blocked(emit_file_name: &str) -> bool {
+    state()
+        .go
+        .as_ref()
+        .is_some_and(|go| go.is_emit_blocked(emit_file_name))
 }
 
 // Go: compiler/program.go:1927 SourceFileMayBeEmitted
@@ -3444,4 +3446,33 @@ fn flatten_diagnostic_message_chain(
     for child in &chain.message_chain {
         flatten_diagnostic_message_chain(writer, child, new_line, level + 1);
     }
+}
+
+// Emit support: run work on a file's checker thread without holding the checker.
+
+/// Runs `f(file)` for each file on the thread of the file's checker, with
+/// no checker borrowed, and returns the results in file order. The emit
+/// resolver borrows its checker itself (`with_checker_at`), so emit runs
+/// through this instead of `with_type_checker_for_file`.
+pub fn run_on_checker_threads_for_files<R: Send + 'static>(
+    files: &[Node],
+    f: impl Fn(Node) -> R + Send + Sync + 'static,
+) -> Vec<R> {
+    if worker_index().is_some() {
+        return files.iter().map(|&file| f(file)).collect();
+    }
+    let f = Arc::new(f);
+    let receivers = files
+        .iter()
+        .map(|&file| {
+            let f = Arc::clone(&f);
+            send_thread_job(checker_index_for_file(file), move || f(file))
+        })
+        .collect();
+    wait_jobs(receivers)
+}
+
+/// The pool index of the checker for `file` (Go `fileAssociations[file]`).
+pub fn checker_index_of_file(file: Node) -> usize {
+    checker_index_for_file(file)
 }

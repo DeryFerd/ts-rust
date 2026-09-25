@@ -854,15 +854,56 @@ impl Printer {
     }
 
     // Go: printer/printer.go:3056 willEmitLeadingNewLine
-    pub(crate) fn will_emit_leading_new_line(&mut self, _node: Node) -> bool {
+    pub(crate) fn will_emit_leading_new_line(&mut self, node: Node) -> bool {
         if self.current_source_file.is_nil() {
             return false;
         }
-        // PORT: Go iterates scanner.GetLeadingCommentRanges(factory, text, node.Pos()).
-        // The rest of Go (parenthesized parse node, synthetic leading comments,
-        // and partially emitted expressions with trailing comment ranges) is
-        // ported when the comment range scanner lands.
-        unported!("scanner.GetLeadingCommentRanges")
+        let text = source_file_text(self.current_source_file);
+        let mut has_leading_comment_ranges = false;
+        let mut has_new_line_comment = false;
+        for comment in crate::frontend::scanner::get_leading_comment_ranges(
+            self.emit_context.factory().as_node_factory(),
+            text,
+            node.pos(),
+        ) {
+            has_leading_comment_ranges = true;
+            if self.comment_will_emit_new_line(&comment) {
+                has_new_line_comment = true;
+            }
+        }
+        if has_leading_comment_ranges {
+            let parse_node = self.emit_context.parse_node(node);
+            if parse_node.is_some() && is_parenthesized_expression(parse_node.parent()) {
+                return true;
+            }
+        }
+        if has_new_line_comment {
+            return true;
+        }
+        if self
+            .emit_context
+            .get_synthetic_leading_comments(node)
+            .iter()
+            .any(|comment| self.synthetic_comment_will_emit_new_line(comment))
+        {
+            return true;
+        }
+        if is_partially_emitted_expression(node) {
+            let expression = node.expression();
+            if node.pos() != expression.pos() {
+                for comment in crate::frontend::scanner::get_trailing_comment_ranges(
+                    self.emit_context.factory().as_node_factory(),
+                    text,
+                    expression.pos(),
+                ) {
+                    if self.comment_will_emit_new_line(&comment) {
+                        return true;
+                    }
+                }
+            }
+            return self.will_emit_leading_new_line(expression);
+        }
+        false
     }
 
     // parenthesizeExpressionForNoAsi wraps an expression in parens if we would emit a leading comment
@@ -1195,7 +1236,7 @@ impl Printer {
         let state = self.enter_node(node);
 
         if self.current_source_file.is_some()
-            && source_file_info(self.current_source_file).script_kind == ScriptKind::JSON
+            && source_file_script_kind(self.current_source_file) == ScriptKind::JSON
         {
             // !!! In strada, this was handled by an undefined parenthesizerRule, so this is a hack.
             self.emit_expression(node.expression(), OperatorPrecedence::COMMA);
@@ -1217,7 +1258,7 @@ impl Printer {
         // Emit semicolon in non json files
         // or if json file that created synthesized expression(eg.define expression statement when --out and amd code generation)
         if self.current_source_file.is_nil()
-            || source_file_info(self.current_source_file).script_kind != ScriptKind::JSON
+            || source_file_script_kind(self.current_source_file) != ScriptKind::JSON
             || node_is_synthesized(node.expression())
         {
             self.write_trailing_semicolon();

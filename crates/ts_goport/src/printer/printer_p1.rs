@@ -47,13 +47,40 @@ pub struct PrintHandlers {
     pub on_after_emit_token: Option<Rc<dyn Fn(Node)>>,
 }
 
-// PORT: the Go `sourcemap` package is not ported (source map emit is out of
-// scope). These stand-ins keep the Printer fields. The generator is never set.
-pub type SourceIndex = i32;
+/// Go `*sourcemap.Generator`.
+pub use crate::sourcemap::generator::Generator as SourceMapGenerator;
+/// Go `sourcemap.SourceIndex`.
+pub use crate::sourcemap::generator::SourceIndex;
 
-// PORT: stand-in for Go `*sourcemap.Generator`. Never constructed in scope.
-#[derive(Debug, Default)]
-pub struct SourceMapGenerator {}
+/// Go `file.ScriptKind` of a parsed or factory SourceFile.
+// PORT: the printer prints transformed SourceFiles. Those are factory
+// (synthetic) nodes, and `source_file_info` only reads parsed files.
+pub(crate) fn source_file_script_kind(file: Node) -> ScriptKind {
+    if is_synthetic_node(file) {
+        return with_synthetic_source_file(file, |d| d.script_kind);
+    }
+    source_file_info(file).script_kind
+}
+
+/// Go `file.IsDeclarationFile` of a parsed or factory SourceFile.
+// PORT: see `source_file_script_kind`.
+pub(crate) fn source_file_is_declaration_file(file: Node) -> bool {
+    if is_synthetic_node(file) {
+        return with_synthetic_source_file(file, |d| d.is_declaration_file);
+    }
+    source_file_info(file).is_declaration_file
+}
+
+/// The parsed SourceFile whose Go `Identifiers` a SourceFile has.
+// PORT: Go `UpdateSourceFile` copies `Identifiers` from the original file.
+// `is_file_level_unique_name` collects them from the tree it gets, so a
+// transformed (factory) SourceFile maps to its most original file here.
+pub(crate) fn identifiers_source_file(emit_context: &EmitContext, file: Node) -> Node {
+    if is_synthetic_node(file) {
+        return emit_context.most_original(file);
+    }
+    file
+}
 
 // Go: printer/printer.go:114 Printer
 pub struct Printer {
@@ -230,6 +257,7 @@ pub fn new_printer(
     {
         let source_file = Rc::clone(&printer.name_generator_source_file);
         let has_global_name = printer.print_handlers.has_global_name.clone();
+        let emit_context = Rc::clone(&emit_context);
         // Go: printer/printer.go:6082 isFileLevelUniqueNameInCurrentFile
         printer
             .name_generator
@@ -237,7 +265,11 @@ pub fn new_printer(
             Some(Rc::new(move |name: &str, _private_name: bool| {
                 let current_source_file = source_file.get();
                 if current_source_file.is_some() {
-                    is_file_level_unique_name(current_source_file, name, has_global_name.as_deref())
+                    is_file_level_unique_name(
+                        identifiers_source_file(&emit_context, current_source_file),
+                        name,
+                        has_global_name.as_deref(),
+                    )
                 } else {
                     true
                 }
@@ -1282,9 +1314,17 @@ impl Printer {
             return false;
         }
 
-        // PORT: Go ranges over scanner.GetTrailingCommentRanges and
-        // scanner.GetLeadingCommentRanges, which are not ported yet.
-        unported!("GetTrailingCommentRanges")
+        let factory = self.emit_context.factory().as_node_factory();
+        let text = source_file_text(self.current_source_file);
+        if !crate::frontend::scanner::get_trailing_comment_ranges(factory, text, pos + 1).is_empty()
+        {
+            return true;
+        }
+        if !crate::frontend::scanner::get_leading_comment_ranges(factory, text, pos + 1).is_empty()
+        {
+            return true;
+        }
+        false
     }
 
     // Go: printer/printer.go:869 shouldEmitIndirectCall
@@ -1297,7 +1337,7 @@ impl Printer {
     // Go: printer/printer.go:873 shouldAllowTrailingComma
     pub(crate) fn should_allow_trailing_comma(&self, node: Node, list: NodeList) -> bool {
         if self.current_source_file.is_nil()
-            || source_file_info(self.current_source_file).script_kind == ScriptKind::JSON
+            || source_file_script_kind(self.current_source_file) == ScriptKind::JSON
         {
             return false;
         }

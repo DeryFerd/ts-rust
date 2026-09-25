@@ -22,17 +22,24 @@ use crate::flags_macros::{go_enum, go_flags};
 use crate::prelude::*;
 use crate::printer::*;
 
+thread_local! {
+    /// Go `p.emitContext.Factory.AsNodeFactory()` for the comment range
+    /// scanner. The scanner only uses it to build `CommentRange` values.
+    static COMMENT_RANGE_FACTORY: NodeFactory = NodeFactory::default();
+}
+
 // Go: scanner/scanner.go:2813 GetLeadingCommentRanges
-// PORT: the scanner comment range iterator is not ported yet. Go takes the
-// node factory only to allocate the ranges; it is dropped here.
+// PORT: the free functions below have no printer, so they use a plain
+// `ast` factory; the scanner does not allocate nodes with it.
 fn get_leading_comment_ranges(text: &str, pos: i32) -> Vec<CommentRange> {
-    unported!("scanner.GetLeadingCommentRanges")
+    COMMENT_RANGE_FACTORY
+        .with(|f| crate::frontend::scanner::get_leading_comment_ranges(f, text, pos))
 }
 
 // Go: scanner/scanner.go:2817 GetTrailingCommentRanges
-// PORT: see get_leading_comment_ranges.
 fn get_trailing_comment_ranges(text: &str, pos: i32) -> Vec<CommentRange> {
-    unported!("scanner.GetTrailingCommentRanges")
+    COMMENT_RANGE_FACTORY
+        .with(|f| crate::frontend::scanner::get_trailing_comment_ranges(f, text, pos))
 }
 
 impl Printer {
@@ -1032,7 +1039,7 @@ impl Printer {
         if !elided {
             if pos == 0
                 && self.current_source_file.is_some()
-                && source_file_info(self.current_source_file).is_declaration_file
+                && source_file_is_declaration_file(self.current_source_file)
             {
                 triple_slash = Tristate::False;
             }
@@ -1365,15 +1372,51 @@ impl Printer {
     //
 
     // Go: printer/printer.go:5778 setSourceMapSource
+    // PORT: Go `sourcemap.Source` is always a source file node here.
     pub(crate) fn set_source_map_source(&mut self, source: Node) {
         if self.source_maps_disabled {
             return;
         }
 
-        // PORT: the rest needs a source map generator and the line character
-        // cache. `SourceMapGenerator` has no values, so source maps are
-        // always disabled here.
-        unported!("Printer.setSourceMapSource")
+        self.source_map_source = source;
+        // PORT: a transformed source file is a synthetic node. Go copies the
+        // text and line map of the original file into it. `get_ecma_line_starts`
+        // caches line maps by file index, and all synthetic nodes share one
+        // file index, so the line map comes from the original file here.
+        let line_source = if is_synthetic_node(source) {
+            self.emit_context.most_original(source)
+        } else {
+            source
+        };
+        self.source_map_line_char_cache = Some(new_line_character_cache(line_source));
+        if self.most_recent_source_map_source == source {
+            self.source_map_source_index = self.most_recent_source_map_source_index;
+            return;
+        }
+
+        let file_name = source_file_file_name(source);
+        self.source_map_source_is_json =
+            crate::frontend::tspath::file_extension_is(file_name, ".json");
+        if self.source_map_source_is_json {
+            return;
+        }
+
+        let generator = self
+            .source_map_generator
+            .clone()
+            .expect("source map generator");
+        self.source_map_source_index = generator.borrow_mut().add_source(file_name);
+        if self.options.inline_sources {
+            if let Err(err) = generator
+                .borrow_mut()
+                .set_source_content(self.source_map_source_index, source_file_text(source))
+            {
+                panic!("{err}");
+            }
+        }
+
+        self.most_recent_source_map_source = source;
+        self.most_recent_source_map_source_index = self.source_map_source_index;
     }
 
     // Go: printer/printer.go:5806 emitPos
@@ -1387,8 +1430,28 @@ impl Printer {
             return;
         }
 
-        // PORT: see set_source_map_source.
-        unported!("sourcemap.Generator.AddSourceMapping")
+        let (source_line, source_character) = self
+            .source_map_line_char_cache
+            .as_mut()
+            .expect("source map line character cache")
+            .get_line_and_character(pos);
+        let (line, column) = {
+            let writer = self.writer_p5();
+            (writer.get_line(), writer.get_column())
+        };
+        let generator = self
+            .source_map_generator
+            .clone()
+            .expect("source map generator");
+        if let Err(err) = generator.borrow_mut().add_source_mapping(
+            line,
+            column,
+            self.source_map_source_index,
+            source_line,
+            source_character,
+        ) {
+            panic!("{err}");
+        }
     }
 
     // Go: printer/printer.go:5843 emitSourcePos
@@ -1698,7 +1761,7 @@ impl Printer {
     ) -> bool {
         if self.current_source_file.is_some() {
             is_file_level_unique_name(
-                self.current_source_file,
+                identifiers_source_file(&self.emit_context, self.current_source_file),
                 name,
                 self.print_handlers.has_global_name.as_deref(),
             )

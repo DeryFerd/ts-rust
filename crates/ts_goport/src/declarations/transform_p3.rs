@@ -31,6 +31,7 @@ use crate::printer::{
     AutoGenerateOptions, EmitFlags, EmitSymbolTracker, GeneratedIdentifierFlags,
     SymbolAccessibilityResult,
 };
+use crate::transformers::utilities::is_simple_inlineable_expression;
 
 /// A Go visitor callback on the transformer.
 type TxVisitFn = fn(&mut DeclarationTransformer, Node) -> Node;
@@ -59,21 +60,6 @@ fn root_visit_nodes(tx: &mut DeclarationTransformer, list: NodeList) -> NodeList
 fn emit_tracker(tx: &DeclarationTransformer) -> EmitSymbolTracker {
     let tracker: Rc<dyn SymbolTracker> = tx.tracker.clone();
     Some(tracker)
-}
-
-// Go: transformers/utilities.go:270 IsSimpleInlineableExpression
-// PORT: package `transformers` is not ported; this is its only use here.
-fn is_simple_inlineable_expression(expression: Node) -> bool {
-    !is_identifier(expression) && is_simple_copiable_expression(expression)
-}
-
-// Go: transformers/utilities.go:241 IsSimpleCopiableExpression
-// PORT: package `transformers` is not ported; this is its only use here.
-fn is_simple_copiable_expression(expression: Node) -> bool {
-    is_string_literal_like(expression)
-        || is_numeric_literal(expression)
-        || is_keyword_kind(expression.kind())
-        || is_identifier(expression)
 }
 
 impl DeclarationTransformer {

@@ -86,8 +86,14 @@ mod tests {
 
     #[test]
     fn replacer_and_line_delimiters() {
-        assert_eq!(remove_test_path_prefixes("a/.ts/b bundled:///libs/lib.d.ts", false), "ab lib.d.ts");
-        assert_eq!(remove_test_path_prefixes("file:///./src/x", true), "file:///x");
+        assert_eq!(
+            remove_test_path_prefixes("a/.ts/b bundled:///libs/lib.d.ts", false),
+            "ab lib.d.ts"
+        );
+        assert_eq!(
+            remove_test_path_prefixes("file:///./src/x", true),
+            "file:///x"
+        );
         assert_eq!(remove_line_delimiters("a\r\nb\nc\rd\r\r\n"), "abc\rd\r");
         assert!(is_default_library_file("/x/lib.es5.d.ts"));
         assert!(!is_default_library_file("/x/lib.es5.ts"));

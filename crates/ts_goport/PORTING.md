@@ -221,6 +221,15 @@ checker pool, and diagnostic sorting. `options.rs` defines Go-shaped
   its own files, not on thread timing.
 - The Go frontend program is not thread-safe. Only the loading thread reads
   it; checker code reads the copies in `program::go_frontend::GoSharedState`.
+- Emit (`emitter/`, `transformers/`, `printer/`, `bin/goport_emit.rs`)
+  runs each file on its checker's thread with no checker borrowed
+  (`program::run_on_checker_threads_for_files`); the emit resolver borrows
+  the checker itself.
+- Transformers return factory (synthetic) SourceFiles. `source_file_info`
+  and the printer's identifier set map one to the parsed file with the same
+  path (Go `copyFrom`). `get_ecma_line_starts` caches its line map by node,
+  because all synthetic nodes share one file index. Read fields that the
+  transforms set with `source_file_parser_fields`.
 
 ## Style
 

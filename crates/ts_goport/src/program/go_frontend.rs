@@ -16,6 +16,7 @@ use crate::frontend::parser::{ParsedSourceFile, SourceFileParseOptions};
 use crate::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
 use crate::frontend::tspath::Path as GoPath;
 use crate::frontend::vfs::{Fs, osvfs_fs};
+use rustc_hash::FxHashSet;
 use std::rc::Rc;
 
 /// The Go frontend program. It is not thread-safe, so only the loading
@@ -40,6 +41,13 @@ pub(super) struct GoSharedState {
     include_diagnostics: FxHashMap<usize, Vec<Diagnostic>>,
     /// Parser inputs of each program file, by file index, for lazy JSDoc.
     parse_inputs: FxHashMap<usize, LazyJsDocInput>,
+    /// Go `processedFiles.sourceFilesFoundSearchingNodeModules`, by path.
+    source_files_found_searching_node_modules: FxHashSet<String>,
+    /// Go `Program.hasEmitBlockingDiagnostics`, by path.
+    has_emit_blocking_diagnostics: FxHashSet<String>,
+    /// Go `Program.toPath` inputs.
+    current_directory: String,
+    use_case_sensitive_file_names: bool,
 }
 
 /// What `parse_js_doc_for_node` needs from a parsed file.
@@ -355,12 +363,26 @@ impl GoSharedState {
                 (store, input)
             })
             .collect();
+        let source_files_found_searching_node_modules = files
+            .source_files_found_searching_node_modules
+            .iter()
+            .map(|path| path.0.clone())
+            .collect();
+        let has_emit_blocking_diagnostics = p
+            .has_emit_blocking_diagnostics
+            .iter()
+            .map(|path| path.0.clone())
+            .collect();
         Self {
+            has_emit_blocking_diagnostics,
+            current_directory: p.get_current_directory(),
+            use_case_sensitive_file_names: p.use_case_sensitive_file_names(),
             resolved_modules,
             jsx_runtime_import_specifiers,
             import_helpers_import_specifiers,
             include_diagnostics,
             parse_inputs,
+            source_files_found_searching_node_modules,
         }
     }
 
@@ -423,6 +445,22 @@ impl GoSharedState {
     }
 
     // Go: compiler/program.go:1922 GetImportHelpersImportSpecifier
+    // Go: compiler/program.go:1225 IsEmitBlocked
+    pub(super) fn is_emit_blocked(&self, emit_file_name: &str) -> bool {
+        let path = crate::frontend::tspath::to_path(
+            emit_file_name,
+            &self.current_directory,
+            self.use_case_sensitive_file_names,
+        );
+        self.has_emit_blocking_diagnostics.contains(&path.0)
+    }
+
+    // Go: compiler/program.go:1912 IsSourceFileFromExternalLibrary
+    pub(super) fn is_source_file_from_external_library(&self, path: &str) -> bool {
+        self.source_files_found_searching_node_modules
+            .contains(path)
+    }
+
     pub(super) fn get_import_helpers_import_specifier(&self, path: &str) -> Node {
         self.import_helpers_import_specifiers
             .get(path)
