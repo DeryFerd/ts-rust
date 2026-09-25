@@ -1474,13 +1474,15 @@ impl Checker {
                     0 => error_node = node,
                     1 => error_node = self.get_effective_check_node(args[arg_count as usize]),
                     _ => {
-                        let _synthetic =
+                        error_node =
                             self.create_synthetic_expression(node, spread_type, false, Node::NIL);
-                        // PORT: Go then sets `errorNode.Loc` to span the rest
-                        // arguments (`args[argCount].Pos()` to
-                        // `args[len(args)-1].End()`). The port has no API to set
-                        // a node's location.
-                        unported!("Node.Loc assignment (synthetic expression)")
+                        set_node_loc(
+                            error_node,
+                            TextRange::new(
+                                args[arg_count as usize].pos(),
+                                args[args.len() - 1].end(),
+                            ),
+                        );
                     }
                 }
             }

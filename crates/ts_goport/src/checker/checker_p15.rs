@@ -1450,7 +1450,7 @@ impl Checker {
         let t = self.check_expression_ex(node, check_mode);
         if self.is_const_context(node) {
             self.get_regular_type_of_literal_type(t)
-        } else if is_type_assertion(node) {
+        } else if checker_is_type_assertion(node) {
             t
         } else {
             let contextual_type = self.get_contextual_type(node, ContextFlags::NONE);
