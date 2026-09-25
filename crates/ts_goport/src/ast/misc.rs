@@ -116,11 +116,8 @@ pub struct RepopulateDiagnosticInfo {
     pub package_name: String,
 }
 
-// PORT: `core::Diagnostic` is fixed and has no `messageKey`,
-// `skippedOnNoEmit` or `repopulateInfo` fields. The message key is always
-// `message.key()`. The other two only matter for emit with `noEmit` and for
-// incremental build info, which this port does not produce. Their setters
-// drop the value; their getters are unported.
+// PORT: `core::Diagnostic` has no `messageKey` field. The message key is
+// always `message.key()`.
 impl Diagnostic {
     // Go: ast/diagnostic.go:50 File
     #[must_use]
@@ -208,8 +205,8 @@ impl Diagnostic {
 
     // Go: ast/diagnostic.go:64 RepopulateInfo
     #[must_use]
-    pub fn repopulate_info(&self) -> Option<Rc<RepopulateDiagnosticInfo>> {
-        unported!("Diagnostic.RepopulateInfo")
+    pub fn repopulate_info(&self) -> Option<std::sync::Arc<RepopulateDiagnosticInfo>> {
+        self.repopulate_info.clone()
     }
 
     // Go: ast/diagnostic.go:66 SetFile
@@ -234,8 +231,9 @@ impl Diagnostic {
     }
 
     // Go: ast/diagnostic.go:70 SetRepopulateInfo
-    // PORT: no field to store it in (see the impl comment); the info is dropped.
-    pub fn set_repopulate_info(&mut self, info: Option<Rc<RepopulateDiagnosticInfo>>) {}
+    pub fn set_repopulate_info(&mut self, info: Option<std::sync::Arc<RepopulateDiagnosticInfo>>) {
+        self.repopulate_info = info;
+    }
 
     // Go: ast/diagnostic.go:72 SetMessageChain
     // PORT: Go returns the receiver for chaining; this returns `&mut Self`.
@@ -333,6 +331,7 @@ pub fn new_diagnostic_from_serialized(
         reports_unnecessary,
         reports_deprecated,
         skipped_on_no_emit,
+        repopulate_info: None,
     }
 }
 
@@ -357,6 +356,7 @@ pub fn new_diagnostic(
         reports_unnecessary: message.reports_unnecessary(),
         reports_deprecated: message.reports_deprecated(),
         skipped_on_no_emit: false,
+        repopulate_info: None,
     }
 }
 

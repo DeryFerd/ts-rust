@@ -173,16 +173,10 @@ pub(super) fn try_load_with(
     config_path: &str,
     edit_options: impl FnOnce(&mut CompilerOptions),
 ) -> Result<&'static GoProgram, String> {
-    let legacy_fs = ts_vfs::OsFileSystem::default();
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let cwd = ts_path::normalize_path(&cwd.to_string_lossy().replace('\\', "/"));
     // Go: sys.FS() is bundled.WrapFS(osvfs.FS()).
     let fs = bundled::wrap_fs(osvfs_fs());
-    let case_sensitivity = if fs.use_case_sensitive_file_names() {
-        CaseSensitivity::Sensitive
-    } else {
-        CaseSensitivity::Insensitive
-    };
     let mut config_abs = ts_path::resolve_path(&cwd, &[config_path]);
     // Go tsc `-p <dir>` reads `<dir>/tsconfig.json`.
     if fs.directory_exists(&config_abs) {
@@ -218,14 +212,28 @@ pub(super) fn try_load_with(
     // Go: tsc.go:293 NewCachedFSCompilerHost, tsc.go:301 NewProgram.
     let host =
         new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, Some(trace_from_sys()));
-    let new_program: &'static NewProgram = Box::leak(Box::new(new_program(ProgramOptions {
+    install_new_program(ProgramOptions {
         host,
         config: Rc::new(config),
         use_source_of_project_reference: false,
         single_threaded: Tristate::Unknown,
         typings_location: String::new(),
         project_name: String::new(),
-    })));
+    })
+}
+
+/// Go `compiler.NewProgram` for a config that is already parsed. It builds
+/// the Go files and installs the program for the process. Call it once.
+pub(super) fn install_new_program(opts: ProgramOptions) -> Result<&'static GoProgram, String> {
+    let legacy_fs = ts_vfs::OsFileSystem::default();
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let cwd = ts_path::normalize_path(&cwd.to_string_lossy().replace('\\', "/"));
+    let case_sensitivity = if osvfs_fs().use_case_sensitive_file_names() {
+        CaseSensitivity::Sensitive
+    } else {
+        CaseSensitivity::Insensitive
+    };
+    let new_program: &'static NewProgram = Box::leak(Box::new(new_program(opts)));
     let options = new_program.options().clone();
 
     let mut parsed = FxHashMap::default();

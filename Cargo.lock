@@ -463,6 +463,7 @@ dependencies = [
  "ts_path",
  "ts_scanner",
  "ts_vfs",
+ "xxhash-rust",
 ]
 
 [[package]]

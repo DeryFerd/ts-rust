@@ -1849,6 +1849,28 @@ pub fn get_source_of_project_reference_if_output_included(file: Node) -> String 
         .map_or_else(|| info.file_name.clone(), str::to_string)
 }
 
+/// Go `compiler.NewProgram` for a config that is already parsed (the build
+/// worker). It installs the program for the process, so call it once.
+/// `opts.host` carries the trace writer.
+pub fn install_new_program(
+    opts: crate::frontend::compiler::ProgramOptions,
+) -> Result<&'static GoProgram, String> {
+    go_frontend::install_new_program(opts)
+}
+
+/// The Go frontend program, or None on the legacy path. Loading thread only.
+pub fn go_frontend_program() -> Option<&'static crate::frontend::compiler::NewProgram> {
+    go_frontend().map(|go| go.program)
+}
+
+// Go: compiler/program.go:1841 ExplainFiles
+// PORT: the legacy path has no Go frontend program and writes nothing.
+pub fn explain_files(w: &mut String) {
+    if let Some(go) = go_frontend() {
+        go.program.explain_files(w);
+    }
+}
+
 // Go: compiler/program.go:397 SourceFiles
 pub fn source_files() -> Vec<Node> {
     prog().source_files().map(|file| file.root).collect()

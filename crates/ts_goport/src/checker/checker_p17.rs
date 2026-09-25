@@ -1027,7 +1027,7 @@ impl Checker {
             package_name,
         );
         let mut result = new_diagnostic_for_node(error_node, details.message, details.args);
-        result.set_repopulate_info(Some(Rc::new(RepopulateDiagnosticInfo {
+        result.set_repopulate_info(Some(std::sync::Arc::new(RepopulateDiagnosticInfo {
             kind: RepopulateDiagnosticKind::MODULE_NOT_FOUND,
             module_reference: module_reference.to_string(),
             mode,
@@ -1044,7 +1044,7 @@ impl Checker {
     ) -> Diagnostic {
         let details = create_mode_mismatch_details(self.program, source_file);
         let mut result = new_diagnostic_for_node(error_node, details.message, details.args);
-        result.set_repopulate_info(Some(Rc::new(RepopulateDiagnosticInfo {
+        result.set_repopulate_info(Some(std::sync::Arc::new(RepopulateDiagnosticInfo {
             kind: RepopulateDiagnosticKind::MODE_MISMATCH,
             ..RepopulateDiagnosticInfo::default()
         })));

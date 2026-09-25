@@ -715,6 +715,10 @@ pub struct Diagnostic {
     pub reports_deprecated: bool,
     /// Go `skippedOnNoEmit`: dropped from semantic diagnostics when noEmit is set.
     pub skipped_on_no_emit: bool,
+    /// Go `repopulateInfo`: lets an incremental build recompute a module
+    /// resolution diagnostic chain. `Arc` because diagnostics cross the
+    /// checker threads.
+    pub repopulate_info: Option<std::sync::Arc<crate::ast::RepopulateDiagnosticInfo>>,
 }
 
 /// Go `...any` diagnostic arguments. Go formats each with `%v`; we use
