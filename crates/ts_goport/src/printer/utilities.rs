@@ -80,10 +80,11 @@ fn encode_utf16_escape_sequence(b: &mut String, char_code: u32) {
 // Based heavily on the abstract 'Quote'/'QuoteJSONString' operation from ECMA-262 (24.3.2.2),
 // but augmented for a few select characters (e.g. lineSeparator, paragraphSeparator, nextLine)
 // Note that this doesn't actually wrap the input in double quotes.
-// PORT: a Rust `&str` is valid UTF-8, so the invalid-byte branch is kept but
-// never triggers. Lone surrogates use the plane-16 sentinel from
-// `encode_js_string_rune` (see scanner_util.rs), which `decode_js_string_rune`
-// maps back to the surrogate, so they print as `\uD800` like Go. `ch` is the
+// PORT: a Rust `&str` is valid UTF-8, so the invalid-byte branch runs only
+// for U+FFFE, the port form of Go's `\xFE` prefix byte. Lone surrogates use
+// the plane-16 sentinel from `encode_js_string_rune` (see scanner_util.rs),
+// which `decode_js_string_rune` maps back to the surrogate, so they print as
+// `\uD800` like Go. `ch` is the
 // `char` form of `code`. For a surrogate it is U+FFFD, which matches no `ch`
 // case, the same as the surrogate rune in Go.
 fn escape_string_worker(
@@ -96,14 +97,23 @@ fn escape_string_worker(
     let mut pos = 0usize;
     let mut i = 0usize;
     while i < s.len() {
-        let (code, size) = decode_js_string_rune(&s[i..]);
+        let (mut code, size) = decode_js_string_rune(&s[i..]);
         let mut size = size as usize;
+        // PORT: Go stores the internal symbol name prefix as the invalid byte
+        // `\xFE`, which decodes as `utf8.RuneError` with size 1. This port
+        // stores it as U+FFFE (INTERNAL_SYMBOL_NAME_PREFIX_CHAR), so print it
+        // as that invalid byte: U+FFFD, always escaped. A real U+FFFE in source
+        // text also prints this way (Go prints it as itself).
+        let invalid_byte = code == crate::ast::INTERNAL_SYMBOL_NAME_PREFIX_CHAR as u32;
+        if invalid_byte {
+            code = char::REPLACEMENT_CHARACTER as u32;
+        }
         let ch = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
 
         let mut escape = false;
         if (0xD800..=0xDFFF).contains(&code) {
             escape = true;
-        } else if ch == char::REPLACEMENT_CHARACTER && size == 1 {
+        } else if invalid_byte {
             // A stray byte that is not valid UTF-8 (for example, a fragment of a
             // surrogate sentinel left behind by code that sliced the string by
             // byte). Escape it as the Unicode replacement character so the output

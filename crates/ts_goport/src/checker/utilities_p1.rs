@@ -636,9 +636,11 @@ struct SymbolSortKey<'a> {
     name: &'a str,
 }
 
-// PORT: Go `strings.Compare` (byte order, returns -1/0/1).
+// PORT: Go `strings.Compare` (byte order, returns -1/0/1). It compares the
+// Go bytes, so lone surrogates and the internal symbol name prefix sort as in
+// Go (see `compare_go_strings`).
 fn compare_strings(a: &str, b: &str) -> i32 {
-    match a.cmp(b) {
+    match crate::scanner_util::compare_go_strings(a, b) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,

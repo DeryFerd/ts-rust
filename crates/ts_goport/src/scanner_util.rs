@@ -305,6 +305,53 @@ pub fn decode_js_string_rune(s: &str) -> (u32, i32) {
     (code, size as i32)
 }
 
+// PORT: Go `strings.Compare` on the Go bytes of a string. Plain `str` order
+// differs from Go in two places, because this port stores two Go byte forms
+// as other characters:
+// - A lone surrogate sentinel (see LONE_SURROGATE_SENTINEL_BASE) is the
+//   3-byte WTF-8 form `ED A0..BF 80..BF` in Go, so it sorts below every
+//   4-byte character. Here it is a plane-16 character with lead byte F4.
+// - `INTERNAL_SYMBOL_NAME_PREFIX_CHAR` (U+FFFE) is the single byte `\xFE` in
+//   Go, so it sorts above every other lead byte. A real U+FFFE in source text
+//   also sorts as `\xFE` here (U+FFFE is a noncharacter, so this is rare).
+// Go byte encodings are prefix free, so comparing the first different
+// character by its Go bytes gives the Go result.
+pub fn compare_go_strings(a: &str, b: &str) -> std::cmp::Ordering {
+    // Equal bytes are equal characters, so skip the common byte prefix and
+    // step back to the start of the first different character.
+    let mut p = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    while !a.is_char_boundary(p) {
+        p -= 1;
+    }
+    match (a[p..].chars().next(), b[p..].chars().next()) {
+        (Some(x), Some(y)) => {
+            let (mut bx, mut by) = ([0u8; 4], [0u8; 4]);
+            go_char_bytes(x, &mut bx).cmp(go_char_bytes(y, &mut by))
+        }
+        (x, y) => x.is_some().cmp(&y.is_some()),
+    }
+}
+
+/// The Go bytes of one character of a port string (see `compare_go_strings`).
+fn go_char_bytes(ch: char, buf: &mut [u8; 4]) -> &[u8] {
+    let code = ch as u32;
+    if code >= LONE_SURROGATE_SENTINEL_BASE {
+        let cp = code - LONE_SURROGATE_SENTINEL_BASE + SURROGATE_HIGH_START;
+        *buf = [
+            0xED,
+            0x80 | ((cp >> 6) & 0x3F) as u8,
+            0x80 | (cp & 0x3F) as u8,
+            0,
+        ];
+        return &buf[..3];
+    }
+    if ch == crate::ast::INTERNAL_SYMBOL_NAME_PREFIX_CHAR {
+        buf[0] = 0xFE;
+        return &buf[..1];
+    }
+    ch.encode_utf8(buf).as_bytes()
+}
+
 // PORT: converts a legacy `ts_scanner` UTF-16 token value to the Go string
 // form. A valid pair becomes one code point and a lone surrogate becomes the
 // `encode_js_string_rune` sentinel, as the Go scanner writes it.
