@@ -201,7 +201,7 @@ fn emit_diagnostics() -> EmitResult {
             diagnostics: Vec::new(),
         };
     }
-    emit(Node::NIL, &mut |file| guard(|| emit_source_file(file)))
+    emit(Node::NIL, |file| guard(|| emit_source_file(file)))
 }
 
 /// Semantic diagnostics for one file. A panic drops that file's results and

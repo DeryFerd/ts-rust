@@ -59,17 +59,35 @@ pub fn get_output_paths_for(
     host: &dyn OutputPathsHost,
     force_dts_emit: bool,
 ) -> OutputPaths {
-    let own_output_file_path = get_own_emit_output_file_path(
+    get_output_paths_for_file(
         source_file.file_name(),
+        source_file.script_kind,
         options,
         host,
-        get_output_extension(source_file.file_name(), options.jsx),
+        force_dts_emit,
+    )
+}
+
+/// Go `GetOutputPathsFor` with the two source file fields it reads. Checker
+/// threads have no `ParsedSourceFile`, only the file name and script kind.
+pub fn get_output_paths_for_file(
+    file_name: &str,
+    script_kind: ScriptKind,
+    options: &CompilerOptions,
+    host: &dyn OutputPathsHost,
+    force_dts_emit: bool,
+) -> OutputPaths {
+    let own_output_file_path = get_own_emit_output_file_path(
+        file_name,
+        options,
+        host,
+        get_output_extension(file_name, options.jsx),
     );
-    let is_json_file = source_file.script_kind == ScriptKind::JSON;
+    let is_json_file = script_kind == ScriptKind::JSON;
     // If json file emits to the same location skip writing it, if emitDeclarationOnly skip writing it
     let is_json_emitted_to_same_location = is_json_file
         && compare_paths(
-            source_file.file_name(),
+            file_name,
             &own_output_file_path,
             &ComparePathsOptions {
                 current_directory: host.get_current_directory(),
@@ -79,13 +97,13 @@ pub fn get_output_paths_for(
     let mut paths = OutputPaths::default();
     if options.emit_declaration_only != Tristate::True && !is_json_emitted_to_same_location {
         paths.js_file_path = own_output_file_path;
-        if source_file.script_kind != ScriptKind::JSON {
+        if script_kind != ScriptKind::JSON {
             paths.source_map_file_path = get_source_map_file_path(&paths.js_file_path, options);
         }
     }
     if force_dts_emit || options.get_emit_declarations() && !is_json_file {
         paths.declaration_file_path =
-            get_declaration_emit_output_file_path(source_file.file_name(), options, host);
+            get_declaration_emit_output_file_path(file_name, options, host);
         if options.get_are_declaration_maps_enabled() {
             paths.declaration_map_path = format!("{}.map", paths.declaration_file_path);
         }

@@ -42,6 +42,16 @@ pub(super) struct GoSharedState {
     include_diagnostics: FxHashMap<usize, Vec<Diagnostic>>,
     /// Parser inputs of each program file, by file index, for lazy JSDoc.
     parse_inputs: FxHashMap<usize, LazyJsDocInput>,
+    /// Go `GetParseFileRedirect` of each resolved module file name that is
+    /// not a program file and has a redirect.
+    parse_file_redirects: FxHashMap<String, String>,
+    /// Go `processedFiles.redirectTargetsMap`, by path.
+    redirect_targets: FxHashMap<String, Vec<String>>,
+    /// Go `GetSourceFileFromReference` of each preserved `/// <reference
+    /// path>` of a program file, by file index and reference file name.
+    references: FxHashMap<(usize, String), Node>,
+    /// Go `Program.CommonSourceDirectory`.
+    common_source_directory: String,
 }
 
 /// What `parse_js_doc_for_node` needs from a parsed file.
@@ -378,13 +388,94 @@ impl GoSharedState {
                 (store, input)
             })
             .collect();
+        // Go reads these lazily from the program. The only file names the
+        // checker asks about are resolved module names.
+        let parse_file_redirects = files
+            .resolved_modules
+            .values()
+            .flat_map(|cache| cache.values())
+            .map(|resolved| &resolved.resolved_file_name)
+            .filter(|name| !name.is_empty() && p.get_source_file(name).is_none())
+            .filter_map(|name| {
+                let redirect = p.get_parse_file_redirect(name);
+                (!redirect.is_empty()).then(|| (name.clone(), redirect))
+            })
+            .collect();
+        let redirect_targets = files
+            .redirect_targets_map
+            .iter()
+            .flatten()
+            .map(|(path, targets)| (path.0.clone(), targets.clone()))
+            .collect();
+        // Go: the declaration transformer asks only for preserved references
+        // (transformers/declarations/transform.go:469).
+        let references = parsed
+            .iter()
+            .flat_map(|(&store, file)| {
+                file.referenced_files
+                    .iter()
+                    .filter(|r| r.preserve)
+                    .map(move |r| {
+                        let target = p
+                            .get_source_file_from_reference(file, r)
+                            .map_or(Node::NIL, |target| target.root);
+                        ((store, r.file_name.clone()), target)
+                    })
+            })
+            .collect();
+        // Go: compiler/program.go:1562 CommonSourceDirectory.
+        // PORT: Go computes it on first use, and `checkSourceFilesBelongToPath`
+        // then adds include diagnostics. Go uses it first either in
+        // `verifyCompilerOptions`, which the frontend program has already run,
+        // or during emit, after the program diagnostics are reported. So the
+        // value is computed here without the check, which adds nothing.
+        let common_source_directory = crate::frontend::outputpaths::get_common_source_directory(
+            p.options(),
+            || {
+                files
+                    .files
+                    .iter()
+                    .filter(|file| {
+                        p.source_file_may_be_emitted(file, false) && !file.is_declaration_file
+                    })
+                    .map(|file| file.file_name().to_string())
+                    .collect()
+            },
+            &p.get_current_directory(),
+            p.use_case_sensitive_file_names(),
+            None,
+        );
         Self {
             resolved_modules,
             jsx_runtime_import_specifiers,
             import_helpers_import_specifiers,
             include_diagnostics,
             parse_inputs,
+            parse_file_redirects,
+            redirect_targets,
+            references,
+            common_source_directory,
         }
+    }
+
+    // Go: compiler/program.go:195 GetParseFileRedirect (for resolved module
+    // file names)
+    pub(super) fn get_parse_file_redirect(&self, file_name: &str) -> Option<&str> {
+        self.parse_file_redirects.get(file_name).map(String::as_str)
+    }
+
+    // Go: compiler/program.go:157 GetRedirectTargets
+    pub(super) fn get_redirect_targets(&self, path: &str) -> Vec<String> {
+        self.redirect_targets.get(path).cloned().unwrap_or_default()
+    }
+
+    // Go: compiler/program.go:226 GetSourceFileFromReference (for the
+    // preserved references of a program file)
+    pub(super) fn get_source_file_from_reference(&self, origin: Node, r: &FileReference) -> Node {
+        self.references
+            .get(&(origin.file_index(), r.file_name.clone()))
+            .copied()
+            .expect("not a preserved reference of a program file")
     }
 
     // Go: ast/ast.go:2614 (*SourceFile).resolveJSDoc (slow path; the caller
@@ -460,5 +551,18 @@ impl GoSharedState {
             .get(&file.file_index())
             .cloned()
             .unwrap_or_default()
+    }
+}
+
+// Go: `*Program` implements `outputpaths.OutputPathsHost`.
+impl crate::frontend::outputpaths::OutputPathsHost for GoSharedState {
+    fn common_source_directory(&self) -> String {
+        self.common_source_directory.clone()
+    }
+    fn get_current_directory(&self) -> String {
+        get_current_directory().to_string()
+    }
+    fn use_case_sensitive_file_names(&self) -> bool {
+        use_case_sensitive_file_names()
     }
 }

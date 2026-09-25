@@ -2252,12 +2252,12 @@ pub fn get_source_file_by_path(path: &str) -> Node {
 pub fn get_source_file_for_resolved_module(file_name: &str) -> Node {
     let file = get_source_file(file_name);
     if file.is_nil()
-        && let Some(go) = &state().go
+        && let Some(redirect) = state()
+            .go
+            .as_ref()
+            .and_then(|go| go.get_parse_file_redirect(file_name))
     {
-        let redirect = go.program.get_parse_file_redirect(file_name);
-        if !redirect.is_empty() {
-            return get_source_file(&redirect);
-        }
+        return get_source_file(redirect);
     }
     file
 }
@@ -2269,7 +2269,7 @@ pub fn get_redirect_targets(path: &crate::frontend::tspath::Path) -> Vec<String>
     state()
         .go
         .as_ref()
-        .map(|go| go.program.get_redirect_targets(path))
+        .map(|go| go.get_redirect_targets(&path.0))
         .unwrap_or_default()
 }
 
@@ -2279,17 +2279,16 @@ pub fn get_source_file_from_reference(origin: Node, r: &FileReference) -> Node {
     let Some(go) = &state().go else {
         unported!("Program.GetSourceFileFromReference")
     };
-    go.program
-        .get_source_file_from_reference(go.parsed_file(origin), r)
-        .map_or(Node::NIL, |file| file.root)
+    go.get_source_file_from_reference(origin, r)
 }
 
 // Go: outputpaths/outputpaths.go:42 GetOutputPathsFor, called by
 // compiler/emitHost.go:94 emitHost.GetOutputPathsFor with the program options.
 // PORT: Go passes the emit host as the `OutputPathsHost`. Its methods forward
-// to the program, so the Go frontend program is the host here. The legacy
-// loader has no parsed files to pass. It is private so it does not clash with
-// the frontend `get_output_paths_for` in the frontend prelude.
+// to the program, so the shared copy of the Go frontend program data is the
+// host here. The legacy loader has no common source directory copy. It is
+// private so it does not clash with the frontend `get_output_paths_for` in
+// the frontend prelude.
 fn get_output_paths_for(
     file: Node,
     force_dts_paths: bool,
@@ -2297,10 +2296,12 @@ fn get_output_paths_for(
     let Some(go) = &state().go else {
         unported!("outputpaths.GetOutputPathsFor")
     };
-    crate::frontend::outputpaths::get_output_paths_for(
-        go.parsed_file(file),
+    let info = source_file_info(file);
+    crate::frontend::outputpaths::get_output_paths_for_file(
+        &info.file_name,
+        info.script_kind,
         options(),
-        go.program,
+        go,
         force_dts_paths,
     )
 }
@@ -3077,17 +3078,23 @@ pub struct EmitResult {
 // PORT: of Go `EmitOptions`, only `TargetSourceFile` is a parameter.
 // `EmitOnly` is always `EmitAll`, and `WriteFile` is not used, because
 // writing outputs is not ported (see `Emitter::emit_js_file`). Go queues one
-// emitter per file on a work group; here `emit_file` runs each file in
-// order, so a caller can guard each file. Pass `emit_source_file` for the Go
-// behavior.
-pub fn emit(target_source_file: Node, emit_file: &mut dyn FnMut(Node) -> EmitResult) -> EmitResult {
+// emitter per file on a work group. Here `emit_file` runs for each file on
+// the thread of the file's checker, where the emit resolver can reach that
+// checker, so a caller can guard each file there. Pass `emit_source_file`
+// for the Go behavior. Call it off the checker threads, like the other
+// program-wide functions.
+pub fn emit(target_source_file: Node, emit_file: fn(Node) -> EmitResult) -> EmitResult {
     // PORT: `options.EmitOnly != EmitOnlyForcedDts` is always true.
     if let Some(result) = handle_no_emit_on_error(target_source_file) {
         return result;
     }
 
     let source_files = get_source_files_to_emit(target_source_file, false);
-    let results: Vec<EmitResult> = source_files.into_iter().map(emit_file).collect();
+    let receivers = source_files
+        .into_iter()
+        .map(|file| send_thread_job(checker_index_for_file(file), move || emit_file(file)))
+        .collect();
+    let results = wait_jobs(receivers);
 
     // collect results from emit, preserving input order
     combine_emit_results(results)
