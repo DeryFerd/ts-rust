@@ -12,6 +12,7 @@
 )]
 
 pub mod ast;
+pub mod baseline;
 pub mod binder;
 pub mod checker;
 pub mod core;
