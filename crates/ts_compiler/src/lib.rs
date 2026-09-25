@@ -8063,11 +8063,9 @@ impl Program {
         }
         let roots = match &self.options.lib {
             None => vec![ts_bundled::default_library_name(self.options.target).to_owned()],
-            // Go: compiler/fileloader.go:164 unknown names are skipped
-            // ("!!! error on unknown name").
             Some(libraries) => libraries
                 .iter()
-                .filter_map(|name| tsoptions_get_lib_file_name(name))
+                .map(|name| bundled_library_name(name))
                 .collect(),
         };
         for root in roots {
@@ -8213,16 +8211,8 @@ impl Program {
                     }
                 }
                 ReferenceKind::Lib => {
-                    // Go: compiler/filesparser.go:143 GetLibFileName maps
-                    // names through LibMap (`esnext.float16` ->
-                    // `lib.es2025.float16.d.ts`).
-                    // PORT: an unknown name loads nothing and records a
-                    // reference with no targets. Go also adds a
-                    // processingDiagnosticKindUnknownReference diagnostic;
-                    // that is not ported here.
-                    let dependencies = tsoptions_get_lib_file_name(&directive.value)
-                        .map(|library_name| ts_bundled::library_closure(&library_name))
-                        .unwrap_or_default();
+                    let library_name = bundled_library_name(&directive.value);
+                    let dependencies = ts_bundled::library_closure(&library_name);
                     self.graph_references.push(ProgramGraphReference {
                         containing_file: containing_file.clone(),
                         range: directive.range,
@@ -8769,6 +8759,15 @@ pub fn tsoptions_get_lib_file_name(lib_name: &str) -> Option<String> {
         .iter()
         .find(|(key, _)| *key == lib_name)
         .map(|(_, file)| (*file).to_owned())
+}
+
+fn bundled_library_name(name: &str) -> String {
+    let name = name.to_ascii_lowercase();
+    if name.starts_with("lib.") && name.ends_with(".d.ts") {
+        name
+    } else {
+        format!("lib.{name}.d.ts")
+    }
 }
 
 fn serialize_source_map(source_map: &SourceMap, source_root: Option<&str>) -> String {
