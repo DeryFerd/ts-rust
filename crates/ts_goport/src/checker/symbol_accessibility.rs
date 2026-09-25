@@ -510,7 +510,7 @@ impl Checker {
         }
         let exports = self.get_exports_of_symbol(container);
         let symbol_name = self.sym(symbol).name.clone();
-        let quick = self.symbols.get(exports, &symbol_name);
+        let quick = self.symbols.get_name(exports, &symbol_name);
         if quick.is_some() && self.get_symbol_if_same_reference(quick, symbol).is_some() {
             return quick;
         }
@@ -701,7 +701,7 @@ impl Checker {
         let is_globals = table_id == SymbolTableID::KIND_GLOBALS;
         // If symbol is directly available by its name in the symbol table
         let name = self.sym(ctx.symbol).name.clone();
-        let res = self.symbols.get(symbols, &name);
+        let res = self.symbols.get_name(symbols, &name);
         if res.is_some() && self.is_accessible(ctx, res, SymbolId::NIL, ignore_qualification) {
             return vec![ctx.symbol];
         }
@@ -906,7 +906,7 @@ impl Checker {
             enclosing_declaration,
             &mut |c, symbol_table, _, _, _, _| {
                 // If symbol of this name is not available in the symbol table we are ok
-                let res = c.symbols.get(symbol_table, &name);
+                let res = c.symbols.get_name(symbol_table, &name);
                 if res.is_nil() {
                     return false;
                 }

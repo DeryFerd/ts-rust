@@ -33,9 +33,9 @@ fn bound_mut(b: &mut Binder, node: Node) -> &mut NodeBindData {
 }
 
 /// Go `node.Flags` during binding: parser flags plus the flags the binder added so far.
+#[inline]
 fn node_flags(b: &Binder, node: Node) -> NodeFlags {
-    let parser = node.go_file().parser_flags[node.node_id().index()];
-    parser | bound(b, node).added_flags
+    b.node_flags(node)
 }
 
 fn flow_data(b: &Binder, flow: FlowNodeId) -> &FlowNode {
@@ -206,7 +206,7 @@ impl Binder {
             self.new_symbol(SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE, "prototype");
         let prototype_name = self.symbols.sym(prototype_symbol).name.clone();
         let exports = binder_get_exports(self, symbol);
-        let symbol_export = self.symbols.get(exports, &prototype_name);
+        let symbol_export = self.symbols.get_name(exports, &prototype_name);
         if symbol_export.is_some() {
             let decl = self.symbols.sym(symbol_export).declarations[0];
             let display = symbol_name(&self.symbols, prototype_symbol);
@@ -377,7 +377,7 @@ impl Binder {
                 // We declare expandos only when there are no non-expando declarations for that name.
                 let exports = binder_get_exports(self, symbol);
                 let declaration_name = self.get_declaration_name(node);
-                let existing = self.symbols.get(exports, &declaration_name);
+                let existing = self.symbols.get_name(exports, &declaration_name);
                 if existing.is_nil()
                     || self
                         .symbols
@@ -1073,6 +1073,7 @@ impl Binder {
     // the getLocalNameOfContainer function in the type checker to validate that the local name
     // used for a container is unique.
     pub fn bind_container(&mut self, node: Node, container_flags: ContainerFlags) {
+        let kind = node.kind();
         // Before we recurse into a node's children, we first save the existing parent, container
         // and block-container.  Then after we pop out of processing the children, we restore
         // these saved values.
@@ -1125,7 +1126,7 @@ impl Binder {
                 && !has_syntactic_modifier(node, ModifierFlags::ASYNC)
                 && !is_generator_function_expression(node)
                 && get_immediately_invoked_function_expression(node).is_some())
-                || node.kind() == SyntaxKind::ClassStaticBlockDeclaration;
+                || kind == SyntaxKind::ClassStaticBlockDeclaration;
             // A non-async, non-generator IIFE is considered part of the containing control flow. Return statements behave
             // similarly to break statements that exit to a label just past the statement body.
             if !is_immediately_invoked {
@@ -1140,7 +1141,7 @@ impl Binder {
             }
             // We create a return control flow graph for IIFEs and constructors. For constructors
             // we use the return control flow graph in strict property initialization checks.
-            if is_immediately_invoked || node.kind() == SyntaxKind::Constructor {
+            if is_immediately_invoked || kind == SyntaxKind::Constructor {
                 self.current_return_target = self.new_flow_node(FlowFlags::BRANCH_LABEL);
             } else {
                 self.current_return_target = FlowNodeId::NIL;
@@ -1151,7 +1152,7 @@ impl Binder {
             self.active_label_list = None;
             self.has_explicit_return = false;
             self.seen_this_keyword = false;
-            self.bind_children(node);
+            self.bind_children_of_kind(node, kind);
             // Reset flags (for incremental scenarios)
             {
                 let data = bound_mut(self, node);
@@ -1178,7 +1179,7 @@ impl Binder {
             if self.seen_this_keyword {
                 bound_mut(self, node).added_flags |= NodeFlags::CONTAINS_THIS;
             }
-            if node.kind() == SyntaxKind::SourceFile {
+            if kind == SyntaxKind::SourceFile {
                 let emit_flags = self.emit_flags;
                 let current_flow = self.current_flow;
                 let data = bound_mut(self, node);
@@ -1191,8 +1192,8 @@ impl Binder {
                 let current_flow = self.current_flow;
                 self.add_antecedent(current_return_target, current_flow);
                 self.current_flow = self.finish_flow_label(current_return_target);
-                if node.kind() == SyntaxKind::Constructor
-                    || node.kind() == SyntaxKind::ClassStaticBlockDeclaration
+                if kind == SyntaxKind::Constructor
+                    || kind == SyntaxKind::ClassStaticBlockDeclaration
                 {
                     let current_flow = self.current_flow;
                     self.set_return_flow_node(node, current_flow);
@@ -1215,7 +1216,7 @@ impl Binder {
         } else if container_flags.intersects(ContainerFlags::IS_INTERFACE) {
             let save_seen_this_keyword = self.seen_this_keyword;
             self.seen_this_keyword = false;
-            self.bind_children(node);
+            self.bind_children_of_kind(node, kind);
             // ContainsThis cannot overlap with HasExtendedUnicodeEscape on Identifier
             let seen_this_keyword = self.seen_this_keyword;
             let data = bound_mut(self, node);
@@ -1226,7 +1227,7 @@ impl Binder {
             }
             self.seen_this_keyword = save_seen_this_keyword;
         } else {
-            self.bind_children(node);
+            self.bind_children_of_kind(node, kind);
         }
         if is_source_file(node) && is_in_js_file(node) {
             // Binding of top-level JSTypeAliasDeclaration nodes is deferred to ensure CommonJS module
@@ -1295,6 +1296,11 @@ impl Binder {
 
     // Go: binder/binder.go:1645 bindChildren
     pub fn bind_children(&mut self, node: Node) {
+        self.bind_children_of_kind(node, node.kind());
+    }
+
+    /// `bind_children` for a caller that already read `node.kind()`.
+    pub fn bind_children_of_kind(&mut self, node: Node, kind: SyntaxKind) {
         let save_in_assignment_pattern = self.in_assignment_pattern;
         // Most nodes aren't valid in an assignment pattern, so we clear the value here
         // and set it before we descend into nodes that could actually be part of an assignment pattern.
@@ -1312,15 +1318,15 @@ impl Binder {
             return;
         }
 
-        if (SyntaxKind::FIRST_STATEMENT as u16) <= (node.kind() as u16)
-            && (node.kind() as u16) <= (SyntaxKind::LAST_STATEMENT as u16)
+        if (SyntaxKind::FIRST_STATEMENT as u16) <= (kind as u16)
+            && (kind as u16) <= (SyntaxKind::LAST_STATEMENT as u16)
         {
             // PORT: Go sets `FlowNodeData().FlowNode` when the node has flow data, which is `setFlowNode`.
             let current_flow = self.current_flow;
             self.set_flow_node(node, current_flow);
         }
 
-        match node.kind() {
+        match kind {
             SyntaxKind::WhileStatement => self.bind_while_statement(node),
             SyntaxKind::DoStatement => self.bind_do_statement(node),
             SyntaxKind::ForStatement => self.bind_for_statement(node),
@@ -1398,14 +1404,18 @@ impl Binder {
     // Go: binder/binder.go:1754 bindNodeList
     pub fn bind_node_list(&mut self, node_list: NodeList) {
         if !node_list.is_nil() {
-            self.bind_each(&node_list.nodes().to_vec());
+            for node in node_list.nodes() {
+                self.bind(node);
+            }
         }
     }
 
     // Go: binder/binder.go:1760 bindModifiers
     pub fn bind_modifiers(&mut self, modifiers: ModifierList) {
         if !modifiers.is_nil() {
-            self.bind_each(&modifiers.nodes().to_vec());
+            for node in modifiers.nodes() {
+                self.bind(node);
+            }
         }
     }
 

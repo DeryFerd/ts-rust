@@ -131,7 +131,7 @@ impl Checker {
         for &base in base_symbols {
             if !self.is_static_private_identifier_property(base) {
                 let base_name = self.sym(base).name.clone();
-                let s = self.symbols.get(symbols, &base_name);
+                let s = self.symbols.get_name(symbols, &base_name);
                 if s.is_nil() || !self.sym(s).flags.intersects(SymbolFlags::VALUE) {
                     if symbols.is_nil() {
                         symbols = self.symbols.new_table();

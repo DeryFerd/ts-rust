@@ -592,36 +592,30 @@ fn is_unicode_case_ignorable(r: char) -> bool {
 // is inlined.
 pub fn compute_ecma_line_starts(text: &str) -> Vec<i32> {
     let bytes = text.as_bytes();
-    let mut result = Vec::with_capacity(bytes.iter().filter(|&&b| b == b'\n').count() + 1);
-    let text_len = bytes.len();
-    let mut pos = 0usize;
+    let mut result = Vec::with_capacity(memchr::memchr_iter(b'\n', bytes).count() + 1);
     let mut line_start = 0usize;
-    while pos < text_len {
-        let b = bytes[pos];
-        if b < 0x80 {
-            pos += 1;
-            match b {
-                b'\r' => {
-                    if pos < text_len && bytes[pos] == b'\n' {
-                        pos += 1;
-                    }
-                    result.push(line_start as i32);
-                    line_start = pos;
-                }
-                b'\n' => {
-                    result.push(line_start as i32);
-                    line_start = pos;
-                }
-                _ => {}
+    // The `\n` of a `\r\n` pair, which the `\r` already counted.
+    let mut skip_lf_at = usize::MAX;
+    // Line breaks are `\n`, `\r`, U+2028 (E2 80 A8) and U+2029 (E2 80 A9).
+    // 0xE2 is never a UTF-8 continuation byte, so each hit starts a char.
+    for i in memchr::memchr3_iter(b'\n', b'\r', 0xE2, bytes) {
+        let next = match bytes[i] {
+            b'\n' if i == skip_lf_at => continue,
+            b'\n' => i + 1,
+            b'\r' if bytes.get(i + 1) == Some(&b'\n') => {
+                skip_lf_at = i + 1;
+                i + 2
             }
-        } else {
-            let (ch, size) = decode_rune_at(text, pos);
-            pos += size;
-            if is_line_break(ch) {
-                result.push(line_start as i32);
-                line_start = pos;
+            b'\r' => i + 1,
+            _ if bytes.get(i + 1) == Some(&0x80)
+                && matches!(bytes.get(i + 2), Some(0xA8 | 0xA9)) =>
+            {
+                i + 3
             }
-        }
+            _ => continue,
+        };
+        result.push(line_start as i32);
+        line_start = next;
     }
     result.push(line_start as i32);
     result
@@ -23747,3 +23741,53 @@ static UNICODE_CASE_IGNORABLE_RANGES: &[(u32, u32, u32)] = &[
     (0xE0021, 0xE007F, 1),
     (0xE0100, 0xE01EF, 1),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_ecma_line_starts, is_line_break};
+
+    /// `compute_ecma_line_starts` written as a plain char scan.
+    fn line_starts_by_char(text: &str) -> Vec<i32> {
+        let mut starts = vec![0];
+        let mut chars = text.char_indices().peekable();
+        while let Some((i, ch)) = chars.next() {
+            if !is_line_break(ch) {
+                continue;
+            }
+            let crlf = ch == '\r' && chars.next_if(|&(_, next)| next == '\n').is_some();
+            starts.push((i + ch.len_utf8() + usize::from(crlf)) as i32);
+        }
+        starts
+    }
+
+    #[test]
+    fn ecma_line_starts_match_char_scan() {
+        const PIECES: [&str; 8] = [
+            "a",
+            " ",
+            "\n",
+            "\r",
+            "\r\n",
+            "\u{2028}",
+            "\u{2029}",
+            "é\u{2000}",
+        ];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..20_000 {
+            let mut text = String::new();
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let mut bits = seed;
+            for _ in 0..(bits % 20) {
+                bits = bits.rotate_right(3) ^ seed;
+                text.push_str(PIECES[(bits % 8) as usize]);
+            }
+            assert_eq!(
+                compute_ecma_line_starts(&text),
+                line_starts_by_char(&text),
+                "{text:?}"
+            );
+        }
+    }
+}

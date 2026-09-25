@@ -326,9 +326,24 @@ impl Checker {
         f(self, t)
     }
 
+    /// Go `c.couldContainTypeVariables(t)`. Go stores a func field that only
+    /// calls the worker, so the port has no field and calls it directly. The
+    /// first two worker tests run inline here, because they answer most calls.
+    #[inline]
     pub fn could_contain_type_variables(&mut self, t: TypeId) -> bool {
-        let f = self.could_contain_type_variables.clone();
-        f(self, t)
+        let ty = self.ty(t);
+        if !ty.flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
+            return false;
+        }
+        if ty
+            .object_flags
+            .intersects(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED)
+        {
+            return ty
+                .object_flags
+                .intersects(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES);
+        }
+        self.could_contain_type_variables_worker(t)
     }
 
     pub fn is_string_index_signature_only_type(&mut self, t: TypeId) -> bool {

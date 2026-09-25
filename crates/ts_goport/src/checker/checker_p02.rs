@@ -314,9 +314,6 @@ impl Checker {
                 || c.ty(t).flags.intersects(TypeFlags::UNION)
                     && c.ty(t).types()[0] == c.missing_type
         });
-        self.could_contain_type_variables = Rc::new(|c: &mut Checker, t: TypeId| -> bool {
-            c.could_contain_type_variables_worker(t)
-        });
         self.is_string_index_signature_only_type = Rc::new(|c: &mut Checker, t: TypeId| -> bool {
             c.is_string_index_signature_only_type_worker(t)
         });

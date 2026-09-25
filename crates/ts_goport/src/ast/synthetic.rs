@@ -214,16 +214,16 @@ pub fn synthetic_ast_node(n: Node) -> &'static ts_ast::Node {
     with_node(n, |s| s.node)
 }
 
-/// The ts_ast node of any node, parsed or synthetic. For code outside
-/// `node.rs` that reads ts_ast data directly.
+/// The ts_ast node of any node, parsed or synthetic. Go dereferences the
+/// pointer, so nil panics. `node.rs` reads node data through this (`raw`).
 #[must_use]
 pub fn ast_node_of(n: Node) -> &'static ts_ast::Node {
     assert!(n.is_some(), "nil node dereference");
     if n.file_index() == SYNTHETIC_NODE_FILE {
         return synthetic_ast_node(n);
     }
-    if has_file_store(n.file_index()) {
-        return store_ast_node(n);
+    if let Some(node) = try_store_ast_node(n) {
+        return node;
     }
     prog().files[n.file_index()]
         .legacy_source()

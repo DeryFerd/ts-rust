@@ -690,7 +690,28 @@ impl Checker {
      * no constituent property has type 'never', but the intersection of the constituent property types is 'never'.
      */
     // Go: checker/checker.go:21718 getReducedType
+    // PORT: split in two. This part returns `t` for the common case (not a
+    // union with intersections and not an intersection) without the frame of
+    // the slow part. The slow part repeats the same tests.
+    #[inline]
     pub fn get_reduced_type(&mut self, t: TypeId) -> TypeId {
+        let ty = self.ty(t);
+        if ty.flags.intersects(TypeFlags::UNION) {
+            if !ty
+                .object_flags
+                .intersects(ObjectFlags::CONTAINS_INTERSECTIONS)
+            {
+                return t;
+            }
+        } else if !ty.flags.intersects(TypeFlags::INTERSECTION) {
+            return t;
+        }
+        self.get_reduced_type_slow(t)
+    }
+
+    /// The full `get_reduced_type` body. Only `get_reduced_type` calls it.
+    #[inline(never)]
+    fn get_reduced_type_slow(&mut self, t: TypeId) -> TypeId {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::UNION) {
             if self
@@ -1339,13 +1360,14 @@ impl Checker {
         if t.is_nil() || m.is_nil() {
             return t;
         }
-        let could_contain_type_variables = self.could_contain_type_variables.clone();
-        let could_contain = could_contain_type_variables(self, t) || {
-            let alias_type_arguments = self.ty(t).alias.type_arguments().to_vec();
-            !alias_type_arguments.is_empty()
-                && alias_type_arguments
-                    .iter()
-                    .any(|&a| could_contain_type_variables(self, a))
+        let could_contain = self.could_contain_type_variables(t) || {
+            // PORT: the alias list does not change after the type is made, so
+            // it is read by index instead of copied.
+            let count = self.ty(t).alias.type_arguments().len();
+            (0..count).any(|i| {
+                let a = self.ty(t).alias.type_arguments()[i];
+                self.could_contain_type_variables(a)
+            })
         };
         if !could_contain {
             return t;
@@ -1366,10 +1388,15 @@ impl Checker {
         if index == -1 {
             self.push_active_mapper(m);
         }
-        let mut b = KeyBuilder::default();
-        b.write_type(t);
-        b.write_alias(&self.symbols, alias.as_deref());
-        let key = b.hash();
+        let key = match alias.as_deref() {
+            None => type_key_no_alias(t),
+            Some(alias) => {
+                let mut b = KeyBuilder::default();
+                b.write_type(t);
+                b.write_alias(&self.symbols, Some(alias));
+                b.hash()
+            }
+        };
         let cache_index = if index != -1 {
             index as usize
         } else {
@@ -1447,7 +1474,6 @@ impl Checker {
         if object_flags.intersects(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED) {
             return object_flags.intersects(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES);
         }
-        let could_contain_type_variables = self.could_contain_type_variables.clone();
         let result = flags.intersects(TypeFlags::INSTANTIABLE)
             || flags.intersects(TypeFlags::OBJECT)
                 && !self.is_non_generic_top_level_type(t)
@@ -1456,7 +1482,7 @@ impl Checker {
                         let type_arguments = self.get_type_arguments(t);
                         type_arguments
                             .iter()
-                            .any(|&a| could_contain_type_variables(self, a))
+                            .any(|&a| self.could_contain_type_variables(a))
                     })
                     || object_flags.intersects(ObjectFlags::ANONYMOUS) && {
                         let symbol = self.ty(t).symbol;
@@ -1482,8 +1508,10 @@ impl Checker {
                 && !flags.intersects(TypeFlags::ENUM_LITERAL)
                 && !self.is_non_generic_top_level_type(t)
                 && {
-                    (0..self.ty(t).types().len())
-                        .any(|i| could_contain_type_variables(self, self.type_at(t, i)))
+                    (0..self.ty(t).types().len()).any(|i| {
+                        let u = self.type_at(t, i);
+                        self.could_contain_type_variables(u)
+                    })
                 };
         self.ty_mut(t).object_flags |= ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
             | if result {
@@ -1496,8 +1524,7 @@ impl Checker {
 
     // Go: checker/checker.go:22100 isNonGenericTopLevelType
     pub fn is_non_generic_top_level_type(&self, t: TypeId) -> bool {
-        let alias = self.ty(t).alias.clone();
-        if let Some(alias) = alias {
+        if let Some(alias) = self.ty(t).alias.as_deref() {
             if alias.type_arguments.is_empty() {
                 let mut declaration = get_declaration_of_kind(
                     &self.symbols,

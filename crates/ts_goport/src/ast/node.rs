@@ -17,6 +17,9 @@
 //! `MutableNode` setters and the `AsFlow*` casts are out of scope.
 
 use crate::prelude::*;
+// `raw(n)`: the ts_ast node for `n`. Go dereferences the pointer, so nil
+// panics.
+use super::synthetic::ast_node_of as raw;
 use ts_ast::NodeData;
 
 // ──────────────────────────────────────────────────────────────────────
@@ -28,23 +31,6 @@ use ts_ast::NodeData;
 // this file computes the id itself.
 fn nid(n: Node) -> ts_ast::NodeId {
     ts_ast::NodeId::new(((n.0 & 0xffff_ffff) - 1) as u32)
-}
-
-/// The ts_ast node for `n`. Go dereferences the pointer, so nil panics.
-fn raw(n: Node) -> &'static ts_ast::Node {
-    assert!(n.is_some(), "nil node dereference");
-    if n.file_index() == SYNTHETIC_NODE_FILE {
-        return synthetic_ast_node(n);
-    }
-    if let Some(node) = try_store_ast_node(n) {
-        return node;
-    }
-    prog().files[n.file_index()]
-        .legacy_source()
-        .parse
-        .arena
-        .get(nid(n))
-        .expect("node is not in its file arena")
 }
 
 /// The ts_ast data for `n`.
@@ -94,9 +80,17 @@ fn mods(file: usize, m: &'static Option<ts_ast::ModifierList>) -> ModifierList {
 macro_rules! by_data {
     ($n:expr, |$file:ident, $d:ident| $e:expr, [$($v:ident),* $(,)?], $def:expr) => {{
         let node: Node = $n;
+        by_data_of!(node, data(node), |$file, $d| $e, [$($v),*], $def)
+    }};
+}
+
+/// Like `by_data!`, but matches `$data`, the data of `$n` that the caller
+/// already read. Accessors with nested matches read the data once this way.
+macro_rules! by_data_of {
+    ($n:expr, $data:expr, |$file:ident, $d:ident| $e:expr, [$($v:ident),* $(,)?], $def:expr) => {{
         #[allow(unused_variables)]
-        let $file = node.file_index();
-        match data(node) {
+        let $file = $n.file_index();
+        match $data {
             $(NodeData::$v($d) => $e,)*
             _ => $def,
         }
@@ -396,6 +390,11 @@ impl NodeSlice {
     pub fn iter(self) -> NodeSliceIter {
         NodeSliceIter {
             slice: self,
+            resolved: if self.ids.is_empty() {
+                None
+            } else {
+                frozen_resolved(self.file as usize)
+            },
             front: 0,
             back: self.len(),
         }
@@ -411,8 +410,21 @@ impl NodeSlice {
 #[derive(Clone, Debug)]
 pub struct NodeSliceIter {
     slice: NodeSlice,
+    /// `frozen_resolved(slice.file)`, read once for the whole loop.
+    resolved: Option<&'static [Node]>,
     front: usize,
     back: usize,
+}
+
+impl NodeSliceIter {
+    /// `self.slice.get(i)`, without the per-node store lookup after freeze.
+    #[inline]
+    fn at(&self, i: usize) -> Node {
+        match self.resolved {
+            Some(resolved) => resolved[self.slice.ids[i].index()],
+            None => self.slice.get(i),
+        }
+    }
 }
 
 impl Iterator for NodeSliceIter {
@@ -422,7 +434,7 @@ impl Iterator for NodeSliceIter {
         if self.front >= self.back {
             return None;
         }
-        let n = self.slice.get(self.front);
+        let n = self.at(self.front);
         self.front += 1;
         Some(n)
     }
@@ -439,7 +451,7 @@ impl DoubleEndedIterator for NodeSliceIter {
             return None;
         }
         self.back -= 1;
-        Some(self.slice.get(self.back))
+        Some(self.at(self.back))
     }
 }
 
@@ -722,9 +734,19 @@ thread_local! {
 }
 
 impl Node {
-    /// Go `node.Kind`.
+    /// Go `node.Kind`. Frozen store nodes read a packed kind table inline;
+    /// other nodes take `kind_slow`.
+    #[inline]
     #[must_use]
     pub fn kind(self) -> SyntaxKind {
+        match frozen_store_kind(self) {
+            Some(kind) => kind,
+            None => self.kind_slow(),
+        }
+    }
+
+    #[inline(never)]
+    fn kind_slow(self) -> SyntaxKind {
         // A store node holds the Go kind in its header.
         if let Some(h) = try_store_header(self) {
             return h.kind;
@@ -739,8 +761,18 @@ impl Node {
     }
 
     /// Go `node.Flags`: parser flags plus the flags the binder adds.
+    #[inline]
     #[must_use]
     pub fn flags(self) -> NodeFlags {
+        // After the freeze every store file is a program file.
+        match frozen_store_flags(self) {
+            Some(flags) => flags | self.bind().added_flags,
+            None => self.flags_slow(),
+        }
+    }
+
+    #[inline(never)]
+    fn flags_slow(self) -> NodeFlags {
         if is_synthetic_node(self) {
             return synthetic_flags(self);
         }
@@ -760,8 +792,17 @@ impl Node {
     }
 
     /// Go `node.Parent`.
+    #[inline]
     #[must_use]
     pub fn parent(self) -> Node {
+        match frozen_store_parent(self) {
+            Some(parent) => parent,
+            None => self.parent_slow(),
+        }
+    }
+
+    #[inline(never)]
+    fn parent_slow(self) -> Node {
         if is_synthetic_node(self) {
             return synthetic_parent(self);
         }
@@ -772,10 +813,19 @@ impl Node {
     }
 
     /// Go `node.Loc`.
+    #[inline]
     #[must_use]
+    pub fn loc(self) -> TextRange {
+        match frozen_store_loc(self) {
+            Some(loc) => loc,
+            None => self.loc_slow(),
+        }
+    }
+
     // PORT: the Rust parser starts a node at its first token. Go starts it
     // at the full start, before the leading trivia (see `ast::go_view`).
-    pub fn loc(self) -> TextRange {
+    #[inline(never)]
+    fn loc_slow(self) -> TextRange {
         if is_synthetic_node(self) {
             return synthetic_loc(self);
         }
@@ -814,6 +864,7 @@ impl Node {
     }
 
     /// Binder data for this node. Nil values before the file is bound.
+    #[inline]
     #[must_use]
     pub fn bind(self) -> &'static NodeBindData {
         if is_synthetic_node(self) {
@@ -828,14 +879,16 @@ impl Node {
     // Go: ast.go:198 Name
     #[must_use]
     pub fn name(self) -> Node {
+        let node_data = data(self);
         // PORT: a QualifiedName that Go parses as a PropertyAccessExpression.
-        if let NodeData::QualifiedName(d) = data(self)
+        if let NodeData::QualifiedName(d) = node_data
             && self.kind() == SyntaxKind::PropertyAccessExpression
         {
             return req(self.file_index(), d.right);
         }
-        by_data!(
+        by_data_of!(
             self,
+            node_data,
             |f, d| opt(f, d.name),
             [
                 BindingElement,
@@ -850,8 +903,9 @@ impl Node {
                 JsDocLinkPlain,
                 JsDocTypedefTag,
             ],
-            by_data!(
+            by_data_of!(
                 self,
+                node_data,
                 |f, d| req(f, d.name),
                 [
                     EnumDeclaration,
@@ -1117,8 +1171,10 @@ impl Node {
     // has no generated accessor.
     #[must_use]
     pub fn body(self) -> Node {
-        by_data!(
+        let node_data = data(self);
+        by_data_of!(
             self,
+            node_data,
             |f, d| opt(f, d.body),
             [
                 FunctionDeclaration,
@@ -1128,8 +1184,9 @@ impl Node {
                 ConstructorDeclaration,
                 ModuleDeclaration,
             ],
-            by_data!(
+            by_data_of!(
                 self,
+                node_data,
                 |f, d| req(f, d.body),
                 [
                     FunctionExpression,
@@ -1183,17 +1240,19 @@ impl Node {
     // generated accessor.
     #[must_use]
     pub fn expression(self) -> Node {
-        if let NodeData::CaseOrDefaultClause(d) = data(self) {
+        let node_data = data(self);
+        if let NodeData::CaseOrDefaultClause(d) = node_data {
             return case_expression(self, self.file_index(), d.expression);
         }
         // PORT: a QualifiedName that Go parses as a PropertyAccessExpression.
-        if let NodeData::QualifiedName(d) = data(self)
+        if let NodeData::QualifiedName(d) = node_data
             && self.kind() == SyntaxKind::PropertyAccessExpression
         {
             return req(self.file_index(), d.left);
         }
-        by_data!(
+        by_data_of!(
             self,
+            node_data,
             |f, d| req(f, d.expression),
             [
                 PropertyAccessExpression,
@@ -1229,8 +1288,9 @@ impl Node {
                 JsxSpreadAttribute,
                 SyntheticReferenceExpression,
             ],
-            by_data!(
+            by_data_of!(
                 self,
+                node_data,
                 |f, d| opt(f, d.expression),
                 [
                     YieldExpression,
@@ -1304,11 +1364,13 @@ impl Node {
     // Go: ast.go:515 TypeParameterList
     #[must_use]
     pub fn type_parameter_list(self) -> NodeList {
-        if let NodeData::JsDocTemplateTag(d) = data(self) {
+        let node_data = data(self);
+        if let NodeData::JsDocTemplateTag(d) = node_data {
             return list(self.file_index(), &d.type_parameters);
         }
-        by_data!(
+        by_data_of!(
             self,
+            node_data,
             |f, d| opt_list(f, &d.type_parameters),
             [
                 ClassDeclaration,
@@ -1343,11 +1405,13 @@ impl Node {
     // Go: ast.go:544 MemberList
     #[must_use]
     pub fn member_list(self) -> NodeList {
-        if let NodeData::MappedTypeNode(_) = data(self) {
+        let node_data = data(self);
+        if let NodeData::MappedTypeNode(_) = node_data {
             return mapped_type_members(self);
         }
-        by_data!(
+        by_data_of!(
             self,
+            node_data,
             |f, d| list(f, &d.members),
             [
                 ClassDeclaration,
@@ -1413,14 +1477,16 @@ impl Node {
     // generated accessor.
     #[must_use]
     pub fn type_(self) -> Node {
+        let node_data = data(self);
         let f = self.file_index();
-        match data(self) {
+        match node_data {
             NodeData::JsDocParameterOrPropertyTag(d) => return opt(f, d.type_expression),
             NodeData::IndexSignatureDeclaration(d) => return req(f, d.type_),
             _ => {}
         }
-        by_data!(
+        by_data_of!(
             self,
+            node_data,
             |f, d| opt(f, d.type_),
             [
                 VariableDeclaration,
@@ -1446,8 +1512,9 @@ impl Node {
                 FunctionTypeNode,
                 ConstructorTypeNode,
             ],
-            by_data!(
+            by_data_of!(
                 self,
+                node_data,
                 |f, d| req(f, d.type_),
                 [
                     PropertySignatureDeclaration,
@@ -1475,8 +1542,10 @@ impl Node {
     // Go: ast.go:739 Initializer
     #[must_use]
     pub fn initializer(self) -> Node {
-        by_data!(
+        let node_data = data(self);
+        by_data_of!(
             self,
+            node_data,
             |f, d| opt(f, d.initializer),
             [
                 VariableDeclaration,
@@ -1487,8 +1556,9 @@ impl Node {
                 ForStatement,
                 JsxAttribute,
             ],
-            by_data!(
+            by_data_of!(
                 self,
+                node_data,
                 |f, d| req(f, d.initializer),
                 [
                     PropertySignatureDeclaration,
@@ -1573,11 +1643,13 @@ impl Node {
     // Go: ast.go:884 CommentList
     #[must_use]
     pub fn comment_list(self) -> NodeList {
-        if let NodeData::JsDoc(d) = data(self) {
+        let node_data = data(self);
+        if let NodeData::JsDoc(d) = node_data {
             return list(self.file_index(), &d.comment);
         }
-        by_data!(
+        by_data_of!(
             self,
+            node_data,
             |f, d| opt_list(f, &d.comment),
             [
                 JsDocUnknownTag,
@@ -1630,12 +1702,15 @@ impl Node {
     // generated accessor.
     #[must_use]
     pub fn attributes(self) -> Node {
-        by_data!(
+        let node_data = data(self);
+        by_data_of!(
             self,
+            node_data,
             |f, d| req(f, d.attributes),
             [JsxOpeningElement, JsxSelfClosingElement,],
-            by_data!(
+            by_data_of!(
                 self,
+                node_data,
                 |f, d| opt(f, d.attributes),
                 [
                     ImportDeclaration,
@@ -1811,8 +1886,10 @@ impl Node {
     // `TypeExpression` fields have no generated accessor.
     #[must_use]
     pub fn type_expression(self) -> Node {
-        by_data!(
+        let node_data = data(self);
+        by_data_of!(
             self,
+            node_data,
             |f, d| opt(f, d.type_expression),
             [
                 JsDocParameterOrPropertyTag,
@@ -1820,8 +1897,9 @@ impl Node {
                 JsDocTypedefTag,
                 JsDocThrowsTag,
             ],
-            by_data!(
+            by_data_of!(
                 self,
+                node_data,
                 |f, d| req(f, d.type_expression),
                 [
                     JsDocTypeTag,

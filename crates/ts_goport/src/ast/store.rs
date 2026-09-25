@@ -166,6 +166,11 @@ struct Frozen {
     stores: &'static [FileStore],
     headers: Box<[&'static [NodeHeader]]>,
     nodes: Box<[&'static [Option<&'static ts_ast::Node>]]>,
+    /// `headers[file][i].kind`, packed. `Node::kind` reads only this.
+    kinds: Box<[Box<[SyntaxKind]>]>,
+    /// `try_resolve_store_id(file, i)` for every slot, computed once.
+    /// `Node::new` reads only this.
+    resolved: Box<[Box<[Node]>]>,
 }
 
 static FROZEN: OnceLock<Frozen> = OnceLock::new();
@@ -521,6 +526,19 @@ pub fn freeze_file_stores() {
         stores,
         headers: stores.iter().map(|s| &s.headers[..]).collect(),
         nodes: stores.iter().map(|s| &s.nodes[..]).collect(),
+        kinds: stores
+            .iter()
+            .map(|s| s.headers.iter().map(|h| h.kind).collect())
+            .collect(),
+        resolved: stores
+            .iter()
+            .enumerate()
+            .map(|(file, s)| {
+                (0..s.headers.len())
+                    .map(|i| resolve_slot(file, i, &s.nodes, &s.headers))
+                    .collect()
+            })
+            .collect(),
     };
     assert!(
         FROZEN.set(frozen).is_ok(),
@@ -681,6 +699,51 @@ pub fn try_store_header(n: Node) -> Option<NodeHeader> {
     })
 }
 
+/// Go `node.Kind` of a store node after freeze. `None` before freeze and
+/// for nil, synthetic and legacy nodes.
+#[inline]
+#[must_use]
+pub fn frozen_store_kind(n: Node) -> Option<SyntaxKind> {
+    if n.is_nil() {
+        return None;
+    }
+    let kinds = FROZEN.get()?.kinds.get(n.file_index())?;
+    Some(kinds[slot_index(n)])
+}
+
+/// The header of a store node after freeze, by reference, so a read of one
+/// field does not copy the whole header. The parent is still in its stored
+/// form (see `LOCAL_STORE`). `None` as for `frozen_store_kind`.
+#[inline]
+fn frozen_header(n: Node) -> Option<&'static NodeHeader> {
+    if n.is_nil() {
+        return None;
+    }
+    let headers = FROZEN.get()?.headers.get(n.file_index())?;
+    Some(&headers[slot_index(n)])
+}
+
+/// Parser `node.Flags` of a store node after freeze (see `frozen_header`).
+#[inline]
+#[must_use]
+pub fn frozen_store_flags(n: Node) -> Option<NodeFlags> {
+    frozen_header(n).map(|h| h.flags)
+}
+
+/// Go `node.Loc` of a store node after freeze (see `frozen_header`).
+#[inline]
+#[must_use]
+pub fn frozen_store_loc(n: Node) -> Option<TextRange> {
+    frozen_header(n).map(|h| h.loc)
+}
+
+/// Go `node.Parent` of a store node after freeze (see `frozen_header`).
+#[inline]
+#[must_use]
+pub fn frozen_store_parent(n: Node) -> Option<Node> {
+    frozen_header(n).map(|h| h.read(n.file_index()).parent)
+}
+
 /// `store_ast_node(n)` when `n` is a store node, in one lookup (see
 /// `try_store_header`). `None` for nil, synthetic and legacy nodes.
 #[inline]
@@ -711,16 +774,10 @@ pub fn try_store_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
 pub fn try_resolve_store_id(file: usize, id: ts_ast::NodeId) -> Option<Node> {
     let index = id.index();
     let resolve = |nodes: &[Option<&'static ts_ast::Node>], headers: &[NodeHeader]| {
-        Some(match nodes[index] {
-            Some(_) => handle(file, index as u32),
-            None => headers[index].parent,
-        })
+        Some(resolve_slot(file, index, nodes, headers))
     };
     if let Some(f) = FROZEN.get() {
-        return match (f.nodes.get(file), f.headers.get(file)) {
-            (Some(nodes), Some(headers)) => resolve(nodes, headers),
-            _ => None,
-        };
+        return f.resolved.get(file).map(|resolved| resolved[index]);
     }
     if is_detached_id(file) {
         return DETACHED.with(|d| match &*d.borrow() {
@@ -733,6 +790,29 @@ pub fn try_resolve_store_id(file: usize, id: ts_ast::NodeId) -> Option<Node> {
             .get(file)
             .and_then(|store| resolve(&store.nodes, &store.headers))
     })
+}
+
+/// The node for slot `index` of store `file`: the slot itself when it holds
+/// a node, else the handle stored in its header.
+fn resolve_slot(
+    file: usize,
+    index: usize,
+    nodes: &[Option<&'static ts_ast::Node>],
+    headers: &[NodeHeader],
+) -> Node {
+    match nodes[index] {
+        Some(_) => handle(file, index as u32),
+        None => headers[index].parent,
+    }
+}
+
+/// `try_resolve_store_id(file, _)` for every slot of store `file`, indexed
+/// by `NodeId::index()`. `None` before freeze and for a file without a
+/// store.
+#[inline]
+#[must_use]
+pub fn frozen_resolved(file: usize) -> Option<&'static [Node]> {
+    Some(&FROZEN.get()?.resolved.get(file)?[..])
 }
 
 /// Go `SourceFile.ECMALineMap()` of store file `file` after freeze. It is

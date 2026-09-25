@@ -118,8 +118,7 @@ impl Checker {
     ) {
         let mut source = source;
         let mut target = target;
-        let could_contain_type_variables = self.could_contain_type_variables.clone();
-        if !could_contain_type_variables(self, target) || self.is_no_infer_type(target) {
+        if !self.could_contain_type_variables(target) || self.is_no_infer_type(target) {
             return;
         }
         if source == self.wildcard_type || source == self.blocked_string_type {
@@ -132,34 +131,38 @@ impl Checker {
             n.borrow_mut().propagation_type = save_propagation_type;
             return;
         }
-        let source_alias = self.ty(source).alias.clone();
-        let target_alias = self.ty(target).alias.clone();
-        if let (Some(sa), Some(ta)) = (&source_alias, &target_alias) {
-            if sa.symbol == ta.symbol {
-                if !sa.type_arguments.is_empty() || !ta.type_arguments.is_empty() {
-                    // Source and target are types originating in the same generic type alias declaration.
-                    // Simply infer from source type arguments to target type arguments, with defaults applied.
-                    let params = self.type_alias_links.get(sa.symbol).type_parameters.clone();
-                    let min_params = self.get_min_type_argument_count(&params);
-                    let node_is_in_js_file = is_in_js_file(self.sym(sa.symbol).value_declaration);
-                    let source_types = self.fill_missing_type_arguments(
-                        &sa.type_arguments,
-                        &params,
-                        min_params,
-                        node_is_in_js_file,
-                    );
-                    let target_types = self.fill_missing_type_arguments(
-                        &ta.type_arguments,
-                        &params,
-                        min_params,
-                        node_is_in_js_file,
-                    );
-                    let variances = self.get_alias_variances(sa.symbol);
-                    self.infer_from_type_arguments(n, &source_types, &target_types, &variances);
-                }
-                // And if there weren't any type arguments, there's no reason to run inference as the types must be the same.
-                return;
+        // PORT: the aliases are compared by reference and cloned only when
+        // they name the same symbol.
+        let same_alias = matches!(
+            (&self.ty(source).alias, &self.ty(target).alias),
+            (Some(sa), Some(ta)) if sa.symbol == ta.symbol
+        );
+        if same_alias {
+            let sa = self.ty(source).alias.clone().unwrap();
+            let ta = self.ty(target).alias.clone().unwrap();
+            if !sa.type_arguments.is_empty() || !ta.type_arguments.is_empty() {
+                // Source and target are types originating in the same generic type alias declaration.
+                // Simply infer from source type arguments to target type arguments, with defaults applied.
+                let params = self.type_alias_links.get(sa.symbol).type_parameters.clone();
+                let min_params = self.get_min_type_argument_count(&params);
+                let node_is_in_js_file = is_in_js_file(self.sym(sa.symbol).value_declaration);
+                let source_types = self.fill_missing_type_arguments(
+                    &sa.type_arguments,
+                    &params,
+                    min_params,
+                    node_is_in_js_file,
+                );
+                let target_types = self.fill_missing_type_arguments(
+                    &ta.type_arguments,
+                    &params,
+                    min_params,
+                    node_is_in_js_file,
+                );
+                let variances = self.get_alias_variances(sa.symbol);
+                self.infer_from_type_arguments(n, &source_types, &target_types, &variances);
             }
+            // And if there weren't any type arguments, there's no reason to run inference as the types must be the same.
+            return;
         }
         if source == target
             && self
@@ -176,18 +179,21 @@ impl Checker {
             return;
         }
         if self.ty(target).flags.intersects(TypeFlags::UNION) {
-            let source_types: SharedList<TypeId> =
-                if self.ty(source).flags.intersects(TypeFlags::UNION) {
-                    self.ty(source).types_list()
-                } else {
-                    vec![source].into()
-                };
+            // PORT: a single source is read from a stack array, not a new list.
+            let (source_list, single);
+            let source_types: &[TypeId] = if self.ty(source).flags.intersects(TypeFlags::UNION) {
+                source_list = self.ty(source).types_list();
+                &source_list
+            } else {
+                single = [source];
+                &single
+            };
             // First, infer between identically matching source and target constituents and remove the
             // matching types.
             let target_distributed = self.ty(target).distributed();
             let (temp_sources, temp_targets) = self.infer_from_matching_types(
                 n,
-                &source_types,
+                source_types,
                 &target_distributed,
                 &mut |c: &mut Checker, s: TypeId, t: TypeId| c.is_type_or_base_identical_to(s, t),
             );
@@ -223,17 +229,20 @@ impl Checker {
             // infer { extra: any } for T. But when inferring to 'string[] & Iterable<T>' we want to keep the
             // string[] on the source side and infer string for T.
             if !self.ty(source).flags.intersects(TypeFlags::UNION) {
-                let source_types: SharedList<TypeId> =
+                let (source_list, single);
+                let source_types: &[TypeId] =
                     if self.ty(source).flags.intersects(TypeFlags::INTERSECTION) {
-                        self.ty(source).types_list()
+                        source_list = self.ty(source).types_list();
+                        &source_list
                     } else {
-                        vec![source].into()
+                        single = [source];
+                        &single
                     };
                 // Infer between identically matching source and target constituents and remove the matching types.
                 let target_types = self.ty(target).types_list();
                 let (sources, targets) = self.infer_from_matching_types(
                     n,
-                    &source_types,
+                    source_types,
                     &target_types,
                     &mut |c: &mut Checker, s: TypeId, t: TypeId| c.is_type_identical_to(s, t),
                 );
@@ -637,17 +646,14 @@ impl Checker {
             s.source_stack.push(source);
             s.target_stack.push(target);
         }
-        // PORT: the stacks are moved out while they are read, instead of
-        // cloned. Nothing reached from isDeeplyNestedType can use `n`.
-        let source_stack = std::mem::take(&mut n.borrow_mut().source_stack);
-        let source_nested = self.is_deeply_nested_type(source, &source_stack, 2);
-        n.borrow_mut().source_stack = source_stack;
+        // PORT: the stacks are read through a shared borrow of `n`, instead
+        // of cloned. Nothing reached from isDeeplyNestedType can use `n`; if
+        // that changes, the borrow check panics.
+        let source_nested = self.is_deeply_nested_type(source, &n.borrow().source_stack, 2);
         if source_nested {
             n.borrow_mut().expanding_flags |= ExpandingFlags::SOURCE;
         }
-        let target_stack = std::mem::take(&mut n.borrow_mut().target_stack);
-        let target_nested = self.is_deeply_nested_type(target, &target_stack, 2);
-        n.borrow_mut().target_stack = target_stack;
+        let target_nested = self.is_deeply_nested_type(target, &n.borrow().target_stack, 2);
         if target_nested {
             n.borrow_mut().expanding_flags |= ExpandingFlags::TARGET;
         }
@@ -720,11 +726,13 @@ impl Checker {
         let mut type_variable_count = 0;
         if target_flags.intersects(TypeFlags::UNION) {
             let mut naked_type_variable = TypeId::NIL;
-            let sources: SharedList<TypeId> = if self.ty(source).flags.intersects(TypeFlags::UNION)
-            {
-                self.ty(source).types_list()
+            let (source_list, single);
+            let sources: &[TypeId] = if self.ty(source).flags.intersects(TypeFlags::UNION) {
+                source_list = self.ty(source).types_list();
+                &source_list
             } else {
-                vec![source].into()
+                single = [source];
+                &single
             };
             let mut matched = vec![false; sources.len()];
             let mut inference_circularity = false;
@@ -1560,8 +1568,7 @@ impl Checker {
             }
         }
         let target_return_type = self.get_return_type_of_signature(target);
-        let could_contain_type_variables = self.could_contain_type_variables.clone();
-        if could_contain_type_variables(self, target_return_type) {
+        if self.could_contain_type_variables(target_return_type) {
             let s = self.get_return_type_of_signature(source);
             callback(self, s, target_return_type);
         }

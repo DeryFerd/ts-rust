@@ -483,7 +483,7 @@ impl Checker {
         // Consecutive symbols mostly come from one file, so the last file
         // index lookup is reused.
         let mut last_file = (Node::NIL, 0);
-        let mut keys: Vec<SymbolSortKey<'_>> = symbols
+        let mut keys: Vec<SymbolSortKey> = symbols
             .iter()
             .map(|&s| self.symbol_sort_key(s, &mut last_file))
             .collect();
@@ -495,7 +495,7 @@ impl Checker {
 
     /// The `compareSymbolsWorker` inputs of one symbol.
     /// `last_file` caches the last `(file, file_index_map[file])` lookup.
-    fn symbol_sort_key(&self, symbol: SymbolId, last_file: &mut (Node, i32)) -> SymbolSortKey<'_> {
+    fn symbol_sort_key(&self, symbol: SymbolId, last_file: &mut (Node, i32)) -> SymbolSortKey {
         if symbol.is_nil() {
             return SymbolSortKey {
                 symbol,
@@ -504,7 +504,7 @@ impl Checker {
                 file: Node::NIL,
                 file_index: 0,
                 pos: 0,
-                name: "",
+                name: Name::default(),
             };
         }
         let sym = self.sym(symbol);
@@ -526,13 +526,13 @@ impl Checker {
             file,
             file_index,
             pos,
-            name: &sym.name,
+            name: sym.name.clone(),
         }
     }
 
     /// `compare_symbols_worker` on cached keys. The symbol id fallback stays
     /// lazy so ids are assigned in the same order as before.
-    fn compare_symbol_sort_keys(&self, k1: &SymbolSortKey<'_>, k2: &SymbolSortKey<'_>) -> i32 {
+    fn compare_symbol_sort_keys(&self, k1: &SymbolSortKey, k2: &SymbolSortKey) -> i32 {
         if k1.symbol == k2.symbol {
             return 0;
         }
@@ -563,9 +563,12 @@ impl Checker {
         } else if k2.has_declaration {
             return 1;
         }
-        let r = compare_strings(k1.name, k2.name);
-        if r != 0 {
-            return r;
+        // Equal ids are equal texts, which compare as 0.
+        if k1.name != k2.name {
+            let r = compare_strings(&k1.name, &k2.name);
+            if r != 0 {
+                return r;
+            }
         }
         let id1 = get_symbol_id(&self.symbols, k1.symbol) as i64;
         let id2 = get_symbol_id(&self.symbols, k2.symbol) as i64;
@@ -631,7 +634,7 @@ impl Checker {
 }
 
 /// Cached `compareSymbolsWorker` inputs for `sort_symbols`.
-struct SymbolSortKey<'a> {
+struct SymbolSortKey {
     symbol: SymbolId,
     has_declaration: bool,
     /// First declaration, or nil.
@@ -641,7 +644,8 @@ struct SymbolSortKey<'a> {
     /// `file_index_map[file]`, zero when absent (Go map miss).
     file_index: i32,
     pos: i32,
-    name: &'a str,
+    /// Its text is read only when the declarations tie.
+    name: Name,
 }
 
 // PORT: Go `strings.Compare` (byte order, returns -1/0/1). It compares the

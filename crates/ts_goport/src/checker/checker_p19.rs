@@ -1130,9 +1130,12 @@ fn xxh3_mix32(acc: &mut (u64, u64), p: &[u8], a: usize, b: usize, ka: usize, kb:
 /// XXH3 accumulate over one 64-byte stripe at `p[o..]` with the secret at `k`.
 #[inline(always)]
 fn xxh3_accumulate_stripe(accs: &mut [u64; 8], p: &[u8], o: usize, k: usize) {
+    // One bounds check for the stripe instead of one per word.
+    let stripe: &[u8; XXH_STRIPE] = p[o..o + XXH_STRIPE].try_into().unwrap();
+    let key: &[u8; XXH_STRIPE] = XXH3_SECRET[k..k + XXH_STRIPE].try_into().unwrap();
     for i in 0..8 {
-        let dv = xxh_read64(p, o + 8 * i);
-        let dk = dv ^ xxh_key64(k + 8 * i);
+        let dv = u64::from_le_bytes(stripe[8 * i..8 * i + 8].try_into().unwrap());
+        let dk = dv ^ u64::from_le_bytes(key[8 * i..8 * i + 8].try_into().unwrap());
         accs[i ^ 1] = accs[i ^ 1].wrapping_add(dv);
         accs[i] = accs[i].wrapping_add((dk & 0xffff_ffff).wrapping_mul(dk >> 32));
     }
@@ -1145,6 +1148,33 @@ fn xxh3_scramble(accs: &mut [u64; 8]) {
         *acc ^= xxh_key64(128 + 8 * i);
         *acc = acc.wrapping_mul(XXH_PRIME32_1);
     }
+}
+
+/// The 4..=8 byte path of `xxh3_hash128`, from the first and last 4 bytes
+/// (little endian, as `u64`) and the length `l`. Returns `(hi, lo)`.
+#[inline(always)]
+fn xxh3_hash128_4to8(first: u64, last: u64, l: u64) -> (u64, u64) {
+    let bitflip = xxh_key64(16) ^ xxh_key64(24);
+    let input_64 = first + (last << 32);
+    let keyed = input_64 ^ bitflip;
+    let r = (keyed as u128).wrapping_mul(XXH_PRIME64_1.wrapping_add(l << 2) as u128);
+    let mut r_hi = (r >> 64) as u64;
+    let mut r_lo = r as u64;
+    r_hi = r_hi.wrapping_add(r_lo << 1);
+    r_lo ^= r_hi >> 3;
+    r_lo ^= r_lo >> 35;
+    r_lo = r_lo.wrapping_mul(0x9fb21c651e98df25);
+    r_lo ^= r_lo >> 28;
+    (xxh3_avalanche(r_hi), r_lo)
+}
+
+/// Go `keyBuilder{}; writeType(t); writeAlias(nil); hash()`, computed in
+/// registers. The key bytes are `t` (4 bytes LE) and then `0`, so the last
+/// 4 bytes are `t >> 8`. Same value as the `KeyBuilder` path.
+#[inline]
+pub fn type_key_no_alias(t: TypeId) -> CacheHashKey {
+    let (hi, lo) = xxh3_hash128_4to8(t.0 as u64, (t.0 >> 8) as u64, 5);
+    CacheHashKey { hi, lo }
 }
 
 /// Go `zeebo/xxh3.Hash128` (seed 0). Returns `(hi, lo)`.
@@ -1171,18 +1201,7 @@ fn xxh3_hash128(p: &[u8]) -> (u64, u64) {
             let r_hi = ((r >> 64) as u64).wrapping_add(m_h.wrapping_mul(XXH_PRIME64_2));
             return (xxh3_avalanche(r_hi), xxh3_avalanche(r as u64));
         } else if l > 3 {
-            let bitflip = xxh_key64(16) ^ xxh_key64(24);
-            let input_64 = xxh_read32(p, 0) + (xxh_read32(p, l - 4) << 32);
-            let keyed = input_64 ^ bitflip;
-            let r = (keyed as u128).wrapping_mul(XXH_PRIME64_1.wrapping_add(lu << 2) as u128);
-            let mut r_hi = (r >> 64) as u64;
-            let mut r_lo = r as u64;
-            r_hi = r_hi.wrapping_add(r_lo << 1);
-            r_lo ^= r_hi >> 3;
-            r_lo ^= r_lo >> 35;
-            r_lo = r_lo.wrapping_mul(0x9fb21c651e98df25);
-            r_lo ^= r_lo >> 28;
-            return (xxh3_avalanche(r_hi), r_lo);
+            return xxh3_hash128_4to8(xxh_read32(p, 0), xxh_read32(p, l - 4), lu);
         } else if l == 3 {
             let c12 = p[0] as u64 | (p[1] as u64) << 8;
             lo = (c12 << 16) + p[2] as u64 + (3 << 8);
@@ -1849,5 +1868,41 @@ impl Checker {
             node, false, /*includeOptionality*/
             check_mode,
         )
+    }
+}
+
+#[cfg(test)]
+mod key_hash_tests {
+    use super::*;
+
+    /// `xxh3_hash128` matches the xxhash-rust `xxh3_128` for every length
+    /// path, and `type_key_no_alias` matches the `KeyBuilder` key.
+    #[test]
+    fn xxh3_and_type_key_match_reference() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let bytes: Vec<u8> = (0..4096).map(|_| next() as u8).collect();
+        for l in 0..bytes.len() {
+            let p = &bytes[..l];
+            let want = xxhash_rust::xxh3::xxh3_128(p);
+            assert_eq!(
+                xxh3_hash128(p),
+                ((want >> 64) as u64, want as u64),
+                "len {l}"
+            );
+        }
+        for _ in 0..100_000 {
+            let t = TypeId(next() as u32);
+            let mut b = KeyBuilder::default();
+            b.write_type(t);
+            // `write_alias(None)` writes this byte.
+            b.write_byte(0);
+            assert_eq!(type_key_no_alias(t), b.hash());
+        }
     }
 }

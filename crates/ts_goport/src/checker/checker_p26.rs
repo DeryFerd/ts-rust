@@ -430,6 +430,7 @@ impl Checker {
     // PORT: Go package function `isTupleType` reads type data, so it is a
     // `Checker` method (see the PORT note in types.rs).
     // Go: checker/checker.go:23391 isTupleType
+    #[inline]
     pub fn is_tuple_type(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
         ty.object_flags.intersects(ObjectFlags::REFERENCE)

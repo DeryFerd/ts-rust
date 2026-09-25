@@ -724,33 +724,46 @@ impl Checker {
     // PORT: Go returns `*StructuredType`. Rust returns a shared borrow of the
     // resolved type's `StructuredType`; callers that need to call other
     // checker methods copy what they need out of it first.
+    // PORT: the resolved case is the common one, so it stays inline and the
+    // dispatch below is out of line.
+    #[inline]
     pub fn resolve_structured_type_members(&mut self, t: TypeId) -> &StructuredType {
+        if !self
+            .ty(t)
+            .object_flags
+            .intersects(ObjectFlags::MEMBERS_RESOLVED)
+        {
+            self.resolve_structured_type_members_slow(t);
+        }
+        self.ty(t).as_structured_type()
+    }
+
+    /// The member resolution dispatch of `resolve_structured_type_members`.
+    #[inline(never)]
+    fn resolve_structured_type_members_slow(&mut self, t: TypeId) {
         let flags = self.ty(t).flags;
         let object_flags = self.ty(t).object_flags;
-        if !object_flags.intersects(ObjectFlags::MEMBERS_RESOLVED) {
-            if flags.intersects(TypeFlags::OBJECT) {
-                if object_flags.intersects(ObjectFlags::REFERENCE) {
-                    self.resolve_type_reference_members(t);
-                } else if object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE) {
-                    self.resolve_class_or_interface_members(t);
-                } else if object_flags.intersects(ObjectFlags::REVERSE_MAPPED) {
-                    self.resolve_reverse_mapped_type_members(t);
-                } else if object_flags.intersects(ObjectFlags::ANONYMOUS) {
-                    self.resolve_anonymous_type_members(t);
-                } else if object_flags.intersects(ObjectFlags::MAPPED) {
-                    self.resolve_mapped_type_members(t);
-                } else {
-                    panic!("Unhandled case in resolveStructuredTypeMembers");
-                }
-            } else if flags.intersects(TypeFlags::UNION) {
-                self.resolve_union_type_members(t);
-            } else if flags.intersects(TypeFlags::INTERSECTION) {
-                self.resolve_intersection_type_members(t);
+        if flags.intersects(TypeFlags::OBJECT) {
+            if object_flags.intersects(ObjectFlags::REFERENCE) {
+                self.resolve_type_reference_members(t);
+            } else if object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE) {
+                self.resolve_class_or_interface_members(t);
+            } else if object_flags.intersects(ObjectFlags::REVERSE_MAPPED) {
+                self.resolve_reverse_mapped_type_members(t);
+            } else if object_flags.intersects(ObjectFlags::ANONYMOUS) {
+                self.resolve_anonymous_type_members(t);
+            } else if object_flags.intersects(ObjectFlags::MAPPED) {
+                self.resolve_mapped_type_members(t);
             } else {
                 panic!("Unhandled case in resolveStructuredTypeMembers");
             }
+        } else if flags.intersects(TypeFlags::UNION) {
+            self.resolve_union_type_members(t);
+        } else if flags.intersects(TypeFlags::INTERSECTION) {
+            self.resolve_intersection_type_members(t);
+        } else {
+            panic!("Unhandled case in resolveStructuredTypeMembers");
         }
-        self.ty(t).as_structured_type()
     }
 
     // Go: checker/checker.go:18990 resolveClassOrInterfaceMembers

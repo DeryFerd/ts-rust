@@ -586,30 +586,28 @@ impl Checker {
         }
         // Keep the flags from the symbol we're instantiating.  Mark that is instantiated, and
         // also transient so that we can just store data on it directly.
-        let (s_flags, s_name, s_check_flags, s_declarations, s_parent, s_value_declaration) = {
+        // PORT: Go calls newSymbol and then sets the fields. This builds the
+        // full symbol and pushes it once; `symbol_count` and TRANSIENT match
+        // `Checker::new_symbol`.
+        let full = {
             let s = self.sym(symbol);
-            (
-                s.flags,
-                s.name.clone(),
-                s.check_flags,
-                s.declarations.clone(),
-                s.parent,
-                s.value_declaration,
-            )
+            Symbol {
+                flags: s.flags | SymbolFlags::TRANSIENT,
+                name: s.name.clone(),
+                check_flags: CheckFlags::INSTANTIATED
+                    | s.check_flags
+                        & (CheckFlags::READONLY
+                            | CheckFlags::LATE
+                            | CheckFlags::OPTIONAL_PARAMETER
+                            | CheckFlags::REST_PARAMETER),
+                declarations: s.declarations.clone(),
+                parent: s.parent,
+                value_declaration: s.value_declaration,
+                ..Symbol::default()
+            }
         };
-        let result = self.new_symbol(s_flags, s_name);
-        {
-            let r = self.sym_mut(result);
-            r.check_flags = CheckFlags::INSTANTIATED
-                | s_check_flags
-                    & (CheckFlags::READONLY
-                        | CheckFlags::LATE
-                        | CheckFlags::OPTIONAL_PARAMETER
-                        | CheckFlags::REST_PARAMETER);
-            r.declarations = s_declarations;
-            r.parent = s_parent;
-            r.value_declaration = s_value_declaration;
-        }
+        self.symbol_count += 1;
+        let result = self.symbols.push_symbol(full);
         let result_links = self.value_symbol_links.get(result);
         result_links.target = symbol;
         result_links.mapper = m;

@@ -1048,7 +1048,12 @@ pub fn set_value_declaration(symbols: &mut SymbolArena, symbol: SymbolId, node: 
 
 // Go: binder/binder.go:2558 GetContainerFlags
 pub fn get_container_flags(node: Node) -> ContainerFlags {
-    match node.kind() {
+    get_container_flags_of_kind(node, node.kind())
+}
+
+/// `get_container_flags` for a caller that already read `node.kind()`.
+pub fn get_container_flags_of_kind(node: Node, kind: SyntaxKind) -> ContainerFlags {
+    match kind {
         SyntaxKind::ClassExpression
         | SyntaxKind::ClassDeclaration
         | SyntaxKind::EnumDeclaration
@@ -1079,7 +1084,7 @@ pub fn get_container_flags(node: Node) -> ContainerFlags {
         | SyntaxKind::FunctionDeclaration
         | SyntaxKind::ClassStaticBlockDeclaration => {
             if matches!(
-                node.kind(),
+                kind,
                 SyntaxKind::GetAccessor | SyntaxKind::SetAccessor | SyntaxKind::MethodDeclaration
             ) && is_object_literal_or_class_expression_method_or_accessor(node)
             {

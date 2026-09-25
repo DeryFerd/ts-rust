@@ -891,7 +891,8 @@ pub struct Checker {
     pub async_iteration_types_resolver: Rc<IterationTypesResolver>,
     pub is_primitive_or_object_or_empty_type: TypeTestFn,
     pub contains_missing_type: TypeTestFn,
-    pub could_contain_type_variables: TypeTestFn,
+    // PORT: Go field `couldContainTypeVariables` is the `#[inline]` method
+    // `Checker::could_contain_type_variables` (fnfields.rs), not a stored fn.
     pub is_string_index_signature_only_type: TypeTestFn,
     pub mark_node_assignments: NodeTestFn,
     pub compare_types_assignable: TypeComparer,
@@ -926,26 +927,31 @@ pub struct Checker {
 // directly; index 0 is the nil dummy.
 impl Checker {
     #[must_use]
+    #[inline(always)]
     pub fn sym(&self, s: SymbolId) -> &Symbol {
         self.symbols.sym(s)
     }
 
+    #[inline(always)]
     pub fn sym_mut(&mut self, s: SymbolId) -> &mut Symbol {
         self.symbols.sym_mut(s)
     }
 
     #[must_use]
+    #[inline(always)]
     pub fn ty(&self, t: TypeId) -> &Type {
         debug_assert!(t.is_some(), "nil type dereference");
         &self.types[t.index()]
     }
 
+    #[inline(always)]
     pub fn ty_mut(&mut self, t: TypeId) -> &mut Type {
         debug_assert!(t.is_some(), "nil type dereference");
         &mut self.types[t.index()]
     }
 
     #[must_use]
+    #[inline(always)]
     pub fn sig(&self, s: SignatureId) -> &Signature {
         debug_assert!(s.is_some(), "nil signature dereference");
         &self.signatures[s.index()]
@@ -1326,7 +1332,6 @@ impl Checker {
             async_iteration_types_resolver: nil_iteration_types_resolver(),
             is_primitive_or_object_or_empty_type: nil_type_test_fn(),
             contains_missing_type: nil_type_test_fn(),
-            could_contain_type_variables: nil_type_test_fn(),
             is_string_index_signature_only_type: nil_type_test_fn(),
             mark_node_assignments: nil_node_test_fn(),
             compare_types_assignable: nil_type_comparer(),

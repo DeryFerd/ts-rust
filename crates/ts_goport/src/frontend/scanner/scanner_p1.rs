@@ -150,26 +150,6 @@ pub(crate) fn rune_to_string(r: i32) -> String {
     rune_to_char(r).to_string()
 }
 
-/// The index of the first `needle` in `haystack`, eight bytes at a time.
-fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
-    const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
-    const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
-    let pattern = ONES * u64::from(needle);
-    let mut chunks = haystack.chunks_exact(8);
-    let mut offset = 0;
-    for chunk in &mut chunks {
-        let word = u64::from_ne_bytes(chunk.try_into().expect("an 8-byte chunk")) ^ pattern;
-        if word.wrapping_sub(ONES) & !word & HIGHS != 0 {
-            break;
-        }
-        offset += 8;
-    }
-    haystack[offset..]
-        .iter()
-        .position(|&b| b == needle)
-        .map(|i| offset + i)
-}
-
 /// Interns a token value as `&'static str`.
 // PORT: Go `ScannerState` holds `tokenValue string`, and Go strings are
 // shared immutable values, so `Mark`/`Rewind` copy it for free. The contract
@@ -177,7 +157,8 @@ fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
 // shared. The set of distinct token values is bounded by the source texts.
 pub(crate) fn intern_token_value(value: &str) -> &'static str {
     thread_local! {
-        static TOKEN_VALUES: RefCell<FxHashSet<&'static str>> = RefCell::new(FxHashSet::default());
+        static TOKEN_VALUES: RefCell<FxHashSet<&'static str>> =
+            const { RefCell::new(FxHashSet::with_hasher(rustc_hash::FxBuildHasher)) };
     }
     if value.is_empty() {
         return "";
@@ -439,7 +420,9 @@ pub struct Scanner {
     pub(crate) scanner_state: ScannerState,
 
     pub(crate) contains_non_ascii: bool,
-    pub(crate) number_cache: FxHashMap<String, String>,
+    // PORT: maps a token value to its interned `jsnum` string, so a hit
+    // needs no second intern lookup.
+    pub(crate) number_cache: FxHashMap<&'static str, &'static str>,
     pub(crate) hex_number_cache: FxHashMap<String, String>,
     pub(crate) hex_digit_cache: FxHashMap<String, String>,
 
@@ -534,6 +517,7 @@ impl Scanner {
 
     /// Go `s.text[start:end]` as a token value. A slice of `'static` source
     /// text needs no interning: like a Go substring, it shares the text.
+    #[inline]
     pub(crate) fn text_token_value(&self, start: usize, end: usize) -> &'static str {
         match &self.text {
             Cow::Borrowed(text) => {
@@ -766,18 +750,27 @@ impl Scanner {
     // NOTE: even though this returns a rune, it only decodes the current byte.
     // It must be checked against utf8.RuneSelf to verify that a call to charAndSize
     // is not needed.
+    // PORT: `end <= text.len()` always, so `get` fails only where Go would
+    // also be past the end; it drops the panic path from the hot loop.
+    #[inline]
     pub(crate) fn char(&self) -> i32 {
-        if self.scanner_state.pos < self.end {
-            return i32::from(self.text.as_bytes()[self.scanner_state.pos as usize]);
+        if self.scanner_state.pos < self.end
+            && let Some(&b) = self.text.as_bytes().get(self.scanner_state.pos as usize)
+        {
+            return i32::from(b);
         }
         -1
     }
 
     // Go: scanner/scanner.go:442 charAt
     // NOTE: this returns a rune, but only decodes the byte at the offset.
+    #[inline]
     pub(crate) fn char_at(&self, offset: i32) -> i32 {
-        if self.scanner_state.pos + offset < self.end {
-            return i32::from(self.text.as_bytes()[(self.scanner_state.pos + offset) as usize]);
+        let i = self.scanner_state.pos + offset;
+        if i < self.end
+            && let Some(&b) = self.text.as_bytes().get(i as usize)
+        {
+            return i32::from(b);
         }
         -1
     }
@@ -800,35 +793,34 @@ impl Scanner {
         (r, size)
     }
 
-    // Go: scanner/scanner.go:468 scanASCIIWhile
-    // scanASCIIWhile advances s.pos over the longest run of ASCII bytes for which
-    // pred returns true. It stops at end-of-text, the first non-ASCII byte, or the
-    // first byte where pred is false.
     /// The position of the first `*/` at or after `pos`, and the position
     /// after the last line break before it, when the text up to it is
     /// ASCII. `None` sends the multi-line comment scan to its byte loop.
     fn ascii_comment_end(&self) -> Option<(i32, Option<i32>)> {
         let start = self.scanner_state.pos as usize;
         let bytes = &self.text.as_bytes()[start..self.end as usize];
-        let mut from = 0;
-        let close = loop {
-            let star = from + find_byte(&bytes[from..], b'*')?;
-            if bytes.get(star + 1) == Some(&b'/') {
-                break star;
-            }
-            from = star + 1;
-        };
+        let close = memchr::memmem::find(bytes, b"*/")?;
         let body = &bytes[..close];
         if !body.is_ascii() {
             return None;
         }
-        let line_start = body
-            .iter()
-            .rposition(|&b| b == b'\n' || b == b'\r')
-            .map(|i| (start + i + 1) as i32);
+        let line_start = memchr::memrchr2(b'\n', b'\r', body).map(|i| (start + i + 1) as i32);
         Some(((start + close) as i32, line_start))
     }
 
+    /// The length of the single-line comment body at `pos`, up to the next
+    /// `\n` or `\r` or the end, when that body is ASCII. `None` sends the
+    /// single-line comment scan to its byte loop.
+    fn ascii_line_comment_len(&self) -> Option<i32> {
+        let rest = &self.text.as_bytes()[self.scanner_state.pos as usize..self.end as usize];
+        let body = &rest[..memchr::memchr2(b'\n', b'\r', rest).unwrap_or(rest.len())];
+        body.is_ascii().then_some(body.len() as i32)
+    }
+
+    // Go: scanner/scanner.go:468 scanASCIIWhile
+    // scanASCIIWhile advances s.pos over the longest run of ASCII bytes for which
+    // pred returns true. It stops at end-of-text, the first non-ASCII byte, or the
+    // first byte where pred is false.
     pub(crate) fn scan_ascii_while(&mut self, pred: impl Fn(u8) -> bool) {
         let text = &self.text.as_bytes()[self.scanner_state.pos as usize..self.end as usize];
         let mut i = 0usize;
@@ -874,6 +866,9 @@ impl Scanner {
                     Some(b'\t' | 0x0B | 0x0C | b' ') => {
                         self.scanner_state.pos += 1;
                         if self.skip_trivia {
+                            // PORT: skips the rest of the run here instead of
+                            // one byte per `'scan` pass; the result is the same.
+                            self.scan_ascii_while(|b| matches!(b, b'\t' | 0x0B | 0x0C | b' '));
                             continue 'scan;
                         }
                         loop {
@@ -914,8 +909,8 @@ impl Scanner {
                         }
                     }
                     Some(b'"' | b'\'') => {
-                        let value = self.scan_string(false /*jsxAttributeString*/);
-                        self.set_token_value(&value);
+                        self.scanner_state.token_value =
+                            self.scan_string(false /*jsxAttributeString*/);
                         self.scanner_state.token = SyntaxKind::StringLiteral;
                     }
                     Some(b'`') => {
@@ -1038,6 +1033,11 @@ impl Scanner {
                         if self.char_at(1) == i32::from(b'/') {
                             self.scanner_state.pos += 2;
 
+                            // PORT: fast path for an ASCII comment; the loop
+                            // below gives the same result byte by byte.
+                            if let Some(len) = self.ascii_line_comment_len() {
+                                self.scanner_state.pos += len;
+                            }
                             loop {
                                 self.scan_ascii_while(|b| b != b'\n' && b != b'\r');
                                 let (ch1, size) = self.char_and_size();

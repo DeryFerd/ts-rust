@@ -50,6 +50,51 @@ fn js_number_string(text: &str) -> String {
     ts_jsnum::Number::from_string(text).to_string()
 }
 
+/// Whether `js_number_string(text) == text` is known without parsing: a
+/// decimal integer with no leading zero and at most 15 digits. Every such
+/// integer is below 2^53, so it prints as its own digits.
+fn is_canonical_js_integer(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 15
+        && (bytes[0] != b'0' || bytes.len() == 1)
+        && bytes.iter().all(u8::is_ascii_digit)
+}
+
+/// The bytes that continue an ASCII identifier: letters, digits, `_`, `$`.
+/// Bytes >= 0x80 are false, so a scan stops there like `scan_ascii_while`.
+static ASCII_IDENT_PART: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut i = 0;
+    while i < 128 {
+        let b = i as u8;
+        table[i] = b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        i += 1;
+    }
+    table
+};
+
+/// A numeric fragment from `scan_number_fragment`: `prefix` followed by
+/// `text[start..end]`. `prefix` holds the digits before the last separator
+/// and stays empty (no allocation) when there is no separator.
+pub(crate) struct NumberFragment {
+    prefix: String,
+    start: i32,
+    end: i32,
+}
+
+impl NumberFragment {
+    fn is_empty(&self) -> bool {
+        self.prefix.is_empty() && self.start == self.end
+    }
+
+    /// Appends the fragment value to `out`.
+    fn push_to(&self, text: &str, out: &mut String) {
+        out.push_str(&self.prefix);
+        out.push_str(&text[self.start as usize..self.end as usize]);
+    }
+}
+
 impl Scanner {
     // Go: scanner/scanner.go:1237 ReScanJsxToken
     pub fn re_scan_jsx_token(&mut self, allow_multiline_jsx_text: bool) -> SyntaxKind {
@@ -213,8 +258,7 @@ impl Scanner {
         self.scanner_state.token_start = self.scanner_state.pos;
         let c = self.char();
         if c == '"' as i32 || c == '\'' as i32 {
-            let value = self.scan_string(true /*jsxAttributeString*/);
-            self.set_token_value(&value);
+            self.scanner_state.token_value = self.scan_string(true /*jsxAttributeString*/);
             self.scanner_state.token = SyntaxKind::StringLiteral;
             self.scanner_state.token
         } else {
@@ -440,13 +484,12 @@ impl Scanner {
         // Fast path for simple ASCII identifiers
         if is_ascii_letter(rune_to_char(ch)) || ch == '_' as i32 || ch == '$' as i32 {
             self.scanner_state.pos += 1;
-            self.scan_ascii_while(|b: u8| {
-                b.is_ascii_lowercase()
-                    || b.is_ascii_uppercase()
-                    || b.is_ascii_digit()
-                    || b == b'_'
-                    || b == b'$'
-            });
+            let rest = &self.text.as_bytes()[self.scanner_state.pos as usize..self.end as usize];
+            let len = rest
+                .iter()
+                .position(|&b| !ASCII_IDENT_PART[usize::from(b)])
+                .unwrap_or(rest.len());
+            self.scanner_state.pos += len as i32;
             let ch = self.char();
             if ch < RUNE_SELF && ch != '\\' as i32 {
                 self.scanner_state.token_value =
@@ -502,29 +545,33 @@ impl Scanner {
     }
 
     // Go: scanner/scanner.go:1598 scanString
-    pub(crate) fn scan_string(&mut self, jsx_attribute_string: bool) -> String {
+    // PORT: returns the token value. A plain string is a slice of the source
+    // text (see `text_token_value`), so it needs no copy or intern.
+    pub(crate) fn scan_string(&mut self, jsx_attribute_string: bool) -> &'static str {
         let quote = self.char();
         if quote == '\'' as i32 {
             self.scanner_state.token_flags |= TokenFlags::SINGLE_QUOTE;
         }
         self.scanner_state.pos += 1;
         // Fast path for simple strings without escape sequences.
-        let str_len: i32 = self.text.as_bytes()[self.scanner_state.pos as usize..]
-            .iter()
-            .position(|&b| b as i32 == quote)
-            .map_or(-1, |i| i as i32);
+        // `quote` is `"` or `'` here, so it fits in a byte.
+        let str_len: i32 = memchr::memchr(
+            quote as u8,
+            &self.text.as_bytes()[self.scanner_state.pos as usize..],
+        )
+        .map_or(-1, |i| i as i32);
         if str_len == 0 {
             self.scanner_state.pos += 1;
-            return String::new();
+            return "";
         }
         if str_len > 0 {
-            let str = &self.text
-                [self.scanner_state.pos as usize..(self.scanner_state.pos + str_len) as usize];
+            let from = self.scanner_state.pos as usize;
+            let to = from + str_len as usize;
             if jsx_attribute_string
-                || !str.contains('\\') && !str.contains('\r') && !str.contains('\n')
+                || memchr::memchr3(b'\\', b'\r', b'\n', &self.text.as_bytes()[from..to]).is_none()
             {
                 self.scanner_state.pos += str_len + 1;
-                return str.to_string();
+                return self.text_token_value(from, to);
             }
         }
         let mut sb = String::new();
@@ -560,7 +607,7 @@ impl Scanner {
             }
             self.scanner_state.pos += 1;
         }
-        sb
+        intern_token_value(&sb)
     }
 
     // Go: scanner/scanner.go:1650 scanTemplateAndSetTokenValue
@@ -571,13 +618,17 @@ impl Scanner {
         let started_with_backtick = self.char() == '`' as i32;
         self.scanner_state.pos += 1;
         let mut start = self.scanner_state.pos;
-        let mut parts: Vec<String> = Vec::with_capacity(4);
+        // PORT: Go collects `parts` and joins them. This keeps one `String` of
+        // the parts before `start`. When it stays empty (no escape and no
+        // `\r`), the value is the source slice `text[start..value_end]`.
+        let mut sb = String::new();
+        let value_end;
         let token;
         loop {
             self.scan_ascii_while(|b: u8| b != b'`' && b != b'$' && b != b'\\' && b != b'\r');
             let ch = self.char();
             if ch < 0 || ch == '`' as i32 {
-                parts.push(self.text[start as usize..self.scanner_state.pos as usize].to_string());
+                value_end = self.scanner_state.pos;
                 if ch == '`' as i32 {
                     self.scanner_state.pos += 1;
                 } else {
@@ -592,7 +643,7 @@ impl Scanner {
                 break;
             }
             if ch == '$' as i32 && self.char_at(1) == '{' as i32 {
-                parts.push(self.text[start as usize..self.scanner_state.pos as usize].to_string());
+                value_end = self.scanner_state.pos;
                 self.scanner_state.pos += 2;
                 token = if started_with_backtick {
                     SyntaxKind::TemplateHead
@@ -602,32 +653,39 @@ impl Scanner {
                 break;
             }
             if ch == '\\' as i32 {
-                parts.push(self.text[start as usize..self.scanner_state.pos as usize].to_string());
+                sb.push_str(&self.text[start as usize..self.scanner_state.pos as usize]);
                 let flags = EscapeSequenceScanningFlags::STRING
                     | if should_emit_invalid_escape_error {
                         EscapeSequenceScanningFlags::REPORT_ERRORS
                     } else {
                         EscapeSequenceScanningFlags::default()
                     };
-                parts.push(self.scan_escape_sequence(flags));
+                let escaped = self.scan_escape_sequence(flags);
+                sb.push_str(&escaped);
                 start = self.scanner_state.pos;
                 continue;
             }
             // Speculated ECMAScript 6 Spec 11.8.6.1:
             // <CR><LF> and <CR> LineTerminatorSequences are normalized to <LF> for Template Values
             if ch == '\r' as i32 {
-                parts.push(self.text[start as usize..self.scanner_state.pos as usize].to_string());
+                sb.push_str(&self.text[start as usize..self.scanner_state.pos as usize]);
                 self.scanner_state.pos += 1;
                 if self.char() == '\n' as i32 {
                     self.scanner_state.pos += 1;
                 }
-                parts.push("\n".to_string());
+                sb.push('\n');
                 start = self.scanner_state.pos;
                 continue;
             }
             self.scanner_state.pos += 1;
         }
-        self.set_token_value(&parts.join(""));
+        if sb.is_empty() {
+            self.scanner_state.token_value =
+                self.text_token_value(start as usize, value_end as usize);
+        } else {
+            sb.push_str(&self.text[start as usize..value_end as usize]);
+            self.set_token_value(&sb);
+        }
         token
     }
 
@@ -978,10 +1036,19 @@ impl Scanner {
             } else {
                 let (digits, is_octal) = self.scan_digits();
                 if digits.is_empty() {
-                    fixed_part = "0".to_string();
+                    // The "0" at `start`.
+                    fixed_part = NumberFragment {
+                        prefix: String::new(),
+                        start,
+                        end: start + 1,
+                    };
                 } else if !is_octal {
                     self.scanner_state.token_flags |= TokenFlags::CONTAINS_LEADING_ZERO;
-                    fixed_part = digits;
+                    fixed_part = NumberFragment {
+                        prefix: digits,
+                        start,
+                        end: start,
+                    };
                 } else {
                     let val = go_parse_int(&digits, 8, 64);
                     self.set_token_value(&val.to_string());
@@ -1004,12 +1071,12 @@ impl Scanner {
             fixed_part = self.scan_number_fragment();
         }
         let fixed_part_end = self.scanner_state.pos;
-        let mut fractional_part = String::new();
-        let mut exponent_preamble = String::new();
-        let mut exponent_part = String::new();
+        let mut fractional_part = None;
+        let mut exponent_preamble = (0, 0);
+        let mut exponent_part = None;
         if self.char() == '.' as i32 {
             self.scanner_state.pos += 1;
-            fractional_part = self.scan_number_fragment();
+            fractional_part = Some(self.scan_number_fragment());
         }
         let mut end = self.scanner_state.pos;
         if self.char() == 'E' as i32 || self.char() == 'e' as i32 {
@@ -1019,13 +1086,13 @@ impl Scanner {
                 self.scanner_state.pos += 1;
             }
             let start_numeric_part = self.scanner_state.pos;
-            exponent_part = self.scan_number_fragment();
-            if exponent_part.is_empty() {
+            let part = self.scan_number_fragment();
+            if part.is_empty() {
                 self.error(diag::Digit_expected);
             } else {
-                exponent_preamble =
-                    self.text[end as usize..start_numeric_part as usize].to_string();
+                exponent_preamble = (end as usize, start_numeric_part as usize);
                 end = self.scanner_state.pos;
+                exponent_part = Some(part);
             }
         }
         if self
@@ -1033,14 +1100,15 @@ impl Scanner {
             .token_flags
             .intersects(TokenFlags::CONTAINS_SEPARATOR)
         {
-            let mut value = fixed_part;
-            if !fractional_part.is_empty() {
+            let mut value = String::new();
+            fixed_part.push_to(&self.text, &mut value);
+            if let Some(part) = fractional_part.filter(|part| !part.is_empty()) {
                 value.push('.');
-                value.push_str(&fractional_part);
+                part.push_to(&self.text, &mut value);
             }
-            if !exponent_part.is_empty() {
-                value.push_str(&exponent_preamble);
-                value.push_str(&exponent_part);
+            if let Some(part) = exponent_part {
+                value.push_str(&self.text[exponent_preamble.0..exponent_preamble.1]);
+                part.push_to(&self.text, &mut value);
             }
             self.set_token_value(&value);
         } else {
@@ -1110,7 +1178,9 @@ impl Scanner {
     }
 
     // Go: scanner/scanner.go:2057 scanNumberFragment
-    pub(crate) fn scan_number_fragment(&mut self) -> String {
+    // PORT: returns a `NumberFragment` so a fragment without separators
+    // needs no `String`.
+    pub(crate) fn scan_number_fragment(&mut self) -> NumberFragment {
         let mut start = self.scanner_state.pos;
         let mut allow_separator = false;
         let mut is_previous_token_separator = false;
@@ -1162,11 +1232,11 @@ impl Scanner {
                 Vec::new(),
             );
         }
-        if result.is_empty() {
-            return self.text[start as usize..self.scanner_state.pos as usize].to_string();
+        NumberFragment {
+            prefix: result,
+            start,
+            end: self.scanner_state.pos,
         }
-        result.push_str(&self.text[start as usize..self.scanner_state.pos as usize]);
-        result
     }
 
     // Go: scanner/scanner.go:2103 scanDigits
@@ -1324,19 +1394,22 @@ impl Scanner {
             self.scanner_state.pos += 1;
             return SyntaxKind::BigIntLiteral;
         }
+        // PORT: a canonical integer keeps its token value, as Go's
+        // `jsnum` round trip would give the same text.
+        let token_value = self.scanner_state.token_value;
+        if is_canonical_js_integer(token_value) {
+            return SyntaxKind::NumericLiteral;
+        }
         // PORT: Go allocates `numberCache` on first use; the Rust map is
         // always allocated.
-        if let Some(cached) = self.number_cache.get(self.scanner_state.token_value) {
-            self.scanner_state.token_value = intern_token_value(cached);
+        if let Some(&cached) = self.number_cache.get(token_value) {
+            self.scanner_state.token_value = cached;
         } else {
-            let token_value = js_number_string(self.scanner_state.token_value);
             // Go: `if tokenValue == s.tokenValue { tokenValue = s.tokenValue }`
             // only shares the string memory; the value is the same.
-            self.number_cache.insert(
-                self.scanner_state.token_value.to_string(),
-                token_value.clone(),
-            );
-            self.set_token_value(&token_value);
+            let value = intern_token_value(&js_number_string(token_value));
+            self.number_cache.insert(token_value, value);
+            self.scanner_state.token_value = value;
         }
         SyntaxKind::NumericLiteral
     }
@@ -1352,5 +1425,25 @@ impl Scanner {
         );
         self.scanner_state.pos += size;
         self.scanner_state.token = SyntaxKind::Unknown;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_canonical_js_integer, js_number_string};
+
+    #[test]
+    fn canonical_integers_round_trip() {
+        let samples = (0..1_000_000u64)
+            .chain((0..1000u64).map(|i| 999_999_999_999_999 - i * 7_919_007_919))
+            .map(|n| n.to_string())
+            .chain(["00", "01", "1e3", "0x10", "", "1234567890123456"].map(String::from));
+        for text in samples {
+            if is_canonical_js_integer(&text) {
+                assert_eq!(js_number_string(&text), text);
+            }
+        }
+        assert!(!is_canonical_js_integer("01"));
+        assert!(!is_canonical_js_integer("1234567890123456"));
     }
 }

@@ -145,8 +145,19 @@ impl Node {
         if self.0 == 0 { None } else { Some(self) }
     }
 
+    #[inline]
     #[must_use]
     pub fn new(file: usize, node: ts_ast::NodeId) -> Self {
+        // After freeze, a store file resolves every child id in one read.
+        // The synthetic file has no store, so it takes the slow path.
+        if let Some(resolved) = crate::ast::frozen_resolved(file) {
+            return resolved[node.index()];
+        }
+        Self::new_slow(file, node)
+    }
+
+    #[inline(never)]
+    fn new_slow(file: usize, node: ts_ast::NodeId) -> Self {
         // Child ids inside factory-made nodes live in the synthetic id space.
         if file == crate::ast::SYNTHETIC_NODE_FILE {
             return crate::ast::resolve_synthetic_id(node);
@@ -327,7 +338,9 @@ impl PartialEq<Name> for String {
 mod intern {
     use super::Name;
     use rustc_hash::{FxBuildHasher, FxHashMap};
-    use std::cell::RefCell;
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::hash::{BuildHasherDefault, Hasher};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -342,23 +355,51 @@ mod intern {
     static TEXTS: [OnceLock<Slots>; CHUNKS] = [const { OnceLock::new() }; CHUNKS];
     static NEXT: AtomicU32 = AtomicU32::new(1);
 
+    /// Hasher for `u64` keys that already are a `hash_str` hash, so a
+    /// lookup does not hash the text again. The halves swap because the
+    /// shard index uses the top bits, and the map also reads the top bits.
+    #[derive(Default)]
+    struct HashIsKey(u64);
+
+    impl Hasher for HashIsKey {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+
+        fn write(&mut self, _: &[u8]) {
+            unreachable!("HashIsKey takes only u64 keys");
+        }
+
+        fn write_u64(&mut self, hash: u64) {
+            self.0 = hash.rotate_left(32);
+        }
+    }
+
     struct Shard {
-        ids: FxHashMap<&'static str, u32>,
+        /// `(text, id)` by the `hash_str` hash of the text.
+        ids: HashMap<u64, (&'static str, u32), BuildHasherDefault<HashIsKey>>,
+        /// Texts whose hash another text in `ids` already has.
+        collisions: FxHashMap<&'static str, u32>,
         /// Unused tail of the current text block.
         free: &'static mut [u8],
     }
 
-    static SHARD_LOCKS: OnceLock<Box<[Mutex<Shard>]>> = OnceLock::new();
+    static SHARD_LOCKS: OnceLock<[Mutex<Shard>; SHARDS]> = OnceLock::new();
+
+    /// One `CACHE` slot: (hash, id, text). Id 0 marks an empty slot.
+    type CacheSlot = Cell<(u64, u32, &'static str)>;
 
     thread_local! {
-        /// Direct-mapped cache of recent `intern` results: (hash, id).
-        static CACHE: RefCell<Vec<(u64, u32)>> = const { RefCell::new(Vec::new()) };
+        /// Direct-mapped cache of recent `intern` results. It is a const
+        /// array with no destructor, so a hit reads thread-local memory
+        /// directly and needs no lazy init, borrow flag or `text` lookup.
+        static CACHE: [CacheSlot; CACHE_SLOTS] =
+            const { [const { Cell::new((0, 0, "")) }; CACHE_SLOTS] };
     }
 
     /// Fx hash of `s`. Symbol tables use it too.
     #[inline]
     pub(super) fn hash_str(s: &str) -> u64 {
-        use std::hash::Hasher;
         let mut hasher = rustc_hash::FxHasher::default();
         hasher.write(s.as_bytes());
         hasher.finish()
@@ -395,41 +436,41 @@ mod intern {
         let hash = hash_str(s);
         let cache_slot = (hash as usize) & (CACHE_SLOTS - 1);
         let cached = CACHE.with(|cache| {
-            let cache = cache.borrow();
-            let &(h, id) = cache.get(cache_slot)?;
-            (id != 0 && h == hash && text(id) == s).then_some(id)
+            let (h, id, stored) = cache[cache_slot].get();
+            (id != 0 && h == hash && stored == s).then_some(id)
         });
         if let Some(id) = cached {
             return Name(id);
         }
-        let id = intern_shared(s, hash);
-        CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            if cache.is_empty() {
-                cache.resize(CACHE_SLOTS, (0, 0));
-            }
-            cache[cache_slot] = (hash, id);
-        });
+        let (id, stored) = intern_shared(s, hash);
+        CACHE.with(|cache| cache[cache_slot].set((hash, id, stored)));
         Name(id)
     }
 
-    fn intern_shared(s: &str, hash: u64) -> u32 {
+    /// The id and stored text of `s`, from the shared map.
+    fn intern_shared(s: &str, hash: u64) -> (u32, &'static str) {
         let shards = SHARD_LOCKS.get_or_init(|| {
-            (0..SHARDS)
-                .map(|_| {
-                    Mutex::new(Shard {
-                        ids: FxHashMap::with_hasher(FxBuildHasher),
-                        free: Default::default(),
-                    })
+            std::array::from_fn(|_| {
+                Mutex::new(Shard {
+                    ids: HashMap::default(),
+                    collisions: FxHashMap::with_hasher(FxBuildHasher),
+                    free: Default::default(),
                 })
-                .collect()
+            })
         });
         let mut shard = shards[(hash >> 59) as usize % SHARDS]
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(&id) = shard.ids.get(s) {
-            return id;
-        }
+        let hash_taken = match shard.ids.get(&hash) {
+            Some(&(stored, id)) if stored == s => return (id, stored),
+            Some(_) => {
+                if let Some((&stored, &id)) = shard.collisions.get_key_value(s) {
+                    return (id, stored);
+                }
+                true
+            }
+            None => false,
+        };
         if shard.free.len() < s.len() {
             shard.free = Box::leak(vec![0u8; BLOCK.max(s.len())].into_boxed_slice());
         }
@@ -447,8 +488,12 @@ mod intern {
                 .collect()
         });
         let _ = slots[index].set(stored);
-        shard.ids.insert(stored, id);
-        id
+        if hash_taken {
+            shard.collisions.insert(stored, id);
+        } else {
+            shard.ids.insert(hash, (stored, id));
+        }
+        (id, stored)
     }
 }
 
@@ -678,6 +723,28 @@ impl<T: Clone> CowChunks<T> {
         self.len += 1;
     }
 
+    /// Pushes every value in order, like `push` in a loop. Each chunk is
+    /// filled in one step.
+    pub fn extend(&mut self, values: impl IntoIterator<Item = T>) {
+        let mut values = values.into_iter();
+        loop {
+            if self.len & COW_CHUNK_MASK == 0 {
+                // `push` starts the next chunk.
+                let Some(value) = values.next() else { return };
+                self.push(value);
+            }
+            let room = COW_CHUNK_LEN - (self.len & COW_CHUNK_MASK);
+            let tail = self.chunks.last_mut().expect("cow chunk").owned();
+            let before = tail.len();
+            tail.extend(values.by_ref().take(room));
+            let added = tail.len() - before;
+            self.len += added;
+            if added < room {
+                return;
+            }
+        }
+    }
+
     #[inline]
     #[must_use]
     pub fn get(&self, i: usize) -> &T {
@@ -752,6 +819,13 @@ impl Table {
         self.find_by(hash, |e| intern::text(e.name) == name)
     }
 
+    /// The position of name id `id`, whose `table_hash` is `hash`. Equal
+    /// texts intern to one id, so the ids compare.
+    #[inline]
+    fn find_id(&self, hash: u32, id: u32) -> Option<usize> {
+        self.find_by(hash, |e| e.name == id)
+    }
+
     /// The position of the entry with hash `hash` that `is_name` accepts.
     #[inline]
     fn find_by(&self, hash: u32, is_name: impl Fn(&TableEntry) -> bool) -> Option<usize> {
@@ -807,8 +881,7 @@ impl Table {
     /// Go `table[name] = symbol`. A new name goes last, like `IndexMap`.
     fn insert(&mut self, name: &Name, symbol: SymbolId) {
         let hash = table_hash(name);
-        // Equal texts intern to one id, so the ids compare.
-        if let Some(position) = self.find_by(hash, |e| e.name == name.0) {
+        if let Some(position) = self.find_id(hash, name.0) {
             self.entries[position].symbol = symbol;
             return;
         }
@@ -896,12 +969,18 @@ impl SymbolArena {
 
     /// Go `&ast.Symbol{Flags: flags, Name: name}`.
     pub fn new_symbol(&mut self, flags: SymbolFlags, name: impl Into<Name>) -> SymbolId {
-        let id = SymbolId(u32::try_from(self.symbols.len()).expect("symbol overflow"));
-        self.symbols.push(Symbol {
+        self.push_symbol(Symbol {
             flags,
             name: name.into(),
             ..Symbol::default()
-        });
+        })
+    }
+
+    /// Pushes a complete symbol and returns its id. Use it instead of
+    /// `new_symbol` plus `sym_mut` writes when every field is known.
+    pub fn push_symbol(&mut self, symbol: Symbol) -> SymbolId {
+        let id = SymbolId(u32::try_from(self.symbols.len()).expect("symbol overflow"));
+        self.symbols.push(symbol);
         id
     }
 
@@ -942,8 +1021,8 @@ impl SymbolArena {
         self.id_in_name |= id_in_name;
         // Move the entries instead of copying them: the file arena was
         // built on a bind thread, and its buffers stay in use here.
-        for symbol in symbols.into_values().skip(1) {
-            self.symbols.push(Symbol {
+        self.symbols
+            .extend(symbols.into_values().skip(1).map(|symbol| Symbol {
                 name: if id_in_name {
                     offsets.name(&symbol.name)
                 } else {
@@ -954,26 +1033,26 @@ impl SymbolArena {
                 parent: offsets.symbol(symbol.parent),
                 export_symbol: offsets.symbol(symbol.export_symbol),
                 ..symbol
-            });
-        }
-        for mut table in tables.into_values().skip(1) {
-            let mut renamed = false;
-            for entry in &mut table.entries {
-                if id_in_name {
-                    let name = offsets.name(&Name(entry.name));
-                    if name.0 != entry.name {
-                        renamed = true;
-                        entry.name = name.0;
-                        entry.hash = table_hash(&name);
+            }));
+        self.tables
+            .extend(tables.into_values().skip(1).map(|mut table| {
+                let mut renamed = false;
+                for entry in &mut table.entries {
+                    if id_in_name {
+                        let name = offsets.name(&Name(entry.name));
+                        if name.0 != entry.name {
+                            renamed = true;
+                            entry.name = name.0;
+                            entry.hash = table_hash(&name);
+                        }
                     }
+                    entry.symbol = offsets.symbol(entry.symbol);
                 }
-                entry.symbol = offsets.symbol(entry.symbol);
-            }
-            if renamed {
-                table.reindex();
-            }
-            self.tables.push(table);
-        }
+                if renamed {
+                    table.reindex();
+                }
+                table
+            }));
         self.share_since(mark);
         offsets
     }
@@ -987,12 +1066,14 @@ impl SymbolArena {
         self.push_table(cloned)
     }
 
+    #[inline(always)]
     #[must_use]
     pub fn sym(&self, symbol: SymbolId) -> &Symbol {
         debug_assert!(symbol.is_some(), "nil symbol dereference");
         self.symbols.get(symbol.index())
     }
 
+    #[inline]
     pub fn sym_mut(&mut self, symbol: SymbolId) -> &mut Symbol {
         debug_assert!(symbol.is_some(), "nil symbol dereference");
         self.symbols.get_mut(symbol.index())
@@ -1010,6 +1091,22 @@ impl SymbolArena {
         }
         table
             .find(table_hash(name), name)
+            .map_or(SymbolId::NIL, |position| table.entries[position].symbol)
+    }
+
+    /// Go `table[name]` for a caller that has a `Name`. It compares ids
+    /// instead of texts.
+    #[must_use]
+    pub fn get_name(&self, table: SymbolTable, name: &Name) -> SymbolId {
+        if table.is_nil() {
+            return SymbolId::NIL;
+        }
+        let table = self.tables.get(table.index());
+        if table.entries.is_empty() {
+            return SymbolId::NIL;
+        }
+        table
+            .find_id(table_hash(name), name.0)
             .map_or(SymbolId::NIL, |position| table.entries[position].symbol)
     }
 
@@ -1078,6 +1175,9 @@ pub struct ArenaMark {
     tables: usize,
 }
 
+/// Prefix of private identifier symbol names (`<prefix>#<id>@<description>`).
+const PRIVATE_PREFIX: &str = "\u{FFFE}#";
+
 /// How the ids of a file arena moved in `SymbolArena::append_file_arena`.
 #[derive(Clone, Copy, Debug)]
 pub struct ArenaOffsets {
@@ -1108,11 +1208,17 @@ impl ArenaOffsets {
 
     /// `name`, with the symbol id in a private identifier name
     /// (`<prefix>#<id>@<description>`) moved.
+    #[inline]
     fn name(self, name: &Name) -> Name {
-        const PRIVATE_PREFIX: &str = "\u{FFFE}#";
         if self.symbols == 0 || !name.starts_with(PRIVATE_PREFIX) {
             return name.clone();
         }
+        self.private_name(name)
+    }
+
+    /// `name` for a name that starts with `PRIVATE_PREFIX`.
+    #[cold]
+    fn private_name(self, name: &Name) -> Name {
         let rest = &name[PRIVATE_PREFIX.len()..];
         let Some(at) = rest.find('@') else {
             return name.clone();

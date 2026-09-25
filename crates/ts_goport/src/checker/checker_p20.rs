@@ -1135,7 +1135,7 @@ impl Checker {
         if let Some(ctx) = &context {
             for prop in self.get_properties_of_context(ctx) {
                 let name = self.sym(prop).name.clone();
-                if self.symbols.get(members, &name).is_nil() {
+                if self.symbols.get_name(members, &name).is_nil() {
                     let undefined_property = self.get_undefined_property(prop);
                     self.symbols.set(members, name, undefined_property);
                 }

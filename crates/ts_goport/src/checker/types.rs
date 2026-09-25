@@ -608,22 +608,27 @@ pub struct Type {
     pub data: TypeData, // Type specific data
 }
 
+#[cold]
+#[inline(never)]
 fn type_cast_panic(want: &str) -> ! {
     panic!("interface conversion: TypeData is not {want}")
 }
 
 impl Type {
     // Go: checker/types.go:676 Type.Id
+    #[inline]
     pub fn id(&self) -> TypeId {
         self.id
     }
 
     // Go: checker/types.go:680 Type.Flags
+    #[inline]
     pub fn flags(&self) -> TypeFlags {
         self.flags
     }
 
     // Go: checker/types.go:684 Type.ObjectFlags
+    #[inline]
     pub fn object_flags(&self) -> ObjectFlags {
         self.object_flags
     }
@@ -631,12 +636,14 @@ impl Type {
     // Casts for concrete struct types
 
     // Go: checker/types.go:690 Type.AsIntrinsicType
+    #[inline]
     pub fn as_intrinsic_type(&self) -> &IntrinsicType {
         match &self.data {
             TypeData::Intrinsic(d) => d,
             _ => type_cast_panic("IntrinsicType"),
         }
     }
+    #[inline]
     pub fn as_intrinsic_type_mut(&mut self) -> &mut IntrinsicType {
         match &mut self.data {
             TypeData::Intrinsic(d) => d,
@@ -645,12 +652,14 @@ impl Type {
     }
 
     // Go: checker/types.go:691 Type.AsLiteralType
+    #[inline]
     pub fn as_literal_type(&self) -> &LiteralType {
         match &self.data {
             TypeData::Literal(d) => d,
             _ => type_cast_panic("LiteralType"),
         }
     }
+    #[inline]
     pub fn as_literal_type_mut(&mut self) -> &mut LiteralType {
         match &mut self.data {
             TypeData::Literal(d) => d,
@@ -659,12 +668,14 @@ impl Type {
     }
 
     // Go: checker/types.go:692 Type.AsUniqueESSymbolType
+    #[inline]
     pub fn as_unique_es_symbol_type(&self) -> &UniqueESSymbolType {
         match &self.data {
             TypeData::UniqueESSymbol(d) => d,
             _ => type_cast_panic("UniqueESSymbolType"),
         }
     }
+    #[inline]
     pub fn as_unique_es_symbol_type_mut(&mut self) -> &mut UniqueESSymbolType {
         match &mut self.data {
             TypeData::UniqueESSymbol(d) => d,
@@ -673,12 +684,14 @@ impl Type {
     }
 
     // Go: checker/types.go:693 Type.AsTupleType
+    #[inline]
     pub fn as_tuple_type(&self) -> &TupleType {
         match &self.data {
             TypeData::Tuple(d) => d,
             _ => type_cast_panic("TupleType"),
         }
     }
+    #[inline]
     pub fn as_tuple_type_mut(&mut self) -> &mut TupleType {
         match &mut self.data {
             TypeData::Tuple(d) => d,
@@ -687,12 +700,14 @@ impl Type {
     }
 
     // Go: checker/types.go:694 Type.AsInstantiationExpressionType
+    #[inline]
     pub fn as_instantiation_expression_type(&self) -> &InstantiationExpressionType {
         match &self.data {
             TypeData::InstantiationExpression(d) => d,
             _ => type_cast_panic("InstantiationExpressionType"),
         }
     }
+    #[inline]
     pub fn as_instantiation_expression_type_mut(&mut self) -> &mut InstantiationExpressionType {
         match &mut self.data {
             TypeData::InstantiationExpression(d) => d,
@@ -701,12 +716,14 @@ impl Type {
     }
 
     // Go: checker/types.go:697 Type.AsMappedType
+    #[inline]
     pub fn as_mapped_type(&self) -> &MappedType {
         match &self.data {
             TypeData::Mapped(d) => d,
             _ => type_cast_panic("MappedType"),
         }
     }
+    #[inline]
     pub fn as_mapped_type_mut(&mut self) -> &mut MappedType {
         match &mut self.data {
             TypeData::Mapped(d) => d,
@@ -715,12 +732,14 @@ impl Type {
     }
 
     // Go: checker/types.go:698 Type.AsReverseMappedType
+    #[inline]
     pub fn as_reverse_mapped_type(&self) -> &ReverseMappedType {
         match &self.data {
             TypeData::ReverseMapped(d) => d,
             _ => type_cast_panic("ReverseMappedType"),
         }
     }
+    #[inline]
     pub fn as_reverse_mapped_type_mut(&mut self) -> &mut ReverseMappedType {
         match &mut self.data {
             TypeData::ReverseMapped(d) => d,
@@ -729,12 +748,14 @@ impl Type {
     }
 
     // Go: checker/types.go:699 Type.AsEvolvingArrayType
+    #[inline]
     pub fn as_evolving_array_type(&self) -> &EvolvingArrayType {
         match &self.data {
             TypeData::EvolvingArray(d) => d,
             _ => type_cast_panic("EvolvingArrayType"),
         }
     }
+    #[inline]
     pub fn as_evolving_array_type_mut(&mut self) -> &mut EvolvingArrayType {
         match &mut self.data {
             TypeData::EvolvingArray(d) => d,
@@ -743,12 +764,14 @@ impl Type {
     }
 
     // Go: checker/types.go:700 Type.AsTypeParameter
+    #[inline]
     pub fn as_type_parameter(&self) -> &TypeParameter {
         match &self.data {
             TypeData::TypeParameter(d) => d,
             _ => type_cast_panic("TypeParameter"),
         }
     }
+    #[inline]
     pub fn as_type_parameter_mut(&mut self) -> &mut TypeParameter {
         match &mut self.data {
             TypeData::TypeParameter(d) => d,
@@ -757,12 +780,14 @@ impl Type {
     }
 
     // Go: checker/types.go:701 Type.AsUnionType
+    #[inline]
     pub fn as_union_type(&self) -> &UnionType {
         match &self.data {
             TypeData::Union(d) => d,
             _ => type_cast_panic("UnionType"),
         }
     }
+    #[inline]
     pub fn as_union_type_mut(&mut self) -> &mut UnionType {
         match &mut self.data {
             TypeData::Union(d) => d,
@@ -771,12 +796,14 @@ impl Type {
     }
 
     // Go: checker/types.go:702 Type.AsIntersectionType
+    #[inline]
     pub fn as_intersection_type(&self) -> &IntersectionType {
         match &self.data {
             TypeData::Intersection(d) => d,
             _ => type_cast_panic("IntersectionType"),
         }
     }
+    #[inline]
     pub fn as_intersection_type_mut(&mut self) -> &mut IntersectionType {
         match &mut self.data {
             TypeData::Intersection(d) => d,
@@ -785,12 +812,14 @@ impl Type {
     }
 
     // Go: checker/types.go:703 Type.AsIndexType
+    #[inline]
     pub fn as_index_type(&self) -> &IndexType {
         match &self.data {
             TypeData::Index(d) => d,
             _ => type_cast_panic("IndexType"),
         }
     }
+    #[inline]
     pub fn as_index_type_mut(&mut self) -> &mut IndexType {
         match &mut self.data {
             TypeData::Index(d) => d,
@@ -799,12 +828,14 @@ impl Type {
     }
 
     // Go: checker/types.go:704 Type.AsIndexedAccessType
+    #[inline]
     pub fn as_indexed_access_type(&self) -> &IndexedAccessType {
         match &self.data {
             TypeData::IndexedAccess(d) => d,
             _ => type_cast_panic("IndexedAccessType"),
         }
     }
+    #[inline]
     pub fn as_indexed_access_type_mut(&mut self) -> &mut IndexedAccessType {
         match &mut self.data {
             TypeData::IndexedAccess(d) => d,
@@ -813,12 +844,14 @@ impl Type {
     }
 
     // Go: checker/types.go:705 Type.AsTemplateLiteralType
+    #[inline]
     pub fn as_template_literal_type(&self) -> &TemplateLiteralType {
         match &self.data {
             TypeData::TemplateLiteral(d) => d,
             _ => type_cast_panic("TemplateLiteralType"),
         }
     }
+    #[inline]
     pub fn as_template_literal_type_mut(&mut self) -> &mut TemplateLiteralType {
         match &mut self.data {
             TypeData::TemplateLiteral(d) => d,
@@ -827,12 +860,14 @@ impl Type {
     }
 
     // Go: checker/types.go:706 Type.AsStringMappingType
+    #[inline]
     pub fn as_string_mapping_type(&self) -> &StringMappingType {
         match &self.data {
             TypeData::StringMapping(d) => d,
             _ => type_cast_panic("StringMappingType"),
         }
     }
+    #[inline]
     pub fn as_string_mapping_type_mut(&mut self) -> &mut StringMappingType {
         match &mut self.data {
             TypeData::StringMapping(d) => d,
@@ -841,12 +876,14 @@ impl Type {
     }
 
     // Go: checker/types.go:707 Type.AsSubstitutionType
+    #[inline]
     pub fn as_substitution_type(&self) -> &SubstitutionType {
         match &self.data {
             TypeData::Substitution(d) => d,
             _ => type_cast_panic("SubstitutionType"),
         }
     }
+    #[inline]
     pub fn as_substitution_type_mut(&mut self) -> &mut SubstitutionType {
         match &mut self.data {
             TypeData::Substitution(d) => d,
@@ -855,12 +892,14 @@ impl Type {
     }
 
     // Go: checker/types.go:708 Type.AsConditionalType
+    #[inline]
     pub fn as_conditional_type(&self) -> &ConditionalType {
         match &self.data {
             TypeData::Conditional(d) => d,
             _ => type_cast_panic("ConditionalType"),
         }
     }
+    #[inline]
     pub fn as_conditional_type_mut(&mut self) -> &mut ConditionalType {
         match &mut self.data {
             TypeData::Conditional(d) => d,
@@ -874,11 +913,13 @@ impl Type {
     // Use `self.data.as_x()` (returns `Option`) for Go nil checks.
 
     // Go: checker/types.go:712 Type.AsConstrainedType
+    #[inline]
     pub fn as_constrained_type(&self) -> &ConstrainedType {
         self.data
             .as_constrained_type()
             .unwrap_or_else(|| type_cast_panic("ConstrainedType"))
     }
+    #[inline]
     pub fn as_constrained_type_mut(&mut self) -> &mut ConstrainedType {
         self.data
             .as_constrained_type_mut()
@@ -886,11 +927,13 @@ impl Type {
     }
 
     // Go: checker/types.go:713 Type.AsStructuredType
+    #[inline]
     pub fn as_structured_type(&self) -> &StructuredType {
         self.data
             .as_structured_type()
             .unwrap_or_else(|| type_cast_panic("StructuredType"))
     }
+    #[inline]
     pub fn as_structured_type_mut(&mut self) -> &mut StructuredType {
         self.data
             .as_structured_type_mut()
@@ -898,11 +941,13 @@ impl Type {
     }
 
     // Go: checker/types.go:714 Type.AsObjectType
+    #[inline]
     pub fn as_object_type(&self) -> &ObjectType {
         self.data
             .as_object_type()
             .unwrap_or_else(|| type_cast_panic("ObjectType"))
     }
+    #[inline]
     pub fn as_object_type_mut(&mut self) -> &mut ObjectType {
         self.data
             .as_object_type_mut()
@@ -910,11 +955,13 @@ impl Type {
     }
 
     // Go: checker/types.go:715 Type.AsTypeReference
+    #[inline(always)]
     pub fn as_type_reference(&self) -> &TypeReference {
         self.data
             .as_type_reference()
             .unwrap_or_else(|| type_cast_panic("TypeReference"))
     }
+    #[inline]
     pub fn as_type_reference_mut(&mut self) -> &mut TypeReference {
         self.data
             .as_type_reference_mut()
@@ -922,11 +969,13 @@ impl Type {
     }
 
     // Go: checker/types.go:716 Type.AsInterfaceType
+    #[inline]
     pub fn as_interface_type(&self) -> &InterfaceType {
         self.data
             .as_interface_type()
             .unwrap_or_else(|| type_cast_panic("InterfaceType"))
     }
+    #[inline]
     pub fn as_interface_type_mut(&mut self) -> &mut InterfaceType {
         self.data
             .as_interface_type_mut()
@@ -934,11 +983,13 @@ impl Type {
     }
 
     // Go: checker/types.go:717 Type.AsUnionOrIntersectionType
+    #[inline]
     pub fn as_union_or_intersection_type(&self) -> &UnionOrIntersectionType {
         self.data
             .as_union_or_intersection_type()
             .unwrap_or_else(|| type_cast_panic("UnionOrIntersectionType"))
     }
+    #[inline]
     pub fn as_union_or_intersection_type_mut(&mut self) -> &mut UnionOrIntersectionType {
         self.data
             .as_union_or_intersection_type_mut()
@@ -960,6 +1011,7 @@ impl Type {
     // Common accessors
 
     // Go: checker/types.go:733 Type.Target
+    #[inline]
     pub fn target(&self) -> TypeId {
         if self.flags.intersects(TypeFlags::OBJECT) {
             return self.as_object_type().target;
@@ -979,6 +1031,7 @@ impl Type {
     }
 
     // Go: checker/types.go:749 Type.Mapper
+    #[inline]
     pub fn mapper(&self) -> MapperId {
         if self.flags.intersects(TypeFlags::OBJECT) {
             return self.as_object_type().mapper;
@@ -991,6 +1044,7 @@ impl Type {
     }
 
     // Go: checker/types.go:761 Type.Types
+    #[inline(always)]
     pub fn types(&self) -> &[TypeId] {
         if self.flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
             return &self.as_union_or_intersection_type().types;
@@ -1149,6 +1203,7 @@ impl Default for TypeData {
 
 impl TypeData {
     // Go: checker/types.go:858 TypeBase.AsConstrainedType
+    #[inline]
     pub fn as_constrained_type(&self) -> Option<&ConstrainedType> {
         match self {
             TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueESSymbol(_) => None,
@@ -1163,6 +1218,7 @@ impl TypeData {
         }
     }
 
+    #[inline]
     pub fn as_constrained_type_mut(&mut self) -> Option<&mut ConstrainedType> {
         match self {
             TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueESSymbol(_) => None,
@@ -1187,6 +1243,7 @@ impl TypeData {
     }
 
     // Go: checker/types.go:859 TypeBase.AsStructuredType
+    #[inline]
     pub fn as_structured_type(&self) -> Option<&StructuredType> {
         match self {
             TypeData::Union(d) => Some(&d.union_or_intersection.structured),
@@ -1195,6 +1252,7 @@ impl TypeData {
         }
     }
 
+    #[inline]
     pub fn as_structured_type_mut(&mut self) -> Option<&mut StructuredType> {
         match self {
             TypeData::Union(d) => Some(&mut d.union_or_intersection.structured),
@@ -1212,6 +1270,7 @@ impl TypeData {
     }
 
     // Go: checker/types.go:860 TypeBase.AsObjectType
+    #[inline]
     pub fn as_object_type(&self) -> Option<&ObjectType> {
         match self {
             TypeData::Object(d) => Some(d),
@@ -1223,6 +1282,7 @@ impl TypeData {
         }
     }
 
+    #[inline]
     pub fn as_object_type_mut(&mut self) -> Option<&mut ObjectType> {
         match self {
             TypeData::Object(d) => Some(d),
@@ -1238,6 +1298,7 @@ impl TypeData {
     }
 
     // Go: checker/types.go:861 TypeBase.AsTypeReference
+    #[inline]
     pub fn as_type_reference(&self) -> Option<&TypeReference> {
         match self {
             TypeData::TypeReference(d) => Some(d),
@@ -1245,6 +1306,7 @@ impl TypeData {
         }
     }
 
+    #[inline]
     pub fn as_type_reference_mut(&mut self) -> Option<&mut TypeReference> {
         match self {
             TypeData::TypeReference(d) => Some(d),
@@ -1255,6 +1317,7 @@ impl TypeData {
     }
 
     // Go: checker/types.go:862 TypeBase.AsInterfaceType
+    #[inline]
     pub fn as_interface_type(&self) -> Option<&InterfaceType> {
         match self {
             TypeData::Interface(d) => Some(d),
@@ -1263,6 +1326,7 @@ impl TypeData {
         }
     }
 
+    #[inline]
     pub fn as_interface_type_mut(&mut self) -> Option<&mut InterfaceType> {
         match self {
             TypeData::Interface(d) => Some(d),
@@ -1272,6 +1336,7 @@ impl TypeData {
     }
 
     // Go: checker/types.go:863 TypeBase.AsUnionOrIntersectionType
+    #[inline]
     pub fn as_union_or_intersection_type(&self) -> Option<&UnionOrIntersectionType> {
         match self {
             TypeData::Union(d) => Some(&d.union_or_intersection),
@@ -1280,6 +1345,7 @@ impl TypeData {
         }
     }
 
+    #[inline]
     pub fn as_union_or_intersection_type_mut(&mut self) -> Option<&mut UnionOrIntersectionType> {
         match self {
             TypeData::Union(d) => Some(&mut d.union_or_intersection),

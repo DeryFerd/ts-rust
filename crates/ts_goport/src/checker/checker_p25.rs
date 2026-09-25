@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use smallvec::SmallVec;
 
 // PORT: cross-file decisions for this range.
 // - Go `*TypeAlias` parameters and returns that store or create an alias are
@@ -30,26 +31,24 @@ impl Checker {
             let t_symbol = self.ty(t).symbol;
             declaration = self.sym(t_symbol).declarations[0];
         }
+        // PORT: both link fields are read with one lookup. The type parameter
+        // list is a `SharedList`, so the clone copies no elements.
+        let links = self.type_node_links.get(declaration);
+        let resolved_type = links.resolved_type;
+        let mut outer_type_parameters = links.outer_type_parameters.clone();
         if t_object_flags.intersects(ObjectFlags::REFERENCE) {
             // Deferred type reference
-            target = self.type_node_links.get(declaration).resolved_type;
+            target = resolved_type;
         } else if t_object_flags.intersects(ObjectFlags::INSTANTIATED) {
             target = self.ty(t).target();
         } else {
             target = t;
         }
-        // PORT: the stored list never changes once it is non-empty, so it is
-        // read in place (by index) instead of copied on every call.
-        let mut type_parameter_count = self
-            .type_node_links
-            .get(declaration)
-            .outer_type_parameters
-            .len();
         // PORT: Go tells a nil `outerTypeParameters` (not computed) from an
         // empty one (computed, none in scope). `TypeNodeLinks` stores a
         // `SharedList`, so an empty list is computed again. The computation
         // only reads cached checker state, so the result is the same.
-        if type_parameter_count == 0 {
+        if outer_type_parameters.is_empty() {
             // The first time an anonymous type is instantiated we compute and store a list of the type
             // parameters that are in scope (and therefore potentially referenced). For type literals that
             // aren't the right hand side of a generic type alias declaration we optimize by reducing the
@@ -84,10 +83,11 @@ impl Checker {
                     }
                 }
             }
-            type_parameter_count = type_parameters.len();
-            self.type_node_links.get(declaration).outer_type_parameters = type_parameters.into();
+            outer_type_parameters = type_parameters.into();
+            self.type_node_links.get(declaration).outer_type_parameters =
+                outer_type_parameters.clone();
         }
-        if type_parameter_count == 0 {
+        if outer_type_parameters.is_empty() {
             return t;
         }
         // We are instantiating an anonymous type that has one or more type parameters in scope. Apply the
@@ -97,10 +97,12 @@ impl Checker {
         // composite mapper is used only here, so its `Map` is inlined instead
         // of adding a mapper to the arena on every call. Mapper ids never
         // affect output.
+        // PORT: the type arguments stay on the stack, because a cache hit only
+        // hashes them.
         let t_mapper = self.ty(t).mapper();
-        let mut type_arguments: Vec<TypeId> = Vec::with_capacity(type_parameter_count);
-        for i in 0..type_parameter_count {
-            let tp = self.type_node_links.get(declaration).outer_type_parameters[i];
+        let mut type_arguments: SmallVec<[TypeId; 8]> =
+            SmallVec::with_capacity(outer_type_parameters.len());
+        for &tp in outer_type_parameters.iter() {
             type_arguments.push(self.map_with_combined_mappers(t_mapper, m, tp));
         }
         // PORT: Go `c.instantiateTypeAlias(t.alias, m)` when `alias` is nil.
@@ -126,7 +128,7 @@ impl Checker {
             instantiations.insert(
                 get_type_instantiation_key(
                     &self.symbols,
-                    &self.type_node_links.get(declaration).outer_type_parameters,
+                    &outer_type_parameters,
                     target_alias.as_deref(),
                     false,
                 ),
@@ -143,14 +145,9 @@ impl Checker {
             .unwrap_or_default();
         if result.is_nil() {
             let new_alias = alias.or_else(|| instantiated_alias.map(Rc::new));
-            let type_parameters = self
-                .type_node_links
-                .get(declaration)
-                .outer_type_parameters
-                .clone();
-            let type_arguments = SharedList::from(type_arguments);
+            let type_arguments = SharedList::from(&type_arguments[..]);
             let mut new_mapper =
-                self.new_type_mapper_shared(type_parameters, type_arguments.clone());
+                self.new_type_mapper_shared(outer_type_parameters, type_arguments.clone());
             let target_object_flags = self.ty(target).object_flags;
             if target_object_flags.intersects(ObjectFlags::SINGLE_SIGNATURE_TYPE) && m.is_some() {
                 new_mapper = self.combine_type_mappers(new_mapper, m);
@@ -391,7 +388,10 @@ impl Checker {
             // We are instantiating a conditional type that has one or more type parameters in scope. Apply the
             // mapper to the type parameters to produce the effective list of type arguments, and compute the
             // instantiation cache key from the type IDs of the type arguments.
-            let mut type_arguments: Vec<TypeId> = Vec::with_capacity(outer_type_parameter_count);
+            // PORT: the type arguments stay on the stack, because a cache hit
+            // only hashes them.
+            let mut type_arguments: SmallVec<[TypeId; 8]> =
+                SmallVec::with_capacity(outer_type_parameter_count);
             for i in 0..outer_type_parameter_count {
                 let tp = root.borrow().outer_type_parameters[i];
                 type_arguments.push(self.map_with_combined_mappers(m1, m2, tp));

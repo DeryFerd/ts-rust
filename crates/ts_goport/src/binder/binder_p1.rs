@@ -64,6 +64,9 @@ pub struct Binder {
 
     /// Rust-only: `Node::file_index` of `file`.
     pub file_index: usize,
+    /// Rust-only: parser flags of `file` (`GoFile::parser_flags`), indexed
+    /// by `NodeId::index()`. Cached so `node_flags` skips the program lookup.
+    pub parser_flags: &'static [NodeFlags],
     /// Rust-only: binder data per node of `file`, indexed by `NodeId::index()`.
     pub node_bind: NodeBindBuilder,
     /// Rust-only: binder fields of `ast.SourceFile` (`BindDiagnostics`,
@@ -216,6 +219,7 @@ pub fn bind_source_file_detached(file: Node, symbols: &mut SymbolArena) -> Bound
     let mut b = Binder {
         file,
         file_index,
+        parser_flags: &go_file.parser_flags,
         symbols: std::mem::take(symbols),
         node_bind: NodeBindBuilder::new(node_count),
         ..Binder::default()
@@ -354,9 +358,11 @@ impl Binder {
     }
 
     /// Go `node.Flags` while binding: parser flags plus binder-added flags.
+    #[inline]
     pub fn node_flags(&self, node: Node) -> NodeFlags {
-        let parser = prog().files[self.file_index].parser_flags[node.node_id().index()];
-        parser | self.node_data(node).added_flags
+        debug_assert_eq!(node.file_index(), self.file_index, "node from another file");
+        let index = node.node_id().index();
+        self.parser_flags[index] | self.node_bind.get(index).added_flags
     }
 
     /// Go `node.Flags |= flags`.
@@ -492,7 +498,7 @@ impl Binder {
             // Otherwise, we'll be merging into a compatible existing symbol (for example when
             // you have multiple 'vars' with the same name in the same container).  In this case
             // just add this node into the declarations list of the symbol.
-            symbol = self.symbols.get(symbol_table, &name);
+            symbol = self.symbols.get_name(symbol_table, &name);
             if includes.intersects(SymbolFlags::CLASSIFIABLE) {
                 self.classifiable_names.insert(name.clone());
             }
@@ -1220,14 +1226,16 @@ impl Binder {
         //
         // However, not all symbols will end up in any of these tables. 'Anonymous' symbols
         // (like TypeLiterals for example) will not be put in any table.
-        match node.kind() {
+        // PORT: the kind is read once. The binder never changes a node's kind.
+        let kind = node.kind();
+        match kind {
             SyntaxKind::Identifier => {
                 let flow = self.current_flow;
                 self.node_bind.set_flow_node(node.node_id().index(), flow);
                 self.check_contextual_identifier(node);
             }
             SyntaxKind::ThisKeyword | SyntaxKind::SuperKeyword => {
-                if node.kind() == SyntaxKind::ThisKeyword {
+                if kind == SyntaxKind::ThisKeyword {
                     self.seen_this_keyword = true;
                 }
                 let flow = self.current_flow;
@@ -1326,7 +1334,10 @@ impl Binder {
                 );
             }
             SyntaxKind::MethodDeclaration | SyntaxKind::MethodSignature => {
-                let excludes = if is_object_literal_method(node) {
+                // Go `ast.IsObjectLiteralMethod(node)` with the kind known.
+                let excludes = if kind == SyntaxKind::MethodDeclaration
+                    && node.parent().kind() == SyntaxKind::ObjectLiteralExpression
+                {
                     SymbolFlags::VALUE
                 } else {
                     SymbolFlags::METHOD_EXCLUDES
@@ -1473,12 +1484,12 @@ impl Binder {
         let mut this_node_or_any_subnodes_has_error = self
             .node_flags(node)
             .intersects(NodeFlags::THIS_NODE_HAS_ERROR);
-        if (node.kind() as u16) > (SyntaxKind::LAST_TOKEN as u16) {
+        if (kind as u16) > (SyntaxKind::LAST_TOKEN as u16) {
             let save_seen_parse_error = self.seen_parse_error;
             self.seen_parse_error = false;
-            let container_flags = get_container_flags(node);
+            let container_flags = get_container_flags_of_kind(node, kind);
             if container_flags == ContainerFlags::NONE {
-                self.bind_children(node);
+                self.bind_children_of_kind(node, kind);
             } else {
                 self.bind_container(node, container_flags);
             }
