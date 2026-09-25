@@ -150,6 +150,26 @@ pub(crate) fn rune_to_string(r: i32) -> String {
     rune_to_char(r).to_string()
 }
 
+/// The index of the first `needle` in `haystack`, eight bytes at a time.
+fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
+    const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+    const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
+    let pattern = ONES * u64::from(needle);
+    let mut chunks = haystack.chunks_exact(8);
+    let mut offset = 0;
+    for chunk in &mut chunks {
+        let word = u64::from_ne_bytes(chunk.try_into().expect("an 8-byte chunk")) ^ pattern;
+        if word.wrapping_sub(ONES) & !word & HIGHS != 0 {
+            break;
+        }
+        offset += 8;
+    }
+    haystack[offset..]
+        .iter()
+        .position(|&b| b == needle)
+        .map(|i| offset + i)
+}
+
 /// Interns a token value as `&'static str`.
 // PORT: Go `ScannerState` holds `tokenValue string`, and Go strings are
 // shared immutable values, so `Mark`/`Rewind` copy it for free. The contract
@@ -512,6 +532,18 @@ impl Scanner {
         self.scanner_state.token_value
     }
 
+    /// Go `s.text[start:end]` as a token value. A slice of `'static` source
+    /// text needs no interning: like a Go substring, it shares the text.
+    pub(crate) fn text_token_value(&self, start: usize, end: usize) -> &'static str {
+        match &self.text {
+            Cow::Borrowed(text) => {
+                let text: &'static str = *text;
+                &text[start..end]
+            }
+            Cow::Owned(text) => intern_token_value(&text[start..end]),
+        }
+    }
+
     /// Go `s.tokenValue = value`.
     // PORT: interns the value; see `intern_token_value`.
     pub(crate) fn set_token_value(&mut self, value: &str) {
@@ -772,6 +804,31 @@ impl Scanner {
     // scanASCIIWhile advances s.pos over the longest run of ASCII bytes for which
     // pred returns true. It stops at end-of-text, the first non-ASCII byte, or the
     // first byte where pred is false.
+    /// The position of the first `*/` at or after `pos`, and the position
+    /// after the last line break before it, when the text up to it is
+    /// ASCII. `None` sends the multi-line comment scan to its byte loop.
+    fn ascii_comment_end(&self) -> Option<(i32, Option<i32>)> {
+        let start = self.scanner_state.pos as usize;
+        let bytes = &self.text.as_bytes()[start..self.end as usize];
+        let mut from = 0;
+        let close = loop {
+            let star = from + find_byte(&bytes[from..], b'*')?;
+            if bytes.get(star + 1) == Some(&b'/') {
+                break star;
+            }
+            from = star + 1;
+        };
+        let body = &bytes[..close];
+        if !body.is_ascii() {
+            return None;
+        }
+        let line_start = body
+            .iter()
+            .rposition(|&b| b == b'\n' || b == b'\r')
+            .map(|i| (start + i + 1) as i32);
+        Some(((start + close) as i32, line_start))
+    }
+
     pub(crate) fn scan_ascii_while(&mut self, pred: impl Fn(u8) -> bool) {
         let text = &self.text.as_bytes()[self.scanner_state.pos as usize..self.end as usize];
         let mut i = 0usize;
@@ -1010,7 +1067,18 @@ impl Scanner {
 
                             let mut comment_closed = false;
                             let mut last_line_start = self.scanner_state.token_start;
-                            loop {
+                            // PORT: fast path for an ASCII comment; the loop
+                            // below gives the same result byte by byte.
+                            if let Some((close, line_start)) = self.ascii_comment_end() {
+                                if let Some(line_start) = line_start {
+                                    last_line_start = line_start;
+                                    self.scanner_state.token_flags |=
+                                        TokenFlags::PRECEDING_LINE_BREAK;
+                                }
+                                self.scanner_state.pos = close + 2;
+                                comment_closed = true;
+                            }
+                            while !comment_closed {
                                 self.scan_ascii_while(|b| b != b'*' && b != b'\n' && b != b'\r');
                                 let (ch1, size) = self.char_and_size();
                                 if size == 0 {
@@ -1730,9 +1798,9 @@ impl Scanner {
             }
 
             self.scanner_state.pos = p;
-            let value = intern_token_value(
-                &self.text
-                    [self.scanner_state.token_start as usize..self.scanner_state.pos as usize],
+            let value = self.text_token_value(
+                self.scanner_state.token_start as usize,
+                self.scanner_state.pos as usize,
             );
             self.scanner_state.token_value = value;
             self.scanner_state.token = SyntaxKind::RegularExpressionLiteral;

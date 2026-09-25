@@ -701,8 +701,12 @@ impl Checker {
                 .expanding_flags
                 .intersects(ExpandingFlags::SOURCE)
             {
-                let source_stack = r.borrow().source_stack.clone();
-                if self.is_deeply_nested_type(source, &source_stack, 3) {
+                // PORT: moved out while read instead of cloned; nothing
+                // reached from isDeeplyNestedType can use `r`.
+                let source_stack = std::mem::take(&mut r.borrow_mut().source_stack);
+                let nested = self.is_deeply_nested_type(source, &source_stack, 3);
+                r.borrow_mut().source_stack = source_stack;
+                if nested {
                     r.borrow_mut().expanding_flags |= ExpandingFlags::SOURCE;
                 }
             }
@@ -714,8 +718,12 @@ impl Checker {
                 .expanding_flags
                 .intersects(ExpandingFlags::TARGET)
             {
-                let target_stack = r.borrow().target_stack.clone();
-                if self.is_deeply_nested_type(target, &target_stack, 3) {
+                // PORT: moved out while read instead of cloned; nothing
+                // reached from isDeeplyNestedType can use `r`.
+                let target_stack = std::mem::take(&mut r.borrow_mut().target_stack);
+                let nested = self.is_deeply_nested_type(target, &target_stack, 3);
+                r.borrow_mut().target_stack = target_stack;
+                if nested {
                     r.borrow_mut().expanding_flags |= ExpandingFlags::TARGET;
                 }
             }
@@ -1502,8 +1510,10 @@ impl Checker {
         } else if target_flags.intersects(TypeFlags::CONDITIONAL) {
             // If we reach 10 levels of nesting for the same conditional type, assume it is an infinitely expanding recursive
             // conditional type and bail out with a Ternary.Maybe result.
-            let target_stack = r.borrow().target_stack.clone();
-            if self.is_deeply_nested_type(target, &target_stack, 10) {
+            let target_stack = std::mem::take(&mut r.borrow_mut().target_stack);
+            let nested = self.is_deeply_nested_type(target, &target_stack, 10);
+            r.borrow_mut().target_stack = target_stack;
+            if nested {
                 return Ternary::MAYBE;
             }
             let (c_root, c_check_type, c_extends_type) = {
@@ -1856,8 +1866,10 @@ impl Checker {
         } else if source_flags.intersects(TypeFlags::CONDITIONAL) {
             // If we reach 10 levels of nesting for the same conditional type, assume it is an infinitely expanding recursive
             // conditional type and bail out with a Ternary.Maybe result.
-            let source_stack = r.borrow().source_stack.clone();
-            if self.is_deeply_nested_type(source, &source_stack, 10) {
+            let source_stack = std::mem::take(&mut r.borrow_mut().source_stack);
+            let nested = self.is_deeply_nested_type(source, &source_stack, 10);
+            r.borrow_mut().source_stack = source_stack;
+            if nested {
                 return Ternary::MAYBE;
             }
             if target_flags.intersects(TypeFlags::CONDITIONAL) {

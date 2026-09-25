@@ -663,7 +663,7 @@ impl Checker {
         }
         let key = CachedTypeKey {
             kind: CachedTypeKind::APPARENT_TYPE,
-            type_id: self.ty(this_argument).id,
+            type_id: this_argument,
         };
         let mut result = self.cached_types.get(&key).copied().unwrap_or_default();
         if result.is_nil() {
@@ -1163,23 +1163,38 @@ impl Checker {
                 .flags
                 .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE);
         if is_class_or_interface_container {
+            // PORT: Go runs isNamedMember and isDeclarationContainedBy again
+            // in the second pass. Both results are cached here from the first
+            // pass, and the container ranges are read once.
+            let container_locs: Vec<TextRange> = self
+                .sym(container)
+                .declarations
+                .iter()
+                .map(|d| d.loc())
+                .collect();
+            let mut others: Vec<SymbolId> = Vec::new();
             for &(reserved, symbol) in &entries {
-                if !reserved
-                    && self.symbol_is_value(symbol)
-                    && self.is_declaration_contained_by(symbol, container)
-                {
+                if reserved || !self.symbol_is_value(symbol) {
+                    continue;
+                }
+                let declaration = self.sym(symbol).value_declaration;
+                let contained = declaration.is_some() && {
+                    let loc = declaration.loc();
+                    container_locs.iter().any(|&l| loc.contained_by(l))
+                };
+                if contained {
                     result.push(symbol);
+                } else {
+                    others.push(symbol);
                 }
             }
             contained_count = result.len();
-        }
-        for &(reserved, symbol) in &entries {
-            if !reserved
-                && self.symbol_is_value(symbol)
-                && (!is_class_or_interface_container
-                    || !self.is_declaration_contained_by(symbol, container))
-            {
-                result.push(symbol);
+            result.extend_from_slice(&others);
+        } else {
+            for &(reserved, symbol) in &entries {
+                if !reserved && self.symbol_is_value(symbol) {
+                    result.push(symbol);
+                }
             }
         }
         self.sort_symbols(&mut result[..contained_count]);
@@ -1282,7 +1297,7 @@ impl Checker {
         let cache_index = if index != -1 {
             index as usize
         } else {
-            self.active_type_mappers_caches.len() - 1
+            self.active_mappers.len() - 1
         };
         if let Some(&cached_type) = self.active_type_mappers_caches[cache_index].get(&key) {
             return cached_type;
@@ -1301,18 +1316,29 @@ impl Checker {
     }
 
     // Go: checker/checker.go:22045 pushActiveMapper
+    // PORT: like Go, cleared maps stay in `active_type_mappers_caches` past
+    // the active length for reuse. The active length is
+    // `active_mappers.len()`; maps past it are always empty.
     pub fn push_active_mapper(&mut self, mapper: MapperId) {
+        let last_index = self.active_mappers.len();
         self.active_mappers.push(mapper);
-        // PORT: Go keeps cleared maps in the slice capacity for reuse. A
-        // fresh empty map behaves the same.
-        self.active_type_mappers_caches.push(FxHashMap::default());
+        if last_index >= self.active_type_mappers_caches.len() {
+            self.active_type_mappers_caches.push(FxHashMap::default());
+        }
     }
 
     // Go: checker/checker.go:22060 popActiveMapper
     pub fn pop_active_mapper(&mut self) {
         self.active_mappers.pop();
         // Clear the map, but leave it in the list for later reuse.
-        self.active_type_mappers_caches.pop();
+        let cache = &mut self.active_type_mappers_caches[self.active_mappers.len()];
+        // PORT: clearing costs time in the map capacity, so a mostly empty
+        // large map is dropped instead.
+        if cache.capacity() > 256 && cache.len() < cache.capacity() / 8 {
+            *cache = FxHashMap::default();
+        } else if !cache.is_empty() {
+            cache.clear();
+        }
     }
 
     // Go: checker/checker.go:22070 findActiveMapper
@@ -1326,7 +1352,9 @@ impl Checker {
     // Go: checker/checker.go:22074 clearActiveMapperCaches
     pub fn clear_active_mapper_caches(&mut self) {
         for cache in self.active_type_mappers_caches.iter_mut() {
-            cache.clear();
+            if !cache.is_empty() {
+                cache.clear();
+            }
         }
     }
 
@@ -1443,12 +1471,15 @@ impl Checker {
                         .as_type_reference()
                         .resolved_type_arguments
                         .clone();
-                    let new_type_arguments = self.instantiate_types(&resolved_type_arguments, m);
-                    // PORT: Go `core.Same` on the `instantiateTypes` result is
-                    // element-wise equality here.
-                    if new_type_arguments == resolved_type_arguments {
+                    // PORT: Go `core.Same` on the `instantiateTypes` result
+                    // is "no element changed" (`None`) here.
+                    let Some(new_type_arguments) = self.instantiate_list_if_changed(
+                        &resolved_type_arguments,
+                        m,
+                        Checker::instantiate_type,
+                    ) else {
                         return t;
-                    }
+                    };
                     let target = self.ty(t).target();
                     return self.create_normalized_type_reference(target, &new_type_arguments);
                 }
@@ -1472,10 +1503,11 @@ impl Checker {
                 }
             }
             let types = self.ty(source).types().to_vec();
-            let new_types = self.instantiate_types(&types, m);
-            if new_types == types && alias.symbol() == self.ty(t).alias.symbol() {
+            let changed = self.instantiate_list_if_changed(&types, m, Checker::instantiate_type);
+            if changed.is_none() && alias.symbol() == self.ty(t).alias.symbol() {
                 return t;
             }
+            let new_types = changed.unwrap_or(types);
             if alias.is_none() {
                 let t_alias = self.ty(t).alias.clone();
                 alias = self.instantiate_type_alias(t_alias, m);
@@ -1525,9 +1557,11 @@ impl Checker {
             return self.get_string_mapping_type(symbol, instantiated);
         } else if flags.intersects(TypeFlags::CONDITIONAL) {
             let conditional_mapper = self.ty(t).as_conditional_type().mapper;
-            let combined = self.combine_type_mappers(conditional_mapper, m);
-            return self.get_conditional_type_instantiation(
-                t, combined, false, /*forConstraint*/
+            return self.get_conditional_type_instantiation_combined(
+                t,
+                conditional_mapper,
+                m,
+                false, /*forConstraint*/
                 alias,
             );
         } else if flags.intersects(TypeFlags::SUBSTITUTION) {

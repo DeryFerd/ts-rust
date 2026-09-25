@@ -540,7 +540,7 @@ impl Checker {
         let t_symbol = self.ty(t).symbol;
         if t_symbol.is_some() && !self.sym(t_symbol).declarations.is_empty() {
             let declarations = self.sym(t_symbol).declarations.clone();
-            for declaration in declarations {
+            for &declaration in declarations.iter() {
                 if is_infer_type_node(declaration.parent()) {
                     // When an 'infer T' declaration is immediately contained in a type reference node
                     // (such as 'Foo<infer T>'), T's constraint is inferred from the constraint of the
@@ -812,7 +812,7 @@ impl Checker {
                     d.mapper,
                 )
             };
-            let t_id = self.ty(t).id;
+            let t_id = t;
             let cached = self
                 .cached_types
                 .get(&CachedTypeKey {
@@ -915,7 +915,7 @@ impl Checker {
     // Go: checker/checker.go:17263 isThislessInterface
     pub fn is_thisless_interface(&mut self, symbol: SymbolId) -> bool {
         let declarations = self.sym(symbol).declarations.clone();
-        for declaration in declarations {
+        for &declaration in declarations.iter() {
             if is_interface_declaration(declaration) {
                 if declaration.flags().intersects(NodeFlags::CONTAINS_THIS) {
                     return false;
@@ -965,11 +965,23 @@ pub fn hash_write64(h: &mut KeyHasher, value: u64) {
 }
 
 // Go: checker/checker.go:17307 CacheHashKey
-// PORT: Go `CacheHashKey` is an `xxh3.Uint128` (`{Hi, Lo uint64}`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+// PORT: Go `CacheHashKey` is an `xxh3.Uint128` (`{Hi, Lo uint64}`). It is
+// 4-byte aligned so cache entries with a 4-byte value take 20 bytes, not 24.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(C, packed(4))]
 pub struct CacheHashKey {
     pub hi: u64,
     pub lo: u64,
+}
+
+// PORT: the key is already an xxh3 hash, so map hashing feeds only its low
+// half to the hasher. Equality still compares both halves. No code depends on
+// the iteration order of maps with these keys.
+impl std::hash::Hash for CacheHashKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.lo);
+    }
 }
 
 impl CacheHashKey {
@@ -1337,7 +1349,7 @@ impl KeyBuilder {
         ignore_constraints: bool,
     ) -> bool {
         let mut constrained = false;
-        let mut type_parameters: Vec<TypeId> = Vec::with_capacity(8);
+        let mut type_parameters: Vec<TypeId> = Vec::new();
         self.write_type_reference_for_key(
             c,
             source,
@@ -1372,12 +1384,10 @@ impl KeyBuilder {
     ) {
         let ref_target = c.ty(ref_).target();
         self.write_type(ref_target);
-        let resolved_type_arguments = c
-            .ty(ref_)
-            .as_type_reference()
-            .resolved_type_arguments
-            .clone();
-        for t in resolved_type_arguments {
+        // PORT: read in place by index; the resolved list does not change.
+        let count = c.ty(ref_).as_type_reference().resolved_type_arguments.len();
+        for i in 0..count {
+            let t = c.ty(ref_).as_type_reference().resolved_type_arguments[i];
             if c.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER) {
                 if ignore_constraints || c.get_constraint_of_type_parameter(t).is_nil() {
                     let index = match type_parameters.iter().position(|&p| p == t) {
@@ -1684,7 +1694,7 @@ impl Checker {
         ignore_constraints: bool,
     ) -> (CacheHashKey, bool) {
         let (mut source, mut target) = (source, target);
-        if is_identity && self.ty(source).id > self.ty(target).id {
+        if is_identity && source > target {
             std::mem::swap(&mut source, &mut target);
         }
         let mut b = KeyBuilder::default();
@@ -1714,10 +1724,24 @@ impl Checker {
         if !self.is_non_deferred_type_reference(t) {
             return false;
         }
-        let type_arguments = self.get_type_arguments(t);
-        for t in type_arguments {
-            if self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER)
-                || self.is_type_reference_with_generic_arguments(t)
+        // PORT: a resolved list is read in place instead of copied. It does
+        // not change once set.
+        let count = self.ty(t).as_type_reference().resolved_type_arguments.len();
+        if count == 0 {
+            let type_arguments = self.get_type_arguments(t);
+            for t in type_arguments {
+                if self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER)
+                    || self.is_type_reference_with_generic_arguments(t)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        for i in 0..count {
+            let a = self.ty(t).as_type_reference().resolved_type_arguments[i];
+            if self.ty(a).flags.intersects(TypeFlags::TYPE_PARAMETER)
+                || self.is_type_reference_with_generic_arguments(a)
             {
                 return true;
             }

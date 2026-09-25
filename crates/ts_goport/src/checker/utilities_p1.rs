@@ -480,8 +480,13 @@ impl Checker {
         if symbols.len() < 2 {
             return;
         }
-        let mut keys: Vec<SymbolSortKey<'_>> =
-            symbols.iter().map(|&s| self.symbol_sort_key(s)).collect();
+        // Consecutive symbols mostly come from one file, so the last file
+        // index lookup is reused.
+        let mut last_file = (Node::NIL, 0);
+        let mut keys: Vec<SymbolSortKey<'_>> = symbols
+            .iter()
+            .map(|&s| self.symbol_sort_key(s, &mut last_file))
+            .collect();
         keys.sort_by(|a, b| self.compare_symbol_sort_keys(a, b).cmp(&0));
         for (slot, key) in symbols.iter_mut().zip(&keys) {
             *slot = key.symbol;
@@ -489,7 +494,8 @@ impl Checker {
     }
 
     /// The `compareSymbolsWorker` inputs of one symbol.
-    fn symbol_sort_key(&self, symbol: SymbolId) -> SymbolSortKey<'_> {
+    /// `last_file` caches the last `(file, file_index_map[file])` lookup.
+    fn symbol_sort_key(&self, symbol: SymbolId, last_file: &mut (Node, i32)) -> SymbolSortKey<'_> {
         if symbol.is_nil() {
             return SymbolSortKey {
                 symbol,
@@ -506,8 +512,10 @@ impl Checker {
         let declaration = sym.declarations.first().copied().unwrap_or(Node::NIL);
         let (file, file_index, pos) = if declaration.is_some() {
             let file = get_source_file_of_node(declaration);
-            let file_index = self.file_index_map.get(&file).copied().unwrap_or(0);
-            (file, file_index, declaration.pos())
+            if file != last_file.0 || file.is_nil() {
+                *last_file = (file, self.file_index_map.get(&file).copied().unwrap_or(0));
+            }
+            (file, last_file.1, declaration.pos())
         } else {
             (Node::NIL, 0, 0)
         };

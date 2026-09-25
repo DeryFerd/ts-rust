@@ -491,6 +491,10 @@ fn bind_files_parallel(symbols: &mut SymbolArena) {
     let files: Vec<Node> = prog().source_files().map(|file| file.root).collect();
     let threads = std::thread::available_parallelism()
         .map_or(1, std::num::NonZero::get)
+        // Each new thread gets its own glibc malloc arena, and freed per-file
+        // bind data stays resident there. 4 threads keep RSS low; the
+        // lib.dom.d.ts bind is the long pole anyway.
+        .min(4)
         .min(files.len());
     if single_threaded()
         || threads < 2
@@ -3118,7 +3122,7 @@ fn get_diagnostics_with_preceding_directives(
     let mut filtered = Vec::with_capacity(diags.len());
     for diagnostic in diags {
         let mut ignore_diagnostic = false;
-        let mut line = compute_line_of_position(&line_starts, diagnostic.pos) - 1;
+        let mut line = compute_line_of_position(line_starts, diagnostic.pos) - 1;
         while line >= 0 {
             // If line contains a @ts-ignore or @ts-expect-error directive, ignore this diagnostic and change
             // the directive kind to @ts-ignore to indicate it was used.

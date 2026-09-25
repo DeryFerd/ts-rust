@@ -702,7 +702,7 @@ impl Checker {
     // Go: checker/checker.go:27205 getDeclaringConstructor
     pub fn get_declaring_constructor(&mut self, symbol: SymbolId) -> Node {
         let declarations = self.sym(symbol).declarations.clone();
-        for declaration in declarations {
+        for &declaration in declarations.iter() {
             let container = get_this_container(
                 declaration,
                 false, /*includeArrowFunctions*/
@@ -837,8 +837,8 @@ impl Checker {
         constraint: TypeId,
     ) -> TypeId {
         let key = SubstitutionTypeKey {
-            base_id: self.ty(base_type).id,
-            constraint_id: self.ty(constraint).id,
+            base_id: base_type,
+            constraint_id: constraint,
         };
         if let Some(&cached) = self.substitution_types.get(&key) {
             if cached.is_some() {
@@ -1083,7 +1083,7 @@ impl Checker {
                 .cached_types
                 .get(&CachedTypeKey {
                     kind: CachedTypeKind::RESTRICTIVE_INSTANTIATION,
-                    type_id: self.ty(t).id,
+                    type_id: t,
                 })
                 .copied()
                 .unwrap_or_default();
@@ -1578,7 +1578,7 @@ impl Checker {
             } else {
                 CachedTypeKind::INDEXED_ACCESS_FOR_READING
             },
-            type_id: self.ty(t).id,
+            type_id: t,
         };
         if let Some(&cached) = self.cached_types.get(&key) {
             if cached.is_some() {

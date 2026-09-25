@@ -300,9 +300,10 @@ impl Checker {
                 set_value_declaration(&mut self.symbols, target, source_value_declaration);
             }
             let source_declarations = self.sym(source).declarations.clone();
-            self.sym_mut(target)
-                .declarations
-                .extend(source_declarations);
+            let target_declarations = &mut self.sym_mut(target).declarations;
+            for &d in source_declarations.iter() {
+                target_declarations.push(d);
+            }
             let source_members = self.sym(source).members;
             if source_members.is_some() {
                 let mut members = self.sym(target).members;
@@ -400,7 +401,7 @@ impl Checker {
     ) {
         let target_declarations = self.sym(target).declarations.clone();
         let source_declarations = self.sym(source).declarations.clone();
-        for node in target_declarations {
+        for &node in target_declarations.iter() {
             self.add_duplicate_declaration_error(node, message, symbol_name, &source_declarations);
         }
     }
@@ -1046,7 +1047,7 @@ impl Checker {
             if export_star.is_some() {
                 let declarations = self.sym(export_star).declarations.clone();
                 let mut default_export = Node::NIL;
-                for decl in declarations {
+                for &decl in declarations.iter() {
                     let found = if !(is_export_declaration(decl)
                         && decl.module_specifier().is_some())
                     {
@@ -1345,7 +1346,7 @@ impl Checker {
                 || !self.sym(type_symbol).declarations.is_empty()
         );
         // Go: slices.Compact(slices.Concat(...)) removes consecutive duplicates.
-        let mut declarations = self.sym(value_symbol).declarations.clone();
+        let mut declarations: Vec<Node> = self.sym(value_symbol).declarations.to_vec();
         declarations.extend(self.sym(type_symbol).declarations.iter().copied());
         declarations.dedup();
         let mut parent = self.sym(value_symbol).parent;
@@ -1355,7 +1356,7 @@ impl Checker {
         let value_declaration = self.sym(value_symbol).value_declaration;
         let type_members = self.sym(type_symbol).members;
         let value_exports = self.sym(value_symbol).exports;
-        self.sym_mut(result).declarations = declarations;
+        self.sym_mut(result).declarations = declarations.into();
         self.sym_mut(result).parent = parent;
         self.sym_mut(result).value_declaration = value_declaration;
         let members = maps_clone_symbol_table(&mut self.symbols, type_members);

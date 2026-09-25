@@ -36,8 +36,8 @@ fn raw(n: Node) -> &'static ts_ast::Node {
     if n.file_index() == SYNTHETIC_NODE_FILE {
         return synthetic_ast_node(n);
     }
-    if has_file_store(n.file_index()) {
-        return store_ast_node(n);
+    if let Some(node) = try_store_ast_node(n) {
+        return node;
     }
     prog().files[n.file_index()]
         .legacy_source()
@@ -722,9 +722,8 @@ impl Node {
     #[must_use]
     pub fn kind(self) -> SyntaxKind {
         // A store node holds the Go kind in its header.
-        if has_file_store(self.file_index()) {
-            assert!(self.is_some(), "nil node dereference");
-            return store_header(self).kind;
+        if let Some(h) = try_store_header(self) {
+            return h.kind;
         }
         let r = raw(self);
         match r.kind {
@@ -741,10 +740,10 @@ impl Node {
         if is_synthetic_node(self) {
             return synthetic_flags(self);
         }
-        if has_file_store(self.file_index()) {
+        if let Some(h) = try_store_header(self) {
             // The parser reads flags before the program exists.
             // After the freeze every store file is a program file.
-            let flags = store_header(self).flags;
+            let flags = h.flags;
             if file_stores_frozen() {
                 return flags | self.bind().added_flags;
             }
@@ -762,8 +761,8 @@ impl Node {
         if is_synthetic_node(self) {
             return synthetic_parent(self);
         }
-        if has_file_store(self.file_index()) {
-            return store_header(self).parent;
+        if let Some(h) = try_store_header(self) {
+            return h.parent;
         }
         opt(self.file_index(), raw(self).parent)
     }
@@ -776,8 +775,8 @@ impl Node {
         if is_synthetic_node(self) {
             return synthetic_loc(self);
         }
-        if has_file_store(self.file_index()) {
-            return store_header(self).loc;
+        if let Some(h) = try_store_header(self) {
+            return h.loc;
         }
         let r = raw(self);
         let Some(file) = prog().files.get(self.file_index()) else {
@@ -817,7 +816,7 @@ impl Node {
             return synthetic_bind(self);
         }
         match self.go_file().node_bind.get() {
-            Some(v) => &v[nid(self).index()],
+            Some(v) => v.get(nid(self).index()),
             None => &NO_BIND,
         }
     }
@@ -3661,6 +3660,11 @@ pub fn source_file_is_js(file: Node) -> bool {
 // Go: ast.go:2702 (*SourceFile).ECMALineMap
 #[must_use]
 pub fn source_file_ecma_line_map(file: Node) -> &'static [i32] {
+    if !is_synthetic_node(file)
+        && let Some(line_map) = crate::ast::store::frozen_file_ecma_line_starts(file.file_index())
+    {
+        return line_map;
+    }
     if let Some(line_map) = ECMA_LINE_MAPS.with(|c| c.borrow().get(&file).copied()) {
         return line_map;
     }

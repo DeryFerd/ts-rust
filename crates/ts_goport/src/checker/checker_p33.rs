@@ -780,7 +780,7 @@ impl Checker {
         };
         let key = CachedTypeKey {
             kind,
-            type_id: self.ty(name_type).id,
+            type_id: name_type,
         };
         if let Some(&override_type) = self.cached_types.get(&key) {
             if override_type.is_some() {
@@ -1334,7 +1334,7 @@ impl Checker {
     ) -> TypeId {
         let key = DiscriminatedContextualTypeKey {
             node_id: node,
-            type_id: self.ty(contextual_type).id,
+            type_id: contextual_type,
         };
         if let Some(&discriminated) = self.discriminated_contextual_types.get(&key) {
             if discriminated.is_some() {

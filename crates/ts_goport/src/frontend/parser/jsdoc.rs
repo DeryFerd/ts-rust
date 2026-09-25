@@ -1773,10 +1773,9 @@ impl Parser {
         }
         let pos = self.scanner.token_start();
         let end = self.scanner.token_end();
-        let text: String = self.scanner.token_value().to_string();
-        self.intern_identifier(&text);
+        let text = self.scanner.token_value();
         self.next_token_js_doc();
-        let n = self.new_identifier(&text);
+        let n = self.new_identifier(text);
         self.finish_node_with_end(n, pos, end)
     }
 }

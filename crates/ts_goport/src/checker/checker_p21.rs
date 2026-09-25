@@ -358,15 +358,14 @@ impl Checker {
             .resolved_properties
             .is_empty()
         {
-            let mut checked: FxHashSet<String> = FxHashSet::default();
+            let mut checked: FxHashSet<Name> = FxHashSet::default();
             let mut props: Vec<SymbolId> = Vec::new();
             let types = self.ty(t).as_union_or_intersection_type().types.clone();
             let t_flags = self.ty(t).flags;
             for current in types {
                 for prop in self.get_properties_of_type(current) {
-                    let prop_name = self.sym(prop).name.to_string();
-                    if !checked.contains(&prop_name) {
-                        checked.insert(prop_name.clone());
+                    let prop_name = self.sym(prop).name.clone();
+                    if checked.insert(prop_name.clone()) {
                         let combined_prop = self.get_property_of_union_or_intersection_type(
                             t,
                             &prop_name,
@@ -873,7 +872,7 @@ impl Checker {
                 && !self.sym(t_symbol).declarations.is_empty()
             {
                 let declarations = self.sym(t_symbol).declarations.clone();
-                for declaration in declarations {
+                for &declaration in declarations.iter() {
                     if is_class_declaration(declaration) || is_interface_declaration(declaration) {
                         self.report_circular_base_type(declaration, t);
                     }
@@ -1459,7 +1458,7 @@ impl Checker {
     // Go: checker/checker.go:19397 resolveBaseTypesOfInterface
     pub fn resolve_base_types_of_interface(&mut self, t: TypeId) {
         let declarations = self.sym(self.ty(t).symbol).declarations.clone();
-        for declaration in declarations {
+        for &declaration in declarations.iter() {
             if is_interface_declaration(declaration) {
                 for node in get_extends_heritage_clause_elements(declaration) {
                     let type_from_node = self.get_type_from_type_node(node);

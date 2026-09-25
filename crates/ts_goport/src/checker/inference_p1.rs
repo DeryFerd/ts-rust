@@ -6,10 +6,19 @@ use crate::prelude::*;
 // are never held across a call that can reach `n` again.
 
 // Go: checker/inference.go:11 InferenceKey
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InferenceKey {
     pub s: TypeId,
     pub t: TypeId,
+}
+
+// PORT: both ids are hashed as one word. No code iterates maps with these
+// keys.
+impl std::hash::Hash for InferenceKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(((self.s.0 as u64) << 32) | self.t.0 as u64);
+    }
 }
 
 // Go: checker/inference.go:16 InferenceState
@@ -51,7 +60,13 @@ impl Checker {
             let mut s = n.borrow_mut();
             let mut visited = s.visited.take();
             if let Some(v) = visited.as_mut() {
-                v.clear();
+                // PORT: Go `clear(n.visited)`. Clearing costs time in the map
+                // capacity, so a mostly empty large map is dropped instead.
+                if v.capacity() > 256 && v.len() < v.capacity() / 8 {
+                    *v = FxHashMap::default();
+                } else {
+                    v.clear();
+                }
             }
             let mut source_stack = std::mem::take(&mut s.source_stack);
             source_stack.clear();
@@ -591,9 +606,10 @@ impl Checker {
         target: TypeId,
         action: fn(&mut Checker, &Rc<RefCell<InferenceState>>, TypeId, TypeId),
     ) {
+        // PORT: a type handle equals its Go `id`, so the key needs no type read.
         let key = InferenceKey {
-            s: self.ty(source).id,
-            t: self.ty(target).id,
+            s: source,
+            t: target,
         };
         let status = n
             .borrow()
@@ -620,12 +636,18 @@ impl Checker {
             s.source_stack.push(source);
             s.target_stack.push(target);
         }
-        let source_stack = n.borrow().source_stack.clone();
-        if self.is_deeply_nested_type(source, &source_stack, 2) {
+        // PORT: the stacks are moved out while they are read, instead of
+        // cloned. Nothing reached from isDeeplyNestedType can use `n`.
+        let source_stack = std::mem::take(&mut n.borrow_mut().source_stack);
+        let source_nested = self.is_deeply_nested_type(source, &source_stack, 2);
+        n.borrow_mut().source_stack = source_stack;
+        if source_nested {
             n.borrow_mut().expanding_flags |= ExpandingFlags::SOURCE;
         }
-        let target_stack = n.borrow().target_stack.clone();
-        if self.is_deeply_nested_type(target, &target_stack, 2) {
+        let target_stack = std::mem::take(&mut n.borrow_mut().target_stack);
+        let target_nested = self.is_deeply_nested_type(target, &target_stack, 2);
+        n.borrow_mut().target_stack = target_stack;
+        if target_nested {
             n.borrow_mut().expanding_flags |= ExpandingFlags::TARGET;
         }
         let expanding_flags = n.borrow().expanding_flags;
@@ -1382,12 +1404,13 @@ impl Checker {
         for target_prop in properties {
             let name = self.sym(target_prop).name.clone();
             let source_prop = self.get_property_of_type(source, &name);
-            if source_prop.is_some() && {
-                let declarations = self.sym(source_prop).declarations.clone();
-                !declarations
+            if source_prop.is_some()
+                && !self
+                    .sym(source_prop)
+                    .declarations
                     .iter()
                     .any(|&d| self.is_skip_direct_inference_node(d))
-            } {
+            {
                 let source_type = self.get_type_of_symbol(source_prop);
                 let source_optional = self
                     .sym(source_prop)

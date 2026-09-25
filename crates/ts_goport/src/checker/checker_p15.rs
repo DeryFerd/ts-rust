@@ -657,7 +657,7 @@ impl Checker {
                 let right_prop = self.symbols.get(members, &left_name);
                 let right_type = self.get_type_of_symbol(right_prop);
                 if self.sym(right_prop).flags.intersects(SymbolFlags::OPTIONAL) {
-                    let mut declarations = self.sym(left_prop).declarations.clone();
+                    let mut declarations: Vec<Node> = self.sym(left_prop).declarations.to_vec();
                     declarations.extend(self.sym(right_prop).declarations.iter().copied());
                     let flags =
                         SymbolFlags::PROPERTY | (self.sym(left_prop).flags & SymbolFlags::OPTIONAL);
@@ -684,7 +684,7 @@ impl Checker {
                     }
                     self.spread_links.get(result).left_spread = left_prop;
                     self.spread_links.get(result).right_spread = right_prop;
-                    self.sym_mut(result).declarations = declarations;
+                    self.sym_mut(result).declarations = declarations.into();
                     let name_type = self.value_symbol_links.get(left_prop).name_type;
                     self.value_symbol_links.get(result).name_type = name_type;
                     self.symbols.set(members, left_name, result);
@@ -1416,10 +1416,20 @@ impl Checker {
         if flags.intersects(SymbolFlags::ENUM_MEMBER) {
             return true;
         }
+        // PORT: isReadonlyAssignmentDeclaration is false for anything but a
+        // call expression, so the list is only copied when it has one.
+        if !self
+            .sym(symbol)
+            .declarations
+            .iter()
+            .any(|&d| is_call_expression(d))
+        {
+            return false;
+        }
         let declarations = self.sym(symbol).declarations.clone();
         declarations
-            .into_iter()
-            .any(|d| self.is_readonly_assignment_declaration(d))
+            .iter()
+            .any(|&d| self.is_readonly_assignment_declaration(d))
     }
 
     // Go: checker/checker.go:13787 checkObjectLiteralMethod

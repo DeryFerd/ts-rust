@@ -449,12 +449,10 @@ impl Parser {
     }
 
     // Go: parser/parser.go:5790 parseLiteralExpression
-    pub fn parse_literal_expression(&mut self, intern: bool) -> Node {
+    // PORT: `intern` only calls `internIdentifier` in Go (not kept, see there).
+    pub fn parse_literal_expression(&mut self, _intern: bool) -> Node {
         let pos = self.node_pos();
-        let mut text = self.scanner.token_value().to_string();
-        if intern {
-            text = self.intern_identifier(&text);
-        }
+        let text = self.scanner.token_value();
         let token_flags = self.scanner.token_flags();
         let result = match self.token {
             SyntaxKind::StringLiteral => self.factory.new_string_literal(text, token_flags),
@@ -558,10 +556,9 @@ impl Parser {
             } else {
                 self.node_pos()
             };
-            let text = self.scanner.token_value().to_string();
+            let text = self.scanner.token_value();
             self.next_token_without_check();
-            let interned = self.intern_identifier(&text);
-            let node = self.new_identifier(&interned);
+            let node = self.new_identifier(text);
             return self.finish_node(node, pos);
         }
         if self.token == SyntaxKind::PrivateIdentifier {
@@ -610,17 +607,11 @@ impl Parser {
     }
 
     // Go: parser/parser.go:5901 internIdentifier
-    // PORT: Go creates the map on first use. The Rust map always exists; the
-    // result is the same.
-    pub fn intern_identifier(&mut self, text: &str) -> String {
-        if let Some(identifier) = self.identifiers.get(text) {
-            return identifier.clone();
-        }
-        let identifier = text.to_string();
-        self.identifiers
-            .insert(identifier.clone(), identifier.clone());
-        identifier
-    }
+    // PORT: not ported. Go returns the interned string, which equals the
+    // text, and adds it to `p.identifiers` (`SourceFile.Identifiers`). Rust
+    // node data owns its text, and nothing reads the parser's set: the
+    // printer rebuilds `SourceFile.Identifiers` from the tree
+    // (`printer::utilities::source_file_identifiers`). Callers skip the call.
 
     // Go: parser/parser.go:5913 newNodeList
     // PORT: Go sets `list.Loc` after `NewNodeList`. Rust lists are immutable
@@ -643,11 +634,17 @@ impl Parser {
 
     // Go: parser/parser.go:5929 finishNodeWithEnd
     pub fn finish_node_with_end(&mut self, node: Node, pos: i32, end: i32) -> Node {
-        set_node_loc(node, TextRange::new(pos, end));
-        set_node_flags(node, node.flags() | self.context_flags);
+        let mut flags = self.context_flags;
         if self.has_parse_error() {
-            set_node_flags(node, node.flags() | NodeFlags::THIS_NODE_HAS_ERROR);
+            flags |= NodeFlags::THIS_NODE_HAS_ERROR;
             self.set_has_parse_error(false);
+        }
+        // PORT: one store write for the Go `Loc` and `Flags` writes. A node
+        // of the parse store has no binder flags yet, so `Flags |= flags`
+        // equals Go `node.Flags = node.Flags | flags`.
+        if !finish_store_node(node, TextRange::new(pos, end), flags) {
+            set_node_loc(node, TextRange::new(pos, end));
+            set_node_flags(node, node.flags() | flags);
         }
         self.override_parent_in_immediate_children(node);
         node
@@ -662,7 +659,9 @@ impl Parser {
         self.current_parent = node;
         let parent = self.current_parent;
         node.for_each_child(|n| {
-            set_node_parent(n, parent);
+            if !try_set_store_node_parent(n, parent) {
+                set_node_parent(n, parent);
+            }
             false
         });
         self.current_parent = Node::NIL;

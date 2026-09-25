@@ -976,7 +976,7 @@ impl Checker {
         symbol: SymbolId,
     ) -> Vec<TypeId> {
         let mut types = types;
-        for node in self.sym(symbol).declarations.clone() {
+        for &node in self.sym(symbol).declarations.clone().iter() {
             if node_kind_is(
                 node,
                 &[
@@ -1085,7 +1085,7 @@ impl Checker {
     pub fn get_declared_type_of_enum(&mut self, symbol: SymbolId) -> TypeId {
         if !(self.declared_type_links.get(symbol).declared_type.is_some()) {
             let mut member_type_list = Vec::new();
-            for declaration in self.sym(symbol).declarations.clone() {
+            for &declaration in self.sym(symbol).declarations.clone().iter() {
                 if declaration.kind() == SyntaxKind::EnumDeclaration {
                     for member in declaration.members().to_vec() {
                         if self.has_bindable_name(member) {

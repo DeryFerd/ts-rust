@@ -1061,7 +1061,7 @@ impl Checker {
         include_origin: bool,
     ) -> TypeId {
         let key = PropertiesTypesKey {
-            type_id: self.ty(t).id,
+            type_id: t,
             include,
             include_origin,
             unresolved_members: self
@@ -1279,7 +1279,7 @@ impl Checker {
             } else {
                 CachedTypeKind::INDEX_TYPE
             },
-            type_id: self.ty(t).id,
+            type_id: t,
         };
         if let Some(&index_type) = self.cached_types.get(&key) {
             if index_type.is_some() {

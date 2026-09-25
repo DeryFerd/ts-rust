@@ -98,14 +98,16 @@ impl CompilerHost for CompilerHostImpl {
         if !ok {
             return None;
         }
+        let script_kind = get_script_kind_from_file_name(&opts.file_name);
+        // PORT: a parse worker may have parsed this text already
+        // (`FilesParser` prefetch).
+        if let Some(file) = take_prefetched_parse(opts, &text, script_kind) {
+            return Some(Rc::new(file));
+        }
         // PORT: the parser takes `&'static str` (node data points into the
         // text), so the file text is leaked for the program lifetime.
         let text: &'static str = Box::leak(text.into_boxed_str());
-        Some(Rc::new(parse_source_file(
-            opts,
-            text,
-            get_script_kind_from_file_name(&opts.file_name),
-        )))
+        Some(Rc::new(parse_source_file(opts, text, script_kind)))
     }
 
     // Go: host.go:86 (*compilerHost).GetResolvedProjectReference

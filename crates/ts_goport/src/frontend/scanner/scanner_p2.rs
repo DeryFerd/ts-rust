@@ -153,9 +153,9 @@ impl Scanner {
                 }
                 self.scanner_state.pos += size;
             }
-            self.scanner_state.token_value = intern_token_value(
-                &self.text
-                    [self.scanner_state.full_start_pos as usize..self.scanner_state.pos as usize],
+            self.scanner_state.token_value = self.text_token_value(
+                self.scanner_state.full_start_pos as usize,
+                self.scanner_state.pos as usize,
             );
             self.scanner_state.token = SyntaxKind::JsxText;
             if first_non_whitespace == -1 {
@@ -271,8 +271,9 @@ impl Scanner {
         if self.scanner_state.pos == self.scanner_state.token_start {
             return self.scan_js_doc_token();
         }
-        self.scanner_state.token_value = intern_token_value(
-            &self.text[self.scanner_state.token_start as usize..self.scanner_state.pos as usize],
+        self.scanner_state.token_value = self.text_token_value(
+            self.scanner_state.token_start as usize,
+            self.scanner_state.pos as usize,
         );
         self.scanner_state.token = SyntaxKind::JsDocCommentTextToken;
         self.scanner_state.token
@@ -449,7 +450,7 @@ impl Scanner {
             let ch = self.char();
             if ch < RUNE_SELF && ch != '\\' as i32 {
                 self.scanner_state.token_value =
-                    intern_token_value(&self.text[start as usize..self.scanner_state.pos as usize]);
+                    self.text_token_value(start as usize, self.scanner_state.pos as usize);
                 return true;
             }
             self.scanner_state.pos = start + prefix_length;
@@ -1043,8 +1044,7 @@ impl Scanner {
             }
             self.set_token_value(&value);
         } else {
-            self.scanner_state.token_value =
-                intern_token_value(&self.text[start as usize..end as usize]);
+            self.scanner_state.token_value = self.text_token_value(start as usize, end as usize);
         }
         if self
             .scanner_state

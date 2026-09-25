@@ -616,7 +616,7 @@ impl Checker {
         }
         if self.is_object_literal_type(target) {
             let source_props = self.get_properties_of_type(source);
-            for source_prop in self.exclude_properties(&source_props, excluded_properties) {
+            for source_prop in self.exclude_properties(source_props, excluded_properties) {
                 let name = self.sym(source_prop).name.clone();
                 if self.get_property_of_object_type(target, &name).is_nil() {
                     if report_errors {
@@ -636,7 +636,7 @@ impl Checker {
         // from the target union, across all members
         let properties = self.get_properties_of_type(target);
         let numeric_names_only = self.is_tuple_type(source) && self.is_tuple_type(target);
-        for target_prop in self.exclude_properties(&properties, excluded_properties) {
+        for target_prop in self.exclude_properties(properties, excluded_properties) {
             let name = self.sym(target_prop).name.clone();
             let target_prop_flags = self.sym(target_prop).flags;
             if !target_prop_flags.intersects(SymbolFlags::PROTOTYPE)
@@ -1033,9 +1033,9 @@ impl Checker {
             return Ternary::FALSE;
         }
         let source_props = self.get_properties_of_object_type(source);
-        let source_properties = self.exclude_properties(&source_props, excluded_properties);
+        let source_properties = self.exclude_properties(source_props, excluded_properties);
         let target_props = self.get_properties_of_object_type(target);
-        let target_properties = self.exclude_properties(&target_props, excluded_properties);
+        let target_properties = self.exclude_properties(target_props, excluded_properties);
         if source_properties.len() != target_properties.len() {
             return Ternary::FALSE;
         }

@@ -740,7 +740,7 @@ impl Checker {
     pub fn get_base_type_of_literal_type_union(&mut self, t: TypeId) -> TypeId {
         let key = CachedTypeKey {
             kind: CachedTypeKind::LITERAL_UNION_BASE_TYPE,
-            type_id: self.ty(t).id,
+            type_id: t,
         };
         if let Some(&cached) = self.cached_types.get(&key) {
             return cached;

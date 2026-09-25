@@ -270,10 +270,9 @@ impl Parser {
     // Go: parser/parser.go:2986 parsePrivateIdentifier
     pub fn parse_private_identifier(&mut self) -> Node {
         let pos = self.node_pos();
-        let text = self.scanner.token_value().to_string();
+        let text = self.scanner.token_value();
         self.next_token();
-        let interned = self.intern_identifier(&text);
-        let result = self.factory.new_private_identifier(interned);
+        let result = self.factory.new_private_identifier(text);
         self.finish_node(result, pos)
     }
 

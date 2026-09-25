@@ -152,8 +152,8 @@ impl Node {
             return crate::ast::resolve_synthetic_id(node);
         }
         // Child ids inside nodes of a ported-parser file are store slots.
-        if crate::ast::has_file_store(file) {
-            return crate::ast::resolve_store_id(file, node);
+        if let Some(n) = crate::ast::try_resolve_store_id(file, node) {
+            return n;
         }
         Self(((file as u64) << 32) | (node.index() as u64 + 1))
     }
@@ -170,71 +170,105 @@ impl Node {
     }
 }
 
-/// A symbol name and symbol table key (Go `string`). Clones share one
-/// allocation, so copying a name into a new symbol or table does not copy
-/// the text. It compares, hashes and prints like the `str` it holds.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Name(Arc<str>);
+/// A symbol name and symbol table key (Go `string`). Every distinct text is
+/// stored once for the whole process (see `intern`), and a `Name` is the
+/// 4-byte id of that text. Clones copy the id. Equal names have equal ids,
+/// so `==` compares ids. It orders, hashes and prints like the `str` it
+/// holds.
+#[derive(PartialEq, Eq)]
+pub struct Name(u32);
 
 impl Name {
+    /// The text. Interned text lives until the process ends.
     #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn as_str(&self) -> &'static str {
+        intern::text(self.0)
+    }
+}
+
+// PORT: not `Copy`, so existing `.clone()` calls stay clean for clippy.
+impl Clone for Name {
+    #[inline]
+    fn clone(&self) -> Self {
+        Name(self.0)
     }
 }
 
 impl Default for Name {
     fn default() -> Self {
-        Name(Arc::from(""))
+        Name(0)
+    }
+}
+
+impl std::hash::Hash for Name {
+    // Hashes the text, so `Borrow<str>` lookups stay correct.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl PartialOrd for Name {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Name {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if self.0 == other.0 {
+            return std::cmp::Ordering::Equal;
+        }
+        self.as_str().cmp(other.as_str())
     }
 }
 
 impl std::ops::Deref for Name {
     type Target = str;
+    #[inline]
     fn deref(&self) -> &str {
-        &self.0
+        self.as_str()
     }
 }
 
 impl std::borrow::Borrow<str> for Name {
     fn borrow(&self) -> &str {
-        &self.0
+        self.as_str()
     }
 }
 
 impl AsRef<str> for Name {
     fn as_ref(&self) -> &str {
-        &self.0
+        self.as_str()
     }
 }
 
 impl std::fmt::Debug for Name {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&*self.0, f)
+        std::fmt::Debug::fmt(self.as_str(), f)
     }
 }
 
 impl std::fmt::Display for Name {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&*self.0, f)
+        std::fmt::Display::fmt(self.as_str(), f)
     }
 }
 
 impl From<&str> for Name {
     fn from(s: &str) -> Self {
-        Name(Arc::from(s))
+        intern::intern(s)
     }
 }
 
 impl From<String> for Name {
     fn from(s: String) -> Self {
-        Name(Arc::from(s))
+        intern::intern(&s)
     }
 }
 
 impl From<&String> for Name {
     fn from(s: &String) -> Self {
-        Name(Arc::from(s.as_str()))
+        intern::intern(s)
     }
 }
 
@@ -246,65 +280,225 @@ impl From<&Name> for Name {
 
 impl From<Name> for String {
     fn from(s: Name) -> Self {
-        s.0.to_string()
+        s.as_str().to_owned()
     }
 }
 
 impl PartialEq<str> for Name {
     fn eq(&self, other: &str) -> bool {
-        *self.0 == *other
+        self.as_str() == other
     }
 }
 
 impl PartialEq<&str> for Name {
     fn eq(&self, other: &&str) -> bool {
-        *self.0 == **other
+        self.as_str() == *other
     }
 }
 
 impl PartialEq<String> for Name {
     fn eq(&self, other: &String) -> bool {
-        *self.0 == **other
+        self.as_str() == other
     }
 }
 
 impl PartialEq<Name> for str {
     fn eq(&self, other: &Name) -> bool {
-        *self == *other.0
+        self == other.as_str()
     }
 }
 
 impl PartialEq<Name> for &str {
     fn eq(&self, other: &Name) -> bool {
-        **self == *other.0
+        *self == other.as_str()
     }
 }
 
 impl PartialEq<Name> for String {
     fn eq(&self, other: &Name) -> bool {
-        **self == *other.0
+        self == other.as_str()
     }
 }
 
-/// `Symbol::declarations` (Go `[]*ast.Node`). Clones share one `Vec`; the
-/// first write through `DerefMut` copies it, so each symbol still owns its
-/// own list, like a Go slice that is copied before an append. An empty list
-/// allocates nothing.
-#[derive(Clone, Default)]
-pub struct Declarations(Option<Arc<Vec<Node>>>);
+/// The process-wide string interner behind `Name`. Text is copied once into
+/// leaked blocks and never freed. Ids are dense and start at 1; id 0 is "".
+/// `text` reads without a lock; `intern` takes one shard lock on a miss in
+/// the per-thread cache.
+mod intern {
+    use super::Name;
+    use rustc_hash::{FxBuildHasher, FxHashMap};
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Mutex, OnceLock, PoisonError};
 
-static NO_DECLARATIONS: Vec<Node> = Vec::new();
+    /// Chunk `k` holds `FIRST_CHUNK << k` ids, so a few chunks cover all ids.
+    const FIRST_CHUNK_SHIFT: u32 = 10;
+    const CHUNKS: usize = 23;
+    const SHARDS: usize = 32;
+    const BLOCK: usize = 16 * 1024;
+    const CACHE_SLOTS: usize = 1024;
+
+    type Slots = Box<[OnceLock<&'static str>]>;
+    static TEXTS: [OnceLock<Slots>; CHUNKS] = [const { OnceLock::new() }; CHUNKS];
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+
+    struct Shard {
+        ids: FxHashMap<&'static str, u32>,
+        /// Unused tail of the current text block.
+        free: &'static mut [u8],
+    }
+
+    static SHARD_LOCKS: OnceLock<Box<[Mutex<Shard>]>> = OnceLock::new();
+
+    thread_local! {
+        /// Direct-mapped cache of recent `intern` results: (hash, id).
+        static CACHE: RefCell<Vec<(u64, u32)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Fx hash of `s`. Symbol tables use it too.
+    #[inline]
+    pub(super) fn hash_str(s: &str) -> u64 {
+        use std::hash::Hasher;
+        let mut hasher = rustc_hash::FxHasher::default();
+        hasher.write(s.as_bytes());
+        hasher.finish()
+    }
+
+    /// Chunk and slot of `id`.
+    #[inline]
+    fn slot(id: u32) -> (usize, usize) {
+        let v = (id >> FIRST_CHUNK_SHIFT) + 1;
+        let k = 31 - v.leading_zeros();
+        let start = ((1u32 << k) - 1) << FIRST_CHUNK_SHIFT;
+        (k as usize, (id - start) as usize)
+    }
+
+    /// The text of name id `id`.
+    #[inline]
+    pub(super) fn text(id: u32) -> &'static str {
+        if id == 0 {
+            return "";
+        }
+        let (chunk, index) = slot(id);
+        TEXTS[chunk]
+            .get()
+            .and_then(|slots| slots[index].get())
+            .copied()
+            .expect("unknown name id")
+    }
+
+    /// The name for `s`, created on first use.
+    pub(super) fn intern(s: &str) -> Name {
+        if s.is_empty() {
+            return Name(0);
+        }
+        let hash = hash_str(s);
+        let cache_slot = (hash as usize) & (CACHE_SLOTS - 1);
+        let cached = CACHE.with(|cache| {
+            let cache = cache.borrow();
+            let &(h, id) = cache.get(cache_slot)?;
+            (id != 0 && h == hash && text(id) == s).then_some(id)
+        });
+        if let Some(id) = cached {
+            return Name(id);
+        }
+        let id = intern_shared(s, hash);
+        CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.is_empty() {
+                cache.resize(CACHE_SLOTS, (0, 0));
+            }
+            cache[cache_slot] = (hash, id);
+        });
+        Name(id)
+    }
+
+    fn intern_shared(s: &str, hash: u64) -> u32 {
+        let shards = SHARD_LOCKS.get_or_init(|| {
+            (0..SHARDS)
+                .map(|_| {
+                    Mutex::new(Shard {
+                        ids: FxHashMap::with_hasher(FxBuildHasher),
+                        free: Default::default(),
+                    })
+                })
+                .collect()
+        });
+        let mut shard = shards[(hash >> 59) as usize % SHARDS]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(&id) = shard.ids.get(s) {
+            return id;
+        }
+        if shard.free.len() < s.len() {
+            shard.free = Box::leak(vec![0u8; BLOCK.max(s.len())].into_boxed_slice());
+        }
+        let (head, tail) = std::mem::take(&mut shard.free).split_at_mut(s.len());
+        head.copy_from_slice(s.as_bytes());
+        shard.free = tail;
+        let head: &'static [u8] = head;
+        let stored = std::str::from_utf8(head).expect("interned text is UTF-8");
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(id != u32::MAX, "name id overflow");
+        let (chunk, index) = slot(id);
+        let slots = TEXTS[chunk].get_or_init(|| {
+            (0..(1usize << (FIRST_CHUNK_SHIFT as usize + chunk)))
+                .map(|_| OnceLock::new())
+                .collect()
+        });
+        let _ = slots[index].set(stored);
+        shard.ids.insert(stored, id);
+        id
+    }
+}
+
+/// `Symbol::declarations` (Go `[]*ast.Node`). An empty list allocates
+/// nothing and a single declaration is stored inline. Longer lists share one
+/// `Vec` between clones; the first write copies it, so each symbol still owns
+/// its own list, like a Go slice that is copied before an append.
+#[derive(Clone, Default)]
+pub struct Declarations(DeclarationList);
+
+#[derive(Clone, Default)]
+enum DeclarationList {
+    #[default]
+    Empty,
+    One(Node),
+    Many(Arc<Vec<Node>>),
+}
+
+impl Declarations {
+    /// Go `append(declarations, node)`.
+    pub fn push(&mut self, node: Node) {
+        match &mut self.0 {
+            DeclarationList::Empty => self.0 = DeclarationList::One(node),
+            DeclarationList::One(first) => {
+                self.0 = DeclarationList::Many(Arc::new(vec![*first, node]));
+            }
+            DeclarationList::Many(list) => Arc::make_mut(list).push(node),
+        }
+    }
+}
 
 impl std::ops::Deref for Declarations {
-    type Target = Vec<Node>;
-    fn deref(&self) -> &Vec<Node> {
-        self.0.as_deref().unwrap_or(&NO_DECLARATIONS)
+    type Target = [Node];
+    #[inline]
+    fn deref(&self) -> &[Node] {
+        match &self.0 {
+            DeclarationList::Empty => &[],
+            DeclarationList::One(node) => std::slice::from_ref(node),
+            DeclarationList::Many(list) => list,
+        }
     }
 }
 
 impl std::ops::DerefMut for Declarations {
-    fn deref_mut(&mut self) -> &mut Vec<Node> {
-        Arc::make_mut(self.0.get_or_insert_with(Arc::default))
+    fn deref_mut(&mut self) -> &mut [Node] {
+        match &mut self.0 {
+            DeclarationList::Empty => &mut [],
+            DeclarationList::One(node) => std::slice::from_mut(node),
+            DeclarationList::Many(list) => Arc::make_mut(list).as_mut_slice(),
+        }
     }
 }
 
@@ -316,21 +510,55 @@ impl std::fmt::Debug for Declarations {
 
 impl From<Vec<Node>> for Declarations {
     fn from(v: Vec<Node>) -> Self {
-        Declarations(Some(Arc::new(v)))
+        Declarations(match v.as_slice() {
+            [] => DeclarationList::Empty,
+            [node] => DeclarationList::One(*node),
+            _ => DeclarationList::Many(Arc::new(v)),
+        })
     }
 }
 
 impl From<Declarations> for Vec<Node> {
     fn from(d: Declarations) -> Self {
-        d.0.map(Arc::unwrap_or_clone).unwrap_or_default()
+        match d.0 {
+            DeclarationList::Empty => Vec::new(),
+            DeclarationList::One(node) => vec![node],
+            DeclarationList::Many(list) => Arc::unwrap_or_clone(list),
+        }
     }
 }
 
+/// By-value iterator over `Declarations`. It reads the shared list in place.
+pub struct DeclarationsIntoIter {
+    list: Declarations,
+    next: usize,
+}
+
+impl Iterator for DeclarationsIntoIter {
+    type Item = Node;
+    #[inline]
+    fn next(&mut self) -> Option<Node> {
+        let node = self.list.get(self.next).copied()?;
+        self.next += 1;
+        Some(node)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.list.len() - self.next;
+        (left, Some(left))
+    }
+}
+
+impl ExactSizeIterator for DeclarationsIntoIter {}
+
 impl IntoIterator for Declarations {
     type Item = Node;
-    type IntoIter = std::vec::IntoIter<Node>;
+    type IntoIter = DeclarationsIntoIter;
     fn into_iter(self) -> Self::IntoIter {
-        Vec::from(self).into_iter()
+        DeclarationsIntoIter {
+            list: self,
+            next: 0,
+        }
     }
 }
 
@@ -370,6 +598,13 @@ const COW_CHUNK_LEN: usize = 1 << COW_CHUNK_SHIFT;
 const COW_CHUNK_MASK: usize = COW_CHUNK_LEN - 1;
 
 impl<T: Clone> CowChunks<T> {
+    /// The values in order, moved out of chunks that no clone shares.
+    pub fn into_values(self) -> impl Iterator<Item = T> {
+        self.chunks
+            .into_iter()
+            .flat_map(|chunk| Arc::unwrap_or_clone(chunk).into_iter())
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -390,8 +625,13 @@ impl<T: Clone> CowChunks<T> {
 
     pub fn push(&mut self, value: T) {
         if self.len & COW_CHUNK_MASK == 0 {
-            self.chunks
-                .push(Arc::new(Vec::with_capacity(COW_CHUNK_LEN)));
+            // The first chunk grows on demand, so a one-file arena on a bind
+            // thread stays small.
+            self.chunks.push(Arc::new(if self.len == 0 {
+                Vec::new()
+            } else {
+                Vec::with_capacity(COW_CHUNK_LEN)
+            }));
         }
         let chunk = self.chunks.last_mut().expect("cow chunk");
         Arc::make_mut(chunk).push(value);
@@ -417,15 +657,137 @@ impl<T: Clone> Default for CowChunks<T> {
     }
 }
 
+/// One symbol table entry. `hash` is the low half of `intern::hash_str` of
+/// the name, so a lookup by text skips most entries without reading them.
+#[derive(Clone, Copy, Debug)]
+struct TableEntry {
+    hash: u32,
+    name: u32,
+    symbol: SymbolId,
+}
+
+/// Tables up to this size are searched linearly and have no index.
+const TABLE_LINEAR_MAX: usize = 8;
+
+/// A Go `ast.SymbolTable`: entries in insertion order. Larger tables also
+/// keep an open-addressing index. A slot holds `position % INDEX_MOD + 1`
+/// (0 is empty); a table longer than `INDEX_MOD` checks every position with
+/// that remainder.
+#[derive(Clone, Debug, Default)]
+struct Table {
+    entries: Vec<TableEntry>,
+    index: Box<[u16]>,
+}
+
+const INDEX_MOD: usize = u16::MAX as usize;
+
+#[inline]
+fn table_hash(name: &str) -> u32 {
+    let hash = intern::hash_str(name);
+    (hash ^ (hash >> 32)) as u32
+}
+
+impl Table {
+    fn with_capacity(capacity: usize) -> Self {
+        Table {
+            entries: Vec::with_capacity(capacity),
+            index: Box::default(),
+        }
+    }
+
+    /// The position of `name`, whose `table_hash` is `hash`.
+    #[inline]
+    fn find(&self, hash: u32, name: &str) -> Option<usize> {
+        if self.index.is_empty() {
+            return self
+                .entries
+                .iter()
+                .position(|e| e.hash == hash && intern::text(e.name) == name);
+        }
+        let mask = self.index.len() - 1;
+        let mut slot = hash as usize & mask;
+        loop {
+            let stored = self.index[slot];
+            if stored == 0 {
+                return None;
+            }
+            let mut position = stored as usize - 1;
+            while position < self.entries.len() {
+                let entry = &self.entries[position];
+                if entry.hash == hash && intern::text(entry.name) == name {
+                    return Some(position);
+                }
+                position += INDEX_MOD;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    /// Adds `position` to the index. The index has a free slot.
+    fn index_insert(index: &mut [u16], hash: u32, position: usize) {
+        let mask = index.len() - 1;
+        let mut slot = hash as usize & mask;
+        while index[slot] != 0 {
+            slot = (slot + 1) & mask;
+        }
+        index[slot] = u16::try_from(position % INDEX_MOD + 1).expect("index slot");
+    }
+
+    /// Rebuilds the index for the current entries.
+    fn reindex(&mut self) {
+        if self.entries.len() <= TABLE_LINEAR_MAX {
+            self.index = Box::default();
+            return;
+        }
+        let size = (self.entries.len() * 2).next_power_of_two();
+        let mut index = vec![0u16; size].into_boxed_slice();
+        for (position, entry) in self.entries.iter().enumerate() {
+            Self::index_insert(&mut index, entry.hash, position);
+        }
+        self.index = index;
+    }
+
+    /// Go `table[name] = symbol`. A new name goes last, like `IndexMap`.
+    fn insert(&mut self, name: &Name, symbol: SymbolId) {
+        let hash = table_hash(name);
+        if let Some(position) = self.find(hash, name) {
+            self.entries[position].symbol = symbol;
+            return;
+        }
+        self.entries.push(TableEntry {
+            hash,
+            name: name.0,
+            symbol,
+        });
+        let len = self.entries.len();
+        if len <= TABLE_LINEAR_MAX {
+            return;
+        }
+        if self.index.len() < len * 2 {
+            self.reindex();
+        } else {
+            Self::index_insert(&mut self.index, hash, len - 1);
+        }
+    }
+
+    /// Go `delete(table, name)`. Later entries keep their order.
+    fn remove(&mut self, name: &str) {
+        if let Some(position) = self.find(table_hash(name), name) {
+            self.entries.remove(position);
+            self.reindex();
+        }
+    }
+}
+
 /// Owns all symbols and symbol tables. The binder fills one arena. Each
 /// checker starts from a clone, so binder ids stay valid and checker
 /// (transient) symbols stay private to that checker. The clone shares the
-/// binder's symbol chunks and tables; a checker copies a chunk or table only
-/// when it first writes to it.
+/// binder's symbol and table chunks; a checker copies a chunk only when it
+/// first writes to it.
 #[derive(Clone, Debug)]
 pub struct SymbolArena {
     symbols: CowChunks<Symbol>,
-    tables: Vec<Arc<FxIndexMap<Name, SymbolId>>>,
+    tables: CowChunks<Table>,
 }
 
 impl Default for SymbolArena {
@@ -439,10 +801,9 @@ impl SymbolArena {
     pub fn new() -> Self {
         let mut symbols = CowChunks::new();
         symbols.push(Symbol::default());
-        Self {
-            symbols,
-            tables: vec![Arc::default()],
-        }
+        let mut tables = CowChunks::new();
+        tables.push(Table::default());
+        Self { symbols, tables }
     }
 
     /// Go `&ast.Symbol{Flags: flags, Name: name}`.
@@ -456,22 +817,20 @@ impl SymbolArena {
         id
     }
 
+    fn push_table(&mut self, table: Table) -> SymbolTable {
+        let id = SymbolTable(u32::try_from(self.tables.len()).expect("table overflow"));
+        self.tables.push(table);
+        id
+    }
+
     /// Go `make(ast.SymbolTable)`.
     pub fn new_table(&mut self) -> SymbolTable {
-        let id = SymbolTable(u32::try_from(self.tables.len()).expect("table overflow"));
-        self.tables.push(Arc::default());
-        id
+        self.push_table(Table::default())
     }
 
     /// Go `make(ast.SymbolTable, capacity)`.
     pub fn new_table_with_capacity(&mut self, capacity: usize) -> SymbolTable {
-        let id = SymbolTable(u32::try_from(self.tables.len()).expect("table overflow"));
-        self.tables
-            .push(Arc::new(FxIndexMap::with_capacity_and_hasher(
-                capacity,
-                FxBuildHasher,
-            )));
-        id
+        self.push_table(Table::with_capacity(capacity))
     }
 
     /// Appends the symbols and tables of `file_arena`, an arena that one
@@ -487,26 +846,33 @@ impl SymbolArena {
             tables: u32::try_from(self.tables.len() - 1).expect("table overflow"),
         };
         let SymbolArena { symbols, tables } = file_arena;
-        for i in 1..symbols.len() {
-            let symbol = symbols.get(i);
+        // Move the entries instead of copying them: the file arena was
+        // built on a bind thread, and its buffers stay in use here.
+        for symbol in symbols.into_values().skip(1) {
             self.symbols.push(Symbol {
-                flags: symbol.flags,
-                check_flags: symbol.check_flags,
                 name: offsets.name(&symbol.name),
-                declarations: symbol.declarations.clone(),
-                value_declaration: symbol.value_declaration,
                 members: offsets.table(symbol.members),
                 exports: offsets.table(symbol.exports),
                 parent: offsets.symbol(symbol.parent),
                 export_symbol: offsets.symbol(symbol.export_symbol),
+                ..symbol
             });
         }
-        for table in tables.into_iter().skip(1) {
-            let mut moved = FxIndexMap::with_capacity_and_hasher(table.len(), FxBuildHasher);
-            for (name, &symbol) in table.iter() {
-                moved.insert(offsets.name(name), offsets.symbol(symbol));
+        for mut table in tables.into_values().skip(1) {
+            let mut renamed = false;
+            for entry in &mut table.entries {
+                let name = offsets.name(&Name(entry.name));
+                if name.0 != entry.name {
+                    renamed = true;
+                    entry.name = name.0;
+                    entry.hash = table_hash(&name);
+                }
+                entry.symbol = offsets.symbol(entry.symbol);
             }
-            self.tables.push(Arc::new(moved));
+            if renamed {
+                table.reindex();
+            }
+            self.tables.push(table);
         }
         offsets
     }
@@ -516,10 +882,8 @@ impl SymbolArena {
         if table.is_nil() {
             return SymbolTable::NIL;
         }
-        let id = SymbolTable(u32::try_from(self.tables.len()).expect("table overflow"));
-        let cloned = FxIndexMap::clone(&self.tables[table.index()]);
-        self.tables.push(Arc::new(cloned));
-        id
+        let cloned = self.tables.get(table.index()).clone();
+        self.push_table(cloned)
     }
 
     #[must_use]
@@ -539,22 +903,26 @@ impl SymbolArena {
         if table.is_nil() {
             return SymbolId::NIL;
         }
-        self.tables[table.index()]
-            .get(name)
-            .copied()
-            .unwrap_or_default()
+        let table = self.tables.get(table.index());
+        if table.entries.is_empty() {
+            return SymbolId::NIL;
+        }
+        table
+            .find(table_hash(name), name)
+            .map_or(SymbolId::NIL, |position| table.entries[position].symbol)
     }
 
     /// Go `table[name] = symbol`. Panics on a nil table, like Go.
     pub fn set(&mut self, table: SymbolTable, name: impl Into<Name>, symbol: SymbolId) {
         assert!(table.is_some(), "assignment to entry in nil map");
-        Arc::make_mut(&mut self.tables[table.index()]).insert(name.into(), symbol);
+        let name = name.into();
+        self.tables.get_mut(table.index()).insert(&name, symbol);
     }
 
     /// Go `delete(table, name)`.
     pub fn delete(&mut self, table: SymbolTable, name: &str) {
         if table.is_some() {
-            Arc::make_mut(&mut self.tables[table.index()]).shift_remove(name);
+            self.tables.get_mut(table.index()).remove(name);
         }
     }
 
@@ -564,7 +932,15 @@ impl SymbolArena {
         if table.is_nil() {
             0
         } else {
-            self.tables[table.index()].len()
+            self.tables.get(table.index()).entries.len()
+        }
+    }
+
+    fn table_entries(&self, table: SymbolTable) -> &[TableEntry] {
+        if table.is_nil() {
+            &[]
+        } else {
+            &self.tables.get(table.index()).entries
         }
     }
 
@@ -572,34 +948,24 @@ impl SymbolArena {
     /// random, so Go code never depends on it; ours is deterministic.
     #[must_use]
     pub fn entries(&self, table: SymbolTable) -> Vec<(Name, SymbolId)> {
-        if table.is_nil() {
-            return Vec::new();
-        }
-        self.tables[table.index()]
+        self.table_entries(table)
             .iter()
-            .map(|(k, v)| (k.clone(), *v))
+            .map(|e| (Name(e.name), e.symbol))
             .collect()
     }
 
     /// Borrowed `(name, symbol)` pairs in insertion order. Use it instead of
     /// `entries` when the table does not change during the loop.
     pub fn iter(&self, table: SymbolTable) -> impl Iterator<Item = (&str, SymbolId)> {
-        let map = if table.is_nil() {
-            None
-        } else {
-            Some(&self.tables[table.index()])
-        };
-        map.into_iter()
-            .flat_map(|map| map.iter().map(|(k, v)| (k.as_str(), *v)))
+        self.table_entries(table)
+            .iter()
+            .map(|e| (intern::text(e.name), e.symbol))
     }
 
     /// Snapshot of the values in insertion order.
     #[must_use]
     pub fn values(&self, table: SymbolTable) -> Vec<SymbolId> {
-        if table.is_nil() {
-            return Vec::new();
-        }
-        self.tables[table.index()].values().copied().collect()
+        self.table_entries(table).iter().map(|e| e.symbol).collect()
     }
 }
 
@@ -669,7 +1035,7 @@ pub struct PatternAmbientModule {
 }
 
 /// Binder output for one node. Go stores these on the node itself.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NodeBindData {
     pub symbol: SymbolId,
     pub local_symbol: SymbolId,
@@ -682,6 +1048,85 @@ pub struct NodeBindData {
     pub added_flags: NodeFlags,
 }
 
+/// Binder data of every node of one bound file, stored compactly. Most
+/// nodes have no data, or the same data as the node before them (a run of
+/// identifiers in one flow region), so they share one entry. Each node keeps
+/// one byte: the offset of its entry from the first entry of its block.
+#[derive(Debug, Default)]
+pub struct FileNodeBind {
+    /// Per node, by `NodeId::index()`: entry offset in its block, or
+    /// `NO_NODE_BIND` for the empty data.
+    slots: Vec<u8>,
+    /// Per block of `NODE_BIND_BLOCK` nodes: the index of its first entry.
+    bases: Vec<u32>,
+    entries: Vec<NodeBindData>,
+}
+
+const NODE_BIND_BLOCK_BITS: usize = 7;
+const NODE_BIND_BLOCK: usize = 1 << NODE_BIND_BLOCK_BITS;
+const NO_NODE_BIND: u8 = u8::MAX;
+
+/// The empty binder data.
+static EMPTY_NODE_BIND: NodeBindData = NodeBindData {
+    symbol: SymbolId::NIL,
+    local_symbol: SymbolId::NIL,
+    locals: SymbolTable::NIL,
+    next_container: Node::NIL,
+    flow_node: FlowNodeId::NIL,
+    end_flow_node: FlowNodeId::NIL,
+    return_flow_node: FlowNodeId::NIL,
+    added_flags: NodeFlags::NONE,
+};
+
+impl FileNodeBind {
+    /// Compacts the per-node data of a bound file.
+    #[must_use]
+    pub fn new(nodes: &[NodeBindData]) -> Self {
+        let mut slots = Vec::with_capacity(nodes.len());
+        let mut bases = Vec::with_capacity(nodes.len().div_ceil(NODE_BIND_BLOCK));
+        let mut entries: Vec<NodeBindData> = Vec::new();
+        let mut block_start = 0;
+        for (index, data) in nodes.iter().enumerate() {
+            if index & (NODE_BIND_BLOCK - 1) == 0 {
+                block_start = entries.len();
+                bases.push(u32::try_from(block_start).expect("node bind overflow"));
+            }
+            if *data == EMPTY_NODE_BIND {
+                slots.push(NO_NODE_BIND);
+                continue;
+            }
+            // Entries are shared only inside a block, so offsets stay small.
+            if entries.len() == block_start || entries.last() != Some(data) {
+                entries.push(*data);
+            }
+            slots.push(u8::try_from(entries.len() - 1 - block_start).expect("block offset"));
+        }
+        entries.shrink_to_fit();
+        FileNodeBind {
+            slots,
+            bases,
+            entries,
+        }
+    }
+
+    /// The distinct data entries, for remapping ids in place. Non-empty data
+    /// stays non-empty and distinct under an id remap.
+    pub fn entries_mut(&mut self) -> &mut [NodeBindData] {
+        &mut self.entries
+    }
+
+    /// The data of node `index` (`NodeId::index()`).
+    #[inline]
+    #[must_use]
+    pub fn get(&self, index: usize) -> &NodeBindData {
+        let offset = self.slots[index];
+        if offset == NO_NODE_BIND {
+            return &EMPTY_NODE_BIND;
+        }
+        &self.entries[self.bases[index >> NODE_BIND_BLOCK_BITS] as usize + offset as usize]
+    }
+}
+
 /// Binder output for one source file. Go stores these on `ast.SourceFile`.
 #[derive(Clone, Debug, Default)]
 pub struct FileBindData {
@@ -689,7 +1134,8 @@ pub struct FileBindData {
     pub bind_suggestion_diagnostics: Vec<Diagnostic>,
     pub end_flow_node: FlowNodeId,
     pub symbol_count: i32,
-    pub classifiable_names: rustc_hash::FxHashSet<String>,
+    /// Go `ClassifiableNames`. Nothing reads it; interned names keep it small.
+    pub classifiable_names: rustc_hash::FxHashSet<Name>,
     pub pattern_ambient_modules: Vec<PatternAmbientModule>,
     pub global_exports: SymbolTable,
     /// Go `JSGlobalAugmentations`.
@@ -722,24 +1168,21 @@ macro_rules! args {
     ($($arg:expr),* $(,)?) => { vec![$(::std::string::ToString::to_string(&$arg)),*] };
 }
 
-/// A `LinkStore` key. Arena handles are dense small indexes, so their
-/// links live in paged slot arrays instead of a hash map.
+/// A `LinkStore` key. Arena handles are dense small indexes, and node and
+/// flow node handles are dense small indexes within a file, so their links
+/// live in paged slot arrays instead of a hash map.
 pub trait LinkKey: Copy + Eq + std::hash::Hash {
-    /// True when `dense_index` gives a small arena index.
-    const DENSE: bool = false;
-
-    fn dense_index(self) -> usize {
-        0
-    }
+    /// The (group, index) of a key with paged slots, or `None` for a key
+    /// that lives in the hash map.
+    fn dense_key(self) -> Option<(usize, usize)>;
 }
 
 macro_rules! dense_link_key {
     ($($name:ident),*) => {$(
         impl LinkKey for $name {
-            const DENSE: bool = true;
-
-            fn dense_index(self) -> usize {
-                self.index()
+            #[inline]
+            fn dense_key(self) -> Option<(usize, usize)> {
+                Some((0, self.index()))
             }
         }
     )*};
@@ -756,28 +1199,61 @@ dense_link_key!(
     SymbolTable
 );
 
-impl LinkKey for Node {}
-impl LinkKey for FlowNodeId {}
+/// Files with an index below this get paged node slots. Synthetic nodes
+/// (a file index near `u32::MAX`) use the hash map.
+const LINK_MAX_GROUPS: u64 = 1 << 20;
 
-/// Slots per page of a dense `LinkStore`. Pages keep sparse stores small.
-const LINK_PAGE_BITS: usize = 9;
+/// Splits a (file << 32 | local + 1) handle into (file, local + 1).
+#[inline]
+fn file_dense_key(handle: u64) -> Option<(usize, usize)> {
+    let file = handle >> 32;
+    (file < LINK_MAX_GROUPS).then_some((file as usize, (handle & 0xffff_ffff) as usize))
+}
+
+impl LinkKey for Node {
+    #[inline]
+    fn dense_key(self) -> Option<(usize, usize)> {
+        file_dense_key(self.0)
+    }
+}
+
+impl LinkKey for FlowNodeId {
+    #[inline]
+    fn dense_key(self) -> Option<(usize, usize)> {
+        file_dense_key(self.0)
+    }
+}
+
+/// Slots per page of a `LinkStore`. Small pages keep sparse stores small.
+const LINK_PAGE_BITS: usize = 6;
 const LINK_PAGE_SIZE: usize = 1 << LINK_PAGE_BITS;
+
+type LinkPages = Vec<Option<Box<[u32; LINK_PAGE_SIZE]>>>;
 
 /// Go `core.LinkStore[K, V]`: lazily created per-key link records.
 /// Dense keys map through paged slots (value index + 1, zero is absent) into
 /// `values`. Other keys use a hash map.
 #[derive(Clone, Debug)]
 pub struct LinkStore<K: LinkKey, V: Default> {
-    pages: Vec<Option<Box<[u32; LINK_PAGE_SIZE]>>>,
-    values: Vec<V>,
+    /// Slot pages by key group (the file for node keys).
+    groups: Vec<LinkPages>,
+    /// Dense values in fixed-size chunks, so growth never copies or
+    /// over-allocates a large block.
+    values: Vec<Vec<V>>,
+    len: usize,
     map: FxHashMap<K, V>,
 }
+
+/// Values per chunk of a dense `LinkStore`.
+const LINK_CHUNK_BITS: usize = 12;
+const LINK_CHUNK_SIZE: usize = 1 << LINK_CHUNK_BITS;
 
 impl<K: LinkKey, V: Default> Default for LinkStore<K, V> {
     fn default() -> Self {
         Self {
-            pages: Vec::new(),
+            groups: Vec::new(),
             values: Vec::new(),
+            len: 0,
             map: FxHashMap::default(),
         }
     }
@@ -785,50 +1261,72 @@ impl<K: LinkKey, V: Default> Default for LinkStore<K, V> {
 
 impl<K: LinkKey, V: Default> LinkStore<K, V> {
     /// The value index for a dense key, if it has a record.
-    fn dense_slot(&self, key: K) -> Option<usize> {
-        let index = key.dense_index();
-        let page = self.pages.get(index >> LINK_PAGE_BITS)?.as_ref()?;
+    #[inline]
+    fn dense_slot(&self, group: usize, index: usize) -> Option<usize> {
+        let page = self
+            .groups
+            .get(group)?
+            .get(index >> LINK_PAGE_BITS)?
+            .as_ref()?;
         let slot = page[index & (LINK_PAGE_SIZE - 1)];
         (slot != 0).then(|| slot as usize - 1)
     }
 
+    #[inline]
+    fn value(&self, value: usize) -> &V {
+        &self.values[value >> LINK_CHUNK_BITS][value & (LINK_CHUNK_SIZE - 1)]
+    }
+
     /// Go `store.Get(key)`: creates the record on first use.
     pub fn get(&mut self, key: K) -> &mut V {
-        if !K::DENSE {
+        let Some((group, index)) = key.dense_key() else {
             return self.map.entry(key).or_default();
+        };
+        if group >= self.groups.len() {
+            self.groups.resize_with(group + 1, Vec::new);
         }
-        let index = key.dense_index();
+        let pages = &mut self.groups[group];
         let page_index = index >> LINK_PAGE_BITS;
-        if page_index >= self.pages.len() {
-            self.pages.resize_with(page_index + 1, || None);
+        if page_index >= pages.len() {
+            pages.resize_with(page_index + 1, || None);
         }
-        let page = self.pages[page_index].get_or_insert_with(|| Box::new([0; LINK_PAGE_SIZE]));
+        let page = pages[page_index].get_or_insert_with(|| Box::new([0; LINK_PAGE_SIZE]));
         let slot = &mut page[index & (LINK_PAGE_SIZE - 1)];
         if *slot == 0 {
-            self.values.push(V::default());
-            *slot = u32::try_from(self.values.len()).expect("link store overflow");
+            if self.len & (LINK_CHUNK_SIZE - 1) == 0 {
+                // The first chunk grows on demand; small stores stay small.
+                self.values.push(if self.len == 0 {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(LINK_CHUNK_SIZE)
+                });
+            }
+            self.values
+                .last_mut()
+                .expect("link chunk")
+                .push(V::default());
+            self.len += 1;
+            *slot = u32::try_from(self.len).expect("link store overflow");
         }
         let value = *slot as usize - 1;
-        &mut self.values[value]
+        &mut self.values[value >> LINK_CHUNK_BITS][value & (LINK_CHUNK_SIZE - 1)]
     }
 
     /// Go `store.Has(key)`.
     #[must_use]
     pub fn has(&self, key: K) -> bool {
-        if K::DENSE {
-            self.dense_slot(key).is_some()
-        } else {
-            self.map.contains_key(&key)
+        match key.dense_key() {
+            Some((group, index)) => self.dense_slot(group, index).is_some(),
+            None => self.map.contains_key(&key),
         }
     }
 
     /// Go `store.TryGet(key)`.
     #[must_use]
     pub fn try_get(&self, key: K) -> Option<&V> {
-        if K::DENSE {
-            self.dense_slot(key).map(|value| &self.values[value])
-        } else {
-            self.map.get(&key)
+        match key.dense_key() {
+            Some((group, index)) => self.dense_slot(group, index).map(|value| self.value(value)),
+            None => self.map.get(&key),
         }
     }
 }
@@ -889,7 +1387,7 @@ pub struct GoFile {
     /// Go `ast.SourceFile` fields that the parser and program set.
     pub info: crate::program::SourceFileInfo,
     /// Binder data per node, indexed by `NodeId::index()`.
-    pub node_bind: std::sync::OnceLock<Vec<NodeBindData>>,
+    pub node_bind: std::sync::OnceLock<FileNodeBind>,
     pub file_bind: std::sync::OnceLock<FileBindData>,
     pub flow_nodes: std::sync::OnceLock<Vec<FlowNode>>,
 }

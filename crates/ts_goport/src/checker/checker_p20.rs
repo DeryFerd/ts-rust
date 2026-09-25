@@ -763,7 +763,7 @@ impl Checker {
         let mut all_this = true;
         let mut type_annotation = Node::NIL;
         let declarations = self.sym(symbol).declarations.clone();
-        for declaration in declarations {
+        for &declaration in declarations.iter() {
             if !is_binary_expression(declaration) {
                 all_this = false;
                 break;
@@ -1039,7 +1039,7 @@ impl Checker {
         {
             let key = CachedTypeKey {
                 kind: CachedTypeKind::WIDENED,
-                type_id: self.ty(t).id,
+                type_id: t,
             };
             if context.is_none() {
                 if let Some(&cached) = self.cached_types.get(&key) {

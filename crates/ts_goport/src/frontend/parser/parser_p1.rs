@@ -163,7 +163,6 @@ pub struct Parser {
     pub statement_has_await_identifier: bool,
     pub has_deprecated_tag: bool,
 
-    pub identifiers: FxHashMap<String, String>,
     pub identifier_count: i32,
     pub not_parenthesized_arrow: FxHashSet<i32>,
     pub jsdoc_infos: Vec<JsDocInfo>,
@@ -202,7 +201,6 @@ pub fn new_parser() -> Parser {
         parsing_contexts: 0,
         statement_has_await_identifier: false,
         has_deprecated_tag: false,
-        identifiers: FxHashMap::default(),
         identifier_count: 0,
         not_parenthesized_arrow: FxHashSet::default(),
         jsdoc_infos: Vec::new(),
@@ -267,19 +265,90 @@ pub fn parse_source_file(
     p.initialize_state(opts, source_text, script_kind);
     let file_name: &'static str = Box::leak(opts.file_name.clone().into_boxed_str());
     p.store = new_file_store(file_name, source_text);
-    p.factory = NodeFactory::for_file(p.store);
-    p.next_token();
-    let result = if p.script_kind == ScriptKind::JSON {
-        p.parse_json_text()
-    } else {
-        p.parse_source_file_worker()
-    };
-    freeze_file_store(p.store);
+    let result = p.parse_into_store();
     set_source_file_diagnostics(result.root, result.diagnostics.clone());
     result
 }
 
+/// A parse that a parse worker made into a detached store
+/// (`parse_source_file_detached`).
+pub struct DetachedParse {
+    pub file: ParsedSourceFile,
+    pub store: DetachedStore,
+    /// True when the parse read `opts.external_module_indicator_options`.
+    /// When false, any options with the same file name and path give the
+    /// same parse.
+    pub read_module_indicator_options: bool,
+    /// The text of each `file.imports` node. The nodes cannot be read after
+    /// the store leaves the worker thread.
+    pub import_specifiers: Vec<String>,
+}
+
+/// `parse_source_file` on a parse worker thread. The nodes go into the
+/// detached store of this thread with a provisional id (`job`), so the
+/// parse does not take a store id. The loading thread gives the store its
+/// real id with `adopt_detached_parse`.
+// PORT: Go parses files on many goroutines (fileloader.go work group) and
+// fixes the file order afterwards. Here store ids follow the serial parse
+// order, so a worker parse gets its id only when the loader asks for it.
+#[must_use]
+pub fn parse_source_file_detached(
+    job: usize,
+    opts: &SourceFileParseOptions,
+    source_text: &'static str,
+    script_kind: ScriptKind,
+) -> DetachedParse {
+    let mut p = new_parser();
+    p.initialize_state(opts, source_text, script_kind);
+    let file_name: &'static str = Box::leak(opts.file_name.clone().into_boxed_str());
+    // Drop what a parse that panicked left on this thread.
+    let _ = take_detached_file_store();
+    p.store = new_detached_file_store(job, file_name, source_text);
+    reset_module_indicator_options_read();
+    let file = p.parse_into_store();
+    let import_specifiers = file.imports.iter().map(|n| n.text().to_string()).collect();
+    DetachedParse {
+        file,
+        store: take_detached_file_store().expect("the detached store of the parse"),
+        read_module_indicator_options: module_indicator_options_read(),
+        import_specifiers,
+    }
+}
+
+/// Makes a detached parse part of the program on the loading thread, as if
+/// `parse_source_file(opts, ..)` had run here now. `opts` must have the file
+/// name and path of the parse; the parse must not have read other module
+/// indicator options than `opts` has.
+#[must_use]
+pub fn adopt_detached_parse(
+    parse: DetachedParse,
+    opts: &SourceFileParseOptions,
+) -> ParsedSourceFile {
+    let DetachedParse {
+        mut file, store, ..
+    } = parse;
+    let remap = adopt_detached_store(store);
+    file.remap_store(remap);
+    file.parse_options = opts.clone();
+    set_source_file_diagnostics(file.root, file.diagnostics.clone());
+    file
+}
+
 impl Parser {
+    /// The part of Go `ParseSourceFile` after `initializeState`, for the
+    /// store in `self.store`. Freezes the store at the end.
+    fn parse_into_store(&mut self) -> ParsedSourceFile {
+        self.factory = NodeFactory::for_file(self.store);
+        self.next_token();
+        let result = if self.script_kind == ScriptKind::JSON {
+            self.parse_json_text()
+        } else {
+            self.parse_source_file_worker()
+        };
+        freeze_file_store(self.store);
+        result
+    }
+
     // Go: parser.go:148 initializeClosures
     // PORT: Go sets the `setParentFromContext` closure field. Rust closures
     // cannot borrow the parser that owns them, so p5
@@ -704,7 +773,6 @@ impl Parser {
         result.language_variant = self.language_variant;
         result.script_kind = self.script_kind;
         set_node_flags(result.root, result.root.flags() | self.source_flags);
-        result.identifiers = self.identifiers.clone();
         result.node_count = self.factory.node_count();
         result.text_count = self.factory.text_count();
         result.identifier_count = self.identifier_count;

@@ -157,6 +157,7 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         },
         files_parser: RefCell::new(FilesParser {
             max_depth: max_node_module_js_depth,
+            single_threaded,
             ..Default::default()
         }),
         root_tasks: Vec::with_capacity(root_files.len() + compiler_options.lib.len()),

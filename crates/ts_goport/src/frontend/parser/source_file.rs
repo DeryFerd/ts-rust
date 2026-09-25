@@ -34,7 +34,6 @@ pub struct ParsedSourceFile {
     pub is_declaration_file: bool,
     pub contains_non_ascii: bool,
     pub uses_uri_style_node_core_modules: Tristate,
-    pub identifiers: FxHashMap<String, String>,
     pub identifier_count: i32,
     pub imports: Vec<Node>,
     pub module_augmentations: Vec<Node>,
@@ -82,7 +81,6 @@ impl ParsedSourceFile {
             is_declaration_file: false,
             contains_non_ascii: false,
             uses_uri_style_node_core_modules: Tristate::Unknown,
-            identifiers: FxHashMap::default(),
             identifier_count: 0,
             imports: Vec::new(),
             module_augmentations: Vec::new(),
@@ -101,6 +99,36 @@ impl ParsedSourceFile {
             common_js_module_indicator: Node::NIL,
             external_module_indicator: Node::NIL,
         }
+    }
+
+    /// Moves the node handles of a detached parse to the real store id
+    /// (`adopt_detached_parse`).
+    pub fn remap_store(&mut self, remap: StoreRemap) {
+        let node = |n: &mut Node| *n = remap.node(*n);
+        self.store = remap.store();
+        node(&mut self.root);
+        node(&mut self.end_of_file_token);
+        node(&mut self.common_js_module_indicator);
+        node(&mut self.external_module_indicator);
+        self.imports.iter_mut().for_each(node);
+        self.module_augmentations.iter_mut().for_each(node);
+        self.reparsed_clones.iter_mut().for_each(node);
+        for diagnostics in [
+            &mut self.diagnostics,
+            &mut self.js_diagnostics,
+            &mut self.jsdoc_diagnostics,
+        ] {
+            for d in diagnostics {
+                remap_diagnostic(d, remap);
+            }
+        }
+        self.jsdoc_cache = std::mem::take(&mut self.jsdoc_cache)
+            .into_iter()
+            .map(|(key, mut jsdocs)| {
+                jsdocs.iter_mut().for_each(node);
+                (remap.node(key), jsdocs)
+            })
+            .collect();
     }
 
     // Go: ast/ast.go:2562 ParseOptions
@@ -138,6 +166,17 @@ impl ParsedSourceFile {
     pub fn is_js(&self) -> bool {
         // Go: IsSourceFileJS
         self.root.flags().intersects(NodeFlags::JAVA_SCRIPT_FILE)
+    }
+}
+
+fn remap_diagnostic(d: &mut Diagnostic, remap: StoreRemap) {
+    d.file = remap.node(d.file);
+    for d in d
+        .message_chain
+        .iter_mut()
+        .chain(d.related_information.iter_mut())
+    {
+        remap_diagnostic(d, remap);
     }
 }
 

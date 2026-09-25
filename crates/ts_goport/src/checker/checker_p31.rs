@@ -205,7 +205,7 @@ impl Checker {
         }
         let key = CachedTypeKey {
             kind: CachedTypeKind::EQUIVALENT_BASE_TYPE,
-            type_id: self.ty(t).id,
+            type_id: t,
         };
         if self
             .ty(t)
@@ -325,7 +325,7 @@ impl Checker {
         }
         let key = CachedTypeKey {
             kind: CachedTypeKind::REGULAR_OBJECT_LITERAL,
-            type_id: self.ty(t).id,
+            type_id: t,
         };
         if let Some(&cached) = self.cached_types.get(&key) {
             if cached.is_some() {
@@ -1354,7 +1354,7 @@ impl Checker {
         }
         let key = CachedTypeKey {
             kind: CachedTypeKind::PROMISED_TYPE_OF_PROMISE,
-            type_id: self.ty(t).id,
+            type_id: t,
         };
         if let Some(&cached) = self.cached_types.get(&key) {
             if cached.is_some() {

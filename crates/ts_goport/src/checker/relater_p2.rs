@@ -217,13 +217,15 @@ impl Checker {
     // PORT: Go package function `excludeProperties` reads symbol names, so it
     // is a `Checker` method. Go `collections.Set[string]` is `FxHashSet<String>`.
     // Go: checker/relater.go:1015 excludeProperties
+    // PORT: takes the list by value and returns it unchanged when nothing is
+    // excluded, instead of copying it.
     pub fn exclude_properties(
         &self,
-        properties: &[SymbolId],
+        properties: Vec<SymbolId>,
         excluded_properties: &FxHashSet<String>,
     ) -> Vec<SymbolId> {
         if excluded_properties.is_empty() || properties.is_empty() {
-            return properties.to_vec();
+            return properties;
         }
         let mut reduced: Vec<SymbolId> = Vec::new();
         let mut excluded = false;
@@ -240,7 +242,7 @@ impl Checker {
         if excluded {
             return reduced;
         }
-        properties.to_vec()
+        properties
     }
 }
 
@@ -847,7 +849,7 @@ impl Checker {
         let symbol = self.ty(tp).symbol;
         if symbol.is_some() {
             let declarations = self.sym(symbol).declarations.clone();
-            for d in declarations {
+            for &d in declarations.iter() {
                 flags |= d.modifier_flags();
             }
         }
