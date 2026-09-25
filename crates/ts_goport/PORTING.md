@@ -208,14 +208,17 @@ checker pool, and diagnostic sorting. `options.rs` defines Go-shaped
 
 ## Exit codes
 
-`goport` and `goport_emit` return the tsc status (Go
-execute/tsc/emit.go:65): 0 success, 1 diagnostics with emit skipped, 2
-diagnostics with emit not skipped. Under noEmit, a program with no
-emittable file (no inputs, or only `.d.ts` files) exits 2. Unported code,
-any other panic and a worker-thread failure exit 70 (`EX_SOFTWARE`). Go
-uses 0 to 5 (3 in cmd/tsgo/sys.go:66, 4 in build mode, 5 NotImplemented),
-so a harness must treat a goport exit outside 0 to 2 as a crash, never as
-a tsgo status.
+`goport`, `goport_emit` and `goport_build` compile and report through the
+shared `execute::tsc` module, as Go `tsc` does. `goport` and `goport_emit`
+return the tsc status (Go execute/tsc/emit.go:65): 0 success, 1
+diagnostics with emit skipped, 2 diagnostics with emit not skipped. Under
+noEmit, a program with no emittable file (no inputs, or only `.d.ts`
+files) exits 2. `goport_build` returns the Go build status, which can also
+be 3 or 4. Unported code, any other panic, a worker-thread failure and a
+failed build worker exit `execute::tsc::EXIT_UNPORTED` (70,
+`EX_SOFTWARE`). Go uses 0 to 5 (3 in cmd/tsgo/sys.go:66, 4 in build mode,
+5 NotImplemented), so a harness must treat a goport exit of 70 as a crash,
+never as a tsgo status.
 
 ## Threads
 

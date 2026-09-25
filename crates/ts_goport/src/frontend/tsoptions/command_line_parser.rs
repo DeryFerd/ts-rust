@@ -93,11 +93,8 @@ pub fn parse_command_line(
 }
 
 // Go: tsoptions/commandlineparser.go:63 ParseBuildCommandLine
-// PORT: build mode (`tsc -b`) is out of scope. The crate has no
-// `ParsedBuildCommandLine`, `BuildOptions` or `buildOptionsParser`.
-pub fn parse_build_command_line(_command_line: &[String], _host: &dyn ParseConfigHost) -> ! {
-    unported!("ParseBuildCommandLine")
-}
+// PORT: ported with the other build mode types in
+// `execute/build/command_line.rs` (`parse_build_command_line`).
 
 // Go: tsoptions/commandlineparser.go:114 parseCommandLineWorker
 // PORT: `fs` is passed down instead of stored (see `CommandLineParser`).

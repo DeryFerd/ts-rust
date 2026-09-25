@@ -1,0 +1,470 @@
+//! Port of execute/incremental/snapshot.go from line 133 (after
+//! `emitSignature`, which is in `hash.rs`): the build info diagnostics with
+//! file names, the diagnostics repopulation, and the `snapshot` state.
+//!
+//! PORT: the process has one program (plan D1), so Go `*compiler.Program`
+//! parameters are dropped and the installed program is read through the
+//! `program.rs` free functions. Go `SyncMap` and `SyncSet` fields are
+//! `IndexMap` and `IndexSet` (see `reference_map.rs` for the order note);
+//! Go `atomic.Bool` and `sync.Once` become plain fields, because the
+//! snapshot is only used on the loading thread.
+
+use super::hash::FileInfo;
+use super::hash::*;
+use super::reference_map::ReferenceMap;
+use crate::emitter::program_emit::WriteFileData;
+use crate::frontend::prelude::*;
+use std::cell::OnceCell;
+
+/// Go `*ast.RepopulateDiagnosticInfo`, as `Diagnostic::repopulate_info`
+/// returns it (`Arc`, because a `Diagnostic` crosses the checker threads).
+pub type RepopulateInfoRef = std::sync::Arc<RepopulateDiagnosticInfo>;
+
+/// Go `diagnostics.Category(raw)`. The build info keeps the raw Go value.
+#[must_use]
+pub fn category_from_raw(raw: i32) -> ts_diagnostics::Category {
+    match raw {
+        0 => ts_diagnostics::Category::Warning,
+        1 => ts_diagnostics::Category::Error,
+        2 => ts_diagnostics::Category::Suggestion,
+        3 => ts_diagnostics::Category::Message,
+        _ => panic!("invalid diagnostic category {raw}"),
+    }
+}
+
+// Go: incremental/snapshot.go:133 buildInfoDiagnosticWithFileName
+// PORT: Go `diagnostics.Category` is kept as the raw Go value, like
+// `BuildInfoDiagnostic.category`; use `category_from_raw`. Go nil slices are
+// empty vectors.
+#[derive(Clone, Debug, Default)]
+pub struct BuildInfoDiagnosticWithFileName {
+    // filename if it is for a File thats other than its stored for
+    pub file: Path,
+    pub no_file: bool,
+    pub pos: i32,
+    pub end: i32,
+    pub code: i32,
+    pub category: i32,
+    pub message_key: String,
+    pub message_args: Vec<String>,
+    pub message_chain: Vec<BuildInfoDiagnosticWithFileName>,
+    pub related_information: Vec<BuildInfoDiagnosticWithFileName>,
+    pub reports_unnecessary: bool,
+    pub reports_deprecated: bool,
+    pub skipped_on_no_emit: bool,
+    pub repopulate_info: Option<RepopulateInfoRef>,
+}
+
+// Go: incremental/snapshot.go:151 DiagnosticsOrBuildInfoDiagnosticsWithFileName
+// PORT: Go nil `diagnostics` is `None`; it marks "not converted yet".
+#[derive(Clone, Debug, Default)]
+pub struct DiagnosticsOrBuildInfoDiagnosticsWithFileName {
+    pub diagnostics: Option<Vec<Diagnostic>>,
+    pub build_info_diagnostics: Vec<BuildInfoDiagnosticWithFileName>,
+}
+
+impl BuildInfoDiagnosticWithFileName {
+    // Go: incremental/snapshot.go:156 toDiagnostic
+    #[must_use]
+    pub fn to_diagnostic(&self, file: Node) -> Diagnostic {
+        let mut file_for_diagnostic = Node::NIL;
+        if !self.file.is_empty() {
+            file_for_diagnostic = get_source_file_by_path(&self.file);
+        } else if !self.no_file {
+            file_for_diagnostic = file;
+        }
+
+        if self.repopulate_info.is_some() {
+            return repopulate_diagnostic_chain(self, file_for_diagnostic);
+        }
+
+        let message_chain = self
+            .message_chain
+            .iter()
+            .map(|msg| msg.to_diagnostic(file_for_diagnostic))
+            .collect();
+        let related_information = self
+            .related_information
+            .iter()
+            .map(|info| info.to_diagnostic(file_for_diagnostic))
+            .collect();
+        new_diagnostic_from_serialized(
+            file_for_diagnostic,
+            TextRange::new(self.pos, self.end),
+            self.code,
+            category_from_raw(self.category),
+            &self.message_key,
+            self.message_args.clone(),
+            message_chain,
+            related_information,
+            self.reports_unnecessary,
+            self.reports_deprecated,
+            self.skipped_on_no_emit,
+        )
+    }
+
+    // Go: incremental/snapshot.go:201 toDiagnosticWithoutRepopulate
+    #[must_use]
+    pub fn to_diagnostic_without_repopulate(&self, file: Node) -> Diagnostic {
+        let message_chain = self
+            .message_chain
+            .iter()
+            .map(|msg| msg.to_diagnostic(file))
+            .collect();
+        let related_information = self
+            .related_information
+            .iter()
+            .map(|info| info.to_diagnostic(file))
+            .collect();
+        new_diagnostic_from_serialized(
+            file,
+            TextRange::new(self.pos, self.end),
+            self.code,
+            category_from_raw(self.category),
+            &self.message_key,
+            self.message_args.clone(),
+            message_chain,
+            related_information,
+            self.reports_unnecessary,
+            self.reports_deprecated,
+            self.skipped_on_no_emit,
+        )
+    }
+}
+
+// Go: incremental/snapshot.go:188 repopulateDiagnosticChain
+// repopulateDiagnosticChain recomputes a diagnostic chain entry that depends on
+// program state which may have changed between incremental builds.
+#[must_use]
+pub fn repopulate_diagnostic_chain(b: &BuildInfoDiagnosticWithFileName, file: Node) -> Diagnostic {
+    let info = b
+        .repopulate_info
+        .clone()
+        .expect("repopulateDiagnosticChain without repopulate info");
+    match info.kind {
+        RepopulateDiagnosticKind::MODE_MISMATCH => repopulate_mode_mismatch_chain(b, file),
+        RepopulateDiagnosticKind::MODULE_NOT_FOUND => {
+            repopulate_module_not_found_chain(b, file, &info)
+        }
+        // Fall back to using the stored (possibly stale) data
+        _ => b.to_diagnostic_without_repopulate(file),
+    }
+}
+
+// Go: incremental/snapshot.go:224 repopulateModeMismatchChain
+#[must_use]
+pub fn repopulate_mode_mismatch_chain(
+    b: &BuildInfoDiagnosticWithFileName,
+    file: Node,
+) -> Diagnostic {
+    if file.is_nil() {
+        return b.to_diagnostic_without_repopulate(file);
+    }
+
+    let details = create_mode_mismatch_details(prog(), file);
+
+    let next_chain = b
+        .message_chain
+        .iter()
+        .map(|msg| msg.to_diagnostic(file))
+        .collect();
+
+    new_diagnostic_from_serialized(
+        file,
+        TextRange::new(b.pos, b.end),
+        details.message.code() as i32,
+        details.message.category(),
+        details.message.key(),
+        details.args,
+        next_chain,
+        Vec::new(),
+        false,
+        false,
+        false,
+    )
+}
+
+// Go: incremental/snapshot.go:251 repopulateModuleNotFoundChain
+#[must_use]
+pub fn repopulate_module_not_found_chain(
+    b: &BuildInfoDiagnosticWithFileName,
+    file: Node,
+    info: &RepopulateDiagnosticInfo,
+) -> Diagnostic {
+    if file.is_nil() {
+        return b.to_diagnostic_without_repopulate(file);
+    }
+
+    let mut package_name = info.package_name.as_str();
+    if package_name.is_empty() {
+        package_name = &info.module_reference;
+    }
+
+    let details = create_module_not_found_chain(
+        prog(),
+        file,
+        &info.module_reference,
+        info.mode,
+        package_name,
+    );
+
+    let next_chain = b
+        .message_chain
+        .iter()
+        .map(|msg| msg.to_diagnostic(file))
+        .collect();
+
+    new_diagnostic_from_serialized(
+        file,
+        TextRange::new(b.pos, b.end),
+        details.message.code() as i32,
+        details.message.category(),
+        details.message.key(),
+        details.args,
+        next_chain,
+        Vec::new(),
+        false,
+        false,
+        false,
+    )
+}
+
+impl DiagnosticsOrBuildInfoDiagnosticsWithFileName {
+    // Go: incremental/snapshot.go:283 getDiagnostics
+    pub fn get_diagnostics(&mut self, file: Node) -> Vec<Diagnostic> {
+        if let Some(diagnostics) = &self.diagnostics {
+            return diagnostics.clone();
+        }
+        // Convert and cache the diagnostics
+        let diagnostics: Vec<Diagnostic> = self
+            .build_info_diagnostics
+            .iter()
+            .map(|diag| diag.to_diagnostic(file))
+            .collect();
+        self.diagnostics = Some(diagnostics.clone());
+        diagnostics
+    }
+}
+
+// Go: incremental/snapshot.go:295 snapshot
+// PORT: Go `options *core.CompilerOptions` is `&'static`: the program
+// options are static, and `buildInfoToSnapshot` leaks the options it reads
+// (one per process). `compiler.ProgramLike.Options` needs `&'static`.
+#[derive(Debug)]
+pub struct Snapshot {
+    // These are the fields that get serialized
+
+    // Information of the file eg. its version, signature etc
+    pub file_infos: IndexMap<Path, FileInfo>,
+    pub options: &'static CompilerOptions,
+    //  Contains the map of ReferencedSet=Referenced files of the file if module emit is enabled
+    pub referenced_map: ReferenceMap,
+    // Cache of semantic diagnostics for files with their Path being the key
+    pub semantic_diagnostics_per_file:
+        IndexMap<Path, DiagnosticsOrBuildInfoDiagnosticsWithFileName>,
+    // Cache of dts emit diagnostics for files with their Path being the key
+    pub emit_diagnostics_per_file: IndexMap<Path, DiagnosticsOrBuildInfoDiagnosticsWithFileName>,
+    // The map has key by source file's path that has been changed
+    pub changed_files_set: IndexSet<Path>,
+    // Files pending to be emitted
+    pub affected_files_pending_emit: IndexMap<Path, FileEmitKind>,
+    // Name of the file whose dts was the latest to change
+    pub latest_changed_dts_file: String,
+    // Hash of d.ts emitted for the file, use to track when emit of d.ts changes
+    // PORT: `FxHashMap` because `BuildInfoEmitSignature::to_emit_signature`
+    // reads it; no Go code depends on its order.
+    pub emit_signatures: FxHashMap<Path, EmitSignature>,
+    // Recorded if program had errors that need to be reported even with --noCheck
+    pub has_errors: Tristate,
+    // Recorded if program had semantic errors only for non incremental build
+    pub has_semantic_errors: bool,
+    // If semantic diagnostic check is pending
+    pub check_pending: bool,
+
+    // Additional fields that are not serialized but needed to track state
+
+    // true if build info emit is pending
+    pub build_info_emit_pending: bool,
+    pub has_errors_from_old_state: Tristate,
+    pub has_semantic_errors_from_old_state: bool,
+    //  Cache of all files excluding default library file for the current program
+    // PORT: Go `allFilesExcludingDefaultLibraryFile` plus its sync.Once.
+    pub all_files_excluding_default_library_file: OnceCell<Vec<Node>>,
+    pub has_changed_dts_file: bool,
+    pub has_emit_diagnostics: bool,
+
+    // Used with testing to add text of hash for better comparison
+    pub hash_with_text: bool,
+}
+
+impl Snapshot {
+    /// A snapshot with Go zero values and the given options.
+    #[must_use]
+    pub fn new(options: &'static CompilerOptions) -> Self {
+        Snapshot {
+            file_infos: IndexMap::default(),
+            options,
+            referenced_map: ReferenceMap::default(),
+            semantic_diagnostics_per_file: IndexMap::default(),
+            emit_diagnostics_per_file: IndexMap::default(),
+            changed_files_set: IndexSet::default(),
+            affected_files_pending_emit: IndexMap::default(),
+            latest_changed_dts_file: String::new(),
+            emit_signatures: FxHashMap::default(),
+            has_errors: Tristate::Unknown,
+            has_semantic_errors: false,
+            check_pending: false,
+            build_info_emit_pending: false,
+            has_errors_from_old_state: Tristate::Unknown,
+            has_semantic_errors_from_old_state: false,
+            all_files_excluding_default_library_file: OnceCell::new(),
+            has_changed_dts_file: false,
+            has_emit_diagnostics: false,
+            hash_with_text: false,
+        }
+    }
+
+    // Go: incremental/snapshot.go:342 addFileToChangeSet
+    pub fn add_file_to_change_set(&mut self, file_path: Path) {
+        self.changed_files_set.insert(file_path);
+        self.build_info_emit_pending = true;
+    }
+
+    // Go: incremental/snapshot.go:347 addFileToAffectedFilesPendingEmit
+    pub fn add_file_to_affected_files_pending_emit(
+        &mut self,
+        file_path: Path,
+        emit_kind: FileEmitKind,
+    ) {
+        let existing_kind = self
+            .affected_files_pending_emit
+            .get(&file_path)
+            .copied()
+            .unwrap_or_default();
+        if emit_kind.intersects(FileEmitKind::DTS_ERRORS) {
+            self.emit_diagnostics_per_file.shift_remove(&file_path);
+        }
+        self.affected_files_pending_emit
+            .insert(file_path, existing_kind | emit_kind);
+        self.build_info_emit_pending = true;
+    }
+
+    // Go: incremental/snapshot.go:356 getAllFilesExcludingDefaultLibraryFile
+    pub fn get_all_files_excluding_default_library_file(&self, first_source_file: Node) -> &[Node] {
+        self.all_files_excluding_default_library_file
+            .get_or_init(|| {
+                let files = source_files();
+                let mut result = Vec::with_capacity(files.len());
+                let mut add_source_file = |file: Node| {
+                    if !is_source_file_default_library(&source_file_info(file).path) {
+                        result.push(file);
+                    }
+                };
+                if first_source_file.is_some() {
+                    add_source_file(first_source_file);
+                }
+                for file in files {
+                    if file != first_source_file {
+                        add_source_file(file);
+                    }
+                }
+                result
+            })
+    }
+
+    // Go: incremental/snapshot.go:384 computeSignatureWithDiagnostics
+    #[must_use]
+    pub fn compute_signature_with_diagnostics(
+        &self,
+        file: Node,
+        text: &str,
+        data: &WriteFileData,
+    ) -> String {
+        compute_signature_with_diagnostics(file, text, data, self.hash_with_text)
+    }
+
+    // Go: incremental/snapshot.go:423 computeHash
+    #[must_use]
+    pub fn compute_hash(&self, text: &str) -> String {
+        compute_hash(text, self.hash_with_text)
+    }
+
+    // Go: incremental/snapshot.go:427 canUseIncrementalState
+    #[must_use]
+    pub fn can_use_incremental_state(&self) -> bool {
+        if !self.options.is_incremental() && self.options.build.is_true() {
+            // If not incremental build (with tsc -b), we don't need to track state except diagnostics per file so we can use it
+            return false;
+        }
+        true
+    }
+}
+
+// Go: incremental/snapshot.go:377 getTextHandlingSourceMapForSignature
+#[must_use]
+pub fn get_text_handling_source_map_for_signature<'a>(
+    text: &'a str,
+    data: &WriteFileData,
+) -> &'a str {
+    if data.source_map_url_pos != -1 {
+        return &text[..data.source_map_url_pos as usize];
+    }
+    text
+}
+
+// Go: incremental/snapshot.go:384 computeSignatureWithDiagnostics
+// PORT: the body of the Go method, as a free function over `hashWithText`,
+// so emit `WriteFile` callbacks on the checker threads can call it without
+// the snapshot.
+#[must_use]
+pub fn compute_signature_with_diagnostics(
+    file: Node,
+    text: &str,
+    data: &WriteFileData,
+    hash_with_text: bool,
+) -> String {
+    let mut builder = String::new();
+    builder.push_str(get_text_handling_source_map_for_signature(text, data));
+    for diag in &data.diagnostics {
+        diagnostic_to_string_builder(Some(diag), file, &mut builder);
+    }
+    compute_hash(&builder, hash_with_text)
+}
+
+// Go: incremental/snapshot.go:393 diagnosticToStringBuilder
+pub fn diagnostic_to_string_builder(
+    diagnostic: Option<&Diagnostic>,
+    file: Node,
+    builder: &mut String,
+) {
+    let Some(diagnostic) = diagnostic else {
+        return;
+    };
+    builder.push('\n');
+    if diagnostic.file() != file {
+        builder.push_str(&ensure_path_is_non_module_name(
+            &get_relative_path_from_directory(
+                &get_directory_path(&source_file_info(file).path),
+                &source_file_info(diagnostic.file()).path,
+                &ComparePathsOptions::default(),
+            ),
+        ));
+    }
+    if diagnostic.file().is_some() {
+        builder.push_str(&format!("({},{}): ", diagnostic.pos(), diagnostic.len()));
+    }
+    builder.push_str(diagnostic.category().name());
+    builder.push_str(&format!("{}: ", diagnostic.code()));
+    builder.push_str(diagnostic.message_key());
+    builder.push('\n');
+    for arg in diagnostic.message_args() {
+        builder.push_str(arg);
+        builder.push('\n');
+    }
+    for chain in diagnostic.message_chain() {
+        diagnostic_to_string_builder(Some(chain), file, builder);
+    }
+    for info in diagnostic.related_information() {
+        diagnostic_to_string_builder(Some(info), file, builder);
+    }
+}

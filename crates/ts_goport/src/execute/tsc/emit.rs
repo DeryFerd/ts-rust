@@ -1,0 +1,228 @@
+//! Go: execute/tsc/emit.go (emit a program and report its diagnostics).
+//!
+//! PORT: Go `compiler.ProgramLike` (compiler/program.go:1710) is the
+//! `ProgramLike` trait below, because this is its first user in the port.
+//! `CompilerProgram` is the plain `*compiler.Program` over the installed
+//! process program; the incremental program implements the same trait.
+//! The process has one program, so Go `EmitInput.Program` (the underlying
+//! `*compiler.Program`) is the installed program and is not a field.
+
+use crate::prelude::*;
+
+use crate::emitter::program_emit::{EmitOptions, EmitResult, WriteFile, emit};
+use crate::frontend::tsoptions::ParsedCommandLine;
+
+use super::compile::{CompileAndEmitResult, CompileTimes, ExitStatus, System, Writer, write_str};
+use super::diagnostics::{DiagnosticReporter, DiagnosticsReporter};
+use super::statistics::{Statistics, read_mem_stats, statistics_from_program};
+
+// Go: compiler/program.go:1710 ProgramLike
+// PORT: only the methods that `EmitFilesAndReportErrors` and
+// `GetDiagnosticsOfAnyProgram` call. Config, syntactic and program
+// diagnostics are read from the installed program by
+// `get_diagnostics_of_any_program`; Go `incremental.Program` forwards them
+// to its program too. Go passes a context; the port has none. The methods
+// take `&self` like Go interface methods; an implementation with state
+// (the incremental snapshot) uses interior mutability.
+pub trait ProgramLike {
+    fn options(&self) -> &'static CompilerOptions;
+    fn get_bind_diagnostics(&self, file: Node) -> Vec<Diagnostic>;
+    fn get_global_diagnostics(&self) -> Vec<Diagnostic>;
+    fn get_semantic_diagnostics(&self, file: Node) -> Vec<Diagnostic>;
+    fn get_declaration_diagnostics(&self, file: Node) -> Vec<Diagnostic>;
+    fn emit(&self, options: EmitOptions) -> EmitResult;
+}
+
+/// Go `*compiler.Program` as a `ProgramLike`: the installed program.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CompilerProgram;
+
+impl ProgramLike for CompilerProgram {
+    // Go: compiler/program.go Options
+    fn options(&self) -> &'static CompilerOptions {
+        options()
+    }
+    // Go: compiler/program.go:643 GetBindDiagnostics
+    fn get_bind_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
+        get_bind_diagnostics(file)
+    }
+    // Go: compiler/program.go GetGlobalDiagnostics
+    fn get_global_diagnostics(&self) -> Vec<Diagnostic> {
+        get_global_diagnostics()
+    }
+    // Go: compiler/program.go:654 GetSemanticDiagnostics
+    fn get_semantic_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
+        get_semantic_diagnostics(file)
+    }
+    // Go: compiler/program.go GetDeclarationDiagnostics
+    fn get_declaration_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
+        get_declaration_diagnostics(file)
+    }
+    // Go: compiler/program.go Emit
+    fn emit(&self, options: EmitOptions) -> EmitResult {
+        emit(options)
+    }
+}
+
+// Go: execute/tsc/emit.go:20 GetTraceWithWriterFromSys
+// PORT: the locale and the testing hook are dropped (see compile.rs).
+pub fn get_trace_with_writer_from_sys(
+    w: Writer,
+) -> Rc<dyn Fn(&'static ts_diagnostics::Message, Vec<String>)> {
+    Rc::new(
+        move |msg: &'static ts_diagnostics::Message, args: Vec<String>| {
+            let text = match msg.format(&args) {
+                Ok(text) => text,
+                Err(_) => panic!("Invalid formatting placeholder"),
+            };
+            write_str(&w, &format!("{text}\n"));
+        },
+    )
+}
+
+// Go: execute/tsc/emit.go:30 EmitInput
+// PORT: `Program` is the installed program (see the module comment).
+// `Testing`, `TestingMTimesCache` and `Tracing` are dropped: they are nil
+// outside Go tests and tracing runs. Go `Config` is optional here: without
+// it, the program options are used, which are the config options with the
+// command line applied.
+pub struct EmitInput<'a> {
+    pub sys: &'a dyn System,
+    pub program_like: &'a dyn ProgramLike,
+    pub config: Option<&'a ParsedCommandLine>,
+    pub report_diagnostic: DiagnosticReporter,
+    pub report_error_summary: DiagnosticsReporter,
+    pub writer: Writer,
+    pub write_file: Option<WriteFile>,
+    pub compile_times: Rc<RefCell<CompileTimes>>,
+}
+
+impl EmitInput<'_> {
+    /// Go `input.Config.CompilerOptions()`.
+    fn config_options(&self) -> &CompilerOptions {
+        match self.config {
+            Some(config) => config.compiler_options(),
+            None => self.program_like.options(),
+        }
+    }
+}
+
+// Go: execute/tsc/emit.go:45 EmitAndReportStatistics
+pub fn emit_and_report_statistics(input: &EmitInput) -> (CompileAndEmitResult, Option<Statistics>) {
+    let mut statistics = None;
+    let mut result = emit_files_and_report_errors(input);
+    if result.status != ExitStatus::Success {
+        // compile exited early
+        return (result, None);
+    }
+    result.times.borrow_mut().total_time = input.sys.since_start();
+
+    if input.config_options().diagnostics.is_true()
+        || input.config_options().extended_diagnostics.is_true()
+    {
+        // PORT: Go runs the GC twice and reads `runtime.MemStats`; see
+        // `read_mem_stats`.
+        let mem_stats = read_mem_stats();
+        let program_statistics = statistics_from_program(&result.times.borrow(), &mem_stats);
+        let mut text = String::new();
+        program_statistics.report(&mut text);
+        write_str(&input.writer, &text);
+        statistics = Some(program_statistics);
+    }
+
+    if result.emit_result.emit_skipped && !result.diagnostics.is_empty() {
+        result.status = ExitStatus::DiagnosticsPresentOutputsSkipped;
+    } else if !result.diagnostics.is_empty() {
+        result.status = ExitStatus::DiagnosticsPresentOutputsGenerated;
+    }
+    (result, statistics)
+}
+
+// Go: execute/tsc/emit.go:72 EmitFilesAndReportErrors
+// PORT: Go times each bind and check call with `sys.Now()`; the port keeps
+// the same assignments.
+pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
+    let mut result = CompileAndEmitResult::default();
+    result.times = input.compile_times.clone();
+    let program_like = input.program_like;
+    let times = result.times.clone();
+
+    let mut all_diagnostics = get_diagnostics_of_any_program(
+        Node::NIL,
+        false,
+        &mut |file| {
+            // Options diagnostics include global diagnostics (even though we collect them separately),
+            // and global diagnostics create checkers, which then bind all of the files. Do this binding
+            // early so we can track the time.
+            let bind_start = std::time::Instant::now();
+            let diags = program_like.get_bind_diagnostics(file);
+            times.borrow_mut().bind_time = bind_start.elapsed();
+            diags
+        },
+        &mut |file| {
+            let check_start = std::time::Instant::now();
+            let diags = program_like.get_semantic_diagnostics(file);
+            times.borrow_mut().check_time = check_start.elapsed();
+            diags
+        },
+        &mut || program_like.get_global_diagnostics(),
+        &mut |file| program_like.get_declaration_diagnostics(file),
+    );
+
+    let mut emit_result = EmitResult {
+        emit_skipped: true,
+        diagnostics: Vec::new(),
+        ..EmitResult::default()
+    };
+    if !program_like.options().list_files_only.is_true() {
+        let emit_start = std::time::Instant::now();
+        emit_result = program_like.emit(EmitOptions {
+            write_file: input.write_file.clone(),
+            ..EmitOptions::default()
+        });
+        result.times.borrow_mut().emit_time = emit_start.elapsed();
+    }
+    all_diagnostics.extend(emit_result.diagnostics.iter().cloned());
+
+    let all_diagnostics = sort_and_deduplicate_diagnostics(all_diagnostics);
+    for diagnostic in &all_diagnostics {
+        (input.report_diagnostic)(diagnostic);
+    }
+
+    list_files(input, &emit_result);
+
+    (input.report_error_summary)(&all_diagnostics);
+    result.diagnostics = all_diagnostics;
+    result.emit_result = emit_result;
+    result.status = ExitStatus::Success;
+    result
+}
+
+// Go: execute/tsc/emit.go:136 listFiles
+// PORT: Go `fmt.Fprintln(w, "TSFILE: ", x)` puts a space between operands.
+fn list_files(input: &EmitInput, emit_result: &EmitResult) {
+    let options = options();
+    if options.list_emitted_files.is_true() {
+        for file in &emit_result.emitted_files {
+            write_str(
+                &input.writer,
+                &format!(
+                    "TSFILE:  {}\n",
+                    crate::frontend::tspath::get_normalized_absolute_path(
+                        file,
+                        get_current_directory()
+                    )
+                ),
+            );
+        }
+    }
+    if options.explain_files.is_true() {
+        let mut text = String::new();
+        crate::program::explain_files(&mut text);
+        write_str(&input.writer, &text);
+    } else if options.list_files.is_true() || options.list_files_only.is_true() {
+        for file in source_files() {
+            write_str(&input.writer, &format!("{}\n", source_file_file_name(file)));
+        }
+    }
+}

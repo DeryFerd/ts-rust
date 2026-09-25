@@ -1,7 +1,10 @@
 //! `goport -p <tsconfig>`: type checks a project with the Go port and prints
 //! the diagnostics like `tsgo --noEmit --pretty false`.
 //!
-//! Go: execute/tsc/emit.go `EmitFilesAndReportErrors` (the non-pretty path).
+//! Go: execute/tsc.go `performCompilation`, which reports through
+//! execute/tsc/emit.go `EmitAndReportStatistics` (the non-pretty path). The
+//! report is the shared `execute::tsc` one, as for `goport_emit` and
+//! `goport_build`.
 //!
 //! Each Go-ported stage runs under `catch_unwind`, so one unported path does
 //! not hide the other diagnostics. Unported hits are printed to stderr as
@@ -12,7 +15,8 @@
 //! the emit was not skipped. Under noEmit, only a program with no emittable
 //! file (no inputs, or only `.d.ts` files) has diagnostics with exit 2.
 //! A run that hit unported code (or another panic) exits
-//! `EXIT_UNPORTED` (70), a code tsgo never returns (Go uses 0 to 5).
+//! `execute::tsc::EXIT_UNPORTED` (70), a code tsgo never returns (Go uses
+//! 0 to 5).
 
 use std::any::Any;
 use std::io::Write;
@@ -20,15 +24,14 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
 
 use ts_goport::emitter::program_emit::{EmitOptions, EmitResult, emit_with};
-use ts_goport::execute::tsc::statistics::{CompileTimes, read_mem_stats, statistics_from_program};
+use ts_goport::execute::tsc::{
+    CompileTimes, EXIT_UNPORTED, EmitInput, ExitStatus, ProgramLike, Writer,
+    create_diagnostic_reporter, create_report_error_summary, emit_and_report_statistics,
+    new_os_system,
+};
 use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
-
-/// Exit code when unported code or another panic was hit. It is outside the
-/// Go `ExitStatus` range (execute/tsc/compile.go:32, 0 to 5), so it never
-/// looks like a tsgo status. 70 is `EX_SOFTWARE` (internal software error).
-const EXIT_UNPORTED: i32 = 70;
 
 /// Stack size for the worker thread. The checker recurses deeply on large
 /// projects.
@@ -180,24 +183,35 @@ fn guard<T: Default>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-// Go: execute/tsc/emit.go:72 EmitFilesAndReportErrors
+// Go: execute/tsc.go:289 performCompilation (the non-incremental path) and
+// execute/tsc.go:244 (the incremental one), with the command line
+// `--noEmit --pretty false`.
 // PORT: noEmit is forced, so the emit step writes no files. It still runs,
 // because Go reports the declaration transformer diagnostics during emit
-// (see `collect_all_diagnostics`). The error summary is only written in
-// pretty mode, so it is not written.
-// Go: execute/tsc/emit.go:45 EmitAndReportStatistics prints the statistics
-// after the diagnostics.
+// (see `GuardedProgram::emit`). The report goes to a buffer that is
+// written to stdout at the end, also when a step panics.
 fn run(config: &str, start: Instant) -> i32 {
+    let sys = match new_os_system() {
+        Ok(sys) => sys,
+        Err(status) => return status.code(),
+    };
+    let buffer: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+    let writer: Writer = buffer.clone();
+    let sys = sys.with_start(start).with_writer(writer.clone());
+
     let mut compile_times = CompileTimes::default();
     let loaded = catch_unwind(AssertUnwindSafe(|| {
         try_load_timed(
             config,
-            |options| options.no_emit = Tristate::True,
+            |options| {
+                options.no_emit = Tristate::True;
+                options.pretty = Tristate::False;
+            },
             &mut compile_times,
         )
     }));
-    let program_loaded = matches!(loaded, Ok(Ok(_)));
-    let (diagnostics, emit_skipped) = match loaded {
+    let mut status = ExitStatus::Success;
+    match loaded {
         Ok(Ok(_)) => {
             // Go: execute/tsc.go:294 and :308 time the build info read and
             // the incremental program. PORT: goport reads no build info and
@@ -209,33 +223,33 @@ fn run(config: &str, start: Instant) -> i32 {
                 let changes_compute_start = Instant::now();
                 compile_times.changes_compute_time = changes_compute_start.elapsed();
             }
-            guard(|| collect_all_diagnostics(&mut compile_times))
+            let reported = catch_unwind(AssertUnwindSafe(|| {
+                let options = options();
+                emit_and_report_statistics(&EmitInput {
+                    sys: &sys,
+                    program_like: &GuardedProgram,
+                    config: None,
+                    report_diagnostic: create_diagnostic_reporter(&sys, writer.clone(), options),
+                    report_error_summary: create_report_error_summary(&sys, Some(options)),
+                    writer: writer.clone(),
+                    write_file: None,
+                    compile_times: Rc::new(RefCell::new(compile_times)),
+                })
+            }));
+            match reported {
+                Ok((result, _statistics)) => status = result.status,
+                Err(payload) => note_panic(payload.as_ref()),
+            }
         }
         Ok(Err(message)) => {
             eprintln!("goport: {message}");
             return 1;
         }
-        Err(payload) => {
-            note_panic(payload.as_ref());
-            (Vec::new(), false)
-        }
-    };
-
-    let mut output = String::new();
-    write_format_diagnostics(&mut output, &diagnostics);
-    if program_loaded {
-        compile_times.total_time = start.elapsed();
-        let options = options();
-        if options.diagnostics.is_true() || options.extended_diagnostics.is_true() {
-            let mem_stats = read_mem_stats();
-            let statistics = guard(|| Some(statistics_from_program(&compile_times, &mem_stats)));
-            if let Some(statistics) = statistics {
-                statistics.report(&mut output);
-            }
-        }
+        Err(payload) => note_panic(payload.as_ref()),
     }
+
     let mut stdout = std::io::stdout().lock();
-    let _ = stdout.write_all(output.as_bytes());
+    let _ = stdout.write_all(&buffer.borrow());
     let _ = stdout.flush();
 
     let unported = unported_report();
@@ -247,84 +261,47 @@ fn run(config: &str, start: Instant) -> i32 {
     if !unported.is_empty() {
         return EXIT_UNPORTED;
     }
-    // Go: execute/tsc/emit.go:65
-    if emit_skipped && !diagnostics.is_empty() {
-        1 // ExitStatusDiagnosticsPresent_OutputsSkipped
-    } else if !diagnostics.is_empty() {
-        2 // ExitStatusDiagnosticsPresent_OutputsGenerated
-    } else {
-        0 // ExitStatusSuccess
-    }
+    status.code()
 }
 
-/// The tsc diagnostics pipeline, with each checker call guarded per file.
-/// Returns the sorted diagnostics and the emit result's `EmitSkipped`.
-/// Records the bind, check and emit times in `times` like Go.
-fn collect_all_diagnostics(times: &mut CompileTimes) -> (Vec<Diagnostic>, bool) {
-    let mut bind_time = None;
-    let mut check_time = None;
-    let all_diagnostics = get_diagnostics_of_any_program(
-        Node::NIL,
-        false,
-        &mut |file| {
-            let bind_start = Instant::now();
-            let diags = guard(|| get_bind_diagnostics(file));
-            bind_time = Some(bind_start.elapsed());
-            diags
-        },
-        &mut |file| {
-            let check_start = Instant::now();
-            let diags = collect_checker_diagnostics_with(file, check_file_guarded);
-            check_time = Some(check_start.elapsed());
-            diags
-        },
-        &mut || guard(get_global_diagnostics),
-        &mut |file| guard(|| get_declaration_diagnostics(file)),
-    );
-    if let Some(bind_time) = bind_time {
-        times.bind_time = bind_time;
-    }
-    if let Some(check_time) = check_time {
-        times.check_time = check_time;
-    }
+/// The installed program as a Go `ProgramLike`, with each step guarded on
+/// its own so one unported path does not hide the other diagnostics.
+struct GuardedProgram;
 
-    let mut all_diagnostics = all_diagnostics;
-    // Go: execute/tsc/emit.go:104 listFilesOnly keeps this skipped result.
-    let mut emit_result = EmitResult {
-        emit_skipped: true,
-        ..EmitResult::default()
-    };
-    if !options().list_files_only.is_true() {
-        let emit_start = Instant::now();
-        emit_result = guard(emit_diagnostics);
-        times.emit_time = emit_start.elapsed();
+impl ProgramLike for GuardedProgram {
+    fn options(&self) -> &'static CompilerOptions {
+        options()
     }
-    all_diagnostics.extend(emit_result.diagnostics);
-
-    (
-        sort_and_deduplicate_diagnostics(all_diagnostics),
-        emit_result.emit_skipped,
-    )
-}
-
-/// The diagnostics of the emit step (Go: execute/tsc/emit.go:103
-/// `ProgramLike.Emit`). Under noEmit, Go `emitDeclarationFile` still runs the
-/// declaration transformer and reports its diagnostics before it checks
-/// `NoEmit` (compiler/emitter.go:226). Each file is guarded on its own.
-fn emit_diagnostics() -> EmitResult {
-    // Go: execute/tsc.go:244 an incremental program is an
-    // `incremental.Program`. Its Emit under noEmit
-    // (execute/incremental/program.go:205) skips the file emit and only
-    // writes the build info.
-    // PORT: the build info is not written, so this adds no diagnostics.
-    if options().is_incremental() {
-        return EmitResult {
-            emit_skipped: true,
-            ..EmitResult::default()
-        };
+    fn get_bind_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
+        guard(|| get_bind_diagnostics(file))
     }
-    // PORT: tsc passes no `WriteFile`. Under noEmit nothing is written.
-    emit_with(EmitOptions::default(), |emit_file| guard(emit_file))
+    fn get_global_diagnostics(&self) -> Vec<Diagnostic> {
+        guard(get_global_diagnostics)
+    }
+    fn get_semantic_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
+        collect_checker_diagnostics_with(file, check_file_guarded)
+    }
+    fn get_declaration_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
+        guard(|| get_declaration_diagnostics(file))
+    }
+    /// Under noEmit, Go `emitDeclarationFile` still runs the declaration
+    /// transformer and reports its diagnostics before it checks `NoEmit`
+    /// (compiler/emitter.go:226). Each file is guarded on its own.
+    fn emit(&self, emit_options: EmitOptions) -> EmitResult {
+        // Go: execute/tsc.go:244 an incremental program is an
+        // `incremental.Program`. Its Emit under noEmit
+        // (execute/incremental/program.go:205) skips the file emit and only
+        // writes the build info.
+        // PORT: the build info is not written, so this adds no diagnostics.
+        if options().is_incremental() {
+            return EmitResult {
+                emit_skipped: true,
+                ..EmitResult::default()
+            };
+        }
+        // PORT: tsc passes no `WriteFile`. Under noEmit nothing is written.
+        guard(|| emit_with(emit_options, |emit_file| guard(emit_file)))
+    }
 }
 
 /// Semantic diagnostics for one file. A panic drops that file's results and

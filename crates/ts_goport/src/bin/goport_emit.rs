@@ -1,7 +1,10 @@
 //! `goport_emit -p <tsconfig> --outDir <dir>`: compiles a project with the Go
 //! port and writes the `.js`, `.d.ts` and `.map` outputs like `tsgo`.
 //!
-//! Go: execute/tsc/emit.go `EmitFilesAndReportErrors` (the non-pretty path).
+//! Go: execute/tsc.go `performCompilation`, which reports through
+//! execute/tsc/emit.go `EmitAndReportStatistics` (the non-pretty path). The
+//! report is the shared `execute::tsc` one, as for `goport` and
+//! `goport_build`.
 //!
 //! Output paths are the Go paths. A config `declarationDir`, or a `.js`
 //! file of a source outside the common source directory, can put an output
@@ -30,25 +33,26 @@
 //!
 //! Exit codes are the tsc ones: 0, 1 when there are diagnostics and the
 //! emit was skipped, 2 when there are diagnostics and outputs were written.
-//! A run that hit unported code (or another panic) exits `EXIT_UNPORTED`
-//! (70), a code tsgo never returns (Go uses 0 to 5), and says so on stderr.
+//! A run that hit unported code (or another panic) exits
+//! `execute::tsc::EXIT_UNPORTED` (70), a code tsgo never returns (Go uses 0
+//! to 5), and says so on stderr.
 
 use std::any::Any;
 use std::collections::HashSet;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use ts_goport::emitter::emitter::EmitOnly;
 use ts_goport::emitter::program_emit::{EmitOptions, EmitResult, WriteFile, WriteFileData, emit};
+use ts_goport::execute::tsc::{
+    CompileTimes, EXIT_UNPORTED, EmitInput, ExitStatus, ProgramLike, Writer,
+    create_diagnostic_reporter, create_report_error_summary, emit_and_report_statistics,
+    new_os_system,
+};
 use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
-
-/// Exit code when unported code or another panic was hit. It is outside the
-/// Go `ExitStatus` range (execute/tsc/compile.go:32, 0 to 5), so it never
-/// looks like a tsgo status. 70 is `EX_SOFTWARE` (internal software error).
-const EXIT_UNPORTED: i32 = 70;
 
 /// Stack size for the worker thread. The checker recurses deeply on large
 /// projects.
@@ -98,6 +102,8 @@ fn apply_flag(options: &mut CompilerOptions, flag: &str, value: bool) {
 }
 
 fn main() {
+    // Go: `System.SinceStart` counts from the process start.
+    let start = Instant::now();
     let config = match parse_args(std::env::args().skip(1).collect()) {
         Ok(config) => config,
         Err(message) => {
@@ -112,7 +118,7 @@ fn main() {
     let worker = std::thread::Builder::new()
         .name("goport_emit".to_string())
         .stack_size(STACK_SIZE)
-        .spawn(move || run(&config));
+        .spawn(move || run(&config, start));
     let code = if let Ok(Ok(code)) = worker.map(std::thread::JoinHandle::join) {
         code
     } else {
@@ -250,8 +256,11 @@ fn config_directory(project: &str) -> String {
     }
 }
 
-// Go: execute/tsc/emit.go:72 EmitFilesAndReportErrors
-fn run(config: &Config) -> i32 {
+// Go: execute/tsc.go:289 performCompilation with the command line
+// `--pretty false` and the emit options above.
+// PORT: the report goes to a buffer that is written to stdout at the end,
+// also when a step panics.
+fn run(config: &Config, start: Instant) -> i32 {
     let config_dir = config_directory(&config.project);
     if config.write_root.is_none() && is_inside(&config.out_dir, &config_dir) {
         eprintln!(
@@ -260,17 +269,31 @@ fn run(config: &Config) -> i32 {
         );
         return 1;
     }
+    let sys = match new_os_system() {
+        Ok(sys) => sys,
+        Err(status) => return status.code(),
+    };
+    let buffer: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+    let writer: Writer = buffer.clone();
+    let sys = sys.with_start(start).with_writer(writer.clone());
+
+    let mut compile_times = CompileTimes::default();
     let loaded = catch_unwind(AssertUnwindSafe(|| {
         // `options` are the command line options, applied over the config.
-        try_load_with(&config.project, |options| {
-            if let Some(dir) = &config.declaration_dir {
-                options.declaration_dir.clone_from(dir);
-            }
-            options.out_dir.clone_from(&config.out_dir);
-            for (flag, value) in &config.flags {
-                apply_flag(options, flag, *value);
-            }
-        })
+        try_load_timed(
+            &config.project,
+            |options| {
+                if let Some(dir) = &config.declaration_dir {
+                    options.declaration_dir.clone_from(dir);
+                }
+                options.out_dir.clone_from(&config.out_dir);
+                for (flag, value) in &config.flags {
+                    apply_flag(options, flag, *value);
+                }
+                options.pretty = Tristate::False;
+            },
+            &mut compile_times,
+        )
     }));
     match loaded {
         Ok(Ok(_)) => {}
@@ -280,7 +303,7 @@ fn run(config: &Config) -> i32 {
         }
         Err(payload) => {
             note_panic(payload.as_ref());
-            return report(&[], true);
+            return finish(&buffer, &[], "", ExitStatus::Success);
         }
     }
 
@@ -303,35 +326,33 @@ fn run(config: &Config) -> i32 {
         }
     }
 
-    let mut all_diagnostics = guard(collect_all_diagnostics);
-
     let refused: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let write_root = config.write_root.as_ref().unwrap_or(&config.out_dir);
     let write_file = new_write_file(write_root.clone(), inputs, refused.clone());
-    // Go: execute/tsc/emit.go:103 listFilesOnly skips the emit.
-    let mut emit_result = EmitResult {
-        emit_skipped: true,
-        ..EmitResult::default()
+    let reported = catch_unwind(AssertUnwindSafe(|| {
+        let options = options();
+        emit_and_report_statistics(&EmitInput {
+            sys: &sys,
+            program_like: &GuardedProgram,
+            config: None,
+            report_diagnostic: create_diagnostic_reporter(&sys, writer.clone(), options),
+            report_error_summary: create_report_error_summary(&sys, Some(options)),
+            writer: writer.clone(),
+            write_file: Some(write_file),
+            compile_times: Rc::new(RefCell::new(compile_times)),
+        })
+    }));
+    let status = match reported {
+        Ok((result, _statistics)) => result.status,
+        Err(payload) => {
+            note_panic(payload.as_ref());
+            ExitStatus::Success
+        }
     };
-    if !options().list_files_only.is_true() {
-        emit_result = guard(|| {
-            emit(EmitOptions {
-                target_source_file: Node::NIL,
-                emit_only: EmitOnly::All,
-                write_file: Some(write_file),
-            })
-        });
-    }
-    let emit_skipped = emit_result.emit_skipped;
-    all_diagnostics.extend(emit_result.diagnostics);
-    let all_diagnostics = sort_and_deduplicate_diagnostics(all_diagnostics);
 
     let refused = refused.lock().map(|r| r.clone()).unwrap_or_default();
-    for path in &refused {
-        eprintln!("goport_emit: refused to write {path} (outside {write_root} or an input file)");
-    }
     // A refused write is also a TS5033 diagnostic, so the status is the tsc one.
-    report(&all_diagnostics, emit_skipped)
+    finish(&buffer, &refused, write_root, status)
 }
 
 /// The Go `WriteFile` callback: writes only under `root`, and never over a
@@ -362,17 +383,22 @@ fn new_write_file(
     )
 }
 
-/// Prints the diagnostics and unported counts and returns the exit code:
-/// the Go tsc status (0, 1 when outputs were skipped, 2 when generated with
-/// diagnostics), or `EXIT_UNPORTED` when something was unported.
-// Go: execute/tsc/emit.go:65 (the exit status)
-fn report(diagnostics: &[Diagnostic], emit_skipped: bool) -> i32 {
-    let mut output = String::new();
-    write_format_diagnostics(&mut output, diagnostics);
+/// Writes the report to stdout, then the refused writes and the unported
+/// counts to stderr, and returns the exit code: the tsc `status`, or
+/// `EXIT_UNPORTED` when something was unported.
+fn finish(
+    buffer: &RefCell<Vec<u8>>,
+    refused: &[String],
+    write_root: &str,
+    status: ExitStatus,
+) -> i32 {
     let mut stdout = std::io::stdout().lock();
-    let _ = stdout.write_all(output.as_bytes());
+    let _ = stdout.write_all(&buffer.borrow());
     let _ = stdout.flush();
 
+    for path in refused {
+        eprintln!("goport_emit: refused to write {path} (outside {write_root} or an input file)");
+    }
     let unported = unported_report();
     let mut stderr = std::io::stderr().lock();
     for (name, count) in &unported {
@@ -380,26 +406,35 @@ fn report(diagnostics: &[Diagnostic], emit_skipped: bool) -> i32 {
     }
 
     if !unported.is_empty() {
-        EXIT_UNPORTED
-    } else if diagnostics.is_empty() {
-        0
-    } else if emit_skipped {
-        1
-    } else {
-        2
+        return EXIT_UNPORTED;
     }
+    status.code()
 }
 
-/// The tsc diagnostics pipeline, with each checker call guarded per file.
-fn collect_all_diagnostics() -> Vec<Diagnostic> {
-    get_diagnostics_of_any_program(
-        Node::NIL,
-        false,
-        &mut |file| guard(|| get_bind_diagnostics(file)),
-        &mut |file| collect_checker_diagnostics_with(file, check_file_guarded),
-        &mut || guard(get_global_diagnostics),
-        &mut |file| guard(|| get_declaration_diagnostics(file)),
-    )
+/// The installed program as a Go `ProgramLike`, with each step guarded on
+/// its own so one unported path does not hide the other diagnostics.
+struct GuardedProgram;
+
+impl ProgramLike for GuardedProgram {
+    fn options(&self) -> &'static CompilerOptions {
+        options()
+    }
+    fn get_bind_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
+        guard(|| get_bind_diagnostics(file))
+    }
+    fn get_global_diagnostics(&self) -> Vec<Diagnostic> {
+        guard(get_global_diagnostics)
+    }
+    fn get_semantic_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
+        collect_checker_diagnostics_with(file, check_file_guarded)
+    }
+    fn get_declaration_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
+        guard(|| get_declaration_diagnostics(file))
+    }
+    // PORT: `.tsbuildinfo` is not written (see the top).
+    fn emit(&self, emit_options: EmitOptions) -> EmitResult {
+        guard(|| emit(emit_options))
+    }
 }
 
 /// Semantic diagnostics for one file. A panic drops that file's results and

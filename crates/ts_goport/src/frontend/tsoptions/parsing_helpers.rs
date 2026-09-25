@@ -63,7 +63,7 @@ pub fn parse_string(value: &CompilerOptionsValue) -> String {
 // Go: tsoptions/parsinghelpers.go:62 parseNumber
 // PORT: Go `*int` is `Option<i32>`. Go `int(float64)` truncates toward zero;
 // `as i32` does the same for values in range.
-fn parse_number(value: &CompilerOptionsValue) -> Option<i32> {
+pub fn parse_number(value: &CompilerOptionsValue) -> Option<i32> {
     if let CompilerOptionsValue::Int(num) = value {
         return Some(*num);
     }
@@ -202,8 +202,7 @@ impl OptionParser for TypeAcquisitionParser<'_> {
 }
 
 // Go: tsoptions/parsinghelpers.go:176 buildOptionsParser
-// PORT: not ported. Build mode is out of scope for this port, and the crate
-// has no `core.BuildOptions` type.
+// PORT: ported next to `core.BuildOptions` in execute/build/command_line.rs.
 
 // Go: tsoptions/parsinghelpers.go:192 ParseCompilerOptions
 // PORT: Go `allOptions` can be nil; every Rust caller has options, so the
@@ -525,8 +524,7 @@ pub fn parse_type_acquisition(
 }
 
 // Go: tsoptions/parsinghelpers.go:538 ParseBuildOptions
-// PORT: not ported. Build mode is out of scope, and the crate has no
-// `core.BuildOptions` type.
+// PORT: ported in execute/build/command_line.rs.
 
 // Go: tsoptions/parsinghelpers.go:570 mergeCompilerOptions
 // mergeCompilerOptions merges the source compiler options into the target compiler options

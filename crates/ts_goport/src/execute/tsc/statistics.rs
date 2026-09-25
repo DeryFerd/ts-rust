@@ -1,27 +1,12 @@
 //! Go: execute/tsc/statistics.go, the `--diagnostics` and
-//! `--extendedDiagnostics` table, and the `CompileTimes` of
-//! execute/tsc/compile.go that the table reads.
+//! `--extendedDiagnostics` table.
 
 use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::prelude::*;
 
-// Go: execute/tsc/compile.go:65 CompileTimes
-// PORT: kept here with its only reader. Go keeps `bindTime`, `checkTime`,
-// `totalTime` and `emitTime` unexported; the goport binary sets them, so all
-// fields are public.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CompileTimes {
-    pub config_time: Duration,
-    pub parse_time: Duration,
-    pub bind_time: Duration,
-    pub check_time: Duration,
-    pub total_time: Duration,
-    pub emit_time: Duration,
-    pub build_info_read_time: Duration,
-    pub changes_compute_time: Duration,
-}
+use super::compile::CompileTimes;
 
 struct TableRow {
     name: String,
