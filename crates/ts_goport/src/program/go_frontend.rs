@@ -41,9 +41,10 @@ impl ParseConfigHost for System {
     }
 }
 
-/// True when `GOPORT_FRONTEND=go` selects this loader.
+/// True unless `GOPORT_FRONTEND=legacy` selects the old ts_compiler loader.
+/// The Go frontend is the default.
 pub(super) fn enabled() -> bool {
-    std::env::var("GOPORT_FRONTEND").is_ok_and(|value| value == "go")
+    std::env::var("GOPORT_FRONTEND").map_or(true, |value| value != "legacy")
 }
 
 /// `try_load_with` for the Go frontend.
