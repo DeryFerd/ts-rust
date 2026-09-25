@@ -159,7 +159,9 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
             max_depth: max_node_module_js_depth,
             ..Default::default()
         }),
-        root_tasks: Vec::with_capacity(root_files.len() + compiler_options.lib.len()),
+        root_tasks: Vec::with_capacity(
+            root_files.len() + compiler_options.lib.as_ref().map_or(0, Vec::len),
+        ),
         supported_extensions,
         supported_extensions_with_json_if_resolve_json_module,
         resolver: None,
@@ -200,19 +202,8 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         );
     }
     if !root_files.is_empty() && compiler_options.no_lib.is_false_or_unknown() {
-        // PORT: Go `compilerOptions.Lib == nil`. `CompilerOptions.lib` is a
-        // `Vec`, so an empty list is taken as nil. Go `"lib": []` gives no
-        // default lib; here it gives the default lib.
-        if compiler_options.lib.is_empty() {
-            let name = get_default_lib_file_name(&compiler_options);
-            let lib_file = loader.path_for_lib_file(&name);
-            loader.add_root_task(
-                &lib_file.path,
-                Some(lib_file.clone()),
-                new_file_include_reason(FileIncludeKind::LIB_FILE, FileIncludeData::None),
-            );
-        } else {
-            for (index, lib) in compiler_options.lib.iter().enumerate() {
+        if let Some(libs) = &compiler_options.lib {
+            for (index, lib) in libs.iter().enumerate() {
                 let (name, ok) = get_lib_file_name(lib);
                 if ok {
                     let lib_file = loader.path_for_lib_file(&name);
@@ -227,6 +218,14 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
                 }
                 // !!! error on unknown name
             }
+        } else {
+            let name = get_default_lib_file_name(&compiler_options);
+            let lib_file = loader.path_for_lib_file(&name);
+            loader.add_root_task(
+                &lib_file.path,
+                Some(lib_file.clone()),
+                new_file_include_reason(FileIncludeKind::LIB_FILE, FileIncludeData::None),
+            );
         }
     }
 
@@ -1214,4 +1213,91 @@ fn get_jsx_implicit_import_base_of_file(
         return result;
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::bundled;
+    use crate::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
+    use crate::frontend::vfs::osvfs_fs;
+
+    struct System {
+        fs: Rc<dyn Fs>,
+        current_directory: String,
+    }
+
+    impl ParseConfigHost for System {
+        fn fs(&self) -> Rc<dyn Fs> {
+            self.fs.clone()
+        }
+        fn get_current_directory(&self) -> String {
+            self.current_directory.clone()
+        }
+    }
+
+    /// Loads a one-file project with `compilerOptions` and returns the base
+    /// names of the lib files in the program.
+    fn lib_file_names(label: &str, compiler_options: &str) -> Vec<String> {
+        let dir = std::env::temp_dir().join(format!(
+            "ts_goport_file_loader_{label}_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ts"), "export const a = 1;\n").unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            format!(r#"{{ "compilerOptions": {compiler_options}, "files": ["a.ts"] }}"#),
+        )
+        .unwrap();
+        let cwd = dir.to_string_lossy().replace('\\', "/");
+        let fs = bundled::wrap_fs(osvfs_fs());
+        let sys = System {
+            fs: fs.clone(),
+            current_directory: cwd.clone(),
+        };
+        let (config, errors) = get_parsed_command_line_of_config_file(
+            &format!("{cwd}/tsconfig.json"),
+            None,
+            None,
+            &sys,
+            None,
+        );
+        assert!(errors.is_empty());
+        let host = new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, None);
+        let processed = process_all_program_files(
+            ProgramOptions {
+                host,
+                config: Rc::new(config.unwrap()),
+                use_source_of_project_reference: false,
+                single_threaded: Tristate::True,
+                typings_location: String::new(),
+                project_name: String::new(),
+            },
+            true,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        processed
+            .files
+            .iter()
+            .map(|file| get_base_file_name(file.file_name()))
+            .filter(|name| name.starts_with("lib."))
+            .collect()
+    }
+
+    // Go `compilerOptions.Lib == nil` loads the default lib. An explicit
+    // empty list is not nil, so it loads no lib.
+    #[test]
+    fn empty_lib_list_loads_no_lib() {
+        assert_eq!(
+            lib_file_names("empty", r#"{ "lib": [] }"#),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn absent_lib_loads_default_lib() {
+        let names = lib_file_names("absent", r#"{ "target": "es2015" }"#);
+        assert!(names.iter().any(|name| name == "lib.es6.d.ts"), "{names:?}");
+    }
 }

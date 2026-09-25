@@ -622,9 +622,7 @@ impl NewProgram {
             );
         }
 
-        // PORT: Go `options.Lib != nil`. `CompilerOptions.lib` is a `Vec`, so
-        // an explicit `"lib": []` is taken as nil here.
-        if !options.lib.is_empty() && options.no_lib.is_true() {
+        if options.lib.is_some() && options.no_lib.is_true() {
             self.create_diagnostic_for_option_name(
                 syntax,
                 diag::Option_0_cannot_be_specified_with_option_1,

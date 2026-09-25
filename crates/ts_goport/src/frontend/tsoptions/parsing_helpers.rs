@@ -307,9 +307,9 @@ fn parse_compiler_options_worker(
         "jsxImportSource" => all_options.jsx_import_source = parse_string(value),
         "lib" => {
             if let CompilerOptionsValue::StringList(lib) = value {
-                all_options.lib = lib.clone();
+                all_options.lib = Some(lib.clone());
             } else {
-                all_options.lib = parse_string_array(value).unwrap_or_default();
+                all_options.lib = parse_string_array(value);
             }
         }
         "libReplacement" => all_options.lib_replacement = parse_tristate(value),
@@ -540,7 +540,8 @@ pub fn parse_type_acquisition(
 // PORT: Go loops over the struct fields by reflection. The Rust port lists
 // each field with its Go json name, in Go field order. Go `IsZero` is
 // `== Default::default()`: a nil or empty Rust `Vec` is zero, while a Go
-// empty non-nil slice is not zero. Go `rawSource any` is the map it must
+// empty non-nil slice is not zero. `lib` is an `Option`, so it keeps that
+// difference. Go `rawSource any` is the map it must
 // hold to have an effect, so it is `Option<&IndexMap>`. The Go merge
 // copies the `Paths` pointer, so a later in-place change of `paths` also
 // changes the source options; the Rust clone does not share it.

@@ -347,7 +347,14 @@ impl FileIncludeReason {
                 if ok {
                     return new_compiler_diagnostic(
                         diag::Library_0_specified_in_compilerOptions,
-                        args![program.options().lib[index as usize]],
+                        args![
+                            program
+                                .options()
+                                .lib
+                                .as_ref()
+                                .expect("lib is set for an indexed lib file")
+                                [index as usize]
+                        ],
                     );
                 }
                 let target = program.options().get_emit_script_target().string();
@@ -534,7 +541,12 @@ impl FileIncludeReason {
                             .include_processor
                             .get_compiler_options_object_literal_syntax(program),
                         "lib",
-                        &program.options().lib[index as usize],
+                        &program
+                            .options()
+                            .lib
+                            .as_ref()
+                            .expect("lib is set for an indexed lib file")
+                            [index as usize],
                     );
                     if !lib_syntax.is_nil() {
                         return Some(create_diagnostic_for_node_in_source_file(

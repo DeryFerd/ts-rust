@@ -19,7 +19,7 @@ pub struct KnownDirectoryLink {
 // Go: symlinks/knownsymlinks.go:22 KnownSymlinks
 // PORT: Go uses SyncMap and SyncSet, whose iteration order is random. The
 // cache is filled once and then only read, so plain ordered maps are used.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct KnownSymlinks {
     directories: IndexMap<Path, Option<KnownDirectoryLink>>,
     directories_by_realpath: IndexMap<Path, IndexSet<String>>,

@@ -112,6 +112,15 @@ pub struct ResolvedProjectReference {
 }
 
 impl ResolvedProjectReference {
+    /// A copy of the parts of a referenced project's command line that the
+    /// checker reads.
+    pub(crate) fn new(compiler_options: CompilerOptions, common_source_directory: String) -> Self {
+        ResolvedProjectReference {
+            compiler_options,
+            common_source_directory,
+        }
+    }
+
     // Go: tsoptions/parsedcommandline.go CompilerOptions
     #[must_use]
     pub fn compiler_options(&self) -> &CompilerOptions {
@@ -130,7 +139,9 @@ impl ResolvedProjectReference {
 pub struct SourceOutputAndProjectReference {
     pub source: String,
     pub output_dts: String,
-    pub resolved: ResolvedProjectReference,
+    /// PORT: Go shares one `*ParsedCommandLine` between the entries of a
+    /// referenced project, so this is an `Arc`.
+    pub resolved: Arc<ResolvedProjectReference>,
 }
 
 /// Go `ast.SourceFile` fields set by the parser and the program.
@@ -1774,38 +1785,68 @@ pub fn uses_uri_style_node_core_modules() -> Tristate {
 }
 
 // Go: compiler/program.go:173 GetProjectReferenceFromSource
-// PORT: project references are not loaded; there is never a reference.
+// PORT: the Go frontend program has the port. The legacy loader does not
+// load project references, so there is never a reference.
 pub fn get_project_reference_from_source(
     path: &str,
 ) -> Option<&'static SourceOutputAndProjectReference> {
-    let _ = path;
-    None
+    state().go.as_ref()?.get_project_reference_from_source(path)
 }
 
 // Go: compiler/program.go:178 IsSourceFromProjectReference
 pub fn is_source_from_project_reference(path: &str) -> bool {
-    get_project_reference_from_source(path).is_some()
+    state()
+        .go
+        .as_ref()
+        .is_some_and(|go| go.is_source_from_project_reference(path))
 }
 
 // Go: compiler/program.go:182 GetProjectReferenceFromOutputDts
-// PORT: project references are not loaded; there is never a reference.
+// PORT: see `get_project_reference_from_source`.
 pub fn get_project_reference_from_output_dts(
     path: &str,
 ) -> Option<&'static SourceOutputAndProjectReference> {
-    let _ = path;
-    None
+    state()
+        .go
+        .as_ref()?
+        .get_project_reference_from_output_dts(path)
 }
 
 // Go: compiler/program.go:190 GetRedirectForResolution
-// PORT: project references are not loaded; there is never a redirect.
+// PORT: see `get_project_reference_from_source`.
 pub fn get_redirect_for_resolution(file: Node) -> Option<&'static ResolvedProjectReference> {
-    let _ = file;
-    None
+    state().go.as_ref()?.get_redirect_for_resolution(file)
 }
 
 // Go: compiler/program.go:199 GetResolvedProjectReferences
-pub fn get_resolved_project_references() -> Vec<&'static ResolvedProjectReference> {
-    Vec::new()
+// PORT: see `get_project_reference_from_source`. A reference that did not
+// load is None (Go nil).
+pub fn get_resolved_project_references() -> Vec<Option<&'static ResolvedProjectReference>> {
+    state()
+        .go
+        .as_ref()
+        .map(go_frontend::GoSharedState::get_resolved_project_references)
+        .unwrap_or_default()
+}
+
+// Go: compiler/program.go:2017 GetSymlinkCache
+// PORT: the Go frontend program has the port, and this is its value. None
+// on the legacy loader, where `modulespecifiers::host` builds its own.
+pub fn get_go_symlink_cache() -> Option<&'static crate::modulespecifiers::symlinks::KnownSymlinks> {
+    state()
+        .go
+        .as_ref()
+        .map(go_frontend::GoSharedState::known_symlinks)
+}
+
+// Go: compiler/program.go:165 GetSourceOfProjectReferenceIfOutputIncluded
+pub fn get_source_of_project_reference_if_output_included(file: Node) -> String {
+    let info = source_file_info(file);
+    state()
+        .go
+        .as_ref()
+        .and_then(|go| go.get_source_of_project_reference_if_output_included(&info.path))
+        .map_or_else(|| info.file_name.clone(), str::to_string)
 }
 
 // Go: compiler/program.go:397 SourceFiles

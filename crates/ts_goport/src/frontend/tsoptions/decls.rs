@@ -1361,7 +1361,8 @@ pub fn compiler_options_field_values(
     o: &CompilerOptions,
 ) -> Vec<(&'static str, CompilerOptionsValue)> {
     use CompilerOptionsValue as V;
-    // PORT: Go `TypeRoots` is `[]string`; Rust keeps `Option<Vec<String>>`.
+    // PORT: Go `TypeRoots` and `Lib` are `[]string`; Rust keeps
+    // `Option<Vec<String>>` for them and lists `None` as empty here.
     // Go nil and empty slices differ under `reflect.DeepEqual`; the Rust
     // `Vec<String>` fields cannot keep that difference.
     vec![
@@ -1452,7 +1453,7 @@ pub fn compiler_options_field_values(
             V::String(o.jsx_fragment_factory.clone()),
         ),
         ("JsxImportSource", V::String(o.jsx_import_source.clone())),
-        ("Lib", V::StringList(o.lib.clone())),
+        ("Lib", V::StringList(o.lib.clone().unwrap_or_default())),
         ("LibReplacement", V::Tristate(o.lib_replacement)),
         ("Locale", V::String(o.locale.clone())),
         ("MapRoot", V::String(o.map_root.clone())),

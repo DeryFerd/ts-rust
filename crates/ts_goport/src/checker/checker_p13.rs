@@ -910,6 +910,7 @@ impl Checker {
             .compiler_options
             .lib
             .iter()
+            .flatten()
             .any(|lib| lib == "lib.dom.d.ts")
             && self.every_contained_type(containing_type, &mut |c: &mut Checker, t: TypeId| {
                 c.has_common_dom_type_name(t)

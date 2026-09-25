@@ -13,7 +13,9 @@ use crate::frontend::compiler::{
 };
 use crate::frontend::module::ModeAwareCacheKey;
 use crate::frontend::parser::{ParsedSourceFile, SourceFileParseOptions};
-use crate::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
+use crate::frontend::tsoptions::{
+    ParseConfigHost, ParsedCommandLine, get_parsed_command_line_of_config_file,
+};
 use crate::frontend::tspath::Path as GoPath;
 use crate::frontend::vfs::{Fs, osvfs_fs};
 use std::io::Write;
@@ -52,6 +54,56 @@ pub(super) struct GoSharedState {
     references: FxHashMap<(usize, String), Node>,
     /// Go `Program.CommonSourceDirectory`.
     common_source_directory: String,
+    /// Go `processedFiles.outputFileToProjectReferenceSource`, by path.
+    output_file_to_project_reference_source: FxHashMap<String, String>,
+    /// Go `projectReferenceFileMapper.sourceToProjectReference`, by path.
+    source_to_project_reference: FxHashMap<String, SourceOutputAndProjectReference>,
+    /// Go `projectReferenceFileMapper.outputDtsToProjectReference`, by path.
+    output_dts_to_project_reference: FxHashMap<String, SourceOutputAndProjectReference>,
+    /// Go `projectReferenceFileMapper.opts.canUseProjectReferenceSource()`.
+    can_use_project_reference_source: bool,
+    /// Go `GetRedirectForResolution` of each program file, by file index.
+    /// A file with no redirect has no entry.
+    redirects_for_resolution: FxHashMap<usize, Arc<ResolvedProjectReference>>,
+    /// Go `GetResolvedProjectReferences`.
+    resolved_project_references: Vec<Option<Arc<ResolvedProjectReference>>>,
+    /// Go `Program.GetSymlinkCache`.
+    known_symlinks: crate::modulespecifiers::symlinks::KnownSymlinks,
+}
+
+type FrontendSourceOutput = crate::frontend::tsoptions::SourceOutputAndProjectReference;
+
+/// Thread-safe copies of the frontend project references. Go shares one
+/// `*ParsedCommandLine` per referenced project, so each is copied once.
+#[derive(Default)]
+struct ProjectReferenceCopies {
+    resolved: FxHashMap<*const ParsedCommandLine, Arc<ResolvedProjectReference>>,
+}
+
+impl ProjectReferenceCopies {
+    fn resolved(&mut self, parsed: &Rc<ParsedCommandLine>) -> Arc<ResolvedProjectReference> {
+        self.resolved
+            .entry(Rc::as_ptr(parsed))
+            .or_insert_with(|| {
+                Arc::new(ResolvedProjectReference::new(
+                    (**parsed.compiler_options()).clone(),
+                    parsed.common_source_directory().to_string(),
+                ))
+            })
+            .clone()
+    }
+
+    fn entry(&mut self, entry: &FrontendSourceOutput) -> SourceOutputAndProjectReference {
+        let parsed = entry
+            .resolved
+            .upgrade()
+            .expect("the referenced project command line is alive");
+        SourceOutputAndProjectReference {
+            source: entry.source.clone(),
+            output_dts: entry.output_dts.clone(),
+            resolved: self.resolved(&parsed),
+        }
+    }
 }
 
 /// What `parse_js_doc_for_node` needs from a parsed file.
@@ -445,6 +497,39 @@ impl GoSharedState {
             p.use_case_sensitive_file_names(),
             None,
         );
+        let output_file_to_project_reference_source = files
+            .output_file_to_project_reference_source
+            .iter()
+            .flatten()
+            .map(|(path, source)| (path.0.clone(), source.clone()))
+            .collect();
+        let mut project_references = ProjectReferenceCopies::default();
+        let mapper = p.mapper();
+        let mut copy_map = |map: &FxHashMap<GoPath, Rc<FrontendSourceOutput>>| {
+            map.iter()
+                .map(|(path, entry)| (path.0.clone(), project_references.entry(entry)))
+                .collect::<FxHashMap<_, _>>()
+        };
+        let source_to_project_reference = copy_map(&mapper.source_to_project_reference);
+        let output_dts_to_project_reference = copy_map(&mapper.output_dts_to_project_reference);
+        let can_use_project_reference_source = mapper.opts.can_use_project_reference_source();
+        drop(mapper);
+        // Go asks for the redirect of checker files only, which are program files.
+        let redirects_for_resolution = parsed
+            .iter()
+            .filter_map(|(&store, file)| {
+                let redirect = p.get_redirect_for_resolution(&**file)?;
+                Some((store, project_references.resolved(&redirect)))
+            })
+            .collect();
+        let resolved_project_references = p
+            .get_resolved_project_references()
+            .iter()
+            .map(|r| r.as_ref().map(|r| project_references.resolved(r)))
+            .collect();
+        // PORT: Go builds the symlink cache on first use. It reads only the
+        // loaded program, so building it here gives the same value.
+        let known_symlinks = (*p.get_symlink_cache()).clone();
         Self {
             resolved_modules,
             jsx_runtime_import_specifiers,
@@ -455,7 +540,70 @@ impl GoSharedState {
             redirect_targets,
             references,
             common_source_directory,
+            output_file_to_project_reference_source,
+            source_to_project_reference,
+            output_dts_to_project_reference,
+            can_use_project_reference_source,
+            redirects_for_resolution,
+            resolved_project_references,
+            known_symlinks,
         }
+    }
+
+    // Go: compiler/program.go:165 GetSourceOfProjectReferenceIfOutputIncluded
+    // (the map lookup; the caller falls back to the file name)
+    pub(super) fn get_source_of_project_reference_if_output_included(
+        &self,
+        path: &str,
+    ) -> Option<&str> {
+        self.output_file_to_project_reference_source
+            .get(path)
+            .map(String::as_str)
+    }
+
+    // Go: compiler/projectreferencefilemapper.go:64 getProjectReferenceFromSource
+    pub(super) fn get_project_reference_from_source(
+        &self,
+        path: &str,
+    ) -> Option<&SourceOutputAndProjectReference> {
+        self.source_to_project_reference.get(path)
+    }
+
+    // Go: compiler/projectreferencefilemapper.go:68 getProjectReferenceFromOutputDts
+    pub(super) fn get_project_reference_from_output_dts(
+        &self,
+        path: &str,
+    ) -> Option<&SourceOutputAndProjectReference> {
+        self.output_dts_to_project_reference.get(path)
+    }
+
+    // Go: compiler/projectreferencefilemapper.go:72 isSourceFromProjectReference
+    pub(super) fn is_source_from_project_reference(&self, path: &str) -> bool {
+        self.can_use_project_reference_source
+            && self.get_project_reference_from_source(path).is_some()
+    }
+
+    // Go: compiler/program.go:190 GetRedirectForResolution (for program files)
+    pub(super) fn get_redirect_for_resolution(
+        &self,
+        file: Node,
+    ) -> Option<&ResolvedProjectReference> {
+        self.redirects_for_resolution
+            .get(&file.file_index())
+            .map(|r| &**r)
+    }
+
+    // Go: compiler/program.go:199 GetResolvedProjectReferences
+    pub(super) fn get_resolved_project_references(&self) -> Vec<Option<&ResolvedProjectReference>> {
+        self.resolved_project_references
+            .iter()
+            .map(|r| r.as_deref())
+            .collect()
+    }
+
+    // Go: compiler/program.go:2017 GetSymlinkCache
+    pub(crate) fn known_symlinks(&self) -> &crate::modulespecifiers::symlinks::KnownSymlinks {
+        &self.known_symlinks
     }
 
     // Go: compiler/program.go:195 GetParseFileRedirect (for resolved module

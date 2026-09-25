@@ -149,6 +149,13 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
         if let Some(cached) = KNOWN_SYMLINKS.with(|c| c.borrow().clone()) {
             return Some(cached);
         }
+        if let Some(go) = crate::program::get_go_symlink_cache() {
+            let known_symlinks = Rc::new(go.clone());
+            KNOWN_SYMLINKS.with(|c| *c.borrow_mut() = Some(known_symlinks.clone()));
+            return Some(known_symlinks);
+        }
+        // PORT: the rest is the legacy loader only. It approximates Go with
+        // the data that loader keeps.
         let cwd = crate::program::get_current_directory();
         let case = crate::program::use_case_sensitive_file_names();
         let mut known_symlinks = KnownSymlinks::new(cwd, case);
@@ -262,10 +269,8 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
     }
 
     // Go: compiler/program.go:165 GetSourceOfProjectReferenceIfOutputIncluded
-    // PORT: project references are not loaded, so
-    // `outputFileToProjectReferenceSource` is always empty.
     fn get_source_of_project_reference_if_output_included(&self, file: Node) -> String {
-        source_file_info(file).file_name.clone()
+        crate::program::get_source_of_project_reference_if_output_included(file)
     }
 
     fn file_exists(&self, path: &str) -> bool {

@@ -162,7 +162,7 @@ pub struct CompilerOptions {
     pub jsx_factory: String,
     pub jsx_fragment_factory: String,
     pub jsx_import_source: String,
-    pub lib: Vec<String>,
+    pub lib: Option<Vec<String>>,
     pub lib_replacement: Tristate,
     pub locale: String,
     pub map_root: String,
@@ -972,15 +972,11 @@ fn ts_new_line_kind(kind: ts_options::NewLineKind) -> NewLineKind {
 pub fn from_ts_options(opts: &ts_options::CompilerOptions) -> CompilerOptions {
     let d = ts_options::CompilerOptions::default();
 
-    let lib: Vec<String> = opts
-        .lib
-        .as_ref()
-        .map(|libs| {
-            libs.iter()
-                .filter_map(|name| ts_compiler::tsoptions_get_lib_file_name(name))
-                .collect()
-        })
-        .unwrap_or_default();
+    let lib: Option<Vec<String>> = opts.lib.as_ref().map(|libs| {
+        libs.iter()
+            .filter_map(|name| ts_compiler::tsoptions_get_lib_file_name(name))
+            .collect()
+    });
 
     // PORT: `ts_options` keeps `paths` in a BTreeMap, so Go's source order
     // is lost; keys come out sorted. An empty map is treated as nil.
