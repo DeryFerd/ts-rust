@@ -18,6 +18,166 @@
 use crate::prelude::*;
 use ts_jsnum::{Number, PseudoBigInt};
 
+/// An immutable list shared by reference count. It works like a Go slice
+/// over an array that is never written again: a clone or a sub-slice copies
+/// no elements. An empty list does not allocate.
+///
+/// PORT: Go returns resolved member, signature, index info and type argument
+/// slices without a copy. Callers read the list through `Deref<[T]>`.
+pub struct SharedList<T> {
+    items: Option<Rc<[T]>>,
+    start: u32,
+    end: u32,
+}
+
+impl<T> SharedList<T> {
+    /// The sub-list `range` of this list, sharing the same storage.
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Self {
+        assert!(range.start <= range.end && range.end <= self.len());
+        if range.is_empty() {
+            return Self::default();
+        }
+        Self {
+            items: self.items.clone(),
+            start: self.start + range.start as u32,
+            end: self.start + range.end as u32,
+        }
+    }
+}
+
+impl<T> Clone for SharedList<T> {
+    fn clone(&self) -> Self {
+        Self {
+            items: self.items.clone(),
+            start: self.start,
+            end: self.end,
+        }
+    }
+}
+
+impl<T> Default for SharedList<T> {
+    fn default() -> Self {
+        Self {
+            items: None,
+            start: 0,
+            end: 0,
+        }
+    }
+}
+
+impl<T> std::ops::Deref for SharedList<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        match &self.items {
+            Some(items) => &items[self.start as usize..self.end as usize],
+            None => &[],
+        }
+    }
+}
+
+impl<T> From<Vec<T>> for SharedList<T> {
+    fn from(items: Vec<T>) -> Self {
+        if items.is_empty() {
+            return Self::default();
+        }
+        let end = u32::try_from(items.len()).expect("list too long");
+        Self {
+            items: Some(items.into()),
+            start: 0,
+            end,
+        }
+    }
+}
+
+impl<T: Clone> From<&[T]> for SharedList<T> {
+    fn from(items: &[T]) -> Self {
+        if items.is_empty() {
+            return Self::default();
+        }
+        let end = u32::try_from(items.len()).expect("list too long");
+        Self {
+            items: Some(items.into()),
+            start: 0,
+            end,
+        }
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for SharedList<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<T: PartialEq> PartialEq for SharedList<T> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<T: Eq> Eq for SharedList<T> {}
+
+impl<'a, T> IntoIterator for &'a SharedList<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<T: Copy> IntoIterator for SharedList<T> {
+    type Item = T;
+    type IntoIter = SharedListIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let back = self.len();
+        SharedListIter {
+            list: self,
+            front: 0,
+            back,
+        }
+    }
+}
+
+/// The owning iterator of a `SharedList`. It yields copies of the elements.
+pub struct SharedListIter<T> {
+    list: SharedList<T>,
+    front: usize,
+    back: usize,
+}
+
+impl<T: Copy> Iterator for SharedListIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if self.front == self.back {
+            return None;
+        }
+        let item = self.list[self.front];
+        self.front += 1;
+        Some(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.back - self.front;
+        (n, Some(n))
+    }
+}
+
+impl<T: Copy> DoubleEndedIterator for SharedListIter<T> {
+    fn next_back(&mut self) -> Option<T> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back -= 1;
+        Some(self.list[self.back])
+    }
+}
+
+impl<T: Copy> ExactSizeIterator for SharedListIter<T> {}
+
 // PORT: Go `TypeFormatFlagsNodeBuilderFlagsMask` is an untyped constant
 // outside the generated `TypeFormatFlags` block.
 impl TypeFormatFlags {
@@ -142,7 +302,7 @@ pub struct TypeAliasLinks {
     pub declared_type: TypeId,
     pub type_parameters: Vec<TypeId>, // Type parameters of type alias (undefined if non-generic)
     // PORT: Go nil map (non-generic alias) is `None`.
-    pub instantiations: Option<FxHashMap<CacheHashKey, TypeId>>, // Instantiations of generic type alias (undefined if non-generic)
+    pub instantiations: Option<CacheKeyMap<TypeId>>, // Instantiations of generic type alias (undefined if non-generic)
     pub is_constructor_declared_property: bool,
 }
 
@@ -210,7 +370,7 @@ pub struct SpreadLinks {
 // Go: checker/types.go:294 VarianceLinks
 #[derive(Clone, Debug, Default)]
 pub struct VarianceLinks {
-    pub variances: Vec<VarianceFlags>,
+    pub variances: SharedList<VarianceFlags>,
 }
 
 // Go: checker/types.go:312 MarkedAssignmentSymbolLinks
@@ -259,7 +419,7 @@ pub struct SymbolNodeLinks {
 #[derive(Clone, Debug, Default)]
 pub struct TypeNodeLinks {
     pub resolved_type: TypeId, // Resolved type associated with node
-    pub outer_type_parameters: Vec<TypeId>, // Outer type parameters of anonymous object type
+    pub outer_type_parameters: SharedList<TypeId>, // Outer type parameters of anonymous object type
 }
 
 // Links for enum members
@@ -790,7 +950,7 @@ impl Type {
     // Go: checker/types.go:721 Type.Distributed
     pub fn distributed(&self) -> Vec<TypeId> {
         if self.flags.intersects(TypeFlags::UNION) {
-            return self.as_union_type().union_or_intersection.types.clone();
+            return self.as_union_type().union_or_intersection.types.to_vec();
         } else if self.flags.intersects(TypeFlags::NEVER) {
             return Vec::new();
         }
@@ -836,6 +996,17 @@ impl Type {
             return &self.as_union_or_intersection_type().types;
         } else if self.flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
             return &self.as_template_literal_type().types;
+        }
+        panic!("Unhandled case in Type.Types")
+    }
+
+    /// `types()` as a shared list. The clone copies no elements, so callers
+    /// can keep it across checker calls that need `&mut self`.
+    pub fn types_list(&self) -> SharedList<TypeId> {
+        if self.flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
+            return self.as_union_or_intersection_type().types.clone();
+        } else if self.flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
+            return self.as_template_literal_type().types.clone();
         }
         panic!("Unhandled case in Type.Types")
     }
@@ -1230,10 +1401,10 @@ pub struct ConstrainedType {
 pub struct StructuredType {
     pub constrained: ConstrainedType,
     pub members: SymbolTable,
-    pub properties: Vec<SymbolId>,
-    pub signatures: Vec<SignatureId>, // Signatures (call + construct)
-    pub call_signature_count: i32,    // Count of call signatures
-    pub index_infos: Vec<IndexInfoId>,
+    pub properties: SharedList<SymbolId>,
+    pub signatures: SharedList<SignatureId>, // Signatures (call + construct)
+    pub call_signature_count: i32,           // Count of call signatures
+    pub index_infos: SharedList<IndexInfoId>,
 
     pub object_type_without_abstract_construct_signatures: TypeId,
 }
@@ -1295,7 +1466,7 @@ pub struct ObjectType {
     pub target: TypeId,   // Target of instantiated type
     pub mapper: MapperId, // Type mapper for instantiated type
     // PORT: Go nil map is `None`; Go creates it lazily.
-    pub instantiations: Option<FxHashMap<CacheHashKey, TypeId>>, // Map of type instantiations
+    pub instantiations: Option<CacheKeyMap<TypeId>>, // Map of type instantiations
 }
 
 // TypeReference (instantiation of an InterfaceType)
@@ -1305,7 +1476,7 @@ pub struct ObjectType {
 pub struct TypeReference {
     pub object: ObjectType,
     pub node: Node, // TypeReferenceNode | ArrayTypeNode | TupleTypeNode when deferred, else nil
-    pub resolved_type_arguments: Vec<TypeId>,
+    pub resolved_type_arguments: SharedList<TypeId>,
 }
 
 // InterfaceType (when generic, serves as reference to instantiation of itself)
@@ -1464,10 +1635,10 @@ pub struct EvolvingArrayType {
 #[derive(Clone, Debug, Default)]
 pub struct UnionOrIntersectionType {
     pub structured: StructuredType,
-    pub types: Vec<TypeId>,
+    pub types: SharedList<TypeId>,
     pub property_cache: SymbolTable,
     pub property_cache_without_function_property_augment: SymbolTable,
-    pub resolved_properties: Vec<SymbolId>,
+    pub resolved_properties: SharedList<SymbolId>,
 }
 
 impl UnionOrIntersectionType {
@@ -1567,8 +1738,8 @@ impl IndexedAccessType {
 #[derive(Clone, Debug, Default)]
 pub struct TemplateLiteralType {
     pub constrained: ConstrainedType,
-    pub texts: Rc<[String]>, // Always one element longer than types
-    pub types: Rc<[TypeId]>, // Always at least one element
+    pub texts: Rc<[String]>,       // Always one element longer than types
+    pub types: SharedList<TypeId>, // Always at least one element
 }
 
 impl TemplateLiteralType {
@@ -1630,7 +1801,7 @@ pub struct ConditionalRoot {
     pub infer_type_parameters: Vec<TypeId>,
     pub outer_type_parameters: Vec<TypeId>,
     // PORT: Go nil map is `None`.
-    pub instantiations: Option<FxHashMap<CacheHashKey, TypeId>>,
+    pub instantiations: Option<CacheKeyMap<TypeId>>,
     pub alias: Option<Rc<TypeAlias>>,
 }
 

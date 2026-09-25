@@ -1407,11 +1407,11 @@ impl Checker {
             return true;
         }
         if self.ty(t).flags.intersects(TypeFlags::UNION) {
-            let types = self.ty(t).types().to_vec();
+            let types = self.ty(t).types_list();
             return types.into_iter().all(|u| self.is_js_literal_type(u));
         }
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
+            let types = self.ty(t).types_list();
             return types.into_iter().any(|u| self.is_js_literal_type(u));
         }
         if self.ty(t).flags.intersects(TypeFlags::INSTANTIABLE) {

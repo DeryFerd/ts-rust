@@ -16,12 +16,10 @@ impl Checker {
         // T[A | B] -> T[A] | T[B] (reading)
         // T[A | B] -> T[A] & T[B] (writing)
         if self.ty(index_type).flags.intersects(TypeFlags::UNION) {
-            let index_types = self.ty(index_type).types().to_vec();
-            let mut types: Vec<TypeId> = Vec::with_capacity(index_types.len());
-            for t in index_types {
-                let indexed = self.get_indexed_access_type(object_type, t);
-                types.push(self.get_simplified_type(indexed, writing));
-            }
+            let types = self.map_constituents(index_type, &mut |c, t| {
+                let indexed = c.get_indexed_access_type(object_type, t);
+                c.get_simplified_type(indexed, writing)
+            });
             if writing {
                 return self.get_intersection_type(&types);
             }
@@ -45,12 +43,10 @@ impl Checker {
             || object_flags.intersects(TypeFlags::INTERSECTION)
                 && !self.should_defer_index_type(object_type, IndexFlags::NONE)
         {
-            let object_types = self.ty(object_type).types().to_vec();
-            let mut types: Vec<TypeId> = Vec::with_capacity(object_types.len());
-            for t in object_types {
-                let indexed = self.get_indexed_access_type(t, index_type);
-                types.push(self.get_simplified_type(indexed, writing));
-            }
+            let types = self.map_constituents(object_type, &mut |c, t| {
+                let indexed = c.get_indexed_access_type(t, index_type);
+                c.get_simplified_type(indexed, writing)
+            });
             if self
                 .ty(object_type)
                 .flags
@@ -139,14 +135,14 @@ impl Checker {
             // (T[K] | undefined) & {} | (T[K] | undefined) & null ==>
             // T[K] & {} | undefined & {} | T[K] & null | undefined & null ==>
             // T[K] & {} | T[K] & null
-            let types = self.ty(t).types().to_vec();
             // PORT: Go `core.SameMap` + `core.Same`: the result differs only
             // when some element was changed by the mapping.
-            let mut normalized_types: Vec<TypeId> = Vec::with_capacity(types.len());
-            for &u in &types {
-                normalized_types.push(self.get_normalized_type(u, writing));
-            }
-            if normalized_types != types {
+            let count = self.ty(t).types().len();
+            if let Some(normalized_types) =
+                self.map_stored_types_if_changed(t, count, Checker::type_at, &mut |c, u| {
+                    c.get_normalized_type(u, writing)
+                })
+            {
                 return self.get_intersection_type(&normalized_types);
             }
         }
@@ -157,8 +153,8 @@ impl Checker {
     pub fn should_normalize_intersection(&mut self, t: TypeId) -> bool {
         let mut has_instantiable = false;
         let mut has_nullable_or_empty = false;
-        let types = self.ty(t).types().to_vec();
-        for t in types {
+        for i in 0..self.ty(t).types().len() {
+            let t = self.type_at(t, i);
             has_instantiable =
                 has_instantiable || self.ty(t).flags.intersects(TypeFlags::INSTANTIABLE);
             has_nullable_or_empty = has_nullable_or_empty
@@ -183,7 +179,7 @@ impl Checker {
                 normalized_elements.push(e);
             }
         }
-        if elements != normalized_elements {
+        if elements[..] != normalized_elements[..] {
             let target = self.ty(t).target();
             return self.create_normalized_tuple_type(target, &normalized_elements);
         }
@@ -251,9 +247,12 @@ impl Checker {
             instantiated_base = self.instantiate_type(bases[0], mapper);
         }
         let mut instantiated_base = instantiated_base;
-        let type_arguments = self.get_type_arguments(t);
-        if type_arguments.len() > type_parameters.len() {
-            let last = type_arguments.last().copied().unwrap_or(TypeId::NIL);
+        let last = {
+            let type_arguments = self.type_arguments_of(t);
+            (type_arguments.len() > type_parameters.len())
+                .then(|| type_arguments.last().copied().unwrap_or(TypeId::NIL))
+        };
+        if let Some(last) = last {
             instantiated_base = self.get_type_with_this_argument(instantiated_base, last, false);
         }
         self.cached_types.insert(key, instantiated_base);
@@ -1363,7 +1362,7 @@ impl Checker {
         }
         let global_promise_type = self.get_global_promise_type();
         if self.is_reference_to_type(t, global_promise_type) {
-            let result = self.get_type_arguments(t)[0];
+            let result = self.type_arguments_of(t)[0];
             self.cached_types.insert(key, result);
             return result;
         }
@@ -1377,7 +1376,7 @@ impl Checker {
         if self.is_type_any(then_function) {
             return TypeId::NIL;
         }
-        let mut then_signatures: Vec<SignatureId> = Vec::new();
+        let mut then_signatures = SharedList::default();
         if then_function.is_some() {
             then_signatures = self.get_signatures_of_type(then_function, SignatureKind::CALL);
         }

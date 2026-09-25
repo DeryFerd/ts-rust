@@ -110,7 +110,7 @@ impl Checker {
         {
             let d = self.ty_mut(t).as_type_reference_mut();
             d.object.target = target;
-            d.resolved_type_arguments = type_arguments.to_vec();
+            d.resolved_type_arguments = type_arguments.into();
         }
         // PORT: Go writes into the interface's instantiations map, which
         // panics when the map is nil. The same happens here.
@@ -193,25 +193,25 @@ impl Checker {
         let t_symbol = self.ty(t).symbol;
         let properties = self.get_named_members(members, t_symbol);
         let data = self.ty_mut(t).as_structured_type_mut();
-        data.properties = properties;
+        data.properties = properties.into();
         if !call_signatures.is_empty() {
             if !construct_signatures.is_empty() {
                 let mut signatures = call_signatures.to_vec();
                 signatures.extend_from_slice(construct_signatures);
-                data.signatures = signatures;
+                data.signatures = signatures.into();
             } else {
-                data.signatures = call_signatures.to_vec();
+                data.signatures = call_signatures.into();
             }
             data.call_signature_count = call_signatures.len() as i32;
         } else {
             if !construct_signatures.is_empty() {
-                data.signatures = construct_signatures.to_vec();
+                data.signatures = construct_signatures.into();
             } else {
-                data.signatures = Vec::new();
+                data.signatures = SharedList::default();
             }
             data.call_signature_count = 0;
         }
-        data.index_infos = index_infos.to_vec();
+        data.index_infos = index_infos.into();
     }
 
     // Go: checker/checker.go:25070 newTypeParameter
@@ -248,7 +248,7 @@ impl Checker {
     // Go: checker/checker.go:25090 newUnionType
     pub fn new_union_type(&mut self, object_flags: ObjectFlags, types: &[TypeId]) -> TypeId {
         let mut data = UnionType::default();
-        data.union_or_intersection.types = types.to_vec();
+        data.union_or_intersection.types = types.into();
         self.new_type(
             TypeFlags::UNION,
             object_flags,
@@ -259,7 +259,7 @@ impl Checker {
     // Go: checker/checker.go:25096 newIntersectionType
     pub fn new_intersection_type(&mut self, object_flags: ObjectFlags, types: &[TypeId]) -> TypeId {
         let mut data = IntersectionType::default();
-        data.union_or_intersection.types = types.to_vec();
+        data.union_or_intersection.types = types.into();
         self.new_type(
             TypeFlags::INTERSECTION,
             object_flags,
@@ -809,10 +809,10 @@ impl Checker {
         if contextual_type.is_some() {
             let contextual_flags = self.ty(contextual_type).flags;
             if contextual_flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
-                let types = self.ty(contextual_type).types().to_vec();
-                return types
-                    .iter()
-                    .any(|&t| self.is_literal_of_contextual_type(candidate_type, t));
+                return (0..self.ty(contextual_type).types().len()).any(|i| {
+                    let t = self.type_at(contextual_type, i);
+                    self.is_literal_of_contextual_type(candidate_type, t)
+                });
             }
             if contextual_flags.intersects(TypeFlags::INSTANTIABLE_NON_PRIMITIVE) {
                 // If the contextual type is a type variable constrained to a primitive type, consider
@@ -860,11 +860,7 @@ impl Checker {
         alias: Option<Rc<TypeAlias>>,
     ) -> TypeId {
         if self.ty(t).flags.intersects(TypeFlags::UNION) && alias.is_some() {
-            let types = self.ty(t).types().to_vec();
-            let mut mapped = Vec::with_capacity(types.len());
-            for u in types {
-                mapped.push(f(self, u));
-            }
+            let mapped = self.map_constituents(t, f);
             return self.get_union_type_ex(&mapped, UnionReduction::LITERAL, alias, TypeId::NIL);
         }
         self.map_type(t, f)
@@ -894,31 +890,39 @@ impl Checker {
             return f(self, t);
         }
         let origin = self.ty(t).as_union_type().origin;
-        let types = if origin.is_some() && self.ty(origin).flags.intersects(TypeFlags::UNION) {
-            self.ty(origin).types().to_vec()
+        let owner = if origin.is_some() && self.ty(origin).flags.intersects(TypeFlags::UNION) {
+            origin
         } else {
-            self.ty(t)
-                .as_union_type()
-                .union_or_intersection
-                .types
-                .clone()
+            t
         };
-        let mut mapped_types: Vec<TypeId> = Vec::with_capacity(16);
-        let mut changed = false;
-        for s in types {
+        // PORT: the constituents are read in place (`type_at`). Until the
+        // first changed element every mapped type equals its non-nil source,
+        // so the mapped list is built only from the first change, and a
+        // mapping that changes nothing costs no copy (Go `changed` is
+        // `mapped_types.is_some()`).
+        let count = self.ty(owner).types().len();
+        let mut mapped_types: Option<Vec<TypeId>> = None;
+        for i in 0..count {
+            let s = self.type_at(owner, i);
             let mapped = if self.ty(s).flags.intersects(TypeFlags::UNION) {
                 self.map_type_ex(s, f, no_reductions)
             } else {
                 f(self, s)
             };
-            if mapped != s {
-                changed = true;
-            }
-            if mapped.is_some() {
-                mapped_types.push(mapped);
+            if let Some(list) = &mut mapped_types {
+                if mapped.is_some() {
+                    list.push(mapped);
+                }
+            } else if mapped != s {
+                let mut list: Vec<TypeId> = Vec::with_capacity(count.max(16));
+                list.extend_from_slice(&self.ty(owner).types()[..i]);
+                if mapped.is_some() {
+                    list.push(mapped);
+                }
+                mapped_types = Some(list);
             }
         }
-        if changed {
+        if let Some(mapped_types) = mapped_types {
             if mapped_types.is_empty() {
                 return TypeId::NIL;
             }
@@ -1099,8 +1103,7 @@ impl Checker {
             for &t in &type_set {
                 let mut in_named = false;
                 for &u in &named_unions {
-                    let u_types = self.ty(u).types().to_vec();
-                    if self.contains_type(&u_types, t) {
+                    if self.contains_type(self.ty(u).types(), t) {
                         in_named = true;
                         break;
                     }
@@ -1280,8 +1283,7 @@ impl Checker {
                         named_unions.push(t);
                     }
                 } else if origin.is_some() && origin_is_union {
-                    let origin_types = self.ty(origin).types().to_vec();
-                    named_unions = self.add_named_unions(named_unions, &origin_types);
+                    named_unions = self.add_named_unions(named_unions, self.ty(origin).types());
                 }
             }
         }

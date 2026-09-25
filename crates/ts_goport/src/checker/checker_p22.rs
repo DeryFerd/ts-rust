@@ -35,8 +35,8 @@ impl Checker {
             return true;
         }
         if flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
-            return types.iter().all(|&t| self.is_valid_base_type(t));
+            return (0..self.ty(t).types().len())
+                .all(|i| self.is_valid_base_type(self.type_at(t, i)));
         }
         false
     }
@@ -58,7 +58,7 @@ impl Checker {
                 return base_types.iter().any(|&b| check(c, b, check_base));
             }
             if c.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-                let types = c.ty(t).types().to_vec();
+                let types = c.ty(t).types_list();
                 return types.iter().any(|&t| check(c, t, check_base));
             }
             false
@@ -84,30 +84,35 @@ impl Checker {
         let mut this_argument = this_argument;
         if self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE) {
             let target = self.ty(t).target();
-            let type_arguments = self.get_type_arguments(t);
-            if self.ty(target).as_interface_type().type_parameters().len() == type_arguments.len() {
+            let type_parameter_count = self.ty(target).as_interface_type().type_parameters().len();
+            let args = {
+                let type_arguments = self.type_arguments_of(t);
+                (type_parameter_count == type_arguments.len()).then(|| {
+                    // One allocation with room for the this-argument.
+                    let mut args = Vec::with_capacity(type_arguments.len() + 1);
+                    args.extend_from_slice(&type_arguments);
+                    args
+                })
+            };
+            if let Some(mut args) = args {
                 if this_argument.is_nil() {
                     this_argument = self.ty(target).as_interface_type().this_type;
                 }
-                let mut args = type_arguments;
                 args.push(this_argument);
                 return self.create_type_reference(target, &args);
             }
             return t;
         } else if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
-            let mut new_types = Vec::with_capacity(types.len());
-            for &ty in &types {
-                new_types.push(self.get_type_with_this_argument(
-                    ty,
-                    this_argument,
-                    need_apparent_type,
-                ));
-            }
-            // PORT: Go `core.SameMap` + `core.Same` is element-wise identity.
-            if new_types == types {
+            // PORT: Go `core.SameMap` + `core.Same` is "no element changed"
+            // (`None`) here.
+            let count = self.ty(t).types().len();
+            let Some(new_types) =
+                self.map_stored_types_if_changed(t, count, Checker::type_at, &mut |c, ty| {
+                    c.get_type_with_this_argument(ty, this_argument, need_apparent_type)
+                })
+            else {
                 return t;
-            }
+            };
             return self.get_intersection_type(&new_types);
         }
         if need_apparent_type {
@@ -413,7 +418,7 @@ impl Checker {
             return true;
         }
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) && !self.is_generic_type(t) {
-            let types = self.ty(t).types().to_vec();
+            let types = self.ty(t).types_list();
             return types.iter().any(|&t| self.is_valid_index_key_type(t));
         }
         false

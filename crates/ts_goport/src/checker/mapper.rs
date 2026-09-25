@@ -180,8 +180,8 @@ pub struct SimpleTypeMapper {
 // Go: checker/mapper.go:122 ArrayTypeMapper
 #[derive(Clone, Debug, Default)]
 pub struct ArrayTypeMapper {
-    pub sources: Vec<TypeId>,
-    pub targets: Vec<TypeId>,
+    pub sources: SharedList<TypeId>,
+    pub targets: SharedList<TypeId>,
     /// Cached Go `len(m.sources) == 1 && isThisTypeParameter(m.sources[0])`.
     pub maps_this_only: bool,
 }
@@ -346,6 +346,18 @@ impl Checker {
         self.new_array_type_mapper(sources, targets)
     }
 
+    /// `new_type_mapper` over shared lists. See `new_array_type_mapper_shared`.
+    pub fn new_type_mapper_shared(
+        &mut self,
+        sources: SharedList<TypeId>,
+        targets: SharedList<TypeId>,
+    ) -> MapperId {
+        if sources.len() == 1 {
+            return self.new_simple_type_mapper(sources[0], targets[0]);
+        }
+        self.new_array_type_mapper_shared(sources, targets)
+    }
+
     // Go: checker/mapper.go:48 combineTypeMappers
     pub fn combine_type_mappers(&mut self, m1: MapperId, m2: MapperId) -> MapperId {
         if m1.is_some() {
@@ -422,11 +434,21 @@ impl Checker {
     // PORT: Go keeps the caller's slices; we copy them. Go callers do not
     // mutate these slices after building the mapper.
     pub fn new_array_type_mapper(&mut self, sources: &[TypeId], targets: &[TypeId]) -> MapperId {
+        self.new_array_type_mapper_shared(sources.into(), targets.into())
+    }
+
+    /// `new_array_type_mapper` over lists that are already shared, so the
+    /// mapper keeps them without a copy, like Go keeps the slices.
+    pub fn new_array_type_mapper_shared(
+        &mut self,
+        sources: SharedList<TypeId>,
+        targets: SharedList<TypeId>,
+    ) -> MapperId {
         // Go: checker/mapper.go:149 (*ArrayTypeMapper).MapsThisOnly
         let maps_this_only = sources.len() == 1 && self.is_this_type_parameter(sources[0]);
         self.alloc_type_mapper(TypeMapper::Array(ArrayTypeMapper {
-            sources: sources.to_vec(),
-            targets: targets.to_vec(),
+            sources,
+            targets,
             maps_this_only,
         }))
     }

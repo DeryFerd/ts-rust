@@ -4,7 +4,7 @@
 //! Our AST is read-only while binding, so this file assumes these `Binder`
 //! fields (defined in binder_p1.rs) hold the per-file results until
 //! `bind_source_file` stores them in the `GoFile` OnceCells:
-//! - `node_bind: Vec<NodeBindData>` indexed by `NodeId::index()` of `self.file` nodes
+//! - `node_bind: NodeBindBuilder` indexed by `NodeId::index()` of `self.file` nodes
 //!   (Go `node.Symbol`, `node.Locals`, `FlowNodeData().FlowNode`, `EndFlowNode`, and
 //!   the binder-added bits of `node.Flags` in `added_flags`).
 //! - `flow_node_arena: Vec<FlowNode>` indexed by `FlowNodeId::local_index()`.
@@ -23,13 +23,13 @@ use crate::prelude::*;
 fn bound(b: &Binder, node: Node) -> &NodeBindData {
     debug_assert!(node.is_some(), "nil node dereference");
     debug_assert_eq!(node.file_index(), b.file.file_index());
-    &b.node_bind[node.node_id().index()]
+    b.node_bind.get(node.node_id().index())
 }
 
 fn bound_mut(b: &mut Binder, node: Node) -> &mut NodeBindData {
     debug_assert!(node.is_some(), "nil node dereference");
     debug_assert_eq!(node.file_index(), b.file.file_index());
-    &mut b.node_bind[node.node_id().index()]
+    b.node_bind.get_mut(node.node_id().index())
 }
 
 /// Go `node.Flags` during binding: parser flags plus the flags the binder added so far.
@@ -1271,7 +1271,7 @@ impl Binder {
             let value_declaration = declarations[0];
             {
                 let s = self.symbols.sym_mut(symbol);
-                s.declarations = declarations.clone().into();
+                s.declarations = declarations.clone();
                 s.value_declaration = value_declaration;
             }
             if name == "module" {
@@ -1281,7 +1281,7 @@ impl Binder {
                 );
                 {
                     let p = self.symbols.sym_mut(exports_property);
-                    p.declarations = declarations.into();
+                    p.declarations = declarations;
                     p.value_declaration = value_declaration;
                     p.parent = symbol;
                 }

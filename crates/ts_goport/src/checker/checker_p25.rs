@@ -20,7 +20,6 @@ impl Checker {
     ) -> TypeId {
         let declaration: Node;
         let target: TypeId;
-        let mut type_parameters: Vec<TypeId>;
         let t_object_flags = self.ty(t).object_flags;
         if t_object_flags.intersects(ObjectFlags::REFERENCE) {
             // Deferred type reference
@@ -39,21 +38,23 @@ impl Checker {
         } else {
             target = t;
         }
-        type_parameters = self
+        // PORT: the stored list never changes once it is non-empty, so it is
+        // read in place (by index) instead of copied on every call.
+        let mut type_parameter_count = self
             .type_node_links
             .get(declaration)
             .outer_type_parameters
-            .clone();
+            .len();
         // PORT: Go tells a nil `outerTypeParameters` (not computed) from an
-        // empty one (computed, none in scope). `TypeNodeLinks` stores a `Vec`,
-        // so an empty list is computed again. The computation only reads
-        // cached checker state, so the result is the same.
-        if type_parameters.is_empty() {
+        // empty one (computed, none in scope). `TypeNodeLinks` stores a
+        // `SharedList`, so an empty list is computed again. The computation
+        // only reads cached checker state, so the result is the same.
+        if type_parameter_count == 0 {
             // The first time an anonymous type is instantiated we compute and store a list of the type
             // parameters that are in scope (and therefore potentially referenced). For type literals that
             // aren't the right hand side of a generic type alias declaration we optimize by reducing the
             // set of type parameters to those that are possibly referenced in the literal.
-            type_parameters =
+            let mut type_parameters =
                 self.get_outer_type_parameters(declaration, true /*includeThisTypes*/);
             if self.ty(target).alias.type_arguments().is_empty() {
                 if t_object_flags
@@ -83,9 +84,10 @@ impl Checker {
                     }
                 }
             }
-            self.type_node_links.get(declaration).outer_type_parameters = type_parameters.clone();
+            type_parameter_count = type_parameters.len();
+            self.type_node_links.get(declaration).outer_type_parameters = type_parameters.into();
         }
-        if type_parameters.is_empty() {
+        if type_parameter_count == 0 {
             return t;
         }
         // We are instantiating an anonymous type that has one or more type parameters in scope. Apply the
@@ -96,29 +98,35 @@ impl Checker {
         // of adding a mapper to the arena on every call. Mapper ids never
         // affect output.
         let t_mapper = self.ty(t).mapper();
-        let mut type_arguments: Vec<TypeId> = Vec::with_capacity(type_parameters.len());
-        for &tp in &type_parameters {
+        let mut type_arguments: Vec<TypeId> = Vec::with_capacity(type_parameter_count);
+        for i in 0..type_parameter_count {
+            let tp = self.type_node_links.get(declaration).outer_type_parameters[i];
             type_arguments.push(self.map_with_combined_mappers(t_mapper, m, tp));
         }
-        let new_alias = if alias.is_none() {
-            let t_alias = self.ty(t).alias.clone();
-            self.instantiate_type_alias(t_alias, m)
+        // PORT: Go `c.instantiateTypeAlias(t.alias, m)` when `alias` is nil.
+        // The instantiated alias is boxed in an `Rc` only on a cache miss,
+        // because a hit never uses it.
+        let instantiated_alias: Option<TypeAlias> = if alias.is_none() {
+            self.ty(t).alias.clone().map(|t_alias| TypeAlias {
+                symbol: t_alias.symbol,
+                type_arguments: self.instantiate_types(&t_alias.type_arguments, m),
+            })
         } else {
-            alias
+            None
         };
         let key = get_type_instantiation_key(
             &self.symbols,
             &type_arguments,
-            new_alias.as_deref(),
+            alias.as_deref().or(instantiated_alias.as_ref()),
             t_object_flags.intersects(ObjectFlags::SINGLE_SIGNATURE_TYPE),
         );
         if self.ty(target).as_object_type().instantiations.is_none() {
             let target_alias = self.ty(target).alias.clone();
-            let mut instantiations: FxHashMap<CacheHashKey, TypeId> = FxHashMap::default();
+            let mut instantiations: CacheKeyMap<TypeId> = CacheKeyMap::default();
             instantiations.insert(
                 get_type_instantiation_key(
                     &self.symbols,
-                    &type_parameters,
+                    &self.type_node_links.get(declaration).outer_type_parameters,
                     target_alias.as_deref(),
                     false,
                 ),
@@ -134,7 +142,15 @@ impl Checker {
             .and_then(|instantiations| instantiations.get(&key).copied())
             .unwrap_or_default();
         if result.is_nil() {
-            let mut new_mapper = self.new_type_mapper(&type_parameters, &type_arguments);
+            let new_alias = alias.or_else(|| instantiated_alias.map(Rc::new));
+            let type_parameters = self
+                .type_node_links
+                .get(declaration)
+                .outer_type_parameters
+                .clone();
+            let type_arguments = SharedList::from(type_arguments);
+            let mut new_mapper =
+                self.new_type_mapper_shared(type_parameters, type_arguments.clone());
             let target_object_flags = self.ty(target).object_flags;
             if target_object_flags.intersects(ObjectFlags::SINGLE_SIGNATURE_TYPE) && m.is_some() {
                 new_mapper = self.combine_type_mappers(new_mapper, m);
@@ -152,7 +168,7 @@ impl Checker {
             self.ty_mut(target)
                 .as_object_type_mut()
                 .instantiations
-                .get_or_insert_with(FxHashMap::default)
+                .get_or_insert_with(CacheKeyMap::default)
                 .insert(key, result);
             if self
                 .ty(result)
@@ -367,13 +383,17 @@ impl Checker {
         alias: Option<Rc<TypeAlias>>,
     ) -> TypeId {
         let root = self.ty(t).as_conditional_type().root.clone();
-        let outer_type_parameters = root.borrow().outer_type_parameters.clone();
-        if !outer_type_parameters.is_empty() {
+        // PORT: the root's outer type parameters never change after it is
+        // created. They are read in place instead of copied; the mapping can
+        // reenter this root, so no borrow is held across it.
+        let outer_type_parameter_count = root.borrow().outer_type_parameters.len();
+        if outer_type_parameter_count != 0 {
             // We are instantiating a conditional type that has one or more type parameters in scope. Apply the
             // mapper to the type parameters to produce the effective list of type arguments, and compute the
             // instantiation cache key from the type IDs of the type arguments.
-            let mut type_arguments: Vec<TypeId> = Vec::with_capacity(outer_type_parameters.len());
-            for &tp in &outer_type_parameters {
+            let mut type_arguments: Vec<TypeId> = Vec::with_capacity(outer_type_parameter_count);
+            for i in 0..outer_type_parameter_count {
+                let tp = root.borrow().outer_type_parameters[i];
                 type_arguments.push(self.map_with_combined_mappers(m1, m2, tp));
             }
             let key = get_conditional_type_key(
@@ -389,7 +409,10 @@ impl Checker {
                 .and_then(|instantiations| instantiations.get(&key).copied())
                 .unwrap_or_default();
             if result.is_nil() {
-                let new_mapper = self.new_type_mapper(&outer_type_parameters, &type_arguments);
+                let new_mapper = {
+                    let root_ref = root.borrow();
+                    self.new_type_mapper(&root_ref.outer_type_parameters, &type_arguments)
+                };
                 let check_type = root.borrow().check_type;
                 let is_distributive = root.borrow().is_distributive;
                 let mut distribution_type = TypeId::NIL;
@@ -427,7 +450,7 @@ impl Checker {
                 }
                 root.borrow_mut()
                     .instantiations
-                    .get_or_insert_with(FxHashMap::default)
+                    .get_or_insert_with(CacheKeyMap::default)
                     .insert(key, result);
             }
             return result;
@@ -551,16 +574,9 @@ impl Checker {
                 return self.instantiate_mapped_tuple_type(s, t, type_variable, m);
             }
             if self.is_array_or_tuple_or_intersection(s) {
-                let types = self.ty(s).types().to_vec();
-                let mut mapped: Vec<TypeId> = Vec::with_capacity(types.len());
-                for constituent in types {
-                    mapped.push(self.instantiate_mapped_type_constituent_p25(
-                        constituent,
-                        t,
-                        type_variable,
-                        m,
-                    ));
-                }
+                let mapped = self.map_constituents(s, &mut |c, constituent| {
+                    c.instantiate_mapped_type_constituent_p25(constituent, t, type_variable, m)
+                });
                 return self.get_intersection_type(&mapped);
             }
         }

@@ -236,7 +236,7 @@ impl Checker {
                 .is_some(),
             TypeSystemPropertyName::RESOLVED_TYPE_ARGUMENTS => {
                 // PORT: Go checks `resolvedTypeArguments != nil`. The Rust field
-                // is a plain `Vec`, so an empty list reads as unresolved.
+                // is a `SharedList`, so an empty list reads as unresolved.
                 !self
                     .ty(as_type(r.target))
                     .as_type_reference()
@@ -327,7 +327,7 @@ impl Checker {
     }
 
     // Go: checker/checker.go:18745 getPropertiesOfType
-    pub fn get_properties_of_type(&mut self, t: TypeId) -> Vec<SymbolId> {
+    pub fn get_properties_of_type(&mut self, t: TypeId) -> SharedList<SymbolId> {
         let t = self.get_reduced_apparent_type(t);
         if self
             .ty(t)
@@ -339,18 +339,52 @@ impl Checker {
         self.get_properties_of_object_type(t)
     }
 
+    /// `get_properties_of_type(t).len()` without a copy of the list.
+    pub fn get_properties_of_type_count(&mut self, t: TypeId) -> usize {
+        let t = self.get_reduced_apparent_type(t);
+        if self
+            .ty(t)
+            .flags
+            .intersects(TypeFlags::UNION_OR_INTERSECTION)
+        {
+            self.resolve_properties_of_union_or_intersection_type(t);
+            return self
+                .ty(t)
+                .as_union_or_intersection_type()
+                .resolved_properties
+                .len();
+        }
+        if self.ty(t).flags.intersects(TypeFlags::OBJECT) {
+            return self.resolve_structured_type_members(t).properties.len();
+        }
+        0
+    }
+
     // Go: checker/checker.go:18753 getPropertiesOfObjectType
-    pub fn get_properties_of_object_type(&mut self, t: TypeId) -> Vec<SymbolId> {
+    pub fn get_properties_of_object_type(&mut self, t: TypeId) -> SharedList<SymbolId> {
         if self.ty(t).flags.intersects(TypeFlags::OBJECT) {
             return self.resolve_structured_type_members(t).properties.clone();
         }
-        Vec::new()
+        SharedList::default()
     }
 
     // Go: checker/checker.go:18760 getPropertiesOfUnionOrIntersectionType
-    pub fn get_properties_of_union_or_intersection_type(&mut self, t: TypeId) -> Vec<SymbolId> {
+    pub fn get_properties_of_union_or_intersection_type(
+        &mut self,
+        t: TypeId,
+    ) -> SharedList<SymbolId> {
+        self.resolve_properties_of_union_or_intersection_type(t);
+        self.ty(t)
+            .as_union_or_intersection_type()
+            .resolved_properties
+            .clone()
+    }
+
+    /// The body of Go `getPropertiesOfUnionOrIntersectionType`. It stores the
+    /// list in `resolved_properties`.
+    fn resolve_properties_of_union_or_intersection_type(&mut self, t: TypeId) {
         // PORT: Go checks `resolvedProperties == nil`. The Rust field is a
-        // plain `Vec`, so an empty result is recomputed; the recomputation is
+        // `SharedList`, so an empty result is recomputed; the recomputation is
         // idempotent because the property lookups are cached.
         if self
             .ty(t)
@@ -360,9 +394,9 @@ impl Checker {
         {
             let mut checked: FxHashSet<Name> = FxHashSet::default();
             let mut props: Vec<SymbolId> = Vec::new();
-            let types = self.ty(t).as_union_or_intersection_type().types.clone();
             let t_flags = self.ty(t).flags;
-            for current in types {
+            for i in 0..self.ty(t).types().len() {
+                let current = self.type_at(t, i);
                 for prop in self.get_properties_of_type(current) {
                     let prop_name = self.sym(prop).name.clone();
                     if checked.insert(prop_name.clone()) {
@@ -386,12 +420,8 @@ impl Checker {
             }
             self.ty_mut(t)
                 .as_union_or_intersection_type_mut()
-                .resolved_properties = props;
+                .resolved_properties = props.into();
         }
-        self.ty(t)
-            .as_union_or_intersection_type()
-            .resolved_properties
-            .clone()
     }
 
     // Go: checker/checker.go:18786 getPropertyOfType
@@ -505,7 +535,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:18858 getSignaturesOfType
-    pub fn get_signatures_of_type(&mut self, t: TypeId, kind: SignatureKind) -> Vec<SignatureId> {
+    pub fn get_signatures_of_type(
+        &mut self,
+        t: TypeId,
+        kind: SignatureKind,
+    ) -> SharedList<SignatureId> {
         let reduced = self.get_reduced_apparent_type(t);
         self.get_signatures_of_structured_type(reduced, kind)
     }
@@ -515,29 +549,60 @@ impl Checker {
         &mut self,
         t: TypeId,
         kind: SignatureKind,
+    ) -> SharedList<SignatureId> {
+        if !self.ty(t).flags.intersects(TypeFlags::STRUCTURED_TYPE) {
+            return SharedList::default();
+        }
+        let resolved = self.resolve_structured_type_members(t);
+        let call_count = resolved.call_signature_count as usize;
+        if kind == SignatureKind::CALL {
+            return resolved.signatures.slice(0..call_count);
+        }
+        resolved
+            .signatures
+            .slice(call_count..resolved.signatures.len())
+    }
+
+    /// `instantiate_signatures(&get_signatures_of_type(t, kind), m)` without a
+    /// copy of the source list. Resolved members never change, so the
+    /// signatures are read in place, in order.
+    pub fn instantiate_signatures_of_type(
+        &mut self,
+        t: TypeId,
+        kind: SignatureKind,
+        m: MapperId,
     ) -> Vec<SignatureId> {
+        let t = self.get_reduced_apparent_type(t);
         if !self.ty(t).flags.intersects(TypeFlags::STRUCTURED_TYPE) {
             return Vec::new();
         }
         let resolved = self.resolve_structured_type_members(t);
-        if kind == SignatureKind::CALL {
-            return resolved.signatures[..resolved.call_signature_count as usize].to_vec();
+        let call_count = resolved.call_signature_count as usize;
+        let range = if kind == SignatureKind::CALL {
+            0..call_count
+        } else {
+            call_count..resolved.signatures.len()
+        };
+        let mut result = Vec::with_capacity(range.len());
+        for i in range {
+            let signature = self.ty(t).as_structured_type().signatures[i];
+            result.push(self.instantiate_signature(signature, m));
         }
-        resolved.signatures[resolved.call_signature_count as usize..].to_vec()
+        result
     }
 
     // Go: checker/checker.go:18873 getIndexInfosOfType
-    pub fn get_index_infos_of_type(&mut self, t: TypeId) -> Vec<IndexInfoId> {
+    pub fn get_index_infos_of_type(&mut self, t: TypeId) -> SharedList<IndexInfoId> {
         let reduced = self.get_reduced_apparent_type(t);
         self.get_index_infos_of_structured_type(reduced)
     }
 
     // Go: checker/checker.go:18877 getIndexInfosOfStructuredType
-    pub fn get_index_infos_of_structured_type(&mut self, t: TypeId) -> Vec<IndexInfoId> {
+    pub fn get_index_infos_of_structured_type(&mut self, t: TypeId) -> SharedList<IndexInfoId> {
         if self.ty(t).flags.intersects(TypeFlags::STRUCTURED_TYPE) {
             return self.resolve_structured_type_members(t).index_infos.clone();
         }
-        Vec::new()
+        SharedList::default()
     }
 
     // Go: checker/checker.go:18886 getIndexInfoOfType
@@ -701,9 +766,14 @@ impl Checker {
             .as_interface_type()
             .all_type_parameters
             .clone();
-        let type_arguments = self.get_type_arguments(t).to_vec();
-        let mut padded_type_arguments = type_arguments.clone();
-        if type_arguments.len() == type_parameters.len().wrapping_sub(1) {
+        // One allocation with room for the padding `t`.
+        let mut padded_type_arguments = {
+            let type_arguments = self.type_arguments_of(t);
+            let mut padded = Vec::with_capacity(type_arguments.len() + 1);
+            padded.extend_from_slice(&type_arguments);
+            padded
+        };
+        if padded_type_arguments.len() == type_parameters.len().wrapping_sub(1) {
             padded_type_arguments.push(t);
         }
         self.resolve_object_type_members(t, source, &type_parameters, &padded_type_arguments);
@@ -788,6 +858,7 @@ impl Checker {
                 let inherited_index_infos: Vec<IndexInfoId> =
                     if instantiated_base_type != self.any_type {
                         self.get_index_infos_of_type(instantiated_base_type)
+                            .to_vec()
                     } else {
                         vec![self.any_base_type_index_info]
                     };
@@ -1497,9 +1568,9 @@ impl Checker {
             .to_vec();
         if !outer_type_parameters.is_empty() {
             let last = outer_type_parameters.len() - 1;
-            let type_arguments = self.get_type_arguments(t).to_vec();
+            let last_type_argument = self.type_arguments_of(t)[last];
             return self.ty(outer_type_parameters[last]).symbol
-                != self.ty(type_arguments[last]).symbol;
+                != self.ty(last_type_argument).symbol;
         }
         true
     }

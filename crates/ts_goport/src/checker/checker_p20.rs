@@ -1055,11 +1055,11 @@ impl Checker {
             } else if self.is_object_literal_type(t) {
                 result = self.get_widened_type_of_object_literal(t, context.clone());
             } else if flags.intersects(TypeFlags::UNION) {
-                let types = self.ty(t).types().to_vec();
+                let types = self.ty(t).types_list();
                 let union_context = match &context {
                     Some(ctx) => ctx.clone(),
                     None => Rc::new(RefCell::new(WideningContext {
-                        siblings: types.clone(),
+                        siblings: types.to_vec(),
                         ..Default::default()
                     })),
                 };
@@ -1090,7 +1090,7 @@ impl Checker {
                 };
                 result = self.get_union_type_ex(&widened_types, reduction, None, TypeId::NIL);
             } else if flags.intersects(TypeFlags::INTERSECTION) {
-                let types = self.ty(t).types().to_vec();
+                let types = self.ty(t).types_list();
                 let mut widened_types: Vec<TypeId> = Vec::with_capacity(types.len());
                 for member in types {
                     widened_types.push(self.get_widened_type(member));

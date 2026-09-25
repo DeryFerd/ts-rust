@@ -584,13 +584,52 @@ pub struct Symbol {
     pub export_symbol: SymbolId,
 }
 
-/// A growable array split into fixed-size chunks that clones share by `Arc`.
-/// The first write to a shared chunk copies only that chunk (`Arc::make_mut`).
+/// A growable array split into fixed-size chunks. A chunk is either owned
+/// by this array, so writes need no atomic operation, or shared with clones
+/// by `Arc`. `share` turns the owned chunks into shared ones before the array
+/// is cloned; a clone copies owned chunks. The first write to a shared chunk
+/// takes it back (a copy only when a clone still uses it).
 /// Reads cost one extra pointer hop compared to a `Vec`.
 #[derive(Clone, Debug)]
 pub struct CowChunks<T> {
-    chunks: Vec<Arc<Vec<T>>>,
+    chunks: Vec<Chunk<T>>,
     len: usize,
+}
+
+#[derive(Clone, Debug)]
+enum Chunk<T> {
+    Owned(Vec<T>),
+    Shared(Arc<Vec<T>>),
+}
+
+impl<T: Clone> Chunk<T> {
+    #[inline]
+    fn values(&self) -> &[T] {
+        match self {
+            Chunk::Owned(values) => values,
+            Chunk::Shared(values) => values,
+        }
+    }
+
+    /// The values, owned. Takes a shared chunk back first.
+    #[inline]
+    fn owned(&mut self) -> &mut Vec<T> {
+        if matches!(self, Chunk::Shared(_)) {
+            let taken = std::mem::replace(self, Chunk::Owned(Vec::new()));
+            *self = Chunk::Owned(taken.into_values());
+        }
+        match self {
+            Chunk::Owned(values) => values,
+            Chunk::Shared(_) => unreachable!("chunk was just taken back"),
+        }
+    }
+
+    fn into_values(self) -> Vec<T> {
+        match self {
+            Chunk::Owned(values) => values,
+            Chunk::Shared(values) => Arc::unwrap_or_clone(values),
+        }
+    }
 }
 
 const COW_CHUNK_SHIFT: usize = 8;
@@ -600,9 +639,7 @@ const COW_CHUNK_MASK: usize = COW_CHUNK_LEN - 1;
 impl<T: Clone> CowChunks<T> {
     /// The values in order, moved out of chunks that no clone shares.
     pub fn into_values(self) -> impl Iterator<Item = T> {
-        self.chunks
-            .into_iter()
-            .flat_map(|chunk| Arc::unwrap_or_clone(chunk).into_iter())
+        self.chunks.into_iter().flat_map(Chunk::into_values)
     }
 
     #[must_use]
@@ -627,27 +664,41 @@ impl<T: Clone> CowChunks<T> {
         if self.len & COW_CHUNK_MASK == 0 {
             // The first chunk grows on demand, so a one-file arena on a bind
             // thread stays small.
-            self.chunks.push(Arc::new(if self.len == 0 {
+            self.chunks.push(Chunk::Owned(if self.len == 0 {
                 Vec::new()
             } else {
                 Vec::with_capacity(COW_CHUNK_LEN)
             }));
         }
-        let chunk = self.chunks.last_mut().expect("cow chunk");
-        Arc::make_mut(chunk).push(value);
+        self.chunks
+            .last_mut()
+            .expect("cow chunk")
+            .owned()
+            .push(value);
         self.len += 1;
     }
 
     #[inline]
     #[must_use]
     pub fn get(&self, i: usize) -> &T {
-        &self.chunks[i >> COW_CHUNK_SHIFT][i & COW_CHUNK_MASK]
+        &self.chunks[i >> COW_CHUNK_SHIFT].values()[i & COW_CHUNK_MASK]
     }
 
-    /// Copies the chunk first if another clone still shares it.
+    /// Takes the chunk back first if it is shared.
     #[inline]
     pub fn get_mut(&mut self, i: usize) -> &mut T {
-        &mut Arc::make_mut(&mut self.chunks[i >> COW_CHUNK_SHIFT])[i & COW_CHUNK_MASK]
+        &mut self.chunks[i >> COW_CHUNK_SHIFT].owned()[i & COW_CHUNK_MASK]
+    }
+
+    /// Makes the chunks that hold values from index `from` on shared, so
+    /// clones copy none of them. Pass 0 to share every chunk.
+    pub fn share_from(&mut self, from: usize) {
+        let first = (from >> COW_CHUNK_SHIFT).min(self.chunks.len());
+        for chunk in &mut self.chunks[first..] {
+            if let Chunk::Owned(values) = chunk {
+                *chunk = Chunk::Shared(Arc::new(std::mem::take(values)));
+            }
+        }
     }
 }
 
@@ -698,11 +749,17 @@ impl Table {
     /// The position of `name`, whose `table_hash` is `hash`.
     #[inline]
     fn find(&self, hash: u32, name: &str) -> Option<usize> {
+        self.find_by(hash, |e| intern::text(e.name) == name)
+    }
+
+    /// The position of the entry with hash `hash` that `is_name` accepts.
+    #[inline]
+    fn find_by(&self, hash: u32, is_name: impl Fn(&TableEntry) -> bool) -> Option<usize> {
         if self.index.is_empty() {
             return self
                 .entries
                 .iter()
-                .position(|e| e.hash == hash && intern::text(e.name) == name);
+                .position(|e| e.hash == hash && is_name(e));
         }
         let mask = self.index.len() - 1;
         let mut slot = hash as usize & mask;
@@ -714,7 +771,7 @@ impl Table {
             let mut position = stored as usize - 1;
             while position < self.entries.len() {
                 let entry = &self.entries[position];
-                if entry.hash == hash && intern::text(entry.name) == name {
+                if entry.hash == hash && is_name(entry) {
                     return Some(position);
                 }
                 position += INDEX_MOD;
@@ -750,7 +807,8 @@ impl Table {
     /// Go `table[name] = symbol`. A new name goes last, like `IndexMap`.
     fn insert(&mut self, name: &Name, symbol: SymbolId) {
         let hash = table_hash(name);
-        if let Some(position) = self.find(hash, name) {
+        // Equal texts intern to one id, so the ids compare.
+        if let Some(position) = self.find_by(hash, |e| e.name == name.0) {
             self.entries[position].symbol = symbol;
             return;
         }
@@ -783,11 +841,15 @@ impl Table {
 /// checker starts from a clone, so binder ids stay valid and checker
 /// (transient) symbols stay private to that checker. The clone shares the
 /// binder's symbol and table chunks; a checker copies a chunk only when it
-/// first writes to it.
+/// first writes to it. The binder writes without atomic operations and then
+/// shares what it wrote (`share_since`), so the clone copies nothing.
 #[derive(Clone, Debug)]
 pub struct SymbolArena {
     symbols: CowChunks<Symbol>,
     tables: CowChunks<Table>,
+    /// A name may hold a symbol id (a private identifier name), so
+    /// `append_file_arena` must move ids inside names.
+    id_in_name: bool,
 }
 
 impl Default for SymbolArena {
@@ -803,7 +865,33 @@ impl SymbolArena {
         symbols.push(Symbol::default());
         let mut tables = CowChunks::new();
         tables.push(Table::default());
-        Self { symbols, tables }
+        Self {
+            symbols,
+            tables,
+            id_in_name: false,
+        }
+    }
+
+    /// Notes that a name now holds a symbol id
+    /// (`get_symbol_name_for_private_identifier`).
+    pub fn note_id_in_name(&mut self) {
+        self.id_in_name = true;
+    }
+
+    /// The current symbol and table counts, for `share_since`.
+    #[must_use]
+    pub fn mark(&self) -> ArenaMark {
+        ArenaMark {
+            symbols: self.symbols.len(),
+            tables: self.tables.len(),
+        }
+    }
+
+    /// Shares the symbols and tables added since `mark` with future clones.
+    /// Call it after binding, before the arena is cloned.
+    pub fn share_since(&mut self, mark: ArenaMark) {
+        self.symbols.share_from(mark.symbols);
+        self.tables.share_from(mark.tables);
     }
 
     /// Go `&ast.Symbol{Flags: flags, Name: name}`.
@@ -841,16 +929,26 @@ impl SymbolArena {
     // identifier symbols (`get_symbol_name_for_private_identifier`), so those
     // names move with the ids.
     pub fn append_file_arena(&mut self, file_arena: SymbolArena) -> ArenaOffsets {
+        let mark = self.mark();
         let offsets = ArenaOffsets {
             symbols: u32::try_from(self.symbols.len() - 1).expect("symbol overflow"),
             tables: u32::try_from(self.tables.len() - 1).expect("table overflow"),
         };
-        let SymbolArena { symbols, tables } = file_arena;
+        let SymbolArena {
+            symbols,
+            tables,
+            id_in_name,
+        } = file_arena;
+        self.id_in_name |= id_in_name;
         // Move the entries instead of copying them: the file arena was
         // built on a bind thread, and its buffers stay in use here.
         for symbol in symbols.into_values().skip(1) {
             self.symbols.push(Symbol {
-                name: offsets.name(&symbol.name),
+                name: if id_in_name {
+                    offsets.name(&symbol.name)
+                } else {
+                    symbol.name.clone()
+                },
                 members: offsets.table(symbol.members),
                 exports: offsets.table(symbol.exports),
                 parent: offsets.symbol(symbol.parent),
@@ -861,11 +959,13 @@ impl SymbolArena {
         for mut table in tables.into_values().skip(1) {
             let mut renamed = false;
             for entry in &mut table.entries {
-                let name = offsets.name(&Name(entry.name));
-                if name.0 != entry.name {
-                    renamed = true;
-                    entry.name = name.0;
-                    entry.hash = table_hash(&name);
+                if id_in_name {
+                    let name = offsets.name(&Name(entry.name));
+                    if name.0 != entry.name {
+                        renamed = true;
+                        entry.name = name.0;
+                        entry.hash = table_hash(&name);
+                    }
                 }
                 entry.symbol = offsets.symbol(entry.symbol);
             }
@@ -874,6 +974,7 @@ impl SymbolArena {
             }
             self.tables.push(table);
         }
+        self.share_since(mark);
         offsets
     }
 
@@ -967,6 +1068,14 @@ impl SymbolArena {
     pub fn values(&self, table: SymbolTable) -> Vec<SymbolId> {
         self.table_entries(table).iter().map(|e| e.symbol).collect()
     }
+}
+
+/// Symbol and table counts of a `SymbolArena` at one point
+/// (`SymbolArena::mark`).
+#[derive(Clone, Copy, Debug)]
+pub struct ArenaMark {
+    symbols: usize,
+    tables: usize,
 }
 
 /// How the ids of a file arena moved in `SymbolArena::append_file_arena`.
@@ -1079,14 +1188,14 @@ static EMPTY_NODE_BIND: NodeBindData = NodeBindData {
 };
 
 impl FileNodeBind {
-    /// Compacts the per-node data of a bound file.
+    /// Compacts the per-node data of a bound file, given in node order.
     #[must_use]
-    pub fn new(nodes: &[NodeBindData]) -> Self {
+    pub fn new<'a>(nodes: impl ExactSizeIterator<Item = &'a NodeBindData>) -> Self {
         let mut slots = Vec::with_capacity(nodes.len());
         let mut bases = Vec::with_capacity(nodes.len().div_ceil(NODE_BIND_BLOCK));
         let mut entries: Vec<NodeBindData> = Vec::new();
         let mut block_start = 0;
-        for (index, data) in nodes.iter().enumerate() {
+        for (index, data) in nodes.enumerate() {
             if index & (NODE_BIND_BLOCK - 1) == 0 {
                 block_start = entries.len();
                 bases.push(u32::try_from(block_start).expect("node bind overflow"));

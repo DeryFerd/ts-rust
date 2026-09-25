@@ -227,7 +227,7 @@ impl Checker {
         if flags.intersects(TypeFlags::TYPE_VARIABLE) {
             return base_constructor_type;
         } else if flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(base_constructor_type).types().to_vec();
+            let types = self.ty(base_constructor_type).types_list();
             for t in types {
                 if self.ty(t).flags.intersects(TypeFlags::TYPE_VARIABLE) {
                     return t;
@@ -894,9 +894,9 @@ impl Checker {
                 d.this_type = this_type;
                 d.all_type_parameters = all_type_parameters;
                 d.outer_type_parameter_count = outer_type_parameter_count as i32;
-                d.reference.resolved_type_arguments = d.type_parameters().to_vec();
+                d.reference.resolved_type_arguments = d.type_parameters().into();
                 let key = get_type_list_key(&d.reference.resolved_type_arguments);
-                let mut instantiations: FxHashMap<CacheHashKey, TypeId> = FxHashMap::default();
+                let mut instantiations: CacheKeyMap<TypeId> = CacheKeyMap::default();
                 instantiations.insert(key, t);
                 d.reference.object.instantiations = Some(instantiations);
                 d.reference.object.target = t;

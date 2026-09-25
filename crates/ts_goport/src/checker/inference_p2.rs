@@ -46,7 +46,7 @@ impl Checker {
         // it has one or more properties and is of a partially inferable type.
         let string_type = self.string_type;
         if !(self.get_index_info_of_type(source, string_type).is_some()
-            || !self.get_properties_of_type(source).is_empty()
+            || self.get_properties_of_type_count(source) != 0
                 && self.is_partially_inferable_type(source))
         {
             return TypeId::NIL;
@@ -54,7 +54,7 @@ impl Checker {
         // For arrays and tuples we infer new arrays and tuples where the reverse mapping has been
         // applied to the element type(s).
         if self.is_array_type(source) {
-            let element = self.get_type_arguments(source)[0];
+            let element = self.type_arguments_of(source)[0];
             let element_type = self.infer_reverse_mapped_type(element, target, constraint);
             if element_type.is_nil() {
                 return TypeId::NIL;
@@ -1022,8 +1022,8 @@ impl Checker {
             .flags
             .intersects(TypeFlags::UNION_OR_INTERSECTION)
         {
-            let types = self.ty(t).types().to_vec();
-            for u in types {
+            for i in 0..self.ty(t).types().len() {
+                let u = self.type_at(t, i);
                 if self.is_type_parameter_at_top_level(u, tp, depth) {
                     return true;
                 }

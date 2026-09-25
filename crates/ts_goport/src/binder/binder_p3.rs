@@ -8,7 +8,7 @@ use crate::prelude::*;
 // nodes and flow nodes directly. The Rust `Binder` (defined in binder_p1)
 // holds that output until `bind_source_file` fills the `GoFile` cells:
 // - `self.flow_nodes: Vec<FlowNode>`, indexed by `FlowNodeId::local_index()`.
-// - `self.node_bind: Vec<NodeBindData>`, indexed by `node.node_id().index()`.
+// - `self.node_bind: NodeBindBuilder`, indexed by `node.node_id().index()`.
 // - `self.file_bind: FileBindData` (bind and suggestion diagnostics).
 // - `self.symbols: SymbolArena` (Go `symbolArena`).
 // - `self.active_label_list: Option<Rc<RefCell<ActiveLabel>>>`.
@@ -32,7 +32,7 @@ impl Binder {
             node.file_index() == self.file.file_index(),
             "binder data for a node in another file"
         );
-        &mut self.node_bind[node.node_id().index()]
+        self.node_bind.get_mut(node.node_id().index())
     }
 }
 
@@ -961,7 +961,9 @@ impl Binder {
     // in the binder until the file is bound, so this is a `Binder` method.
     pub fn set_flow_node(&mut self, node: Node, flow_node: FlowNodeId) {
         if p3_has_flow_node_data(node) {
-            self.p3_node_bind_mut(node).flow_node = flow_node;
+            debug_assert_eq!(node.file_index(), self.file.file_index());
+            self.node_bind
+                .set_flow_node(node.node_id().index(), flow_node);
         }
     }
 
@@ -1006,7 +1008,7 @@ impl Binder {
         self.p3_node_bind_mut(node).symbol = symbol;
         if self.symbols.sym(symbol).declarations.is_empty() {
             let declarations = self.new_single_declaration(node);
-            self.symbols.sym_mut(symbol).declarations = declarations.into();
+            self.symbols.sym_mut(symbol).declarations = declarations;
         } else {
             // Go core.AppendIfUnique
             let declarations = &mut self.symbols.sym_mut(symbol).declarations;

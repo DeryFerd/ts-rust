@@ -611,10 +611,10 @@ impl Checker {
         let t_flags = self.ty(t).flags;
         if t_flags.intersects(TypeFlags::UNION | TypeFlags::INTERSECTION) {
             let types: Vec<TypeId> = if t_flags.intersects(TypeFlags::UNION) {
-                let members = self.ty(t).types().to_vec();
+                let members = self.ty(t).types_list();
                 self.format_union_types(&members, expanding_enum)
             } else {
-                self.ty(t).types().to_vec()
+                self.ty(t).types_list().to_vec()
             };
             if types.len() == 1 {
                 return self.type_to_type_node(b, types[0]);

@@ -882,7 +882,7 @@ impl Checker {
         if !self.ty(source).flags.intersects(TypeFlags::UNION) {
             return self.is_type_assignable_to(source, target);
         }
-        for t in self.ty(source).types().to_vec() {
+        for t in self.ty(source).types_list() {
             if self.is_type_assignable_to(t, target) {
                 return true;
             }

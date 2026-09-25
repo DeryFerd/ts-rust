@@ -232,7 +232,7 @@ impl Checker {
             // creates a map that is never read (instantiations are only used when
             // there are outer type parameters), so testing for non-empty is equivalent.
             if !outer_type_parameters.is_empty() {
-                let mut instantiations: FxHashMap<CacheHashKey, TypeId> = FxHashMap::default();
+                let mut instantiations: CacheKeyMap<TypeId> = CacheKeyMap::default();
                 let key = self.get_conditional_type_key(
                     &outer_type_parameters,
                     None,  /*alias*/
@@ -1142,11 +1142,11 @@ impl Checker {
         let d = self.ty_mut(t).as_tuple_type_mut();
         d.interface.this_type = this_type;
         d.interface.all_type_parameters = all_type_parameters;
-        let mut instantiations: FxHashMap<CacheHashKey, TypeId> = FxHashMap::default();
+        let mut instantiations: CacheKeyMap<TypeId> = CacheKeyMap::default();
         instantiations.insert(key, t);
         d.interface.reference.object.instantiations = Some(instantiations);
         d.interface.reference.object.target = t;
-        d.interface.reference.resolved_type_arguments = tps;
+        d.interface.reference.resolved_type_arguments = tps.into();
         d.interface.declared_members_resolved = true;
         d.interface.declared_members = members;
         d.element_infos = element_infos.to_vec();
@@ -1170,7 +1170,7 @@ impl Checker {
         let length = self.get_type_reference_arity(t) - end_skip_count;
         let element_infos: Vec<TupleElementInfo> = self.target_tuple_type(t).element_infos.clone();
         if index < length {
-            let type_arguments: Vec<TypeId> = self.get_type_arguments(t).to_vec();
+            let type_arguments = self.get_type_arguments(t);
             let mut element_types: Vec<TypeId> = Vec::new();
             for i in index..length {
                 let mut e = type_arguments[i as usize];
@@ -1251,8 +1251,8 @@ impl Checker {
                 .intersects(ObjectFlags::IS_GENERIC_TYPE_COMPUTED)
             {
                 if flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
-                    let types: Vec<TypeId> = self.ty(t).types().to_vec();
-                    for u in types {
+                    for i in 0..self.ty(t).types().len() {
+                        let u = self.type_at(t, i);
                         combined_flags |= self.get_generic_object_flags(u);
                     }
                 } else {
@@ -1328,8 +1328,8 @@ impl Checker {
                 .object_flags
                 .intersects(ObjectFlags::CONTAINS_INTERSECTIONS)
         {
-            let types: Vec<TypeId> = self.ty(t).types().to_vec();
-            for u in types {
+            for i in 0..self.ty(t).types().len() {
+                let u = self.type_at(t, i);
                 if self.is_generic_reducible_type(u) {
                     return true;
                 }

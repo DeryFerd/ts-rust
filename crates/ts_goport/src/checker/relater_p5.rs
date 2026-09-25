@@ -277,7 +277,7 @@ impl Checker {
         // Match each combination of the cartesian product of discriminant properties to one or more
         // constituents of 'target'. If any combination does not have a match then 'source' is not relatable.
         let mut matching_types: Vec<TypeId> = Vec::new();
-        let target_types = self.ty(target).types().to_vec();
+        let target_types = self.ty(target).types_list();
         let skip_optional =
             self.strict_null_checks || Rc::ptr_eq(&relation, &self.comparable_relation);
         for combination in &discriminant_combinations {
@@ -1441,10 +1441,8 @@ impl Checker {
     // Go: checker/relater.go:4617 isObjectTypeWithInferableIndex
     pub fn is_object_type_with_inferable_index(&mut self, t: TypeId) -> bool {
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
-            return types
-                .iter()
-                .all(|&t| self.is_object_type_with_inferable_index(t));
+            return (0..self.ty(t).types().len())
+                .all(|i| self.is_object_type_with_inferable_index(self.type_at(t, i)));
         }
         let symbol = self.ty(t).symbol;
         let object_flags = self.ty(t).object_flags;
@@ -1476,7 +1474,7 @@ impl Checker {
         let mut result = Ternary::TRUE;
         let key_type = self.index_info(target_info).key_type;
         let target_value_type = self.index_info(target_info).value_type;
-        let props: Vec<SymbolId>;
+        let props: SharedList<SymbolId>;
         if self.ty(source).flags.intersects(TypeFlags::INTERSECTION) {
             props = self.get_properties_of_union_or_intersection_type(source);
         } else {
@@ -1667,7 +1665,7 @@ impl Checker {
             .intersects(ObjectFlags::JSX_ATTRIBUTES)
             && target_flags.intersects(TypeFlags::INTERSECTION)
         {
-            let target_types = self.ty(target).types().to_vec();
+            let target_types = self.ty(target).types_list();
             let error_node = r.borrow().error_node;
             // PORT: Go `JsxNames.IntrinsicAttributes` and
             // `JsxNames.IntrinsicClassAttributes` are these string constants.
@@ -2089,14 +2087,14 @@ impl Checker {
         let source_flags = self.ty(source).flags;
         let target_flags = self.ty(target).flags;
         if source_flags.intersects(TypeFlags::UNION) {
-            let types = self.ty(source).types().to_vec();
-            types.iter().all(|&t| self.is_type_derived_from(t, target))
+            (0..self.ty(source).types().len())
+                .all(|i| self.is_type_derived_from(self.type_at(source, i), target))
         } else if target_flags.intersects(TypeFlags::UNION) {
-            let types = self.ty(target).types().to_vec();
-            types.iter().any(|&t| self.is_type_derived_from(source, t))
+            (0..self.ty(target).types().len())
+                .any(|i| self.is_type_derived_from(source, self.type_at(target, i)))
         } else if source_flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(source).types().to_vec();
-            types.iter().any(|&t| self.is_type_derived_from(t, target))
+            (0..self.ty(source).types().len())
+                .any(|i| self.is_type_derived_from(self.type_at(source, i), target))
         } else if source_flags.intersects(TypeFlags::INSTANTIABLE_NON_PRIMITIVE) {
             let mut constraint = self.get_base_constraint_of_type(source);
             if constraint.is_nil() {

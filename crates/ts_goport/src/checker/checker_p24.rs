@@ -2,7 +2,6 @@
 //! intersection properties, apparent and reduced types, type arguments and
 //! defaults, named members, and the core of type instantiation.
 
-use crate::core::FxIndexSet;
 use crate::prelude::*;
 
 impl Checker {
@@ -164,7 +163,10 @@ impl Checker {
     ) -> SymbolId {
         let mut prop_flags = SymbolFlags::NONE;
         let mut single_prop = SymbolId::NIL;
-        let mut prop_set: FxIndexSet<SymbolId> = FxIndexSet::default();
+        // PORT: Go `orderedSet[*ast.Symbol]` is a list here, kept free of
+        // duplicates by `ordered_symbol_set_add`. Most sets hold a few symbols.
+        let mut prop_set: Vec<SymbolId> = Vec::new();
+        let mut prop_set_index: FxHashSet<SymbolId> = FxHashSet::default();
         let mut index_types: Vec<TypeId> = Vec::new();
         let is_union = self.ty(containing_type).flags.intersects(TypeFlags::UNION);
         // Flags we want to propagate to the result if they exist in all source symbols
@@ -176,8 +178,8 @@ impl Checker {
         }
         let mut synthetic_flag = CheckFlags::SYNTHETIC_METHOD;
         let mut merged_instantiations = false;
-        let constituents = self.ty(containing_type).types().to_vec();
-        for current in constituents {
+        for i in 0..self.ty(containing_type).types().len() {
+            let current = self.type_at(containing_type, i);
             let t = self.get_apparent_type(current);
             if !self.is_error_type(t) && !self.ty(t).flags.intersects(TypeFlags::NEVER) {
                 let prop = self.get_property_of_type_ex(
@@ -232,9 +234,13 @@ impl Checker {
                                     .is_empty();
                         } else {
                             if prop_set.is_empty() {
-                                prop_set.insert(single_prop);
+                                ordered_symbol_set_add(
+                                    &mut prop_set,
+                                    &mut prop_set_index,
+                                    single_prop,
+                                );
                             }
-                            prop_set.insert(prop);
+                            ordered_symbol_set_add(&mut prop_set, &mut prop_set_index, prop);
                         }
                         // classes created by mixins are represented as intersections
                         // and overriding a property in a derived class redefines it completely at runtime
@@ -351,18 +357,21 @@ impl Checker {
             return clone;
         }
         if prop_set.is_empty() {
-            prop_set.insert(single_prop);
+            prop_set.push(single_prop);
         }
-        let mut declarations: Vec<Node> = Vec::new();
+        let declaration_count = prop_set
+            .iter()
+            .map(|&prop| self.sym(prop).declarations.len())
+            .sum();
+        let mut declarations: Vec<Node> = Vec::with_capacity(declaration_count);
         let mut first_type = TypeId::NIL;
         let mut name_type = TypeId::NIL;
-        let mut prop_types: Vec<TypeId> = Vec::new();
+        let mut prop_types: Vec<TypeId> = Vec::with_capacity(prop_set.len() + index_types.len());
         // PORT: Go nil slice `writeTypes` is `None`.
         let mut write_types: Option<Vec<TypeId>> = None;
         let mut first_value_declaration = Node::NIL;
         let mut has_non_uniform_value_declaration = false;
-        let props: Vec<SymbolId> = prop_set.iter().copied().collect();
-        for prop in props {
+        for &prop in &prop_set {
             let prop_value_declaration = self.sym(prop).value_declaration;
             if first_value_declaration.is_nil() {
                 first_value_declaration = prop_value_declaration;
@@ -462,7 +471,7 @@ impl Checker {
     }
 
     // Go: checker/checker.go:21578 hasCommonDeclaration
-    pub fn has_common_declaration(&self, symbols: &FxIndexSet<SymbolId>) -> bool {
+    pub fn has_common_declaration(&self, symbols: &[SymbolId]) -> bool {
         // PORT: Go `collections.Set[*ast.Node]`; only its size is observed, so
         // iteration order does not matter.
         let mut common_declarations: FxHashSet<Node> = FxHashSet::default();
@@ -731,16 +740,16 @@ impl Checker {
 
     // Go: checker/checker.go:21743 getReducedUnionType
     pub fn get_reduced_union_type(&mut self, union_type: TypeId) -> TypeId {
-        let types = self.ty(union_type).types().to_vec();
         // PORT: Go `core.SameMap` returns the input slice when no element
-        // changes, so `core.Same` is element-wise equality here.
-        let mut reduced_types: Vec<TypeId> = Vec::with_capacity(types.len());
-        for &t in &types {
-            reduced_types.push(self.get_reduced_type(t));
-        }
-        if reduced_types == types {
+        // changes, so `core.Same` is "no element changed" (`None`) here.
+        let count = self.ty(union_type).types().len();
+        let Some(reduced_types) =
+            self.map_stored_types_if_changed(union_type, count, Checker::type_at, &mut |c, t| {
+                c.get_reduced_type(t)
+            })
+        else {
             return union_type;
-        }
+        };
         let reduced = self.get_union_type(&reduced_types);
         if self.ty(reduced).flags.intersects(TypeFlags::UNION) {
             self.ty_mut(reduced)
@@ -852,10 +861,86 @@ impl Checker {
         s.value_declaration.is_nil() && s.check_flags.intersects(CheckFlags::CONTAINS_PRIVATE)
     }
 
+    /// Constituent `i` of the union, intersection or template literal type
+    /// `t`. These lists never change after the type is created, so a loop can
+    /// read them by index across checker calls instead of copying them.
+    #[inline]
+    pub fn type_at(&self, t: TypeId, i: usize) -> TypeId {
+        self.ty(t).types()[i]
+    }
+
+    /// Go `core.Map(t.Types(), f)`: maps each constituent of `t` in order,
+    /// read in place instead of from a copy of the list.
+    pub fn map_constituents(
+        &mut self,
+        t: TypeId,
+        f: &mut dyn FnMut(&mut Checker, TypeId) -> TypeId,
+    ) -> Vec<TypeId> {
+        let count = self.ty(t).types().len();
+        let mut mapped = Vec::with_capacity(count);
+        for i in 0..count {
+            let u = self.type_at(t, i);
+            mapped.push(f(self, u));
+        }
+        mapped
+    }
+
+    /// Go `core.SameMap` + `core.Same` over a type list stored on `owner`
+    /// that never changes once set (constituents, resolved type arguments).
+    /// `read(c, owner, i)` reads element `i` in place, so the list is copied
+    /// only when an element changes. Each element is mapped once, in order.
+    /// `None` means no element changed.
+    pub fn map_stored_types_if_changed(
+        &mut self,
+        owner: TypeId,
+        count: usize,
+        read: fn(&Checker, TypeId, usize) -> TypeId,
+        map: &mut dyn FnMut(&mut Checker, TypeId) -> TypeId,
+    ) -> Option<Vec<TypeId>> {
+        for i in 0..count {
+            let value = read(self, owner, i);
+            let mapped = map(self, value);
+            if mapped != value {
+                let mut result: Vec<TypeId> = Vec::with_capacity(count);
+                result.extend((0..i).map(|j| read(self, owner, j)));
+                result.push(mapped);
+                for j in i + 1..count {
+                    let value = read(self, owner, j);
+                    result.push(map(self, value));
+                }
+                return Some(result);
+            }
+        }
+        None
+    }
+
     // Go: checker/checker.go:21792 getTypeArguments
-    pub fn get_type_arguments(&mut self, t: TypeId) -> Vec<TypeId> {
+    pub fn get_type_arguments(&mut self, t: TypeId) -> SharedList<TypeId> {
+        if let Some(count) = self.resolve_type_arguments(t) {
+            return vec![self.error_type; count].into();
+        }
+        self.ty(t)
+            .as_type_reference()
+            .resolved_type_arguments
+            .clone()
+    }
+
+    /// `get_type_arguments` without a copy of the resolved list. Use it when
+    /// the caller only reads the list before its next checker call.
+    pub fn type_arguments_of(&mut self, t: TypeId) -> std::borrow::Cow<'_, [TypeId]> {
+        if let Some(count) = self.resolve_type_arguments(t) {
+            return std::borrow::Cow::Owned(vec![self.error_type; count]);
+        }
+        std::borrow::Cow::Borrowed(&self.ty(t).as_type_reference().resolved_type_arguments[..])
+    }
+
+    /// The body of Go `getTypeArguments`. It stores the resolved list on `t`.
+    /// When the type arguments circularly reference themselves while they
+    /// resolve, it stores nothing and returns the count of error types that
+    /// Go returns in place of the list.
+    fn resolve_type_arguments(&mut self, t: TypeId) -> Option<usize> {
         // PORT: Go tests `resolvedTypeArguments == nil`. The Rust field is a
-        // `Vec`, so an empty list reads as unresolved. An empty list resolves
+        // `SharedList`, so an empty list reads as unresolved. An empty list resolves
         // to an empty list again, so the result is the same.
         if self
             .ty(t)
@@ -869,7 +954,7 @@ impl Checker {
                 TypeSystemEntity::Type(t),
                 TypeSystemPropertyName::RESOLVED_TYPE_ARGUMENTS,
             ) {
-                return vec![self.error_type; type_parameter_count];
+                return Some(type_parameter_count);
             }
             let mut type_arguments: Vec<TypeId> = Vec::new();
             let node = self.ty(t).as_type_reference().node;
@@ -913,7 +998,7 @@ impl Checker {
                     let resolved = self.instantiate_types(&type_arguments, mapper);
                     self.ty_mut(t)
                         .as_type_reference_mut()
-                        .resolved_type_arguments = resolved;
+                        .resolved_type_arguments = resolved.into();
                 }
             } else {
                 if self
@@ -925,7 +1010,7 @@ impl Checker {
                     let error_type = self.error_type;
                     self.ty_mut(t)
                         .as_type_reference_mut()
-                        .resolved_type_arguments = vec![error_type; type_parameter_count];
+                        .resolved_type_arguments = vec![error_type; type_parameter_count].into();
                 }
                 let error_node = if node.is_some() {
                     node
@@ -949,10 +1034,7 @@ impl Checker {
                 }
             }
         }
-        self.ty(t)
-            .as_type_reference()
-            .resolved_type_arguments
-            .clone()
+        None
     }
 
     // Go: checker/checker.go:21832 getEffectiveTypeArguments
@@ -1147,15 +1229,18 @@ impl Checker {
         // For classes and interfaces, we store explicitly declared members ahead of inherited members. This ensures we process
         // explicitly declared members first in type relations, which is beneficial because explicitly declared members are more
         // likely to contain discriminating differences. See for example https://github.com/microsoft/typescript-go/issues/1968.
-        // PORT: `is_named_member` only reads the name for
-        // `is_reserved_member_name`, so the snapshot keeps that result, not a
-        // copy of the name.
-        let entries: Vec<(bool, SymbolId)> = self
-            .symbols
-            .iter(members)
-            .map(|(id, symbol)| (is_reserved_member_name(id), symbol))
-            .collect();
-        let mut result: Vec<SymbolId> = Vec::with_capacity(entries.len());
+        // PORT: `is_named_member` is `!is_reserved_member_name(id)` and then
+        // `symbol_is_value`. The first test only reads the table, so it runs
+        // while the snapshot is built. The second can resolve aliases, so it
+        // runs on the snapshot, in table order as in Go.
+        let mut result: Vec<SymbolId> = Vec::with_capacity(self.symbols.len(members));
+        result.extend(
+            self.symbols
+                .iter(members)
+                .filter(|(id, _)| !is_reserved_member_name(id))
+                .map(|(_, symbol)| symbol),
+        );
+        result.retain(|&symbol| self.symbol_is_value(symbol));
         let mut contained_count = 0usize;
         let is_class_or_interface_container = container.is_some()
             && self
@@ -1164,38 +1249,29 @@ impl Checker {
                 .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE);
         if is_class_or_interface_container {
             // PORT: Go runs isNamedMember and isDeclarationContainedBy again
-            // in the second pass. Both results are cached here from the first
-            // pass, and the container ranges are read once.
-            let container_locs: Vec<TextRange> = self
-                .sym(container)
-                .declarations
-                .iter()
-                .map(|d| d.loc())
-                .collect();
+            // in the second pass. Both are pure here, so one stable partition
+            // keeps the contained members first.
+            let member_count = result.len();
             let mut others: Vec<SymbolId> = Vec::new();
-            for &(reserved, symbol) in &entries {
-                if reserved || !self.symbol_is_value(symbol) {
-                    continue;
-                }
+            result.retain(|&symbol| {
                 let declaration = self.sym(symbol).value_declaration;
                 let contained = declaration.is_some() && {
                     let loc = declaration.loc();
-                    container_locs.iter().any(|&l| loc.contained_by(l))
+                    self.sym(container)
+                        .declarations
+                        .iter()
+                        .any(|d| loc.contained_by(d.loc()))
                 };
-                if contained {
-                    result.push(symbol);
-                } else {
+                if !contained {
+                    if others.capacity() == 0 {
+                        others.reserve_exact(member_count);
+                    }
                     others.push(symbol);
                 }
-            }
+                contained
+            });
             contained_count = result.len();
             result.extend_from_slice(&others);
-        } else {
-            for &(reserved, symbol) in &entries {
-                if !reserved && self.symbol_is_value(symbol) {
-                    result.push(symbol);
-                }
-            }
         }
         self.sort_symbols(&mut result[..contained_count]);
         self.sort_symbols(&mut result[contained_count..]);
@@ -1323,7 +1399,7 @@ impl Checker {
         let last_index = self.active_mappers.len();
         self.active_mappers.push(mapper);
         if last_index >= self.active_type_mappers_caches.len() {
-            self.active_type_mappers_caches.push(FxHashMap::default());
+            self.active_type_mappers_caches.push(CacheKeyMap::default());
         }
     }
 
@@ -1335,7 +1411,7 @@ impl Checker {
         // PORT: clearing costs time in the map capacity, so a mostly empty
         // large map is dropped instead.
         if cache.capacity() > 256 && cache.len() < cache.capacity() / 8 {
-            *cache = FxHashMap::default();
+            *cache = CacheKeyMap::default();
         } else if !cache.is_empty() {
             cache.clear();
         }
@@ -1406,8 +1482,8 @@ impl Checker {
                 && !flags.intersects(TypeFlags::ENUM_LITERAL)
                 && !self.is_non_generic_top_level_type(t)
                 && {
-                    let types = self.ty(t).types().to_vec();
-                    types.iter().any(|&u| could_contain_type_variables(self, u))
+                    (0..self.ty(t).types().len())
+                        .any(|i| could_contain_type_variables(self, self.type_at(t, i)))
                 };
         self.ty_mut(t).object_flags |= ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
             | if result {
@@ -1466,17 +1542,14 @@ impl Checker {
                 if object_flags.intersects(ObjectFlags::REFERENCE)
                     && self.ty(t).as_type_reference().node.is_nil()
                 {
-                    let resolved_type_arguments = self
-                        .ty(t)
-                        .as_type_reference()
-                        .resolved_type_arguments
-                        .clone();
                     // PORT: Go `core.Same` on the `instantiateTypes` result
                     // is "no element changed" (`None`) here.
-                    let Some(new_type_arguments) = self.instantiate_list_if_changed(
-                        &resolved_type_arguments,
-                        m,
-                        Checker::instantiate_type,
+                    let count = self.ty(t).as_type_reference().resolved_type_arguments.len();
+                    let Some(new_type_arguments) = self.map_stored_types_if_changed(
+                        t,
+                        count,
+                        |c, t, i| c.ty(t).as_type_reference().resolved_type_arguments[i],
+                        &mut |c, a| c.instantiate_type(a, m),
                     ) else {
                         return t;
                     };
@@ -1502,21 +1575,30 @@ impl Checker {
                     source = origin;
                 }
             }
-            let types = self.ty(source).types().to_vec();
-            let changed = self.instantiate_list_if_changed(&types, m, Checker::instantiate_type);
+            let count = self.ty(source).types().len();
+            let changed =
+                self.map_stored_types_if_changed(source, count, Checker::type_at, &mut |c, u| {
+                    c.instantiate_type(u, m)
+                });
             if changed.is_none() && alias.symbol() == self.ty(t).alias.symbol() {
                 return t;
             }
-            let new_types = changed.unwrap_or(types);
+            let unchanged;
+            let new_types: &[TypeId] = if let Some(types) = &changed {
+                types
+            } else {
+                unchanged = self.ty(source).types_list();
+                &unchanged
+            };
             if alias.is_none() {
                 let t_alias = self.ty(t).alias.clone();
                 alias = self.instantiate_type_alias(t_alias, m);
             }
             if self.ty(source).flags.intersects(TypeFlags::INTERSECTION) {
-                return self.get_intersection_type_ex(&new_types, IntersectionFlags::NONE, alias);
+                return self.get_intersection_type_ex(new_types, IntersectionFlags::NONE, alias);
             }
             return self.get_union_type_ex(
-                &new_types,
+                new_types,
                 UnionReduction::LITERAL,
                 alias,
                 TypeId::NIL, /*origin*/
@@ -1607,5 +1689,22 @@ impl Checker {
             return self.get_intersection_type(&[new_constraint, new_base_type]);
         }
         t
+    }
+}
+
+/// Go `orderedSet.Add` for a small symbol set kept as a list. Lookups scan the
+/// list while it is short; from `ORDERED_SYMBOL_SET_SCAN` symbols on, `index`
+/// holds every member and answers them instead.
+fn ordered_symbol_set_add(list: &mut Vec<SymbolId>, index: &mut FxHashSet<SymbolId>, s: SymbolId) {
+    const ORDERED_SYMBOL_SET_SCAN: usize = 32;
+    if list.len() < ORDERED_SYMBOL_SET_SCAN {
+        if !list.contains(&s) {
+            list.push(s);
+            if list.len() == ORDERED_SYMBOL_SET_SCAN {
+                index.extend(list.iter().copied());
+            }
+        }
+    } else if index.insert(s) {
+        list.push(s);
     }
 }

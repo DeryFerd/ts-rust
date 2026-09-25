@@ -735,18 +735,15 @@ impl Checker {
         let flags = self.ty(t).flags;
         (flags.intersects(TypeFlags::OBJECT)
             && !self.is_generic_mapped_type(t)
-            && self.get_properties_of_type(t).is_empty()
+            && self.get_properties_of_type_count(t) == 0
             && self.get_index_infos_of_type(t).len() == 1
             && {
                 let string_type = self.string_type;
                 self.get_index_info_of_type(t, string_type).is_some()
             })
-            || (flags.intersects(TypeFlags::UNION_OR_INTERSECTION) && {
-                let types = self.ty(t).types().to_vec();
-                types
-                    .into_iter()
-                    .all(|t| self.is_string_index_signature_only_type(t))
-            })
+            || (flags.intersects(TypeFlags::UNION_OR_INTERSECTION)
+                && (0..self.ty(t).types().len())
+                    .all(|i| self.is_string_index_signature_only_type(self.type_at(t, i))))
     }
 
     // Go: checker/checker.go:27230 shouldDeferIndexedAccessType
@@ -987,7 +984,7 @@ impl Checker {
             }
             return self.get_next_base_constraint(constraint, stack);
         } else if flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
+            let types = self.ty(t).types_list();
             let mut constraints: Vec<TypeId> = Vec::with_capacity(types.len());
             let mut different = false;
             for &s in &types {
@@ -1024,7 +1021,7 @@ impl Checker {
             }
             return self.string_number_symbol_type;
         } else if flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
-            let types = self.ty(t).types().to_vec();
+            let types = self.ty(t).types_list();
             let mut constraints: Vec<TypeId> = Vec::with_capacity(types.len());
             for &s in &types {
                 let constraint = self.get_next_base_constraint(s, stack);
@@ -1158,8 +1155,8 @@ impl Checker {
             return true;
         }
         if flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
-            for t in types {
+            for i in 0..self.ty(t).types().len() {
+                let t = self.type_at(t, i);
                 if self.maybe_type_of_kind(t, kind) {
                     return true;
                 }
@@ -1194,10 +1191,10 @@ impl Checker {
         strict: bool,
     ) -> bool {
         if self.ty(source).flags.intersects(TypeFlags::UNION) {
-            let types = self.ty(source).types().to_vec();
-            return types
-                .into_iter()
-                .all(|sub_type| self.all_types_assignable_to_kind_ex(sub_type, kind, strict));
+            return (0..self.ty(source).types().len()).all(|i| {
+                let sub_type = self.type_at(source, i);
+                self.all_types_assignable_to_kind_ex(sub_type, kind, strict)
+            });
         }
         self.is_type_assignable_to_kind_ex(source, kind, strict)
     }
@@ -1480,13 +1477,17 @@ impl Checker {
                 .intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED)
             {
                 self.ty_mut(t).object_flags |= ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED;
-                let types = self.ty(t).types().to_vec();
-                if types.len() >= 3
-                    && self.ty(types[0]).flags.intersects(TypeFlags::UNDEFINED)
-                    && self.ty(types[1]).flags.intersects(TypeFlags::NULL)
-                    && types
-                        .iter()
-                        .any(|&s| self.is_empty_anonymous_object_type(s))
+                let count = self.ty(t).types().len();
+                if count >= 3
+                    && self
+                        .ty(self.type_at(t, 0))
+                        .flags
+                        .intersects(TypeFlags::UNDEFINED)
+                    && self
+                        .ty(self.type_at(t, 1))
+                        .flags
+                        .intersects(TypeFlags::NULL)
+                    && (0..count).any(|i| self.is_empty_anonymous_object_type(self.type_at(t, i)))
                 {
                     self.ty_mut(t).object_flags |= ObjectFlags::IS_UNKNOWN_LIKE_UNION;
                 }

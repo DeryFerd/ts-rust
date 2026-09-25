@@ -1091,7 +1091,7 @@ impl Checker {
             target = error_target.name();
         }
         if self.ty(apparent_type).flags.intersects(TypeFlags::UNION) {
-            let types = self.ty(apparent_type).types().to_vec();
+            let types = self.ty(apparent_type).types_list();
             let mut has_signatures = false;
             for constituent in types {
                 let signatures = self.get_signatures_of_type(constituent, kind);
@@ -1657,7 +1657,7 @@ impl Checker {
             return self.get_contextual_call_signature(t, node);
         }
         let mut signature_list: Vec<SignatureId> = Vec::new();
-        let types = self.ty(t).types().to_vec();
+        let types = self.ty(t).types_list();
         for current in types {
             let signature = self.get_contextual_call_signature(current, node);
             if signature.is_some() {

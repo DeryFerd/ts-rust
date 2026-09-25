@@ -992,9 +992,13 @@ fn prefetch_worker_count() -> usize {
     }
     std::thread::available_parallelism()
         .map_or(1, std::num::NonZero::get)
-        .min(8)
+        .min(PARSE_THREAD_CAP)
         - 1
 }
+
+/// The most parse threads, the loading thread included. 8 is the measured
+/// best with glibc malloc: more workers make zod and effect parse slower.
+const PARSE_THREAD_CAP: usize = 8;
 
 /// The parse of one file by a parse worker.
 struct PrefetchJob {
@@ -1019,8 +1023,11 @@ enum PrefetchState {
 #[derive(Default)]
 struct PrefetchQueue {
     /// Jobs no worker has taken yet. Workers take the newest first, like
-    /// the loader's queue.
+    /// the loader's queue, but take `lib.dom.d.ts` before all others.
     pending: Vec<Arc<PrefetchJob>>,
+    /// The queued `lib.dom.d.ts` job. It is the largest file of most
+    /// programs, so its parse starts first to end before the loader needs it.
+    first: Option<Arc<PrefetchJob>>,
     /// Every job by file name. A file name is queued once.
     by_name: FxHashMap<String, Arc<PrefetchJob>>,
     next_job: usize,
@@ -1096,7 +1103,11 @@ impl PrefetchShared {
         queue
             .by_name
             .insert(job.opts.file_name.clone(), job.clone());
-        queue.pending.push(job);
+        if job.opts.file_name.ends_with("/lib.dom.d.ts") {
+            queue.first = Some(job);
+        } else {
+            queue.pending.push(job);
+        }
         drop(queue);
         self.ready.notify_one();
     }
@@ -1205,7 +1216,7 @@ fn run_prefetch_worker(shared: &PrefetchShared) {
                 if queue.closed {
                     return;
                 }
-                if let Some(job) = queue.pending.pop() {
+                if let Some(job) = queue.first.take().or_else(|| queue.pending.pop()) {
                     break job;
                 }
                 queue = shared

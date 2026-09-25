@@ -169,17 +169,19 @@ impl Checker {
         {
             // When source and target are the same union or intersection type, just relate each constituent
             // type to itself.
-            for t in self.ty(source).types().to_vec() {
+            for i in 0..self.ty(source).types().len() {
+                let t = self.type_at(source, i);
                 self.infer_from_types(n, t, t);
             }
             return;
         }
         if self.ty(target).flags.intersects(TypeFlags::UNION) {
-            let source_types: Vec<TypeId> = if self.ty(source).flags.intersects(TypeFlags::UNION) {
-                self.ty(source).types().to_vec()
-            } else {
-                vec![source]
-            };
+            let source_types: SharedList<TypeId> =
+                if self.ty(source).flags.intersects(TypeFlags::UNION) {
+                    self.ty(source).types_list()
+                } else {
+                    vec![source].into()
+                };
             // First, infer between identically matching source and target constituents and remove the
             // matching types.
             let target_distributed = self.ty(target).distributed();
@@ -212,25 +214,23 @@ impl Checker {
                 return;
             }
             source = self.get_union_type(&sources);
-        } else if self.ty(target).flags.intersects(TypeFlags::INTERSECTION) && {
-            let target_types = self.ty(target).types().to_vec();
-            !target_types
-                .iter()
-                .all(|&t| self.is_non_generic_object_type(t))
-        } {
+        } else if self.ty(target).flags.intersects(TypeFlags::INTERSECTION)
+            && !(0..self.ty(target).types().len())
+                .all(|i| self.is_non_generic_object_type(self.type_at(target, i)))
+        {
             // We reduce intersection types unless they're simple combinations of object types. For example,
             // when inferring from 'string[] & { extra: any }' to 'string[] & T' we want to remove string[] and
             // infer { extra: any } for T. But when inferring to 'string[] & Iterable<T>' we want to keep the
             // string[] on the source side and infer string for T.
             if !self.ty(source).flags.intersects(TypeFlags::UNION) {
-                let source_types: Vec<TypeId> =
+                let source_types: SharedList<TypeId> =
                     if self.ty(source).flags.intersects(TypeFlags::INTERSECTION) {
-                        self.ty(source).types().to_vec()
+                        self.ty(source).types_list()
                     } else {
-                        vec![source]
+                        vec![source].into()
                     };
                 // Infer between identically matching source and target constituents and remove the matching types.
-                let target_types = self.ty(target).types().to_vec();
+                let target_types = self.ty(target).types_list();
                 let (sources, targets) = self.infer_from_matching_types(
                     n,
                     &source_types,
@@ -458,11 +458,12 @@ impl Checker {
         } else if target_flags.intersects(TypeFlags::CONDITIONAL) {
             self.invoke_once(n, source, target, Checker::infer_to_conditional_type);
         } else if target_flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
-            let target_types = self.ty(target).types().to_vec();
+            let target_types = self.ty(target).types_list();
             self.infer_to_multiple_types(n, source, &target_types, target_flags);
         } else if source_flags.intersects(TypeFlags::UNION) {
             // Source is a union or intersection type, infer from each constituent type
-            for source_type in self.ty(source).types().to_vec() {
+            for i in 0..self.ty(source).types().len() {
+                let source_type = self.type_at(source, i);
                 self.infer_from_types(n, source_type, target);
             }
         } else if target_flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
@@ -692,21 +693,20 @@ impl Checker {
                 }
             }
         }
-        let mut sources: Vec<TypeId> = sources.to_vec();
-        let mut targets: Vec<TypeId> = targets.to_vec();
-        if !matched_sources.is_empty() {
-            sources = sources
-                .into_iter()
-                .filter(|t| !matched_sources.contains(t))
-                .collect();
-        }
-        if !matched_targets.is_empty() {
-            targets = targets
-                .into_iter()
-                .filter(|t| !matched_targets.contains(t))
-                .collect();
-        }
-        (sources, targets)
+        // Copies the list once, without the matched types.
+        let unmatched = |list: &[TypeId], matched: &[TypeId]| -> Vec<TypeId> {
+            if matched.is_empty() {
+                return list.to_vec();
+            }
+            list.iter()
+                .copied()
+                .filter(|t| !matched.contains(t))
+                .collect()
+        };
+        (
+            unmatched(sources, &matched_sources),
+            unmatched(targets, &matched_targets),
+        )
     }
 
     // Go: checker/inference.go:391 inferToMultipleTypes
@@ -720,10 +720,11 @@ impl Checker {
         let mut type_variable_count = 0;
         if target_flags.intersects(TypeFlags::UNION) {
             let mut naked_type_variable = TypeId::NIL;
-            let sources: Vec<TypeId> = if self.ty(source).flags.intersects(TypeFlags::UNION) {
-                self.ty(source).types().to_vec()
+            let sources: SharedList<TypeId> = if self.ty(source).flags.intersects(TypeFlags::UNION)
+            {
+                self.ty(source).types_list()
             } else {
-                vec![source]
+                vec![source].into()
             };
             let mut matched = vec![false; sources.len()];
             let mut inference_circularity = false;
@@ -1161,7 +1162,7 @@ impl Checker {
                     && self.is_tuple_type_structure_matching(source, target)
                 {
                     for i in 0..target_arity as usize {
-                        let s = self.get_type_arguments(source)[i];
+                        let s = self.type_arguments_of(source)[i];
                         self.infer_from_types(n, s, element_types[i]);
                     }
                     return;
@@ -1192,7 +1193,7 @@ impl Checker {
                 }
                 // Infer between starting fixed elements.
                 for i in 0..start_length as usize {
-                    let s = self.get_type_arguments(source)[i];
+                    let s = self.type_arguments_of(source)[i];
                     self.infer_from_types(n, s, element_types[i]);
                 }
                 if !self.is_tuple_type(source)
@@ -1202,7 +1203,7 @@ impl Checker {
                             .intersects(ElementFlags::REST)
                 {
                     // Single rest element remains in source, infer from that to every element in target
-                    let rest_type = self.get_type_arguments(source)[start_length as usize];
+                    let rest_type = self.type_arguments_of(source)[start_length as usize];
                     for i in start_length..target_arity - end_length {
                         let mut t = rest_type;
                         if element_infos[i as usize]
@@ -1377,7 +1378,7 @@ impl Checker {
                 }
                 // Infer between ending fixed elements
                 for i in 0..end_length {
-                    let s = self.get_type_arguments(source)[(source_arity - i - 1) as usize];
+                    let s = self.type_arguments_of(source)[(source_arity - i - 1) as usize];
                     self.infer_from_types(n, s, element_types[(target_arity - i - 1) as usize]);
                 }
                 return;
@@ -1638,7 +1639,7 @@ impl Checker {
                 .intersects(TypeFlags::INTERSECTION)
         {
             let mut result = false;
-            for t in self.ty(constraint_type).types().to_vec() {
+            for t in self.ty(constraint_type).types_list() {
                 let r = self.infer_to_mapped_type(n, source, target, t);
                 result = r || result;
             }

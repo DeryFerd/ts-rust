@@ -476,6 +476,27 @@ fn bind_thread_fingerprint() -> (usize, (u64, u64), usize) {
     )
 }
 
+/// Number of bind threads. `GOPORT_BIND_THREADS` sets it (below 2 binds
+/// serially).
+fn bind_thread_count() -> usize {
+    if let Some(count) = std::env::var("GOPORT_BIND_THREADS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return count;
+    }
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        // Each new thread gets its own glibc malloc arena, and freed per-file
+        // bind data stays resident there, so RSS grows with the cap.
+        .min(BIND_THREAD_CAP)
+}
+
+/// The most bind threads. 8 is the measured best: effect binds in 48 ms
+/// (83 ms with 4) and peak RSS grows by 2 to 5 MB. More threads give less
+/// than 5 ms and cost more RSS.
+const BIND_THREAD_CAP: usize = 8;
+
 /// One file bound on a bind thread, or None when binding it made
 /// thread-local state or panicked.
 type ParallelBind = (usize, Option<(BoundFile, SymbolArena)>);
@@ -487,13 +508,7 @@ type ParallelBind = (usize, Option<(BoundFile, SymbolArena)>);
 /// serially, which gives the same result as a serial bind of every file.
 fn bind_files_parallel(symbols: &mut SymbolArena) {
     let files: Vec<Node> = prog().source_files().map(|file| file.root).collect();
-    let threads = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        // Each new thread gets its own glibc malloc arena, and freed per-file
-        // bind data stays resident there. 4 threads keep RSS low; the
-        // lib.dom.d.ts bind is the long pole anyway.
-        .min(4)
-        .min(files.len());
+    let threads = bind_thread_count().min(files.len());
     if single_threaded()
         || threads < 2
         || prog()

@@ -1570,7 +1570,7 @@ impl Checker {
         b: &Rc<RefCell<NodeBuilderImpl>>,
         t: TypeId,
     ) -> Node {
-        let mut type_arguments: Vec<TypeId> = self.get_type_arguments(t);
+        let mut type_arguments: Vec<TypeId> = self.get_type_arguments(t).to_vec();
         let target = self.ty(t).target();
         let e = nb_e(b);
         let f = e.factory();

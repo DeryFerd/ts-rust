@@ -77,7 +77,7 @@ impl Checker {
             return self.get_combined_mapped_type_optionality(modifiers_type);
         }
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
+            let types = self.ty(t).types_list();
             let optionality = self.get_combined_mapped_type_optionality(types[0]);
             for &t in &types[1..] {
                 if self.get_combined_mapped_type_optionality(t) != optionality {

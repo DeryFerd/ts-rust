@@ -1712,13 +1712,13 @@ impl Checker {
                 .intersects(TypeFlags::UNION)
         {
             // If each member has some combination of new/call signatures; make a union signature list for those
-            let types = self.ty(apparent_elem_type).types().to_vec();
+            let types = self.ty(apparent_elem_type).types_list();
             let lists: Vec<Vec<SignatureId>> = types
                 .iter()
                 .map(|&t| self.get_uninstantiated_jsx_signatures_of_type(t, caller))
                 .collect();
-            signatures = self.get_union_signatures(&lists);
+            signatures = self.get_union_signatures(&lists).into();
         }
-        signatures
+        signatures.to_vec()
     }
 }

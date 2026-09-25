@@ -24,6 +24,7 @@ const UNPORTED_PREFIX: &str = "unported Go code";
 const STACK_SIZE: usize = 1 << 30;
 
 fn main() {
+    set_malloc_tunables();
     let config = match parse_args(std::env::args().skip(1).collect()) {
         Ok(config) => config,
         Err(message) => {
@@ -46,6 +47,45 @@ fn main() {
         2
     };
     std::process::exit(code);
+}
+
+/// Sets glibc malloc tunables for this process.
+///
+/// - `hugetlb=1` grows each heap in transparent huge page steps. By default
+///   the heaps grow in small steps, so the kernel maps 4 KiB pages and the
+///   first touch of each page faults (effect: 260k faults, 0.4 s system
+///   time; with huge pages 8k faults, 0.08 s).
+/// - `arena_max=6` caps the thread arenas. Every parse and bind thread would
+///   otherwise keep its own partly used huge pages, which raises peak RSS
+///   (query: 125 MB with no cap, 121 MB at 8, 117 MB at 6). At 5 or fewer
+///   the threads wait on arena locks.
+///
+/// glibc reads `GLIBC_TUNABLES` only at process start, so this runs the same
+/// binary again once with the tunables set. It does nothing when the caller
+/// already set `GLIBC_TUNABLES`, and the run continues without the tunables
+/// when the exec fails.
+fn set_malloc_tunables() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use std::os::unix::process::CommandExt;
+        const MALLOC_TUNABLES: &str = "glibc.malloc.hugetlb=1:glibc.malloc.arena_max=6";
+        if std::env::var_os("GLIBC_TUNABLES").is_some() {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let mut args = std::env::args_os();
+        let mut command = std::process::Command::new(exe);
+        if let Some(arg0) = args.next() {
+            command.arg0(arg0);
+        }
+        // `exec` returns only when it fails.
+        let _ = command
+            .args(args)
+            .env("GLIBC_TUNABLES", MALLOC_TUNABLES)
+            .exec();
+    }
 }
 
 /// Reads `-p <path>`, `--project <path>` and their `=` forms. Without one,

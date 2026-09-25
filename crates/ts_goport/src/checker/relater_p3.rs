@@ -1069,7 +1069,7 @@ impl Checker {
         let target_flags = self.ty(target).flags;
         let source_flags = self.ty(source).flags;
         if target_flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(target).types().to_vec();
+            let types = self.ty(target).types_list();
             for t in types {
                 if !(t == self.empty_type_literal_type
                     || self.is_valid_type_for_template_literal_placeholder(
@@ -1204,7 +1204,7 @@ pub struct Relater {
     pub error_chain: Option<Rc<ErrorChain>>,
     pub related_info: Vec<Diagnostic>,
     pub maybe_keys: Vec<CacheHashKey>,
-    pub maybe_keys_set: FxHashSet<CacheHashKey>,
+    pub maybe_keys_set: CacheKeySet,
     pub source_stack: Vec<TypeId>,
     pub target_stack: Vec<TypeId>,
     pub maybe_count: i32,
@@ -1244,7 +1244,12 @@ impl Checker {
             source_stack.clear();
             let mut target_stack = std::mem::take(&mut rb.target_stack);
             target_stack.clear();
+            // PORT: Go sets `relation` to nil. The pooled relater keeps the
+            // last checker relation instead of allocating a default one on
+            // every put. The next `getRelater` user always sets it first.
+            let relation = rb.relation.clone();
             *rb = Relater {
+                relation,
                 maybe_keys,
                 maybe_keys_set,
                 source_stack,
@@ -1421,7 +1426,7 @@ impl Checker {
             .intersects(TypeFlags::DEFINITELY_NON_NULLABLE)
             && self.ty(target).flags.intersects(TypeFlags::UNION)
         {
-            let types = self.ty(target).types().to_vec();
+            let types = self.ty(target).types_list();
             let mut candidate = TypeId::NIL;
             if types.len() == 2 && self.ty(types[0]).flags.intersects(TypeFlags::NULLABLE) {
                 candidate = types[1];
@@ -1499,7 +1504,7 @@ impl Checker {
                         .flags
                         .intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION)
                     && self.is_weak_type(target)
-                    && (!self.get_properties_of_type(source).is_empty()
+                    && (self.get_properties_of_type_count(source) != 0
                         || self.type_has_call_or_construct_signatures(source));
             let is_comparing_jsx_attributes = self
                 .ty(source)

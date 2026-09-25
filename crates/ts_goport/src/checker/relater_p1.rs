@@ -91,10 +91,44 @@ pub fn as_recursion_id<T: Into<RecursionId>>(value: T) -> RecursionId {
     value.into()
 }
 
+/// Hasher for maps keyed by `CacheHashKey`. The key is already an xxh3 hash
+/// and `CacheHashKey` hashes only its low half, so that half is the map hash
+/// as is. Iteration order differs from `FxHashMap`, so use it only for maps
+/// that no code iterates.
+#[derive(Clone, Copy, Default)]
+pub struct CacheKeyHasher(u64);
+
+impl std::hash::Hasher for CacheKeyHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+
+    // Only reached if a key other than `CacheHashKey` is used.
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+}
+
+/// A map keyed by `CacheHashKey` that hashes with `CacheKeyHasher`.
+pub type CacheKeyMap<V> =
+    std::collections::HashMap<CacheHashKey, V, std::hash::BuildHasherDefault<CacheKeyHasher>>;
+
+/// A set of `CacheHashKey` that hashes with `CacheKeyHasher`.
+pub type CacheKeySet =
+    std::collections::HashSet<CacheHashKey, std::hash::BuildHasherDefault<CacheKeyHasher>>;
+
 // Go: checker/relater.go:99 Relation
 #[derive(Clone, Debug, Default)]
 pub struct Relation {
-    pub results: FxHashMap<CacheHashKey, RelationComparisonResult>,
+    pub results: CacheKeyMap<RelationComparisonResult>,
 }
 
 impl Relation {
@@ -1485,8 +1519,8 @@ impl Checker {
             return self.is_weak_type(base_type);
         }
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-            for t in self.ty(t).types().to_vec() {
-                if !self.is_weak_type(t) {
+            for i in 0..self.ty(t).types().len() {
+                if !self.is_weak_type(self.type_at(t, i)) {
                     return false;
                 }
             }
@@ -1566,7 +1600,8 @@ impl Checker {
             .intersects(TypeFlags::UNION_OR_INTERSECTION)
             && self.is_excess_property_check_target(target_type)
         {
-            for t in self.ty(target_type).types().to_vec() {
+            for i in 0..self.ty(target_type).types().len() {
+                let t = self.type_at(target_type, i);
                 if self.is_known_property(t, name, is_comparing_jsx_attributes) {
                     return true;
                 }
@@ -1620,8 +1655,8 @@ impl Checker {
                 t = self.get_mapped_target_with_symbol(t);
             }
             if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-                for t in self.ty(t).types().to_vec() {
-                    if self.is_deeply_nested_type(t, stack, max_depth) {
+                for i in 0..self.ty(t).types().len() {
+                    if self.is_deeply_nested_type(self.type_at(t, i), stack, max_depth) {
                         return true;
                     }
                 }
@@ -1689,8 +1724,8 @@ impl Checker {
             t = self.get_mapped_target_with_symbol(t);
         }
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-            for t in self.ty(t).types().to_vec() {
-                if self.has_matching_recursion_identity(t, identity) {
+            for i in 0..self.ty(t).types().len() {
+                if self.has_matching_recursion_identity(self.type_at(t, i), identity) {
                     return true;
                 }
             }

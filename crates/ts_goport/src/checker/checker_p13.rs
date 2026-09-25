@@ -681,7 +681,7 @@ impl Checker {
             && containing_flags.intersects(TypeFlags::UNION)
             && !containing_flags.intersects(TypeFlags::PRIMITIVE)
         {
-            let types = self.ty(containing_type).types().to_vec();
+            let types = self.ty(containing_type).types_list();
             for subtype in types {
                 if self
                     .get_property_of_type(subtype, prop_node.text())
@@ -1331,7 +1331,7 @@ impl Checker {
             return callback(self, prop);
         }
         let containing_type = self.value_symbol_links.get(prop).containing_type;
-        let types = self.ty(containing_type).types().to_vec();
+        let types = self.ty(containing_type).types_list();
         let name = self.sym(prop).name.clone();
         for t in types {
             let p = self.get_property_of_type(t, &name);

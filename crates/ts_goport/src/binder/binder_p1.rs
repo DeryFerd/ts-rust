@@ -65,7 +65,7 @@ pub struct Binder {
     /// Rust-only: `Node::file_index` of `file`.
     pub file_index: usize,
     /// Rust-only: binder data per node of `file`, indexed by `NodeId::index()`.
-    pub node_bind: Vec<NodeBindData>,
+    pub node_bind: NodeBindBuilder,
     /// Rust-only: binder fields of `ast.SourceFile` (`BindDiagnostics`,
     /// `EndFlowNode`, `PatternAmbientModules`, `GlobalExports`, ...).
     pub file_bind: FileBindData,
@@ -134,7 +134,66 @@ pub fn bind_source_file(file: Node, symbols: &mut SymbolArena) {
     if prog().files[file.file_index()].file_bind.get().is_some() {
         return;
     }
+    let mark = symbols.mark();
     bind_source_file_detached(file, symbols).install();
+    // Checkers clone the program arena; share what this file added.
+    symbols.share_since(mark);
+}
+
+/// Binder data per node of the file being bound. Most nodes get no data, so
+/// a node keeps a 4-byte slot into `entries`, and `entries[0]` is the empty
+/// data, which is never written.
+#[derive(Default)]
+pub struct NodeBindBuilder {
+    slots: Vec<u32>,
+    entries: Vec<NodeBindData>,
+}
+
+impl NodeBindBuilder {
+    #[must_use]
+    pub fn new(node_count: usize) -> Self {
+        // About one node in four gets data; reserving that avoids copies
+        // as the entries grow.
+        let mut entries = Vec::with_capacity(node_count / 4 + 1);
+        entries.push(NodeBindData::default());
+        NodeBindBuilder {
+            slots: vec![0; node_count],
+            entries,
+        }
+    }
+
+    /// The data of node `index` (`NodeId::index()`).
+    #[inline]
+    #[must_use]
+    pub fn get(&self, index: usize) -> &NodeBindData {
+        &self.entries[self.slots[index] as usize]
+    }
+
+    /// The data of node `index`, made on first write.
+    #[inline]
+    pub fn get_mut(&mut self, index: usize) -> &mut NodeBindData {
+        let mut slot = self.slots[index];
+        if slot == 0 {
+            slot = u32::try_from(self.entries.len()).expect("node bind overflow");
+            self.entries.push(NodeBindData::default());
+            self.slots[index] = slot;
+        }
+        &mut self.entries[slot as usize]
+    }
+
+    /// Sets the flow node of node `index`. A nil flow on a node without
+    /// data changes nothing, so it makes no entry.
+    #[inline]
+    pub fn set_flow_node(&mut self, index: usize, flow: FlowNodeId) {
+        if flow.is_some() || self.slots[index] != 0 {
+            self.get_mut(index).flow_node = flow;
+        }
+    }
+
+    /// The compact form of the data, in node order.
+    fn finish(&self) -> FileNodeBind {
+        FileNodeBind::new(self.slots.iter().map(|&slot| &self.entries[slot as usize]))
+    }
 }
 
 /// The binder output of one file before it is stored in its `GoFile`.
@@ -158,7 +217,7 @@ pub fn bind_source_file_detached(file: Node, symbols: &mut SymbolArena) -> Bound
         file,
         file_index,
         symbols: std::mem::take(symbols),
-        node_bind: vec![NodeBindData::default(); node_count],
+        node_bind: NodeBindBuilder::new(node_count),
         ..Binder::default()
     };
     b.unreachable_flow = b.new_flow_node(FlowFlags::UNREACHABLE);
@@ -176,7 +235,7 @@ pub fn bind_source_file_detached(file: Node, symbols: &mut SymbolArena) -> Bound
     } = b;
     BoundFile {
         file,
-        node_bind: FileNodeBind::new(&node_bind),
+        node_bind: node_bind.finish(),
         flow_nodes,
         file_bind,
     }
@@ -235,14 +294,14 @@ impl Binder {
     pub fn node_data(&self, node: Node) -> &NodeBindData {
         debug_assert!(node.is_some(), "nil node dereference");
         debug_assert_eq!(node.file_index(), self.file_index, "node from another file");
-        &self.node_bind[node.node_id().index()]
+        self.node_bind.get(node.node_id().index())
     }
 
     /// Mutable binder data of a node in the file being bound.
     pub fn node_data_mut(&mut self, node: Node) -> &mut NodeBindData {
         debug_assert!(node.is_some(), "nil node dereference");
         debug_assert_eq!(node.file_index(), self.file_index, "node from another file");
-        &mut self.node_bind[node.node_id().index()]
+        self.node_bind.get_mut(node.node_id().index())
     }
 
     /// Go `node.Symbol()` while binding.
@@ -399,10 +458,10 @@ impl Binder {
         let is_default_export = has_syntactic_modifier(node, ModifierFlags::DEFAULT)
             || is_export_specifier(node) && module_export_name_is_default(node.name());
         // The exported symbol for an export default function/class node is always named "default"
-        let name: String = if is_computed_name {
-            INTERNAL_SYMBOL_NAME_COMPUTED.to_string()
+        let name: Name = if is_computed_name {
+            Name::from(INTERNAL_SYMBOL_NAME_COMPUTED)
         } else if is_default_export && parent.is_some() {
-            INTERNAL_SYMBOL_NAME_DEFAULT.to_string()
+            Name::from(INTERNAL_SYMBOL_NAME_DEFAULT)
         } else {
             self.get_declaration_name(node)
         };
@@ -435,7 +494,7 @@ impl Binder {
             // just add this node into the declarations list of the symbol.
             symbol = self.symbols.get(symbol_table, &name);
             if includes.intersects(SymbolFlags::CLASSIFIABLE) {
-                self.classifiable_names.insert(Name::from(&name));
+                self.classifiable_names.insert(name.clone());
             }
             if symbol.is_nil() {
                 symbol = self.new_symbol(SymbolFlags::NONE, name.clone());
@@ -595,12 +654,15 @@ impl Binder {
     // Should not be called on a declaration with a computed property name,
     // unless it is a well known Symbol.
     // Go: binder/binder.go:306 getDeclarationName
-    pub fn get_declaration_name(&self, node: Node) -> String {
+    // PORT: returns the interned name, so a declaration interns its text once
+    // and allocates nothing for an identifier name. `&mut self` only to note
+    // a private identifier name in the arena (`note_id_in_name`).
+    pub fn get_declaration_name(&mut self, node: Node) -> Name {
         if is_export_assignment(node) {
             return if node.is_export_equals() {
-                INTERNAL_SYMBOL_NAME_EXPORT_EQUALS.to_string()
+                Name::from(INTERNAL_SYMBOL_NAME_EXPORT_EQUALS)
             } else {
-                INTERNAL_SYMBOL_NAME_DEFAULT.to_string()
+                Name::from(INTERNAL_SYMBOL_NAME_DEFAULT)
             };
         }
         let name = get_name_of_declaration(node);
@@ -608,70 +670,71 @@ impl Binder {
             if is_ambient_module(node) {
                 let module_name = name.text();
                 if is_global_scope_augmentation(node) {
-                    return INTERNAL_SYMBOL_NAME_GLOBAL.to_string();
+                    return Name::from(INTERNAL_SYMBOL_NAME_GLOBAL);
                 }
-                return format!("\"{module_name}\"");
+                return Name::from(format!("\"{module_name}\""));
             }
             if is_private_identifier(name) {
                 // containingClass exists because private names only allowed inside classes
                 let containing_class = get_containing_class(node);
                 if containing_class.is_nil() {
                     // we can get here in cases where there is already a parse error.
-                    return INTERNAL_SYMBOL_NAME_MISSING.to_string();
+                    return Name::from(INTERNAL_SYMBOL_NAME_MISSING);
                 }
-                return get_symbol_name_for_private_identifier(
+                self.symbols.note_id_in_name();
+                return Name::from(get_symbol_name_for_private_identifier(
                     &self.symbols,
                     self.node_symbol(containing_class),
                     name.text(),
-                );
+                ));
             }
             if is_property_name_literal(name) || is_jsx_namespaced_name(name) {
-                return name.text().to_string();
+                return Name::from(name.text());
             }
             if is_computed_property_name(name) {
                 let name_expression = name.expression();
                 // treat computed property names where expression is string/numeric literal as just string/numeric literal
                 if is_string_or_numeric_literal_like(name_expression) {
-                    return name_expression.text().to_string();
+                    return Name::from(name_expression.text());
                 }
                 if is_signed_numeric_literal(name_expression) {
-                    return format!(
+                    return Name::from(format!(
                         "{}{}",
                         token_to_string(name_expression.operator()),
                         name_expression.operand().text()
-                    );
+                    ));
                 }
                 panic!("Only computed properties with literal names have declaration names");
             }
-            return INTERNAL_SYMBOL_NAME_MISSING.to_string();
+            return Name::from(INTERNAL_SYMBOL_NAME_MISSING);
         }
         match node.kind() {
-            SyntaxKind::Constructor => return INTERNAL_SYMBOL_NAME_CONSTRUCTOR.to_string(),
+            SyntaxKind::Constructor => return Name::from(INTERNAL_SYMBOL_NAME_CONSTRUCTOR),
             SyntaxKind::FunctionType | SyntaxKind::CallSignature => {
-                return INTERNAL_SYMBOL_NAME_CALL.to_string();
+                return Name::from(INTERNAL_SYMBOL_NAME_CALL);
             }
             SyntaxKind::ConstructorType | SyntaxKind::ConstructSignature => {
-                return INTERNAL_SYMBOL_NAME_NEW.to_string();
+                return Name::from(INTERNAL_SYMBOL_NAME_NEW);
             }
-            SyntaxKind::IndexSignature => return INTERNAL_SYMBOL_NAME_INDEX.to_string(),
-            SyntaxKind::ExportDeclaration => return INTERNAL_SYMBOL_NAME_EXPORT_STAR.to_string(),
+            SyntaxKind::IndexSignature => return Name::from(INTERNAL_SYMBOL_NAME_INDEX),
+            SyntaxKind::ExportDeclaration => return Name::from(INTERNAL_SYMBOL_NAME_EXPORT_STAR),
             SyntaxKind::SourceFile | SyntaxKind::BinaryExpression => {
-                return INTERNAL_SYMBOL_NAME_EXPORT_EQUALS.to_string();
+                return Name::from(INTERNAL_SYMBOL_NAME_EXPORT_EQUALS);
             }
             _ => {}
         }
-        INTERNAL_SYMBOL_NAME_MISSING.to_string()
+        Name::from(INTERNAL_SYMBOL_NAME_MISSING)
     }
 
     // Go: binder/binder.go:362 getDisplayName
-    pub fn get_display_name(&self, node: Node) -> String {
+    pub fn get_display_name(&mut self, node: Node) -> String {
         let name_node = node.name();
         if name_node.is_some() {
             return declaration_name_to_string(name_node).to_string();
         }
         let name = self.get_declaration_name(node);
         if name != INTERNAL_SYMBOL_NAME_MISSING {
-            return name;
+            return name.into();
         }
         "(Missing)".to_string()
     }
@@ -1079,8 +1142,12 @@ impl Binder {
     }
 
     // Go: binder/binder.go:534 newSingleDeclaration
-    pub fn new_single_declaration(&mut self, declaration: Node) -> Vec<Node> {
-        vec![declaration]
+    // PORT: returns `Declarations`, which holds one node inline, so no list
+    // is allocated.
+    pub fn new_single_declaration(&mut self, declaration: Node) -> Declarations {
+        let mut declarations = Declarations::default();
+        declarations.push(declaration);
+        declarations
     }
 
     // Go: binder/binder.go:538 setFlowNodeReferenced
@@ -1156,7 +1223,7 @@ impl Binder {
         match node.kind() {
             SyntaxKind::Identifier => {
                 let flow = self.current_flow;
-                self.node_data_mut(node).flow_node = flow;
+                self.node_bind.set_flow_node(node.node_id().index(), flow);
                 self.check_contextual_identifier(node);
             }
             SyntaxKind::ThisKeyword | SyntaxKind::SuperKeyword => {
@@ -1164,7 +1231,7 @@ impl Binder {
                     self.seen_this_keyword = true;
                 }
                 let flow = self.current_flow;
-                self.node_data_mut(node).flow_node = flow;
+                self.node_bind.set_flow_node(node.node_id().index(), flow);
             }
             SyntaxKind::QualifiedName => {
                 if self.current_flow.is_some() && is_part_of_type_query(node) {

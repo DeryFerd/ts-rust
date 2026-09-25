@@ -10,19 +10,13 @@ impl Checker {
             return self.instantiate_type(t, mapper);
         }
         if flags.intersects(TypeFlags::UNION) {
-            let types = self.ty(t).types().to_vec();
-            let mapped: Vec<TypeId> = types
-                .into_iter()
-                .map(|t| self.instantiate_instantiable_types(t, mapper))
-                .collect();
+            let mapped =
+                self.map_constituents(t, &mut |c, u| c.instantiate_instantiable_types(u, mapper));
             return self.get_union_type_ex(&mapped, UnionReduction::NONE, None, TypeId::NIL);
         }
         if flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
-            let mapped: Vec<TypeId> = types
-                .into_iter()
-                .map(|t| self.instantiate_instantiable_types(t, mapper))
-                .collect();
+            let mapped =
+                self.map_constituents(t, &mut |c, u| c.instantiate_instantiable_types(u, mapper));
             return self.get_intersection_type(&mapped);
         }
         t
@@ -332,8 +326,8 @@ impl Checker {
             return TypeFacts::NONE;
         } else if flags.intersects(TypeFlags::UNION) {
             let mut facts = TypeFacts::NONE;
-            let types = self.ty(t).types().to_vec();
-            for t in types {
+            for i in 0..self.ty(t).types().len() {
+                let t = self.type_at(t, i);
                 facts = facts | self.get_type_facts_worker(t, caller_only_needs);
             }
             return facts;
@@ -356,8 +350,8 @@ impl Checker {
         // and others are computed as `or`.
         let mut ored_facts = TypeFacts::NONE;
         let mut anded_facts = TypeFacts::ALL;
-        let types = self.ty(t).types().to_vec();
-        for t in types {
+        for i in 0..self.ty(t).types().len() {
+            let t = self.type_at(t, i);
             if !(ignore_objects && self.ty(t).flags.intersects(TypeFlags::OBJECT)) {
                 let f = self.get_type_facts_worker(t, caller_only_needs);
                 ored_facts = ored_facts | f;
@@ -946,10 +940,8 @@ impl Checker {
     // Go: checker/checker.go:31271 isGenericTypeWithUnionConstraint
     pub fn is_generic_type_with_union_constraint(&mut self, t: TypeId) -> bool {
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
-            return types
-                .into_iter()
-                .any(|t| self.is_generic_type_with_union_constraint(t));
+            return (0..self.ty(t).types().len())
+                .any(|i| self.is_generic_type_with_union_constraint(self.type_at(t, i)));
         }
         if !self.ty(t).flags.intersects(TypeFlags::INSTANTIABLE) {
             return false;
@@ -963,10 +955,8 @@ impl Checker {
     // Go: checker/checker.go:31278 isGenericTypeWithoutNullableConstraint
     pub fn is_generic_type_without_nullable_constraint(&mut self, t: TypeId) -> bool {
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
-            return types
-                .into_iter()
-                .any(|t| self.is_generic_type_without_nullable_constraint(t));
+            return (0..self.ty(t).types().len())
+                .any(|i| self.is_generic_type_without_nullable_constraint(self.type_at(t, i)));
         }
         if !self.ty(t).flags.intersects(TypeFlags::INSTANTIABLE) {
             return false;

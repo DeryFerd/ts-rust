@@ -736,7 +736,7 @@ impl Checker {
             if self.ty(array_type).flags.intersects(TypeFlags::UNION) {
                 // After we remove all types that are StringLike, we will know if there was a string constituent
                 // based on whether the result of filter is a new array.
-                let array_types = self.ty(input_type).types().to_vec();
+                let array_types = self.ty(input_type).types_list();
                 let filtered_types: Vec<TypeId> = array_types
                     .iter()
                     .copied()
@@ -965,7 +965,7 @@ impl Checker {
         no_cache: bool,
     ) -> IterationTypes {
         if self.ty(t).flags.intersects(TypeFlags::UNION) {
-            let types = self.ty(t).types().to_vec();
+            let types = self.ty(t).types_list();
             let mut all_iteration_types: Vec<IterationTypes> = Vec::with_capacity(types.len());
             for constituent in types {
                 let iteration_types = self.get_iteration_types_of_iterable_worker(

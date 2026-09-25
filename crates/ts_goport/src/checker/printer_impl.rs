@@ -613,7 +613,7 @@ impl Checker {
                     };
                     if self.ty(base_type).flags.intersects(TypeFlags::UNION) {
                         // PORT: Go reads AsUnionType().types. Type.types() returns the same slice for a union.
-                        let base_types = self.ty(base_type).types().to_vec();
+                        let base_types = self.ty(base_type).types_list();
                         let count = base_types.len();
                         if i + count <= types.len()
                             && self.get_regular_type_of_literal_type(types[i + count - 1])

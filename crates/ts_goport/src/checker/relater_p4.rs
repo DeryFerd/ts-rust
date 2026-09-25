@@ -161,8 +161,8 @@ impl Checker {
     // Go: checker/relater.go:2834 isTypeSubsetOfUnion
     pub fn is_type_subset_of_union(&mut self, source: TypeId, target: TypeId) -> bool {
         if self.ty(source).flags.intersects(TypeFlags::UNION) {
-            let source_types = self.ty(source).types().to_vec();
-            for t in source_types {
+            for i in 0..self.ty(source).types().len() {
+                let t = self.type_at(source, i);
                 if !self.contains_type(self.ty(target).types(), t) {
                     return false;
                 }
@@ -269,7 +269,7 @@ impl Checker {
             // PORT: Go `core.SameMap` returns the original slice when no element
             // changes, and `core.Same` then compares slice identity. Element-wise
             // equality with the original list gives the same answer.
-            let source_types = self.ty(source).types().to_vec();
+            let source_types = self.ty(source).types_list();
             let mut constraints: Vec<TypeId> = Vec::with_capacity(source_types.len());
             for &t in &source_types {
                 if self.ty(t).flags.intersects(TypeFlags::INSTANTIABLE) {
@@ -283,7 +283,7 @@ impl Checker {
                     constraints.push(t);
                 }
             }
-            if constraints != source_types {
+            if constraints[..] != source_types[..] {
                 source = self.get_intersection_type(&constraints);
                 if self.ty(source).flags.intersects(TypeFlags::NEVER) {
                     return Ternary::FALSE;
@@ -331,14 +331,14 @@ impl Checker {
         report_errors: bool,
         intersection_state: IntersectionState,
     ) -> Ternary {
-        let source_types = self.ty(source).types().to_vec();
         if self.ty(source).flags.intersects(TypeFlags::UNION)
-            && self.contains_type(&source_types, target)
+            && self.contains_type(self.ty(source).types(), target)
         {
             return Ternary::TRUE;
         }
-        let n = source_types.len();
-        for (i, &t) in source_types.iter().enumerate() {
+        let n = self.ty(source).types().len();
+        for i in 0..n {
+            let t = self.type_at(source, i);
             let related = self.is_related_to_ex(
                 r,
                 t,
@@ -365,18 +365,23 @@ impl Checker {
         intersection_state: IntersectionState,
     ) -> Ternary {
         let mut result = Ternary::TRUE;
-        let source_types = self.ty(source).types().to_vec();
+        // PORT: both constituent lists are read in place (`type_at`); they
+        // never change once the types exist.
+        let source_count = self.ty(source).types().len();
         // We strip `undefined` from the target if the `source` trivially doesn't contain it for our correspondence-checking fastpath
         // since `undefined` is frequently added by optionality and would otherwise spoil a potentially useful correspondence
         let stripped_target = self.get_undefined_stripped_target_if_needed(r, source, target);
-        let mut stripped_types: Vec<TypeId> = Vec::new();
-        if self.ty(stripped_target).flags.intersects(TypeFlags::UNION) {
-            stripped_types = self.ty(stripped_target).types().to_vec();
-        }
-        for (i, &source_type) in source_types.iter().enumerate() {
-            if self.ty(stripped_target).flags.intersects(TypeFlags::UNION)
-                && source_types.len() >= stripped_types.len()
-                && source_types.len() % stripped_types.len() == 0
+        let stripped_is_union = self.ty(stripped_target).flags.intersects(TypeFlags::UNION);
+        let stripped_count = if stripped_is_union {
+            self.ty(stripped_target).types().len()
+        } else {
+            0
+        };
+        for i in 0..source_count {
+            let source_type = self.type_at(source, i);
+            if stripped_is_union
+                && source_count >= stripped_count
+                && source_count % stripped_count == 0
             {
                 // many unions are mappings of one another; in such cases, simply comparing members at the same index can shortcut the comparison
                 // such unions will have identical lengths, and their corresponding elements will match up. Another common scenario is where a large
@@ -386,7 +391,7 @@ impl Checker {
                 let related = self.is_related_to_ex(
                     r,
                     source_type,
-                    stripped_types[i % stripped_types.len()],
+                    self.type_at(stripped_target, i % stripped_count),
                     RecursionFlags::BOTH,
                     false, /*reportErrors*/
                     None,  /*headMessage*/
@@ -446,9 +451,8 @@ impl Checker {
         report_errors: bool,
         intersection_state: IntersectionState,
     ) -> Ternary {
-        let target_types = self.ty(target).types().to_vec();
         if self.ty(target).flags.intersects(TypeFlags::UNION) {
-            if self.contains_type(&target_types, source) {
+            if self.contains_type(self.ty(target).types(), source) {
                 return Ternary::TRUE;
             }
             let source_flags = self.ty(source).flags;
@@ -489,8 +493,9 @@ impl Checker {
                 } else {
                     TypeId::NIL
                 };
-                if primitive.is_some() && self.contains_type(&target_types, primitive)
-                    || alternate_form.is_some() && self.contains_type(&target_types, alternate_form)
+                let target_types = self.ty(target).types();
+                if primitive.is_some() && self.contains_type(target_types, primitive)
+                    || alternate_form.is_some() && self.contains_type(target_types, alternate_form)
                 {
                     return Ternary::TRUE;
                 }
@@ -512,7 +517,8 @@ impl Checker {
                 }
             }
         }
-        for &t in &target_types {
+        for i in 0..self.ty(target).types().len() {
+            let t = self.type_at(target, i);
             let related = self.is_related_to_ex(
                 r,
                 source,
@@ -558,8 +564,8 @@ impl Checker {
         intersection_state: IntersectionState,
     ) -> Ternary {
         let mut result = Ternary::TRUE;
-        let target_types = self.ty(target).types().to_vec();
-        for target_type in target_types {
+        for i in 0..self.ty(target).types().len() {
+            let target_type = self.type_at(target, i);
             let related = self.is_related_to_ex(
                 r,
                 source,
@@ -585,8 +591,8 @@ impl Checker {
         target: TypeId,
     ) -> Ternary {
         let mut result = Ternary::TRUE;
-        let source_types = self.ty(source).types().to_vec();
-        for source_type in source_types {
+        for i in 0..self.ty(source).types().len() {
+            let source_type = self.type_at(source, i);
             let related = self.type_related_to_some_type(
                 r,
                 source_type,
@@ -854,12 +860,12 @@ impl Checker {
                     || source_flags.intersects(TypeFlags::TYPE_PARAMETER)
                         && target_flags.intersects(TypeFlags::UNION))
             {
-                let source_types: Vec<TypeId> = if source_flags.intersects(TypeFlags::INTERSECTION)
-                {
-                    self.ty(source).types().to_vec()
-                } else {
-                    vec![source]
-                };
+                let source_types: SharedList<TypeId> =
+                    if source_flags.intersects(TypeFlags::INTERSECTION) {
+                        self.ty(source).types_list()
+                    } else {
+                        vec![source].into()
+                    };
                 let constraint = self.get_effective_constraint_of_intersection(
                     &source_types,
                     target_flags.intersects(TypeFlags::UNION),
@@ -1247,7 +1253,7 @@ impl Checker {
         if self.is_single_element_generic_tuple_type(source)
             && !self.target_tuple_type(source).readonly
         {
-            let first = self.get_type_arguments(source)[0];
+            let first = self.type_arguments_of(source)[0];
             result = self.is_related_to(
                 r,
                 first,
@@ -1266,7 +1272,7 @@ impl Checker {
                 self.is_mutable_array_or_tuple(base)
             }
         } {
-            let first = self.get_type_arguments(target)[0];
+            let first = self.type_arguments_of(target)[0];
             result = self.is_related_to(
                 r,
                 source,

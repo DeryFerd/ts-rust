@@ -758,7 +758,7 @@ impl EmitResolver {
         self.with_checker(|c| {
             let sym = container.symbol();
             let sym_type = c.get_type_of_symbol(sym);
-            let static_infos = c.get_index_infos_of_type(sym_type);
+            let static_infos = c.get_index_infos_of_type(sym_type).to_vec();
             let instance_index_symbol = c.get_index_symbol(sym);
             let mut instance_infos: Vec<IndexInfoId> = Vec::new();
             if instance_index_symbol.is_some() {
@@ -1067,7 +1067,7 @@ impl EmitResolver {
             return Vec::new();
         }
         let t = c.get_type_of_symbol(s);
-        c.get_properties_of_type(t)
+        c.get_properties_of_type(t).to_vec()
     }
 
     // Go: checker/emitresolver.go:1264 TryJSTypeNodeToTypeNode

@@ -651,14 +651,18 @@ impl ModifierList {
 
     /// Go `modifiers.ModifierFlags`. NONE when nil.
     // PORT: ts_ast stores its own flag type, so the Go flags are computed
-    // from the modifier nodes with `modifiers_to_flags`, as the Go factory
-    // does when it builds the list.
+    // from the modifier nodes, like `modifiers_to_flags` (as the Go factory
+    // does when it builds the list), without copying the list.
     #[must_use]
     pub fn modifier_flags(self) -> ModifierFlags {
         if self.is_nil() {
             return ModifierFlags::NONE;
         }
-        modifiers_to_flags(&self.nodes().to_vec())
+        let mut flags = ModifierFlags::NONE;
+        for modifier in self.nodes() {
+            flags |= modifier_to_flag(modifier.kind());
+        }
+        flags
     }
 }
 

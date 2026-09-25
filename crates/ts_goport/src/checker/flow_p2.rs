@@ -1016,7 +1016,7 @@ impl Checker {
             return self.auto_array_type;
         }
         if flags.intersects(TypeFlags::UNION) {
-            let types = self.ty(element_type).types().to_vec();
+            let types = self.ty(element_type).types_list();
             let union = self.get_union_type_ex(&types, UnionReduction::SUBTYPE, None, TypeId::NIL);
             return self.create_array_type(union);
         }

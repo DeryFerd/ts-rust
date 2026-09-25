@@ -398,13 +398,13 @@ pub fn get_total_fixed_element_count(t: &TupleType) -> i32 {
 
 impl Checker {
     // Go: checker/checker.go:23370 getElementTypes
-    pub fn get_element_types(&mut self, t: TypeId) -> Vec<TypeId> {
+    pub fn get_element_types(&mut self, t: TypeId) -> SharedList<TypeId> {
         let type_arguments = self.get_type_arguments(t);
         let arity = self.get_type_reference_arity(t) as usize;
         if type_arguments.len() == arity {
             return type_arguments;
         }
-        type_arguments[0..arity].to_vec()
+        type_arguments.slice(0..arity)
     }
 
     // Go: checker/checker.go:23379 getTypeReferenceArity
@@ -463,7 +463,7 @@ impl Checker {
     // Go: checker/checker.go:23415 getElementTypeOfArrayType
     pub fn get_element_type_of_array_type(&mut self, t: TypeId) -> TypeId {
         if self.is_array_type(t) {
-            return self.get_type_arguments(t)[0];
+            return self.type_arguments_of(t)[0];
         }
         TypeId::NIL
     }
@@ -1051,7 +1051,7 @@ impl Checker {
                     let key = get_type_list_key(&type_parameters);
                     let links = self.type_alias_links.get(symbol);
                     links.type_parameters = type_parameters;
-                    let mut instantiations = FxHashMap::default();
+                    let mut instantiations = CacheKeyMap::default();
                     instantiations.insert(key, t);
                     links.instantiations = Some(instantiations);
                 }

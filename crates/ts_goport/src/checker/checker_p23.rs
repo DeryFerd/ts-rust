@@ -97,7 +97,7 @@ impl Checker {
             .intersects(ObjectFlags::CONTAINS_WIDENING_TYPE)
         {
             if self.ty(t).flags.intersects(TypeFlags::UNION) {
-                let types = self.ty(t).types().to_vec();
+                let types = self.ty(t).types_list();
                 if types.iter().any(|&s| self.is_empty_object_type(s)) {
                     error_reported = true;
                 } else {
@@ -106,7 +106,7 @@ impl Checker {
                     }
                 }
             } else if self.is_array_or_tuple_type(t) {
-                for s in self.get_type_arguments(t).to_vec() {
+                for s in self.get_type_arguments(t) {
                     error_reported = error_reported || self.report_widening_errors_in_type(s);
                 }
             } else if self.is_object_literal_type(t) {
@@ -378,12 +378,10 @@ impl Checker {
             self.set_structured_type_members(t, SymbolTable::NIL, &[], &[], &[]);
             let properties = self.get_properties_of_object_type(d_target);
             let members = self.create_instantiated_symbol_table(&properties, d_mapper);
-            let target_call_signatures = self.get_signatures_of_type(d_target, SignatureKind::CALL);
-            let call_signatures = self.instantiate_signatures(&target_call_signatures, d_mapper);
-            let target_construct_signatures =
-                self.get_signatures_of_type(d_target, SignatureKind::CONSTRUCT);
+            let call_signatures =
+                self.instantiate_signatures_of_type(d_target, SignatureKind::CALL, d_mapper);
             let construct_signatures =
-                self.instantiate_signatures(&target_construct_signatures, d_mapper);
+                self.instantiate_signatures_of_type(d_target, SignatureKind::CONSTRUCT, d_mapper);
             let target_index_infos = self.get_index_infos_of_type(d_target);
             let index_infos = self.instantiate_index_infos(&target_index_infos, d_mapper);
             self.set_structured_type_members(
@@ -475,7 +473,7 @@ impl Checker {
                 }
             }
         }
-        self.ty_mut(t).as_object_type_mut().structured.index_infos = index_infos;
+        self.ty_mut(t).as_object_type_mut().structured.index_infos = index_infos.into();
         // We resolve the members before computing the signatures because a signature may use
         // typeof with a qualified name expression that circularly references the type we are
         // in the process of resolving (see issue #6072). The temporarily empty signature list
@@ -488,7 +486,7 @@ impl Checker {
             let signatures = self.get_signatures_of_symbol(symbol);
             let d = &mut self.ty_mut(t).as_object_type_mut().structured;
             d.call_signature_count = signatures.len() as i32;
-            d.signatures = signatures;
+            d.signatures = signatures.into();
         }
         // And likewise for construct signatures for classes
         if self.sym(symbol).flags.intersects(SymbolFlags::CLASS) {
@@ -501,11 +499,10 @@ impl Checker {
             if construct_signatures.is_empty() {
                 construct_signatures = self.get_default_construct_signatures(class_type);
             }
-            self.ty_mut(t)
-                .as_object_type_mut()
-                .structured
-                .signatures
-                .extend(construct_signatures);
+            let d = &mut self.ty_mut(t).as_object_type_mut().structured;
+            let mut signatures = d.signatures.to_vec();
+            signatures.extend(construct_signatures);
+            d.signatures = signatures.into();
         }
     }
 
@@ -793,6 +790,21 @@ impl Checker {
         result
     }
 
+    /// `get_property_name_from_type` as an interned `Name`. String literal
+    /// and unique symbol names are interned from the type with no `String`.
+    pub fn get_property_name_from_type_as_name(&self, t: TypeId) -> Name {
+        let ty = self.ty(t);
+        if ty.flags.intersects(TypeFlags::STRING_LITERAL)
+            && let Some(LiteralValue::String(s)) = ty.as_literal_type().value.as_ref()
+        {
+            return Name::from(s.as_str());
+        }
+        if ty.flags.intersects(TypeFlags::UNIQUE_ES_SYMBOL) {
+            return Name::from(ty.as_unique_es_symbol_type().name.as_str());
+        }
+        Name::from(self.get_property_name_from_type(t).as_str())
+    }
+
     // Go: checker/checker.go:20793 resolveMappedTypeMembers
     pub fn resolve_mapped_type_members(&mut self, t: TypeId) {
         let members = self.symbols.new_table();
@@ -824,7 +836,7 @@ impl Checker {
                     // If the current iteration type constituent is a string literal type, create a property.
                     // Otherwise, for type string create a string index signature.
                     if c.is_type_usable_as_property_name(prop_name_type) {
-                        let prop_name = c.get_property_name_from_type(prop_name_type);
+                        let prop_name = c.get_property_name_from_type_as_name(prop_name_type);
                         // String enum members from separate enums with identical values
                         // are distinct types with the same property name. Make the resulting
                         // property symbol's name type be the union of those enum member types.
@@ -842,7 +854,7 @@ impl Checker {
                         } else {
                             let mut modifiers_prop = SymbolId::NIL;
                             if c.is_type_usable_as_property_name(key_type) {
-                                let key_name = c.get_property_name_from_type(key_type);
+                                let key_name = c.get_property_name_from_type_as_name(key_type);
                                 modifiers_prop = c.get_property_of_type(modifiers_type, &key_name);
                             }
                             let is_optional = template_modifiers
@@ -1067,7 +1079,7 @@ impl Checker {
         } else if flags.intersects(TypeFlags::INTERSECTION) {
             // Similarly to getTypeFromIntersectionTypeNode, we preserve the special string & {}, number & {},
             // and bigint & {} intersections that are used to prevent subtype reduction in union types.
-            let types = self.ty(t).types().to_vec();
+            let types = self.ty(t).types_list();
             if types.len() == 2
                 && self
                     .ty(types[0])
@@ -1090,14 +1102,14 @@ impl Checker {
     pub fn resolve_union_type_members(&mut self, t: TypeId) {
         // The members and properties collections are empty for union types. To get all properties of a union
         // type use getPropertiesOfType (only the language service uses this).
-        let types = self.ty(t).types().to_vec();
+        let types = self.ty(t).types_list();
         let call_signature_lists: Vec<Vec<SignatureId>> = types
             .iter()
             .map(|&u| {
                 if u == self.global_function_type {
                     return vec![self.unknown_signature];
                 }
-                self.get_signatures_of_type(u, SignatureKind::CALL)
+                self.get_signatures_of_type(u, SignatureKind::CALL).to_vec()
             })
             .collect();
         let mut call_signatures = self.get_union_signatures(&call_signature_lists);
@@ -1106,7 +1118,10 @@ impl Checker {
         }
         let construct_signature_lists: Vec<Vec<SignatureId>> = types
             .iter()
-            .map(|&u| self.get_signatures_of_type(u, SignatureKind::CONSTRUCT))
+            .map(|&u| {
+                self.get_signatures_of_type(u, SignatureKind::CONSTRUCT)
+                    .to_vec()
+            })
             .collect();
         let construct_signatures = self.get_union_signatures(&construct_signature_lists);
         let index_infos = self.get_union_index_infos(&types);
@@ -1123,7 +1138,7 @@ impl Checker {
     pub fn get_array_member_call_signatures(&mut self, t: TypeId) -> Vec<SignatureId> {
         // Check if union is exclusively instantiations of a member of the global Array or ReadonlyArray type.
         let mut member_name = String::new();
-        let types = self.ty(t).types().to_vec();
+        let types = self.ty(t).types_list();
         for (i, u) in types.into_iter().enumerate() {
             let (u_object_flags, u_symbol) = {
                 let ut = self.ty(u);
@@ -1160,6 +1175,7 @@ impl Checker {
         let array_type = self.create_array_type_ex(array_arg, readonly);
         let prop_type = self.get_type_of_property_of_type(array_type, &member_name);
         self.get_signatures_of_type(prop_type, SignatureKind::CALL)
+            .to_vec()
     }
 
     // Go: checker/checker.go:20993 isArrayOrTupleSymbol
@@ -1535,7 +1551,7 @@ impl Checker {
         let mut call_signatures: Vec<SignatureId> = Vec::new();
         let mut construct_signatures: Vec<SignatureId> = Vec::new();
         let mut index_infos: Vec<IndexInfoId> = Vec::new();
-        let types = self.ty(t).types().to_vec();
+        let types = self.ty(t).types_list();
         let (mixin_flags, mixin_count) = self.find_mixins(&types);
         for (i, &u) in types.iter().enumerate() {
             // When an intersection type contains mixin constructor types, the construct signatures from
@@ -1544,7 +1560,9 @@ impl Checker {
             // '{ new(...args: any[]) => A } & { new(s: string) => B }' has a single construct signature
             // 'new(s: string) => A & B'.
             if !mixin_flags[i] {
-                let mut signatures = self.get_signatures_of_type(u, SignatureKind::CONSTRUCT);
+                let mut signatures = self
+                    .get_signatures_of_type(u, SignatureKind::CONSTRUCT)
+                    .to_vec();
                 if !signatures.is_empty() && mixin_count > 0 {
                     signatures = signatures
                         .iter()

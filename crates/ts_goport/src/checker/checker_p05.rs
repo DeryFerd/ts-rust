@@ -1122,7 +1122,7 @@ impl Checker {
                 return result;
             }
         } else if flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
+            let types = self.ty(t).types_list();
             let mut mapped = Vec::with_capacity(types.len());
             for member in types {
                 mapped.push(self.get_type_without_signatures(member));

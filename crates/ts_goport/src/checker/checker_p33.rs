@@ -99,7 +99,7 @@ impl Checker {
                     if (first_spread_index < 0 || index < first_spread_index)
                         && index < c.target_tuple_type(t).fixed_length
                     {
-                        let type_arg = c.get_type_arguments(t)[index as usize];
+                        let type_arg = c.type_arguments_of(t)[index as usize];
                         let is_optional = c.target_tuple_type(t).element_infos[index as usize]
                             .flags
                             .intersects(ElementFlags::OPTIONAL);
@@ -124,7 +124,7 @@ impl Checker {
                     // tuple element.
                     if offset > 0 && offset <= fixed_end_length {
                         let arity = c.get_type_reference_arity(t);
-                        return c.get_type_arguments(t)[(arity - offset) as usize];
+                        return c.type_arguments_of(t)[(arity - offset) as usize];
                     }
                     // Return a union of the possible contextual element types with no subtype reduction.
                     let mut tuple_index = c.target_tuple_type(t).fixed_length;
@@ -1005,8 +1005,8 @@ impl Checker {
                     let mut types: Vec<TypeId> = Vec::new();
                     let mut index_info_candidates: Vec<TypeId> = Vec::new();
                     let mut ignore_index_infos = false;
-                    let constituents = c.ty(t).types().to_vec();
-                    for constituent_type in constituents {
+                    for i in 0..c.ty(t).types().len() {
+                        let constituent_type = c.type_at(t, i);
                         if !c.ty(constituent_type).flags.intersects(TypeFlags::OBJECT) {
                             continue;
                         }
@@ -1129,8 +1129,8 @@ impl Checker {
             return self.is_type_assignable_to(property_name_type, extends_type);
         }
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
-            for t in types {
+            for i in 0..self.ty(t).types().len() {
+                let t = self.type_at(t, i);
                 if self.is_excluded_mapped_property_name(t, property_name_type) {
                     return true;
                 }
@@ -1489,7 +1489,7 @@ impl Checker {
                     let t = self.instantiate_instantiable_types(contextual_type, return_mapper);
                     if !self.ty(t).flags.intersects(TypeFlags::ANY_OR_UNKNOWN) {
                         if self.ty(t).flags.intersects(TypeFlags::UNION) {
-                            let types = self.ty(t).types().to_vec();
+                            let types = self.ty(t).types_list();
                             let (regular_false_type, regular_true_type) =
                                 (self.regular_false_type, self.regular_true_type);
                             if self.contains_type(&types, regular_false_type)

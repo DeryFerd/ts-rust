@@ -611,12 +611,12 @@ impl Checker {
             // intersection with the right type. For example when the left type is 'T & { a: string }'
             // and the right type is '{ b: string }' we produce 'T & { a: string, b: string }'.
             if self.ty(left).flags.intersects(TypeFlags::INTERSECTION) {
-                let types = self.ty(left).types().to_vec();
+                let types = self.ty(left).types_list();
                 let last_left = types[types.len() - 1];
                 if self.is_non_generic_object_type(last_left)
                     && self.is_non_generic_object_type(right)
                 {
-                    let mut new_types = types.clone();
+                    let mut new_types = types.to_vec();
                     let last = new_types.len() - 1;
                     new_types[last] =
                         self.get_spread_type(last_left, right, symbol, object_flags, readonly);
@@ -628,7 +628,7 @@ impl Checker {
         let members = self.symbols.new_table();
         let mut skipped_private_members: FxHashSet<String> = FxHashSet::default();
         let index_infos = if left == self.empty_object_type {
-            self.get_index_infos_of_type(right)
+            self.get_index_infos_of_type(right).to_vec()
         } else {
             self.get_union_index_infos(&[left, right])
         };
@@ -744,7 +744,7 @@ impl Checker {
             return true;
         }
         if s_flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
-            let types = self.ty(s).types().to_vec();
+            let types = self.ty(s).types_list();
             for t in types {
                 if !self.is_valid_spread_type(t) {
                     return false;
@@ -805,7 +805,7 @@ impl Checker {
         if !self.ty(t).flags.intersects(TypeFlags::UNION) {
             return t;
         }
-        let types = self.ty(t).types().to_vec();
+        let types = self.ty(t).types_list();
         let mut every = true;
         for &u in &types {
             if !self.is_empty_object_type_or_spreads_into_empty_object(u) {
@@ -1052,7 +1052,7 @@ impl Checker {
                     .iter()
                     .any(|&d| has_syntactic_modifier(d, ModifierFlags::CONST));
         } else if flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
+            let types = self.ty(t).types_list();
             for s in types {
                 if self.is_const_type_variable(s, depth) {
                     return true;

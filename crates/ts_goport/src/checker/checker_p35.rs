@@ -397,8 +397,8 @@ impl Checker {
     pub fn get_this_type_from_contextual_type(&mut self, t: TypeId) -> TypeId {
         self.map_type(t, &mut |c: &mut Checker, t: TypeId| -> TypeId {
             if c.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-                let types = c.ty(t).types().to_vec();
-                for t in types {
+                for i in 0..c.ty(t).types().len() {
+                    let t = c.type_at(t, i);
                     let type_arg = c.get_this_type_argument(t);
                     if type_arg.is_some() {
                         return type_arg;
@@ -416,7 +416,7 @@ impl Checker {
         if self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE)
             && self.ty(t).target() == self.global_this_type
         {
-            return self.get_type_arguments(t)[0];
+            return self.type_arguments_of(t)[0];
         }
         TypeId::NIL
     }

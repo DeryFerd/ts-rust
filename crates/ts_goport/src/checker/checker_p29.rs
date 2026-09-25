@@ -28,18 +28,18 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25944 getIntersectionTypeEx
-    // PORT: Go `orderedSet[*Type]` is an `IndexSet<TypeId>` here. It keeps
+    // PORT: Go `orderedSet[*Type]` is a `Vec<TypeId>` here. It keeps
     // insertion order and `contains`/`add` match Go (Go only adds values it
-    // has not seen).
+    // has not seen). Intersections are small, so a linear `contains` is
+    // cheaper than a hash set and the list becomes the type set with no copy.
     pub fn get_intersection_type_ex(
         &mut self,
         types: &[TypeId],
         flags: IntersectionFlags,
         alias: Option<Rc<TypeAlias>>,
     ) -> TypeId {
-        let mut ordered_types: IndexSet<TypeId> = IndexSet::with_capacity(types.len());
-        let includes = self.add_types_to_intersection(&mut ordered_types, TypeFlags::NONE, types);
-        let mut type_set: Vec<TypeId> = ordered_types.into_iter().collect();
+        let mut type_set: Vec<TypeId> = Vec::with_capacity(types.len());
+        let includes = self.add_types_to_intersection(&mut type_set, TypeFlags::NONE, types);
         let mut object_flags = ObjectFlags::NONE;
         // An intersection type is considered empty if it contains
         // the type never, or
@@ -350,7 +350,7 @@ impl Checker {
     // Go: checker/checker.go:26139 addTypesToIntersection
     pub fn add_types_to_intersection(
         &mut self,
-        type_set: &mut IndexSet<TypeId>,
+        type_set: &mut Vec<TypeId>,
         includes: TypeFlags,
         types: &[TypeId],
     ) -> TypeFlags {
@@ -365,7 +365,7 @@ impl Checker {
     // Go: checker/checker.go:26146 addTypeToIntersection
     pub fn add_type_to_intersection(
         &mut self,
-        type_set: &mut IndexSet<TypeId>,
+        type_set: &mut Vec<TypeId>,
         includes: TypeFlags,
         t: TypeId,
     ) -> TypeFlags {
@@ -373,13 +373,20 @@ impl Checker {
         let mut t = t;
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
-            return self.add_types_to_intersection(type_set, includes, &types);
+            // Go `addTypesToIntersection(typeSet, includes, t.Types())`.
+            for i in 0..self.ty(t).types().len() {
+                let regular = self.get_regular_type_of_literal_type(self.type_at(t, i));
+                includes = self.add_type_to_intersection(type_set, includes, regular);
+            }
+            return includes;
         }
         if self.is_empty_anonymous_object_type(t) {
             if !includes.intersects(TypeFlags::INCLUDES_EMPTY_OBJECT) {
                 includes |= TypeFlags::INCLUDES_EMPTY_OBJECT;
-                type_set.insert(t);
+                // Go `orderedSet.Add` adds only values it has not seen.
+                if !type_set.contains(&t) {
+                    type_set.push(t);
+                }
             }
         } else {
             if flags.intersects(TypeFlags::ANY_OR_UNKNOWN) {
@@ -402,7 +409,7 @@ impl Checker {
                         // empty intersection. Adding TypeFlags.NonPrimitive causes that to happen.
                         includes |= TypeFlags::NON_PRIMITIVE;
                     }
-                    type_set.insert(t);
+                    type_set.push(t);
                 }
             }
             includes |= flags & TypeFlags::INCLUDES_MASK;
@@ -518,8 +525,8 @@ impl Checker {
         let mut checked: Vec<TypeId> = Vec::new();
         let mut result: Vec<TypeId> = Vec::new();
         for &u in &union_types {
-            let u_types = self.ty(u).types().to_vec();
-            for t in u_types {
+            for i in 0..self.ty(u).types().len() {
+                let t = self.type_at(u, i);
                 let (new_checked, inserted) = self.insert_type(&checked, t);
                 checked = new_checked;
                 if inserted {
@@ -691,7 +698,7 @@ impl Checker {
             return true;
         }
         if flags.intersects(TypeFlags::UNION) {
-            let types = self.ty(t).types().to_vec();
+            let types = self.ty(t).types_list();
             for u in types {
                 if self.is_empty_object_type(u) {
                     return true;
@@ -700,8 +707,8 @@ impl Checker {
             return false;
         }
         if flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
-            for u in types {
+            for i in 0..self.ty(t).types().len() {
+                let u = self.type_at(t, i);
                 if !self.is_empty_object_type(u) {
                     return false;
                 }
@@ -764,8 +771,8 @@ impl Checker {
     // Go: checker/checker.go:26410 forEachType
     pub fn for_each_type(&mut self, t: TypeId, f: &mut dyn FnMut(&mut Checker, TypeId)) {
         if self.ty(t).flags.intersects(TypeFlags::UNION) {
-            let types = self.ty(t).types().to_vec();
-            for u in types {
+            for i in 0..self.ty(t).types().len() {
+                let u = self.type_at(t, i);
                 f(self, u);
             }
         } else {
@@ -780,8 +787,8 @@ impl Checker {
         f: &mut dyn FnMut(&mut Checker, TypeId) -> bool,
     ) -> bool {
         if self.ty(t).flags.intersects(TypeFlags::UNION) {
-            let types = self.ty(t).types().to_vec();
-            for u in types {
+            for i in 0..self.ty(t).types().len() {
+                let u = self.type_at(t, i);
                 if f(self, u) {
                     return true;
                 }
@@ -798,8 +805,8 @@ impl Checker {
         f: &mut dyn FnMut(&mut Checker, TypeId) -> bool,
     ) -> bool {
         if self.ty(t).flags.intersects(TypeFlags::UNION) {
-            let types = self.ty(t).types().to_vec();
-            for u in types {
+            for i in 0..self.ty(t).types().len() {
+                let u = self.type_at(t, i);
                 if !f(self, u) {
                     return false;
                 }
@@ -820,8 +827,8 @@ impl Checker {
             .flags
             .intersects(TypeFlags::UNION_OR_INTERSECTION)
         {
-            let types = self.ty(t).types().to_vec();
-            for u in types {
+            for i in 0..self.ty(t).types().len() {
+                let u = self.type_at(t, i);
                 if !f(self, u) {
                     return false;
                 }
@@ -838,18 +845,28 @@ impl Checker {
         f: &mut dyn FnMut(&mut Checker, TypeId) -> bool,
     ) -> TypeId {
         if self.ty(t).flags.intersects(TypeFlags::UNION) {
-            let types = self.ty(t).types().to_vec();
-            let mut filtered: Vec<TypeId> = Vec::with_capacity(types.len());
-            for &u in &types {
-                if f(self, u) {
-                    filtered.push(u);
+            // PORT: Go `core.Same(types, core.Filter(types, f))` is true exactly
+            // when nothing was filtered out. The filtered list is built only
+            // once the first type is dropped, so a type that keeps every
+            // constituent costs no copy.
+            let types_len = self.ty(t).types().len();
+            let mut filtered: Option<Vec<TypeId>> = None;
+            for i in 0..types_len {
+                let u = self.type_at(t, i);
+                let keep = f(self, u);
+                if let Some(list) = &mut filtered {
+                    if keep {
+                        list.push(u);
+                    }
+                } else if !keep {
+                    let mut list = Vec::with_capacity(types_len - 1);
+                    list.extend_from_slice(&self.ty(t).types()[..i]);
+                    filtered = Some(list);
                 }
             }
-            // PORT: Go `core.Same(types, core.Filter(types, f))` is true exactly
-            // when nothing was filtered out.
-            if filtered.len() == types.len() {
+            let Some(filtered) = filtered else {
                 return t;
-            }
+            };
             let origin = self.ty(t).as_union_type().origin;
             let mut new_origin = TypeId::NIL;
             if origin.is_some() && self.ty(origin).flags.intersects(TypeFlags::UNION) {
@@ -858,14 +875,14 @@ impl Checker {
                 // filtered types are within nested unions in the origin), then we can't construct a new origin type.
                 // Otherwise, if we have exactly one type left in the origin set, return that as the filtered type.
                 // Otherwise, construct a new filtered origin type.
-                let origin_types = self.ty(origin).types().to_vec();
+                let origin_types = self.ty(origin).types_list();
                 let mut origin_filtered: Vec<TypeId> = Vec::with_capacity(origin_types.len());
                 for &u in &origin_types {
                     if self.ty(u).flags.intersects(TypeFlags::UNION) || f(self, u) {
                         origin_filtered.push(u);
                     }
                 }
-                if origin_types.len() - origin_filtered.len() == types.len() - filtered.len() {
+                if origin_types.len() - origin_filtered.len() == types_len - filtered.len() {
                     if origin_filtered.len() == 1 {
                         return origin_filtered[0];
                     }
@@ -999,7 +1016,7 @@ impl Checker {
             return self.get_index_type_for_generic_type(t, index_flags);
         }
         if self.ty(t).flags.intersects(TypeFlags::UNION) {
-            let types = self.ty(t).types().to_vec();
+            let types = self.ty(t).types_list();
             let mapped: Vec<TypeId> = types
                 .into_iter()
                 .map(|u| self.get_index_type_ex(u, index_flags))
@@ -1007,7 +1024,7 @@ impl Checker {
             return self.get_intersection_type(&mapped);
         }
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-            let types = self.ty(t).types().to_vec();
+            let types = self.ty(t).types_list();
             let mapped: Vec<TypeId> = types
                 .into_iter()
                 .map(|u| self.get_index_type_ex(u, index_flags))
@@ -1247,10 +1264,8 @@ impl Checker {
             || flags.intersects(TypeFlags::INTERSECTION)
                 && self.maybe_type_of_kind(t, TypeFlags::INSTANTIABLE)
                 && {
-                    let types = self.ty(t).types().to_vec();
-                    types
-                        .into_iter()
-                        .any(|u| self.is_empty_anonymous_object_type(u))
+                    (0..self.ty(t).types().len())
+                        .any(|i| self.is_empty_anonymous_object_type(self.type_at(t, i)))
                 }
     }
 
@@ -1478,8 +1493,8 @@ impl Checker {
         {
             let mut prop_types: Vec<TypeId> = Vec::new();
             let mut was_missing_prop = false;
-            let types = self.ty(index_type).types().to_vec();
-            for t in types {
+            for i in 0..self.ty(index_type).types().len() {
+                let t = self.type_at(index_type, i);
                 let extra = if was_missing_prop {
                     AccessFlags::SUPPRESS_NO_IMPLICIT_ANY_ERROR
                 } else {

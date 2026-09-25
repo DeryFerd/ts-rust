@@ -12,8 +12,8 @@ impl Checker {
         kind: SignatureKind,
     ) -> TypeId {
         if !self.get_signatures_of_type(source, kind).is_empty() {
-            let types = self.ty(union_target).types().to_vec();
-            for t in types {
+            for i in 0..self.ty(union_target).types().len() {
+                let t = self.type_at(union_target, i);
                 if !self.get_signatures_of_type(t, kind).is_empty() {
                     return t;
                 }
@@ -32,7 +32,7 @@ impl Checker {
             .intersects(TypeFlags::PRIMITIVE | TypeFlags::INSTANTIABLE_PRIMITIVE)
         {
             let mut matching_count: i32 = 0;
-            let types = self.ty(union_target).types().to_vec();
+            let types = self.ty(union_target).types_list();
             for target in types {
                 if !self
                     .ty(target)
@@ -85,8 +85,8 @@ impl Checker {
                 c.is_array_like_type(t)
             })
         {
-            let types = self.ty(union_target).types().to_vec();
-            for t in types {
+            for i in 0..self.ty(union_target).types().len() {
+                let t = self.type_at(union_target, i);
                 if !self.is_array_like_type(t) {
                     return t;
                 }
@@ -221,9 +221,9 @@ impl Checker {
     // excluded, instead of copying it.
     pub fn exclude_properties(
         &self,
-        properties: Vec<SymbolId>,
+        properties: SharedList<SymbolId>,
         excluded_properties: &FxHashSet<String>,
-    ) -> Vec<SymbolId> {
+    ) -> SharedList<SymbolId> {
         if excluded_properties.is_empty() || properties.is_empty() {
             return properties;
         }
@@ -240,7 +240,7 @@ impl Checker {
             }
         }
         if excluded {
-            return reduced;
+            return reduced.into();
         }
         properties
     }
@@ -441,7 +441,7 @@ impl Checker {
         &mut self,
         t: TypeId,
     ) -> (String, Option<FxHashMap<TypeId, TypeId>>) {
-        let types = self.ty(t).types().to_vec();
+        let types = self.ty(t).types_list();
         if types.len() < 10
             || self
                 .ty(t)
@@ -541,7 +541,7 @@ impl Checker {
         target: TypeId,
         discriminator: &mut dyn Discriminator,
     ) -> TypeId {
-        let types = self.ty(target).types().to_vec();
+        let types = self.ty(target).types_list();
         let mut include: Vec<Ternary> = vec![Ternary::FALSE; types.len()];
         for (i, &t) in types.iter().enumerate() {
             if !self.ty(t).flags.intersects(TypeFlags::PRIMITIVE) && {
@@ -679,8 +679,8 @@ impl Checker {
             .flags
             .intersects(TypeFlags::UNION_OR_INTERSECTION)
         {
-            let types = self.ty(t).types().to_vec();
-            for s in types {
+            for i in 0..self.ty(t).types().len() {
+                let s = self.type_at(t, i);
                 if self.type_could_have_top_level_singleton_types(s) {
                     return true;
                 }
@@ -699,7 +699,7 @@ impl Checker {
     }
 
     // Go: checker/relater.go:1323 getVariances
-    pub fn get_variances(&mut self, t: TypeId) -> Vec<VarianceFlags> {
+    pub fn get_variances(&mut self, t: TypeId) -> SharedList<VarianceFlags> {
         // Arrays and tuples are known to be covariant, no need to spend time computing this.
         if t == self.global_array_type
             || t == self.global_readonly_array_type
@@ -708,12 +708,17 @@ impl Checker {
             return self.array_variances.clone();
         }
         let symbol = self.ty(t).symbol;
+        // PORT: the cached result is returned before the type parameters are
+        // copied; `get_variances_worker` would return the same list.
+        if self.variance_links.has(symbol) {
+            return self.variance_links.get(symbol).variances.clone();
+        }
         let type_parameters = self.ty(t).as_interface_type().type_parameters().to_vec();
         self.get_variances_worker(symbol, &type_parameters)
     }
 
     // Go: checker/relater.go:1331 getAliasVariances
-    pub fn get_alias_variances(&mut self, symbol: SymbolId) -> Vec<VarianceFlags> {
+    pub fn get_alias_variances(&mut self, symbol: SymbolId) -> SharedList<VarianceFlags> {
         let type_parameters = self.type_alias_links.get(symbol).type_parameters.clone();
         self.get_variances_worker(symbol, &type_parameters)
     }
@@ -726,7 +731,7 @@ impl Checker {
     //
     // PORT: Go distinguishes a nil `links.variances` (not computed) from an
     // empty slice (in progress, or no type parameters). `VarianceLinks` holds a
-    // plain `Vec`, and `varianceLinks` is only used here, so "the link record
+    // `SharedList`, and `varianceLinks` is only used here, so "the link record
     // exists" stands for "variances != nil": the record is created at the same
     // point Go assigns the empty in-progress slice.
     // Go: checker/relater.go:1341 getVariancesWorker
@@ -734,7 +739,7 @@ impl Checker {
         &mut self,
         symbol: SymbolId,
         type_parameters: &[TypeId],
-    ) -> Vec<VarianceFlags> {
+    ) -> SharedList<VarianceFlags> {
         if !self.variance_links.has(symbol) {
             let old_variance_computation = self.in_variance_computation;
             let save_resolution_start = self.resolution_start;
@@ -742,7 +747,7 @@ impl Checker {
                 self.in_variance_computation = true;
                 self.resolution_start = self.type_resolutions.len() as i32;
             }
-            self.variance_links.get(symbol).variances = Vec::new();
+            self.variance_links.get(symbol).variances = SharedList::default();
             let mut variances: Vec<VarianceFlags> =
                 vec![VarianceFlags::default(); type_parameters.len()];
             for (i, &tp) in type_parameters.iter().enumerate() {
@@ -807,7 +812,7 @@ impl Checker {
                 self.in_variance_computation = false;
                 self.resolution_start = save_resolution_start;
             }
-            self.variance_links.get(symbol).variances = variances;
+            self.variance_links.get(symbol).variances = variances.into();
         }
         self.variance_links.get(symbol).variances.clone()
     }
@@ -1294,7 +1299,7 @@ impl Checker {
             let first_parameter = self.sig(s).parameters[0];
             let param_type = self.get_type_of_parameter(first_parameter);
             let rest_type = if self.is_array_type(param_type) {
-                self.get_type_arguments(param_type)[0]
+                self.type_arguments_of(param_type)[0]
             } else {
                 param_type
             };

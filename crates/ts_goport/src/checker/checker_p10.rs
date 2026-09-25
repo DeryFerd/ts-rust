@@ -398,7 +398,7 @@ impl Checker {
                 .types
                 .clone();
             let (mixin_flags, _) = self.find_mixins(&types);
-            let members = self.ty(first_base).types().to_vec();
+            let members = self.ty(first_base).types_list();
             for (i, intersection_member) in members.into_iter().enumerate() {
                 // We want to ignore mixin ctors
                 if !mixin_flags[i] {

@@ -215,7 +215,8 @@ impl Checker {
         // Instance members via addPropertyToElementList (reusing existing serialization),
         // then convert TypeElements to ClassElements and add class-specific modifiers
         let all_props = self.get_properties_of_type(class_type);
-        let symbol_props = self.filter_inherited_properties(class_type, &base_types, all_props);
+        let symbol_props =
+            self.filter_inherited_properties(class_type, &base_types, all_props.to_vec());
         let public_props: Vec<SymbolId> = symbol_props
             .iter()
             .copied()
@@ -388,8 +389,11 @@ impl Checker {
             ));
         }
         // Properties, filtering inherited
-        let filtered_props =
-            self.filter_inherited_properties(interface_type, &base_types, resolved_properties);
+        let filtered_props = self.filter_inherited_properties(
+            interface_type,
+            &base_types,
+            resolved_properties.to_vec(),
+        );
         members = self.serialize_properties_with_truncation(b, filtered_props, members);
 
         // Heritage clauses
