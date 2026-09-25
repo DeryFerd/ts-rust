@@ -26,3 +26,5 @@ pub mod checker;
 pub mod pseudochecker;
 pub mod printer;
 pub mod declarations;
+pub mod modulespecifiers;
+pub mod frontend;

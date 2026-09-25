@@ -1,0 +1,20 @@
+//! Go package `parser`.
+pub mod source_file;
+pub mod parser_p1;
+pub mod parser_p2;
+pub mod parser_p3;
+pub mod parser_p4;
+pub mod parser_p5;
+pub mod jsdoc;
+pub mod reparser;
+pub mod references;
+pub mod utilities;
+pub use source_file::*;
+pub use parser_p1::*;
+pub use parser_p2::*;
+pub use parser_p3::*;
+pub use parser_p4::*;
+pub use parser_p5::*;
+pub use jsdoc::*;
+pub use references::*;
+pub use utilities::*;

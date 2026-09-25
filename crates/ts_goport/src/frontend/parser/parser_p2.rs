@@ -12,7 +12,7 @@
 //! `Option<&'static Message>`. Go `nodeSliceArena` allocations are plain
 //! slices passed to `new_node_list` / `new_modifier_list`.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 impl Parser {
     // Go: parser/parser.go:1409 parseDefaultClause
@@ -164,7 +164,7 @@ impl Parser {
         let node = self.factory.new_expression_statement(expression);
         let result = self.finish_node(node, pos);
         if has_paren {
-            jsdoc &= !JsdocScannerInfo::HAS_JS_DOC;
+            jsdoc &= !JSDOC_SCANNER_INFO_HAS_JS_DOC;
         }
         self.with_js_doc(result, jsdoc);
         result

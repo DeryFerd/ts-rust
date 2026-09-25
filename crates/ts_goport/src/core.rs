@@ -404,8 +404,10 @@ macro_rules! unported {
 /// One loaded source file. Parser data is ready when the program is
 /// installed. The binder fills the `OnceCell` fields once per file.
 pub struct GoFile {
-    /// The ts_compiler source file (arena, text, file name).
-    pub source: &'static ts_compiler::SourceFile,
+    /// The ts_compiler source file (arena, text, file name). None for a
+    /// file parsed by the Go frontend (`GOPORT_FRONTEND=go`), whose nodes
+    /// live in a node store (`ast::store`).
+    pub source: Option<&'static ts_compiler::SourceFile>,
     /// The `SourceFile` node.
     pub root: Node,
     /// Go `node.Flags` from the parser for each node, indexed by
@@ -422,12 +424,33 @@ pub struct GoFile {
 /// Go `Program` as the checker sees it. Installed once per thread with
 /// `crate::program::install`, then read with `prog()`.
 pub struct GoProgram {
-    pub program: &'static ts_compiler::Program,
-    /// Files in Go `Program.SourceFiles()` order. `Node::file_index` indexes it.
+    /// The legacy graph. None on the Go frontend path.
+    pub program: Option<&'static ts_compiler::Program>,
+    /// Files by file index. `Node::file_index` indexes it. On the Go frontend
+    /// path this holds every node store, including config files that are not
+    /// program source files.
     pub files: Vec<GoFile>,
+    /// File indexes in Go `Program.SourceFiles()` order.
+    pub source_file_order: Vec<usize>,
     pub options: crate::options::CompilerOptions,
     /// Binder symbols. Each checker clones this.
     pub bound_symbols: std::cell::OnceCell<SymbolArena>,
+}
+
+impl GoFile {
+    /// The legacy source file. Panics for a Go frontend file; callers check
+    /// `ast::store::has_file_store` first.
+    #[must_use]
+    pub fn legacy_source(&self) -> &'static ts_compiler::SourceFile {
+        self.source.expect("legacy source read for a Go frontend file")
+    }
+}
+
+impl GoProgram {
+    /// Go `Program.SourceFiles()`: the program files in Go order.
+    pub fn source_files(&self) -> impl Iterator<Item = &GoFile> {
+        self.source_file_order.iter().map(|&index| &self.files[index])
+    }
 }
 
 thread_local! {
@@ -453,4 +476,33 @@ pub fn try_prog() -> Option<&'static GoProgram> {
 #[must_use]
 pub fn prog() -> &'static GoProgram {
     PROGRAM.with(|cell| *cell.get().expect("GoProgram not installed"))
+}
+
+// Go: core/version.go:8 version
+// PORT: Go keeps this in a var that ldflags can override. The pinned
+// reference build does not override it.
+const VERSION: &str = "7.0.0-dev";
+
+// Go: core/version.go:10 Version
+pub fn version() -> &'static str {
+    VERSION
+}
+
+// Go: core/version.go:14 versionMajorMinor
+// Go: core/version.go:31 VersionMajorMinor
+pub fn version_major_minor() -> &'static str {
+    let mut seen_major = false;
+    let i = VERSION.find(|r: char| {
+        if r == '.' {
+            if seen_major {
+                return true;
+            }
+            seen_major = true;
+        }
+        false
+    });
+    match i {
+        Some(i) => &VERSION[..i],
+        None => panic!("invalid version string: {VERSION}"),
+    }
 }

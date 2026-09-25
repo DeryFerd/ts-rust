@@ -18,7 +18,7 @@ pub fn is_valid_big_int_string(s: &str, round_trip_only: bool) -> bool {
     if s.is_empty() {
         return false;
     }
-    let mut scanner = new_scanner();
+    let mut scanner = rs_new_scanner();
     scanner.set_skip_trivia(false);
     let success = Rc::new(Cell::new(true));
     let success_in_callback = success.clone();

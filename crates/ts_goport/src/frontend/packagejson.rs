@@ -14,7 +14,7 @@
 //! - Go `*collections.OrderedMap` is `Rc<IndexMap>`. Go slices and pointers
 //!   share their data on copy, so `Rc` keeps that.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::cell::OnceCell;
 use std::sync::LazyLock;
 use ts_diagnostics::Message;

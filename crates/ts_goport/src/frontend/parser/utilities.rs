@@ -8,7 +8,7 @@
 //! PORT: parseoptions.go is in package `ast`. The plan gives it to this unit
 //! without a file, so it is here, next to the parser code that uses it.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // ── parser/utilities.go ────────────────────────────────────────────────
 

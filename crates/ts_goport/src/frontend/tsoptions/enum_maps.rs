@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::sync::LazyLock;
 
 // PORT: Go `core.WatchFileKind`, `core.WatchDirectoryKind` and

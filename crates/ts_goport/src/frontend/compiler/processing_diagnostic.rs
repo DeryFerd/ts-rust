@@ -1,7 +1,7 @@
 //! Go `internal/compiler/processingDiagnostic.go`: diagnostics found while
 //! files are loaded. They become real diagnostics after the program is built.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 /// Go `processingDiagnosticKind`.
 // PORT: Go `int` enum with iota constants, kept as a newtype like

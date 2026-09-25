@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // This file ports tsoptions/commandlineparser.go.
 // PORT: Go `any` values are `CompilerOptionsValue`. Go
@@ -52,10 +52,11 @@ pub struct CommandLineParser {
 // so that step is left out. It does not change the compiler options, the
 // file names, the errors or the raw options.
 pub fn parse_command_line(command_line: &[String], host: &dyn ParseConfigHost) -> ParsedCommandLine {
+    let fs = host.fs();
     let parser = parse_command_line_worker(
         &COMPILER_OPTIONS_DID_YOU_MEAN_DIAGNOSTICS,
         command_line,
-        Some(host.fs()),
+        Some(&*fs),
         host.get_current_directory(),
     );
     let options_with_absolute_paths = convert_to_options_with_absolute_paths(

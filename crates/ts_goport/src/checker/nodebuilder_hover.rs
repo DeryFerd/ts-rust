@@ -252,10 +252,9 @@ impl Checker {
             if mod_flags != ModifierFlags::NONE && can_have_modifiers(m) {
                 let existing = m.modifier_flags();
                 if mod_flags != existing {
-                    let mods = modifier_list_from_flags(b.borrow().f(), mod_flags | existing);
-                    // PORT: Go passes b.f. The current ast `replace_modifiers` has no
-                    // factory parameter (see crossFile).
-                    members[i] = replace_modifiers(m, mods);
+                    let bb = b.borrow();
+                    let mods = modifier_list_from_flags(bb.f(), mod_flags | existing);
+                    members[i] = replace_modifiers(bb.f(), m, mods);
                 }
             }
         }
@@ -669,8 +668,7 @@ impl Checker {
             }
             if can_have_modifiers(s.node) {
                 let mf = s.node.modifier_flags() | ModifierFlags::EXPORT;
-                // PORT: Go passes b.f (see add_class_modifiers).
-                s.node = replace_modifiers(s.node, modifier_list_from_flags(bb.f(), mf));
+                s.node = replace_modifiers(bb.f(), s.node, modifier_list_from_flags(bb.f(), mf));
             }
         }
 
@@ -682,8 +680,7 @@ impl Checker {
             for stmt in body_statements.iter_mut() {
                 if can_have_modifiers(*stmt) {
                     let mf = stmt.modifier_flags().without(ModifierFlags::EXPORT);
-                    // PORT: Go passes b.f (see add_class_modifiers).
-                    *stmt = replace_modifiers(*stmt, modifier_list_from_flags(bb.f(), mf));
+                    *stmt = replace_modifiers(bb.f(), *stmt, modifier_list_from_flags(bb.f(), mf));
                 }
             }
         }

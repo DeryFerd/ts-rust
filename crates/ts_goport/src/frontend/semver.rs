@@ -10,7 +10,7 @@
 //! ASCII only in RE2 (`\s` is `[\t\n\f\r ]`).
 
 #[allow(unused_imports)]
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 use std::cmp::Ordering;
 

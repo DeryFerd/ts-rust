@@ -10,7 +10,7 @@
 //! `jsdocTagCommentsPartsSpace`). They only save allocations. Here each call
 //! uses a new `Vec`, and the parser fields are not used.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // Go: jsdoc.go:13 init
 // PORT: Go registers `parseJSDocForNode` with `ast.SetParseJSDocForNode`.
@@ -173,7 +173,7 @@ impl Parser {
         let _ = parent;
         let end = if end == -1 { self.source_text.len() as i32 } else { end };
         // Check for /** (JSDoc opening part)
-        if !is_js_doc_like_text(&self.source_text[start as usize..]) {
+        if !super::utilities::is_js_doc_like_text(&self.source_text[start as usize..]) {
             // TODO: This should be a panic, unless parseSingleJSDocComment is calling this (not ported yet)
             return Node::NIL;
         }
@@ -184,7 +184,7 @@ impl Parser {
         let save_parsing_contexts = self.parsing_contexts;
         let save_scanner_state = self.scanner.mark();
         let save_diagnostics_length = self.diagnostics.borrow().diagnostics.len();
-        let save_has_parse_error = self.has_parse_error;
+        let save_has_parse_error = self.has_parse_error();
         let save_has_await_identifier = self.statement_has_await_identifier;
 
         // initial indent is start+4 to account for leading `/** `
@@ -213,7 +213,7 @@ impl Parser {
         self.context_flags = save_context_flags;
         self.scanner.rewind(save_scanner_state);
         self.token = save_token;
-        self.has_parse_error = save_has_parse_error;
+        self.set_has_parse_error(save_has_parse_error);
         self.statement_has_await_identifier = save_has_await_identifier;
 
         comment
@@ -359,7 +359,7 @@ impl Parser {
                                 if link_end == start {
                                     remove_leading_newlines(&mut comments);
                                 }
-                                let text = self.factory.new_js_doc_text(&comments);
+                                let text = self.factory.new_js_doc_text(comments.clone());
                                 let jsdoc_text = self.finish_node_with_end(text, link_end, comment_end);
                                 comment_parts.push(jsdoc_text);
                                 comment_parts.push(link);
@@ -393,7 +393,7 @@ impl Parser {
 
         if let Some(last) = comments.last_mut() {
             *last = last.trim_end_matches(char::is_whitespace).to_string();
-            let text = self.factory.new_js_doc_text(&comments);
+            let text = self.factory.new_js_doc_text(comments.clone());
             let jsdoc_text = self.finish_node_with_end(text, link_end, comments_pos);
             comment_parts.push(jsdoc_text);
         }
@@ -607,7 +607,7 @@ impl Parser {
                         let link = self.parse_js_doc_link(link_start);
                         if !link.is_nil() {
                             let comment_start = if link_end > -1 { link_end } else { comments_pos };
-                            let t = self.factory.new_js_doc_text(&comments);
+                            let t = self.factory.new_js_doc_text(comments.clone());
                             let text = self.finish_node_with_end(t, comment_start, comment_end);
                             parts.push(text);
                             parts.push(link);
@@ -659,7 +659,7 @@ impl Parser {
         remove_leading_newlines(&mut comments);
         if !comments.is_empty() {
             let comment_start = if link_end > -1 { link_end } else { comments_pos };
-            let t = self.factory.new_js_doc_text(&comments);
+            let t = self.factory.new_js_doc_text(comments.clone());
             let text = self.finish_node(t, comment_start);
             parts.push(text);
         }
@@ -691,9 +691,9 @@ impl Parser {
             self.next_token_js_doc(); // Couldn't this be nextTokenCommentJSDoc?
         }
         let create = match link_type.as_str() {
-            "link" => self.factory.new_js_doc_link(name, &text),
-            "linkcode" => self.factory.new_js_doc_link_code(name, &text),
-            _ => self.factory.new_js_doc_link_plain(name, &text),
+            "link" => self.factory.new_js_doc_link(name, text.clone()),
+            "linkcode" => self.factory.new_js_doc_link_code(name, text.clone()),
+            _ => self.factory.new_js_doc_link_plain(name, text.clone()),
         };
         let end = self.scanner.token_end();
         self.finish_node_with_end(create, start, end)

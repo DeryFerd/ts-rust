@@ -124,7 +124,7 @@ impl NodeFactory {
     }
 
     // Go: ast/ast.go:84 (f *NodeFactory) newNode
-    fn new_node(&self, kind: SyntaxKind, data: D) -> Node {
+    pub(crate) fn new_node(&self, kind: SyntaxKind, data: D) -> Node {
         self.node_count.set(self.node_count.get() + 1);
         let node = match self.target {
             NodeFactoryTarget::Synthetic => alloc_synthetic_node(kind, data),
@@ -138,7 +138,7 @@ impl NodeFactory {
     }
 
     /// `newNode` plus Go `f.textCount++`, for nodes that carry text.
-    fn new_text_node(&self, kind: SyntaxKind, data: D) -> Node {
+    pub(crate) fn new_text_node(&self, kind: SyntaxKind, data: D) -> Node {
         self.text_count.set(self.text_count.get() + 1);
         self.new_node(kind, data)
     }
@@ -160,6 +160,62 @@ impl NodeFactory {
     #[must_use]
     pub fn text_count(&self) -> usize {
         self.text_count.get()
+    }
+
+    // ── Source files ───────────────────────────────────────────────────
+
+    // Go: ast/ast.go:2549 NewSourceFile
+    // PORT: Go takes `opts SourceFileParseOptions`; only its `FileName` and
+    // `Path` are kept (see `SyntheticSourceFileData`). A synthetic
+    // SourceFile keeps the Go fields in its slot. A store SourceFile (the
+    // ported parser) keeps file name and text in its node store.
+    pub fn new_source_file(
+        &self,
+        file_name: &'static str,
+        path: &str,
+        text: &'static str,
+        statements: NodeList,
+        end_of_file_token: Node,
+    ) -> Node {
+        // PORT: Go `tspath.GetEncodedRootLength` and `tspath.NormalizePath`
+        // are `ts_path::root_length` and `ts_path::normalize_path` here. They
+        // agree on normalized absolute file names.
+        if ts_path::root_length(file_name) == 0 || file_name != ts_path::normalize_path(file_name) {
+            panic!("fileName should be normalized and absolute: {file_name:?}");
+        }
+        let node = self.new_node(
+            SyntaxKind::SourceFile,
+            D::SourceFile(Box::new(ts_ast::SourceFileData {
+                end_of_file_token: self.id(end_of_file_token),
+                locals: ts_ast::SymbolTable,
+                next_container: None,
+                statements: self.req_list(statements),
+                symbol: None,
+                facts: 0,
+            })),
+        );
+        if self.target == NodeFactoryTarget::Synthetic {
+            set_synthetic_source_file_data(
+                node,
+                SyntheticSourceFileData { file_name, path: path.to_string(), text, ..Default::default() },
+            );
+        }
+        node
+    }
+
+    /// Go `f.NewSourceFile(node.parseOptions, node.text, statements,
+    /// endOfFileToken)` followed by `updated.copyFrom(node)`, the shared start
+    /// of Go `UpdateSourceFile` and `SourceFile.Clone`. `node` is a parsed or
+    /// factory SourceFile.
+    pub fn new_source_file_from(&self, node: Node, statements: NodeList, end_of_file_token: Node) -> Node {
+        let (file_name, path, text) = if is_synthetic_node(node) {
+            with_synthetic_source_file(node, |d| (d.file_name, d.path.clone(), d.text))
+        } else {
+            (source_file_file_name(node), source_file_info(node).path.clone(), source_file_text(node))
+        };
+        let updated = self.new_source_file(file_name, &path, text, statements, end_of_file_token);
+        source_file_copy_from(updated, node);
+        updated
     }
 
     // ── Lists ──────────────────────────────────────────────────────────

@@ -277,7 +277,6 @@ impl Checker {
     // Go: checker/nodebuilderimpl.go:1232 getSpecifierForModuleSymbol
     // PORT: the specifier cache key is `(path, mode)` for Go
     // `module.ModeAwareCacheKey{Name, Mode}`.
-    #[allow(unreachable_code, unused_variables)]
     pub fn get_specifier_for_module_symbol(&mut self, b: &Nb, symbol: SymbolId, override_import_mode: ResolutionMode) -> String {
         let mut file = get_declaration_of_kind(&self.symbols, symbol, SyntaxKind::SourceFile);
         if file.is_nil() {
@@ -333,11 +332,32 @@ impl Checker {
         // just like how the declaration emitter does for the ambient module declarations - we can easily accomplish this
         // using the `baseUrl` compiler option (which we would otherwise never use in declaration emit) and a non-relative
         // specifier preference
-        // PORT: Go passes `b.ctx.host`, the compiler options, the
-        // ProjectRelative specifier preference and the ending preference
-        // (Js when `resolution_mode` is ESM, else None) to
-        // GetModuleSpecifiers, which is not ported.
-        let all_specifiers: Vec<String> = unported!("GetModuleSpecifiers");
+        // PORT: Go uses `b.ctx.host`, which is the program. The program state
+        // is global here, so `ProgramHost` has no fields.
+        let all_specifiers: Vec<String> = {
+            use crate::modulespecifiers as ms;
+            let host = ms::ProgramHost;
+            let specifier_compiler_options = self.compiler_options;
+            let specifier_pref = ms::ImportModuleSpecifierPreference::ProjectRelative;
+            let mut ending_pref = ms::ImportModuleSpecifierEndingPreference::None;
+            if resolution_mode == ResolutionMode::ESM {
+                ending_pref = ms::ImportModuleSpecifierEndingPreference::Js;
+            }
+            ms::get_module_specifiers(
+                symbol,
+                self,
+                specifier_compiler_options,
+                &context_file,
+                &host,
+                &ms::UserPreferences {
+                    import_module_specifier_preference: specifier_pref,
+                    import_module_specifier_ending: ending_pref,
+                    ..Default::default()
+                },
+                ms::ModuleSpecifierOptions { override_import_mode },
+                false, /*forAutoImports*/
+            )
+        };
         let mut nb = b.borrow_mut();
         let cache = nb.symbol_links.get(symbol).specifier_cache.get_or_insert_with(FxHashMap::default);
         if all_specifiers.is_empty() {

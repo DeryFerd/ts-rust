@@ -78,12 +78,12 @@ impl Checker {
     // reach the checker, so the callback records each report in order and the
     // same `lastError` logic runs on the recorded reports after the scan. No
     // other diagnostic is added during the scan, so the order is the same.
-    // `ErrorCallback` (scanner_util) carries no format args, so args are empty.
+    // `RsErrorCallback` (scanner_util) carries no format args, so args are empty.
     pub fn check_grammar_regular_expression_literal(&mut self, node: Node) -> bool {
         let source_file = get_source_file_of_node(node);
         if !self.has_parse_diagnostics(source_file) {
             let reports: Rc<RefCell<Vec<(&'static Message, i32, i32)>>> = Rc::new(RefCell::new(Vec::new()));
-            let mut reg_exp_scanner = new_scanner();
+            let mut reg_exp_scanner = rs_new_scanner();
             reg_exp_scanner.set_script_target(self.language_version);
             reg_exp_scanner.set_language_variant(source_file_info(source_file).language_variant);
             let sink = reports.clone();

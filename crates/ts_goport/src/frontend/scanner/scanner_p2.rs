@@ -8,7 +8,7 @@
 //! one to a `char` for the `stringutil` predicates. The token value is set
 //! through `set_token_value` (interned `&'static str`, see scanner_p1.rs).
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 use super::scanner_p1::{
     intern_token_value, rune_to_char, rune_to_string, utf8_decode_last_rune_in_string, utf8_decode_rune_in_string,

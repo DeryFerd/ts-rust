@@ -139,11 +139,31 @@ impl EmitContext {
 
     // Go: printer/emitcontext.go:90 NewNodeVisitor
     // Creates a new NodeVisitor attached to this EmitContext
-    // PORT: needs the U1 `Visitor` hook API (VisitParameters,
-    // VisitFunctionBody, VisitIterationBody, VisitTopLevelStatements,
-    // VisitEmbeddedStatement). The hook methods are ported below.
-    pub fn new_node_visitor(&self, _visit: Box<dyn FnMut(Node) -> Node>) -> Visitor {
-        unported!("NewNodeVisitor")
+    // PORT: `ctx` is the callback state (see `ast/visitor.rs`). The hooks
+    // borrow this context for `'a`, as Go closes over `c`. The visitor factory
+    // is `c.Factory.AsNodeFactory()`, the `ast` factory inside the printer one.
+    pub fn new_node_visitor<'a, C>(
+        &'a self,
+        visit: impl Fn(Node, &mut NodeVisitor<'a, C>) -> Node + 'a,
+        ctx: C,
+    ) -> NodeVisitor<'a, C> {
+        new_node_visitor(
+            visit,
+            Some(&self.factory().ast),
+            NodeVisitorHooks {
+                visit_parameters: Some(Rc::new(move |nodes: NodeList, v: &mut NodeVisitor<'a, C>| self.visit_parameters(nodes, v))),
+                visit_function_body: Some(Rc::new(move |node: Node, v: &mut NodeVisitor<'a, C>| self.visit_function_body(node, v))),
+                visit_iteration_body: Some(Rc::new(move |node: Node, v: &mut NodeVisitor<'a, C>| self.visit_iteration_body(node, v))),
+                visit_top_level_statements: Some(Rc::new(move |nodes: NodeList, v: &mut NodeVisitor<'a, C>| {
+                    self.visit_variable_environment(nodes, v)
+                })),
+                visit_embedded_statement: Some(Rc::new(move |node: Node, v: &mut NodeVisitor<'a, C>| {
+                    self.visit_embedded_statement(node, v)
+                })),
+                ..NodeVisitorHooks::default()
+            },
+            ctx,
+        )
     }
 
     //
@@ -968,14 +988,14 @@ impl EmitContext {
     //
 
     // Go: printer/emitcontext.go:759 VisitVariableEnvironment
-    pub fn visit_variable_environment(&self, nodes: NodeList, visitor: &mut Visitor) -> NodeList {
+    pub fn visit_variable_environment<C>(&self, nodes: NodeList, visitor: &mut NodeVisitor<'_, C>) -> NodeList {
         self.start_variable_environment();
         let visited = visitor.visit_nodes(nodes);
         self.end_and_merge_variable_environment_list(visited)
     }
 
     // Go: printer/emitcontext.go:764 VisitParameters
-    pub fn visit_parameters(&self, nodes: NodeList, visitor: &mut Visitor) -> NodeList {
+    pub fn visit_parameters<C>(&self, nodes: NodeList, visitor: &mut NodeVisitor<'_, C>) -> NodeList {
         self.start_variable_environment();
         let scope = self.var_scope_stack.borrow().last().cloned().expect("stack is empty");
         let old_flags = scope.borrow().flags;
@@ -1103,7 +1123,7 @@ impl EmitContext {
     }
 
     // Go: printer/emitcontext.go:895 VisitFunctionBody
-    pub fn visit_function_body(&self, node: Node, visitor: &mut Visitor) -> Node {
+    pub fn visit_function_body<C>(&self, node: Node, visitor: &mut NodeVisitor<'_, C>) -> Node {
         // !!! c.resumeVariableEnvironment()
         let updated = visitor.visit_node(node);
         let declarations = self.end_variable_environment();
@@ -1125,7 +1145,7 @@ impl EmitContext {
     }
 
     // Go: printer/emitcontext.go:919 VisitIterationBody
-    pub fn visit_iteration_body(&self, body: Node, visitor: &mut Visitor) -> Node {
+    pub fn visit_iteration_body<C>(&self, body: Node, visitor: &mut NodeVisitor<'_, C>) -> Node {
         if body.is_nil() {
             return Node::NIL;
         }
@@ -1152,15 +1172,13 @@ impl EmitContext {
     }
 
     // Go: printer/emitcontext.go:945 VisitEmbeddedStatement
-    pub fn visit_embedded_statement(&self, node: Node, visitor: &mut Visitor) -> Node {
+    pub fn visit_embedded_statement<C>(&self, node: Node, visitor: &mut NodeVisitor<'_, C>) -> Node {
         if node.is_nil() {
             return Node::NIL;
         }
         let embedded_statement = visitor.visit_embedded_statement(node);
         if embedded_statement.is_nil() || is_not_emitted_statement(embedded_statement) {
-            // PORT: Go uses `visitor.Factory`, which is this context's factory
-            // for visitors made by `NewNodeVisitor`.
-            let empty_statement = self.factory().new_empty_statement();
+            let empty_statement = visitor.factory().new_empty_statement();
             set_node_loc(empty_statement, node.loc());
             self.set_original(empty_statement, node);
             self.assign_comment_range(empty_statement, node);

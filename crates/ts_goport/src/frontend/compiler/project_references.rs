@@ -3,7 +3,7 @@
 //! source <-> output .d.ts maps, and the resolution host that fakes the
 //! output .d.ts files of referenced projects.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------
@@ -179,10 +179,10 @@ impl<'a> ProjectReferenceParser<'a> {
                     // overwrite parent entries when a file belongs to multiple projects.
                     {
                         let mut mapper = self.loader.project_reference_file_mapper.borrow_mut();
-                        for (k, v) in resolved.source_to_project_reference() {
+                        for (k, v) in resolved.source_to_project_reference().into_iter().flatten() {
                             mapper.source_to_project_reference.insert(k.clone(), v.clone());
                         }
-                        for (k, v) in resolved.output_dts_to_project_reference() {
+                        for (k, v) in resolved.output_dts_to_project_reference().into_iter().flatten() {
                             mapper.output_dts_to_project_reference.insert(k.clone(), v.clone());
                         }
                     }
@@ -376,16 +376,16 @@ impl ProjectReferenceFileMapper {
         let path = file.path();
         // Check if outputdts of source file from project reference
         if let Some(output) = self.get_project_reference_from_source(&path) {
-            return (Some(output.resolved.clone()), output.source.clone());
+            return (output.resolved.upgrade(), output.source.clone());
         }
 
         // Source file from project reference
         if let Some(result_from_dts) = self.get_project_reference_from_output_dts(&path) {
-            return (Some(result_from_dts.resolved.clone()), result_from_dts.source.clone());
+            return (result_from_dts.resolved.upgrade(), result_from_dts.source.clone());
         }
 
         if let Some(realpath_dts_to_source) = self.get_source_to_dts_if_symlink(file) {
-            return (Some(realpath_dts_to_source.resolved.clone()), realpath_dts_to_source.source.clone());
+            return (realpath_dts_to_source.resolved.upgrade(), realpath_dts_to_source.source.clone());
         }
         (None, file.file_name())
     }
@@ -616,7 +616,7 @@ impl ProjectReferenceDtsFakingVfs {
         self.known_symlinks.borrow_mut().set_directory(
             directory,
             directory_path,
-            Rc::new(KnownDirectoryLink { real: ensure_trailing_directory_separator(&real_directory), real_path }),
+            Some(KnownDirectoryLink { real: ensure_trailing_directory_separator(&real_directory), real_path }),
         );
     }
 
@@ -637,12 +637,14 @@ impl ProjectReferenceDtsFakingVfs {
             return result == Tristate::True;
         }
 
-        let known_directory_links: Vec<(Path, Rc<KnownDirectoryLink>)> = self
+        // PORT: Go stores `*KnownDirectoryLink`; a nil link would panic at
+        // the `RealPath` read, and this code never stores one.
+        let known_directory_links: Vec<(Path, KnownDirectoryLink)> = self
             .known_symlinks
             .borrow()
             .directories()
             .iter()
-            .map(|(path, link)| (path.clone(), link.clone()))
+            .map(|(path, link)| (path.clone(), link.clone().expect("known directory link is set")))
             .collect();
         if known_directory_links.is_empty() {
             return false;
@@ -672,7 +674,7 @@ impl ProjectReferenceDtsFakingVfs {
                     self.known_symlinks.borrow_mut().set_file(
                         &absolute_path,
                         file_or_directory_path.clone(),
-                        real,
+                        &real,
                     );
                 }
                 break;

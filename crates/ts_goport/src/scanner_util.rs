@@ -5,7 +5,7 @@
 //! Unicode tables at the end of this file) and a few `core/core.go` helpers.
 //!
 //! Full tokenization (Go `Scanner.Scan`) is delegated to crate `ts_scanner`
-//! through the Go-shaped [`Scanner`] wrapper below.
+//! through the Go-shaped [`RsScanner`] wrapper below.
 //!
 //! Go `rune` ports to `char` where the value is a real code point. Go strings
 //! that hold WTF-8 lone-surrogate sentinels cannot exist in a Rust `&str`, so
@@ -683,7 +683,7 @@ pub fn compare_booleans(a: bool, b: bool) -> i32 {
 /// Go `ErrorCallback func(diagnostic *diagnostics.Message, start, length int, args ...any)`.
 // PORT: `ts_scanner` reports finished diagnostics without their format
 // arguments, so the callback gets no args.
-pub type ErrorCallback = Box<dyn FnMut(&'static ts_diagnostics::Message, i32, i32)>;
+pub type RsErrorCallback = Box<dyn FnMut(&'static ts_diagnostics::Message, i32, i32)>;
 
 /// Go `textToKeyword` map, in Go source order.
 static TEXT_TO_KEYWORD: &[(&str, SyntaxKind)] = &[
@@ -1053,7 +1053,7 @@ pub fn skip_trivia_ex(text: &str, pos: i32, options: Option<&SkipTriviaOptions>)
 const MERGE_CONFLICT_MARKER_LENGTH: usize = "<<<<<<<".len();
 
 // Go: scanner/scanner.go:2422 isConflictMarkerTrivia
-fn is_conflict_marker_trivia(text: &str, pos: usize) -> bool {
+pub(crate) fn is_conflict_marker_trivia(text: &str, pos: usize) -> bool {
     let bytes = text.as_bytes();
 
     // Fast reject: a conflict marker is the same byte repeated seven times. If the
@@ -1089,7 +1089,7 @@ fn is_conflict_marker_trivia(text: &str, pos: usize) -> bool {
 // Go: scanner/scanner.go:2457 scanConflictMarkerTrivia
 // PORT: `reportError` keeps the Go shape; only `SkipTriviaEx` calls this and
 // it passes nil.
-fn scan_conflict_marker_trivia(
+pub(crate) fn scan_conflict_marker_trivia(
     text: &str,
     pos: usize,
     report_error: Option<&mut dyn FnMut(&'static ts_diagnostics::Message, i32, i32)>,
@@ -1128,7 +1128,7 @@ fn scan_conflict_marker_trivia(
 }
 
 // Go: scanner/scanner.go:2488 isShebangTrivia
-fn is_shebang_trivia(text: &str, pos: usize) -> bool {
+pub(crate) fn is_shebang_trivia(text: &str, pos: usize) -> bool {
     let bytes = text.as_bytes();
     if bytes.len() < 2 {
         return false;
@@ -1138,7 +1138,7 @@ fn is_shebang_trivia(text: &str, pos: usize) -> bool {
 }
 
 // Go: scanner/scanner.go:2498 scanShebangTrivia
-fn scan_shebang_trivia(text: &str, pos: usize) -> usize {
+pub(crate) fn scan_shebang_trivia(text: &str, pos: usize) -> usize {
     let mut pos = pos + 2;
     while pos < text.len() {
         let (ch, size) = decode_rune_at(text, pos);
@@ -1167,11 +1167,11 @@ pub fn get_shebang(text: &str) -> String {
 /// `ScannerState` fields out of it.
 // PORT: `ts_scanner` has no script target and no JSDoc asterisk state for
 // these callers; `script_target` is stored for Go parity only.
-pub struct Scanner {
+pub struct RsScanner {
     text: Cow<'static, str>,
     language_variant: LanguageVariant,
     script_target: ScriptTarget,
-    on_error: Option<ErrorCallback>,
+    on_error: Option<RsErrorCallback>,
     skip_trivia: bool,
     // Go ScannerState.
     pos: i32,
@@ -1185,8 +1185,8 @@ pub struct Scanner {
 }
 
 // Go: scanner/scanner.go:218 defaultScanner
-fn default_scanner() -> Scanner {
-    Scanner {
+fn default_scanner() -> RsScanner {
+    RsScanner {
         text: Cow::Borrowed(""),
         language_variant: LanguageVariant::STANDARD,
         script_target: ScriptTarget::NONE,
@@ -1203,7 +1203,7 @@ fn default_scanner() -> Scanner {
 }
 
 // Go: scanner/scanner.go:225 NewScanner
-pub fn new_scanner() -> Scanner {
+pub fn rs_new_scanner() -> RsScanner {
     default_scanner()
 }
 
@@ -1240,7 +1240,7 @@ fn go_token_flags(flags: ts_scanner::TokenFlags) -> TokenFlags {
     result
 }
 
-impl Scanner {
+impl RsScanner {
     // Go: scanner/scanner.go:245 Text
     pub fn text(&self) -> &str {
         &self.text
@@ -1321,7 +1321,7 @@ impl Scanner {
     }
 
     // Go: scanner/scanner.go:402 SetOnError
-    pub fn set_on_error(&mut self, error_callback: Option<ErrorCallback>) {
+    pub fn set_on_error(&mut self, error_callback: Option<RsErrorCallback>) {
         self.on_error = error_callback;
     }
 
@@ -1420,8 +1420,8 @@ impl Scanner {
 }
 
 // Go: scanner/scanner.go:2519 GetScannerForSourceFile
-pub fn get_scanner_for_source_file(source_file: Node, pos: i32) -> Scanner {
-    let mut s = new_scanner();
+pub fn get_scanner_for_source_file(source_file: Node, pos: i32) -> RsScanner {
+    let mut s = rs_new_scanner();
     s.text = Cow::Borrowed(source_file_text(source_file));
     s.pos = pos;
     s.language_variant = source_file_info(source_file).language_variant;

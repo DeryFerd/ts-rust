@@ -13,6 +13,7 @@ pub mod go_view;
 pub mod synthetic;
 pub mod store;
 pub mod factory;
+pub mod factory_p3;
 pub mod update;
 pub mod visitor;
 pub mod clone;

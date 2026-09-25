@@ -6,9 +6,8 @@
 //! `tx.visit`, so Go `tx.Visitor().Visit(n)` is `self.visit(n)` here. The
 //! other visitor methods (`VisitNode`, `VisitNodes`, `VisitEachChild`) go
 //! through `with_visitor`, which builds an `ast` visitor over the transformer.
-//! The emit context hooks (`VisitParameters`, `VisitFunctionBody`, ...) only
-//! track variable environments, which declaration emit never fills. They take
-//! a `Visitor<()>`, so they are not attached (same as `transform_source_file_root`).
+//! `with_visitor` uses `EmitContext::new_node_visitor`, so the emit context
+//! hooks (`VisitParameters`, `VisitFunctionBody`, ...) are attached as in Go.
 //!
 //! Methods ported in other files of this module (`rewriteModuleSpecifier`,
 //! `ensureType`, `ensureModifiers`, `preserveJsDoc`, ...) are called with their
@@ -19,7 +18,7 @@ use super::tracker::SymbolTrackerImpl;
 use super::transform::DeclarationTransformer;
 use super::transform_p3::is_common_js_alias_export;
 use super::util::{get_binding_name_visible, is_private_method_type_parameter, unwrap_parenthesized_expression};
-use crate::ast::visitor::{new_node_visitor, syntax_list_children, NodeVisitor, NodeVisitorHooks};
+use crate::ast::visitor::{syntax_list_children, NodeVisitor};
 use crate::prelude::*;
 use crate::printer::{AutoGenerateOptions, EmitSymbolTracker, GeneratedIdentifierFlags, SymbolAccessibilityResult};
 
@@ -57,12 +56,8 @@ impl DeclarationTransformer {
     // PORT: see the module comment.
     pub(super) fn with_visitor<R>(&mut self, f: impl FnOnce(&mut NodeVisitor<'_, &mut DeclarationTransformer>) -> R) -> R {
         let emit_context = self.emit_context.clone();
-        let mut visitor = new_node_visitor(
-            |node, v: &mut NodeVisitor<'_, &mut DeclarationTransformer>| v.ctx.visit(node),
-            Some(&emit_context.factory().ast),
-            NodeVisitorHooks::default(),
-            self,
-        );
+        let mut visitor = emit_context
+            .new_node_visitor(|node, v: &mut NodeVisitor<'_, &mut DeclarationTransformer>| v.ctx.visit(node), self);
         f(&mut visitor)
     }
 

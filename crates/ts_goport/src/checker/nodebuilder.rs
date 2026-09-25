@@ -99,14 +99,14 @@ fn simplify_class_declaration(c: &Checker, f: &crate::ast::NodeFactory, mut clas
             class_decl.member_list(),
         );
     }
-    replace_modifiers(class_decl, f.new_modifier_list(&create_modifiers_from_modifier_flags(modifiers, &mut |k| f.new_modifier(k))))
+    replace_modifiers(f, class_decl, f.new_modifier_list(&create_modifiers_from_modifier_flags(modifiers, &mut |k| f.new_modifier(k))))
 }
 
 // Go: checker/nodebuilder.go:212 simplifyModifiers
 fn simplify_modifiers(c: &Checker, f: &crate::ast::NodeFactory, new_decl: Node, is_decl_kind: fn(Node) -> bool, symbol: SymbolId) -> Node {
     let decl_with_modifiers = c.sym(symbol).declarations.iter().copied().find(|&d| is_decl_kind(d)).unwrap_or(new_decl);
     let modifiers = decl_with_modifiers.modifier_flags() & !(ModifierFlags::EXPORT | ModifierFlags::AMBIENT);
-    replace_modifiers(new_decl, f.new_modifier_list(&create_modifiers_from_modifier_flags(modifiers, &mut |k| f.new_modifier(k))))
+    replace_modifiers(f, new_decl, f.new_modifier_list(&create_modifiers_from_modifier_flags(modifiers, &mut |k| f.new_modifier(k))))
 }
 
 /// Go `b.impl`.

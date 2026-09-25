@@ -13,7 +13,7 @@
 //! (a raw byte, or -1 at the end). `match rune(ch)` stands in for a Go
 //! `switch ch` over ASCII cases.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use crate::flags_macros::{go_enum, go_flags};
 
 use super::scanner_p1::{

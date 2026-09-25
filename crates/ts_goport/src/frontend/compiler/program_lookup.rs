@@ -2,7 +2,7 @@
 //! explanations, resolution lookups, package name collection, the symlink
 //! cache and the `plainJSErrors` set.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 
@@ -208,10 +208,8 @@ impl NewProgram {
     }
 
     // Go: program.go:1926 (*Program).SourceFileMayBeEmitted
-    // PORT: Go `sourceFileMayBeEmitted` is in emitter.go. The emitter is out
-    // of scope for the frontend port.
-    pub fn source_file_may_be_emitted(&self, _source_file: &ParsedSourceFile, _force_dts_emit: bool) -> bool {
-        unported!("sourceFileMayBeEmitted")
+    pub fn source_file_may_be_emitted(&self, source_file: &ParsedSourceFile, force_dts_emit: bool) -> bool {
+        source_file_may_be_emitted(source_file, self, force_dts_emit)
     }
 
     // Go: program.go:1930 (*Program).ResolvedPackageNames
@@ -251,7 +249,7 @@ impl NewProgram {
                     if let Some(resolved_modules) = self.processed_files.resolved_modules.get(file.path()) {
                         let key = ModeAwareCacheKey {
                             name: imp.text().to_string(),
-                            mode: self.get_mode_for_usage_location(file, imp),
+                            mode: self.get_mode_for_usage_location(&**file, imp),
                         };
                         if let Some(resolved_module) = resolved_modules.get(&key)
                             && resolved_module.is_resolved()
@@ -268,7 +266,7 @@ impl NewProgram {
                                     resolver.get_package_scope_for_path(&resolved_module.resolved_file_name)
                                     && package_scope.exists()
                                 {
-                                    let (scope_name, ok) = package_scope.contents.name.get_value();
+                                    let (scope_name, ok) = package_scope.get_contents().expect("package scope exists").header_fields.name.get_value();
                                     if ok {
                                         name = scope_name;
                                     }
@@ -289,7 +287,7 @@ impl NewProgram {
                                     && let Some(scope) =
                                         resolver.get_package_scope_for_path(&resolved_module.resolved_file_name)
                                     && scope.exists()
-                                    && !scope.contents.exports.is_present()
+                                    && !scope.get_contents().expect("package scope exists").path_fields.exports.is_present()
                                 {
                                     package_names
                                         .deep_import_packages
@@ -325,7 +323,7 @@ impl NewProgram {
         self.known_symlinks
             .get_value(|| {
                 let mut known_symlinks =
-                    new_known_symlink(&self.get_current_directory(), self.use_case_sensitive_file_names());
+                    KnownSymlinks::new(&self.get_current_directory(), self.use_case_sensitive_file_names());
 
                 // Resolved modules store realpath information when they're resolved inside node_modules
                 if !self.processed_files.resolved_modules.is_empty()
@@ -552,4 +550,295 @@ pub fn plain_js_errors() -> &'static FxHashSet<i32> {
         .into_iter()
         .collect()
     })
+}
+
+// Go: symlinks/knownsymlinks.go:81 (*KnownSymlinks).SetSymlinksFromResolutions
+// PORT: the method lives here because it needs frontend resolution types.
+impl KnownSymlinks {
+    pub fn set_symlinks_from_resolutions(
+        &mut self,
+        for_each_resolved_module: &dyn Fn(&mut ResolutionCallback<'_, Rc<ResolvedModule>>, Option<&ParsedSourceFile>),
+        for_each_resolved_type_reference_directive: &dyn Fn(
+            &mut ResolutionCallback<'_, Rc<ResolvedTypeReferenceDirective>>,
+            Option<&ParsedSourceFile>,
+        ),
+    ) {
+        for_each_resolved_module(
+            &mut |resolution: &Rc<ResolvedModule>, _module_name: &str, _mode: ResolutionMode, _file_path: &Path| {
+                self.process_resolution(&resolution.original_path, &resolution.resolved_file_name);
+            },
+            None,
+        );
+        for_each_resolved_type_reference_directive(
+            &mut |resolution: &Rc<ResolvedTypeReferenceDirective>,
+                  _module_name: &str,
+                  _mode: ResolutionMode,
+                  _file_path: &Path| {
+                self.process_resolution(&resolution.original_path, &resolution.resolved_file_name);
+            },
+            None,
+        );
+    }
+}
+
+impl NewProgram {
+    // Go: program.go:494 (*Program).GetResolvedModule
+    pub fn get_resolved_module(
+        &self,
+        file: &dyn HasFileName,
+        module_reference: &str,
+        mode: ResolutionMode,
+    ) -> Option<Rc<ResolvedModule>> {
+        if let Some(resolutions) = self.processed_files.resolved_modules.get(&file.path()) {
+            if let Some(resolved) =
+                resolutions.get(&ModeAwareCacheKey { name: module_reference.to_string(), mode })
+            {
+                return Some(resolved.clone());
+            }
+        }
+        None
+    }
+
+    // Go: program.go:503 (*Program).GetResolvedModuleFromModuleSpecifier
+    pub fn get_resolved_module_from_module_specifier(
+        &self,
+        file: &dyn HasFileName,
+        module_specifier: Node,
+    ) -> Option<Rc<ResolvedModule>> {
+        if !is_string_literal_like(module_specifier) {
+            panic!("moduleSpecifier must be a StringLiteralLike");
+        }
+        let mode = self.get_mode_for_usage_location(file, module_specifier);
+        self.get_resolved_module(file, module_specifier.text(), mode)
+    }
+
+    // Go: program.go:1519 (*Program).GetSourceFileMetaData
+    // PORT: a missing Go map entry is the zero value.
+    pub fn get_source_file_meta_data(&self, path: &Path) -> SourceFileMetaData {
+        self.processed_files.source_file_meta_datas.get(path).cloned().unwrap_or_default()
+    }
+
+    // Go: program.go:1523 (*Program).GetEmitModuleFormatOfFile
+    pub fn get_emit_module_format_of_file(&self, source_file: &dyn HasFileName) -> ModuleKind {
+        get_emit_module_format_of_file_worker(
+            &source_file.file_name(),
+            &self.mapper().get_compiler_options_for_file(source_file),
+            &self.get_source_file_meta_data(&source_file.path()),
+        )
+    }
+
+    // Go: program.go:1527 (*Program).GetEmitSyntaxForUsageLocation
+    pub fn get_emit_syntax_for_usage_location(&self, source_file: &dyn HasFileName, location: Node) -> ResolutionMode {
+        super::file_loader::get_emit_syntax_for_usage_location_worker(
+            &source_file.file_name(),
+            &self.get_source_file_meta_data(&source_file.path()),
+            location,
+            &self.mapper().get_compiler_options_for_file(source_file),
+        )
+    }
+
+    // Go: program.go:1531 (*Program).GetImpliedNodeFormatForEmit
+    pub fn get_implied_node_format_for_emit(&self, source_file: &dyn HasFileName) -> ResolutionMode {
+        get_implied_node_format_for_emit_worker(
+            &source_file.file_name(),
+            self.mapper().get_compiler_options_for_file(source_file).get_emit_module_kind(),
+            &self.get_source_file_meta_data(&source_file.path()),
+        )
+    }
+
+    // Go: program.go:1535 (*Program).GetModeForUsageLocation
+    pub fn get_mode_for_usage_location(&self, source_file: &dyn HasFileName, location: Node) -> ResolutionMode {
+        super::file_loader::get_mode_for_usage_location(
+            &source_file.file_name(),
+            &self.get_source_file_meta_data(&source_file.path()),
+            location,
+            Some(&self.mapper().get_compiler_options_for_file(source_file)),
+        )
+    }
+
+    // Go: program.go:1539 (*Program).GetDefaultResolutionModeForFile
+    pub fn get_default_resolution_mode_for_file(&self, source_file: &dyn HasFileName) -> ResolutionMode {
+        super::file_loader::get_default_resolution_mode_for_file(
+            &source_file.file_name(),
+            &self.get_source_file_meta_data(&source_file.path()),
+            &self.mapper().get_compiler_options_for_file(source_file),
+        )
+    }
+
+    // Go: program.go:1543 (*Program).IsSourceFileDefaultLibrary
+    pub fn is_source_file_default_library(&self, path: &Path) -> bool {
+        self.processed_files.lib_files.contains_key(path)
+    }
+
+    // Go: program.go:1562 (*Program).CommonSourceDirectory
+    // PORT: Go `checkSourceFilesBelongToPath` adds processing diagnostics
+    // through the include processor, which uses interior mutability here.
+    pub fn common_source_directory(&self) -> String {
+        self.common_source_directory
+            .get_or_init(|| {
+                let files = || -> Vec<String> {
+                    self.processed_files
+                        .files
+                        .iter()
+                        .filter(|file| self.source_file_may_be_emitted(file, false) && !file.is_declaration_file)
+                        .map(|file| file.file_name().to_string())
+                        .collect()
+                };
+                let mut check = |source_files: &[String], root_directory: &str| -> bool {
+                    self.check_source_files_belong_to_path(source_files, root_directory)
+                };
+                get_common_source_directory(
+                    self.options(),
+                    files,
+                    &self.get_current_directory(),
+                    self.use_case_sensitive_file_names(),
+                    Some(&mut check),
+                )
+            })
+            .clone()
+    }
+
+    // Go: program.go:714 (*Program).getSourceFilesToEmit
+    pub fn get_source_files_to_emit(
+        &self,
+        target_source_file: Option<&Rc<ParsedSourceFile>>,
+        force_dts_emit: bool,
+    ) -> Vec<Rc<ParsedSourceFile>> {
+        if target_source_file.is_none() && !force_dts_emit {
+            return self.source_files_to_emit.get_or_init(|| get_source_files_to_emit(self, None, false)).clone();
+        }
+        get_source_files_to_emit(self, target_source_file, force_dts_emit)
+    }
+}
+
+// Go: emitter.go:451 sourceFileMayBeEmitted
+// PORT: the Go host is `SourceFileMayBeEmittedHost`; the program is the only
+// host the frontend uses.
+pub fn source_file_may_be_emitted(source_file: &ParsedSourceFile, host: &NewProgram, force_dts_emit: bool) -> bool {
+    // TODO: move this to outputpaths?
+
+    let options = host.options();
+    // Js files are emitted only if option is enabled
+    if options.no_emit_for_js_files.is_true() && source_file.is_js() {
+        return false;
+    }
+
+    // Declaration files are not emitted
+    if source_file.is_declaration_file {
+        return false;
+    }
+
+    // Source file from node_modules are not emitted
+    if host.is_source_file_from_external_library(source_file) {
+        return false;
+    }
+
+    // forcing dts emit => file needs to be emitted
+    if force_dts_emit {
+        return true;
+    }
+
+    // Check other conditions for file emit
+    // Source files from referenced projects are not emitted
+    if host.get_project_reference_from_source(source_file.path()).is_some() {
+        return false;
+    }
+
+    // Any non json file should be emitted
+    if source_file.script_kind != ScriptKind::JSON {
+        return true;
+    }
+
+    // Json file is not emitted if outDir is not specified
+    if options.out_dir.is_empty() {
+        return false;
+    }
+
+    // Otherwise, if rootDir is specified or a config file exists, we know the common source directory and can check if the file would be emitted in the same location
+    if !options.root_dir.is_empty() || !options.config_file_path.is_empty() {
+        let current_directory = host.get_current_directory();
+        let common_dir = get_normalized_absolute_path(
+            &get_common_source_directory(
+                options,
+                Vec::new,
+                &current_directory,
+                host.use_case_sensitive_file_names(),
+                None,
+            ),
+            &current_directory,
+        );
+        let output_path = get_source_file_path_in_new_dir_worker(
+            source_file.file_name(),
+            &options.out_dir,
+            &current_directory,
+            &common_dir,
+            host.use_case_sensitive_file_names(),
+        );
+        if compare_paths(
+            source_file.file_name(),
+            &output_path,
+            &ComparePathsOptions {
+                use_case_sensitive_file_names: host.use_case_sensitive_file_names(),
+                current_directory: current_directory.clone(),
+            },
+        ) == 0
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+// Go: emitter.go:506 getSourceFilesToEmit
+pub fn get_source_files_to_emit(
+    host: &NewProgram,
+    target_source_file: Option<&Rc<ParsedSourceFile>>,
+    force_dts_emit: bool,
+) -> Vec<Rc<ParsedSourceFile>> {
+    let source_files: Vec<Rc<ParsedSourceFile>> = match target_source_file {
+        Some(target_source_file) => vec![target_source_file.clone()],
+        None => host.processed_files.files.clone(),
+    };
+    source_files.into_iter().filter(|source_file| source_file_may_be_emitted(source_file, host, force_dts_emit)).collect()
+}
+
+// Go: `*Program` implements `outputpaths.OutputPathsHost`.
+impl OutputPathsHost for NewProgram {
+    fn common_source_directory(&self) -> String {
+        NewProgram::common_source_directory(self)
+    }
+    fn get_current_directory(&self) -> String {
+        NewProgram::get_current_directory(self)
+    }
+    fn use_case_sensitive_file_names(&self) -> bool {
+        NewProgram::use_case_sensitive_file_names(self)
+    }
+}
+
+impl NewProgram {
+    // Go: program.go:1580 (*Program).checkSourceFilesBelongToPath
+    pub fn check_source_files_belong_to_path(&self, source_files: &[String], root_directory: &str) -> bool {
+        let mut all_files_belong_to_path = true;
+        for file in source_files {
+            let absolute_source_file_path = get_canonical_file_name(
+                &get_normalized_absolute_path(file, &self.get_current_directory()),
+                self.use_case_sensitive_file_names(),
+            );
+            if !contains_path(root_directory, file, &self.compare_paths_options) {
+                self.include_processor.late_processing_diagnostics.borrow_mut().push(Rc::new(ProcessingDiagnostic {
+                    kind: ProcessingDiagnosticKind::EXPLAINING_FILE_INCLUDE,
+                    data: ProcessingDiagnosticData::IncludeExplaining(IncludeExplainingDiagnostic {
+                        file: Path(absolute_source_file_path),
+                        diagnostic_reason: None,
+                        message: diag::File_0_is_not_under_rootDir_1_rootDir_is_expected_to_contain_all_source_files,
+                        args: vec![file.clone(), root_directory.to_string()],
+                    }),
+                }));
+                all_files_belong_to_path = false;
+            }
+        }
+
+        all_files_belong_to_path
+    }
 }

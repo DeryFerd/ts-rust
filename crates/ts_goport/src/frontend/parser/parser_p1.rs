@@ -7,7 +7,7 @@
 //! Parts U5 to U10 (parser_p2 to parser_p5, jsdoc.rs) add more
 //! `impl Parser` blocks. They read and write the `Parser` fields directly.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 // PORT: explicit imports. `scanner_util` (in the prelude) still has the old
 // `Scanner` and `new_scanner`. An explicit import wins over the glob.
 use crate::frontend::scanner::scanner_p1::{new_scanner, ErrorCallback, Scanner, ScannerState, TEXT_TO_KEYWORD};
@@ -253,6 +253,7 @@ pub fn parse_source_file(opts: &SourceFileParseOptions, source_text: &'static st
     p.next_token();
     let result = if p.script_kind == ScriptKind::JSON { p.parse_json_text() } else { p.parse_source_file_worker() };
     freeze_file_store(p.store);
+    set_source_file_diagnostics(result.root, result.diagnostics.clone());
     result
 }
 
@@ -285,7 +286,7 @@ impl Parser {
             let mut expressions: Vec<Node> = Vec::new();
 
             while self.token != SyntaxKind::EndOfFile {
-                let expression = match self.token {
+                let expression = match { self.token } {
                     SyntaxKind::OpenBracketToken => self.parse_array_literal_expression(),
                     SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword | SyntaxKind::NullKeyword => self.parse_token_node(),
                     SyntaxKind::MinusToken => {
@@ -327,7 +328,7 @@ impl Parser {
             statements = self.new_node_list(TextRange::new(pos, end), &[statement]);
             eof = self.parse_expected_token(SyntaxKind::EndOfFile);
         }
-        let node = self.factory.new_source_file(&self.opts, self.source_text, statements, eof);
+        let node = self.factory.new_parsed_source_file(&self.opts, self.source_text, statements, eof);
         let node = self.finish_node(node, pos);
         let mut result = ParsedSourceFile::new(self.store, node, self.opts.clone(), self.source_text, eof);
         let first = result.statements().nodes();
@@ -601,7 +602,7 @@ impl Parser {
             statements.append(&mut self.reparse_list);
         }
         let list = self.new_node_list(TextRange::new(pos, end), &statements);
-        let node = self.factory.new_source_file(&self.opts, self.source_text, list, eof);
+        let node = self.factory.new_parsed_source_file(&self.opts, self.source_text, list, eof);
         let node = self.finish_node(node, pos);
         let mut result = ParsedSourceFile::new(self.store, node, self.opts.clone(), self.source_text, eof);
         self.finish_source_file(&mut result, is_declaration_file);
@@ -764,7 +765,7 @@ impl Parser {
 
         let loc = source_file.statements().loc();
         let list = self.new_node_list(loc, &statements);
-        let result = self.factory.new_source_file(source_file.parse_options(), self.source_text, list, source_file.end_of_file_token);
+        let result = self.factory.new_parsed_source_file(source_file.parse_options(), self.source_text, list, source_file.end_of_file_token);
         for s in statements {
             set_node_parent(s, result); // force (re)set parent to reparsed source file
         }

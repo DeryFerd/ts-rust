@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // This file ports vfs/vfsmatch/vfsmatch.go and stringer_generated.go.
 // It implements the glob matching algorithm specified in MATCHING_ALGORITHM.md.

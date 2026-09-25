@@ -47,8 +47,7 @@ pub struct DeclarationFileLinks {
 // PORT: Go `isValueAliasDeclaration` and `aliasMarkingVisitor` are method
 // values cached to avoid closure allocation. Here they are plain calls to
 // `is_value_alias_declaration_worker` and `alias_marking_visitor_worker`.
-// PORT: Go `referenceResolver binder.ReferenceResolver` is not ported in this
-// crate (see `crate::printer::EmitResolver`); part 2 reports it as unported.
+// PORT: Go caches referenceResolver binder.ReferenceResolver; part 2 builds one per call in get_reference_resolver (it has no state when all hooks are set).
 pub struct EmitResolver {
     /// Index of the owning checker in the program checker pool.
     pub checker_index: usize,
@@ -537,6 +536,17 @@ fn get_meaning_of_entity_name_reference(entity_name: Node) -> SymbolFlags {
 // PORT: Go exported methods. Methods from emitresolver.go lines 1 to 600 are
 // ported here in full. The others call the part 2 inherent methods.
 impl crate::printer::EmitResolver for EmitResolver {
+    // PORT: not in Go (Go `make(ast.SymbolTable)` in the declaration transformer).
+    fn make_symbol_table(&self, entries: &[(&str, SymbolId)]) -> SymbolTable {
+        self.with_checker(|c| {
+            let table = c.symbols.new_table();
+            for &(name, symbol) in entries {
+                c.symbols.set(table, name, symbol);
+            }
+            table
+        })
+    }
+
     // Go: checker/emitresolver.go:878 EmitResolver.GetReferencedValueDeclaration
     fn get_referenced_value_declaration(&self, node: Node) -> Node {
         EmitResolver::get_referenced_value_declaration(self, node)

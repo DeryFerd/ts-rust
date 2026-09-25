@@ -1,7 +1,7 @@
 //! Port of compiler/fileInclude.go: why a file is part of the program, and
 //! the "explain files" diagnostics for each reason.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::cell::OnceCell;
 
 // Go: fileInclude.go:15 fileIncludeKind
@@ -186,7 +186,7 @@ impl FileIncludeReason {
                     }
                 }
                 let resolution = program
-                    .get_resolved_module_from_module_specifier(&file, specifier)
+                    .get_resolved_module_from_module_specifier(&*file, specifier)
                     .expect("import reason without a resolved module");
                 ReferenceFileLocation {
                     file,
@@ -424,7 +424,7 @@ impl FileIncludeReason {
                 );
                 let matched_file_spec = config.get_matched_file_spec(&file_name);
                 if !matched_file_spec.is_empty() {
-                    let files_node = get_ts_config_prop_array_element_value(config_source_file, "files", &matched_file_spec);
+                    let files_node = get_tsconfig_prop_array_element_value(config_source_file, "files", &matched_file_spec);
                     if !files_node.is_nil() {
                         return Some(create_diagnostic_for_node_in_source_file(
                             config_source_file,
@@ -437,7 +437,7 @@ impl FileIncludeReason {
                     let (matched_include_spec, is_default_include_spec) = config.get_matched_include_spec(&file_name);
                     if !matched_include_spec.is_empty() && !is_default_include_spec {
                         let include_node =
-                            get_ts_config_prop_array_element_value(config_source_file, "include", &matched_include_spec);
+                            get_tsconfig_prop_array_element_value(config_source_file, "include", &matched_include_spec);
                         if !include_node.is_nil() {
                             return Some(create_diagnostic_for_node_in_source_file(
                                 config_source_file,
@@ -490,8 +490,9 @@ impl FileIncludeReason {
                             program.processed_files.include_processor.get_compiler_options_object_literal_syntax(program),
                             "target",
                             get_callback_for_finding_property_assignment_by_value(&target),
+                            &[],
                         );
-                        if !target_value_syntax.is_nil() {
+                        if let Some(target_value_syntax) = target_value_syntax {
                             return Some(create_diagnostic_for_node_in_source_file(
                                 config_source_file,
                                 target_value_syntax,

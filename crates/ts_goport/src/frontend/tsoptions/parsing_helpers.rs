@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // Port of tsoptions/parsinghelpers.go.
 //
@@ -474,6 +474,11 @@ pub fn merge_compiler_options<'a>(
         }
     }
 
+    // Go `reflect.Value.IsZero` for one field.
+    fn is_zero_value<T: Default + PartialEq>(value: &T) -> bool {
+        *value == T::default()
+    }
+
     // Do the merge, handling explicit nulls during the normal merge
     macro_rules! merge_fields {
         ($($field:ident => $json:literal,)*) => {
@@ -481,7 +486,7 @@ pub fn merge_compiler_options<'a>(
                 // Get the JSON field name for this struct field and check if it's explicitly null
                 if explicit_null_fields.contains($json) {
                     target_options.$field = Default::default();
-                } else if source_options.$field != Default::default() {
+                } else if !is_zero_value(&source_options.$field) {
                     // Normal merge behavior: copy non-zero fields
                     target_options.$field = source_options.$field.clone();
                 }

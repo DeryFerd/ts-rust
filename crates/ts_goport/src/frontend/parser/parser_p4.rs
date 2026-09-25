@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // Go: internal/parser/parser.go lines 4184 to 5533 (yield, arrow functions,
 // conditional and binary expressions, unary and update expressions, JSX,
@@ -1070,7 +1070,7 @@ impl Parser {
 
     // Go: parser.go:5066 parseSimpleUnaryExpression
     pub fn parse_simple_unary_expression(&mut self) -> Node {
-        match self.token {
+        match { self.token } {
             SyntaxKind::PlusToken | SyntaxKind::MinusToken | SyntaxKind::TildeToken | SyntaxKind::ExclamationToken => {
                 self.parse_prefix_unary_expression()
             }

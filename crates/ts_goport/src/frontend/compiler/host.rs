@@ -1,7 +1,7 @@
 //! Go `internal/compiler/host.go`: the compiler host that reads and parses
 //! source files and resolves project references.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 /// Go `compiler.CompilerHost`.
 // PORT: Go `FS()` returns the `vfs.FS` interface. This returns a shared
@@ -84,7 +84,7 @@ impl CompilerHost for CompilerHostImpl {
 
     // Go: host.go:78 (*compilerHost).GetSourceFile
     fn get_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
-        let (text, ok) = self.fs().read_file(&opts.file_name);
+        let (text, ok) = CompilerHost::fs(self).read_file(&opts.file_name);
         if !ok {
             return None;
         }
@@ -98,7 +98,7 @@ impl CompilerHost for CompilerHostImpl {
     fn get_resolved_project_reference(&self, file_name: &str, path: &Path) -> Option<Rc<ParsedCommandLine>> {
         let (command_line, _) = get_parsed_command_line_of_config_file_path(
             file_name,
-            path,
+            path.clone(),
             None,
             None, /*optionsRaw*/
             self,
@@ -111,8 +111,8 @@ impl CompilerHost for CompilerHostImpl {
 // PORT: Go passes the `*compilerHost` as a `tsoptions.ParseConfigHost`
 // (it has `FS()` and `GetCurrentDirectory()`). Rust needs the explicit impl.
 impl ParseConfigHost for CompilerHostImpl {
-    fn fs(&self) -> &dyn Fs {
-        &*self.fs
+    fn fs(&self) -> Rc<dyn Fs> {
+        self.fs.clone()
     }
 
     fn get_current_directory(&self) -> String {

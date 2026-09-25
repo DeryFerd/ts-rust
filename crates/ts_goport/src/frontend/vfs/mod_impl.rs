@@ -5,7 +5,7 @@
 //! `fs.Stat`, `fs.ReadDir`, `fs.ReadFile` and `fs.WalkDir` helpers) are
 //! ported here too, because Rust has no equivalent with the same behavior.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::io;
 use std::time::SystemTime;
 

@@ -40,7 +40,7 @@ fn raw(n: Node) -> &'static ts_ast::Node {
         return store_ast_node(n);
     }
     prog().files[n.file_index()]
-        .source
+        .legacy_source()
         .parse
         .arena
         .get(nid(n))
@@ -266,7 +266,7 @@ fn go_kind(file: usize, id: ts_ast::NodeId, n: &ts_ast::Node) -> SyntaxKind {
     let Some(f) = prog().files.get(file) else {
         return n.kind;
     };
-    let arena = &f.source.parse.arena;
+    let arena = &f.legacy_source().parse.arena;
     let Some(parent_id) = n.parent else {
         return n.kind;
     };
@@ -490,8 +490,8 @@ impl NodeList {
         let Some(file) = prog().files.get(self.file as usize) else {
             return text_range_of(&l.range);
         };
-        let arena = &file.source.parse.arena;
-        let text = file.source.source_text.as_bytes();
+        let arena = &file.legacy_source().parse.arena;
+        let text = file.legacy_source().source_text.as_bytes();
         let span = |id: &ts_ast::NodeId| {
             arena.get(*id).map(|n| crate::ast::go_view::go_node_range(&file.info.trivia, text, arena, n))
         };
@@ -726,8 +726,8 @@ impl Node {
         };
         let (pos, end) = crate::ast::go_view::go_node_range(
             &file.info.trivia,
-            file.source.source_text.as_bytes(),
-            &file.source.parse.arena,
+            file.legacy_source().source_text.as_bytes(),
+            &file.legacy_source().parse.arena,
             r,
         );
         TextRange::new(pos as i32, end as i32)
@@ -2866,8 +2866,9 @@ impl Node {
     /// The JSDoc nodes of this node. Pass `Node::NIL` for `file` to walk up
     /// to the source file.
     // PORT: Go resolves a lazy cache miss with the parser hook
-    // `parseJSDocForNode`. That hook is not ported, so a miss on a lazy file
-    // stops at `unported!`.
+    // `parseJSDocForNode`. The Go frontend path (`GOPORT_FRONTEND=go`) runs
+    // it through `program::resolve_lazy_js_doc`. The legacy path has no
+    // hook, so a miss on a lazy file stops at `unported!`.
     #[must_use]
     pub fn js_doc(self, file: Node) -> NodeSlice {
         if !self.flags().intersects(NodeFlags::HAS_JS_DOC) {
@@ -2880,7 +2881,10 @@ impl Node {
         let info = source_file_info(file);
         match info.jsdoc_cache.get(&self) {
             Some(jsdocs) => NodeSlice::from_nodes(jsdocs),
-            None if info.has_lazy_js_doc => unported!("parseJSDocForNode"),
+            None if info.has_lazy_js_doc => match crate::program::resolve_lazy_js_doc(file, self) {
+                Some(jsdocs) => NodeSlice::from_nodes(jsdocs),
+                None => unported!("parseJSDocForNode"),
+            },
             None => NodeSlice::NIL,
         }
     }
@@ -2975,19 +2979,21 @@ thread_local! {
 // Go: ast.go:2566 (*SourceFile).Text
 #[must_use]
 pub fn source_file_text(file: Node) -> &'static str {
+    if is_synthetic_node(file) { return synthetic_source_file_text(file); }
     if has_file_store(file.file_index()) {
         return file_store_text(file.file_index());
     }
-    &file.go_file().source.source_text
+    &file.go_file().legacy_source().source_text
 }
 
 // Go: ast.go:2570 (*SourceFile).FileName
 #[must_use]
 pub fn source_file_file_name(file: Node) -> &'static str {
+    if is_synthetic_node(file) { return synthetic_source_file_file_name(file); }
     if has_file_store(file.file_index()) {
         return file_store_file_name(file.file_index());
     }
-    &file.go_file().source.file_name
+    &file.go_file().legacy_source().file_name
 }
 
 // Go: ast.go:2578 (*SourceFile).Imports

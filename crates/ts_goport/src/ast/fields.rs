@@ -292,12 +292,14 @@ impl Node {
 
     // Go: ast/ast_generated.go:1488 FallthroughFlowNode
     /// Go `node.AsX().FallthroughFlowNode` for: CaseOrDefaultClause.
-    /// PORT: the binder sets this field. `core::NodeBindData` has no slot
-    /// for it, and the ts_ast value is not a Go flow node id.
+    /// PORT: the binder sets this field. `core::NodeBindData` has no
+    /// separate slot, and case/default clauses have no Go `FlowNodeData`, so
+    /// `bindCaseBlock` (binder_p3.rs) stores it in the clause's `flow_node`
+    /// slot. The ts_ast value is not a Go flow node id and is not read.
     #[must_use]
     pub fn fallthrough_flow_node(self) -> FlowNodeId {
         match node_data(self) {
-            NodeData::CaseOrDefaultClause(_) => unported!("FallthroughFlowNode"),
+            NodeData::CaseOrDefaultClause(_) => self.bind().flow_node,
             _ => field_panic(self, "FallthroughFlowNode"),
         }
     }

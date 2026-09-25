@@ -2,7 +2,7 @@
 //! checks (`verifyCompilerOptions`), project reference checks and emit
 //! blocking.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 /// The Go `core.Memoize` locals of `verifyCompilerOptions`.
 // PORT: Go computes them lazily. They only read the config file syntax and

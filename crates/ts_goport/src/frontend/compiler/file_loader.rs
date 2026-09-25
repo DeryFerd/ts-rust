@@ -3,7 +3,7 @@
 //!
 //! PORT: Go `opts.Tracing` spans are not ported. They do not change results.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::cell::Cell;
 
 // Go: fileloader.go:21 libResolution
@@ -90,6 +90,7 @@ impl RedirectsFile {
 // Go: fileloader.go:86 processedFiles
 // PORT: Go nil maps that stay nil until first use are `Option`. Go
 // `*includeProcessor` is owned by value.
+#[derive(Clone)]
 pub struct ProcessedFiles {
     pub resolver: Option<Rc<Resolver>>,
     pub files: Vec<Rc<ParsedSourceFile>>,
@@ -134,7 +135,7 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
     let root_files: Vec<String> = opts.config.file_names().to_vec();
     let supported_extensions = get_supported_extensions(&compiler_options, &[] /*extraFileExtensions*/);
     let supported_extensions_with_json_if_resolve_json_module =
-        get_supported_extensions_with_json_if_resolve_json_module(&compiler_options, &supported_extensions);
+        get_supported_extensions_with_json_if_resolve_json_module(Some(&compiler_options), supported_extensions.clone());
     let mut max_node_module_js_depth = 0;
     if let Some(p) = opts.config.compiler_options().max_node_module_js_depth {
         max_node_module_js_depth = p;
@@ -265,7 +266,7 @@ impl FileLoader {
         let abs_path = get_normalized_absolute_path(file_name, &curr_dir);
         let mut containing_file = curr_dir.clone();
         if let Some(config_file) = &self.opts.config.config_file {
-            containing_file = get_normalized_absolute_path(config_file.source_file.file_name(), &curr_dir);
+            containing_file = get_normalized_absolute_path(&config_file.file_name, &curr_dir);
         }
         let (resolved_file, diagnostic) =
             self.get_source_file_from_reference(&abs_path, file_name, &containing_file, &include_reason);
@@ -315,7 +316,9 @@ impl FileLoader {
         let mut type_resolutions_in_file: ModeAwareCache<Rc<ResolvedTypeReferenceDirective>> = ModeAwareCache::default();
         let mut type_resolutions_trace: Vec<DiagAndArgs> = Vec::new();
         let mut p_diagnostics: Vec<Rc<ProcessingDiagnostic>> = Vec::new();
-        let host: &dyn ResolutionHost = &*self.opts.host;
+        // PORT: Go passes the compiler host as a `module.ResolutionHost`.
+        let host = CompilerResolutionHost::new(self.opts.host.clone());
+        let host: &dyn ResolutionHost = &host;
         let automatic_type_directive_names =
             get_automatic_type_directive_names(self.opts.config.compiler_options(), host);
         if !automatic_type_directive_names.is_empty() {
@@ -367,7 +370,7 @@ impl FileLoader {
     // value for the field. It is made from the same `opts` and host, so the
     // result is the same.
     pub fn add_project_reference_tasks(&mut self, single_threaded: bool) {
-        let project_references = self.opts.config.resolved_project_reference_paths();
+        let project_references = self.opts.config.resolved_project_reference_paths().to_vec();
         if project_references.is_empty() {
             return;
         }
@@ -441,7 +444,7 @@ impl FileLoader {
             .project_reference_file_mapper
             .borrow()
             .get_compiler_options_for_file(&new_has_file_name(&t.normalized_file_path, &t.path));
-        self.opts.host.get_source_file(SourceFileParseOptions {
+        self.opts.host.get_source_file(&SourceFileParseOptions {
             file_name: t.normalized_file_path.clone(),
             path,
             external_module_indicator_options: get_external_module_indicator_options(
@@ -907,7 +910,7 @@ pub fn get_mode_for_type_reference_directive_in_file(
 // Go: fileloader.go:718 getDefaultResolutionModeForFile
 // PORT: private, because program.rs has a public
 // `get_default_resolution_mode_for_file` (Go program.go) with another shape.
-fn get_default_resolution_mode_for_file(
+pub(crate) fn get_default_resolution_mode_for_file(
     file_name: &str,
     meta: &SourceFileMetaData,
     options: &CompilerOptions,
@@ -922,7 +925,7 @@ fn get_default_resolution_mode_for_file(
 // Go: fileloader.go:726 getModeForUsageLocation
 // PORT: private, because program.rs has a public `get_mode_for_usage_location`
 // (Go program.go) with another shape. Go `options` can be nil (`None`).
-fn get_mode_for_usage_location(
+pub(crate) fn get_mode_for_usage_location(
     file_name: &str,
     meta: &SourceFileMetaData,
     usage: Node,
@@ -976,7 +979,7 @@ fn import_syntax_affects_module_resolution(options: &CompilerOptions) -> bool {
 }
 
 // Go: fileloader.go:764 getEmitSyntaxForUsageLocationWorker
-fn get_emit_syntax_for_usage_location_worker(
+pub(crate) fn get_emit_syntax_for_usage_location_worker(
     file_name: &str,
     meta: &SourceFileMetaData,
     usage: Node,

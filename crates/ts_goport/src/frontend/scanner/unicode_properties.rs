@@ -1,7 +1,7 @@
 //! Port of `scanner/unicodeproperties.go`: the Unicode property names and
 //! values that regular expression `\p{...}` escapes accept.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // PORT: Go builds these as `map[string]string` and `collections.Set[string]`
 // package vars. Rust keeps them as static slices in Go source order and looks

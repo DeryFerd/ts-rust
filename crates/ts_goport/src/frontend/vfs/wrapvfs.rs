@@ -1,6 +1,6 @@
 //! Go: internal/vfs/wrapvfs/wrapvfs.go
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::time::SystemTime;
 
 // Go: wrapvfs.go:9 Replacements

@@ -1,6 +1,6 @@
 //! Go: internal/vfs/cachedvfs/cachedvfs.go
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::cell::Cell;
 use std::time::SystemTime;
 

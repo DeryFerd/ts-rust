@@ -4,7 +4,7 @@
 //! The Go standard library pieces that osvfs reaches (`os.DirFS`,
 //! `os.RemoveAll`, `filepath.Abs`, `filepath.Clean`) are ported here too.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::io::{self, Write as _};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};

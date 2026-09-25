@@ -3,7 +3,7 @@
 //! The `Program` type is `NewProgram` (the loader contract name), so it does
 //! not clash with the legacy program in program.rs.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::cell::OnceCell;
 
 /// Go `compiler.ProgramOptions`.
@@ -88,6 +88,11 @@ pub struct NewProgram {
     pub source_files_to_emit: OnceCell<Vec<Rc<ParsedSourceFile>>>,
     // Cached unresolved imports for ATA
     pub unresolved_imports: LazyValue<FxHashSet<String>>,
+    pub known_symlinks: LazyValue<Rc<KnownSymlinks>>,
+    // Used by auto-imports
+    pub package_names: LazyValue<Rc<PackageNamesInfo>>,
+    // Go `hasTSFileOnce` plus `hasTSFile`.
+    pub has_ts_file: OnceCell<bool>,
 }
 
 impl std::ops::Deref for NewProgram {
@@ -111,7 +116,7 @@ impl NewProgram {
         self.resolver.as_ref().expect("program resolver is not set")
     }
 
-    fn mapper(&self) -> std::cell::Ref<'_, ProjectReferenceFileMapper> {
+    pub(crate) fn mapper(&self) -> std::cell::Ref<'_, ProjectReferenceFileMapper> {
         self.project_reference_file_mapper.as_ref().expect("program project reference file mapper is not set").borrow()
     }
 
@@ -202,8 +207,7 @@ impl NewProgram {
 
     // Go: program.go:195 (*Program).GetParseFileRedirect
     pub fn get_parse_file_redirect(&self, file_name: &str) -> String {
-        self.project_reference_file_mapper
-            .get_parse_file_redirect(&new_has_file_name(file_name, &self.to_path(file_name)))
+        self.mapper().get_parse_file_redirect(&new_has_file_name(file_name, &self.to_path(file_name)))
     }
 
     // Go: program.go:199 (*Program).GetResolvedProjectReferences
@@ -252,7 +256,7 @@ impl NewProgram {
         let file_name = resolve_path(&get_directory_path(origin.file_name()), &[&r.file_name]);
         let supported_extensions_base = get_supported_extensions(self.options(), &[] /*extraFileExtensions*/);
         let supported_extensions =
-            get_supported_extensions_with_json_if_resolve_json_module(self.options(), supported_extensions_base);
+            get_supported_extensions_with_json_if_resolve_json_module(Some(self.options()), supported_extensions_base);
         let allow_non_ts_extensions = self.options().allow_non_ts_extensions.is_true();
         if has_extension(&file_name) {
             if !allow_non_ts_extensions {
@@ -307,6 +311,9 @@ pub fn new_program(opts: ProgramOptions) -> NewProgram {
         has_emit_blocking_diagnostics: FxHashSet::default(),
         source_files_to_emit: OnceCell::new(),
         unresolved_imports: LazyValue::default(),
+        known_symlinks: LazyValue::default(),
+        package_names: LazyValue::default(),
+        has_ts_file: OnceCell::new(),
     };
     p.init_checker_pool();
     p.verify_compiler_options();
@@ -368,8 +375,13 @@ impl NewProgram {
             has_emit_blocking_diagnostics: self.has_emit_blocking_diagnostics.clone(),
             source_files_to_emit: OnceCell::new(),
             unresolved_imports: LazyValue::default(),
+            known_symlinks: LazyValue::default(),
+            package_names: LazyValue::default(),
+            has_ts_file: OnceCell::new(),
         };
         result.unresolved_imports.try_reuse(&self.unresolved_imports);
+        result.known_symlinks.try_reuse(&self.known_symlinks);
+        result.package_names.try_reuse(&self.package_names);
         result.init_checker_pool();
         // PORT: Go `core.FindIndex` returns -1 and the index panics; so does this.
         let index = result
@@ -420,7 +432,10 @@ impl NewProgram {
     pub fn needs_import_helpers_import_specifier(&self, file: &ParsedSourceFile) -> bool {
         let (redirect, _) = self.mapper().get_redirect_for_resolution(file);
         let options_for_file =
-            get_compiler_options_with_redirect(self.opts.config.compiler_options(), redirect.as_deref());
+            get_compiler_options_with_redirect(
+                self.opts.config.compiler_options(),
+                redirect.as_deref().map(|r| r as &dyn ModuleResolvedProjectReference),
+            );
         if !options_for_file.import_helpers.is_true() {
             return false;
         }

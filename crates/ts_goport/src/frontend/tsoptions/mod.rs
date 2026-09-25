@@ -1,0 +1,21 @@
+//! Go package `tsoptions`.
+pub mod command_line_option;
+pub mod decls;
+pub mod enum_maps;
+pub mod tsconfig_p1;
+pub mod tsconfig_p2;
+pub mod errors;
+pub mod wildcard;
+pub mod parsing_helpers;
+pub mod parsed_command_line;
+pub mod command_line_parser;
+pub use command_line_option::*;
+pub use decls::*;
+pub use enum_maps::*;
+pub use tsconfig_p1::*;
+pub use tsconfig_p2::*;
+pub use errors::*;
+pub use wildcard::*;
+pub use parsing_helpers::*;
+pub use parsed_command_line::*;
+pub use command_line_parser::*;

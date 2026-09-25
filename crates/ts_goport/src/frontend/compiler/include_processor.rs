@@ -2,7 +2,7 @@
 //! the processing diagnostics, and caches used to explain why a file is in
 //! the program.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::cell::OnceCell;
 
 /// Go `includeProcessor`.
@@ -13,15 +13,19 @@ use std::cell::OnceCell;
 pub struct IncludeProcessor {
     pub file_include_reasons: FxHashMap<Path, Vec<Rc<FileIncludeReason>>>,
     pub processing_diagnostics: Vec<Rc<ProcessingDiagnostic>>,
+    // PORT: Go `checkSourceFilesBelongToPath` appends processing diagnostics
+    // from `CommonSourceDirectory`, which takes `&self` here. They are kept
+    // apart and read after `processing_diagnostics`, the Go append order.
+    pub late_processing_diagnostics: RefCell<Vec<Rc<ProcessingDiagnostic>>>,
 
-    reason_to_reference_location: RefCell<FxHashMap<*const FileIncludeReason, Rc<ReferenceFileLocation>>>,
-    include_reason_to_related_info: RefCell<FxHashMap<*const FileIncludeReason, Option<Diagnostic>>>,
-    redirect_and_file_format: RefCell<FxHashMap<Path, Vec<Diagnostic>>>,
+    pub(crate) reason_to_reference_location: RefCell<FxHashMap<*const FileIncludeReason, Rc<ReferenceFileLocation>>>,
+    pub(crate) include_reason_to_related_info: RefCell<FxHashMap<*const FileIncludeReason, Option<Diagnostic>>>,
+    pub(crate) redirect_and_file_format: RefCell<FxHashMap<Path, Vec<Diagnostic>>>,
     // PORT: Go returns a shared `*ast.DiagnosticsCollection` that callers
     // sort in place. Here callers borrow the `RefCell` mutably.
-    computed_diagnostics: OnceCell<RefCell<DiagnosticsCollection>>,
+    pub(crate) computed_diagnostics: OnceCell<RefCell<DiagnosticsCollection>>,
     // PORT: Go nil `*ast.ObjectLiteralExpression` is `Node::NIL`.
-    compiler_options_syntax: OnceCell<Node>,
+    pub(crate) compiler_options_syntax: OnceCell<Node>,
 }
 
 // PORT: Go `UpdateProgram` copies `processedFiles` and so shares the
@@ -33,6 +37,7 @@ impl Clone for IncludeProcessor {
         IncludeProcessor {
             file_include_reasons: self.file_include_reasons.clone(),
             processing_diagnostics: self.processing_diagnostics.clone(),
+            late_processing_diagnostics: self.late_processing_diagnostics.clone(),
             ..IncludeProcessor::default()
         }
     }
@@ -45,6 +50,7 @@ pub fn update_file_include_processor(p: &mut NewProgram) {
     p.include_processor = IncludeProcessor {
         file_include_reasons: p.include_processor.file_include_reasons.clone(),
         processing_diagnostics: p.include_processor.processing_diagnostics.clone(),
+        late_processing_diagnostics: p.include_processor.late_processing_diagnostics.clone(),
         ..IncludeProcessor::default()
     };
 }
@@ -54,7 +60,7 @@ impl IncludeProcessor {
     pub fn get_diagnostics(&self, p: &NewProgram) -> &RefCell<DiagnosticsCollection> {
         self.computed_diagnostics.get_or_init(|| {
             let mut computed_diagnostics = DiagnosticsCollection::default();
-            for d in &self.processing_diagnostics {
+            for d in self.processing_diagnostics.iter().chain(self.late_processing_diagnostics.borrow().iter()) {
                 computed_diagnostics.add(d.to_diagnostic(p));
             }
             // PORT: Go map order is random here; the collection sorts later.

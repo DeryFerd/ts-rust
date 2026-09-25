@@ -81,9 +81,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1047 UpdateDoStatement
     pub fn update_do_statement(&self, node: Node, statement: Node, expression: Node) -> Node {
         if statement != node.statement() || expression != node.expression() {
-            // PORT: `f.NewDoStatement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewDoStatement(statement, expression), node.AsNode(), f.hooks)
-            unported!("NewDoStatement");
+            return update_node(self.new_do_statement(statement, expression), node, self.hooks());
         }
         node
     }
@@ -91,9 +89,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1092 UpdateWhileStatement
     pub fn update_while_statement(&self, node: Node, expression: Node, statement: Node) -> Node {
         if expression != node.expression() || statement != node.statement() {
-            // PORT: `f.NewWhileStatement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewWhileStatement(expression, statement), node.AsNode(), f.hooks)
-            unported!("NewWhileStatement");
+            return update_node(self.new_while_statement(expression, statement), node, self.hooks());
         }
         node
     }
@@ -101,9 +97,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1142 UpdateForStatement
     pub fn update_for_statement(&self, node: Node, initializer: Node, condition: Node, incrementor: Node, statement: Node) -> Node {
         if initializer != node.initializer() || condition != node.condition() || incrementor != node.incrementor() || statement != node.statement() {
-            // PORT: `f.NewForStatement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewForStatement(initializer, condition, incrementor, statement), node.AsNode(), f.hooks)
-            unported!("NewForStatement");
+            return update_node(self.new_for_statement(initializer, condition, incrementor, statement), node, self.hooks());
         }
         node
     }
@@ -111,9 +105,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1198 UpdateForInOrOfStatement
     pub fn update_for_in_or_of_statement(&self, node: Node, await_modifier: Node, initializer: Node, expression: Node, statement: Node) -> Node {
         if await_modifier != node.await_modifier() || initializer != node.initializer() || expression != node.expression() || statement != node.statement() {
-            // PORT: `f.NewForInOrOfStatement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewForInOrOfStatement(node.Kind, awaitModifier, initializer, expression, statement), node.AsNode(), f.hooks)
-            unported!("NewForInOrOfStatement");
+            return update_node(self.new_for_in_or_of_statement(node.kind(), await_modifier, initializer, expression, statement), node, self.hooks());
         }
         node
     }
@@ -121,9 +113,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1243 UpdateBreakStatement
     pub fn update_break_statement(&self, node: Node, label: Node) -> Node {
         if label != node.label() {
-            // PORT: `f.NewBreakStatement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewBreakStatement(label), node.AsNode(), f.hooks)
-            unported!("NewBreakStatement");
+            return update_node(self.new_break_statement(label), node, self.hooks());
         }
         node
     }
@@ -131,9 +121,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1281 UpdateContinueStatement
     pub fn update_continue_statement(&self, node: Node, label: Node) -> Node {
         if label != node.label() {
-            // PORT: `f.NewContinueStatement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewContinueStatement(label), node.AsNode(), f.hooks)
-            unported!("NewContinueStatement");
+            return update_node(self.new_continue_statement(label), node, self.hooks());
         }
         node
     }
@@ -149,9 +137,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1361 UpdateWithStatement
     pub fn update_with_statement(&self, node: Node, expression: Node, statement: Node) -> Node {
         if expression != node.expression() || statement != node.statement() {
-            // PORT: `f.NewWithStatement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewWithStatement(expression, statement), node.AsNode(), f.hooks)
-            unported!("NewWithStatement");
+            return update_node(self.new_with_statement(expression, statement), node, self.hooks());
         }
         node
     }
@@ -159,9 +145,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1407 UpdateSwitchStatement
     pub fn update_switch_statement(&self, node: Node, expression: Node, case_block: Node) -> Node {
         if expression != node.expression() || case_block != node.case_block() {
-            // PORT: `f.NewSwitchStatement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewSwitchStatement(expression, caseBlock), node.AsNode(), f.hooks)
-            unported!("NewSwitchStatement");
+            return update_node(self.new_switch_statement(expression, case_block), node, self.hooks());
         }
         node
     }
@@ -169,9 +153,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1452 UpdateCaseBlock
     pub fn update_case_block(&self, node: Node, clauses: NodeList) -> Node {
         if clauses != node.clauses() {
-            // PORT: `f.NewCaseBlock` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewCaseBlock(clauses), node.AsNode(), f.hooks)
-            unported!("NewCaseBlock");
+            return update_node(self.new_case_block(clauses), node, self.hooks());
         }
         node
     }
@@ -179,9 +161,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1498 UpdateCaseOrDefaultClause
     pub fn update_case_or_default_clause(&self, node: Node, expression: Node, statements: NodeList) -> Node {
         if expression != node.expression() || statements != node.statement_list() {
-            // PORT: `f.NewCaseOrDefaultClause` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewCaseOrDefaultClause(node.Kind, expression, statements), node.AsNode(), f.hooks)
-            unported!("NewCaseOrDefaultClause");
+            return update_node(self.new_case_or_default_clause(node.kind(), expression, statements), node, self.hooks());
         }
         node
     }
@@ -189,9 +169,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1546 UpdateThrowStatement
     pub fn update_throw_statement(&self, node: Node, expression: Node) -> Node {
         if expression != node.expression() {
-            // PORT: `f.NewThrowStatement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewThrowStatement(expression), node.AsNode(), f.hooks)
-            unported!("NewThrowStatement");
+            return update_node(self.new_throw_statement(expression), node, self.hooks());
         }
         node
     }
@@ -199,9 +177,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1593 UpdateTryStatement
     pub fn update_try_statement(&self, node: Node, try_block: Node, catch_clause: Node, finally_block: Node) -> Node {
         if try_block != node.try_block() || catch_clause != node.catch_clause() || finally_block != node.finally_block() {
-            // PORT: `f.NewTryStatement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewTryStatement(tryBlock, catchClause, finallyBlock), node.AsNode(), f.hooks)
-            unported!("NewTryStatement");
+            return update_node(self.new_try_statement(try_block, catch_clause, finally_block), node, self.hooks());
         }
         node
     }
@@ -209,9 +185,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1641 UpdateCatchClause
     pub fn update_catch_clause(&self, node: Node, variable_declaration: Node, block: Node) -> Node {
         if variable_declaration != node.variable_declaration() || block != node.block() {
-            // PORT: `f.NewCatchClause` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewCatchClause(variableDeclaration, block), node.AsNode(), f.hooks)
-            unported!("NewCatchClause");
+            return update_node(self.new_catch_clause(variable_declaration, block), node, self.hooks());
         }
         node
     }
@@ -219,9 +193,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1702 UpdateLabeledStatement
     pub fn update_labeled_statement(&self, node: Node, label: Node, statement: Node) -> Node {
         if label != node.label() || statement != node.statement() {
-            // PORT: `f.NewLabeledStatement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewLabeledStatement(label, statement), node.AsNode(), f.hooks)
-            unported!("NewLabeledStatement");
+            return update_node(self.new_labeled_statement(label, statement), node, self.hooks());
         }
         node
     }
@@ -269,9 +241,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:1970 UpdateBindingPattern
     pub fn update_binding_pattern(&self, node: Node, elements: NodeList) -> Node {
         if elements != node.element_list() {
-            // PORT: `f.NewBindingPattern` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewBindingPattern(node.Kind, elements), node.AsNode(), f.hooks)
-            unported!("NewBindingPattern");
+            return update_node(self.new_binding_pattern(node.kind(), elements), node, self.hooks());
         }
         node
     }
@@ -287,9 +257,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:2081 UpdateBindingElement
     pub fn update_binding_element(&self, node: Node, dot_dot_dot_token: Node, property_name: Node, name: Node, initializer: Node) -> Node {
         if dot_dot_dot_token != node.dot_dot_dot_token() || property_name != node.property_name() || name != node.name() || initializer != node.initializer() {
-            // PORT: `f.NewBindingElement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewBindingElement(dotDotDotToken, propertyName, name, initializer), node.AsNode(), f.hooks)
-            unported!("NewBindingElement");
+            return update_node(self.new_binding_element(dot_dot_dot_token, property_name, name, initializer), node, self.hooks());
         }
         node
     }
@@ -297,9 +265,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:2127 UpdateMissingDeclaration
     pub fn update_missing_declaration(&self, node: Node, modifiers: ModifierList) -> Node {
         if modifiers != node.modifiers() {
-            // PORT: `f.NewMissingDeclaration` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewMissingDeclaration(modifiers), node.AsNode(), f.hooks)
-            unported!("NewMissingDeclaration");
+            return update_node(self.new_missing_declaration(modifiers), node, self.hooks());
         }
         node
     }
@@ -349,8 +315,7 @@ impl NodeFactory {
         if modifiers != node.modifiers() || name != node.name() || type_parameters != node.type_parameter_list() || type_node != node.type_() {
             match node.kind() {
                 SyntaxKind::TypeAliasDeclaration => return update_node(self.new_type_alias_declaration(modifiers, name, type_parameters, type_node), node, self.hooks()),
-                // PORT: `f.NewJSTypeAliasDeclaration` is not in `ast::NodeFactory` yet.
-                SyntaxKind::JsTypeAliasDeclaration => unported!("NewJSTypeAliasDeclaration"),
+                SyntaxKind::JsTypeAliasDeclaration => return update_node(self.new_js_type_alias_declaration(modifiers, name, type_parameters, type_node), node, self.hooks()),
                 _ => panic!("unexpected kind in UpdateTypeAliasDeclaration: {:?}", node.kind()),
             }
         }
@@ -385,10 +350,8 @@ impl NodeFactory {
     pub fn update_import_declaration(&self, node: Node, modifiers: ModifierList, import_clause: Node, module_specifier: Node, attributes: Node) -> Node {
         if modifiers != node.modifiers() || import_clause != node.import_clause() || module_specifier != node.module_specifier() || attributes != node.attributes() {
             match node.kind() {
-                // PORT: `f.NewImportDeclaration` is not in `ast::NodeFactory` yet.
-                SyntaxKind::ImportDeclaration => unported!("NewImportDeclaration"),
-                // PORT: `f.NewJSImportDeclaration` is not in `ast::NodeFactory` yet.
-                SyntaxKind::JsImportDeclaration => unported!("NewJSImportDeclaration"),
+                SyntaxKind::ImportDeclaration => return update_node(self.new_import_declaration(modifiers, import_clause, module_specifier, attributes), node, self.hooks()),
+                SyntaxKind::JsImportDeclaration => return update_node(self.new_js_import_declaration(modifiers, import_clause, module_specifier, attributes), node, self.hooks()),
                 _ => panic!("unexpected kind in UpdateImportDeclaration: {:?}", node.kind()),
             }
         }
@@ -398,9 +361,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:2771 UpdateExternalModuleReference
     pub fn update_external_module_reference(&self, node: Node, expression: Node) -> Node {
         if expression != node.expression() {
-            // PORT: `f.NewExternalModuleReference` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewExternalModuleReference(expression), node.AsNode(), f.hooks)
-            unported!("NewExternalModuleReference");
+            return update_node(self.new_external_module_reference(expression), node, self.hooks());
         }
         node
     }
@@ -408,9 +369,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:2815 UpdateNamespaceImport
     pub fn update_namespace_import(&self, node: Node, name: Node) -> Node {
         if name != node.name() {
-            // PORT: `f.NewNamespaceImport` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewNamespaceImport(name), node.AsNode(), f.hooks)
-            unported!("NewNamespaceImport");
+            return update_node(self.new_namespace_import(name), node, self.hooks());
         }
         node
     }
@@ -418,9 +377,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:2862 UpdateNamedImports
     pub fn update_named_imports(&self, node: Node, elements: NodeList) -> Node {
         if elements != node.element_list() {
-            // PORT: `f.NewNamedImports` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewNamedImports(elements), node.AsNode(), f.hooks)
-            unported!("NewNamedImports");
+            return update_node(self.new_named_imports(elements), node, self.hooks());
         }
         node
     }
@@ -436,9 +393,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:2954 UpdateNamespaceExportDeclaration
     pub fn update_namespace_export_declaration(&self, node: Node, modifiers: ModifierList, name: Node) -> Node {
         if modifiers != node.modifiers() || name != node.name() {
-            // PORT: `f.NewNamespaceExportDeclaration` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewNamespaceExportDeclaration(modifiers, name), node.AsNode(), f.hooks)
-            unported!("NewNamespaceExportDeclaration");
+            return update_node(self.new_namespace_export_declaration(modifiers, name), node, self.hooks());
         }
         node
     }
@@ -446,9 +401,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:2997 UpdateNamespaceExport
     pub fn update_namespace_export(&self, node: Node, name: Node) -> Node {
         if name != node.name() {
-            // PORT: `f.NewNamespaceExport` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewNamespaceExport(name), node.AsNode(), f.hooks)
-            unported!("NewNamespaceExport");
+            return update_node(self.new_namespace_export(name), node, self.hooks());
         }
         node
     }
@@ -552,9 +505,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:3681 UpdateClassStaticBlockDeclaration
     pub fn update_class_static_block_declaration(&self, node: Node, modifiers: ModifierList, body: Node) -> Node {
         if modifiers != node.modifiers() || body != node.body() {
-            // PORT: `f.NewClassStaticBlockDeclaration` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewClassStaticBlockDeclaration(modifiers, body), node.AsNode(), f.hooks)
-            unported!("NewClassStaticBlockDeclaration");
+            return update_node(self.new_class_static_block_declaration(modifiers, body), node, self.hooks());
         }
         node
     }
@@ -578,9 +529,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:3991 UpdatePostfixUnaryExpression
     pub fn update_postfix_unary_expression(&self, node: Node, operand: Node, operator: SyntaxKind) -> Node {
         if operand != node.operand() || operator != node.operator() {
-            // PORT: `f.NewPostfixUnaryExpression` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewPostfixUnaryExpression(operand, operator), node.AsNode(), f.hooks)
-            unported!("NewPostfixUnaryExpression");
+            return update_node(self.new_postfix_unary_expression(operand, operator), node, self.hooks());
         }
         node
     }
@@ -668,9 +617,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:4529 UpdateMetaProperty
     pub fn update_meta_property(&self, node: Node, keyword_token: SyntaxKind, name: Node) -> Node {
         if keyword_token != node.keyword_token() || name != node.name() {
-            // PORT: `f.NewMetaProperty` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewMetaProperty(keywordToken, name), node.AsNode(), f.hooks)
-            unported!("NewMetaProperty");
+            return update_node(self.new_meta_property(keyword_token, name), node, self.hooks());
         }
         node
     }
@@ -694,9 +641,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:4652 UpdateTemplateExpression
     pub fn update_template_expression(&self, node: Node, head: Node, template_spans: NodeList) -> Node {
         if head != node.head() || template_spans != node.template_spans() {
-            // PORT: `f.NewTemplateExpression` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewTemplateExpression(head, templateSpans), node.AsNode(), f.hooks)
-            unported!("NewTemplateExpression");
+            return update_node(self.new_template_expression(head, template_spans), node, self.hooks());
         }
         node
     }
@@ -704,9 +649,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:4697 UpdateTemplateSpan
     pub fn update_template_span(&self, node: Node, expression: Node, literal: Node) -> Node {
         if expression != node.expression() || literal != node.literal() {
-            // PORT: `f.NewTemplateSpan` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewTemplateSpan(expression, literal), node.AsNode(), f.hooks)
-            unported!("NewTemplateSpan");
+            return update_node(self.new_template_span(expression, literal), node, self.hooks());
         }
         node
     }
@@ -746,9 +689,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:4925 UpdateSpreadAssignment
     pub fn update_spread_assignment(&self, node: Node, expression: Node) -> Node {
         if expression != node.expression() {
-            // PORT: `f.NewSpreadAssignment` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewSpreadAssignment(expression), node.AsNode(), f.hooks)
-            unported!("NewSpreadAssignment");
+            return update_node(self.new_spread_assignment(expression), node, self.hooks());
         }
         node
     }
@@ -764,9 +705,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:5027 UpdateShorthandPropertyAssignment
     pub fn update_shorthand_property_assignment(&self, node: Node, modifiers: ModifierList, name: Node, postfix_token: Node, type_node: Node, equals_token: Node, object_assignment_initializer: Node) -> Node {
         if modifiers != node.modifiers() || name != node.name() || postfix_token != node.postfix_token() || type_node != node.type_() || equals_token != node.equals_token() || object_assignment_initializer != node.object_assignment_initializer() {
-            // PORT: `f.NewShorthandPropertyAssignment` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewShorthandPropertyAssignment(modifiers, name, postfixToken, typeNode, equalsToken, objectAssignmentInitializer), node.AsNode(), f.hooks)
-            unported!("NewShorthandPropertyAssignment");
+            return update_node(self.new_shorthand_property_assignment(modifiers, name, postfix_token, type_node, equals_token, object_assignment_initializer), node, self.hooks());
         }
         node
     }
@@ -1022,9 +961,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:6493 UpdatePartiallyEmittedExpression
     pub fn update_partially_emitted_expression(&self, node: Node, expression: Node) -> Node {
         if expression != node.expression() {
-            // PORT: `f.NewPartiallyEmittedExpression` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewPartiallyEmittedExpression(expression), node.AsNode(), f.hooks)
-            unported!("NewPartiallyEmittedExpression");
+            return update_node(self.new_partially_emitted_expression(expression), node, self.hooks());
         }
         node
     }
@@ -1032,9 +969,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:6540 UpdateJsxElement
     pub fn update_jsx_element(&self, node: Node, opening_element: Node, children: NodeList, closing_element: Node) -> Node {
         if opening_element != node.opening_element() || children != node.children() || closing_element != node.closing_element() {
-            // PORT: `f.NewJsxElement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJsxElement(openingElement, children, closingElement), node.AsNode(), f.hooks)
-            unported!("NewJsxElement");
+            return update_node(self.new_jsx_element(opening_element, children, closing_element), node, self.hooks());
         }
         node
     }
@@ -1042,9 +977,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:6580 UpdateJsxAttributes
     pub fn update_jsx_attributes(&self, node: Node, properties: NodeList) -> Node {
         if properties != node.property_list() {
-            // PORT: `f.NewJsxAttributes` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJsxAttributes(properties), node.AsNode(), f.hooks)
-            unported!("NewJsxAttributes");
+            return update_node(self.new_jsx_attributes(properties), node, self.hooks());
         }
         node
     }
@@ -1052,9 +985,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:6621 UpdateJsxNamespacedName
     pub fn update_jsx_namespaced_name(&self, node: Node, namespace: Node, name: Node) -> Node {
         if namespace != node.namespace() || name != node.name() {
-            // PORT: `f.NewJsxNamespacedName` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJsxNamespacedName(namespace, name), node.AsNode(), f.hooks)
-            unported!("NewJsxNamespacedName");
+            return update_node(self.new_jsx_namespaced_name(namespace, name), node, self.hooks());
         }
         node
     }
@@ -1062,9 +993,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:6668 UpdateJsxOpeningElement
     pub fn update_jsx_opening_element(&self, node: Node, tag_name: Node, type_arguments: NodeList, attributes: Node) -> Node {
         if tag_name != node.tag_name() || type_arguments != node.type_argument_list() || attributes != node.attributes() {
-            // PORT: `f.NewJsxOpeningElement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJsxOpeningElement(tagName, typeArguments, attributes), node.AsNode(), f.hooks)
-            unported!("NewJsxOpeningElement");
+            return update_node(self.new_jsx_opening_element(tag_name, type_arguments, attributes), node, self.hooks());
         }
         node
     }
@@ -1072,9 +1001,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:6711 UpdateJsxSelfClosingElement
     pub fn update_jsx_self_closing_element(&self, node: Node, tag_name: Node, type_arguments: NodeList, attributes: Node) -> Node {
         if tag_name != node.tag_name() || type_arguments != node.type_argument_list() || attributes != node.attributes() {
-            // PORT: `f.NewJsxSelfClosingElement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJsxSelfClosingElement(tagName, typeArguments, attributes), node.AsNode(), f.hooks)
-            unported!("NewJsxSelfClosingElement");
+            return update_node(self.new_jsx_self_closing_element(tag_name, type_arguments, attributes), node, self.hooks());
         }
         node
     }
@@ -1082,9 +1009,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:6754 UpdateJsxFragment
     pub fn update_jsx_fragment(&self, node: Node, opening_fragment: Node, children: NodeList, closing_fragment: Node) -> Node {
         if opening_fragment != node.opening_fragment() || children != node.children() || closing_fragment != node.closing_fragment() {
-            // PORT: `f.NewJsxFragment` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJsxFragment(openingFragment, children, closingFragment), node.AsNode(), f.hooks)
-            unported!("NewJsxFragment");
+            return update_node(self.new_jsx_fragment(opening_fragment, children, closing_fragment), node, self.hooks());
         }
         node
     }
@@ -1092,9 +1017,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:6838 UpdateJsxAttribute
     pub fn update_jsx_attribute(&self, node: Node, name: Node, initializer: Node) -> Node {
         if name != node.name() || initializer != node.initializer() {
-            // PORT: `f.NewJsxAttribute` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJsxAttribute(name, initializer), node.AsNode(), f.hooks)
-            unported!("NewJsxAttribute");
+            return update_node(self.new_jsx_attribute(name, initializer), node, self.hooks());
         }
         node
     }
@@ -1102,9 +1025,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:6881 UpdateJsxSpreadAttribute
     pub fn update_jsx_spread_attribute(&self, node: Node, expression: Node) -> Node {
         if expression != node.expression() {
-            // PORT: `f.NewJsxSpreadAttribute` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJsxSpreadAttribute(expression), node.AsNode(), f.hooks)
-            unported!("NewJsxSpreadAttribute");
+            return update_node(self.new_jsx_spread_attribute(expression), node, self.hooks());
         }
         node
     }
@@ -1112,9 +1033,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:6919 UpdateJsxClosingElement
     pub fn update_jsx_closing_element(&self, node: Node, tag_name: Node) -> Node {
         if tag_name != node.tag_name() {
-            // PORT: `f.NewJsxClosingElement` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJsxClosingElement(tagName), node.AsNode(), f.hooks)
-            unported!("NewJsxClosingElement");
+            return update_node(self.new_jsx_closing_element(tag_name), node, self.hooks());
         }
         node
     }
@@ -1122,9 +1041,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:6959 UpdateJsxExpression
     pub fn update_jsx_expression(&self, node: Node, dot_dot_dot_token: Node, expression: Node) -> Node {
         if dot_dot_dot_token != node.dot_dot_dot_token() || expression != node.expression() {
-            // PORT: `f.NewJsxExpression` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJsxExpression(dotDotDotToken, expression), node.AsNode(), f.hooks)
-            unported!("NewJsxExpression");
+            return update_node(self.new_jsx_expression(dot_dot_dot_token, expression), node, self.hooks());
         }
         node
     }
@@ -1134,9 +1051,7 @@ impl NodeFactory {
     // unchanged children when `core.SameMap` would return the original slice.
     pub fn update_syntax_list(&self, node: Node, children: &[Node]) -> Node {
         if children != syntax_list_children(node).as_slice() {
-            // PORT: `f.NewSyntaxList` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewSyntaxList(children), node.AsNode(), f.hooks)
-            unported!("NewSyntaxList");
+            return update_node(self.new_syntax_list(children), node, self.hooks());
         }
         node
     }
@@ -1144,9 +1059,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7064 UpdateJSDoc
     pub fn update_js_doc(&self, node: Node, comment: NodeList, tags: NodeList) -> Node {
         if comment != node.comment() || tags != node.tags() {
-            // PORT: `f.NewJSDoc` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDoc(comment, tags), node.AsNode(), f.hooks)
-            unported!("NewJSDoc");
+            return update_node(self.new_js_doc(comment, tags), node, self.hooks());
         }
         node
     }
@@ -1154,9 +1067,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7102 UpdateJSDocTypeExpression
     pub fn update_js_doc_type_expression(&self, node: Node, type_node: Node) -> Node {
         if type_node != node.type_() {
-            // PORT: `f.NewJSDocTypeExpression` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocTypeExpression(typeNode), node.AsNode(), f.hooks)
-            unported!("NewJSDocTypeExpression");
+            return update_node(self.new_js_doc_type_expression(type_node), node, self.hooks());
         }
         node
     }
@@ -1164,9 +1075,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7140 UpdateJSDocNonNullableType
     pub fn update_js_doc_non_nullable_type(&self, node: Node, type_node: Node) -> Node {
         if type_node != node.type_() {
-            // PORT: `f.NewJSDocNonNullableType` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocNonNullableType(typeNode), node.AsNode(), f.hooks)
-            unported!("NewJSDocNonNullableType");
+            return update_node(self.new_js_doc_non_nullable_type(type_node), node, self.hooks());
         }
         node
     }
@@ -1174,9 +1083,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7178 UpdateJSDocNullableType
     pub fn update_js_doc_nullable_type(&self, node: Node, type_node: Node) -> Node {
         if type_node != node.type_() {
-            // PORT: `f.NewJSDocNullableType` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocNullableType(typeNode), node.AsNode(), f.hooks)
-            unported!("NewJSDocNullableType");
+            return update_node(self.new_js_doc_nullable_type(type_node), node, self.hooks());
         }
         node
     }
@@ -1184,9 +1091,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7237 UpdateJSDocVariadicType
     pub fn update_js_doc_variadic_type(&self, node: Node, type_node: Node) -> Node {
         if type_node != node.type_() {
-            // PORT: `f.NewJSDocVariadicType` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocVariadicType(typeNode), node.AsNode(), f.hooks)
-            unported!("NewJSDocVariadicType");
+            return update_node(self.new_js_doc_variadic_type(type_node), node, self.hooks());
         }
         node
     }
@@ -1194,9 +1099,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7275 UpdateJSDocOptionalType
     pub fn update_js_doc_optional_type(&self, node: Node, type_node: Node) -> Node {
         if type_node != node.type_() {
-            // PORT: `f.NewJSDocOptionalType` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocOptionalType(typeNode), node.AsNode(), f.hooks)
-            unported!("NewJSDocOptionalType");
+            return update_node(self.new_js_doc_optional_type(type_node), node, self.hooks());
         }
         node
     }
@@ -1204,9 +1107,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7315 UpdateJSDocTypeTag
     pub fn update_js_doc_type_tag(&self, node: Node, tag_name: Node, type_expression: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || type_expression != node.type_expression() || comment != node.comment() {
-            // PORT: `f.NewJSDocTypeTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocTypeTag(tagName, typeExpression, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocTypeTag");
+            return update_node(self.new_js_doc_type_tag(tag_name, type_expression, comment), node, self.hooks());
         }
         node
     }
@@ -1214,9 +1115,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7353 UpdateJSDocUnknownTag
     pub fn update_js_doc_unknown_tag(&self, node: Node, tag_name: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || comment != node.comment() {
-            // PORT: `f.NewJSDocUnknownTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocUnknownTag(tagName, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocUnknownTag");
+            return update_node(self.new_js_doc_unknown_tag(tag_name, comment), node, self.hooks());
         }
         node
     }
@@ -1224,9 +1123,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7395 UpdateJSDocTemplateTag
     pub fn update_js_doc_template_tag(&self, node: Node, tag_name: Node, constraint: Node, type_parameters: NodeList, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || constraint != node.constraint() || type_parameters != node.type_parameter_list() || comment != node.comment() {
-            // PORT: `f.NewJSDocTemplateTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocTemplateTag(tagName, constraint, typeParameters, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocTemplateTag");
+            return update_node(self.new_js_doc_template_tag(tag_name, constraint, type_parameters, comment), node, self.hooks());
         }
         node
     }
@@ -1234,9 +1131,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7438 UpdateJSDocReturnTag
     pub fn update_js_doc_return_tag(&self, node: Node, tag_name: Node, type_expression: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || type_expression != node.type_expression() || comment != node.comment() {
-            // PORT: `f.NewJSDocReturnTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocReturnTag(tagName, typeExpression, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocReturnTag");
+            return update_node(self.new_js_doc_return_tag(tag_name, type_expression, comment), node, self.hooks());
         }
         node
     }
@@ -1244,9 +1139,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7476 UpdateJSDocPublicTag
     pub fn update_js_doc_public_tag(&self, node: Node, tag_name: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || comment != node.comment() {
-            // PORT: `f.NewJSDocPublicTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocPublicTag(tagName, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocPublicTag");
+            return update_node(self.new_js_doc_public_tag(tag_name, comment), node, self.hooks());
         }
         node
     }
@@ -1254,9 +1147,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7514 UpdateJSDocPrivateTag
     pub fn update_js_doc_private_tag(&self, node: Node, tag_name: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || comment != node.comment() {
-            // PORT: `f.NewJSDocPrivateTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocPrivateTag(tagName, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocPrivateTag");
+            return update_node(self.new_js_doc_private_tag(tag_name, comment), node, self.hooks());
         }
         node
     }
@@ -1264,9 +1155,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7552 UpdateJSDocProtectedTag
     pub fn update_js_doc_protected_tag(&self, node: Node, tag_name: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || comment != node.comment() {
-            // PORT: `f.NewJSDocProtectedTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocProtectedTag(tagName, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocProtectedTag");
+            return update_node(self.new_js_doc_protected_tag(tag_name, comment), node, self.hooks());
         }
         node
     }
@@ -1274,9 +1163,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7590 UpdateJSDocReadonlyTag
     pub fn update_js_doc_readonly_tag(&self, node: Node, tag_name: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || comment != node.comment() {
-            // PORT: `f.NewJSDocReadonlyTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocReadonlyTag(tagName, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocReadonlyTag");
+            return update_node(self.new_js_doc_readonly_tag(tag_name, comment), node, self.hooks());
         }
         node
     }
@@ -1284,9 +1171,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7628 UpdateJSDocOverrideTag
     pub fn update_js_doc_override_tag(&self, node: Node, tag_name: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || comment != node.comment() {
-            // PORT: `f.NewJSDocOverrideTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocOverrideTag(tagName, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocOverrideTag");
+            return update_node(self.new_js_doc_override_tag(tag_name, comment), node, self.hooks());
         }
         node
     }
@@ -1294,9 +1179,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7666 UpdateJSDocDeprecatedTag
     pub fn update_js_doc_deprecated_tag(&self, node: Node, tag_name: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || comment != node.comment() {
-            // PORT: `f.NewJSDocDeprecatedTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocDeprecatedTag(tagName, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocDeprecatedTag");
+            return update_node(self.new_js_doc_deprecated_tag(tag_name, comment), node, self.hooks());
         }
         node
     }
@@ -1304,9 +1187,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7706 UpdateJSDocSeeTag
     pub fn update_js_doc_see_tag(&self, node: Node, tag_name: Node, name_expression: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || name_expression != node.name_expression() || comment != node.comment() {
-            // PORT: `f.NewJSDocSeeTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocSeeTag(tagName, nameExpression, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocSeeTag");
+            return update_node(self.new_js_doc_see_tag(tag_name, name_expression, comment), node, self.hooks());
         }
         node
     }
@@ -1314,9 +1195,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7746 UpdateJSDocImplementsTag
     pub fn update_js_doc_implements_tag(&self, node: Node, tag_name: Node, class_name: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || class_name != node.class_name() || comment != node.comment() {
-            // PORT: `f.NewJSDocImplementsTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocImplementsTag(tagName, className, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocImplementsTag");
+            return update_node(self.new_js_doc_implements_tag(tag_name, class_name, comment), node, self.hooks());
         }
         node
     }
@@ -1324,9 +1203,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7786 UpdateJSDocAugmentsTag
     pub fn update_js_doc_augments_tag(&self, node: Node, tag_name: Node, class_name: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || class_name != node.class_name() || comment != node.comment() {
-            // PORT: `f.NewJSDocAugmentsTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocAugmentsTag(tagName, className, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocAugmentsTag");
+            return update_node(self.new_js_doc_augments_tag(tag_name, class_name, comment), node, self.hooks());
         }
         node
     }
@@ -1334,9 +1211,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7826 UpdateJSDocSatisfiesTag
     pub fn update_js_doc_satisfies_tag(&self, node: Node, tag_name: Node, type_expression: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || type_expression != node.type_expression() || comment != node.comment() {
-            // PORT: `f.NewJSDocSatisfiesTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocSatisfiesTag(tagName, typeExpression, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocSatisfiesTag");
+            return update_node(self.new_js_doc_satisfies_tag(tag_name, type_expression, comment), node, self.hooks());
         }
         node
     }
@@ -1344,9 +1219,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7866 UpdateJSDocThrowsTag
     pub fn update_js_doc_throws_tag(&self, node: Node, tag_name: Node, type_expression: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || type_expression != node.type_expression() || comment != node.comment() {
-            // PORT: `f.NewJSDocThrowsTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocThrowsTag(tagName, typeExpression, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocThrowsTag");
+            return update_node(self.new_js_doc_throws_tag(tag_name, type_expression, comment), node, self.hooks());
         }
         node
     }
@@ -1354,9 +1227,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7906 UpdateJSDocThisTag
     pub fn update_js_doc_this_tag(&self, node: Node, tag_name: Node, type_expression: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || type_expression != node.type_expression() || comment != node.comment() {
-            // PORT: `f.NewJSDocThisTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocThisTag(tagName, typeExpression, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocThisTag");
+            return update_node(self.new_js_doc_this_tag(tag_name, type_expression, comment), node, self.hooks());
         }
         node
     }
@@ -1364,9 +1235,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7950 UpdateJSDocImportTag
     pub fn update_js_doc_import_tag(&self, node: Node, tag_name: Node, import_clause: Node, module_specifier: Node, attributes: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || import_clause != node.import_clause() || module_specifier != node.module_specifier() || attributes != node.attributes() || comment != node.comment() {
-            // PORT: `f.NewJSDocImportTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocImportTag(tagName, importClause, moduleSpecifier, attributes, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocImportTag");
+            return update_node(self.new_js_doc_import_tag(tag_name, import_clause, module_specifier, attributes, comment), node, self.hooks());
         }
         node
     }
@@ -1374,9 +1243,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:7996 UpdateJSDocCallbackTag
     pub fn update_js_doc_callback_tag(&self, node: Node, tag_name: Node, type_expression: Node, name: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || type_expression != node.type_expression() || name != node.name() || comment != node.comment() {
-            // PORT: `f.NewJSDocCallbackTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocCallbackTag(tagName, typeExpression, name, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocCallbackTag");
+            return update_node(self.new_js_doc_callback_tag(tag_name, type_expression, name, comment), node, self.hooks());
         }
         node
     }
@@ -1384,9 +1251,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:8043 UpdateJSDocOverloadTag
     pub fn update_js_doc_overload_tag(&self, node: Node, tag_name: Node, type_expression: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || type_expression != node.type_expression() || comment != node.comment() {
-            // PORT: `f.NewJSDocOverloadTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocOverloadTag(tagName, typeExpression, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocOverloadTag");
+            return update_node(self.new_js_doc_overload_tag(tag_name, type_expression, comment), node, self.hooks());
         }
         node
     }
@@ -1394,9 +1259,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:8085 UpdateJSDocTypedefTag
     pub fn update_js_doc_typedef_tag(&self, node: Node, tag_name: Node, type_expression: Node, name: Node, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || type_expression != node.type_expression() || name != node.name() || comment != node.comment() {
-            // PORT: `f.NewJSDocTypedefTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocTypedefTag(tagName, typeExpression, name, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocTypedefTag");
+            return update_node(self.new_js_doc_typedef_tag(tag_name, type_expression, name, comment), node, self.hooks());
         }
         node
     }
@@ -1404,9 +1267,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:8132 UpdateJSDocSignature
     pub fn update_js_doc_signature(&self, node: Node, type_parameters: NodeList, parameters: NodeList, type_node: Node) -> Node {
         if type_parameters != node.type_parameter_list() || parameters != node.parameter_list() || type_node != node.type_() {
-            // PORT: `f.NewJSDocSignature` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocSignature(typeParameters, parameters, typeNode), node.AsNode(), f.hooks)
-            unported!("NewJSDocSignature");
+            return update_node(self.new_js_doc_signature(type_parameters, parameters, type_node), node, self.hooks());
         }
         node
     }
@@ -1414,9 +1275,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:8170 UpdateJSDocNameReference
     pub fn update_js_doc_name_reference(&self, node: Node, name: Node) -> Node {
         if name != node.name() {
-            // PORT: `f.NewJSDocNameReference` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocNameReference(name), node.AsNode(), f.hooks)
-            unported!("NewJSDocNameReference");
+            return update_node(self.new_js_doc_name_reference(name), node, self.hooks());
         }
         node
     }
@@ -1432,9 +1291,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:8282 UpdateImportEqualsDeclaration
     pub fn update_import_equals_declaration(&self, node: Node, modifiers: ModifierList, is_type_only: bool, name: Node, module_reference: Node) -> Node {
         if modifiers != node.modifiers() || is_type_only != node.is_type_only() || name != node.name() || module_reference != node.module_reference() {
-            // PORT: `f.NewImportEqualsDeclaration` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewImportEqualsDeclaration(modifiers, isTypeOnly, name, moduleReference), node.AsNode(), f.hooks)
-            unported!("NewImportEqualsDeclaration");
+            return update_node(self.new_import_equals_declaration(modifiers, is_type_only, name, module_reference), node, self.hooks());
         }
         node
     }
@@ -1458,9 +1315,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:8430 UpdateImportClause
     pub fn update_import_clause(&self, node: Node, phase_modifier: SyntaxKind, name: Node, named_bindings: Node) -> Node {
         if phase_modifier != node.phase_modifier() || name != node.name() || named_bindings != node.named_bindings() {
-            // PORT: `f.NewImportClause` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewImportClause(phaseModifier, name, namedBindings), node.AsNode(), f.hooks)
-            unported!("NewImportClause");
+            return update_node(self.new_import_clause(phase_modifier, name, named_bindings), node, self.hooks());
         }
         node
     }
@@ -1468,9 +1323,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:8479 UpdateImportSpecifier
     pub fn update_import_specifier(&self, node: Node, is_type_only: bool, property_name: Node, name: Node) -> Node {
         if is_type_only != node.is_type_only() || property_name != node.property_name() || name != node.name() {
-            // PORT: `f.NewImportSpecifier` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewImportSpecifier(isTypeOnly, propertyName, name), node.AsNode(), f.hooks)
-            unported!("NewImportSpecifier");
+            return update_node(self.new_import_specifier(is_type_only, property_name, name), node, self.hooks());
         }
         node
     }
@@ -1479,9 +1332,8 @@ impl NodeFactory {
     // PORT: Go `text []string` and `core.Same`; ts_ast stores the link text as one string, compared by value.
     pub fn update_js_doc_link(&self, node: Node, name: Node, text: &str) -> Node {
         if name != node.name() || text != node.text() {
-            // PORT: `f.NewJSDocLink` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocLink(name, text), node.AsNode(), f.hooks)
-            unported!("NewJSDocLink");
+            // PORT: Go passes the `[]string` text; here the one joined string.
+            return update_node(self.new_js_doc_link(name, vec![text.to_string()]), node, self.hooks());
         }
         node
     }
@@ -1490,9 +1342,8 @@ impl NodeFactory {
     // PORT: Go `text []string` and `core.Same`; ts_ast stores the link text as one string, compared by value.
     pub fn update_js_doc_link_plain(&self, node: Node, name: Node, text: &str) -> Node {
         if name != node.name() || text != node.text() {
-            // PORT: `f.NewJSDocLinkPlain` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocLinkPlain(name, text), node.AsNode(), f.hooks)
-            unported!("NewJSDocLinkPlain");
+            // PORT: Go passes the `[]string` text; here the one joined string.
+            return update_node(self.new_js_doc_link_plain(name, vec![text.to_string()]), node, self.hooks());
         }
         node
     }
@@ -1501,9 +1352,8 @@ impl NodeFactory {
     // PORT: Go `text []string` and `core.Same`; ts_ast stores the link text as one string, compared by value.
     pub fn update_js_doc_link_code(&self, node: Node, name: Node, text: &str) -> Node {
         if name != node.name() || text != node.text() {
-            // PORT: `f.NewJSDocLinkCode` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocLinkCode(name, text), node.AsNode(), f.hooks)
-            unported!("NewJSDocLinkCode");
+            // PORT: Go passes the `[]string` text; here the one joined string.
+            return update_node(self.new_js_doc_link_code(name, vec![text.to_string()]), node, self.hooks());
         }
         node
     }
@@ -1519,9 +1369,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:8734 UpdateSyntheticReferenceExpression
     pub fn update_synthetic_reference_expression(&self, node: Node, expression: Node, this_arg: Node) -> Node {
         if expression != node.expression() || this_arg != node.this_arg() {
-            // PORT: `f.NewSyntheticReferenceExpression` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewSyntheticReferenceExpression(expression, thisArg), node.AsNode(), f.hooks)
-            unported!("NewSyntheticReferenceExpression");
+            return update_node(self.new_synthetic_reference_expression(expression, this_arg), node, self.hooks());
         }
         node
     }
@@ -1531,9 +1379,7 @@ impl NodeFactory {
     // unchanged children when `core.SameMap` would return the original slice.
     pub fn update_js_doc_type_literal(&self, node: Node, jsdoc_property_tags: &[Node], is_array_type: bool) -> Node {
         if jsdoc_property_tags != node.js_doc_property_tags().as_slice() || is_array_type != node.is_array_type() {
-            // PORT: `f.NewJSDocTypeLiteral` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocTypeLiteral(jsdocPropertyTags, isArrayType), node.AsNode(), f.hooks)
-            unported!("NewJSDocTypeLiteral");
+            return update_node(self.new_js_doc_type_literal(jsdoc_property_tags, is_array_type), node, self.hooks());
         }
         node
     }
@@ -1541,9 +1387,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:8827 UpdateJSDocParameterOrPropertyTag
     pub fn update_js_doc_parameter_or_property_tag(&self, node: Node, tag_name: Node, name: Node, is_bracketed: bool, type_expression: Node, is_name_first: bool, comment: NodeList) -> Node {
         if tag_name != node.tag_name() || name != node.name() || is_bracketed != node.is_bracketed() || type_expression != node.type_expression() || is_name_first != node.is_name_first() || comment != node.comment() {
-            // PORT: `f.NewJSDocParameterOrPropertyTag` is not in `ast::NodeFactory` yet.
-            // Go: return updateNode(f.NewJSDocParameterOrPropertyTag(node.Kind, tagName, name, isBracketed, typeExpression, isNameFirst, comment), node.AsNode(), f.hooks)
-            unported!("NewJSDocParameterOrPropertyTag");
+            return update_node(self.new_js_doc_parameter_or_property_tag(node.kind(), tag_name, name, is_bracketed, type_expression, is_name_first, comment), node, self.hooks());
         }
         node
     }
@@ -1551,11 +1395,8 @@ impl NodeFactory {
     // Go: ast/ast.go:2693 UpdateSourceFile
     pub fn update_source_file(&self, node: Node, statements: NodeList, end_of_file_token: Node) -> Node {
         if statements != node.statement_list() || end_of_file_token != node.end_of_file_token() {
-            // PORT: `f.NewSourceFile` and `SourceFile.copyFrom` are not in `ast::NodeFactory` yet.
-            // Go: updated := f.NewSourceFile(node.parseOptions, node.text, statements, endOfFileToken).AsSourceFile()
-            //     updated.copyFrom(node)
-            //     return updateNode(updated.AsNode(), node.AsNode(), f.hooks)
-            unported!("NewSourceFile");
+            let updated = self.new_source_file_from(node, statements, end_of_file_token);
+            return update_node(updated, node, self.hooks());
         }
         node
     }

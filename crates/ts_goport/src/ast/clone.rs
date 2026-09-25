@@ -280,38 +280,32 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:1062 (node *DoStatement) Clone
     fn clone_do_statement(&self, node: Node) -> Node {
-        // PORT: NewDoStatement is not in ast::NodeFactory yet. Go: self.new_do_statement(node.statement(), node.expression())
-        unported!("NewDoStatement")
+        clone_node_from(self.new_do_statement(node.statement(), node.expression()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1107 (node *WhileStatement) Clone
     fn clone_while_statement(&self, node: Node) -> Node {
-        // PORT: NewWhileStatement is not in ast::NodeFactory yet. Go: self.new_while_statement(node.expression(), node.statement())
-        unported!("NewWhileStatement")
+        clone_node_from(self.new_while_statement(node.expression(), node.statement()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1160 (node *ForStatement) Clone
     fn clone_for_statement(&self, node: Node) -> Node {
-        // PORT: NewForStatement is not in ast::NodeFactory yet. Go: self.new_for_statement(node.initializer(), node.condition(), node.incrementor(), node.statement())
-        unported!("NewForStatement")
+        clone_node_from(self.new_for_statement(node.initializer(), node.condition(), node.incrementor(), node.statement()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1216 (node *ForInOrOfStatement) Clone
     fn clone_for_in_or_of_statement(&self, node: Node) -> Node {
-        // PORT: NewForInOrOfStatement is not in ast::NodeFactory yet. Go: self.new_for_in_or_of_statement(node.kind(), node.await_modifier(), node.initializer(), node.expression(), node.statement())
-        unported!("NewForInOrOfStatement")
+        clone_node_from(self.new_for_in_or_of_statement(node.kind(), node.await_modifier(), node.initializer(), node.expression(), node.statement()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1258 (node *BreakStatement) Clone
     fn clone_break_statement(&self, node: Node) -> Node {
-        // PORT: NewBreakStatement is not in ast::NodeFactory yet. Go: self.new_break_statement(node.label())
-        unported!("NewBreakStatement")
+        clone_node_from(self.new_break_statement(node.label()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1296 (node *ContinueStatement) Clone
     fn clone_continue_statement(&self, node: Node) -> Node {
-        // PORT: NewContinueStatement is not in ast::NodeFactory yet. Go: self.new_continue_statement(node.label())
-        unported!("NewContinueStatement")
+        clone_node_from(self.new_continue_statement(node.label()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1335 (node *ReturnStatement) Clone
@@ -321,56 +315,47 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:1376 (node *WithStatement) Clone
     fn clone_with_statement(&self, node: Node) -> Node {
-        // PORT: NewWithStatement is not in ast::NodeFactory yet. Go: self.new_with_statement(node.expression(), node.statement())
-        unported!("NewWithStatement")
+        clone_node_from(self.new_with_statement(node.expression(), node.statement()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1422 (node *SwitchStatement) Clone
     fn clone_switch_statement(&self, node: Node) -> Node {
-        // PORT: NewSwitchStatement is not in ast::NodeFactory yet. Go: self.new_switch_statement(node.expression(), node.case_block())
-        unported!("NewSwitchStatement")
+        clone_node_from(self.new_switch_statement(node.expression(), node.case_block()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1467 (node *CaseBlock) Clone
     fn clone_case_block(&self, node: Node) -> Node {
-        // PORT: NewCaseBlock is not in ast::NodeFactory yet. Go: self.new_case_block(node.clauses())
-        unported!("NewCaseBlock")
+        clone_node_from(self.new_case_block(node.clauses()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1513 (node *CaseOrDefaultClause) Clone
     fn clone_case_or_default_clause(&self, node: Node) -> Node {
-        // PORT: NewCaseOrDefaultClause is not in ast::NodeFactory yet. Go: self.new_case_or_default_clause(node.kind(), node.expression(), node.statement_list())
-        unported!("NewCaseOrDefaultClause")
+        clone_node_from(self.new_case_or_default_clause(node.kind(), node.expression(), node.statement_list()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1561 (node *ThrowStatement) Clone
     fn clone_throw_statement(&self, node: Node) -> Node {
-        // PORT: NewThrowStatement is not in ast::NodeFactory yet. Go: self.new_throw_statement(node.expression())
-        unported!("NewThrowStatement")
+        clone_node_from(self.new_throw_statement(node.expression()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1608 (node *TryStatement) Clone
     fn clone_try_statement(&self, node: Node) -> Node {
-        // PORT: NewTryStatement is not in ast::NodeFactory yet. Go: self.new_try_statement(node.try_block(), node.catch_clause(), node.finally_block())
-        unported!("NewTryStatement")
+        clone_node_from(self.new_try_statement(node.try_block(), node.catch_clause(), node.finally_block()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1656 (node *CatchClause) Clone
     fn clone_catch_clause(&self, node: Node) -> Node {
-        // PORT: NewCatchClause is not in ast::NodeFactory yet. Go: self.new_catch_clause(node.variable_declaration(), node.block())
-        unported!("NewCatchClause")
+        clone_node_from(self.new_catch_clause(node.variable_declaration(), node.block()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1677 (node *DebuggerStatement) Clone
     fn clone_debugger_statement(&self, node: Node) -> Node {
-        // PORT: NewDebuggerStatement is not in ast::NodeFactory yet. Go: self.new_debugger_statement()
-        unported!("NewDebuggerStatement")
+        clone_node_from(self.new_debugger_statement(), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1717 (node *LabeledStatement) Clone
     fn clone_labeled_statement(&self, node: Node) -> Node {
-        // PORT: NewLabeledStatement is not in ast::NodeFactory yet. Go: self.new_labeled_statement(node.label(), node.statement())
-        unported!("NewLabeledStatement")
+        clone_node_from(self.new_labeled_statement(node.label(), node.statement()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:1760 (node *ExpressionStatement) Clone
@@ -400,8 +385,7 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:1985 (node *BindingPattern) Clone
     fn clone_binding_pattern(&self, node: Node) -> Node {
-        // PORT: NewBindingPattern is not in ast::NodeFactory yet. Go: self.new_binding_pattern(node.kind(), node.element_list())
-        unported!("NewBindingPattern")
+        clone_node_from(self.new_binding_pattern(node.kind(), node.element_list()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:2044 (node *ParameterDeclaration) Clone
@@ -411,20 +395,17 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:2099 (node *BindingElement) Clone
     fn clone_binding_element(&self, node: Node) -> Node {
-        // PORT: NewBindingElement is not in ast::NodeFactory yet. Go: self.new_binding_element(node.dot_dot_dot_token(), node.property_name(), node.name(), node.initializer())
-        unported!("NewBindingElement")
+        clone_node_from(self.new_binding_element(node.dot_dot_dot_token(), node.property_name(), node.name(), node.initializer()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:2142 (node *MissingDeclaration) Clone
     fn clone_missing_declaration(&self, node: Node) -> Node {
-        // PORT: NewMissingDeclaration is not in ast::NodeFactory yet. Go: self.new_missing_declaration(node.modifiers())
-        unported!("NewMissingDeclaration")
+        clone_node_from(self.new_missing_declaration(node.modifiers()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:2200 (node *FunctionDeclaration) Clone
     fn clone_function_declaration(&self, node: Node) -> Node {
-        // PORT: NewFunctionDeclaration is not in ast::NodeFactory yet. Go: self.new_function_declaration(node.modifiers(), node.asterisk_token(), node.name(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body())
-        unported!("NewFunctionDeclaration")
+        clone_node_from(self.new_function_declaration(node.modifiers(), node.asterisk_token(), node.name(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:2251 (node *ClassDeclaration) Clone
@@ -451,8 +432,7 @@ impl NodeFactory {
     fn clone_type_alias_declaration(&self, node: Node) -> Node {
         match node.kind() {
             SyntaxKind::TypeAliasDeclaration => clone_node_from(self.new_type_alias_declaration(node.modifiers(), node.name(), node.type_parameter_list(), node.type_()), node, self.hooks()),
-            // PORT: NewJSTypeAliasDeclaration is not in ast::NodeFactory yet. Go: self.new_js_type_alias_declaration(node.modifiers(), node.name(), node.type_parameter_list(), node.type_())
-            SyntaxKind::JsTypeAliasDeclaration => unported!("NewJSTypeAliasDeclaration"),
+            SyntaxKind::JsTypeAliasDeclaration => clone_node_from(self.new_js_type_alias_declaration(node.modifiers(), node.name(), node.type_parameter_list(), node.type_()), node, self.hooks()),
             _ => panic!("unexpected kind in TypeAliasDeclaration.Clone: {:?}", node.kind()),
         }
     }
@@ -485,30 +465,25 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:2730 (node *ImportDeclaration) Clone
     fn clone_import_declaration(&self, node: Node) -> Node {
         match node.kind() {
-            // PORT: NewImportDeclaration is not in ast::NodeFactory yet. Go: self.new_import_declaration(node.modifiers(), node.import_clause(), node.module_specifier(), node.attributes())
-            SyntaxKind::ImportDeclaration => unported!("NewImportDeclaration"),
-            // PORT: NewJSImportDeclaration is not in ast::NodeFactory yet. Go: self.new_js_import_declaration(node.modifiers(), node.import_clause(), node.module_specifier(), node.attributes())
-            SyntaxKind::JsImportDeclaration => unported!("NewJSImportDeclaration"),
+            SyntaxKind::ImportDeclaration => clone_node_from(self.new_import_declaration(node.modifiers(), node.import_clause(), node.module_specifier(), node.attributes()), node, self.hooks()),
+            SyntaxKind::JsImportDeclaration => clone_node_from(self.new_js_import_declaration(node.modifiers(), node.import_clause(), node.module_specifier(), node.attributes()), node, self.hooks()),
             _ => panic!("unexpected kind in ImportDeclaration.Clone: {:?}", node.kind()),
         }
     }
 
     // Go: ast/ast_generated.go:2786 (node *ExternalModuleReference) Clone
     fn clone_external_module_reference(&self, node: Node) -> Node {
-        // PORT: NewExternalModuleReference is not in ast::NodeFactory yet. Go: self.new_external_module_reference(node.expression())
-        unported!("NewExternalModuleReference")
+        clone_node_from(self.new_external_module_reference(node.expression()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:2830 (node *NamespaceImport) Clone
     fn clone_namespace_import(&self, node: Node) -> Node {
-        // PORT: NewNamespaceImport is not in ast::NodeFactory yet. Go: self.new_namespace_import(node.name())
-        unported!("NewNamespaceImport")
+        clone_node_from(self.new_namespace_import(node.name()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:2877 (node *NamedImports) Clone
     fn clone_named_imports(&self, node: Node) -> Node {
-        // PORT: NewNamedImports is not in ast::NodeFactory yet. Go: self.new_named_imports(node.element_list())
-        unported!("NewNamedImports")
+        clone_node_from(self.new_named_imports(node.element_list()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:2927 (node *ExportAssignment) Clone
@@ -518,14 +493,12 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:2969 (node *NamespaceExportDeclaration) Clone
     fn clone_namespace_export_declaration(&self, node: Node) -> Node {
-        // PORT: NewNamespaceExportDeclaration is not in ast::NodeFactory yet. Go: self.new_namespace_export_declaration(node.modifiers(), node.name())
-        unported!("NewNamespaceExportDeclaration")
+        clone_node_from(self.new_namespace_export_declaration(node.modifiers(), node.name()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:3012 (node *NamespaceExport) Clone
     fn clone_namespace_export(&self, node: Node) -> Node {
-        // PORT: NewNamespaceExport is not in ast::NodeFactory yet. Go: self.new_namespace_export(node.name())
-        unported!("NewNamespaceExport")
+        clone_node_from(self.new_namespace_export(node.name()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:3059 (node *NamedExports) Clone
@@ -555,20 +528,17 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:3300 (node *GetAccessorDeclaration) Clone
     fn clone_get_accessor_declaration(&self, node: Node) -> Node {
-        // PORT: NewGetAccessorDeclaration is not in ast::NodeFactory yet. Go: self.new_get_accessor_declaration(node.modifiers(), node.name(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body())
-        unported!("NewGetAccessorDeclaration")
+        clone_node_from(self.new_get_accessor_declaration(node.modifiers(), node.name(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:3353 (node *SetAccessorDeclaration) Clone
     fn clone_set_accessor_declaration(&self, node: Node) -> Node {
-        // PORT: NewSetAccessorDeclaration is not in ast::NodeFactory yet. Go: self.new_set_accessor_declaration(node.modifiers(), node.name(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body())
-        unported!("NewSetAccessorDeclaration")
+        clone_node_from(self.new_set_accessor_declaration(node.modifiers(), node.name(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:3402 (node *IndexSignatureDeclaration) Clone
     fn clone_index_signature_declaration(&self, node: Node) -> Node {
-        // PORT: NewIndexSignatureDeclaration is not in ast::NodeFactory yet. Go: self.new_index_signature_declaration(node.modifiers(), node.parameter_list(), node.type_())
-        unported!("NewIndexSignatureDeclaration")
+        clone_node_from(self.new_index_signature_declaration(node.modifiers(), node.parameter_list(), node.type_()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:3453 (node *MethodSignatureDeclaration) Clone
@@ -578,14 +548,12 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:3516 (node *MethodDeclaration) Clone
     fn clone_method_declaration(&self, node: Node) -> Node {
-        // PORT: NewMethodDeclaration is not in ast::NodeFactory yet. Go: self.new_method_declaration(node.modifiers(), node.asterisk_token(), node.name(), node.postfix_token(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body())
-        unported!("NewMethodDeclaration")
+        clone_node_from(self.new_method_declaration(node.modifiers(), node.asterisk_token(), node.name(), node.postfix_token(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:3570 (node *PropertySignatureDeclaration) Clone
     fn clone_property_signature_declaration(&self, node: Node) -> Node {
-        // PORT: NewPropertySignatureDeclaration is not in ast::NodeFactory yet. Go: self.new_property_signature_declaration(node.modifiers(), node.name(), node.postfix_token(), node.type_(), node.initializer())
-        unported!("NewPropertySignatureDeclaration")
+        clone_node_from(self.new_property_signature_declaration(node.modifiers(), node.name(), node.postfix_token(), node.type_(), node.initializer()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:3624 (node *PropertyDeclaration) Clone
@@ -595,20 +563,17 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:3651 (node *SemicolonClassElement) Clone
     fn clone_semicolon_class_element(&self, node: Node) -> Node {
-        // PORT: NewSemicolonClassElement is not in ast::NodeFactory yet. Go: self.new_semicolon_class_element()
-        unported!("NewSemicolonClassElement")
+        clone_node_from(self.new_semicolon_class_element(), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:3696 (node *ClassStaticBlockDeclaration) Clone
     fn clone_class_static_block_declaration(&self, node: Node) -> Node {
-        // PORT: NewClassStaticBlockDeclaration is not in ast::NodeFactory yet. Go: self.new_class_static_block_declaration(node.modifiers(), node.body())
-        unported!("NewClassStaticBlockDeclaration")
+        clone_node_from(self.new_class_static_block_declaration(node.modifiers(), node.body()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:3717 (node *OmittedExpression) Clone
     fn clone_omitted_expression(&self, node: Node) -> Node {
-        // PORT: NewOmittedExpression is not in ast::NodeFactory yet. Go: self.new_omitted_expression()
-        unported!("NewOmittedExpression")
+        clone_node_from(self.new_omitted_expression(), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:3739 (node *KeywordExpression) Clone
@@ -638,8 +603,7 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:3870 (node *NoSubstitutionTemplateLiteral) Clone
     fn clone_no_substitution_template_literal(&self, node: Node) -> Node {
-        // PORT: NewNoSubstitutionTemplateLiteral is not in ast::NodeFactory yet. Go: self.new_no_substitution_template_literal(node.text(), node.template_flags())
-        unported!("NewNoSubstitutionTemplateLiteral")
+        clone_node_from(self.new_no_substitution_template_literal(node.text(), node.template_flags()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:3922 (node *BinaryExpression) Clone
@@ -654,8 +618,7 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:4006 (node *PostfixUnaryExpression) Clone
     fn clone_postfix_unary_expression(&self, node: Node) -> Node {
-        // PORT: NewPostfixUnaryExpression is not in ast::NodeFactory yet. Go: self.new_postfix_unary_expression(node.operand(), node.operator())
-        unported!("NewPostfixUnaryExpression")
+        clone_node_from(self.new_postfix_unary_expression(node.operand(), node.operator()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:4050 (node *YieldExpression) Clone
@@ -665,14 +628,12 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:4105 (node *ArrowFunction) Clone
     fn clone_arrow_function(&self, node: Node) -> Node {
-        // PORT: NewArrowFunction is not in ast::NodeFactory yet. Go: self.new_arrow_function(node.modifiers(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.equals_greater_than_token(), node.body())
-        unported!("NewArrowFunction")
+        clone_node_from(self.new_arrow_function(node.modifiers(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.equals_greater_than_token(), node.body()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:4163 (node *FunctionExpression) Clone
     fn clone_function_expression(&self, node: Node) -> Node {
-        // PORT: NewFunctionExpression is not in ast::NodeFactory yet. Go: self.new_function_expression(node.modifiers(), node.asterisk_token(), node.name(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body())
-        unported!("NewFunctionExpression")
+        clone_node_from(self.new_function_expression(node.modifiers(), node.asterisk_token(), node.name(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:4207 (node *AsExpression) Clone
@@ -712,8 +673,7 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:4544 (node *MetaProperty) Clone
     fn clone_meta_property(&self, node: Node) -> Node {
-        // PORT: NewMetaProperty is not in ast::NodeFactory yet. Go: self.new_meta_property(node.keyword_token(), node.name())
-        unported!("NewMetaProperty")
+        clone_node_from(self.new_meta_property(node.keyword_token(), node.name()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:4588 (node *NonNullExpression) Clone
@@ -728,14 +688,12 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:4667 (node *TemplateExpression) Clone
     fn clone_template_expression(&self, node: Node) -> Node {
-        // PORT: NewTemplateExpression is not in ast::NodeFactory yet. Go: self.new_template_expression(node.head(), node.template_spans())
-        unported!("NewTemplateExpression")
+        clone_node_from(self.new_template_expression(node.head(), node.template_spans()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:4712 (node *TemplateSpan) Clone
     fn clone_template_span(&self, node: Node) -> Node {
-        // PORT: NewTemplateSpan is not in ast::NodeFactory yet. Go: self.new_template_span(node.expression(), node.literal())
-        unported!("NewTemplateSpan")
+        clone_node_from(self.new_template_span(node.expression(), node.literal()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:4767 (node *TaggedTemplateExpression) Clone
@@ -760,8 +718,7 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:4940 (node *SpreadAssignment) Clone
     fn clone_spread_assignment(&self, node: Node) -> Node {
-        // PORT: NewSpreadAssignment is not in ast::NodeFactory yet. Go: self.new_spread_assignment(node.expression())
-        unported!("NewSpreadAssignment")
+        clone_node_from(self.new_spread_assignment(node.expression()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:4990 (node *PropertyAssignment) Clone
@@ -771,8 +728,7 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:5047 (node *ShorthandPropertyAssignment) Clone
     fn clone_shorthand_property_assignment(&self, node: Node) -> Node {
-        // PORT: NewShorthandPropertyAssignment is not in ast::NodeFactory yet. Go: self.new_shorthand_property_assignment(node.modifiers(), node.name(), node.postfix_token(), node.type_(), node.equals_token(), node.object_assignment_initializer())
-        unported!("NewShorthandPropertyAssignment")
+        clone_node_from(self.new_shorthand_property_assignment(node.modifiers(), node.name(), node.postfix_token(), node.type_(), node.equals_token(), node.object_assignment_initializer()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:5089 (node *DeleteExpression) Clone
@@ -958,272 +914,227 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:6470 (node *SyntheticExpression) Clone
     fn clone_synthetic_expression(&self, node: Node) -> Node {
-        // PORT: NewSyntheticExpression is not in ast::NodeFactory yet. Go: self.new_synthetic_expression(node.type_(), node.is_spread(), node.tuple_name_source())
-        unported!("NewSyntheticExpression")
+        clone_node_from(self.new_synthetic_expression(synthetic_expression_type(node), node.is_spread(), node.tuple_name_source()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:6508 (node *PartiallyEmittedExpression) Clone
     fn clone_partially_emitted_expression(&self, node: Node) -> Node {
-        // PORT: NewPartiallyEmittedExpression is not in ast::NodeFactory yet. Go: self.new_partially_emitted_expression(node.expression())
-        unported!("NewPartiallyEmittedExpression")
+        clone_node_from(self.new_partially_emitted_expression(node.expression()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:6555 (node *JsxElement) Clone
     fn clone_jsx_element(&self, node: Node) -> Node {
-        // PORT: NewJsxElement is not in ast::NodeFactory yet. Go: self.new_jsx_element(node.opening_element(), node.children(), node.closing_element())
-        unported!("NewJsxElement")
+        clone_node_from(self.new_jsx_element(node.opening_element(), node.children(), node.closing_element()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:6595 (node *JsxAttributes) Clone
     fn clone_jsx_attributes(&self, node: Node) -> Node {
-        // PORT: NewJsxAttributes is not in ast::NodeFactory yet. Go: self.new_jsx_attributes(node.property_list())
-        unported!("NewJsxAttributes")
+        clone_node_from(self.new_jsx_attributes(node.property_list()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:6636 (node *JsxNamespacedName) Clone
     fn clone_jsx_namespaced_name(&self, node: Node) -> Node {
-        // PORT: NewJsxNamespacedName is not in ast::NodeFactory yet. Go: self.new_jsx_namespaced_name(node.namespace(), node.name())
-        unported!("NewJsxNamespacedName")
+        clone_node_from(self.new_jsx_namespaced_name(node.namespace(), node.name()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:6683 (node *JsxOpeningElement) Clone
     fn clone_jsx_opening_element(&self, node: Node) -> Node {
-        // PORT: NewJsxOpeningElement is not in ast::NodeFactory yet. Go: self.new_jsx_opening_element(node.tag_name(), node.type_argument_list(), node.attributes())
-        unported!("NewJsxOpeningElement")
+        clone_node_from(self.new_jsx_opening_element(node.tag_name(), node.type_argument_list(), node.attributes()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:6726 (node *JsxSelfClosingElement) Clone
     fn clone_jsx_self_closing_element(&self, node: Node) -> Node {
-        // PORT: NewJsxSelfClosingElement is not in ast::NodeFactory yet. Go: self.new_jsx_self_closing_element(node.tag_name(), node.type_argument_list(), node.attributes())
-        unported!("NewJsxSelfClosingElement")
+        clone_node_from(self.new_jsx_self_closing_element(node.tag_name(), node.type_argument_list(), node.attributes()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:6769 (node *JsxFragment) Clone
     fn clone_jsx_fragment(&self, node: Node) -> Node {
-        // PORT: NewJsxFragment is not in ast::NodeFactory yet. Go: self.new_jsx_fragment(node.opening_fragment(), node.children(), node.closing_fragment())
-        unported!("NewJsxFragment")
+        clone_node_from(self.new_jsx_fragment(node.opening_fragment(), node.children(), node.closing_fragment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:6790 (node *JsxOpeningFragment) Clone
     fn clone_jsx_opening_fragment(&self, node: Node) -> Node {
-        // PORT: NewJsxOpeningFragment is not in ast::NodeFactory yet. Go: self.new_jsx_opening_fragment()
-        unported!("NewJsxOpeningFragment")
+        clone_node_from(self.new_jsx_opening_fragment(), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:6811 (node *JsxClosingFragment) Clone
     fn clone_jsx_closing_fragment(&self, node: Node) -> Node {
-        // PORT: NewJsxClosingFragment is not in ast::NodeFactory yet. Go: self.new_jsx_closing_fragment()
-        unported!("NewJsxClosingFragment")
+        clone_node_from(self.new_jsx_closing_fragment(), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:6853 (node *JsxAttribute) Clone
     fn clone_jsx_attribute(&self, node: Node) -> Node {
-        // PORT: NewJsxAttribute is not in ast::NodeFactory yet. Go: self.new_jsx_attribute(node.name(), node.initializer())
-        unported!("NewJsxAttribute")
+        clone_node_from(self.new_jsx_attribute(node.name(), node.initializer()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:6896 (node *JsxSpreadAttribute) Clone
     fn clone_jsx_spread_attribute(&self, node: Node) -> Node {
-        // PORT: NewJsxSpreadAttribute is not in ast::NodeFactory yet. Go: self.new_jsx_spread_attribute(node.expression())
-        unported!("NewJsxSpreadAttribute")
+        clone_node_from(self.new_jsx_spread_attribute(node.expression()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:6934 (node *JsxClosingElement) Clone
     fn clone_jsx_closing_element(&self, node: Node) -> Node {
-        // PORT: NewJsxClosingElement is not in ast::NodeFactory yet. Go: self.new_jsx_closing_element(node.tag_name())
-        unported!("NewJsxClosingElement")
+        clone_node_from(self.new_jsx_closing_element(node.tag_name()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:6974 (node *JsxExpression) Clone
     fn clone_jsx_expression(&self, node: Node) -> Node {
-        // PORT: NewJsxExpression is not in ast::NodeFactory yet. Go: self.new_jsx_expression(node.dot_dot_dot_token(), node.expression())
-        unported!("NewJsxExpression")
+        clone_node_from(self.new_jsx_expression(node.dot_dot_dot_token(), node.expression()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7000 (node *JsxText) Clone
     fn clone_jsx_text(&self, node: Node) -> Node {
-        // PORT: NewJsxText is not in ast::NodeFactory yet. Go: self.new_jsx_text(node.text(), node.contains_only_trivia_white_spaces())
-        unported!("NewJsxText")
+        clone_node_from(self.new_jsx_text(node.text(), node.contains_only_trivia_white_spaces()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7039 (node *SyntaxList) Clone
     fn clone_syntax_list(&self, node: Node) -> Node {
-        // PORT: NewSyntaxList is not in ast::NodeFactory yet. Go: self.new_syntax_list(node.children())
-        unported!("NewSyntaxList")
+        clone_node_from(self.new_syntax_list(&syntax_list_children(node)), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7079 (node *JSDoc) Clone
     fn clone_js_doc(&self, node: Node) -> Node {
-        // PORT: NewJSDoc is not in ast::NodeFactory yet. Go: self.new_js_doc(node.comment(), node.tags())
-        unported!("NewJSDoc")
+        clone_node_from(self.new_js_doc(node.comment(), node.tags()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7117 (node *JSDocTypeExpression) Clone
     fn clone_js_doc_type_expression(&self, node: Node) -> Node {
-        // PORT: NewJSDocTypeExpression is not in ast::NodeFactory yet. Go: self.new_js_doc_type_expression(node.type_())
-        unported!("NewJSDocTypeExpression")
+        clone_node_from(self.new_js_doc_type_expression(node.type_()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7155 (node *JSDocNonNullableType) Clone
     fn clone_js_doc_non_nullable_type(&self, node: Node) -> Node {
-        // PORT: NewJSDocNonNullableType is not in ast::NodeFactory yet. Go: self.new_js_doc_non_nullable_type(node.type_())
-        unported!("NewJSDocNonNullableType")
+        clone_node_from(self.new_js_doc_non_nullable_type(node.type_()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7193 (node *JSDocNullableType) Clone
     fn clone_js_doc_nullable_type(&self, node: Node) -> Node {
-        // PORT: NewJSDocNullableType is not in ast::NodeFactory yet. Go: self.new_js_doc_nullable_type(node.type_())
-        unported!("NewJSDocNullableType")
+        clone_node_from(self.new_js_doc_nullable_type(node.type_()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7214 (node *JSDocAllType) Clone
     fn clone_js_doc_all_type(&self, node: Node) -> Node {
-        // PORT: NewJSDocAllType is not in ast::NodeFactory yet. Go: self.new_js_doc_all_type()
-        unported!("NewJSDocAllType")
+        clone_node_from(self.new_js_doc_all_type(), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7252 (node *JSDocVariadicType) Clone
     fn clone_js_doc_variadic_type(&self, node: Node) -> Node {
-        // PORT: NewJSDocVariadicType is not in ast::NodeFactory yet. Go: self.new_js_doc_variadic_type(node.type_())
-        unported!("NewJSDocVariadicType")
+        clone_node_from(self.new_js_doc_variadic_type(node.type_()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7290 (node *JSDocOptionalType) Clone
     fn clone_js_doc_optional_type(&self, node: Node) -> Node {
-        // PORT: NewJSDocOptionalType is not in ast::NodeFactory yet. Go: self.new_js_doc_optional_type(node.type_())
-        unported!("NewJSDocOptionalType")
+        clone_node_from(self.new_js_doc_optional_type(node.type_()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7330 (node *JSDocTypeTag) Clone
     fn clone_js_doc_type_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocTypeTag is not in ast::NodeFactory yet. Go: self.new_js_doc_type_tag(node.tag_name(), node.type_expression(), node.comment())
-        unported!("NewJSDocTypeTag")
+        clone_node_from(self.new_js_doc_type_tag(node.tag_name(), node.type_expression(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7368 (node *JSDocUnknownTag) Clone
     fn clone_js_doc_unknown_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocUnknownTag is not in ast::NodeFactory yet. Go: self.new_js_doc_unknown_tag(node.tag_name(), node.comment())
-        unported!("NewJSDocUnknownTag")
+        clone_node_from(self.new_js_doc_unknown_tag(node.tag_name(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7413 (node *JSDocTemplateTag) Clone
     fn clone_js_doc_template_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocTemplateTag is not in ast::NodeFactory yet. Go: self.new_js_doc_template_tag(node.tag_name(), node.constraint(), node.type_parameter_list(), node.comment())
-        unported!("NewJSDocTemplateTag")
+        clone_node_from(self.new_js_doc_template_tag(node.tag_name(), node.constraint(), node.type_parameter_list(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7453 (node *JSDocReturnTag) Clone
     fn clone_js_doc_return_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocReturnTag is not in ast::NodeFactory yet. Go: self.new_js_doc_return_tag(node.tag_name(), node.type_expression(), node.comment())
-        unported!("NewJSDocReturnTag")
+        clone_node_from(self.new_js_doc_return_tag(node.tag_name(), node.type_expression(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7491 (node *JSDocPublicTag) Clone
     fn clone_js_doc_public_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocPublicTag is not in ast::NodeFactory yet. Go: self.new_js_doc_public_tag(node.tag_name(), node.comment())
-        unported!("NewJSDocPublicTag")
+        clone_node_from(self.new_js_doc_public_tag(node.tag_name(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7529 (node *JSDocPrivateTag) Clone
     fn clone_js_doc_private_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocPrivateTag is not in ast::NodeFactory yet. Go: self.new_js_doc_private_tag(node.tag_name(), node.comment())
-        unported!("NewJSDocPrivateTag")
+        clone_node_from(self.new_js_doc_private_tag(node.tag_name(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7567 (node *JSDocProtectedTag) Clone
     fn clone_js_doc_protected_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocProtectedTag is not in ast::NodeFactory yet. Go: self.new_js_doc_protected_tag(node.tag_name(), node.comment())
-        unported!("NewJSDocProtectedTag")
+        clone_node_from(self.new_js_doc_protected_tag(node.tag_name(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7605 (node *JSDocReadonlyTag) Clone
     fn clone_js_doc_readonly_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocReadonlyTag is not in ast::NodeFactory yet. Go: self.new_js_doc_readonly_tag(node.tag_name(), node.comment())
-        unported!("NewJSDocReadonlyTag")
+        clone_node_from(self.new_js_doc_readonly_tag(node.tag_name(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7643 (node *JSDocOverrideTag) Clone
     fn clone_js_doc_override_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocOverrideTag is not in ast::NodeFactory yet. Go: self.new_js_doc_override_tag(node.tag_name(), node.comment())
-        unported!("NewJSDocOverrideTag")
+        clone_node_from(self.new_js_doc_override_tag(node.tag_name(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7681 (node *JSDocDeprecatedTag) Clone
     fn clone_js_doc_deprecated_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocDeprecatedTag is not in ast::NodeFactory yet. Go: self.new_js_doc_deprecated_tag(node.tag_name(), node.comment())
-        unported!("NewJSDocDeprecatedTag")
+        clone_node_from(self.new_js_doc_deprecated_tag(node.tag_name(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7721 (node *JSDocSeeTag) Clone
     fn clone_js_doc_see_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocSeeTag is not in ast::NodeFactory yet. Go: self.new_js_doc_see_tag(node.tag_name(), node.name_expression(), node.comment())
-        unported!("NewJSDocSeeTag")
+        clone_node_from(self.new_js_doc_see_tag(node.tag_name(), node.name_expression(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7761 (node *JSDocImplementsTag) Clone
     fn clone_js_doc_implements_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocImplementsTag is not in ast::NodeFactory yet. Go: self.new_js_doc_implements_tag(node.tag_name(), node.class_name(), node.comment())
-        unported!("NewJSDocImplementsTag")
+        clone_node_from(self.new_js_doc_implements_tag(node.tag_name(), node.class_name(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7801 (node *JSDocAugmentsTag) Clone
     fn clone_js_doc_augments_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocAugmentsTag is not in ast::NodeFactory yet. Go: self.new_js_doc_augments_tag(node.tag_name(), node.class_name(), node.comment())
-        unported!("NewJSDocAugmentsTag")
+        clone_node_from(self.new_js_doc_augments_tag(node.tag_name(), node.class_name(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7841 (node *JSDocSatisfiesTag) Clone
     fn clone_js_doc_satisfies_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocSatisfiesTag is not in ast::NodeFactory yet. Go: self.new_js_doc_satisfies_tag(node.tag_name(), node.type_expression(), node.comment())
-        unported!("NewJSDocSatisfiesTag")
+        clone_node_from(self.new_js_doc_satisfies_tag(node.tag_name(), node.type_expression(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7881 (node *JSDocThrowsTag) Clone
     fn clone_js_doc_throws_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocThrowsTag is not in ast::NodeFactory yet. Go: self.new_js_doc_throws_tag(node.tag_name(), node.type_expression(), node.comment())
-        unported!("NewJSDocThrowsTag")
+        clone_node_from(self.new_js_doc_throws_tag(node.tag_name(), node.type_expression(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7921 (node *JSDocThisTag) Clone
     fn clone_js_doc_this_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocThisTag is not in ast::NodeFactory yet. Go: self.new_js_doc_this_tag(node.tag_name(), node.type_expression(), node.comment())
-        unported!("NewJSDocThisTag")
+        clone_node_from(self.new_js_doc_this_tag(node.tag_name(), node.type_expression(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:7969 (node *JSDocImportTag) Clone
     fn clone_js_doc_import_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocImportTag is not in ast::NodeFactory yet. Go: self.new_js_doc_import_tag(node.tag_name(), node.import_clause(), node.module_specifier(), node.attributes(), node.comment())
-        unported!("NewJSDocImportTag")
+        clone_node_from(self.new_js_doc_import_tag(node.tag_name(), node.import_clause(), node.module_specifier(), node.attributes(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8014 (node *JSDocCallbackTag) Clone
     fn clone_js_doc_callback_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocCallbackTag is not in ast::NodeFactory yet. Go: self.new_js_doc_callback_tag(node.tag_name(), node.type_expression(), node.name(), node.comment())
-        unported!("NewJSDocCallbackTag")
+        clone_node_from(self.new_js_doc_callback_tag(node.tag_name(), node.type_expression(), node.name(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8058 (node *JSDocOverloadTag) Clone
     fn clone_js_doc_overload_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocOverloadTag is not in ast::NodeFactory yet. Go: self.new_js_doc_overload_tag(node.tag_name(), node.type_expression(), node.comment())
-        unported!("NewJSDocOverloadTag")
+        clone_node_from(self.new_js_doc_overload_tag(node.tag_name(), node.type_expression(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8103 (node *JSDocTypedefTag) Clone
     fn clone_js_doc_typedef_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocTypedefTag is not in ast::NodeFactory yet. Go: self.new_js_doc_typedef_tag(node.tag_name(), node.type_expression(), node.name(), node.comment())
-        unported!("NewJSDocTypedefTag")
+        clone_node_from(self.new_js_doc_typedef_tag(node.tag_name(), node.type_expression(), node.name(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8147 (node *JSDocSignature) Clone
     fn clone_js_doc_signature(&self, node: Node) -> Node {
-        // PORT: NewJSDocSignature is not in ast::NodeFactory yet. Go: self.new_js_doc_signature(node.type_parameter_list(), node.parameter_list(), node.type_())
-        unported!("NewJSDocSignature")
+        clone_node_from(self.new_js_doc_signature(node.type_parameter_list(), node.parameter_list(), node.type_()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8185 (node *JSDocNameReference) Clone
     fn clone_js_doc_name_reference(&self, node: Node) -> Node {
-        // PORT: NewJSDocNameReference is not in ast::NodeFactory yet. Go: self.new_js_doc_name_reference(node.name())
-        unported!("NewJSDocNameReference")
+        clone_node_from(self.new_js_doc_name_reference(node.name()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8246 (node *ModuleDeclaration) Clone
@@ -1233,8 +1144,7 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:8297 (node *ImportEqualsDeclaration) Clone
     fn clone_import_equals_declaration(&self, node: Node) -> Node {
-        // PORT: NewImportEqualsDeclaration is not in ast::NodeFactory yet. Go: self.new_import_equals_declaration(node.modifiers(), node.is_type_only(), node.name(), node.module_reference())
-        unported!("NewImportEqualsDeclaration")
+        clone_node_from(self.new_import_equals_declaration(node.modifiers(), node.is_type_only(), node.name(), node.module_reference()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8352 (node *ExportDeclaration) Clone
@@ -1249,38 +1159,52 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:8445 (node *ImportClause) Clone
     fn clone_import_clause(&self, node: Node) -> Node {
-        // PORT: NewImportClause is not in ast::NodeFactory yet. Go: self.new_import_clause(node.phase_modifier(), node.name(), node.named_bindings())
-        unported!("NewImportClause")
+        clone_node_from(self.new_import_clause(node.phase_modifier(), node.name(), node.named_bindings()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8494 (node *ImportSpecifier) Clone
     fn clone_import_specifier(&self, node: Node) -> Node {
-        // PORT: NewImportSpecifier is not in ast::NodeFactory yet. Go: self.new_import_specifier(node.is_type_only(), node.property_name(), node.name())
-        unported!("NewImportSpecifier")
+        clone_node_from(self.new_import_specifier(node.is_type_only(), node.property_name(), node.name()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8521 (node *JSDocText) Clone
     fn clone_js_doc_text(&self, node: Node) -> Node {
-        // PORT: NewJSDocText is not in ast::NodeFactory yet. Go: self.new_js_doc_text(node.text())
-        unported!("NewJSDocText")
+        // PORT: `Node::text` joins the parts. Go copies the `[]string`, so the
+        // parts are read from the data.
+        let D::JsDocText(d) = ast_data_of(node) else {
+            panic!("AsJSDocText called on {:?}", node.kind());
+        };
+        clone_node_from(self.new_js_doc_text(d.text.clone()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8561 (node *JSDocLink) Clone
     fn clone_js_doc_link(&self, node: Node) -> Node {
-        // PORT: NewJSDocLink is not in ast::NodeFactory yet. Go: self.new_js_doc_link(node.name(), node.text())
-        unported!("NewJSDocLink")
+        // PORT: `Node::text` joins the parts. Go copies the `[]string`, so the
+        // parts are read from the data.
+        let D::JsDocLink(d) = ast_data_of(node) else {
+            panic!("AsJSDocLink called on {:?}", node.kind());
+        };
+        clone_node_from(self.new_js_doc_link(node.name(), d.text.clone()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8605 (node *JSDocLinkPlain) Clone
     fn clone_js_doc_link_plain(&self, node: Node) -> Node {
-        // PORT: NewJSDocLinkPlain is not in ast::NodeFactory yet. Go: self.new_js_doc_link_plain(node.name(), node.text())
-        unported!("NewJSDocLinkPlain")
+        // PORT: `Node::text` joins the parts. Go copies the `[]string`, so the
+        // parts are read from the data.
+        let D::JsDocLinkPlain(d) = ast_data_of(node) else {
+            panic!("AsJSDocLinkPlain called on {:?}", node.kind());
+        };
+        clone_node_from(self.new_js_doc_link_plain(node.name(), d.text.clone()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8649 (node *JSDocLinkCode) Clone
     fn clone_js_doc_link_code(&self, node: Node) -> Node {
-        // PORT: NewJSDocLinkCode is not in ast::NodeFactory yet. Go: self.new_js_doc_link_code(node.name(), node.text())
-        unported!("NewJSDocLinkCode")
+        // PORT: `Node::text` joins the parts. Go copies the `[]string`, so the
+        // parts are read from the data.
+        let D::JsDocLinkCode(d) = ast_data_of(node) else {
+            panic!("AsJSDocLinkCode called on {:?}", node.kind());
+        };
+        clone_node_from(self.new_js_doc_link_code(node.name(), d.text.clone()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8705 (node *TypeParameterDeclaration) Clone
@@ -1290,26 +1214,23 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:8749 (node *SyntheticReferenceExpression) Clone
     fn clone_synthetic_reference_expression(&self, node: Node) -> Node {
-        // PORT: NewSyntheticReferenceExpression is not in ast::NodeFactory yet. Go: self.new_synthetic_reference_expression(node.expression(), node.this_arg())
-        unported!("NewSyntheticReferenceExpression")
+        clone_node_from(self.new_synthetic_reference_expression(node.expression(), node.this_arg()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8796 (node *JSDocTypeLiteral) Clone
     fn clone_js_doc_type_literal(&self, node: Node) -> Node {
-        // PORT: NewJSDocTypeLiteral is not in ast::NodeFactory yet. Go: self.new_js_doc_type_literal(node.js_doc_property_tags(), node.is_array_type())
-        unported!("NewJSDocTypeLiteral")
+        clone_node_from(self.new_js_doc_type_literal(&node.js_doc_property_tags(), node.is_array_type()), node, self.hooks())
     }
 
     // Go: ast/ast_generated.go:8842 (node *JSDocParameterOrPropertyTag) Clone
     fn clone_js_doc_parameter_or_property_tag(&self, node: Node) -> Node {
-        // PORT: NewJSDocParameterOrPropertyTag is not in ast::NodeFactory yet. Go: self.new_js_doc_parameter_or_property_tag(node.kind(), node.tag_name(), node.name(), node.is_bracketed(), node.type_expression(), node.is_name_first(), node.comment())
-        unported!("NewJSDocParameterOrPropertyTag")
+        clone_node_from(self.new_js_doc_parameter_or_property_tag(node.kind(), node.tag_name(), node.name(), node.is_bracketed(), node.type_expression(), node.is_name_first(), node.comment()), node, self.hooks())
     }
 
     // Go: ast/ast.go:2682 (node *SourceFile) Clone
     fn clone_source_file(&self, node: Node) -> Node {
-        // PORT: NewSourceFile and SourceFile.copyFrom are not in ast::NodeFactory.
-        unported!("NewSourceFile")
+        let updated = self.new_source_file_from(node, node.statement_list(), node.end_of_file_token());
+        clone_node_from(updated, node, self.hooks())
     }
 
 }

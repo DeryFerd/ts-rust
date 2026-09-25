@@ -748,9 +748,123 @@ pub fn is_file_level_unique_name(source_file: Node, name: &str, has_global_name:
     {
         return false;
     }
-    // PORT: `SourceFile.Identifiers` is not in the port's source file data yet.
-    let _ = source_file;
-    unported!("SourceFile.Identifiers")
+    source_file_identifiers(source_file, |identifiers| !identifiers.contains(name))
+}
+
+thread_local! {
+    /// Go `SourceFile.Identifiers`, computed on first use per source file.
+    /// The program is installed once per thread, so a thread cache is safe.
+    static SOURCE_FILE_IDENTIFIERS: RefCell<FxHashMap<Node, Rc<FxHashSet<&'static str>>>> =
+        RefCell::new(FxHashMap::default());
+}
+
+/// Go `sourceFile.Identifiers`: calls `f` with the set of texts that the Go
+/// parser passes to `internIdentifier` for `source_file`.
+// PORT: the Rust parser does not record `Parser.identifiers`, so the set is
+// rebuilt from the tree with the same rules as the Go parser (see
+// `collect_interned_texts`). It is cached per file.
+fn source_file_identifiers<R>(source_file: Node, f: impl FnOnce(&FxHashSet<&'static str>) -> R) -> R {
+    let cached = SOURCE_FILE_IDENTIFIERS.with(|cache| cache.borrow().get(&source_file).cloned());
+    let identifiers = match cached {
+        Some(identifiers) => identifiers,
+        None => {
+            let mut identifiers = FxHashSet::default();
+            collect_interned_texts(source_file, source_file, &mut identifiers);
+            let identifiers = Rc::new(identifiers);
+            SOURCE_FILE_IDENTIFIERS.with(|cache| cache.borrow_mut().insert(source_file, identifiers.clone()));
+            identifiers
+        }
+    };
+    f(&identifiers)
+}
+
+/// Adds the texts that Go `Parser.internIdentifier` records for `node` and
+/// its subtree (including parsed JSDoc) to `out`.
+// PORT: Go interns these texts:
+// - identifiers from `createIdentifier` and JSDoc `parseJSDocIdentifierName`
+//   (missing identifiers have text "" and are not interned),
+// - private identifiers,
+// - string, numeric and bigint literal property names (`parsePropertyName`),
+// - string literal names of ambient modules and module specifiers
+//   (`parseModuleSpecifier`),
+// - string, no-substitution template and numeric literal arguments of
+//   element access expressions.
+// Identifiers that the JS reparser creates (`this`) are not interned by Go;
+// they are only in JS files and are collected here too.
+// JSDoc that is not parsed yet (`has_lazy_js_doc`) is not visited, because
+// the lazy JSDoc parser hook is not ported.
+fn collect_interned_texts(node: Node, source_file: Node, out: &mut FxHashSet<&'static str>) {
+    match node.kind() {
+        SyntaxKind::Identifier => {
+            let text = node.text();
+            if !text.is_empty() {
+                out.insert(text);
+            }
+        }
+        SyntaxKind::PrivateIdentifier => {
+            out.insert(node.text());
+        }
+        SyntaxKind::StringLiteral
+        | SyntaxKind::NumericLiteral
+        | SyntaxKind::BigIntLiteral
+        | SyntaxKind::NoSubstitutionTemplateLiteral => {
+            if is_interned_literal(node) {
+                out.insert(node.text());
+            }
+        }
+        _ => {}
+    }
+    for js_doc in node.eager_js_doc(source_file).iter() {
+        collect_interned_texts(js_doc, source_file, out);
+    }
+    node.for_each_child(|child| {
+        collect_interned_texts(child, source_file, out);
+        false
+    });
+}
+
+/// Reports whether the Go parser interns the text of the literal `node`
+/// (`parseLiteralExpression(true)` or `parseElementAccessExpressionRest`).
+fn is_interned_literal(node: Node) -> bool {
+    let parent = node.parent();
+    if parent.is_nil() {
+        return false;
+    }
+    let kind = node.kind();
+    match parent.kind() {
+        // parsePropertyName
+        SyntaxKind::PropertyDeclaration
+        | SyntaxKind::MethodDeclaration
+        | SyntaxKind::GetAccessor
+        | SyntaxKind::SetAccessor
+        | SyntaxKind::PropertySignature
+        | SyntaxKind::MethodSignature
+        | SyntaxKind::EnumMember
+        | SyntaxKind::PropertyAssignment => {
+            matches!(kind, SyntaxKind::StringLiteral | SyntaxKind::NumericLiteral | SyntaxKind::BigIntLiteral)
+                && parent.name() == node
+        }
+        SyntaxKind::BindingElement => {
+            matches!(kind, SyntaxKind::StringLiteral | SyntaxKind::NumericLiteral | SyntaxKind::BigIntLiteral)
+                && parent.property_name() == node
+        }
+        // parseAmbientExternalModuleDeclaration
+        SyntaxKind::ModuleDeclaration => kind == SyntaxKind::StringLiteral && parent.name() == node,
+        // parseModuleSpecifier
+        SyntaxKind::ImportDeclaration
+        | SyntaxKind::JsImportDeclaration
+        | SyntaxKind::ExportDeclaration
+        | SyntaxKind::JsDocImportTag => kind == SyntaxKind::StringLiteral && parent.module_specifier() == node,
+        SyntaxKind::ExternalModuleReference => kind == SyntaxKind::StringLiteral && parent.expression() == node,
+        // parseElementAccessExpressionRest
+        SyntaxKind::ElementAccessExpression => {
+            matches!(
+                kind,
+                SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral | SyntaxKind::NumericLiteral
+            ) && parent.argument_expression() == node
+        }
+        _ => false,
+    }
 }
 
 // Go: printer/utilities.go:659 hasLeadingHash

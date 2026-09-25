@@ -10,7 +10,7 @@
 //! runes with `utf8_decode_rune_in_string`, which follows Go
 //! `utf8.DecodeRuneInString` also at a non-boundary position.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use crate::flags_macros::go_flags;
 use std::borrow::Cow;
 

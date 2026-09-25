@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::cell::OnceCell;
 use std::rc::Weak;
 
@@ -67,6 +67,8 @@ pub struct ParsedCommandLine {
     pub source_and_output_maps: OnceCell<SourceAndOutputMaps>,
 
     pub common_source_directory: OnceCell<String>,
+    /// Go appends these to `Errors` from `CommonSourceDirectory`.
+    pub common_source_directory_errors: RefCell<Vec<Diagnostic>>,
 
     pub resolved_project_reference_paths: OnceCell<Vec<String>>,
 
@@ -154,12 +156,12 @@ impl ParsedCommandLine {
     }
 
     // Go: tsoptions/parsedcommandline.go:122 (*ParsedCommandLine).CommonSourceDirectory
-    // PORT: `outputpaths.GetCommonSourceDirectory` is out of scope. Go also
-    // passes `checkSourceFilesBelongToPath`, which appends to `Errors`; a
-    // port must give that callback mutable access to `errors`.
+    // PORT: Go passes `checkSourceFilesBelongToPath`, which appends to
+    // `Errors`. This method takes `&self`, so those diagnostics go to
+    // `common_source_directory_errors` instead.
     pub fn common_source_directory(&self) -> &str {
         self.common_source_directory.get_or_init(|| {
-            let _files = || -> Vec<String> {
+            let files = || -> Vec<String> {
                 self.parsed_config
                     .file_names
                     .iter()
@@ -171,12 +173,21 @@ impl ParsedCommandLine {
                     .cloned()
                     .collect()
             };
-            unported!("outputpaths.GetCommonSourceDirectory")
+            let mut check = |source_files: &[String], root_directory: &str| -> bool {
+                self.check_source_files_belong_to_path(source_files, root_directory)
+            };
+            get_common_source_directory(
+                &self.parsed_config.compiler_options,
+                files,
+                self.get_current_directory(),
+                self.use_case_sensitive_file_names(),
+                Some(&mut check),
+            )
         })
     }
 
     // Go: tsoptions/parsedcommandline.go:141 (*ParsedCommandLine).checkSourceFilesBelongToPath
-    pub fn check_source_files_belong_to_path(&mut self, source_files: &[String], root_directory: &str) -> bool {
+    pub fn check_source_files_belong_to_path(&self, source_files: &[String], root_directory: &str) -> bool {
         let mut all_files_belong_to_path = true;
         for file in source_files {
             let absolute_source_file_path = get_canonical_file_name(
@@ -184,7 +195,7 @@ impl ParsedCommandLine {
                 self.use_case_sensitive_file_names(),
             );
             if !contains_path(root_directory, file, &self.compare_paths_options) {
-                self.errors.push(new_compiler_diagnostic(
+                self.common_source_directory_errors.borrow_mut().push(new_compiler_diagnostic(
                     diag::File_0_is_not_under_rootDir_1_rootDir_is_expected_to_contain_all_source_files,
                     args![absolute_source_file_path, root_directory],
                 ));
@@ -212,7 +223,7 @@ impl ParsedCommandLine {
         for file_name in &self.parsed_config.file_names {
             let mut output_dts = String::new();
             if !is_declaration_file_name(file_name) && !file_extension_is(file_name, EXTENSION_JSON) {
-                output_dts = unported!("outputpaths.GetOutputDeclarationFileNameWorker");
+                output_dts = get_output_declaration_file_name_worker(file_name, &self.parsed_config.compiler_options, self);
             }
             result.push((output_dts, file_name.clone()));
         }
@@ -220,22 +231,48 @@ impl ParsedCommandLine {
     }
 
     // Go: tsoptions/parsedcommandline.go:176 (*ParsedCommandLine).GetOutputFileNames
-    // PORT: Go `iter.Seq[string]` is an eager `Vec`. `outputpaths` is out of
-    // scope, so the first file that needs an output name stops here.
+    // PORT: Go `iter.Seq[string]` is an eager `Vec`.
     pub fn get_output_file_names(&self) -> Vec<String> {
-        let result: Vec<String> = Vec::new();
+        let mut result: Vec<String> = Vec::new();
         for file_name in &self.parsed_config.file_names {
             if is_declaration_file_name(file_name) {
                 continue;
             }
-            unported!("outputpaths.GetOutputJSFileName")
+            let opts = &self.parsed_config.compiler_options;
+            let js_file_name = get_output_js_file_name(file_name, opts, self);
+            let is_json = file_extension_is(file_name, EXTENSION_JSON);
+            if !js_file_name.is_empty() {
+                if !is_json {
+                    let source_map = get_source_map_file_path(&js_file_name, opts);
+                    result.push(js_file_name);
+                    if !source_map.is_empty() {
+                        result.push(source_map);
+                    }
+                } else {
+                    result.push(js_file_name);
+                }
+            }
+            if is_json {
+                continue;
+            }
+            if opts.get_emit_declarations() {
+                let dts_file_name = get_output_declaration_file_name_worker(file_name, opts, self);
+                if !dts_file_name.is_empty() {
+                    let are_maps = opts.get_are_declaration_maps_enabled();
+                    let declaration_map = format!("{dts_file_name}.map");
+                    result.push(dts_file_name);
+                    if are_maps {
+                        result.push(declaration_map);
+                    }
+                }
+            }
         }
         result
     }
 
     // Go: tsoptions/parsedcommandline.go:218 (*ParsedCommandLine).GetBuildInfoFileName
     pub fn get_build_info_file_name(&self) -> String {
-        unported!("outputpaths.GetBuildInfoFileName")
+        get_build_info_file_name(&self.parsed_config.compiler_options, &self.compare_paths_options)
     }
 
     // Go: tsoptions/parsedcommandline.go:223 (*ParsedCommandLine).WildcardDirectories
@@ -339,7 +376,7 @@ impl ParsedCommandLine {
     pub fn get_config_file_parsing_diagnostics(&self) -> Vec<Diagnostic> {
         if let Some(config_file) = &self.config_file {
             // todo: !!! should be ConfigFile.ParseDiagnostics, check if they are the same
-            let mut result = source_file_diagnostics(config_file.source_file).to_vec();
+            let mut result = parsed_source_file_diagnostics(config_file.source_file).to_vec();
             result.extend(self.errors.iter().cloned());
             return result;
         }
@@ -428,9 +465,9 @@ impl ParsedCommandLine {
     pub fn reload_file_names_of_parsed_command_line(&self, fs: &dyn Fs) -> ParsedCommandLine {
         let mut parsed_config = self.parsed_config.clone();
         let (file_names, literal_file_names_len) = get_file_names_from_config_specs(
-            self.config_file_specs().clone(),
+            self.config_file_specs(),
             self.get_current_directory(),
-            self.compiler_options(),
+            Some(&**self.compiler_options()),
             fs,
             &self.extra_file_extensions,
         );
@@ -454,5 +491,28 @@ impl ParsedCommandLine {
     pub fn locale(&self) -> ! {
         let _ = &self.parsed_config.compiler_options.locale;
         unported!("locale.Parse")
+    }
+}
+
+// Go: `*ParsedCommandLine` implements `module.ResolvedProjectReference`.
+impl ModuleResolvedProjectReference for ParsedCommandLine {
+    fn config_name(&self) -> &str {
+        ParsedCommandLine::config_name(self)
+    }
+    fn compiler_options(&self) -> Option<Rc<CompilerOptions>> {
+        Some(ParsedCommandLine::compiler_options(self).clone())
+    }
+}
+
+// Go: `*ParsedCommandLine` implements `outputpaths.OutputPathsHost`.
+impl OutputPathsHost for ParsedCommandLine {
+    fn common_source_directory(&self) -> String {
+        ParsedCommandLine::common_source_directory(self).to_string()
+    }
+    fn get_current_directory(&self) -> String {
+        ParsedCommandLine::get_current_directory(self).to_string()
+    }
+    fn use_case_sensitive_file_names(&self) -> bool {
+        ParsedCommandLine::use_case_sensitive_file_names(self)
     }
 }

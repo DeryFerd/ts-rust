@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::sync::LazyLock;
 
 // This file ports tsoptions/declscompiler.go, namemap.go, declsbuild.go,

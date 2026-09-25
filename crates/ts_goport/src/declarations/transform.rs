@@ -438,16 +438,19 @@ impl DeclarationTransformer {
         let lib_reference_directives = self.get_lib_references();
         let type_reference_directives = self.get_type_references();
         let referenced_files = self.get_referenced_files(&output_file_path);
+        // PORT: the result is always a new factory SourceFile (the statement
+        // list above is always new), so the Go field writes go to its slot.
+        update_synthetic_source_file(result, |d| {
+            d.lib_reference_directives = lib_reference_directives;
+            d.type_reference_directives = type_reference_directives;
+            d.is_declaration_file = true;
+            d.referenced_files = referenced_files;
+        });
         // Go: defer
         self.cjs_export_assignment = Node::NIL;
         self.cjs_export_assignment_name = Node::NIL;
         self.cjs_export_members = Vec::new();
-        // PORT: Go sets `LibReferenceDirectives`, `TypeReferenceDirectives`,
-        // `IsDeclarationFile = true` and `ReferencedFiles` on the result. A
-        // SourceFile keeps these in its `SourceFileInfo`, which a synthetic
-        // SourceFile does not have yet.
-        let _ = (result, lib_reference_directives, type_reference_directives, referenced_files);
-        unported!("SourceFile.LibReferenceDirectives/TypeReferenceDirectives/IsDeclarationFile/ReferencedFiles setters")
+        result
     }
 
     // Go: transformers/declarations/transform.go:384 DeclarationTransformer.transformAndReplaceLatePaintedStatements

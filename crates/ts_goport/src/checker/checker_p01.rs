@@ -993,14 +993,14 @@ impl Checker {
             .bound_symbols
             .get_or_init(|| {
                 let mut symbols = SymbolArena::new();
-                for file in &program.files {
+                for file in program.source_files() {
                     bind_source_file(file.root, &mut symbols);
                 }
                 symbols
             })
             .clone();
         let compiler_options = &program.options;
-        let files: Vec<Node> = program.files.iter().map(|f| f.root).collect();
+        let files: Vec<Node> = program.source_files().map(|f| f.root).collect();
         let file_index_map = create_file_index_map(&files);
         let mut c = Checker {
             id: u32::try_from(checker_index + 1).expect("checker id overflow"),

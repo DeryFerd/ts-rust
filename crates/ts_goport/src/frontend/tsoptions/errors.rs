@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::sync::LazyLock;
 use ts_diagnostics::Message;
 

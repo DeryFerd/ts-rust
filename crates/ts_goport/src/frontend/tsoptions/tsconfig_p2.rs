@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // This file ports tsoptions/tsconfigparsing.go lines 901 to 1833.
 // PORT: Go `any` values are `CompilerOptionsValue`. Go
@@ -101,18 +101,28 @@ fn read_json_config_file(
     path: Path,
     read_file: &dyn Fn(&str) -> (String, bool),
 ) -> (TsConfigSourceFile, Vec<Diagnostic>) {
-    let (text, diagnostic) = try_read_file(file_name, read_file, Vec::new());
+    let (text, diagnostic) = try_read_file(file_name, &mut |name: &str| read_file(name), Vec::new());
     if !text.is_empty() {
         let source_file = parse_source_file(
             &SourceFileParseOptions { file_name: file_name.to_string(), path, ..Default::default() },
             Box::leak(text.into_boxed_str()),
             ScriptKind::JSON,
         );
-        (TsConfigSourceFile { source_file: source_file.root, ..Default::default() }, diagnostic)
+        (
+            TsConfigSourceFile {
+                source_file: source_file.root,
+                path: source_file.path().clone(),
+                file_name: source_file.file_name().to_string(),
+                ..Default::default()
+            },
+            diagnostic,
+        )
     } else {
         let factory = NodeFactory::for_file(new_file_store(Box::leak(file_name.to_string().into_boxed_str()), ""));
         let file = TsConfigSourceFile {
-            source_file: factory.new_source_file(
+            path: path.clone(),
+            file_name: file_name.to_string(),
+            source_file: factory.new_parsed_source_file(
                 &SourceFileParseOptions { file_name: file_name.to_string(), path, ..Default::default() },
                 "",
                 factory.new_node_list(&[]),
@@ -189,7 +199,7 @@ pub fn parse_extended_config(
         return entry;
     }
 
-    let parse_diagnostics = source_file_diagnostics(extended_result.source_file);
+    let parse_diagnostics = parsed_source_file_diagnostics(extended_result.source_file);
     if !parse_diagnostics.is_empty() {
         entry.extended_result = Some(Rc::new(extended_result));
         entry.errors = parse_diagnostics.to_vec();
@@ -201,7 +211,7 @@ pub fn parse_extended_config(
         Some(&mut extended_result),
         host,
         &get_directory_path(file_name),
-        get_base_file_name(file_name),
+        &get_base_file_name(file_name),
         resolution_stack,
         extended_config_cache,
     );
@@ -718,7 +728,7 @@ pub fn parse_json_config_file_content_worker(
             &config_file_specs,
             &base_path_for_file_names,
             parsed_config_options,
-            host.fs(),
+            &*host.fs(),
             extra_file_extensions,
         );
         if should_report_no_input_files(&file_names, can_json_report_no_input_files(&raw_config), resolution_stack) {
@@ -761,13 +771,14 @@ pub fn parse_json_config_file_content_worker(
 
     ParsedCommandLine {
         parsed_config: ParsedOptions {
-            compiler_options: parsed_config.options,
+            // PORT: Go nil options become the default options.
+            compiler_options: Rc::new(parsed_config.options.unwrap_or_default()),
             type_acquisition: parsed_config.type_acquisition,
             // WatchOptions:      nil,
             file_names,
             project_references,
         },
-        config_file: source_file,
+        config_file: source_file.map(Rc::new),
         raw: parsed_config.raw,
         errors,
 
@@ -822,7 +833,7 @@ fn validate_specs(
 }
 
 // Go: tsoptions/tsconfigparsing.go:1423 specToDiagnostic
-fn spec_to_diagnostic(spec: &str, disallow_trailing_recursion: bool) -> Option<&'static Message> {
+pub(crate) fn spec_to_diagnostic(spec: &str, disallow_trailing_recursion: bool) -> Option<&'static Message> {
     if disallow_trailing_recursion && invalid_trailing_recursion(spec) {
         return Some(diag::File_specification_cannot_end_in_a_recursive_directory_wildcard_Asterisk_Asterisk_Colon_0);
     }
@@ -1119,7 +1130,7 @@ fn remove_wildcard_files_with_lower_priority_extension(
 // PORT: Go `options` can be nil only after a config cycle; Go
 // `GetSupportedExtensions` then panics on the nil pointer, and so does this
 // port.
-fn get_file_names_from_config_specs(
+pub(crate) fn get_file_names_from_config_specs(
     config_file_specs: &ConfigFileSpecs,
     base_path: &str, // considering this is the current directory
     options: Option<&CompilerOptions>,
@@ -1307,7 +1318,7 @@ pub fn get_parsed_command_line_of_config_file_path(
     extended_config_cache: Option<&dyn ExtendedConfigCache>,
 ) -> (Option<ParsedCommandLine>, Vec<Diagnostic>) {
     let errors: Vec<Diagnostic> = Vec::new();
-    let (config_file_text, errors) = try_read_file(config_file_name, &|name| sys.fs().read_file(name), errors);
+    let (config_file_text, errors) = try_read_file(config_file_name, &mut |name: &str| sys.fs().read_file(name), errors);
     if !errors.is_empty() {
         // these are unrecoverable errors--exit to report them as diagnostics
         return (None, errors);

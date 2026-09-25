@@ -5,15 +5,13 @@
 //! read the private `DeclarationTransformer` fields and helpers.
 //!
 //! PORT: Go keeps six `*ast.NodeVisitor` fields made by
-//! `EmitContext.NewNodeVisitor` (still unported). Each use here builds a plain
-//! `ast` visitor on the transformer with the same callback and the emit
-//! context factory (`with_tx_visitor`). The emit context hooks only change
-//! `VisitEachChild` of function bodies, parameters and iteration bodies; they
-//! start and end variable environments that the declaration transform never
-//! fills. Go `tx.Visitor().Visit(n)` calls the callback directly, so it is
+//! `EmitContext.NewNodeVisitor`. Each use here builds one on demand with
+//! `EmitContext::new_node_visitor` and the same callback (`with_tx_visitor`),
+//! so the emit context hooks are attached as in Go. Go
+//! `tx.Visitor().Visit(n)` calls the callback directly, so it is
 //! `self.visit(n)`.
 
-use crate::ast::visitor::{new_node_visitor, syntax_list_children, NodeVisitor, NodeVisitorHooks};
+use crate::ast::visitor::{syntax_list_children, NodeVisitor};
 use crate::checker::nodebuilder_types::SymbolTracker;
 use crate::declarations::diagnostics::{
     bound_symbol_declarations, create_get_symbol_accessibility_diagnostic_for_node, GetSymbolAccessibilityDiagnostic,
@@ -44,10 +42,8 @@ fn with_tx_visitor<R>(
     f: impl FnOnce(&mut NodeVisitor<'_, &mut DeclarationTransformer>) -> R,
 ) -> R {
     let ec = tx.emit_context.clone();
-    let mut v = new_node_visitor(
+    let mut v = ec.new_node_visitor(
         move |node, v: &mut NodeVisitor<'_, &mut DeclarationTransformer>| visit(&mut *v.ctx, node),
-        Some(&ec.factory().ast),
-        NodeVisitorHooks::default(),
         tx,
     );
     f(&mut v)
@@ -321,9 +317,9 @@ impl DeclarationTransformer {
         if input.kind() == SyntaxKind::ImportDeclaration || input.kind() == SyntaxKind::JsImportDeclaration {
             let res = self.transform_import_declaration(input);
             if res.is_some() && res.kind() != SyntaxKind::ImportDeclaration {
-                // PORT: Go clones `res` and sets `res.Kind = ast.KindImportDeclaration`.
-                // The Rust node kind cannot be reassigned.
-                unported!("Node.Kind assignment (JSImportDeclaration to ImportDeclaration)")
+                let res = self.emit_context.factory().as_node_factory().clone_node(res);
+                set_node_kind(res, SyntaxKind::ImportDeclaration);
+                return res;
             }
             return res;
         }
@@ -525,8 +521,7 @@ impl DeclarationTransformer {
         }
         let new_flags = old_flags & ModifierFlags(ModifierFlags::ALL.0 ^ ModifierFlags::EXPORT.0);
         let modifiers = create_modifiers_from_modifier_flags(new_flags, &mut |kind| ec.factory().new_modifier(kind));
-        // PORT: `replace_modifiers` drops the Go factory parameter (see its port).
-        replace_modifiers(statement, ec.factory().new_modifier_list(&modifiers))
+        replace_modifiers(ec.factory().as_node_factory(), statement, ec.factory().new_modifier_list(&modifiers))
     }
 
     // Go: transformers/declarations/transform.go:1885 DeclarationTransformer.buildClassMembers

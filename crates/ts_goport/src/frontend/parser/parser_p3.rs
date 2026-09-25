@@ -10,7 +10,7 @@
 //! children into locals first, in the same order, and then calls the factory,
 //! because `self.factory` cannot stay borrowed while a child parse runs.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // PORT: Go reads `p.diagnostics` directly. The parser and the scanner share
 // the diagnostics through `Rc<RefCell<ParseDiagnostics>>` (contract 4.5).
@@ -283,7 +283,7 @@ impl Parser {
 
     // Go: parser/parser.go:3003 reScanSlashToken
     pub fn re_scan_slash_token(&mut self) -> SyntaxKind {
-        self.token = self.scanner.re_scan_slash_token();
+        self.token = self.scanner.re_scan_slash_token(false);
         self.token
     }
 

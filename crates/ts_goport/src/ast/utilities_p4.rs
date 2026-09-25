@@ -751,36 +751,123 @@ pub fn get_this_parameter(signature: Node) -> Node {
 }
 
 // Go: ast/utilities.go:3292 ReplaceModifiers
-// PORT: the Go `factory *NodeFactory` parameter is dropped because the node
-// factory is not ported. Every branch calls the matching factory `UpdateX`
-// method in Go, so every branch is `unported!`. The final panic is kept.
-pub fn replace_modifiers(node: Node, modifier_array: ModifierList) -> Node {
+pub fn replace_modifiers(factory: &NodeFactory, node: Node, modifier_array: ModifierList) -> Node {
     match node.kind() {
-        SyntaxKind::TypeParameter => unported!("UpdateTypeParameterDeclaration"),
-        SyntaxKind::Parameter => unported!("UpdateParameterDeclaration"),
-        SyntaxKind::ConstructorType => unported!("UpdateConstructorTypeNode"),
-        SyntaxKind::PropertySignature => unported!("UpdatePropertySignatureDeclaration"),
-        SyntaxKind::PropertyDeclaration => unported!("UpdatePropertyDeclaration"),
-        SyntaxKind::MethodSignature => unported!("UpdateMethodSignatureDeclaration"),
-        SyntaxKind::MethodDeclaration => unported!("UpdateMethodDeclaration"),
-        SyntaxKind::Constructor => unported!("UpdateConstructorDeclaration"),
-        SyntaxKind::GetAccessor => unported!("UpdateGetAccessorDeclaration"),
-        SyntaxKind::SetAccessor => unported!("UpdateSetAccessorDeclaration"),
-        SyntaxKind::IndexSignature => unported!("UpdateIndexSignatureDeclaration"),
-        SyntaxKind::FunctionExpression => unported!("UpdateFunctionExpression"),
-        SyntaxKind::ArrowFunction => unported!("UpdateArrowFunction"),
-        SyntaxKind::ClassExpression => unported!("UpdateClassExpression"),
-        SyntaxKind::VariableStatement => unported!("UpdateVariableStatement"),
-        SyntaxKind::FunctionDeclaration => unported!("UpdateFunctionDeclaration"),
-        SyntaxKind::ClassDeclaration => unported!("UpdateClassDeclaration"),
-        SyntaxKind::InterfaceDeclaration => unported!("UpdateInterfaceDeclaration"),
-        SyntaxKind::TypeAliasDeclaration => unported!("UpdateTypeAliasDeclaration"),
-        SyntaxKind::EnumDeclaration => unported!("UpdateEnumDeclaration"),
-        SyntaxKind::ModuleDeclaration => unported!("UpdateModuleDeclaration"),
-        SyntaxKind::ImportEqualsDeclaration => unported!("UpdateImportEqualsDeclaration"),
-        SyntaxKind::ImportDeclaration => unported!("UpdateImportDeclaration"),
-        SyntaxKind::ExportAssignment => unported!("UpdateExportAssignment"),
-        SyntaxKind::ExportDeclaration => unported!("UpdateExportDeclaration"),
+        SyntaxKind::TypeParameter => {
+            return factory.update_type_parameter_declaration(node, modifier_array, node.name(), node.constraint(), node.expression(), node.default_type());
+        }
+        SyntaxKind::Parameter => {
+            return factory.update_parameter_declaration(node, modifier_array, node.dot_dot_dot_token(), node.name(), node.question_token(), node.type_(), node.initializer());
+        }
+        SyntaxKind::ConstructorType => {
+            return factory.update_constructor_type_node(node, modifier_array, node.type_parameter_list(), node.parameter_list(), node.type_());
+        }
+        SyntaxKind::PropertySignature => {
+            return factory.update_property_signature_declaration(node, modifier_array, node.name(), node.postfix_token(), node.type_(), node.initializer());
+        }
+        SyntaxKind::PropertyDeclaration => {
+            return factory.update_property_declaration(node, modifier_array, node.name(), node.postfix_token(), node.type_(), node.initializer());
+        }
+        SyntaxKind::MethodSignature => {
+            return factory.update_method_signature_declaration(node, modifier_array, node.name(), node.postfix_token(), node.type_parameter_list(), node.parameter_list(), node.type_());
+        }
+        SyntaxKind::MethodDeclaration => {
+            return factory.update_method_declaration(
+                node,
+                modifier_array,
+                node.asterisk_token(),
+                node.name(),
+                node.postfix_token(),
+                node.type_parameter_list(),
+                node.parameter_list(),
+                node.type_(),
+                node.full_signature(),
+                node.body(),
+            );
+        }
+        SyntaxKind::Constructor => {
+            return factory.update_constructor_declaration(node, modifier_array, node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body());
+        }
+        SyntaxKind::GetAccessor => {
+            return factory.update_get_accessor_declaration(node, modifier_array, node.name(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body());
+        }
+        SyntaxKind::SetAccessor => {
+            return factory.update_set_accessor_declaration(node, modifier_array, node.name(), node.type_parameter_list(), node.parameter_list(), node.type_(), node.full_signature(), node.body());
+        }
+        SyntaxKind::IndexSignature => {
+            return factory.update_index_signature_declaration(node, modifier_array, node.parameter_list(), node.type_());
+        }
+        SyntaxKind::FunctionExpression => {
+            return factory.update_function_expression(
+                node,
+                modifier_array,
+                node.asterisk_token(),
+                node.name(),
+                node.type_parameter_list(),
+                node.parameter_list(),
+                node.type_(),
+                node.full_signature(),
+                node.body(),
+            );
+        }
+        SyntaxKind::ArrowFunction => {
+            return factory.update_arrow_function(
+                node,
+                modifier_array,
+                node.type_parameter_list(),
+                node.parameter_list(),
+                node.type_(),
+                node.full_signature(),
+                node.equals_greater_than_token(),
+                node.body(),
+            );
+        }
+        SyntaxKind::ClassExpression => {
+            return factory.update_class_expression(node, modifier_array, node.name(), node.type_parameter_list(), node.heritage_clauses(), node.member_list());
+        }
+        SyntaxKind::VariableStatement => {
+            return factory.update_variable_statement(node, modifier_array, node.declaration_list());
+        }
+        SyntaxKind::FunctionDeclaration => {
+            return factory.update_function_declaration(
+                node,
+                modifier_array,
+                node.asterisk_token(),
+                node.name(),
+                node.type_parameter_list(),
+                node.parameter_list(),
+                node.type_(),
+                node.full_signature(),
+                node.body(),
+            );
+        }
+        SyntaxKind::ClassDeclaration => {
+            return factory.update_class_declaration(node, modifier_array, node.name(), node.type_parameter_list(), node.heritage_clauses(), node.member_list());
+        }
+        SyntaxKind::InterfaceDeclaration => {
+            return factory.update_interface_declaration(node, modifier_array, node.name(), node.type_parameter_list(), node.heritage_clauses(), node.member_list());
+        }
+        SyntaxKind::TypeAliasDeclaration => {
+            return factory.update_type_alias_declaration(node, modifier_array, node.name(), node.type_parameter_list(), node.type_());
+        }
+        SyntaxKind::EnumDeclaration => {
+            return factory.update_enum_declaration(node, modifier_array, node.name(), node.member_list());
+        }
+        SyntaxKind::ModuleDeclaration => {
+            return factory.update_module_declaration(node, modifier_array, node.keyword(), node.name(), node.body());
+        }
+        SyntaxKind::ImportEqualsDeclaration => {
+            return factory.update_import_equals_declaration(node, modifier_array, node.is_type_only(), node.name(), node.module_reference());
+        }
+        SyntaxKind::ImportDeclaration => {
+            return factory.update_import_declaration(node, modifier_array, node.import_clause(), node.module_specifier(), node.attributes());
+        }
+        SyntaxKind::ExportAssignment => {
+            return factory.update_export_assignment(node, modifier_array, node.is_export_equals(), node.type_(), node.expression());
+        }
+        SyntaxKind::ExportDeclaration => {
+            return factory.update_export_declaration(node, modifier_array, node.is_type_only(), node.export_clause(), node.module_specifier(), node.attributes());
+        }
         _ => {}
     }
     panic!(

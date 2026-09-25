@@ -1,0 +1,21 @@
+//! Go package `compiler`: program construction and file loading.
+pub mod host;
+pub mod file_include;
+pub mod include_processor;
+pub mod processing_diagnostic;
+pub mod project_references;
+pub mod file_loader;
+pub mod files_parser;
+pub mod program_new;
+pub mod program_lookup;
+pub mod verify;
+pub use host::*;
+pub use file_include::*;
+pub use include_processor::*;
+pub use processing_diagnostic::*;
+pub use project_references::*;
+pub use file_loader::*;
+pub use files_parser::*;
+pub use program_new::*;
+pub use program_lookup::*;
+pub use verify::*;

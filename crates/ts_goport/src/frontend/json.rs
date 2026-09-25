@@ -20,7 +20,7 @@
 //! (`isFatalError`), so every impl returns the first error. Error messages are
 //! not the v2 texts; no caller shows them.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 /// Go JSON v2 `*json.SemanticError` / `*jsontext.SyntacticError`.
 /// PORT: one error type with a message.

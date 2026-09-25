@@ -1,6 +1,6 @@
 //! Port of module/types.go.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // Go: module/types.go:14 ResolutionHost
 // PORT: Go interface. `FS()` returns a borrowed trait object; the host

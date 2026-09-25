@@ -17,6 +17,7 @@
 use crate::prelude::*;
 
 use crate::checker::emit_resolver_p1::{is_common_js_module_exports, EmitResolver};
+use crate::binder::reference_resolver::{new_reference_resolver, ReferenceResolver, ReferenceResolverHooks};
 use crate::printer::{SymbolAccessibility, SymbolAccessibilityResult, TypeReferenceSerializationKind};
 
 impl EmitResolver {
@@ -298,20 +299,35 @@ impl EmitResolver {
     }
 
     // Go: checker/emitresolver.go:831 getReferenceResolver
-    // PORT: `binder.NewReferenceResolver` and `binder.ReferenceResolver` are not ported.
-    pub fn get_reference_resolver(&self) -> ! {
-        unported!("binder.NewReferenceResolver")
+    // PORT: Go caches the resolver in `r.referenceResolver`. The resolver only
+    // holds the options, the hooks and a lazy name resolver that is used only
+    // when `ResolveName` is nil. All hooks are set here, so a new resolver per
+    // call behaves the same, and `EmitResolver` needs no cache field.
+    pub fn get_reference_resolver(&self, c: &Checker) -> ReferenceResolver {
+        new_reference_resolver(
+            c.compiler_options,
+            ReferenceResolverHooks {
+                resolve_name: Some(|c, location, name, meaning, name_not_found_message, is_use, exclude_globals| {
+                    c.resolve_name(location, name, meaning, name_not_found_message, is_use, exclude_globals)
+                }),
+                get_resolved_symbol: Some(|c, node| c.get_resolved_symbol_or_nil(node)),
+                get_merged_symbol: Some(|c, symbol| c.get_merged_symbol(symbol)),
+                get_parent_of_symbol: Some(|c, symbol| c.get_parent_of_symbol(symbol)),
+                get_symbol_of_declaration: Some(|c, declaration| c.get_symbol_of_declaration(declaration)),
+                get_type_only_alias_declaration: Some(|c, symbol, include| c.get_type_only_alias_declaration_ex(symbol, include)),
+                get_export_symbol_of_value_symbol_if_exported: Some(|c, symbol| c.get_export_symbol_of_value_symbol_if_exported(symbol)),
+                get_element_access_expression_name: Some(|c, expression| c.try_get_element_access_expression_name(expression)),
+            },
+        )
     }
 
     // Go: checker/emitresolver.go:847 GetReferencedExportContainer
-    pub fn get_referenced_export_container(&self, node: Node, _prefix_locals: bool) -> Node /*SourceFile|ModuleDeclaration|EnumDeclaration*/ {
+    pub fn get_referenced_export_container(&self, node: Node, prefix_locals: bool) -> Node /*SourceFile|ModuleDeclaration|EnumDeclaration*/ {
         if !is_parse_tree_node(node) {
             return Node::NIL;
         }
 
-        // PORT: Go locks, then calls `r.getReferenceResolver().GetReferencedExportContainer`.
-        // The reference resolver is not ported, so it stops before the lock.
-        self.get_reference_resolver()
+        self.with_checker(|c| self.get_reference_resolver(c).get_referenced_export_container(c, node, prefix_locals))
     }
 
     // Go: checker/emitresolver.go:858 SetReferencedImportDeclaration
@@ -343,8 +359,7 @@ impl EmitResolver {
             return Node::NIL;
         }
 
-        // PORT: see `get_referenced_export_container`.
-        self.get_reference_resolver()
+        self.with_checker(|c| self.get_reference_resolver(c).get_referenced_value_declaration(c, node))
     }
 
     // Go: checker/emitresolver.go:889 GetReferencedValueDeclarations
@@ -353,8 +368,7 @@ impl EmitResolver {
             return Vec::new();
         }
 
-        // PORT: see `get_referenced_export_container`.
-        self.get_reference_resolver()
+        self.with_checker(|c| self.get_reference_resolver(c).get_referenced_value_declarations(c, node))
     }
 
     // Go: checker/emitresolver.go:900 IsNameResolvable
@@ -379,8 +393,7 @@ impl EmitResolver {
             return String::new();
         }
 
-        // PORT: see `get_referenced_export_container`.
-        self.get_reference_resolver()
+        self.with_checker(|c| self.get_reference_resolver(c).get_element_access_expression_name(c, expression))
     }
 
     // Go: checker/emitresolver.go:920 GetReferencedMemberValueDeclaration
@@ -389,8 +402,7 @@ impl EmitResolver {
             return Node::NIL;
         }
 
-        // PORT: see `get_referenced_export_container`.
-        self.get_reference_resolver()
+        self.with_checker(|c| self.get_reference_resolver(c).get_referenced_member_value_declaration(c, node))
     }
 
     // TODO: the emit resolver being responsible for some amount of node construction is a very leaky abstraction,
@@ -741,9 +753,7 @@ impl EmitResolver {
     // Go: checker/emitresolver.go:1150 GetConstantValue
     pub fn get_constant_value(&self, node: Node) -> Option<LiteralValue> {
         // node = emitContext.ParseNode(node)
-        // PORT: Go calls `r.checker.GetConstantValue(node)` (checker/services.go:859),
-        // which is not ported.
-        self.with_checker(|_c| unported!("Checker.GetConstantValue"))
+        self.with_checker(|c| c.get_constant_value(node))
     }
 
     // Go: checker/emitresolver.go:1157 GetTypeReferenceSerializationKind
@@ -938,4 +948,39 @@ fn mark_linked_references_recursively_visit(c: &mut Checker, n: Node) -> bool {
 // builder keeps an `Rc<EmitContext>`; the context's factory holds that `Rc`.
 fn emit_context_rc(emit_context: &EmitContext) -> Rc<EmitContext> {
     emit_context.factory.emit_context.clone()
+}
+
+impl Checker {
+    // Go: checker/services.go:859 GetConstantValue
+    // PORT: Go `any` result is `Option<LiteralValue>` (`None` is Go nil). The
+    // Go function lives in services.go; it is here because the emit resolver
+    // is its only non-language-service caller in this crate.
+    pub fn get_constant_value(&mut self, node: Node) -> Option<LiteralValue> {
+        if node.kind() == SyntaxKind::EnumMember {
+            return self.get_enum_member_value(node).value;
+        }
+
+        if self.symbol_node_links.get(node).resolved_symbol.is_nil() {
+            self.check_expression_cached(node); // ensure cached resolved symbol is set
+        }
+        let mut symbol = self.symbol_node_links.get(node).resolved_symbol;
+        if symbol.is_nil() && is_entity_name_expression(node) {
+            symbol = self.resolve_entity_name(
+                node,
+                SymbolFlags::VALUE,
+                true,      /*ignoreErrors*/
+                false,     /*dontResolveAlias*/
+                Node::NIL, /*location*/
+            );
+        }
+        if symbol.is_some() && self.sym(symbol).flags.intersects(SymbolFlags::ENUM_MEMBER) {
+            // inline property\index accesses only for const enums
+            let member = self.sym(symbol).value_declaration;
+            if is_enum_const(member.parent()) {
+                return self.get_enum_member_value(member).value;
+            }
+        }
+
+        None
+    }
 }

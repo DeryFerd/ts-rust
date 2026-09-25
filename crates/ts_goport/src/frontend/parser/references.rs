@@ -4,7 +4,7 @@
 //! PORT: Go writes these to `*ast.SourceFile`. Here they go to the matching
 //! `ParsedSourceFile` fields (plan contract 6).
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // Go: core/nodemodules.go:9 UnprefixedNodeCoreModules
 // PORT: Go `map[string]bool`; a fixed array searched with `contains`.

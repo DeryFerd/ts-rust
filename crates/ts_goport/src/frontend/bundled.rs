@@ -7,7 +7,7 @@
 //! `crates/ts_bundled/libs`, which is identical to the pinned
 //! `internal/bundled/libs`.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::sync::OnceLock;
 use std::time::SystemTime;
 

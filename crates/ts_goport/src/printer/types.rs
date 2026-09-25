@@ -235,6 +235,8 @@ pub trait EmitResolver {
     /// symbols live in the checker arena, so callers outside the checker
     /// read it through the resolver.
     fn symbol_value_declaration(&self, symbol: SymbolId) -> Node;
+    /// PORT: not in Go. Go `make(ast.SymbolTable)` plus `table[name] = symbol`; tables live in the checker arena.
+    fn make_symbol_table(&self, entries: &[(&str, SymbolId)]) -> SymbolTable;
 
     fn is_referenced_alias_declaration(&self, node: Node) -> bool;
     fn is_value_alias_declaration(&self, node: Node) -> bool;

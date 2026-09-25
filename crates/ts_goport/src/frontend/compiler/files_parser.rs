@@ -1,7 +1,7 @@
 //! Go: compiler/filesparser.go (parse tasks, the files parser and
 //! `getProcessedFiles`).
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // Go: filesparser.go:19 parseTask
 // PORT: Go `*parseTask` is shared by the root task list, sub task lists,
@@ -115,7 +115,7 @@ impl ParseTask {
 
         self.file = Some(file.clone());
         self.sub_tasks =
-            Vec::with_capacity(file.referenced_files.len() + file.imports().len() + file.module_augmentations.len());
+            Vec::with_capacity(file.referenced_files.len() + file.imports.len() + file.module_augmentations.len());
 
         let compiler_options = loader.opts.config.compiler_options();
         if !compiler_options.no_resolve.is_true() {
@@ -216,7 +216,7 @@ pub struct ResolvedRef {
 
 /// One queued run of the closure that Go `filesParser.start` passes to
 /// `wg.Queue`, with the values it captures.
-struct QueuedParseTask {
+pub(crate) struct QueuedParseTask {
     task: ParseTaskRef,
     data: Rc<RefCell<ParseTaskData>>,
     loaded: bool,
@@ -231,7 +231,7 @@ struct QueuedParseTask {
 // value is made only when the path is new, which is the same result.
 #[derive(Default)]
 pub struct FilesParser {
-    queue: Vec<QueuedParseTask>,
+    pub(crate) queue: Vec<QueuedParseTask>,
     pub task_data_by_path: FxHashMap<Path, Rc<RefCell<ParseTaskData>>>,
     pub max_depth: i32,
 }
@@ -482,7 +482,7 @@ impl FilesParser {
                                     &task_path,
                                     &checked_name,
                                     &normalized_file_path,
-                                    include_reason.clone(),
+                                    include_reason.clone().expect("nil pointer dereference: includeReason"),
                                 );
                             }
                         }
@@ -499,7 +499,7 @@ impl FilesParser {
                                 &t.path,
                                 &t.normalized_file_path,
                                 &normalized_file_path,
-                                include_reason.clone(),
+                                include_reason.clone().expect("nil pointer dereference: includeReason"),
                             );
                         } else {
                             tasks_seen_by_name_ignore_case.insert(path_lower_case, task.clone());
@@ -758,7 +758,3 @@ pub(crate) fn new_unknown_reference_processing_diagnostic(
     })
 }
 
-/// Go `&FileIncludeReason{kind: kind, data: data}`.
-pub(crate) fn new_file_include_reason(kind: FileIncludeKind, data: FileIncludeData) -> Rc<FileIncludeReason> {
-    Rc::new(FileIncludeReason::new(kind, data))
-}

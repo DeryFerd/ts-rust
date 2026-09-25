@@ -13,7 +13,7 @@
 //! PORT: Go `p.nodeSliceArena` only saves allocations. Here each call uses a
 //! new `Vec`.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use ts_ast::NodeData as D;
 
 /// Go `node.AsX().Field = v`: clones the data of `n`, lets `f` change it and

@@ -26,7 +26,7 @@
 //! used by `ls/autoimport` and `modulespecifiers.ProcessEntrypointEnding`
 //! (language service). They are not ported.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 /// Go `if r.tracer != nil { r.tracer.write(diag, args...) }`.
 macro_rules! trace_write {

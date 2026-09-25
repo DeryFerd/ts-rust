@@ -1,6 +1,6 @@
 //! Port of tspath/path.go and tspath/ignoredpaths.go.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // Go: tspath/path.go:13 Path
 // PORT: Go `type Path string`. A newtype keeps the Go method set

@@ -16,7 +16,7 @@
 //! - Go `*ResolvedModule` results are owned values. The resolver caches
 //!   hold them as `Rc`.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 /// Go `if r.tracer != nil { r.tracer.write(diag, args...) }`.
 macro_rules! trace_write {

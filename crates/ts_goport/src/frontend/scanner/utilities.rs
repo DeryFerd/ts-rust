@@ -1,6 +1,6 @@
 //! Port of `scanner/utilities.go`.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 use super::scanner_p1::{rune_to_char, text_to_keyword, utf8_decode_rune_in_string};
 

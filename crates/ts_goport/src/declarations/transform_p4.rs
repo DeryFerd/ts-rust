@@ -7,17 +7,16 @@
 //!
 //! PORT: Go keeps `*ast.NodeVisitor` fields made by
 //! `EmitContext.NewNodeVisitor` (bindingNameVisitor, expressionVisitor,
-//! cjsExportAssignmentVisitor). Each use here builds a plain `ast` visitor on
-//! the transformer with the same callback and the emit context factory
-//! (`with_tx_visitor`). The emit context hooks only start and end variable
-//! environments that the declaration transform never fills. Go
+//! cjsExportAssignmentVisitor). Each use here builds one on demand with
+//! `EmitContext::new_node_visitor` and the same callback (`with_tx_visitor`),
+//! so the emit context hooks are attached as in Go. Go
 //! `tx.Visitor().Visit(n)` calls the callback directly, so it is `self.visit(n)`.
 //!
 //! PORT: Go `setupDiagnosticContext` returns a cleanup closure. Here it
 //! returns `CleanupDiagnosticContext`, and `cleanup.run(self)` restores it. Go
 //! runs the cleanup in a `defer`, so every return path below runs it.
 
-use crate::ast::visitor::{new_node_visitor, syntax_list_children, NodeVisitor, NodeVisitorHooks};
+use crate::ast::visitor::{syntax_list_children, NodeVisitor};
 use crate::checker::nodebuilder_types::SymbolTracker;
 use crate::declarations::diagnostics::{create_diagnostic_for_node, create_get_symbol_accessibility_diagnostic_for_node};
 use crate::declarations::transform::{
@@ -43,10 +42,8 @@ fn with_tx_visitor<R>(
     f: impl FnOnce(&mut NodeVisitor<'_, &mut DeclarationTransformer>) -> R,
 ) -> R {
     let ec = tx.emit_context.clone();
-    let mut v = new_node_visitor(
+    let mut v = ec.new_node_visitor(
         move |node, v: &mut NodeVisitor<'_, &mut DeclarationTransformer>| visit(&mut *v.ctx, node),
-        Some(&ec.factory().ast),
-        NodeVisitorHooks::default(),
         tx,
     );
     f(&mut v)
@@ -804,61 +801,56 @@ impl DeclarationTransformer {
         );
         set_node_parent(synthesized_namespace, self.enclosing_declaration);
         set_node_symbol(synthesized_namespace, host);
-        // PORT: Go `containerData.Locals = make(ast.SymbolTable, 0)` and
-        // `Locals[localName.Text()] = symbol`. A `SymbolTable` is only made by
-        // a symbol arena, which the transformer does not hold.
-        let _ = symbol;
-        unported!("make(ast.SymbolTable)");
+        // Go: containerData.Locals = make(ast.SymbolTable, 0); Locals[localName.Text()] = symbol
+        let locals = self.resolver.make_symbol_table(&[(local_name.text(), symbol)]);
+        set_node_locals(synthesized_namespace, locals);
 
-        #[allow(unreachable_code)]
-        {
-            let old_enclosing = self.enclosing_declaration;
-            self.enclosing_declaration = synthesized_namespace;
+        let old_enclosing = self.enclosing_declaration;
+        self.enclosing_declaration = synthesized_namespace;
 
-            let type_node = self.ensure_type(node, false);
-            let mut statements: Vec<Node> = vec![f.new_variable_statement(
-                var_modifiers,
-                f.new_variable_declaration_list(
-                    f.new_node_list(&[f.new_variable_declaration(
-                        local_name,
-                        Node::NIL, /*exclamationToken*/
-                        type_node,
-                        Node::NIL, /*initializer*/
-                    )]),
-                    NodeFlags::NONE,
-                ),
-            )];
+        let type_node = self.ensure_type(node, false);
+        let mut statements: Vec<Node> = vec![f.new_variable_statement(
+            var_modifiers,
+            f.new_variable_declaration_list(
+                f.new_node_list(&[f.new_variable_declaration(
+                    local_name,
+                    Node::NIL, /*exclamationToken*/
+                    type_node,
+                    Node::NIL, /*initializer*/
+                )]),
+                NodeFlags::NONE,
+            ),
+        )];
 
-            if local_name.text() != export_name.text() {
-                let named_exports = f.new_named_exports(
-                    f.new_node_list(&[f.new_export_specifier(false /*isTypeOnly*/, local_name, export_name)]),
-                );
-                statements.push(f.new_export_declaration(
-                    ModifierList::NIL, /*modifiers*/
-                    false,             /*isTypeOnly*/
-                    named_exports,
-                    Node::NIL, /*moduleSpecifier*/
-                    Node::NIL, /*attributes*/
-                ));
-            }
-
-            if statements.len() > 1 && !preexisting_expando_has_export {
-                // Add an `export` modifier to all existing expando members so they remain exported after the `export {}` is added
-                let existing = self.expando_members.get(&host_id).cloned().unwrap_or_default();
-                for decl in existing {
-                    let modifier_flags = ModifierFlags::EXPORT | get_combined_modifier_flags(decl);
-                    let modifiers = f.new_modifier_list(&create_modifiers_from_modifier_flags(modifier_flags, &mut |k| {
-                        f.new_modifier(k)
-                    }));
-                    set_node_modifiers(decl, modifiers);
-                }
-            }
-            self.expando_members.entry(host_id).or_default().extend(statements);
-
-            // Go defers run last-in first-out.
-            self.enclosing_declaration = old_enclosing;
-            cleanup.run(self);
+        if local_name.text() != export_name.text() {
+            let named_exports = f.new_named_exports(
+                f.new_node_list(&[f.new_export_specifier(false /*isTypeOnly*/, local_name, export_name)]),
+            );
+            statements.push(f.new_export_declaration(
+                ModifierList::NIL, /*modifiers*/
+                false,             /*isTypeOnly*/
+                named_exports,
+                Node::NIL, /*moduleSpecifier*/
+                Node::NIL, /*attributes*/
+            ));
         }
+
+        if statements.len() > 1 && !preexisting_expando_has_export {
+            // Add an `export` modifier to all existing expando members so they remain exported after the `export {}` is added
+            let existing = self.expando_members.get(&host_id).cloned().unwrap_or_default();
+            for decl in existing {
+                let modifier_flags = ModifierFlags::EXPORT | get_combined_modifier_flags(decl);
+                let modifiers = f.new_modifier_list(&create_modifiers_from_modifier_flags(modifier_flags, &mut |k| {
+                    f.new_modifier(k)
+                }));
+                set_node_modifiers(decl, modifiers);
+            }
+        }
+        self.expando_members.entry(host_id).or_default().extend(statements);
+
+        // Go defers run last-in first-out.
+        self.enclosing_declaration = old_enclosing;
+        cleanup.run(self);
     }
 
     // Go: transformers/declarations/transform.go:2815 DeclarationTransformer.getExpandoHostId

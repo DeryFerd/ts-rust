@@ -1,6 +1,6 @@
 //! Port of module/cache.go.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // Go: module/cache.go:11 ModeAwareCache
 pub type ModeAwareCache<T> = FxHashMap<ModeAwareCacheKey, T>;

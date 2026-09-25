@@ -17,6 +17,10 @@ use std::ops::Deref;
 use ts_path::CaseSensitivity;
 use ts_vfs::FileSystem;
 
+mod go_frontend;
+type ParsedSourceFileRef = crate::frontend::parser::ParsedSourceFile;
+mod verify_options;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -70,7 +74,7 @@ pub struct SourceFileMetaData {
 }
 
 /// Go `module.PackageId`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct PackageId {
     pub name: String,
     pub sub_module_name: String,
@@ -253,6 +257,8 @@ struct ProgramState {
     pool: RefCell<Option<CheckerPool>>,
     /// Go `Program.declarationDiagnosticCache`.
     declaration_diagnostic_cache: RefCell<FxHashMap<Node, Vec<Diagnostic>>>,
+    /// The Go frontend program (`GOPORT_FRONTEND=go`). None on the legacy path.
+    go: Option<go_frontend::GoFrontendState>,
 }
 
 thread_local! {
@@ -288,6 +294,9 @@ pub fn try_load_with(
     config_path: &str,
     edit_options: impl FnOnce(&mut CompilerOptions),
 ) -> Result<&'static GoProgram, String> {
+    if go_frontend::enabled() {
+        return go_frontend::try_load_with(config_path, edit_options);
+    }
     let fs = ts_vfs::OsFileSystem::default();
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let cwd = ts_path::normalize_path(&cwd.to_string_lossy().replace('\\', "/"));
@@ -317,7 +326,7 @@ pub fn try_load_with(
         let info = build_early_info(index, source, &parser_flags, &options, &cwd, case_sensitivity, &fs);
         file_by_path.insert(info.path.clone(), index);
         files.push(GoFile {
-            source,
+            source: Some(source),
             root,
             parser_flags,
             info,
@@ -342,9 +351,11 @@ pub fn try_load_with(
         &mut external_locations,
     );
 
+    let source_file_order = (0..files.len()).collect();
     let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
-        program: compiler_program,
+        program: Some(compiler_program),
         files,
+        source_file_order,
         options,
         bound_symbols: OnceCell::new(),
     }));
@@ -360,6 +371,7 @@ pub fn try_load_with(
         common_source_directory: OnceCell::new(),
         pool: RefCell::new(None),
         declaration_diagnostic_cache: RefCell::new(FxHashMap::default()),
+        go: None,
     }));
     STATE.with(|cell| {
         assert!(cell.set(program_state).is_ok(), "program already loaded");
@@ -388,7 +400,7 @@ pub fn bind_all() {
     let program = prog();
     program.bound_symbols.get_or_init(|| {
         let mut symbols = SymbolArena::new();
-        for file in &program.files {
+        for file in program.source_files() {
             bind_source_file(file.root, &mut symbols);
         }
         symbols
@@ -1378,8 +1390,18 @@ fn file_info_by_path(path: &str) -> Option<&'static SourceFileInfo> {
     state().file_by_path.get(path).map(|&index| &prog().files[index].info)
 }
 
+/// Lazy JSDoc of `node` in `file` on the Go frontend path (Go
+/// `SourceFile.resolveJSDoc`). None on the legacy path, where lazy JSDoc
+/// parsing is not ported.
+pub fn resolve_lazy_js_doc(file: Node, node: Node) -> Option<&'static [Node]> {
+    state().go.as_ref().map(|go| go.resolve_js_doc(file, node))
+}
+
 // Go: compiler/program.go:122 FileExists
 pub fn file_exists(path: &str) -> bool {
+    if let Some(go) = &state().go {
+        return go.program.file_exists(path);
+    }
     state().fs.file_exists(path)
 }
 
@@ -1433,7 +1455,7 @@ pub fn get_resolved_project_references() -> Vec<&'static ResolvedProjectReferenc
 
 // Go: compiler/program.go:397 SourceFiles
 pub fn source_files() -> Vec<Node> {
-    prog().files.iter().map(|file| file.root).collect()
+    prog().source_files().map(|file| file.root).collect()
 }
 
 // Go: compiler/program.go:399 Options
@@ -1442,8 +1464,13 @@ pub fn options() -> &'static CompilerOptions {
 }
 
 // Go: compiler/program.go:403 GetConfigFileParsingDiagnostics
+// PORT: `ts_compiler` records of the option checks in `verify_options` are
+// removed. Go reports those as program diagnostics.
 pub fn get_config_file_parsing_diagnostics() -> Vec<Diagnostic> {
-    state().config_diagnostics.clone()
+    if let Some(go) = &state().go {
+        return go.program.get_config_file_parsing_diagnostics();
+    }
+    verify_options::without_reverified_option_diagnostics(&state().config_diagnostics)
 }
 
 // Go: compiler/program.go:441 SingleThreaded
@@ -1459,6 +1486,10 @@ pub fn single_threaded() -> bool {
 // import by a different mode than the Go mode computation. A miss (Go: a
 // failed resolution) returns None.
 pub fn get_resolved_module(file: Node, module_reference: &str, mode: ResolutionMode) -> Option<ResolvedModule> {
+    if let Some(go) = &state().go {
+        let parsed: &ParsedSourceFileRef = &**go.parsed_file(file);
+        return go.program.get_resolved_module(parsed, module_reference, mode).map(|r| (*r).clone());
+    }
     let program = prog();
     let go_file = &program.files[file.file_index()];
     let formats = [None, Some(ts_module::ModuleFormat::CommonJs), Some(ts_module::ModuleFormat::Esm)];
@@ -1471,7 +1502,7 @@ pub fn get_resolved_module(file: Node, module_reference: &str, mode: ResolutionM
     };
     let target = std::iter::once(wanted)
         .chain(formats.into_iter().filter(|f| *f != wanted))
-        .find_map(|format| program.program.resolved_module_file(go_file.source.id, module_reference, format))?;
+        .find_map(|format| program.program.expect("legacy program").resolved_module_file(go_file.legacy_source().id, module_reference, format))?;
     Some(build_resolved_module(module_reference, &target.file_name))
 }
 
@@ -1519,7 +1550,7 @@ pub fn get_resolved_module_from_module_specifier(file: Node, module_specifier: N
 pub fn get_resolved_modules() -> &'static IndexMap<String, IndexMap<(String, ResolutionMode), ResolvedModule>> {
     state().resolved_modules.get_or_init(|| {
         let mut result = IndexMap::new();
-        for file in &prog().files {
+        for file in prog().source_files() {
             let mut in_file = IndexMap::new();
             let augmentations = file.info.module_augmentations.iter().copied().filter(|n| is_string_literal(*n));
             for specifier in file.info.imports.iter().copied().chain(augmentations) {
@@ -1592,8 +1623,7 @@ pub fn common_source_directory() -> &'static str {
     state().common_source_directory.get_or_init(|| {
         let files = || {
             prog()
-                .files
-                .iter()
+                .source_files()
                 .filter(|file| source_file_may_be_emitted(file.root, false) && !file.info.is_declaration_file)
                 .map(|file| file.info.file_name.clone())
                 .collect::<Vec<_>>()
@@ -1603,8 +1633,9 @@ pub fn common_source_directory() -> &'static str {
 }
 
 // Go: outputpaths/commonsourcedirectory.go:59 GetCommonSourceDirectory
-// PORT: Go `checkSourceFilesBelongToPath` reports rootDir errors as program
-// diagnostics. It is not run; the Rust graph loader reports those.
+// PORT: Go `checkSourceFilesBelongToPath` reports TS6059 (file not under
+// rootDir) as include processor diagnostics. It is not run, and the Rust
+// graph loader does not report TS6059 either.
 fn get_common_source_directory(
     options: &CompilerOptions,
     files: impl FnOnce() -> Vec<String>,
@@ -1871,14 +1902,18 @@ fn checker_count() -> usize {
     } else if let Some(count) = program.options.checkers {
         checker_count = i64::from(count);
     }
-    checker_count.min(program.files.len() as i64).min(256).max(1) as usize
+    checker_count.min(program.source_file_order.len() as i64).min(256).max(1) as usize
 }
 
 // Go: compiler/checkerpool.go:98 createCheckers
 fn create_checkers() -> CheckerPool {
     let count = checker_count();
     let checkers = (0..count).map(Checker::new).collect();
-    let file_associations = (0..prog().files.len()).map(|i| i % count).collect();
+    let program = prog();
+    let mut file_associations = vec![0; program.files.len()];
+    for (i, &file_index) in program.source_file_order.iter().enumerate() {
+        file_associations[file_index] = i % count;
+    }
     CheckerPool { checkers, file_associations }
 }
 
@@ -1944,7 +1979,7 @@ fn collect_diagnostics(file: Node, collect: &mut dyn FnMut(Node) -> Vec<Diagnost
     let result = if file.is_some() {
         collect(file)
     } else {
-        prog().files.iter().flat_map(|f| collect(f.root)).collect()
+        prog().source_files().flat_map(|f| collect(f.root)).collect()
     };
     sort_and_deduplicate_diagnostics(result)
 }
@@ -2052,7 +2087,14 @@ pub fn get_suggestion_diagnostics(source_file: Node) -> Vec<Diagnostic> {
 // PORT: the include processor diagnostics are part of the converted
 // `ts_compiler` program diagnostics.
 pub fn get_program_diagnostics() -> Vec<Diagnostic> {
-    sort_and_deduplicate_diagnostics(state().program_diagnostics.clone())
+    if let Some(go) = &state().go {
+        let mut diagnostics = go.program.program_diagnostics.clone();
+        diagnostics.extend(go.program.include_processor.get_diagnostics(go.program).borrow_mut().get_global_diagnostics());
+        return sort_and_deduplicate_diagnostics(diagnostics);
+    }
+    let mut diagnostics = verify_options::without_reverified_option_diagnostics(&state().program_diagnostics);
+    diagnostics.extend(verify_options::verify_compiler_options());
+    sort_and_deduplicate_diagnostics(diagnostics)
 }
 
 // Go: compiler/program.go:678 GetIncludeProcessorDiagnostics
@@ -2062,7 +2104,16 @@ pub fn get_include_processor_diagnostics(source_file: Node) -> Vec<Diagnostic> {
     if skip_type_checking(source_file, false) {
         return Vec::new();
     }
-    let (filtered, _) = get_diagnostics_with_preceding_directives(source_file, Vec::new());
+    let diagnostics = match &state().go {
+        Some(go) => go
+            .program
+            .include_processor
+            .get_diagnostics(go.program)
+            .borrow_mut()
+            .get_diagnostics_for_file(&source_file_info(source_file).file_name),
+        None => Vec::new(),
+    };
+    let (filtered, _) = get_diagnostics_with_preceding_directives(source_file, diagnostics);
     filtered
 }
 
@@ -2099,7 +2150,7 @@ fn can_include_bind_and_check_diagnostics(source_file: Node) -> bool {
 
 // Go: compiler/program.go:1290 GetGlobalDiagnostics
 pub fn get_global_diagnostics() -> Vec<Diagnostic> {
-    if prog().files.is_empty() {
+    if prog().source_file_order.is_empty() {
         return Vec::new();
     }
     pool_get_global_diagnostics()

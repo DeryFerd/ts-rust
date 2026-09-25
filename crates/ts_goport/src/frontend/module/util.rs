@@ -1,6 +1,6 @@
 //! Port of module/util.go.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::sync::LazyLock;
 
 // Go: module/util.go:13 typeScriptVersion

@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::sync::LazyLock;
 
 // This file ports tsoptions/tsconfigparsing.go lines 1 to 900.
@@ -378,10 +378,14 @@ pub fn parse_own_config_of_json_source_file(
 // PORT: Go `*configFileSpecs` is `Option<ConfigFileSpecs>`; readers copy
 // or borrow it and never share it.
 #[derive(Clone, Debug, Default)]
+// PORT: Go embeds `*ast.SourceFile`. `source_file` is its root node, and
+// `path` and `file_name` keep its `Path()` and `FileName()`.
 pub struct TsConfigSourceFile {
     pub extended_source_files: Vec<String>,
     pub config_file_specs: Option<ConfigFileSpecs>,
     pub source_file: Node,
+    pub path: Path,
+    pub file_name: String,
 }
 
 // Go: tsoptions/tsconfigparsing.go:283 tsconfigToSourceFile
@@ -409,7 +413,12 @@ pub fn new_tsconfig_source_file_from_file_path(
         Box::leak(config_source_text.to_string().into_boxed_str()),
         ScriptKind::JSON,
     );
-    TsConfigSourceFile { source_file: source_file.root, ..Default::default() }
+    TsConfigSourceFile {
+        source_file: source_file.root,
+        path: source_file.path().clone(),
+        file_name: source_file.file_name().to_string(),
+        ..Default::default()
+    }
 }
 
 /// Callback for `JsonConversionNotifier`: key text, value, property
@@ -830,8 +839,9 @@ pub fn get_extends_config_path(
         return (extended_config_path, errors);
     }
     // If the path isn't a rooted or relative path, resolve like a module
-    let resolver_host = ResolverHost { parse_config_host: host };
-    let resolved = resolve_config(&extended_config, &combine_paths(base_path, &["tsconfig.json"]), &resolver_host);
+    let resolver_host: Rc<dyn ResolutionHost> =
+        Rc::new(ResolverHost { fs: host.fs(), current_directory: host.get_current_directory() });
+    let resolved = resolve_config(&extended_config, &combine_paths(base_path, &["tsconfig.json"]), resolver_host);
     if resolved.is_resolved() {
         return (resolved.resolved_file_name.clone(), errors);
     }
@@ -1017,7 +1027,7 @@ pub fn parse_config_file_text_to_json(file_name: &str, path: Path, json_text: &s
     )
     .root;
     let (config, mut errors) = convert_config_file_to_object(json_source_file /*jsonConversionNotifier*/, None);
-    let diagnostics = source_file_diagnostics(json_source_file);
+    let diagnostics = parsed_source_file_diagnostics(json_source_file);
     if !diagnostics.is_empty() {
         errors = vec![diagnostics[0].clone()];
     }
@@ -1025,29 +1035,33 @@ pub fn parse_config_file_text_to_json(file_name: &str, path: Path, json_text: &s
 }
 
 // Go: tsoptions/tsconfigparsing.go:715 ParseConfigHost
+// PORT: Go `FS()` returns the `vfs.FS` interface. This returns a shared
+// `Rc<dyn Fs>`, so the resolver host can keep it.
 pub trait ParseConfigHost {
-    fn fs(&self) -> &dyn Fs;
+    fn fs(&self) -> Rc<dyn Fs>;
     fn get_current_directory(&self) -> String;
 }
 
 // Go: tsoptions/tsconfigparsing.go:720 resolverHost
-// PORT: Go embeds the interface; this holds a reference to it.
-pub struct ResolverHost<'a> {
-    pub parse_config_host: &'a dyn ParseConfigHost,
+// PORT: Go embeds the ParseConfigHost interface. This keeps its `FS()` and
+// `GetCurrentDirectory()` values, because `ResolutionHost` returns borrows.
+pub struct ResolverHost {
+    pub fs: Rc<dyn Fs>,
+    pub current_directory: String,
 }
 
-impl ResolverHost<'_> {
+impl ResolverHost {
     // Go: tsoptions/tsconfigparsing.go:724 (*resolverHost).Trace
     pub fn trace(&self, _msg: &str) {}
 }
 
-impl ResolutionHost for ResolverHost<'_> {
+impl ResolutionHost for ResolverHost {
     fn fs(&self) -> &dyn Fs {
-        self.parse_config_host.fs()
+        &*self.fs
     }
 
-    fn get_current_directory(&self) -> String {
-        self.parse_config_host.get_current_directory()
+    fn get_current_directory(&self) -> &str {
+        &self.current_directory
     }
 }
 

@@ -5,7 +5,7 @@
 //! the extra fields live in `ParsedSourceFile`. The parser (parser.go),
 //! references.go and parseoptions.go set them.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 /// The Go `ast.SourceFile` fields that the parser sets.
 // PORT: Go keeps these fields on the `SourceFile` node data. ts_ast cannot
@@ -139,4 +139,25 @@ impl ParsedSourceFile {
         // Go: IsSourceFileJS
         self.root.flags().intersects(NodeFlags::JAVA_SCRIPT_FILE)
     }
+}
+
+// PORT: Go `(*SourceFile).Diagnostics()` and `SetDiagnostics` read the
+// node itself. Code that only holds the `SourceFile` node of a parsed store
+// file (the tsconfig parser) reads the diagnostics from this table, keyed by
+// store id. `parse_source_file` fills it.
+thread_local! {
+    static PARSED_FILE_DIAGNOSTICS: RefCell<FxHashMap<usize, &'static [Diagnostic]>> =
+        RefCell::new(FxHashMap::default());
+}
+
+// Go: ast.go (*SourceFile).SetDiagnostics
+pub fn set_source_file_diagnostics(file: Node, diagnostics: Vec<Diagnostic>) {
+    let diagnostics: &'static [Diagnostic] = Box::leak(diagnostics.into_boxed_slice());
+    PARSED_FILE_DIAGNOSTICS.with(|m| m.borrow_mut().insert(file.file_index(), diagnostics));
+}
+
+// Go: ast.go (*SourceFile).Diagnostics, for a parsed store file.
+#[must_use]
+pub fn parsed_source_file_diagnostics(file: Node) -> &'static [Diagnostic] {
+    PARSED_FILE_DIAGNOSTICS.with(|m| m.borrow().get(&file.file_index()).copied().unwrap_or(&[]))
 }

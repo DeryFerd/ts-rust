@@ -1,6 +1,6 @@
 //! Port of tspath/extension.go.
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // Go: tspath/extension.go:8 Extension constants
 pub const EXTENSION_TS: &str = ".ts";

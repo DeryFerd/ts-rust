@@ -5,7 +5,7 @@
 //! Unit U8 of the frontend plan (`/tmp/port/frontend/plan.md`). The `Parser`
 //! struct and its fields are in `parser_p1.rs` (U4).
 
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 impl Parser {
     // Go: parser/parser.go:5534 parseTemplateExpression
@@ -119,7 +119,7 @@ impl Parser {
         self.parse_expected(SyntaxKind::CloseParenToken);
         let node = self.factory.new_parenthesized_expression(expression);
         let result = self.finish_node(node, pos);
-        self.with_jsdoc(result, jsdoc);
+        self.with_js_doc(result, jsdoc);
         result
     }
 
@@ -130,7 +130,7 @@ impl Parser {
         let open_bracket_parsed = self.parse_expected(SyntaxKind::OpenBracketToken);
         let multi_line = self.has_preceding_line_break();
         let elements =
-            self.parse_delimited_list(ParsingContext::ARRAY_LITERAL_MEMBERS, Parser::parse_argument_or_array_literal_element);
+            self.parse_delimited_list(ParsingContext::ArrayLiteralMembers, Parser::parse_argument_or_array_literal_element);
         self.parse_expected_matching_brackets(
             SyntaxKind::OpenBracketToken,
             SyntaxKind::CloseBracketToken,
@@ -148,7 +148,7 @@ impl Parser {
         let open_brace_parsed = self.parse_expected(SyntaxKind::OpenBraceToken);
         let multi_line = self.has_preceding_line_break();
         let properties =
-            self.parse_delimited_list(ParsingContext::OBJECT_LITERAL_MEMBERS, Parser::parse_object_literal_element);
+            self.parse_delimited_list(ParsingContext::ObjectLiteralMembers, Parser::parse_object_literal_element);
         self.parse_expected_matching_brackets(
             SyntaxKind::OpenBraceToken,
             SyntaxKind::CloseBraceToken,
@@ -167,7 +167,7 @@ impl Parser {
             let expression = self.parse_assignment_expression_or_higher();
             let node = self.factory.new_spread_assignment(expression);
             let result = self.finish_node(node, pos);
-            self.with_jsdoc(result, jsdoc);
+            self.with_js_doc(result, jsdoc);
             return result;
         }
         let modifiers = self.parse_modifiers_ex(
@@ -234,7 +234,7 @@ impl Parser {
             node = self.factory.new_property_assignment(modifiers, name, postfix_token, Node::NIL /*typeNode*/, initializer);
         }
         self.finish_node(node, pos);
-        self.with_jsdoc(node, jsdoc);
+        self.with_js_doc(node, jsdoc);
         node
     }
 
@@ -286,7 +286,7 @@ impl Parser {
             body,
         );
         self.finish_node(result, pos);
-        self.with_jsdoc(result, jsdoc);
+        self.with_js_doc(result, jsdoc);
         self.check_js_syntax(result);
         result
     }
@@ -460,7 +460,7 @@ impl Parser {
         private_identifier_diagnostic_message: Option<&'static Message>,
     ) -> Node {
         if is_identifier {
-            let pos = if self.scanner.has_preceding_jsdoc_leading_asterisks() {
+            let pos = if self.scanner.has_preceding_js_doc_leading_asterisks() {
                 self.scanner.token_start()
             } else {
                 self.node_pos()
@@ -548,9 +548,9 @@ impl Parser {
     pub fn finish_node_with_end(&mut self, node: Node, pos: i32, end: i32) -> Node {
         set_node_loc(node, TextRange::new(pos, end));
         set_node_flags(node, node.flags() | self.context_flags);
-        if self.has_parse_error {
+        if self.has_parse_error() {
             set_node_flags(node, node.flags() | NodeFlags::THIS_NODE_HAS_ERROR);
-            self.has_parse_error = false;
+            self.set_has_parse_error(false);
         }
         self.override_parent_in_immediate_children(node);
         node
@@ -1065,13 +1065,13 @@ impl Parser {
         {
             return false;
         }
-        self.token > SyntaxKind::LAST_RESERVED_WORD
+        (self.token as u16) > (SyntaxKind::LAST_RESERVED_WORD as u16)
     }
 
     // Go: parser/parser.go:6287 isBindingIdentifier
     pub fn is_binding_identifier(&self) -> bool {
         // `let await`/`let yield` in [Yield] or [Await] are allowed here and disallowed in the binder.
-        self.token == SyntaxKind::Identifier || self.token > SyntaxKind::LAST_RESERVED_WORD
+        self.token == SyntaxKind::Identifier || (self.token as u16) > (SyntaxKind::LAST_RESERVED_WORD as u16)
     }
 
     // Go: parser/parser.go:6292 isImportAttributeName
@@ -1226,7 +1226,7 @@ pub fn do_in_context<T>(p: &mut Parser, flags: NodeFlags, value: bool, f: impl F
 
 // Go: parser/parser.go:6413 isReservedWord
 pub fn is_reserved_word(token: SyntaxKind) -> bool {
-    SyntaxKind::FIRST_RESERVED_WORD <= token && token <= SyntaxKind::LAST_RESERVED_WORD
+    (SyntaxKind::FIRST_RESERVED_WORD as u16) <= (token as u16) && (token as u16) <= (SyntaxKind::LAST_RESERVED_WORD as u16)
 }
 
 // Go: parser/parser.go:6417 attachFileToDiagnostics

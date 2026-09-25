@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 use std::sync::LazyLock;
 use ts_diagnostics::Message;
 
@@ -60,6 +60,8 @@ pub enum CompilerOptionsValue {
     StringList(Vec<String>),
     Paths(Option<IndexMap<String, Vec<String>>>),
     IntPtr(Option<i32>),
+    /// Go `struct{}{}`, returned by `convertToJson` for a missing root.
+    EmptyStruct,
 }
 
 impl CompilerOptionsValue {

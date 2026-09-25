@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::frontend::prelude::*;
 
 // Go: tsoptions/wildcarddirectories.go:10 getWildcardDirectories
 // PORT: Go returns a nil map for an empty include list. Every reader treats

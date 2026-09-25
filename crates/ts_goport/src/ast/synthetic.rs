@@ -56,6 +56,43 @@ struct SyntheticNode {
     bind: &'static NodeBindData,
     /// Go `SyntheticExpression.Type.(*Type)`. Nil for other kinds.
     synthetic_type: TypeId,
+    /// The Go `ast.SourceFile` fields of a factory SourceFile. `None` for
+    /// other kinds.
+    source_file: Option<Box<SyntheticSourceFileData>>,
+}
+
+/// The Go `ast.SourceFile` fields (other than `Statements` and
+/// `EndOfFileToken`, which are in the node data) of a SourceFile that the
+/// factory made: `NewSourceFile` sets the first group, `copyFrom` and later
+/// Go writes (`result.AsSourceFile().IsDeclarationFile = true`) set the rest.
+// PORT: a parsed SourceFile keeps these fields in `SourceFileInfo`. ts_ast
+// node data cannot hold them, so a factory SourceFile keeps them in its slot.
+// Go `parseOptions` is kept as its file name and path; the external module
+// indicator options are only read by the parser. `ContainsNonASCII` and
+// `Identifiers` are not in `SourceFileInfo`, so `copyFrom` cannot copy them
+// from a parsed file and they are not kept.
+#[derive(Clone, Debug, Default)]
+pub struct SyntheticSourceFileData {
+    // Fields set by NewSourceFile
+    pub file_name: &'static str,
+    pub path: String,
+    pub text: &'static str,
+
+    // Fields set by copyFrom (Go "fields set by parser") and later writes
+    pub language_variant: LanguageVariant,
+    pub script_kind: ScriptKind,
+    pub is_declaration_file: bool,
+    pub uses_uri_style_node_core_modules: Tristate,
+    pub imports: Vec<Node>,
+    pub module_augmentations: Vec<Node>,
+    pub ambient_module_names: Vec<String>,
+    pub comment_directives: Vec<CommentDirective>,
+    pub pragmas: Vec<Pragma>,
+    pub referenced_files: Vec<FileReference>,
+    pub type_reference_directives: Vec<FileReference>,
+    pub lib_reference_directives: Vec<FileReference>,
+    pub common_js_module_indicator: Node,
+    pub external_module_indicator: Node,
 }
 
 struct SyntheticArena {
@@ -151,7 +188,7 @@ pub fn ast_node_of(n: Node) -> &'static ts_ast::Node {
         return store_ast_node(n);
     }
     prog().files[n.file_index()]
-        .source
+        .legacy_source()
         .parse
         .arena
         .get(n.node_id())
@@ -236,6 +273,25 @@ pub fn replace_node_data(n: Node, data: NodeData) {
     with_node_mut(n, |s| {
         let kind = s.node.kind;
         debug_assert!(data.matches_syntax_kind(kind), "{kind:?} does not fit its NodeData");
+        s.node = Box::leak(Box::new(ts_ast::Node {
+            kind,
+            flags: ts_ast::NodeFlags(0),
+            range: undefined_ts_range(),
+            parent: None,
+            data,
+        }));
+    });
+}
+
+/// Go `node.Kind = kind` on a factory node. The new kind must fit the node
+/// data (Go only does this between kinds with one data struct, such as
+/// `KindJSImportDeclaration` to `KindImportDeclaration`).
+// PORT: the kind lives in the leaked ts_ast node, so the node gets a new
+// leaked ts_ast node with the same data; the old one leaks.
+pub fn set_node_kind(n: Node, kind: SyntaxKind) {
+    with_node_mut(n, |s| {
+        let data = s.node.data.clone();
+        assert!(data.matches_syntax_kind(kind), "{kind:?} does not fit the data of {:?}", s.node.kind);
         s.node = Box::leak(Box::new(ts_ast::Node {
             kind,
             flags: ts_ast::NodeFlags(0),
@@ -348,6 +404,7 @@ pub fn alloc_synthetic_node(kind: SyntaxKind, data: NodeData) -> Node {
             loc: TextRange::undefined(),
             bind: &EMPTY_BIND,
             synthetic_type: TypeId::NIL,
+            source_file: None,
         }));
         handle(index)
     })
@@ -356,6 +413,103 @@ pub fn alloc_synthetic_node(kind: SyntaxKind, data: NodeData) -> Node {
 /// Sets the Go `SyntheticExpression.Type` of a new node.
 pub(crate) fn set_synthetic_expression_type(n: Node, t: TypeId) {
     with_node_mut(n, |s| s.synthetic_type = t);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Factory SourceFile fields
+// ──────────────────────────────────────────────────────────────────────
+
+/// Attaches the Go `ast.SourceFile` fields to a new factory SourceFile.
+pub(crate) fn set_synthetic_source_file_data(n: Node, data: SyntheticSourceFileData) {
+    debug_assert!(n.kind() == SyntaxKind::SourceFile);
+    with_node_mut(n, |s| s.source_file = Some(Box::new(data)));
+}
+
+/// True when `n` is a SourceFile that the factory made.
+#[must_use]
+pub fn is_synthetic_source_file(n: Node) -> bool {
+    is_synthetic_node(n) && with_node(n, |s| s.source_file.is_some())
+}
+
+/// Reads the Go `ast.SourceFile` fields of a factory SourceFile.
+pub fn with_synthetic_source_file<R>(n: Node, f: impl FnOnce(&SyntheticSourceFileData) -> R) -> R {
+    with_node(n, |s| f(s.source_file.as_deref().expect("node is not a factory SourceFile")))
+}
+
+/// Go writes to the fields of a factory SourceFile
+/// (`file.AsSourceFile().IsDeclarationFile = true`, ...). Panics on a
+/// parsed SourceFile (see the module comment).
+pub fn update_synthetic_source_file<R>(n: Node, f: impl FnOnce(&mut SyntheticSourceFileData) -> R) -> R {
+    with_node_mut(n, |s| f(s.source_file.as_deref_mut().expect("node is not a factory SourceFile")))
+}
+
+/// Go `file.Text()` of a factory SourceFile.
+#[must_use]
+pub fn synthetic_source_file_text(n: Node) -> &'static str {
+    with_synthetic_source_file(n, |d| d.text)
+}
+
+/// Go `file.FileName()` of a factory SourceFile.
+#[must_use]
+pub fn synthetic_source_file_file_name(n: Node) -> &'static str {
+    with_synthetic_source_file(n, |d| d.file_name)
+}
+
+/// Go `file.AsSourceFile().ReferencedFiles`, `TypeReferenceDirectives` and
+/// `LibReferenceDirectives`, `IsDeclarationFile` of any SourceFile, parsed
+/// or factory-made.
+// PORT: `SourceFileInfo` is `&'static` for parsed files only, so readers that
+// must also see a factory SourceFile use this copy.
+#[must_use]
+pub fn source_file_parser_fields(file: Node) -> SyntheticSourceFileData {
+    if is_synthetic_node(file) {
+        return with_synthetic_source_file(file, Clone::clone);
+    }
+    let info = source_file_info(file);
+    SyntheticSourceFileData {
+        file_name: source_file_file_name(file),
+        path: info.path.clone(),
+        text: source_file_text(file),
+        language_variant: info.language_variant,
+        script_kind: info.script_kind,
+        is_declaration_file: info.is_declaration_file,
+        uses_uri_style_node_core_modules: info.uses_uri_style_node_core_modules,
+        imports: info.imports.clone(),
+        module_augmentations: info.module_augmentations.clone(),
+        ambient_module_names: info.ambient_module_names.clone(),
+        comment_directives: info.comment_directives.clone(),
+        pragmas: info.pragmas.clone(),
+        referenced_files: info.referenced_files.clone(),
+        type_reference_directives: info.type_reference_directives.clone(),
+        lib_reference_directives: info.lib_reference_directives.clone(),
+        common_js_module_indicator: info.common_js_module_indicator,
+        external_module_indicator: info.external_module_indicator,
+    }
+}
+
+// Go: ast/ast.go:2663 (node *SourceFile) copyFrom
+/// Copies the parser fields of `other` (parsed or factory-made) to the
+/// factory SourceFile `node`.
+pub fn source_file_copy_from(node: Node, other: Node) {
+    // Do not copy fields set by NewSourceFile (Text, FileName, Path, or Statements)
+    let o = source_file_parser_fields(other);
+    update_synthetic_source_file(node, |d| {
+        d.language_variant = o.language_variant;
+        d.script_kind = o.script_kind;
+        d.is_declaration_file = o.is_declaration_file;
+        d.uses_uri_style_node_core_modules = o.uses_uri_style_node_core_modules;
+        d.imports = o.imports;
+        d.module_augmentations = o.module_augmentations;
+        d.ambient_module_names = o.ambient_module_names;
+        d.comment_directives = o.comment_directives;
+        d.pragmas = o.pragmas;
+        d.referenced_files = o.referenced_files;
+        d.type_reference_directives = o.type_reference_directives;
+        d.lib_reference_directives = o.lib_reference_directives;
+        d.common_js_module_indicator = o.common_js_module_indicator;
+        d.external_module_indicator = o.external_module_indicator;
+    });
+    set_node_flags(node, node.flags() | other.flags());
 }
 
 /// The synthetic-space id that stands for `n` inside synthetic `NodeData`.
