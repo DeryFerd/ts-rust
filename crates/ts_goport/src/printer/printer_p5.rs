@@ -1471,7 +1471,7 @@ impl Printer {
     // Generate the text for a generated identifier or private identifier
     // Go: printer/printer.go:6077 generateName
     pub(crate) fn generate_name(&mut self, name: Node) {
-        let _ = self.name_generator.generate_name(name);
+        let _ = self.sync_name_generator().generate_name(name);
     }
 
     // Returns a value indicating whether a name is unique globally or within the current file.

@@ -1900,6 +1900,11 @@ pub fn with_type_checker_for_file<R>(file: Node, f: impl FnOnce(&mut Checker) ->
     })
 }
 
+// PORT: replaces EmitResolver.checkerMu; borrows pool checker by index.
+pub fn with_checker_at<R>(index: usize, f: impl FnOnce(&mut Checker) -> R) -> R {
+    with_pool(|pool| f(&mut pool.checkers[index]))
+}
+
 // Go: compiler/checkerpool.go:123 forEachCheckerParallel
 pub fn for_each_checker_parallel(cb: &mut dyn FnMut(usize, &mut Checker)) {
     with_pool(|pool| {

@@ -1256,7 +1256,7 @@ fn maps_clone_p17(symbols: &mut SymbolArena, table: SymbolTable) -> SymbolTable 
 
 /// Private copies of Go `tspath` functions used by this unit. tspath has no
 /// Go-shaped port in this crate, so these follow the Go code exactly.
-mod tspath_p17 {
+pub(crate) mod tspath_p17 {
     // Go: tspath/extension.go constants
     pub const EXTENSION_TS: &str = ".ts";
     pub const EXTENSION_TSX: &str = ".tsx";
@@ -1346,7 +1346,7 @@ mod tspath_p17 {
     }
 
     // Go: tspath/path.go:37 IsRootedDiskPath
-    fn is_rooted_disk_path(path: &str) -> bool {
+    pub fn is_rooted_disk_path(path: &str) -> bool {
         get_encoded_root_length(path) > 0
     }
 
@@ -1524,7 +1524,7 @@ mod tspath_p17 {
     }
 
     // Go: tspath/path.go:269 GetPathFromPathComponents
-    fn get_path_from_path_components(path_components: &[String]) -> String {
+    pub fn get_path_from_path_components(path_components: &[String]) -> String {
         if path_components.is_empty() {
             return String::new();
         }
@@ -1538,7 +1538,7 @@ mod tspath_p17 {
     }
 
     // Go: tspath/path.go:282 NormalizeSlashes
-    fn normalize_slashes(path: &str) -> String {
+    pub fn normalize_slashes(path: &str) -> String {
         path.replace('\\', "/")
     }
 
@@ -1869,7 +1869,7 @@ mod tspath_p17 {
     }
 
     // Go: tspath/path.go:729 GetPathComponentsRelativeTo
-    fn get_path_components_relative_to(from: &str, to: &str, options: &ComparePathsOptions) -> Vec<String> {
+    pub fn get_path_components_relative_to(from: &str, to: &str, options: &ComparePathsOptions) -> Vec<String> {
         let from_components = reduce_path_components(get_path_components(from, &options.current_directory));
         let to_components = reduce_path_components(get_path_components(to, &options.current_directory));
 

@@ -6,7 +6,7 @@
 
 use crate::prelude::*;
 use crate::flags_macros::go_enum;
-use std::cell::RefMut;
+use std::cell::{Cell, RefMut};
 
 // Go: printer/printer.go:35 PrinterOptions
 #[derive(Clone, Debug, Default)]
@@ -91,6 +91,11 @@ pub struct Printer {
     pub(crate) comments_disabled: bool,
     pub(crate) in_extends: bool, // whether we are emitting the `extends` clause of a ConditionalTypeNode or InferTypeNode
     pub(crate) name_generator: NameGenerator,
+    // PORT: the name generator callbacks in Go read `p.currentSourceFile`
+    // through the captured Printer. The Rust callbacks capture this cell
+    // instead. `sync_name_generator` copies `current_source_file` into it
+    // before each call into the name generator.
+    pub(crate) name_generator_source_file: Rc<Cell<Node>>,
     // PORT: Go `makeFileLevelOptimisticUniqueName func(string) string` is a
     // closure over the Printer. Rust cannot store a closure that borrows its
     // owner, so it is the method `make_file_level_optimistic_unique_name`.
@@ -193,13 +198,37 @@ pub fn new_printer(options: PrinterOptions, handlers: PrintHandlers, emit_contex
         comments_disabled: false,
         in_extends: false,
         name_generator: NameGenerator::default(),
+        name_generator_source_file: Rc::new(Cell::new(Node::NIL)),
         id_to_symbol: None,
     };
-    printer.name_generator.context = Some(emit_context);
-    // PORT: Go also stores the closures `GetTextOfNode` and
-    // `IsFileLevelUniqueNameInCurrentFile` on the name generator. They capture
-    // the Printer, which Rust cannot store inside the Printer. The name
-    // generator must get them from the Printer at call time.
+    printer.name_generator.context = Some(Rc::clone(&emit_context));
+    // PORT: the Go closures capture the Printer. The Rust closures capture the
+    // Printer state that the Go methods read: the emit context, the target,
+    // `HasGlobalName` and the current source file (through a shared cell).
+    // `emitContext`, `Options` and `PrintHandlers` are not reassigned after
+    // construction.
+    {
+        let source_file = Rc::clone(&printer.name_generator_source_file);
+        let emit_context = Rc::clone(&emit_context);
+        let target = printer.options.target;
+        printer.name_generator.get_text_of_node = Some(Rc::new(move |generator: &mut NameGenerator, node: Node| {
+            get_text_of_node_worker(generator, &emit_context, source_file.get(), target, node, false)
+        }));
+    }
+    {
+        let source_file = Rc::clone(&printer.name_generator_source_file);
+        let has_global_name = printer.print_handlers.has_global_name.clone();
+        // Go: printer/printer.go:6082 isFileLevelUniqueNameInCurrentFile
+        printer.name_generator.is_file_level_unique_name_in_current_file =
+            Some(Rc::new(move |name: &str, _private_name: bool| {
+                let current_source_file = source_file.get();
+                if current_source_file.is_some() {
+                    is_file_level_unique_name(current_source_file, name, has_global_name.as_deref())
+                } else {
+                    true
+                }
+            }));
+    }
     printer.container_pos = -1;
     printer.container_end = -1;
     printer.declaration_list_container_end = -1;
@@ -217,88 +246,147 @@ impl Printer {
     // Go: printer/printer.go:183 (closure) makeFileLevelOptimisticUniqueName
     // PORT: the Go closure field becomes a method.
     pub(crate) fn make_file_level_optimistic_unique_name(&mut self, name: &str) -> String {
-        self.name_generator.make_file_level_optimistic_unique_name(name)
+        self.sync_name_generator().make_file_level_optimistic_unique_name(name)
+    }
+
+    /// Returns the name generator after its callbacks see the current
+    /// source file. Use it for every call into the name generator.
+    // PORT: no Go counterpart. See `name_generator_source_file`.
+    pub(crate) fn sync_name_generator(&mut self) -> &mut NameGenerator {
+        self.name_generator_source_file.set(self.current_source_file);
+        &mut self.name_generator
     }
 
     // Go: printer/printer.go:193 getLiteralTextOfNode
     pub(crate) fn get_literal_text_of_node(&mut self, node: Node, source_file: Node, flags: GetLiteralTextFlags) -> String {
-        let mut flags = flags;
-        if is_string_literal(node) {
-            let text_source_node = self.emit_context.text_source.borrow().get(&node).copied();
-            if let Some(text_source_node) = text_source_node.filter(|n| n.is_some()) {
-                let text: String;
-                match text_source_node.kind() {
-                    SyntaxKind::NumericLiteral => {
-                        text = text_source_node.text().to_string();
-                    }
-                    SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier | SyntaxKind::JsxNamespacedName => {
-                        text = self.get_text_of_node(text_source_node, false);
-                    }
-                    _ => {
-                        return self.get_literal_text_of_node(text_source_node, get_source_file_of_node(text_source_node), flags);
-                    }
-                }
-
-                if flags.intersects(GetLiteralTextFlags::JSX_ATTRIBUTE_ESCAPE) {
-                    return format!("\"{}\"", escape_jsx_attribute_string(&text, QuoteChar::DOUBLE_QUOTE));
-                } else if flags.intersects(GetLiteralTextFlags::NEVER_ASCII_ESCAPE)
-                    || self.emit_context.emit_flags(node).intersects(EmitFlags::NO_ASCII_ESCAPING)
-                {
-                    return format!("\"{}\"", escape_string(&text, QuoteChar::DOUBLE_QUOTE));
-                } else {
-                    return format!("\"{}\"", escape_non_ascii_string(&text, QuoteChar::DOUBLE_QUOTE));
-                }
-            }
-        }
-        // !!! Printer option to control whether to terminate unterminated literals
-        if self.emit_context.emit_flags(node).intersects(EmitFlags::NO_ASCII_ESCAPING) {
-            flags |= GetLiteralTextFlags::NEVER_ASCII_ESCAPE;
-        }
-        if self.options.target >= ScriptTarget::ES2021 {
-            flags |= GetLiteralTextFlags::ALLOW_NUMERIC_SEPARATOR;
-        }
-        // Go: core.Coalesce(sourceFile, p.currentSourceFile)
-        let source_file = if source_file.is_some() { source_file } else { self.current_source_file };
-        get_literal_text(node, source_file, flags)
+        let current_source_file = self.current_source_file;
+        let target = self.options.target;
+        let emit_context = Rc::clone(&self.emit_context);
+        get_literal_text_of_node_worker(self.sync_name_generator(), &emit_context, current_source_file, target, node, source_file, flags)
     }
 
     // Go: printer/printer.go:226 getTextOfNode
     // `node` must be one of Identifier | PrivateIdentifier | LiteralExpression | JsxNamespacedName
     pub(crate) fn get_text_of_node(&mut self, node: Node, include_trivia: bool) -> String {
-        if is_member_name(node) && self.emit_context.auto_generate.borrow().contains_key(&node) {
-            return self.name_generator.generate_name(node);
-        }
+        let current_source_file = self.current_source_file;
+        let target = self.options.target;
+        let emit_context = Rc::clone(&self.emit_context);
+        get_text_of_node_worker(self.sync_name_generator(), &emit_context, current_source_file, target, node, include_trivia)
+    }
+}
 
-        if is_string_literal(node) {
-            let text_source_node = self.emit_context.text_source.borrow().get(&node).copied().unwrap_or(Node::NIL);
-            if text_source_node.is_some() {
-                return self.get_text_of_node(text_source_node, include_trivia);
-            }
-        }
-
-        let can_use_source_file = self.current_source_file.is_some() && node.parent().is_some() && !node_is_synthesized(node);
-
-        match node.kind() {
-            SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier | SyntaxKind::JsxNamespacedName => {
-                if !can_use_source_file
-                    || get_source_file_of_node(node) != self.emit_context.most_original(self.current_source_file)
-                {
-                    return node.text().to_string();
+// Go: printer/printer.go:193 getLiteralTextOfNode
+// PORT: body of the Printer method as a free function over the Printer state
+// it reads (`p.emitContext`, `p.currentSourceFile`, `p.Options.Target`,
+// `p.nameGenerator`). The name generator callback runs it without the
+// Printer. See `new_printer`.
+fn get_literal_text_of_node_worker(
+    generator: &mut NameGenerator,
+    emit_context: &EmitContext,
+    current_source_file: Node,
+    target: ScriptTarget,
+    node: Node,
+    source_file: Node,
+    flags: GetLiteralTextFlags,
+) -> String {
+    let mut flags = flags;
+    if is_string_literal(node) {
+        let text_source_node = emit_context.text_source.borrow().get(&node).copied();
+        if let Some(text_source_node) = text_source_node.filter(|n| n.is_some()) {
+            let text: String;
+            match text_source_node.kind() {
+                SyntaxKind::NumericLiteral => {
+                    text = text_source_node.text().to_string();
+                }
+                SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier | SyntaxKind::JsxNamespacedName => {
+                    text = get_text_of_node_worker(generator, emit_context, current_source_file, target, text_source_node, false);
+                }
+                _ => {
+                    return get_literal_text_of_node_worker(
+                        generator,
+                        emit_context,
+                        current_source_file,
+                        target,
+                        text_source_node,
+                        get_source_file_of_node(text_source_node),
+                        flags,
+                    );
                 }
             }
-            SyntaxKind::StringLiteral
-            | SyntaxKind::NumericLiteral
-            | SyntaxKind::BigIntLiteral
-            | SyntaxKind::NoSubstitutionTemplateLiteral
-            | SyntaxKind::TemplateHead
-            | SyntaxKind::TemplateMiddle
-            | SyntaxKind::TemplateTail => {
-                return self.get_literal_text_of_node(node, Node::NIL /*sourceFile*/, GetLiteralTextFlags::NONE);
+
+            if flags.intersects(GetLiteralTextFlags::JSX_ATTRIBUTE_ESCAPE) {
+                return format!("\"{}\"", escape_jsx_attribute_string(&text, QuoteChar::DOUBLE_QUOTE));
+            } else if flags.intersects(GetLiteralTextFlags::NEVER_ASCII_ESCAPE)
+                || emit_context.emit_flags(node).intersects(EmitFlags::NO_ASCII_ESCAPING)
+            {
+                return format!("\"{}\"", escape_string(&text, QuoteChar::DOUBLE_QUOTE));
+            } else {
+                return format!("\"{}\"", escape_non_ascii_string(&text, QuoteChar::DOUBLE_QUOTE));
             }
-            kind => panic!("unexpected node: {:?}", kind),
         }
-        get_source_text_of_node_from_source_file(self.current_source_file, node, include_trivia)
     }
+    // !!! Printer option to control whether to terminate unterminated literals
+    if emit_context.emit_flags(node).intersects(EmitFlags::NO_ASCII_ESCAPING) {
+        flags |= GetLiteralTextFlags::NEVER_ASCII_ESCAPE;
+    }
+    if target >= ScriptTarget::ES2021 {
+        flags |= GetLiteralTextFlags::ALLOW_NUMERIC_SEPARATOR;
+    }
+    // Go: core.Coalesce(sourceFile, p.currentSourceFile)
+    let source_file = if source_file.is_some() { source_file } else { current_source_file };
+    get_literal_text(node, source_file, flags)
+}
+
+// Go: printer/printer.go:226 getTextOfNode
+// PORT: free function form of the Printer method. See
+// `get_literal_text_of_node_worker`.
+fn get_text_of_node_worker(
+    generator: &mut NameGenerator,
+    emit_context: &EmitContext,
+    current_source_file: Node,
+    target: ScriptTarget,
+    node: Node,
+    include_trivia: bool,
+) -> String {
+    if is_member_name(node) && emit_context.auto_generate.borrow().contains_key(&node) {
+        return generator.generate_name(node);
+    }
+
+    if is_string_literal(node) {
+        let text_source_node = emit_context.text_source.borrow().get(&node).copied().unwrap_or(Node::NIL);
+        if text_source_node.is_some() {
+            return get_text_of_node_worker(generator, emit_context, current_source_file, target, text_source_node, include_trivia);
+        }
+    }
+
+    let can_use_source_file = current_source_file.is_some() && node.parent().is_some() && !node_is_synthesized(node);
+
+    match node.kind() {
+        SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier | SyntaxKind::JsxNamespacedName => {
+            if !can_use_source_file || get_source_file_of_node(node) != emit_context.most_original(current_source_file) {
+                return node.text().to_string();
+            }
+        }
+        SyntaxKind::StringLiteral
+        | SyntaxKind::NumericLiteral
+        | SyntaxKind::BigIntLiteral
+        | SyntaxKind::NoSubstitutionTemplateLiteral
+        | SyntaxKind::TemplateHead
+        | SyntaxKind::TemplateMiddle
+        | SyntaxKind::TemplateTail => {
+            return get_literal_text_of_node_worker(
+                generator,
+                emit_context,
+                current_source_file,
+                target,
+                node,
+                Node::NIL, /*sourceFile*/
+                GetLiteralTextFlags::NONE,
+            );
+        }
+        kind => panic!("unexpected node: {:?}", kind),
+    }
+    get_source_text_of_node_from_source_file(current_source_file, node, include_trivia)
 }
 
 //

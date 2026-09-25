@@ -474,13 +474,6 @@ impl Checker {
         self.get_type_of_node(get_reparsed_node_for_node(node))
     }
 
-    // Go: checker/checker.go:31911 GetEmitResolver
-    // PORT: the emit resolver is out of scope for this port, and `Checker`
-    // has no `emit_resolver` field, so this always reports unported code.
-    pub fn get_emit_resolver(&mut self) -> ! {
-        unported!("newEmitResolver")
-    }
-
     // Go: checker/checker.go:31919 GetAliasedSymbol
     pub fn get_aliased_symbol(&mut self, symbol: SymbolId) -> SymbolId {
         self.resolve_alias(symbol)

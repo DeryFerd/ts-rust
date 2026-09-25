@@ -133,14 +133,16 @@ impl Checker {
         }
 
         // !!! TODO: JSDoc, getEmitResolver call is unfortunate layering for the helper - hoist it into checker
-        // PORT: Go calls `b.ch.GetEmitResolver().requiresAddingImplicitUndefined(declaration, symbol,
-        // b.ctx.enclosingDeclaration)`. The emit resolver is not ported yet. The Go `&&` guard
-        // is kept, so the call is reached only for parameter and property declarations.
+        // PORT: Go `requiresAddingImplicitUndefined` reads `r.checker`; here the checker is passed in.
         let requires_adding_undefined = declaration.is_some()
             && (is_parameter_declaration(declaration)
                 || is_property_signature_declaration(declaration)
                 || is_property_declaration(declaration))
-            && unported!("requiresAddingImplicitUndefined");
+            && {
+                let resolver = self.get_emit_resolver();
+                let enclosing_declaration = nb_ctx(b, |c| c.enclosing_declaration);
+                resolver.requires_adding_implicit_undefined(self, declaration, symbol, enclosing_declaration)
+            };
         let add_undefined_for_parameter = requires_adding_undefined && is_parameter_declaration(declaration) /*|| ast.IsJSDocParameterTag(declaration)*/;
         if add_undefined_for_parameter {
             t = self.get_optional_type(t, false);

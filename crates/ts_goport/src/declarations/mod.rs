@@ -4,6 +4,9 @@
 pub mod diagnostics;
 pub mod tracker;
 pub mod transform;
+pub mod transform_p2;
+pub mod transform_p3;
+pub mod transform_p4;
 pub mod util;
 
 pub use diagnostics::*;

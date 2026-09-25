@@ -32,6 +32,31 @@ pub struct SymbolTrackerImpl {
 }
 
 impl SymbolTrackerImpl {
+    // Go: transformers/declarations/tracker.go:61 SymbolTrackerImpl.ReportInferenceFallback
+    // PORT: the transformer calls this outside any checker call, so there is
+    // no checker in hand. The resolver trait methods borrow the checker
+    // themselves. The checker `SymbolTracker` trait method is the in-checker
+    // path.
+    pub(crate) fn report_inference_fallback(&self, node: Node) {
+        let (isolated_declarations, current_source_file) = {
+            let state = self.state.borrow();
+            (state.isolated_declarations, state.current_source_file)
+        };
+        if !isolated_declarations {
+            return;
+        }
+        if get_source_file_of_node(node) != current_source_file {
+            return; // Nested error on a declaration in another file - ignore, will be reemitted if file is in the output file set
+        }
+        if self.resolver.is_expando_function_declaration_unsafe(node) {
+            let resolver = self.resolver.clone();
+            SymbolTrackerSharedState::report_expando_function_errors(&self.state, node, &mut |n| {
+                let props = resolver.get_properties_of_container_function(n);
+                props.into_iter().map(|p| resolver.symbol_value_declaration(p)).collect()
+            });
+        }
+    }
+
     // Go: transformers/declarations/tracker.go:27 SymbolTrackerImpl.PopErrorFallbackNode
     // PORT: the trait method needs a checker. The transformer pushes and pops
     // outside of any checker call, so the body is here and the trait forwards.
@@ -82,7 +107,7 @@ impl SymbolTrackerImpl {
     }
 
     // Go: transformers/declarations/tracker.go:176 SymbolTrackerImpl.handleSymbolAccessibilityError
-    fn handle_symbol_accessibility_error(&self, symbol_accessibility_result: SymbolAccessibilityResult) -> bool {
+    pub(crate) fn handle_symbol_accessibility_error(&self, symbol_accessibility_result: SymbolAccessibilityResult) -> bool {
         if symbol_accessibility_result.accessibility == SymbolAccessibility::ACCESSIBLE {
             // Add aliases back onto the possible imports list if they're not there so we can try them again with updated visibility info
             if !symbol_accessibility_result.aliases_to_make_visible.is_empty() {
@@ -193,10 +218,16 @@ impl SymbolTracker for SymbolTrackerImpl {
         if get_source_file_of_node(node) != current_source_file {
             return; // Nested error on a declaration in another file - ignore, will be reemitted if file is in the output file set
         }
-        if self.resolver.is_expando_function_declaration_unsafe(node) {
+        // PORT: Go calls `s.resolver.IsExpandoFunctionDeclarationUnsafe` and
+        // `GetPropertiesOfContainerFunction` without the lock. The trait path
+        // would borrow the checker again, so this uses the worker with the
+        // checker in hand.
+        if c.get_emit_resolver().is_expando_function_declaration_unsafe_worker(c, node) {
             // within a node builder call that should already lock the checker, use the unsafe call
-            // PORT: Go `p.ValueDeclaration` on checker symbols; read through the checker in hand.
-            SymbolTrackerSharedState::report_expando_function_errors(&self.state, node, &|p| c.sym(p).value_declaration);
+            SymbolTrackerSharedState::report_expando_function_errors(&self.state, node, &mut |n| {
+                let props = c.get_emit_resolver().get_properties_of_container_function_worker(c, n);
+                props.into_iter().map(|p| c.sym(p).value_declaration).collect()
+            });
         }
         self.add_diagnostic((self.get_isolated_declaration_error)(node));
     }
@@ -349,24 +380,21 @@ impl SymbolTrackerSharedState {
     }
 
     // Go: transformers/declarations/transform.go:116 NewDeclarationTransformer.func1 (reportExpandoFunctionErrors)
-    // PORT: `value_declaration` reads `p.ValueDeclaration`. The symbols come
-    // from the checker arena, so the caller supplies the lookup. The resolver
-    // is cloned out so the state is not borrowed during the resolver call.
+    // PORT: Go calls `resolver.GetPropertiesOfContainerFunction(node)` (not
+    // locked) and reads `p.ValueDeclaration` of each result. The symbols live
+    // in the checker arena, and the tracker path already holds the checker,
+    // so the caller supplies `prop_value_declarations`, which returns
+    // `p.ValueDeclaration` for each property in order.
     pub(crate) fn report_expando_function_errors(
         state: &Rc<RefCell<SymbolTrackerSharedState>>,
         node: Node,
-        value_declaration: &dyn Fn(SymbolId) -> Node,
+        prop_value_declarations: &mut dyn FnMut(Node) -> Vec<Node>,
     ) {
-        let (isolated_declarations, resolver) = {
-            let s = state.borrow();
-            (s.isolated_declarations, s.resolver.clone())
-        };
+        let isolated_declarations = state.borrow().isolated_declarations;
         if !isolated_declarations {
             return;
         }
-        let props = resolver.get_properties_of_container_function(node);
-        for p in props {
-            let p_value_declaration = value_declaration(p);
+        for p_value_declaration in prop_value_declarations(node) {
             if is_expando_property_declaration(p_value_declaration) {
                 let mut error_target = p_value_declaration;
                 if is_binary_expression(error_target) {

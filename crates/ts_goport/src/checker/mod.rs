@@ -71,6 +71,8 @@ pub mod utilities_p2;
 pub mod jsx_p1;
 pub mod jsx_p2;
 pub mod jsdoc;
+pub mod emit_resolver_p1;
+pub mod emit_resolver_p2;
 
 pub use nameresolver::*;
 pub use types::*;

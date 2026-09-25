@@ -215,11 +215,11 @@ go_enum!(TypeReferenceSerializationKind, i32 {
 /// Go `nodebuilder.SymbolTracker` as the emit resolver receives it (an
 /// interface value that may be nil).
 // PORT: Go passes the interface by value; here it is a shared handle.
-pub type EmitSymbolTracker = Option<Rc<RefCell<dyn SymbolTracker>>>;
+pub type EmitSymbolTracker = Option<Rc<dyn SymbolTracker>>;
 
 /// Go `printer.EmitResolver`.
-// PORT: Go embeds `binder.ReferenceResolver`. That interface is not ported
-// in this crate yet, so its methods are not part of this trait.
+// PORT: Go embeds `binder.ReferenceResolver`. Only the methods that the
+// declaration transformer uses are in this trait so far.
 // PORT: Go methods on the resolver lock a mutex and call the checker. Here
 // they take `&self`; an implementation holds its checker in a `RefCell`.
 // PORT: Go `GetConstantValue` returns `any` (string, float64 or nil); that is
@@ -227,6 +227,15 @@ pub type EmitSymbolTracker = Option<Rc<RefCell<dyn SymbolTracker>>>;
 // (`Node::NIL` for nil).
 // Go: printer/emitresolver.go:79 EmitResolver
 pub trait EmitResolver {
+    // Go binder.ReferenceResolver (embedded)
+    fn get_referenced_value_declaration(&self, node: Node) -> Node;
+    fn get_element_access_expression_name(&self, expression: Node) -> String;
+    fn get_referenced_member_value_declaration(&self, node: Node) -> Node;
+    /// PORT: not in Go. Go reads `symbol.ValueDeclaration` directly; here
+    /// symbols live in the checker arena, so callers outside the checker
+    /// read it through the resolver.
+    fn symbol_value_declaration(&self, symbol: SymbolId) -> Node;
+
     fn is_referenced_alias_declaration(&self, node: Node) -> bool;
     fn is_value_alias_declaration(&self, node: Node) -> bool;
     fn is_top_level_value_import_equals_with_entity_name(&self, node: Node) -> bool;

@@ -1337,7 +1337,7 @@ impl Checker {
     }
 
     // Go: checker/nodebuilderimpl.go:2061 isTriviallySerializableComputedName
-    fn is_trivially_serializable_computed_name(&mut self, _b: &Nb, e: Node) -> bool {
+    fn is_trivially_serializable_computed_name(&mut self, b: &Nb, e: Node) -> bool {
         let shape_good = e.is_some()
             && e.name().is_some()
             && is_computed_property_name(e.name())
@@ -1346,11 +1346,9 @@ impl Checker {
             return false;
         }
         // TODO: going through emit resolver here is weird. Relayer these APIs.
-        // PORT: Go calls `b.ch.GetEmitResolver().isEntityNameVisible(
-        // e.Name().Expression(), b.ctx.enclosingDeclaration, false)` and
-        // compares its accessibility to Accessible. The emit resolver is
-        // not ported.
-        unported!("GetEmitResolver")
+        let enclosing_declaration = nb_ctx(b).borrow().enclosing_declaration;
+        self.get_emit_resolver().is_entity_name_visible(self, e.name().expression(), enclosing_declaration, false).accessibility
+            == SymbolAccessibility::ACCESSIBLE
     }
 
     // Go: checker/nodebuilderimpl.go:2070 indexInfoToObjectComputedNamesOrSignatureDeclaration

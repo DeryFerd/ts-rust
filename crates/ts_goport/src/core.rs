@@ -114,6 +114,7 @@ impl FlowNodeId {
 
 /// Go `*ast.Node` (and every alias: `*ast.Expression`, `*ast.TypeNode`,
 /// `*ast.SourceFile`, ...). High 32 bits: file index in `GoProgram::files`.
+/// For a ported-parser file this is also its store id (`ast/store.rs`).
 /// Low 32 bits: `ts_ast::NodeId::index() + 1`. Zero is nil.
 /// Node methods (kind, parent, fields, binder data) live in `crate::ast`.
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Debug)]
@@ -142,6 +143,10 @@ impl Node {
         // Child ids inside factory-made nodes live in the synthetic id space.
         if file == crate::ast::SYNTHETIC_NODE_FILE {
             return crate::ast::resolve_synthetic_id(node);
+        }
+        // Child ids inside nodes of a ported-parser file are store slots.
+        if crate::ast::has_file_store(file) {
+            return crate::ast::resolve_store_id(file, node);
         }
         Self(((file as u64) << 32) | (node.index() as u64 + 1))
     }
@@ -434,6 +439,13 @@ pub fn set_prog(program: &'static GoProgram) {
     PROGRAM.with(|cell| {
         assert!(cell.set(program).is_ok(), "GoProgram already installed");
     });
+}
+
+/// The installed program, or `None` before `set_prog`. The ported parser
+/// reads nodes before the program exists.
+#[must_use]
+pub fn try_prog() -> Option<&'static GoProgram> {
+    PROGRAM.with(|cell| cell.get().copied())
 }
 
 /// The installed program. Go code reads nodes without a context; this is

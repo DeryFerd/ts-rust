@@ -558,9 +558,10 @@ fn nil_iteration_types_resolver() -> Rc<IterationTypesResolver> {
 // - `symbolArena`, `signatureArena`, `indexInfoArena` are replaced by the
 //   arenas at the end (`symbols`, `types`, `signatures`, `index_infos`,
 //   `type_predicates`, `mappers`, `inference_contexts`), see `PORTING.md`.
-// - `regExpScanner` (Go scanner), `emitResolver`, `emitResolverOnce`,
-//   `ctx`, `mu` and `tracer` are out of scope (scanner object, emit
-//   resolver, cancellation, concurrency, tracing) and are not fields.
+// - `regExpScanner` (Go scanner), `ctx`, `mu` and `tracer` are out of
+//   scope (scanner object, cancellation, concurrency, tracing) and are not
+//   fields. `emitResolver` plus `emitResolverOnce` is the
+//   `Option<Rc<EmitResolver>>` field `emit_resolver`.
 // - `sync.Once` fields become `bool` "done" flags.
 // - `*T` pools and shared structs (`*Relation`, `*Relater`, `*FlowState`,
 //   `*InferenceState`) are `Rc<RefCell<T>>`; nil-able ones are `Option`.
@@ -599,6 +600,7 @@ pub struct Checker {
     pub use_unknown_in_catch_variables: bool,
     pub exact_optional_property_types: bool,
     pub can_collect_symbol_alias_accessibility_data: bool,
+    pub emit_resolver: Option<Rc<crate::checker::emit_resolver_p1::EmitResolver>>,
     pub was_canceled: bool,
     pub save_deferred_diagnostics: bool,
     pub array_variances: Vec<VarianceFlags>,
@@ -1037,6 +1039,7 @@ impl Checker {
                 .get_strict_option_value(compiler_options.use_unknown_in_catch_variables),
             exact_optional_property_types: compiler_options.exact_optional_property_types == Tristate::True,
             can_collect_symbol_alias_accessibility_data: compiler_options.verbatim_module_syntax.is_false_or_unknown(),
+            emit_resolver: None,
             was_canceled: false,
             save_deferred_diagnostics: false,
             array_variances: vec![VarianceFlags::COVARIANT],

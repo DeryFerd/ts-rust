@@ -16,7 +16,11 @@ pub(crate) const TEMP_FLAGS_I: TempFlags = 0x1000_0000; // Use/preference flag f
 /// Go `func(string, bool) bool` (Printer.isFileLevelUniqueNameInCurrentFile).
 pub type IsFileLevelUniqueNameFn = Rc<dyn Fn(&str, bool) -> bool>;
 /// Go `func(*ast.Node) string` (Printer.getTextOfNode).
-pub type GetTextOfNodeFn = Rc<dyn Fn(Node) -> String>;
+// PORT: the Go closure captures the Printer, and Printer.getTextOfNode can
+// call back into this same NameGenerator (GenerateName). Rust cannot give the
+// closure a second mutable path to the generator, so the generator passes
+// itself to the callback.
+pub type GetTextOfNodeFn = Rc<dyn Fn(&mut NameGenerator, Node) -> String>;
 
 /// Go `NameGenerator`.
 // PORT: Go func fields are `Option<Rc<dyn Fn>>`; `None` is Go `nil`. Nil
@@ -121,9 +125,9 @@ impl NameGenerator {
     }
 
     /// Go `g.GetTextOfNode(node)`. Panics when the callback is nil, as Go does.
-    fn text_of_node(&self, node: Node) -> String {
-        let get_text_of_node = self.get_text_of_node.as_ref().expect("nil GetTextOfNode callback");
-        get_text_of_node(node)
+    fn text_of_node(&mut self, node: Node) -> String {
+        let get_text_of_node = self.get_text_of_node.clone().expect("nil GetTextOfNode callback");
+        get_text_of_node(self, node)
     }
 
     // Go: printer/namegenerator.go:114 GenerateName

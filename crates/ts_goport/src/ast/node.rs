@@ -4,7 +4,9 @@
 //! `TextRange`).
 //!
 //! Go reads the AST without a context. So do we: every method reaches the
-//! parsed ts_ast arena through `prog()`.
+//! parsed ts_ast arena through `prog()`. Nodes of a ported-parser file are
+//! read from its node store (`ast/store.rs`), and factory nodes from the
+//! synthetic arena (`ast/synthetic.rs`).
 //!
 //! PORT: Go methods that panic with "Unhandled case in Node.X" return nil,
 //! an empty list or "" here (PORTING.md "AST"). They also cover every node
@@ -33,6 +35,9 @@ fn raw(n: Node) -> &'static ts_ast::Node {
     assert!(n.is_some(), "nil node dereference");
     if n.file_index() == SYNTHETIC_NODE_FILE {
         return synthetic_ast_node(n);
+    }
+    if has_file_store(n.file_index()) {
+        return store_ast_node(n);
     }
     prog().files[n.file_index()]
         .source
@@ -228,7 +233,8 @@ fn mapped_type_members(n: Node) -> NodeList {
         return NodeList::NIL;
     };
     let f = n.file_index();
-    if d.members.is_some() || prog().files.get(f).is_none() {
+    // A ported-parser file keeps the Go list as parsed.
+    if d.members.is_some() || has_file_store(f) || prog().files.get(f).is_none() {
         return opt_list(f, &d.members);
     }
     let l = MAPPED_TYPE_MEMBERS.with(|cache| {
@@ -431,9 +437,9 @@ pub struct NodeList {
 
 impl PartialEq for NodeList {
     fn eq(&self, other: &Self) -> bool {
-        match (self.list, other.list) {
-            (None, None) => true,
-            (Some(a), Some(b)) => std::ptr::eq(a, b),
+        match (self.is_nil(), other.is_nil(), self.list, other.list) {
+            (true, true, _, _) => true,
+            (false, false, Some(a), Some(b)) => std::ptr::eq(a, b),
             _ => false,
         }
     }
@@ -445,14 +451,19 @@ impl NodeList {
     /// Go `nil`.
     pub const NIL: Self = Self { file: 0, list: None };
 
+    /// Go `list == nil`. A required ts_ast list field of a store node holds
+    /// Go `nil` as a marker list (`store::NIL_LIST_POS`).
     #[must_use]
-    pub const fn is_nil(self) -> bool {
-        self.list.is_none()
+    pub fn is_nil(self) -> bool {
+        match self.list {
+            None => true,
+            Some(l) => is_nil_list_marker(l),
+        }
     }
 
     #[must_use]
-    pub const fn is_some(self) -> bool {
-        self.list.is_some()
+    pub fn is_some(self) -> bool {
+        !self.is_nil()
     }
 
     /// Go `list.Nodes`. Empty when nil.
@@ -471,6 +482,11 @@ impl NodeList {
     // and end after the last element or its trailing comma.
     pub fn loc(self) -> TextRange {
         let l = self.list.expect("nil NodeList dereference");
+        assert!(!is_nil_list_marker(l), "nil NodeList dereference");
+        // Synthetic and store lists hold the Go `Loc`.
+        if self.file as usize == SYNTHETIC_NODE_FILE || has_file_store(self.file as usize) {
+            return text_range_of(&l.range);
+        }
         let Some(file) = prog().files.get(self.file as usize) else {
             return text_range_of(&l.range);
         };
@@ -652,6 +668,10 @@ impl Node {
     #[must_use]
     pub fn kind(self) -> SyntaxKind {
         let r = raw(self);
+        // A store node holds the Go kind.
+        if has_file_store(self.file_index()) {
+            return r.kind;
+        }
         match r.kind {
             SyntaxKind::PropertyDeclaration | SyntaxKind::QualifiedName | SyntaxKind::OmittedExpression => {
                 go_kind(self.file_index(), nid(self), r)
@@ -666,6 +686,14 @@ impl Node {
         if is_synthetic_node(self) {
             return synthetic_flags(self);
         }
+        if has_file_store(self.file_index()) {
+            // The parser reads flags before the program exists.
+            let flags = store_header(self).flags;
+            return match crate::core::try_prog() {
+                Some(p) if self.file_index() < p.files.len() => flags | self.bind().added_flags,
+                _ => flags,
+            };
+        }
         self.go_file().parser_flags[nid(self).index()] | self.bind().added_flags
     }
 
@@ -674,6 +702,9 @@ impl Node {
     pub fn parent(self) -> Node {
         if is_synthetic_node(self) {
             return synthetic_parent(self);
+        }
+        if has_file_store(self.file_index()) {
+            return store_header(self).parent;
         }
         opt(self.file_index(), raw(self).parent)
     }
@@ -685,6 +716,9 @@ impl Node {
     pub fn loc(self) -> TextRange {
         if is_synthetic_node(self) {
             return synthetic_loc(self);
+        }
+        if has_file_store(self.file_index()) {
+            return store_header(self).loc;
         }
         let r = raw(self);
         let Some(file) = prog().files.get(self.file_index()) else {
@@ -2941,12 +2975,18 @@ thread_local! {
 // Go: ast.go:2566 (*SourceFile).Text
 #[must_use]
 pub fn source_file_text(file: Node) -> &'static str {
+    if has_file_store(file.file_index()) {
+        return file_store_text(file.file_index());
+    }
     &file.go_file().source.source_text
 }
 
 // Go: ast.go:2570 (*SourceFile).FileName
 #[must_use]
 pub fn source_file_file_name(file: Node) -> &'static str {
+    if has_file_store(file.file_index()) {
+        return file_store_file_name(file.file_index());
+    }
     &file.go_file().source.file_name
 }
 

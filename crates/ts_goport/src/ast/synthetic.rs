@@ -20,8 +20,10 @@
 //! `node.AsX().Symbol = s`). Those fields live in the slot, not in the leaked
 //! `ts_ast::Node`, and `node.rs` reads them through the hooks below.
 //!
-//! PORT: parsed nodes are immutable. The setters panic on a parsed node. Go
-//! code that writes a field of a parsed node needs its own port decision.
+//! PORT: parsed nodes are immutable. The setters panic on a parsed node,
+//! except on a node of a ported-parser file that the parser has not finished
+//! (`ast/store.rs`). Go code that writes a field of a parsed node needs its
+//! own port decision.
 
 use crate::prelude::*;
 use ts_ast::NodeData;
@@ -145,6 +147,9 @@ pub fn ast_node_of(n: Node) -> &'static ts_ast::Node {
     if n.file_index() == SYNTHETIC_NODE_FILE {
         return synthetic_ast_node(n);
     }
+    if has_file_store(n.file_index()) {
+        return store_ast_node(n);
+    }
     prog().files[n.file_index()]
         .source
         .parse
@@ -194,19 +199,98 @@ pub fn synthetic_expression_type(n: Node) -> TypeId {
 // Go field writes on factory nodes
 // ──────────────────────────────────────────────────────────────────────
 
-/// Go `node.Parent = parent`.
+/// Go `node.Parent = parent`. Works on factory nodes and on nodes of a
+/// ported-parser file that is not finished.
 pub fn set_node_parent(n: Node, parent: Node) {
+    if is_store_node(n) {
+        return set_store_node_parent(n, parent);
+    }
     with_node_mut(n, |s| s.parent = parent);
 }
 
 /// Go `node.Loc = loc`.
 pub fn set_node_loc(n: Node, loc: TextRange) {
+    if is_store_node(n) {
+        return set_store_node_loc(n, loc);
+    }
     with_node_mut(n, |s| s.loc = loc);
 }
 
 /// Go `node.Flags = flags`.
 pub fn set_node_flags(n: Node, flags: NodeFlags) {
+    if is_store_node(n) {
+        return set_store_node_flags(n, flags);
+    }
     with_node_mut(n, |s| s.flags = flags);
+}
+
+/// A Go write to a data field of a node (`node.AsX().Field = v`): `data` is
+/// the node's data with that field changed. Works on factory nodes and on
+/// nodes of a ported-parser file that is not finished.
+// PORT: ts_ast data is leaked and shared, so the node gets a new leaked
+// ts_ast node with the same kind; the old one leaks. Writes are rare.
+pub fn replace_node_data(n: Node, data: NodeData) {
+    if is_store_node(n) {
+        return replace_store_node_data(n, data);
+    }
+    with_node_mut(n, |s| {
+        let kind = s.node.kind;
+        debug_assert!(data.matches_syntax_kind(kind), "{kind:?} does not fit its NodeData");
+        s.node = Box::leak(Box::new(ts_ast::Node {
+            kind,
+            flags: ts_ast::NodeFlags(0),
+            range: undefined_ts_range(),
+            parent: None,
+            data,
+        }));
+    });
+}
+
+/// Go `node.AsMutable().SetModifiers(modifiers)`.
+// Go: ast/ast.go:227 (n *MutableNode) SetModifiers
+// PORT: Go dispatches to `setModifiers` on the data. The kinds with a
+// `modifiers` field set it (ModifiersBase, NamedMemberBase,
+// BinaryExpression); other kinds do nothing, like Go `NodeDefault`.
+pub fn set_node_modifiers(n: Node, modifiers: ModifierList) {
+    let mods = synthetic_modifiers_value(modifiers);
+    let mut data = ast_data_of(n).clone();
+    match &mut data {
+        NodeData::ArrowFunction(d) => d.modifiers = mods,
+        NodeData::BinaryExpression(d) => d.modifiers = mods,
+        NodeData::ClassDeclaration(d) => d.modifiers = mods,
+        NodeData::ClassExpression(d) => d.modifiers = mods,
+        NodeData::ClassStaticBlockDeclaration(d) => d.modifiers = mods,
+        NodeData::ConstructorDeclaration(d) => d.modifiers = mods,
+        NodeData::ConstructorTypeNode(d) => d.modifiers = mods,
+        NodeData::EnumDeclaration(d) => d.modifiers = mods,
+        NodeData::EnumMember(d) => d.modifiers = mods,
+        NodeData::ExportAssignment(d) => d.modifiers = mods,
+        NodeData::ExportDeclaration(d) => d.modifiers = mods,
+        NodeData::FunctionDeclaration(d) => d.modifiers = mods,
+        NodeData::FunctionExpression(d) => d.modifiers = mods,
+        NodeData::FunctionTypeNode(d) => d.modifiers = mods,
+        NodeData::GetAccessorDeclaration(d) => d.modifiers = mods,
+        NodeData::ImportDeclaration(d) => d.modifiers = mods,
+        NodeData::ImportEqualsDeclaration(d) => d.modifiers = mods,
+        NodeData::IndexSignatureDeclaration(d) => d.modifiers = mods,
+        NodeData::InterfaceDeclaration(d) => d.modifiers = mods,
+        NodeData::MethodDeclaration(d) => d.modifiers = mods,
+        NodeData::MethodSignatureDeclaration(d) => d.modifiers = mods,
+        NodeData::MissingDeclaration(d) => d.modifiers = mods,
+        NodeData::ModuleDeclaration(d) => d.modifiers = mods,
+        NodeData::NamespaceExportDeclaration(d) => d.modifiers = mods,
+        NodeData::ParameterDeclaration(d) => d.modifiers = mods,
+        NodeData::PropertyAssignment(d) => d.modifiers = mods,
+        NodeData::PropertyDeclaration(d) => d.modifiers = mods,
+        NodeData::PropertySignatureDeclaration(d) => d.modifiers = mods,
+        NodeData::SetAccessorDeclaration(d) => d.modifiers = mods,
+        NodeData::ShorthandPropertyAssignment(d) => d.modifiers = mods,
+        NodeData::TypeAliasDeclaration(d) => d.modifiers = mods,
+        NodeData::TypeParameterDeclaration(d) => d.modifiers = mods,
+        NodeData::VariableStatement(d) => d.modifiers = mods,
+        _ => return,
+    }
+    replace_node_data(n, data);
 }
 
 /// Changes the binder data of a factory node: Go
@@ -350,6 +434,9 @@ pub fn new_synthetic_modifier_list(nodes: &[Node], loc: TextRange) -> ModifierLi
 // copy is false where Go compares equal pointers.
 #[must_use]
 pub fn synthetic_list_value(list: NodeList) -> Option<ts_ast::NodeList> {
+    if list.is_nil() {
+        return None;
+    }
     let l = list.list?;
     if list.file as usize == SYNTHETIC_NODE_FILE {
         return Some(l.clone());
