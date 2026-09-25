@@ -1825,12 +1825,27 @@ pub fn compute_line_of_position(line_starts: &[i32], pos: i32) -> i32 {
 thread_local! {
     /// Go `SourceFile.ECMALineMap()` cache, keyed by `Node::file_index`.
     static ECMA_LINE_MAPS: RefCell<FxHashMap<usize, Rc<Vec<i32>>>> = RefCell::new(FxHashMap::default());
+    /// The same cache for synthetic (transformed) source files, keyed by node.
+    static SYNTHETIC_ECMA_LINE_MAPS: RefCell<FxHashMap<Node, Rc<Vec<i32>>>> = RefCell::new(FxHashMap::default());
 }
 
 // Go: scanner/scanner.go:2686 GetECMALineStarts
 // PORT: Go reads the lazily computed `sourceFile.ECMALineMap()`; this port
 // keeps the same lazy map in a per-thread cache keyed by the file index.
 pub fn get_ecma_line_starts(source_file: Node) -> Rc<Vec<i32>> {
+    // All synthetic nodes share one file index, so a transformed (synthetic)
+    // source file must not use the file index cache.
+    if is_synthetic_node(source_file) {
+        if let Some(line_map) =
+            SYNTHETIC_ECMA_LINE_MAPS.with(|maps| maps.borrow().get(&source_file).cloned())
+        {
+            return line_map;
+        }
+        let line_map = Rc::new(compute_ecma_line_starts(source_file_text(source_file)));
+        SYNTHETIC_ECMA_LINE_MAPS
+            .with(|maps| maps.borrow_mut().insert(source_file, line_map.clone()));
+        return line_map;
+    }
     let file_index = source_file.file_index();
     if let Some(line_map) = ECMA_LINE_MAPS.with(|maps| maps.borrow().get(&file_index).cloned()) {
         return line_map;

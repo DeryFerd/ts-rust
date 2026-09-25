@@ -18,6 +18,7 @@ use crate::frontend::tsoptions::{
 };
 use crate::frontend::tspath::Path as GoPath;
 use crate::frontend::vfs::{Fs, osvfs_fs};
+use rustc_hash::FxHashSet;
 use std::io::Write;
 use std::rc::Rc;
 use ts_diagnostics::Message;
@@ -69,6 +70,13 @@ pub(super) struct GoSharedState {
     resolved_project_references: Vec<Option<Arc<ResolvedProjectReference>>>,
     /// Go `Program.GetSymlinkCache`.
     known_symlinks: crate::modulespecifiers::symlinks::KnownSymlinks,
+    /// Go `processedFiles.sourceFilesFoundSearchingNodeModules`, by path.
+    source_files_found_searching_node_modules: FxHashSet<String>,
+    /// Go `Program.hasEmitBlockingDiagnostics`, by path.
+    has_emit_blocking_diagnostics: FxHashSet<String>,
+    /// Go `Program.toPath` inputs.
+    current_directory: String,
+    use_case_sensitive_file_names: bool,
 }
 
 type FrontendSourceOutput = crate::frontend::tsoptions::SourceOutputAndProjectReference;
@@ -530,7 +538,20 @@ impl GoSharedState {
         // PORT: Go builds the symlink cache on first use. It reads only the
         // loaded program, so building it here gives the same value.
         let known_symlinks = (*p.get_symlink_cache()).clone();
+        let source_files_found_searching_node_modules = files
+            .source_files_found_searching_node_modules
+            .iter()
+            .map(|path| path.0.clone())
+            .collect();
+        let has_emit_blocking_diagnostics = p
+            .has_emit_blocking_diagnostics
+            .iter()
+            .map(|path| path.0.clone())
+            .collect();
         Self {
+            has_emit_blocking_diagnostics,
+            current_directory: p.get_current_directory(),
+            use_case_sensitive_file_names: p.use_case_sensitive_file_names(),
             resolved_modules,
             jsx_runtime_import_specifiers,
             import_helpers_import_specifiers,
@@ -547,6 +568,7 @@ impl GoSharedState {
             redirects_for_resolution,
             resolved_project_references,
             known_symlinks,
+            source_files_found_searching_node_modules,
         }
     }
 
@@ -599,6 +621,11 @@ impl GoSharedState {
             .iter()
             .map(|r| r.as_deref())
             .collect()
+    }
+
+    // Go: compiler/program.go:1562 CommonSourceDirectory
+    pub(super) fn common_source_directory(&self) -> &str {
+        &self.common_source_directory
     }
 
     // Go: compiler/program.go:2017 GetSymlinkCache
@@ -684,6 +711,22 @@ impl GoSharedState {
             .unwrap_or((String::new(), Node::NIL))
     }
 
+    // Go: compiler/program.go:1225 IsEmitBlocked
+    pub(super) fn is_emit_blocked(&self, emit_file_name: &str) -> bool {
+        let path = crate::frontend::tspath::to_path(
+            emit_file_name,
+            &self.current_directory,
+            self.use_case_sensitive_file_names,
+        );
+        self.has_emit_blocking_diagnostics.contains(&path.0)
+    }
+
+    // Go: compiler/program.go:1912 IsSourceFileFromExternalLibrary
+    pub(super) fn is_source_file_from_external_library(&self, path: &str) -> bool {
+        self.source_files_found_searching_node_modules
+            .contains(path)
+    }
+
     // Go: compiler/program.go:1922 GetImportHelpersImportSpecifier
     pub(super) fn get_import_helpers_import_specifier(&self, path: &str) -> Node {
         self.import_helpers_import_specifiers
@@ -699,18 +742,5 @@ impl GoSharedState {
             .get(&file.file_index())
             .cloned()
             .unwrap_or_default()
-    }
-}
-
-// Go: `*Program` implements `outputpaths.OutputPathsHost`.
-impl crate::frontend::outputpaths::OutputPathsHost for GoSharedState {
-    fn common_source_directory(&self) -> String {
-        self.common_source_directory.clone()
-    }
-    fn get_current_directory(&self) -> String {
-        get_current_directory().to_string()
-    }
-    fn use_case_sensitive_file_names(&self) -> bool {
-        use_case_sensitive_file_names()
     }
 }

@@ -14,6 +14,7 @@ use std::any::Any;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use ts_goport::emitter::program_emit::{EmitOptions, EmitResult, emit_with};
 use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
@@ -198,10 +199,11 @@ fn emit_diagnostics() -> EmitResult {
     if options().is_incremental() {
         return EmitResult {
             emit_skipped: true,
-            diagnostics: Vec::new(),
+            ..EmitResult::default()
         };
     }
-    emit(Node::NIL, |file| guard(|| emit_source_file(file)))
+    // PORT: tsc passes no `WriteFile`. Under noEmit nothing is written.
+    emit_with(EmitOptions::default(), |emit_file| guard(emit_file))
 }
 
 /// Semantic diagnostics for one file. A panic drops that file's results and

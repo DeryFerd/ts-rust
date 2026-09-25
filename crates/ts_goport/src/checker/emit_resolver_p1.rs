@@ -605,6 +605,21 @@ impl crate::printer::EmitResolver for EmitResolver {
         })
     }
 
+    // Go: checker/emitresolver.go:847 EmitResolver.GetReferencedExportContainer
+    fn get_referenced_export_container(&self, node: Node, prefix_locals: bool) -> Node {
+        EmitResolver::get_referenced_export_container(self, node, prefix_locals)
+    }
+
+    // Go: checker/emitresolver.go:864 EmitResolver.GetReferencedImportDeclaration
+    fn get_referenced_import_declaration(&self, node: Node) -> Node {
+        EmitResolver::get_referenced_import_declaration(self, node)
+    }
+
+    // Go: checker/emitresolver.go:889 EmitResolver.GetReferencedValueDeclarations
+    fn get_referenced_value_declarations(&self, node: Node) -> Vec<Node> {
+        EmitResolver::get_referenced_value_declarations(self, node)
+    }
+
     // Go: checker/emitresolver.go:878 EmitResolver.GetReferencedValueDeclaration
     fn get_referenced_value_declaration(&self, node: Node) -> Node {
         EmitResolver::get_referenced_value_declaration(self, node)

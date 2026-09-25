@@ -69,9 +69,8 @@ pub struct Binder {
     /// Rust-only: binder fields of `ast.SourceFile` (`BindDiagnostics`,
     /// `EndFlowNode`, `PatternAmbientModules`, `GlobalExports`, ...).
     pub file_bind: FileBindData,
-    /// Rust-only: Go `file.CommonJSModuleIndicator`, which only the binder
-    /// sets. PORT: `FileBindData` has no field for it, so it does not leave
-    /// the binder.
+    /// Go `file.CommonJSModuleIndicator` while binding. It is copied to
+    /// `file_bind` when the bind ends.
     pub common_js_module_indicator: Node,
 }
 

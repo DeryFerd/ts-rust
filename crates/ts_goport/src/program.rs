@@ -2058,7 +2058,12 @@ pub fn is_source_file_default_library(path: &str) -> bool {
 }
 
 // Go: compiler/program.go:1562 CommonSourceDirectory
+// PORT: the Go frontend program computes it once (see `GoSharedState`). The
+// legacy loader computes it here.
 pub fn common_source_directory() -> &'static str {
+    if let Some(go) = &state().go {
+        return go.common_source_directory();
+    }
     state().common_source_directory.get_or_init(|| {
         let files = || {
             prog()
@@ -2188,10 +2193,25 @@ fn compute_common_source_directory_of_filenames(
 }
 
 // Go: compiler/program.go:1912 IsSourceFileFromExternalLibrary
-// PORT: Go records files found while searching node_modules. The Rust
-// loader does not; a path inside node_modules stands in for it.
+// PORT: the Go frontend loader records files found while searching
+// node_modules. The legacy loader does not; a path inside node_modules
+// stands in for it there.
 pub fn is_source_file_from_external_library(file: Node) -> bool {
-    source_file_info(file).path.contains("/node_modules/")
+    let path = &source_file_info(file).path;
+    if let Some(go) = &state().go {
+        return go.is_source_file_from_external_library(path);
+    }
+    path.contains("/node_modules/")
+}
+
+// Go: compiler/program.go:1225 IsEmitBlocked
+// PORT: the legacy loader does not verify output paths, so nothing is
+// blocked there.
+pub fn is_emit_blocked(emit_file_name: &str) -> bool {
+    state()
+        .go
+        .as_ref()
+        .is_some_and(|go| go.is_emit_blocked(emit_file_name))
 }
 
 // Go: compiler/program.go:1927 SourceFileMayBeEmitted
@@ -2315,34 +2335,86 @@ pub fn get_redirect_targets(path: &crate::frontend::tspath::Path) -> Vec<String>
 }
 
 // Go: compiler/program.go:226 GetSourceFileFromReference
-// PORT: the Go frontend program has the port. The legacy loader has none.
+// PORT: the Go frontend program has the port, and its answers for the
+// preserved references are copied. The legacy loader runs the Go function
+// on its own files.
 pub fn get_source_file_from_reference(origin: Node, r: &FileReference) -> Node {
-    let Some(go) = &state().go else {
-        unported!("Program.GetSourceFileFromReference")
+    if let Some(go) = &state().go {
+        return go.get_source_file_from_reference(origin, r);
+    }
+    get_source_file_from_reference_legacy(origin, r)
+}
+
+// Go: compiler/program.go:226 GetSourceFileFromReference (the body)
+fn get_source_file_from_reference_legacy(origin: Node, r#ref: &FileReference) -> Node {
+    use crate::frontend::tspath::{
+        file_extension_is_one_of, get_canonical_file_name, get_directory_path, has_extension,
+        resolve_path,
     };
-    go.get_source_file_from_reference(origin, r)
+    // TODO: The module loader in corsa is fairly different than strada, it should probably be able to expose this functionality at some point,
+    // rather than redoing the logic approximately here, since most of the related logic now lives in module.Resolver
+    // Still, without the failed lookup reporting that only the loader does, this isn't terribly complicated
+
+    let file_name = resolve_path(
+        &get_directory_path(source_file_file_name(origin)),
+        &[&r#ref.file_name],
+    );
+    let supported_extensions_base =
+        crate::frontend::tsoptions::get_supported_extensions(options(), &[]);
+    let supported_extensions =
+        crate::frontend::tsoptions::get_supported_extensions_with_json_if_resolve_json_module(
+            Some(options()),
+            supported_extensions_base,
+        );
+    let allow_non_ts_extensions = options().allow_non_ts_extensions.is_true();
+    if has_extension(&file_name) {
+        if !allow_non_ts_extensions {
+            let canonical_file_name =
+                get_canonical_file_name(&file_name, use_case_sensitive_file_names());
+            let supported = supported_extensions.iter().any(|group| {
+                let group: Vec<&str> = group.iter().map(String::as_str).collect();
+                file_extension_is_one_of(&canonical_file_name, &group)
+            });
+            if !supported {
+                return Node::NIL; // unsupported extensions are forced to fail
+            }
+        }
+
+        return get_source_file_for_resolved_module(&file_name);
+    }
+    if allow_non_ts_extensions {
+        let extensionless = get_source_file_for_resolved_module(&file_name);
+        if extensionless.is_some() {
+            return extensionless;
+        }
+    }
+
+    // Only try adding extensions from the first supported group (which should be .ts/.tsx/.d.ts)
+    for ext in &supported_extensions[0] {
+        let result = get_source_file_for_resolved_module(&format!("{file_name}{ext}"));
+        if result.is_some() {
+            return result;
+        }
+    }
+    Node::NIL
 }
 
 // Go: outputpaths/outputpaths.go:42 GetOutputPathsFor, called by
 // compiler/emitHost.go:94 emitHost.GetOutputPathsFor with the program options.
-// PORT: Go passes the emit host as the `OutputPathsHost`. Its methods forward
-// to the program, so the shared copy of the Go frontend program data is the
-// host here. The legacy loader has no common source directory copy. It is
-// private so it does not clash with the frontend `get_output_paths_for` in
-// the frontend prelude.
-fn get_output_paths_for(
+// PORT: Go reads two fields of the source file. It is named for the emit
+// host method so it does not clash with the frontend `get_output_paths_for`
+// in the frontend prelude.
+pub fn get_output_paths_for_source_file(
     file: Node,
+    host: &dyn crate::frontend::outputpaths::OutputPathsHost,
     force_dts_paths: bool,
 ) -> crate::frontend::outputpaths::OutputPaths {
-    let Some(go) = &state().go else {
-        unported!("outputpaths.GetOutputPathsFor")
-    };
     let info = source_file_info(file);
     crate::frontend::outputpaths::get_output_paths_for_file(
         &info.file_name,
         info.script_kind,
         options(),
-        go,
+        host,
         force_dts_paths,
     )
 }
@@ -2948,7 +3020,10 @@ fn declaration_diagnostic_cache() -> std::sync::MutexGuard<'static, FxHashMap<No
 
 // Go: compiler/emitter.go:506 getSourceFilesToEmit
 // PORT: Go takes a `SourceFileMayBeEmittedHost`; the program functions are that host.
-fn get_source_files_to_emit(target_source_file: Node, force_dts_emit: bool) -> Vec<Node> {
+pub(crate) fn get_source_files_to_emit(
+    target_source_file: Node,
+    force_dts_emit: bool,
+) -> Vec<Node> {
     let source_files = if target_source_file.is_some() {
         vec![target_source_file]
     } else {
@@ -2991,16 +3066,47 @@ fn get_declaration_diagnostics_worker(host: Rc<EmitHost>, file: Node) -> Vec<Dia
 // NOTE: emitHost operations must be thread-safe
 pub struct EmitHost {
     emit_resolver: Rc<dyn crate::printer::EmitResolver>,
+    /// Pool index of the checker that owns the file being emitted.
+    pub checker_index: usize,
 }
 
 // Go: compiler/emitHost.go:38 newEmitHost
 // PORT: Go gets the file's checker and a `done` func that releases it. The
 // checker is lent only for the `GetEmitResolver` call here; the resolver
-// must reach its checker itself.
-fn new_emit_host(file: Node) -> Rc<EmitHost> {
+// must reach its checker itself. Call it on the thread of the file's checker.
+pub fn new_emit_host(file: Node) -> Rc<EmitHost> {
+    let checker_index = checker_index_for_file(file);
     let emit_resolver: Rc<dyn crate::printer::EmitResolver> =
-        with_checker_at(checker_index_for_file(file), Checker::get_emit_resolver);
-    Rc::new(EmitHost { emit_resolver })
+        with_checker_at(checker_index, Checker::get_emit_resolver);
+    Rc::new(EmitHost {
+        emit_resolver,
+        checker_index,
+    })
+}
+
+impl EmitHost {
+    /// Go `host.GetEmitResolver()` without the trait object.
+    #[must_use]
+    pub fn emit_resolver(&self) -> Rc<dyn crate::printer::EmitResolver> {
+        self.emit_resolver.clone()
+    }
+}
+
+impl crate::frontend::outputpaths::OutputPathsHost for EmitHost {
+    // Go: compiler/emitHost.go:110 emitHost.CommonSourceDirectory
+    fn common_source_directory(&self) -> String {
+        common_source_directory().to_string()
+    }
+
+    // Go: compiler/emitHost.go:109 emitHost.GetCurrentDirectory
+    fn get_current_directory(&self) -> String {
+        get_current_directory().to_string()
+    }
+
+    // Go: compiler/emitHost.go:112 emitHost.UseCaseSensitiveFileNames
+    fn use_case_sensitive_file_names(&self) -> bool {
+        use_case_sensitive_file_names()
+    }
 }
 
 // PORT: Go `emitHost` also implements `modulespecifiers.ModuleSpecifierGenerationHost`
@@ -3033,7 +3139,11 @@ impl crate::declarations::DeclarationEmitHost for EmitHost {
         force_dts_paths: bool,
     ) -> Box<dyn crate::declarations::OutputPaths> {
         // TODO: cache
-        Box::new(get_output_paths_for(file, force_dts_paths))
+        Box::new(get_output_paths_for_source_file(
+            file,
+            self,
+            force_dts_paths,
+        ))
     }
 
     // Go: compiler/emitHost.go:99 emitHost.GetResolutionModeOverride
@@ -3080,18 +3190,21 @@ impl crate::printer::EmitHost for EmitHost {
     }
 
     // Go: compiler/emitHost.go:116 emitHost.IsEmitBlocked
-    fn is_emit_blocked(&self, _file: &str) -> bool {
-        unported!("Program.IsEmitBlocked")
+    fn is_emit_blocked(&self, file: &str) -> bool {
+        is_emit_blocked(file)
     }
 
     // Go: compiler/emitHost.go:120 emitHost.WriteFile
-    fn write_file(&self, _file_name: &str, _text: &str) -> Result<(), String> {
-        unported!("emitHost.WriteFile")
+    // PORT: Go writes through the program host file system. Here the emit
+    // caller always passes `EmitOptions.write_file`; without one the
+    // write fails instead of touching the disk.
+    fn write_file(&self, file_name: &str, _text: &str) -> Result<(), String> {
+        Err(format!("no WriteFile callback for {file_name}"))
     }
 
     // Go: compiler/emitHost.go:58 emitHost.GetEmitModuleFormatOfFile
     fn get_emit_module_format_of_file(&self, file: Node) -> ModuleKind {
-        get_emit_module_format_of_file(file)
+        get_emit_module_format_of_file(crate::emitter::emitter::parsed_source_file(file))
     }
 
     // Go: compiler/emitHost.go:124 emitHost.GetEmitResolver
@@ -3102,208 +3215,6 @@ impl crate::printer::EmitHost for EmitHost {
     // Go: compiler/emitHost.go:128 emitHost.IsSourceFileFromExternalLibrary
     fn is_source_file_from_external_library(&self, file: Node) -> bool {
         is_source_file_from_external_library(file)
-    }
-}
-
-// Go: compiler/program.go:1615 EmitResult
-// PORT: `EmittedFiles` and `SourceMaps` are left out. Writing outputs is not
-// ported, so they would always be empty.
-#[derive(Clone, Debug, Default)]
-pub struct EmitResult {
-    pub emit_skipped: bool,
-    /// Contains declaration emit diagnostics
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-// Go: compiler/program.go:1628 Emit
-// PORT: of Go `EmitOptions`, only `TargetSourceFile` is a parameter.
-// `EmitOnly` is always `EmitAll`, and `WriteFile` is not used, because
-// writing outputs is not ported (see `Emitter::emit_js_file`). Go queues one
-// emitter per file on a work group. Here `emit_file` runs for each file on
-// the thread of the file's checker, where the emit resolver can reach that
-// checker, so a caller can guard each file there. Pass `emit_source_file`
-// for the Go behavior. Call it off the checker threads, like the other
-// program-wide functions.
-pub fn emit(target_source_file: Node, emit_file: fn(Node) -> EmitResult) -> EmitResult {
-    // PORT: `options.EmitOnly != EmitOnlyForcedDts` is always true.
-    if let Some(result) = handle_no_emit_on_error(target_source_file) {
-        return result;
-    }
-
-    let source_files = get_source_files_to_emit(target_source_file, false);
-    let receivers = source_files
-        .into_iter()
-        .map(|file| send_thread_job(checker_index_for_file(file), move || emit_file(file)))
-        .collect();
-    let results = wait_jobs(receivers);
-
-    // collect results from emit, preserving input order
-    combine_emit_results(results)
-}
-
-// Go: compiler/program.go:1663 (the work that Program.Emit queues for each file)
-pub fn emit_source_file(source_file: Node) -> EmitResult {
-    let host = new_emit_host(source_file);
-    let paths = get_output_paths_for(source_file, false);
-    let mut emitter = Emitter {
-        host,
-        source_file,
-        emit_result: EmitResult::default(),
-        emitter_diagnostics: DiagnosticsCollection::default(),
-    };
-    emitter.emit(&paths);
-    emitter.emit_result
-}
-
-// Go: compiler/program.go:1692 CombineEmitResults
-pub fn combine_emit_results(results: Vec<EmitResult>) -> EmitResult {
-    let mut result = EmitResult::default();
-    for emit_result in results {
-        if emit_result.emit_skipped {
-            result.emit_skipped = true;
-        }
-        result.diagnostics.extend(emit_result.diagnostics);
-    }
-    result
-}
-
-// Go: compiler/program.go:1728 HandleNoEmitOnError
-// PORT: Go takes the program; the program functions are that program.
-pub fn handle_no_emit_on_error(file: Node) -> Option<EmitResult> {
-    if !options().no_emit_on_error.is_true() {
-        return None; // No emit on error is not set, so we can proceed with emitting
-    }
-
-    let diagnostics = get_diagnostics_of_any_program(
-        file,
-        true,
-        &mut get_bind_diagnostics,
-        &mut get_semantic_diagnostics,
-        &mut get_global_diagnostics,
-        &mut get_declaration_diagnostics,
-    );
-    if diagnostics.is_empty() {
-        return None; // No diagnostics, so we can proceed with emitting
-    }
-    Some(EmitResult {
-        diagnostics,
-        emit_skipped: true,
-    })
-}
-
-// Go: compiler/emitter.go:33 emitter
-// PORT: `writer`, `paths` and `tr` are left out. The printer and output
-// writing are not ported, and the paths are passed to `emit`. `emitOnly` is
-// always `EmitAll`.
-struct Emitter {
-    host: Rc<EmitHost>,
-    source_file: Node,
-    emit_result: EmitResult,
-    emitter_diagnostics: DiagnosticsCollection,
-}
-
-impl Emitter {
-    // Go: compiler/emitter.go:45 emitter.emit
-    fn emit(&mut self, paths: &crate::frontend::outputpaths::OutputPaths) {
-        self.emit_js_file(
-            self.source_file,
-            paths.js_file_path(),
-            paths.source_map_file_path(),
-        );
-        self.emit_declaration_file(
-            self.source_file,
-            paths.declaration_file_path(),
-            paths.declaration_map_path(),
-        );
-        self.emit_result.diagnostics = self.emitter_diagnostics.get_diagnostics();
-    }
-
-    // Go: compiler/emitter.go:69 emitter.runDeclarationTransformers
-    // PORT: Go returns the transformed file too. Only the printer reads it,
-    // and the printer is not ported, so only the diagnostics are returned.
-    fn run_declaration_transformers(
-        &self,
-        emit_context: Rc<crate::printer::EmitContext>,
-        source_file: Node,
-        declaration_file_path: &str,
-        declaration_map_path: &str,
-    ) -> Vec<Diagnostic> {
-        // Go: compiler/emitter.go:54 getDeclarationTransformers (one transformer)
-        let mut transform = crate::declarations::new_declaration_transformer(
-            self.host.clone(),
-            Some(emit_context),
-            options(),
-            declaration_file_path,
-            declaration_map_path,
-        );
-        transform.transform_source_file_root(source_file);
-        transform.get_diagnostics()
-    }
-
-    // Go: compiler/emitter.go:173 emitter.emitJSFile
-    fn emit_js_file(&mut self, source_file: Node, js_file_path: &str, _source_map_file_path: &str) {
-        let options = options();
-
-        // PORT: `emitOnly` is always `EmitAll`.
-        if source_file.is_nil() || js_file_path.is_empty() {
-            return;
-        }
-
-        if options.no_emit == Tristate::True
-            || crate::printer::EmitHost::is_emit_blocked(&*self.host, js_file_path)
-        {
-            self.emit_result.emit_skipped = true;
-            return;
-        }
-
-        // PORT: the script transformers and the printer are not ported.
-        unported!("emitter.emitJSFile")
-    }
-
-    // Go: compiler/emitter.go:213 emitter.emitDeclarationFile
-    fn emit_declaration_file(
-        &mut self,
-        source_file: Node,
-        declaration_file_path: &str,
-        declaration_map_path: &str,
-    ) {
-        let options = options();
-
-        // PORT: `emitOnly` is always `EmitAll`, never `EmitOnlyJs`.
-        if source_file.is_nil() || declaration_file_path.is_empty() {
-            return;
-        }
-
-        // Go: printer.GetEmitContext takes a clean context from a pool.
-        let emit_context = crate::printer::new_emit_context();
-        let diags = self.run_declaration_transformers(
-            emit_context,
-            source_file,
-            declaration_file_path,
-            declaration_map_path,
-        );
-        let decl_blocked = !diags.is_empty();
-
-        for elem in diags {
-            // Add declaration transform diagnostics to emit diagnostics
-            self.emitter_diagnostics.add(elem);
-        }
-
-        // PORT: `emitOnly` is never `EmitOnlyForcedDts`.
-        if options.no_emit == Tristate::True
-            || crate::printer::EmitHost::is_emit_blocked(&*self.host, declaration_file_path)
-        {
-            self.emit_result.emit_skipped = true;
-            return;
-        }
-
-        if decl_blocked {
-            self.emit_result.emit_skipped = true;
-            return;
-        }
-
-        // PORT: the declaration printer and output writing are not ported.
-        unported!("emitter.emitDeclarationFile")
     }
 }
 
@@ -3727,4 +3638,33 @@ fn flatten_diagnostic_message_chain(
     for child in &chain.message_chain {
         flatten_diagnostic_message_chain(writer, child, new_line, level + 1);
     }
+}
+
+// Emit support: run work on a file's checker thread without holding the checker.
+
+/// Runs `f(file)` for each file on the thread of the file's checker, with
+/// no checker borrowed, and returns the results in file order. The emit
+/// resolver borrows its checker itself (`with_checker_at`), so emit runs
+/// through this instead of `with_type_checker_for_file`.
+pub fn run_on_checker_threads_for_files<R: Send + 'static>(
+    files: &[Node],
+    f: impl Fn(Node) -> R + Send + Sync + 'static,
+) -> Vec<R> {
+    if worker_index().is_some() {
+        return files.iter().map(|&file| f(file)).collect();
+    }
+    let f = Arc::new(f);
+    let receivers = files
+        .iter()
+        .map(|&file| {
+            let f = Arc::clone(&f);
+            send_thread_job(checker_index_for_file(file), move || f(file))
+        })
+        .collect();
+    wait_jobs(receivers)
+}
+
+/// The pool index of the checker for `file` (Go `fileAssociations[file]`).
+pub fn checker_index_of_file(file: Node) -> usize {
+    checker_index_for_file(file)
 }

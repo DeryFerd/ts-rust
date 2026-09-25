@@ -1248,7 +1248,7 @@ impl Printer {
         self.generate_all_names(statements);
 
         let mut index = 0;
-        let info = source_file_info(node);
+        let info = source_file_parser_fields(node);
         // PORT: Go `var state *commentState` starts nil; both branches assign it.
         let state;
         if info.script_kind != ScriptKind::JSON {
@@ -1283,7 +1283,7 @@ impl Printer {
 
     // Go: printer.go:4674 emitTripleSlashDirectives
     pub(crate) fn emit_triple_slash_directives(&mut self, node: Node) {
-        let info = source_file_info(node);
+        let info = source_file_parser_fields(node);
         self.emit_directive("path", &info.referenced_files);
         self.emit_directive("types", &info.type_reference_directives);
         self.emit_directive("lib", &info.lib_reference_directives);

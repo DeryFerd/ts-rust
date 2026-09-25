@@ -1062,6 +1062,14 @@ impl FlowNodeId {
 /// Go `file.AsSourceFile()` fields that the parser and program set.
 #[must_use]
 pub fn source_file_info(file: Node) -> &'static crate::program::SourceFileInfo {
+    // PORT: Go SourceFile.copyFrom copies the parsed fields onto a factory
+    // SourceFile. Here a factory SourceFile reads the parsed file with its path.
+    if is_synthetic_node(file) {
+        let path = with_synthetic_source_file(file, |d| d.path.clone());
+        return &crate::program::get_source_file_by_path(&path)
+            .go_file()
+            .info;
+    }
     &file.go_file().info
 }
 

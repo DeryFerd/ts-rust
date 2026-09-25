@@ -218,8 +218,8 @@ go_enum!(TypeReferenceSerializationKind, i32 {
 pub type EmitSymbolTracker = Option<Rc<dyn SymbolTracker>>;
 
 /// Go `printer.EmitResolver`.
-// PORT: Go embeds `binder.ReferenceResolver`. Only the methods that the
-// declaration transformer uses are in this trait so far.
+// PORT: Go embeds `binder.ReferenceResolver`; its six methods are the
+// first methods of this trait.
 // PORT: Go methods on the resolver lock a mutex and call the checker. Here
 // they take `&self`; an implementation holds its checker in a `RefCell`.
 // PORT: Go `GetConstantValue` returns `any` (string, float64 or nil); that is
@@ -228,6 +228,9 @@ pub type EmitSymbolTracker = Option<Rc<dyn SymbolTracker>>;
 // Go: printer/emitresolver.go:79 EmitResolver
 pub trait EmitResolver {
     // Go binder.ReferenceResolver (embedded)
+    fn get_referenced_export_container(&self, node: Node, prefix_locals: bool) -> Node;
+    fn get_referenced_import_declaration(&self, node: Node) -> Node;
+    fn get_referenced_value_declarations(&self, node: Node) -> Vec<Node>;
     fn get_referenced_value_declaration(&self, node: Node) -> Node;
     fn get_element_access_expression_name(&self, expression: Node) -> String;
     fn get_referenced_member_value_declaration(&self, node: Node) -> Node;

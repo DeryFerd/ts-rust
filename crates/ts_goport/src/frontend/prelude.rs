@@ -21,7 +21,7 @@ pub use ts_diagnostics::Message;
 pub use crate::frontend::outputpaths::*;
 pub use crate::frontend::tsoptions::SourceOutputAndProjectReference;
 // Go `internal/symlinks` is ported in modulespecifiers.
-pub use crate::frontend::compiler::source_file_may_be_emitted;
+pub use crate::frontend::compiler::{get_source_files_to_emit, source_file_may_be_emitted};
 pub use crate::frontend::module::types;
 pub use crate::frontend::parser::jsdoc;
 pub use crate::frontend::scanner::utilities;
