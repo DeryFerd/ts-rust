@@ -1227,10 +1227,12 @@ fn handle_option_config_dir_template_substitution(
 
     if let Some(paths) = compiler_options.paths.as_mut() {
         for v in paths.values_mut() {
-            if let Some(substitution) =
-                get_substituted_string_array_with_config_dir_template(v, base_path)
-            {
-                *v = substitution;
+            // Go ranges over a nil slice as zero items and returns nil.
+            if let Some(substitution) = get_substituted_string_array_with_config_dir_template(
+                v.as_deref().unwrap_or_default(),
+                base_path,
+            ) {
+                *v = Some(substitution);
             }
         }
     }

@@ -200,32 +200,19 @@ static NOT_BOUND: PostBindInfo = PostBindInfo {
 impl Deref for LateSourceFileInfo {
     type Target = PostBindInfo;
 
-    // PORT: Go `SourceFile.CommonJSModuleIndicator` is set by the binder. The
-    // Rust binder keeps its indicator on the Binder struct. A bound file with
-    // no ES module indicator whose root got a symbol was bound as a CommonJS
-    // module (JSON files excluded), so the root is the indicator. Before the
-    // file is bound the value is nil and not cached.
+    // PORT: Go `SourceFile.CommonJSModuleIndicator` is set by the binder
+    // (binder.go:924-943). The Rust binder stores it in `FileBindData`.
+    // Before the file is bound the value is nil and not cached.
     fn deref(&self) -> &PostBindInfo {
         if let Some(info) = self.post_bind.get() {
             return info;
         }
         let file = &prog().files[self.file_index];
-        if file.file_bind.get().is_none() {
+        let Some(file_bind) = file.file_bind.get() else {
             return &NOT_BOUND;
-        }
-        self.post_bind.get_or_init(|| {
-            let root = file.root;
-            let indicator = if self.external_module_indicator.is_nil()
-                && file.info.script_kind != ScriptKind::JSON
-                && root.symbol().is_some()
-            {
-                root
-            } else {
-                Node::NIL
-            };
-            PostBindInfo {
-                common_js_module_indicator: indicator,
-            }
+        };
+        self.post_bind.get_or_init(|| PostBindInfo {
+            common_js_module_indicator: file_bind.common_js_module_indicator,
         })
     }
 }
@@ -2142,10 +2129,62 @@ pub fn get_source_file_by_path(path: &str) -> Node {
 }
 
 // Go: compiler/program.go:1797 GetSourceFileForResolvedModule
-// PORT: there are no parse-file redirects (package deduplication), so the
-// redirect fallback never finds a file.
+// PORT: the legacy loader has no parse-file redirects, so only the Go
+// frontend program has the redirect fallback.
 pub fn get_source_file_for_resolved_module(file_name: &str) -> Node {
-    get_source_file(file_name)
+    let file = get_source_file(file_name);
+    if file.is_nil()
+        && let Some(go) = &state().go
+    {
+        let redirect = go.program.get_parse_file_redirect(file_name);
+        if !redirect.is_empty() {
+            return get_source_file(&redirect);
+        }
+    }
+    file
+}
+
+// Go: compiler/program.go:157 GetRedirectTargets
+// PORT: the legacy loader does not deduplicate packages, so it has no
+// redirect targets.
+pub fn get_redirect_targets(path: &crate::frontend::tspath::Path) -> Vec<String> {
+    state()
+        .go
+        .as_ref()
+        .map(|go| go.program.get_redirect_targets(path))
+        .unwrap_or_default()
+}
+
+// Go: compiler/program.go:226 GetSourceFileFromReference
+// PORT: the Go frontend program has the port. The legacy loader has none.
+pub fn get_source_file_from_reference(origin: Node, r: &FileReference) -> Node {
+    let Some(go) = &state().go else {
+        unported!("Program.GetSourceFileFromReference")
+    };
+    go.program
+        .get_source_file_from_reference(go.parsed_file(origin), r)
+        .map_or(Node::NIL, |file| file.root)
+}
+
+// Go: outputpaths/outputpaths.go:42 GetOutputPathsFor, called by
+// compiler/emitHost.go:94 emitHost.GetOutputPathsFor with the program options.
+// PORT: Go passes the emit host as the `OutputPathsHost`. Its methods forward
+// to the program, so the Go frontend program is the host here. The legacy
+// loader has no parsed files to pass. It is private so it does not clash with
+// the frontend `get_output_paths_for` in the frontend prelude.
+fn get_output_paths_for(
+    file: Node,
+    force_dts_paths: bool,
+) -> crate::frontend::outputpaths::OutputPaths {
+    let Some(go) = &state().go else {
+        unported!("outputpaths.GetOutputPathsFor")
+    };
+    crate::frontend::outputpaths::get_output_paths_for(
+        go.parsed_file(file),
+        options(),
+        go.program,
+        force_dts_paths,
+    )
 }
 
 // Go: compiler/program.go:1916 GetJSXRuntimeImportSpecifier
@@ -2655,18 +2694,18 @@ impl crate::declarations::DeclarationEmitHost for EmitHost {
     }
 
     // Go: compiler/emitHost.go:103 emitHost.GetSourceFileFromReference
-    fn get_source_file_from_reference(&self, _origin: Node, _ref: &FileReference) -> Node {
-        unported!("Program.GetSourceFileFromReference")
+    fn get_source_file_from_reference(&self, origin: Node, r#ref: &FileReference) -> Node {
+        get_source_file_from_reference(origin, r#ref)
     }
 
     // Go: compiler/emitHost.go:94 emitHost.GetOutputPathsFor
     fn get_output_paths_for(
         &self,
-        _file: Node,
-        _force_dts_paths: bool,
+        file: Node,
+        force_dts_paths: bool,
     ) -> Box<dyn crate::declarations::OutputPaths> {
         // TODO: cache
-        unported!("outputpaths.GetOutputPathsFor")
+        Box::new(get_output_paths_for(file, force_dts_paths))
     }
 
     // Go: compiler/emitHost.go:99 emitHost.GetResolutionModeOverride
@@ -2735,6 +2774,202 @@ impl crate::printer::EmitHost for EmitHost {
     // Go: compiler/emitHost.go:128 emitHost.IsSourceFileFromExternalLibrary
     fn is_source_file_from_external_library(&self, file: Node) -> bool {
         is_source_file_from_external_library(file)
+    }
+}
+
+// Go: compiler/program.go:1615 EmitResult
+// PORT: `EmittedFiles` and `SourceMaps` are left out. Writing outputs is not
+// ported, so they would always be empty.
+#[derive(Clone, Debug, Default)]
+pub struct EmitResult {
+    pub emit_skipped: bool,
+    /// Contains declaration emit diagnostics
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+// Go: compiler/program.go:1628 Emit
+// PORT: of Go `EmitOptions`, only `TargetSourceFile` is a parameter.
+// `EmitOnly` is always `EmitAll`, and `WriteFile` is not used, because
+// writing outputs is not ported (see `Emitter::emit_js_file`). Go queues one
+// emitter per file on a work group; here `emit_file` runs each file in
+// order, so a caller can guard each file. Pass `emit_source_file` for the Go
+// behavior.
+pub fn emit(target_source_file: Node, emit_file: &mut dyn FnMut(Node) -> EmitResult) -> EmitResult {
+    // PORT: `options.EmitOnly != EmitOnlyForcedDts` is always true.
+    if let Some(result) = handle_no_emit_on_error(target_source_file) {
+        return result;
+    }
+
+    let source_files = get_source_files_to_emit(target_source_file, false);
+    let results: Vec<EmitResult> = source_files.into_iter().map(emit_file).collect();
+
+    // collect results from emit, preserving input order
+    combine_emit_results(results)
+}
+
+// Go: compiler/program.go:1663 (the work that Program.Emit queues for each file)
+pub fn emit_source_file(source_file: Node) -> EmitResult {
+    let host = new_emit_host(source_file);
+    let paths = get_output_paths_for(source_file, false);
+    let mut emitter = Emitter {
+        host,
+        source_file,
+        emit_result: EmitResult::default(),
+        emitter_diagnostics: DiagnosticsCollection::default(),
+    };
+    emitter.emit(&paths);
+    emitter.emit_result
+}
+
+// Go: compiler/program.go:1692 CombineEmitResults
+pub fn combine_emit_results(results: Vec<EmitResult>) -> EmitResult {
+    let mut result = EmitResult::default();
+    for emit_result in results {
+        if emit_result.emit_skipped {
+            result.emit_skipped = true;
+        }
+        result.diagnostics.extend(emit_result.diagnostics);
+    }
+    result
+}
+
+// Go: compiler/program.go:1728 HandleNoEmitOnError
+// PORT: Go takes the program; the program functions are that program.
+pub fn handle_no_emit_on_error(file: Node) -> Option<EmitResult> {
+    if !options().no_emit_on_error.is_true() {
+        return None; // No emit on error is not set, so we can proceed with emitting
+    }
+
+    let diagnostics = get_diagnostics_of_any_program(
+        file,
+        true,
+        &mut get_bind_diagnostics,
+        &mut get_semantic_diagnostics,
+        &mut get_global_diagnostics,
+        &mut get_declaration_diagnostics,
+    );
+    if diagnostics.is_empty() {
+        return None; // No diagnostics, so we can proceed with emitting
+    }
+    Some(EmitResult {
+        diagnostics,
+        emit_skipped: true,
+    })
+}
+
+// Go: compiler/emitter.go:33 emitter
+// PORT: `writer`, `paths` and `tr` are left out. The printer and output
+// writing are not ported, and the paths are passed to `emit`. `emitOnly` is
+// always `EmitAll`.
+struct Emitter {
+    host: Rc<EmitHost>,
+    source_file: Node,
+    emit_result: EmitResult,
+    emitter_diagnostics: DiagnosticsCollection,
+}
+
+impl Emitter {
+    // Go: compiler/emitter.go:45 emitter.emit
+    fn emit(&mut self, paths: &crate::frontend::outputpaths::OutputPaths) {
+        self.emit_js_file(
+            self.source_file,
+            paths.js_file_path(),
+            paths.source_map_file_path(),
+        );
+        self.emit_declaration_file(
+            self.source_file,
+            paths.declaration_file_path(),
+            paths.declaration_map_path(),
+        );
+        self.emit_result.diagnostics = self.emitter_diagnostics.get_diagnostics();
+    }
+
+    // Go: compiler/emitter.go:69 emitter.runDeclarationTransformers
+    // PORT: Go returns the transformed file too. Only the printer reads it,
+    // and the printer is not ported, so only the diagnostics are returned.
+    fn run_declaration_transformers(
+        &self,
+        emit_context: Rc<crate::printer::EmitContext>,
+        source_file: Node,
+        declaration_file_path: &str,
+        declaration_map_path: &str,
+    ) -> Vec<Diagnostic> {
+        // Go: compiler/emitter.go:54 getDeclarationTransformers (one transformer)
+        let mut transform = crate::declarations::new_declaration_transformer(
+            self.host.clone(),
+            Some(emit_context),
+            options(),
+            declaration_file_path,
+            declaration_map_path,
+        );
+        transform.transform_source_file_root(source_file);
+        transform.get_diagnostics()
+    }
+
+    // Go: compiler/emitter.go:173 emitter.emitJSFile
+    fn emit_js_file(&mut self, source_file: Node, js_file_path: &str, _source_map_file_path: &str) {
+        let options = options();
+
+        // PORT: `emitOnly` is always `EmitAll`.
+        if source_file.is_nil() || js_file_path.is_empty() {
+            return;
+        }
+
+        if options.no_emit == Tristate::True
+            || crate::printer::EmitHost::is_emit_blocked(&*self.host, js_file_path)
+        {
+            self.emit_result.emit_skipped = true;
+            return;
+        }
+
+        // PORT: the script transformers and the printer are not ported.
+        unported!("emitter.emitJSFile")
+    }
+
+    // Go: compiler/emitter.go:213 emitter.emitDeclarationFile
+    fn emit_declaration_file(
+        &mut self,
+        source_file: Node,
+        declaration_file_path: &str,
+        declaration_map_path: &str,
+    ) {
+        let options = options();
+
+        // PORT: `emitOnly` is always `EmitAll`, never `EmitOnlyJs`.
+        if source_file.is_nil() || declaration_file_path.is_empty() {
+            return;
+        }
+
+        // Go: printer.GetEmitContext takes a clean context from a pool.
+        let emit_context = crate::printer::new_emit_context();
+        let diags = self.run_declaration_transformers(
+            emit_context,
+            source_file,
+            declaration_file_path,
+            declaration_map_path,
+        );
+        let decl_blocked = !diags.is_empty();
+
+        for elem in diags {
+            // Add declaration transform diagnostics to emit diagnostics
+            self.emitter_diagnostics.add(elem);
+        }
+
+        // PORT: `emitOnly` is never `EmitOnlyForcedDts`.
+        if options.no_emit == Tristate::True
+            || crate::printer::EmitHost::is_emit_blocked(&*self.host, declaration_file_path)
+        {
+            self.emit_result.emit_skipped = true;
+            return;
+        }
+
+        if decl_blocked {
+            self.emit_result.emit_skipped = true;
+            return;
+        }
+
+        // PORT: the declaration printer and output writing are not ported.
+        unported!("emitter.emitDeclarationFile")
     }
 }
 

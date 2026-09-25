@@ -125,9 +125,10 @@ fn guard<T: Default>(f: impl FnOnce() -> T) -> T {
 }
 
 // Go: execute/tsc/emit.go:72 EmitFilesAndReportErrors
-// PORT: noEmit is forced, so the Go emit step adds no diagnostics and is
-// skipped. The error summary is only written in pretty mode, so it is not
-// written.
+// PORT: noEmit is forced, so the emit step writes no files. It still runs,
+// because Go reports the declaration transformer diagnostics during emit
+// (see `collect_all_diagnostics`). The error summary is only written in
+// pretty mode, so it is not written.
 fn run(config: &str) -> i32 {
     let loaded = catch_unwind(AssertUnwindSafe(|| {
         try_load_with(config, |options| options.no_emit = Tristate::True)
@@ -173,7 +174,33 @@ fn collect_all_diagnostics() -> Vec<Diagnostic> {
         &mut || guard(get_global_diagnostics),
         &mut |file| guard(|| get_declaration_diagnostics(file)),
     );
+
+    let mut all_diagnostics = all_diagnostics;
+    let options = options();
+    if !options.list_files_only.is_true() {
+        all_diagnostics.extend(guard(emit_diagnostics).diagnostics);
+    }
+
     sort_and_deduplicate_diagnostics(all_diagnostics)
+}
+
+/// The diagnostics of the emit step (Go: execute/tsc/emit.go:103
+/// `ProgramLike.Emit`). Under noEmit, Go `emitDeclarationFile` still runs the
+/// declaration transformer and reports its diagnostics before it checks
+/// `NoEmit` (compiler/emitter.go:226). Each file is guarded on its own.
+fn emit_diagnostics() -> EmitResult {
+    // Go: execute/tsc.go:244 an incremental program is an
+    // `incremental.Program`. Its Emit under noEmit
+    // (execute/incremental/program.go:205) skips the file emit and only
+    // writes the build info.
+    // PORT: the build info is not written, so this adds no diagnostics.
+    if options().is_incremental() {
+        return EmitResult {
+            emit_skipped: true,
+            diagnostics: Vec::new(),
+        };
+    }
+    emit(Node::NIL, &mut |file| guard(|| emit_source_file(file)))
 }
 
 /// Semantic diagnostics for one file. A panic drops that file's results and

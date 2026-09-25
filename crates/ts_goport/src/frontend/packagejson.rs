@@ -927,7 +927,7 @@ impl PackageJson {
 pub struct VersionPaths {
     pub version: String,
     paths_json: Option<Rc<IndexMap<String, JSONValue>>>,
-    paths: OnceCell<IndexMap<String, Vec<String>>>,
+    paths: OnceCell<IndexMap<String, Option<Vec<String>>>>,
 }
 
 impl VersionPaths {
@@ -939,7 +939,7 @@ impl VersionPaths {
 
     // Go: cache.go:98 GetPaths
     #[must_use]
-    pub fn get_paths(&self) -> Option<&IndexMap<String, Vec<String>>> {
+    pub fn get_paths(&self) -> Option<&IndexMap<String, Option<Vec<String>>>> {
         if !self.exists() {
             return None;
         }
@@ -958,7 +958,7 @@ impl VersionPaths {
                     }
                     slice[i] = path.as_string().to_string();
                 }
-                paths.insert(key.clone(), slice);
+                paths.insert(key.clone(), Some(slice));
             }
             paths
         }))

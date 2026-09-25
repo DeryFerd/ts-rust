@@ -897,10 +897,8 @@ impl FileLoader {
 
                 let import_index = index as i32 - imports_start;
 
-                // PORT: Go passes the `*ast.SourceFile`. The crate
-                // `get_resolution_diagnostic` takes the root node.
                 let should_add_file = !module_name.is_empty()
-                    && get_resolution_diagnostic(&options_for_file, &resolved_module, file.root)
+                    && get_resolution_diagnostic(&options_for_file, &resolved_module, &file)
                         .is_none()
                     && !options_for_file.no_resolve.is_true()
                     && !(is_js_file && !options_for_file.get_allow_js())

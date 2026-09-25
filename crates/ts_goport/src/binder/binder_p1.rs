@@ -150,6 +150,7 @@ pub fn bind_source_file(file: Node, symbols: &mut SymbolArena) {
     b.bind_deferred_expando_assignments();
     b.file_bind.symbol_count = b.symbol_count;
     b.file_bind.classifiable_names = std::mem::take(&mut b.classifiable_names);
+    b.file_bind.common_js_module_indicator = b.common_js_module_indicator;
     *symbols = std::mem::take(&mut b.symbols);
     let Binder {
         node_bind,

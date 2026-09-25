@@ -93,19 +93,18 @@ impl Checker {
     // reach the checker, so the callback records each report in order and the
     // same `lastError` logic runs on the recorded reports after the scan. No
     // other diagnostic is added during the scan, so the order is the same.
-    // `RsErrorCallback` (scanner_util) carries no format args, so args are empty.
     pub fn check_grammar_regular_expression_literal(&mut self, node: Node) -> bool {
         let source_file = get_source_file_of_node(node);
         if !self.has_parse_diagnostics(source_file) {
-            let reports: Rc<RefCell<Vec<(&'static Message, i32, i32)>>> =
+            let reports: Rc<RefCell<Vec<(&'static Message, i32, i32, Vec<String>)>>> =
                 Rc::new(RefCell::new(Vec::new()));
-            let mut reg_exp_scanner = rs_new_scanner();
+            let mut reg_exp_scanner = crate::frontend::scanner::new_scanner();
             reg_exp_scanner.set_script_target(self.language_version);
             reg_exp_scanner.set_language_variant(source_file_info(source_file).language_variant);
             let sink = reports.clone();
             reg_exp_scanner.set_on_error(Some(Box::new(
-                move |message: &'static Message, start: i32, length: i32| {
-                    sink.borrow_mut().push((message, start, length));
+                move |message: &'static Message, start: i32, length: i32, args: Vec<String>| {
+                    sink.borrow_mut().push((message, start, length, args));
                 },
             )));
             reg_exp_scanner.set_text(source_file_text(source_file));
@@ -121,7 +120,7 @@ impl Checker {
             // into `pending`; entries are added to the checker in order below.
             let mut pending: Vec<Diagnostic> = Vec::new();
             let mut last_error: Option<usize> = None;
-            for (message, start, length) in reports.borrow().iter().copied() {
+            for (message, start, length, args) in reports.take() {
                 let matches_last = last_error.is_some_and(|i| {
                     let e = &pending[i];
                     start == e.pos() && length == e.len()
@@ -135,7 +134,7 @@ impl Checker {
                         Node::NIL,
                         TextRange::new(start, start + length),
                         message,
-                        args![],
+                        args,
                     );
                     let i = last_error.unwrap();
                     pending[i].add_related_info(Some(err));
@@ -144,7 +143,7 @@ impl Checker {
                         source_file,
                         TextRange::new(start, start + length),
                         message,
-                        args![],
+                        args,
                     ));
                     last_error = Some(pending.len() - 1);
                 }

@@ -363,7 +363,7 @@ impl VersionPaths {
 
     // Go: packagejson/cache.go:98 GetPaths
     // PORT: Go caches the result; this builds it on each call.
-    pub fn get_paths(&self) -> Option<IndexMap<String, Vec<String>>> {
+    pub fn get_paths(&self) -> Option<IndexMap<String, Option<Vec<String>>>> {
         if !self.exists() {
             return None;
         }
@@ -379,7 +379,7 @@ impl VersionPaths {
                     slice[i] = s.clone();
                 }
             }
-            paths.insert(key.clone(), slice);
+            paths.insert(key.clone(), Some(slice));
         }
         Some(paths)
     }

@@ -40,6 +40,18 @@ impl OutputPaths {
     }
 }
 
+// Go: `*outputpaths.OutputPaths` implements `declarations.OutputPaths`
+// (transformers/declarations/transform.go:28).
+impl crate::declarations::OutputPaths for OutputPaths {
+    fn declaration_file_path(&self) -> String {
+        self.declaration_file_path.clone()
+    }
+
+    fn js_file_path(&self) -> String {
+        self.js_file_path.clone()
+    }
+}
+
 // Go: outputpaths/outputpaths.go:42 GetOutputPathsFor
 pub fn get_output_paths_for(
     source_file: &ParsedSourceFile,

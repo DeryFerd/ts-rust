@@ -332,6 +332,8 @@ pub struct FileBindData {
     pub global_exports: SymbolTable,
     /// Go `JSGlobalAugmentations`.
     pub js_global_augmentations: SymbolTable,
+    /// Go `SourceFile.CommonJSModuleIndicator` (set by the binder).
+    pub common_js_module_indicator: Node,
 }
 
 /// Go `*ast.Diagnostic`. Positions are Go positions (UTF-8 byte offsets).

@@ -134,13 +134,13 @@ pub fn compare_pattern_keys(a: &str, b: &str) -> i32 {
 // Returns a DiagnosticMessage if we won't include a resolved module due to its extension.
 // The DiagnosticMessage's parameters are the imported module name, and the filename it resolved to.
 // This returns a diagnostic even if the module will be an untyped module.
-// PORT: Go `*ast.SourceFile` is a source file `Node`; `IsDeclarationFile`
-// is read through `source_file_info`.
+// PORT: Go `*ast.SourceFile` is the loader's `ParsedSourceFile`. The only
+// caller runs during program construction, before `source_file_info` exists.
 #[must_use]
 pub fn get_resolution_diagnostic(
     options: &CompilerOptions,
     resolved_module: &ResolvedModule,
-    file: Node,
+    file: &ParsedSourceFile,
 ) -> Option<&'static Message> {
     let need_jsx = || -> Option<&'static Message> {
         if options.jsx != JsxEmit::NONE {
@@ -169,9 +169,7 @@ pub fn get_resolution_diagnostic(
     };
 
     let need_allow_arbitrary_extensions = || -> Option<&'static Message> {
-        if source_file_info(file).is_declaration_file
-            || options.allow_arbitrary_extensions.is_true()
-        {
+        if file.is_declaration_file || options.allow_arbitrary_extensions.is_true() {
             return None;
         }
         Some(diag::Module_0_was_resolved_to_1_but_allowArbitraryExtensions_is_not_set)

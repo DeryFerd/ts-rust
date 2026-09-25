@@ -506,9 +506,8 @@ impl NewProgram {
                 .add_processing_diagnostic(not_listed);
         }
 
-        // PORT: Go `options.Paths.Entries()` walks the ordered map. Go can
-        // hold a nil substitution list; `Vec<String>` cannot, so the
-        // `Substitutions_for_pattern_0_should_be_an_array` branch cannot run.
+        // PORT: Go `options.Paths.Entries()` walks the ordered map. A nil
+        // substitution slice is `None`.
         if let Some(paths) = &options.paths {
             for (key, value) in paths {
                 // !!! This code does not handle cases where where the path mappings have the wrong types,
@@ -522,16 +521,29 @@ impl NewProgram {
                         &args![key],
                     );
                 }
-                if value.is_empty() {
-                    self.create_diagnostic_for_option_paths(
-                        syntax,
-                        false, /*onKey*/
-                        key,
-                        diag::Substitutions_for_pattern_0_shouldn_t_be_an_empty_array,
-                        &args![key],
-                    );
+                match value {
+                    None => {
+                        self.create_diagnostic_for_option_paths(
+                            syntax,
+                            false, /*onKey*/
+                            key,
+                            diag::Substitutions_for_pattern_0_should_be_an_array,
+                            &args![key],
+                        );
+                    }
+                    Some(value) if value.is_empty() => {
+                        self.create_diagnostic_for_option_paths(
+                            syntax,
+                            false, /*onKey*/
+                            key,
+                            diag::Substitutions_for_pattern_0_shouldn_t_be_an_empty_array,
+                            &args![key],
+                        );
+                    }
+                    Some(_) => {}
                 }
-                for (i, subst) in value.iter().enumerate() {
+                // Go ranges over a nil slice as zero items.
+                for (i, subst) in value.iter().flatten().enumerate() {
                     if !has_zero_or_one_asterisk_character(subst) {
                         self.create_diagnostic_for_option_path_key_value(
                             syntax,
