@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadState, verifyAppendOnly } from "./state.mjs";
 
 // This checks saved evidence. It does not run Cargo or authenticate agent identities.
 export const CHECKPOINT_SHA256 = "60a372581586cb3c8d0046ba6e4ab0af65b515267485a0a01bdfe90695f7a538";
@@ -214,7 +215,11 @@ export function checkBatch(state, readEvidence = readPinnedJson) {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (process.argv.length === 3 && process.argv[2] === "--help") {
-    console.log(`Usage: node scripts/check-typechecker-batch.mjs <state.json>
+    console.log(`Usage: node scripts/check-typechecker-batch.mjs <state-dir | legacy-state.json>
+
+A state directory holds current.json and the append-only history.jsonl. The
+check rebuilds the full state from both and stops if committed history lines
+were changed or removed.
 
 Read-only pre-acceptance check. Exit 0 means the protected-name and review
 prerequisites pass. Exit 1 means STOP. This is not a Cargo wrapper.
@@ -247,11 +252,18 @@ This check cannot prevent arbitrary direct commands or edits to state history.`)
   } else {
   let result;
   try {
-    requireValue(process.argv.length === 3, "Usage: node scripts/check-typechecker-batch.mjs <state.json>");
-    const state = JSON.parse(readFileSync(resolve(process.argv[2]), "utf8"));
+    requireValue(process.argv.length === 3, "Usage: node scripts/check-typechecker-batch.mjs <state-dir | legacy-state.json>");
+    const path = resolve(process.argv[2]);
+    let state;
+    if (statSync(path).isDirectory()) {
+      verifyAppendOnly(path);
+      state = loadState(path);
+    } else {
+      state = JSON.parse(readFileSync(path, "utf8"));
+    }
     result = checkBatch(state);
-  } catch {
-    result = { verdict: "STOP", scope: SCOPE, reasons: ["Missing or invalid state. Usage: node scripts/check-typechecker-batch.mjs <state.json>."] };
+  } catch (error) {
+    result = { verdict: "STOP", scope: SCOPE, reasons: [`Missing or invalid state: ${error.message}`] };
   }
   if (result.losses) {
     result.losses = Object.fromEntries(Object.entries(result.losses).map(([name, rows]) => [name, { total: rows.length, first20: rows.slice(0, 20) }]));

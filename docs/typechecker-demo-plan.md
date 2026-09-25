@@ -1,7 +1,7 @@
 # First complete project demos
 
 Current execution rules are in [accountability](typechecker-accountability.md),
-[saved state](typechecker-accountability-state.json) and the
+[saved state](typechecker-state/current.json) and the
 [September 5 reset plan](typechecker-reset-plan.md). The execution instructions
 below are historical. Full port requirements remain in force.
 
