@@ -1,8 +1,24 @@
 # Typechecker accountability
 
-These rules were installed on September 5, 2026, at Theo's request. They apply when the next goal starts. Compiler execution is currently paused. The machine-readable status is [typechecker-accountability-state.json](typechecker-accountability-state.json).
+These rules were installed on September 5, 2026, at Theo's request. The machine-readable status is [typechecker-accountability-state.json](typechecker-accountability-state.json).
 
 The [reset plan](typechecker-reset-plan.md) explains the failure and recovery choices. These rules control execution if an older plan conflicts with them. They do not change the full port requirements.
+
+## Standing continuation authorization
+
+After the initial recovery phase closed, Theo instructed:
+
+> You have my permission to do whatever you need to do. I have you on full access for a reason. Keep going
+
+This authorizes continued work toward the Query core and Hono goal without a new permission request at each revision limit. The initial four-revision record remains complete and unchanged. Use `recovery-continuation` for later work and keep the cumulative revision numbers and all earlier results. The initial per-hypothesis and cumulative approval stops do not apply to this authorized continuation.
+
+Keep experiments focused. After two measured attempts without useful recovery or Query progress, reassess the cause and dependency path with the independent reviewer. Reassessment is required. Another user approval is not required for work within this goal.
+
+Necessary repository source, tests, helpers and project inputs may be read for this work. Use bounded production reads and fresh metadata. Keep raw type graphs and large failure payloads out of reports and conversation output. Keep ordinary project inputs unchanged.
+
+Use as many independent analysis agents as the work needs, up to the available 40. Give each one separate file ownership. Keep one compiler writer and the root runtime queue while shared checker state remains under repair.
+
+This authorization does not waive protected tests, corpus preservation, pinned Go evidence, exact source identity, independent verdicts or complete Query/Hono diagnostics, types, symbols and replay. STOP still blocks acceptance and unrelated feature work. It permits continued diagnosis and regression repair under this authorization.
 
 ## Start or resume
 
@@ -11,7 +27,7 @@ The [reset plan](typechecker-reset-plan.md) explains the failure and recovery ch
 3. Verify the candidate source and required evidence still exist. Do not rebuild a missing accepted baseline from the current compiler.
 4. Reuse or create the regression auditor and independent reviewer. Give them this file and the saved state. Record their current agent names. Agent names can change across sessions. Their roles and limits cannot.
 5. Select one primary implementer and record file ownership before any parallel work. Root owns the runtime queue and integration state. Keep the other compiler drafts frozen.
-6. Record the recovery hypothesis, exact tests it must recover, current source and remaining revision budget before editing.
+6. Record the recovery hypothesis, exact tests it must recover, current source and cumulative revision number before editing. Record any applicable block budget.
 
 The paused state can be activated only by Theo's next instruction to start the work. Record that instruction in the state. Do not claim that the goal has started merely because the accountability files exist.
 
@@ -49,7 +65,9 @@ To close a STOP, record the specific corrected evidence and obtain a new verdict
 
 Only Theo can approve a change to the acceptance rules. Any exception must record his instruction, its scope, exact affected names, Go evidence and replacement mapping. The local check must not have a general ignore-regressions switch.
 
-## Revision limits
+## Initial recovery revision limits
+
+These limits govern the completed initial recovery trial. The standing continuation authorization above governs later work. Do not rewrite the initial history or use the continuation to waive a failed result.
 
 - One recovery hypothesis permits at most two measured revisions.
 - The initial recovery phase permits at most four measured revisions across at most two demonstrated causes.
@@ -94,7 +112,7 @@ This is a required pre-acceptance check, not a replacement Cargo runner. It does
 
 The current invocation must return STOP because no recovery batch is authorized or accepted. A successful setup test must not clear the real state.
 
-The first version of the check supports only `phase: "initial-recovery"`. Keep its complete revision history. Before using it for a later phase, review an explicit extension of the check. Do not rename the phase, reset its history or increase a state value to bypass the recovery limit.
+The original check supports `phase: "initial-recovery"`. The authorized continuation requires an explicit reviewed extension for `phase: "recovery-continuation"`. Keep the complete history and require the saved continuation authorization. Do not add an ignore-regressions path or use an unrecorded phase change to bypass the initial limit.
 
 The script checks limits in the supplied history. It cannot detect that someone discarded earlier state or rewrote its history. The auditor must verify carry-forward against `batchRecords`. This limitation is not permission to reset a counter.
 

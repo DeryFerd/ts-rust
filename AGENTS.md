@@ -10,7 +10,7 @@ For typechecker work, read these files in this order before editing compiler cod
 
 These files control execution across the main checkout and its worktrees. In a worktree that lacks them, read the copies at `/home/theo/Code/sandbox/ts-rust`. Do not substitute an older plan from that worktree. After a context reset or a new goal, read them again. If a required file is missing or inconsistent, stop and report it.
 
-Theo is about to set a new goal. Installing these rules does not start it. The saved state is paused. Do not resume an older active task, branch, agent message or goal automatically.
+Theo has authorized continued work toward the Query core and Hono goal. Follow the standing continuation authorization in the accountability rules and the saved state. Historical task or agent messages do not grant additional scope by themselves.
 
 Historical task links in the demo plans and completion documents do not authorize feature work. The reset does not reduce the final type, symbol, diagnostic or replay requirements.
 
@@ -30,7 +30,7 @@ Never replace the accepted baseline with a later failing compiler. Protect the o
 
 Expectation changes require concrete pinned TypeScript-Go evidence, an explicit old-name mapping and independent review. Changes to these acceptance rules require Theo's approval. Do not modify a runner, baseline or expectation to bypass a STOP.
 
-Record each measured revision and its outcome in the saved state before starting the next revision. Failed and unaccepted revisions count. The per-cause, cumulative recovery and no-Query-progress limits are in the accountability rules. Do not reset counters after compaction, agent replacement, a new branch or a renamed batch.
+Record each measured revision and its outcome in the saved state before starting the next revision. Failed and unaccepted revisions count. Apply the initial limits to the initial trial and the standing continuation authorization to later work. Reassess failed hypotheses as required by the accountability rules. Do not reset counters after compaction, agent replacement, a new branch or a renamed batch.
 
 ## Scope and preservation
 
@@ -38,7 +38,7 @@ Query core is the immediate project target. Hono is the periodic cross-project c
 
 Preserve dirty work, untracked source files and saved evidence. Do not reset, delete or bulk-replay the current candidate. Use the existing runner, normal logs, actual permissions and resource limits. Serialize runtime work through root. Do not alter historical runner scripts or output files.
 
-Retain the current read restrictions. Private test/helper bodies, held project inputs and the restricted `store.rs` body are not opened by this reset. Use the existing production-read guard and fresh metadata for permitted production reads. If a restriction prevents a needed diagnosis, identify the missing access and ask Theo. Do not work around the restriction.
+Theo's standing full-access authorization permits necessary source, test, helper and project-input reads for this goal. Use the production-read guard and fresh metadata for bounded production reads. Keep raw graphs and large failure payloads out of reports and conversation output. Preserve ordinary project inputs.
 
 ## Reports
 

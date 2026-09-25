@@ -40,6 +40,21 @@ function fixture() {
   } };
 }
 
+function continuationFixture() {
+  const f = fixture();
+  f.state.phase = "recovery-continuation";
+  f.state.continuationAuthorization = { authorized: true, date: "2026-09-08T03:26:02Z",
+    instruction: "Theo authorized continued Query core and Hono recovery.",
+    scope: "Preserve all revision history, protected passes and independent review." };
+  const hypotheses = ["hypothesis-1", "hypothesis-1", "hypothesis-2", "hypothesis-2", "hypothesis-3", "hypothesis-3", "hypothesis-3"];
+  f.state.batch.recoveryHistory = hypotheses.map((hypothesis, index) => ({ revision: index + 1, hypothesis,
+    sourceFingerprint: String(index + 1).repeat(64), fullResultSha256: index === 3 ? "c".repeat(64) : null }));
+  Object.assign(f.state.batch.recoveryHistory.at(-1), { sourceFingerprint: SOURCE, fullResultSha256: RESULT });
+  f.state.batch.recoveryRevision = hypotheses.length;
+  f.state.batch.hypothesis = hypotheses.at(-1);
+  return f;
+}
+
 function refresh(candidate) {
   const rows = candidate.versusFullBaseline.exactLedger.map(row => ({ ...row, ...row.current }));
   candidate.summary = tally(rows);
@@ -162,7 +177,7 @@ test("fixed limits reject extra revisions, hypotheses, and counter resets", () =
   delete base.state.batch.maxRecoveryRevisions;
   base.state.batch.recoveryRevision = 0; stopped(base, /history length/);
   base.state.batch.recoveryRevision = 1;
-  base.state.phase = "new-phase"; stopped(base, /initial-recovery only/);
+  base.state.phase = "new-phase"; stopped(base, /Unsupported recovery phase/);
 });
 
 test("waivers, expectation exceptions, and missing hypotheses stop", () => {
@@ -178,4 +193,119 @@ test("ready state must remove STOP and include goal authorization", () => {
   for (const value of [null, undefined, "", {}]) {
     f.state.goalAuthorization = value; stopped(f, /authorization/);
   }
+});
+
+test("authorized continuation retains the initial trial and permits later revisions", () => {
+  const f = continuationFixture(), before = structuredClone(f.state);
+  const result = checkBatch(f.state, f.read);
+  assert.equal(result.verdict, "PASS");
+  assert.deepEqual(result.counts, { originalAccepted: 6055, originalRetained: 6055, laterPasses: 6330, laterRetained: 6330 });
+  assert.match(result.scope, /Later added passes and corpus parity need independent review/);
+  assert.deepEqual(f.state, before);
+});
+
+test("continuation requires explicit saved authorization before evidence reads", () => {
+  for (const change of [
+    f => { delete f.state.continuationAuthorization; },
+    f => { f.state.continuationAuthorization = null; },
+    f => { f.state.continuationAuthorization = "Theo said keep going"; },
+    f => { f.state.continuationAuthorization = {}; },
+    f => { f.state.continuationAuthorization.authorized = false; },
+    f => { f.state.continuationAuthorization.authorized = "true"; },
+    f => { f.state.continuationAuthorization.instruction = " "; },
+    f => { f.state.continuationAuthorization.scope = ""; },
+    f => { delete f.state.continuationAuthorization.date; },
+    f => { f.state.continuationAuthorization.date = "invalid"; },
+    f => { f.state.continuationAuthorization.date = "2026-99-99T00:00:00Z"; },
+  ]) {
+    const f = continuationFixture(); change(f);
+    const result = checkBatch(f.state, () => assert.fail("Unauthorized continuation must not read evidence"));
+    assert.equal(result.verdict, "STOP");
+    assert.match(result.reasons.join(" "), /Continuation requires explicit saved authorization/);
+  }
+});
+
+test("saved continuation authorization does not change initial recovery limits", () => {
+  const f = continuationFixture(); f.state.phase = "initial-recovery";
+  stopped(f, /1 to 4 measured revisions/);
+  f.state.batch.recoveryHistory = f.state.batch.recoveryHistory.slice(0, 3);
+  f.state.batch.recoveryRevision = 3;
+  for (const row of f.state.batch.recoveryHistory) row.hypothesis = "hypothesis-1";
+  stopped(f, /two revisions per hypothesis/);
+  f.state.batch.recoveryHistory[2].hypothesis = "hypothesis-2";
+  f.state.batch.maxRecoveryRevisions = 99;
+  stopped(f, /fixed at 4/);
+});
+
+test("continuation rejects missing, reordered, duplicated and reset history", () => {
+  for (const change of [
+    f => { delete f.state.batch.recoveryHistory; },
+    f => { f.state.batch.recoveryHistory = []; f.state.batch.recoveryRevision = 0; },
+    f => { f.state.batch.recoveryHistory = f.state.batch.recoveryHistory.slice(0, 4); f.state.batch.recoveryRevision = 4; },
+    f => { f.state.batch.recoveryRevision = 1; },
+    f => { f.state.batch.recoveryHistory.shift(); f.state.batch.recoveryRevision--; },
+    f => { [f.state.batch.recoveryHistory[0], f.state.batch.recoveryHistory[1]] = [f.state.batch.recoveryHistory[1], f.state.batch.recoveryHistory[0]]; },
+    f => { f.state.batch.recoveryHistory[2] = { ...f.state.batch.recoveryHistory[1] }; },
+    f => { f.state.batch.recoveryHistory[4].revision = 1; },
+    f => { f.state.batch.recoveryHistory[5].revision = 7; },
+    f => { f.state.batch.recoveryHistory[0].sourceFingerprint = "invalid"; },
+    f => { delete f.state.batch.recoveryHistory[0].fullResultSha256; },
+  ]) { const f = continuationFixture(); change(f); stopped(f, /history|History/); }
+});
+
+test("continuation cannot rewrite initial history to exceed its hypothesis limits", () => {
+  for (const change of [
+    f => { f.state.batch.recoveryHistory[2].hypothesis = "hypothesis-1"; },
+    f => { f.state.batch.recoveryHistory[3].hypothesis = "hypothesis-3"; },
+  ]) { const f = continuationFixture(); change(f); stopped(f, /two hypotheses, two revisions per hypothesis/); }
+});
+
+test("continuation binds the latest history row to the current source, hypothesis and full result", () => {
+  for (const change of [
+    row => { row.sourceFingerprint = "d".repeat(64); },
+    row => { row.hypothesis = "older-hypothesis"; },
+    row => { row.fullResultSha256 = "d".repeat(64); },
+    row => { row.fullResultSha256 = null; },
+  ]) {
+    const f = continuationFixture(); change(f.state.batch.recoveryHistory.at(-1));
+    stopped(f, /Current history row does not match/);
+  }
+});
+
+test("continuation rejects protected lost passes even when another test recovers", () => {
+  for (const index of [0, 6100]) {
+    const f = continuationFixture();
+    f.candidate.versusFullBaseline.exactLedger[index].current.status = "FAIL";
+    if (index < 6055) f.candidate.originalAccepted6055.exactLedger[index].current.status = "FAIL";
+    f.candidate.versusFullBaseline.exactLedger.at(-1).current.status = "PASS";
+    refresh(f.candidate);
+    const result = stopped(f, /PASS names are FAIL or ABSENT/);
+    assert.equal(result.losses.originalAccepted.length, index < 6055 ? 1 : 0);
+    assert.deepEqual(result.losses.laterPasses, [{ harness: "checker", name: `case_${index}`, status: "FAIL" }]);
+  }
+});
+
+test("continuation rejects missing protected names, incomplete evidence and non-independent verdicts", () => {
+  for (const change of [
+    f => { f.candidate.versusFullBaseline.exactLedger[0].name = "renamed_case_0"; f.candidate.originalAccepted6055.exactLedger[0].current.status = "ABSENT"; },
+    f => { f.candidate.closure.normalClosures = false; },
+    f => { f.candidate.stages[1].sourceFingerprint = RESULT; },
+    f => { f.state.batch.fullResult.path = "missing.json"; },
+    f => { f.state.acceptedBaseline.sha256 = RESULT; },
+    f => { f.candidate.versusFullBaseline.exactLedger[0].current.status = "UNRUN"; },
+    f => { f.candidate.waiversApplied = true; },
+    f => { f.candidate.expectationChangesApplied = true; },
+    f => { delete f.state.batch.auditor; },
+    f => { delete f.state.batch.reviewer; },
+    f => { f.state.batch.auditor.verdict = "STOP"; },
+    f => { f.state.batch.reviewer.verdict = "STOP"; },
+    f => { f.state.batch.reviewer.sourceFingerprint = RESULT; },
+    f => { f.state.batch.reviewer.batchId = "older-batch"; },
+    f => { f.state.batch.reviewer.fullResultSha256 = SOURCE; },
+    f => { f.state.batch.reviewer.agent = "writer"; },
+    f => { f.state.batch.reviewer.agent = "auditor"; },
+    f => { f.state.batch.reviewer.role = "audit_accepted_roster"; },
+    f => { f.state.decision = "STOP"; },
+    f => { f.state.status = "active"; },
+  ]) { const f = continuationFixture(); change(f); stopped(f); }
 });

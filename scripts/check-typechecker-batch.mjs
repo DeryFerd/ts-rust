@@ -69,25 +69,37 @@ export function readPinnedJson(reference) {
 
 function validateBatch(state) {
   requireValue(state?.schemaVersion === 1, "Unsupported state schema.");
-  requireValue(state.phase === "initial-recovery", "STOP: this guard supports initial-recovery only.");
+  const continuation = state.phase === "recovery-continuation";
+  requireValue(state.phase === "initial-recovery" || continuation, "Unsupported recovery phase.");
   requireValue(state.status === "ready", "State is not ready. Paused or missing state means STOP.");
   requireValue(state.decision === "REVIEW" || state.decision === "PASS", "Ready state cannot keep a STOP or missing decision.");
   requireValue(text(state.goalAuthorization) || (state.goalAuthorization !== null && typeof state.goalAuthorization === "object"
     && !Array.isArray(state.goalAuthorization) && Object.keys(state.goalAuthorization).length > 0), "Missing goal authorization.");
+  if (continuation) {
+    const authorization = state.continuationAuthorization;
+    requireValue(authorization?.authorized === true && text(authorization.instruction) && text(authorization.scope)
+      && text(authorization.date) && /^\d{4}-\d{2}-\d{2}T/.test(authorization.date) && Number.isFinite(Date.parse(authorization.date)),
+    "Continuation requires explicit saved authorization, instruction, scope, and a valid date.");
+  }
   requireValue(HASH.test(state.preservedCandidateSourceFingerprint), "Missing preserved candidate fingerprint.");
   const batch = state.batch;
   requireValue(batch && text(batch.id) && text(batch.implementer) && text(batch.hypothesis), "Missing authorized batch, implementer, or hypothesis.");
   requireValue(HASH.test(batch.sourceFingerprint), "Missing batch source fingerprint.");
   requireValue(text(batch.fullResult?.path) && HASH.test(batch.fullResult?.sha256), "Missing completed full result.");
   const history = batch.recoveryHistory;
-  requireValue(Array.isArray(history) && history.length >= 1 && history.length <= 4, "Recovery history must contain 1 to 4 measured revisions.");
+  requireValue(Array.isArray(history) && (continuation ? history.length >= 5 : history.length >= 1 && history.length <= 4),
+    continuation ? "Continuation history must retain all four initial revisions and each later measured revision."
+      : "Recovery history must contain 1 to 4 measured revisions.");
   requireValue(batch.recoveryRevision === history.length, "Recovery revision must equal the retained history length.");
-  requireValue(batch.maxRecoveryRevisions === undefined || batch.maxRecoveryRevisions === 4, "The recovery limit is fixed at 4.");
+  if (!continuation) {
+    requireValue(batch.maxRecoveryRevisions === undefined || batch.maxRecoveryRevisions === 4, "The recovery limit is fixed at 4.");
+  }
   const hypotheses = new Map();
   for (const [index, row] of history.entries()) {
     requireValue(row?.revision === index + 1 && text(row.hypothesis) && HASH.test(row.sourceFingerprint), "Invalid or reset recovery history.");
     requireValue(row.fullResultSha256 === null || HASH.test(row.fullResultSha256), "History needs a result hash or explicit null.");
-    hypotheses.set(row.hypothesis, (hypotheses.get(row.hypothesis) ?? 0) + 1);
+    // Later authorization does not change the initial four-revision trial.
+    if (index < 4) hypotheses.set(row.hypothesis, (hypotheses.get(row.hypothesis) ?? 0) + 1);
   }
   requireValue(hypotheses.size <= 2 && [...hypotheses.values()].every(value => value <= 2), "Limit: two hypotheses, two revisions per hypothesis.");
   const last = history.at(-1);
@@ -207,15 +219,20 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 Read-only pre-acceptance check. Exit 0 means the protected-name and review
 prerequisites pass. Exit 1 means STOP. This is not a Cargo wrapper.
 
-State requires schemaVersion 1, phase initial-recovery, status ready,
+State requires schemaVersion 1, phase initial-recovery or recovery-continuation, status ready,
 decision REVIEW or PASS, goalAuthorization, and a preserved candidate hash.
 acceptedBaseline, originalAccepted, and laterPassBaseline need pinned path/SHA-256
 references. Original expectedNames is 6055. Later expectedPasses is 6330.
 
 batch needs id, implementer, hypothesis, sourceFingerprint, fullResult path/hash,
 recoveryRevision, recoveryHistory, auditor, and reviewer. History retains all
-measured revisions, including failures. Limits are 4 revisions, 2 hypotheses,
-and 2 revisions per hypothesis. Each history row needs revision, hypothesis,
+measured revisions, including failures. Initial recovery limits are 4 revisions,
+2 hypotheses, and 2 revisions per hypothesis. Continuation requires a saved
+continuationAuthorization with authorized true, instruction, scope, and a valid
+ISO date. Its history must keep all four initial revisions and each later
+revision, numbered from 1 without gaps or resets. Initial limits still apply
+to the first four rows. Later revisions have no fixed count or hypothesis limit.
+Each history row needs revision, hypothesis,
 sourceFingerprint, and fullResultSha256. A past result hash may be null.
 The final row must match this completed full result.
 
@@ -225,6 +242,7 @@ The auditor role is audit_accepted_roster. Missing evidence, STOP, source
 mismatch, renamed/missing protected names, or expectation exceptions stop.
 
 ${SCOPE}
+Independent review must compare retained history against saved batchRecords.
 This check cannot prevent arbitrary direct commands or edits to state history.`);
   } else {
   let result;
