@@ -471,7 +471,7 @@ stage emit env JOBS=4 bash "$R/emit/compare-emit.sh" "$BINS/goport_emit" "gate-$
 TS_NAMES=(query hono); [[ $MODE == full ]] && TS_NAMES+=(effect)
 stage typesyms py typesyms "$BINS/goport_typesyms" "$OUT/runs/typesyms" "$OUT/items/typesyms.jsonl" "${TS_NAMES[@]}"
 build_seq() {
-  local S=$R/build-mode/compare-build.sh
+  local S=$HERE/compare-build.sh
   GOPORT_BUILD=$BINS/goport_build bash "$S" seq repro cold edits flags foreign
   GOPORT_BUILD=$BINS/goport_build bash "$S" seq query-chain cold edits flags foreign
 }

@@ -25,3 +25,7 @@ corpus-diag/11466 | single-threaded-equal | traceResolution case library-referen
 # Effect McpProtocol (typesyms/strord-verify): the Go dumper prints the Rpc union members of
 # ProtocolAdapter in a check-order dependent order.
 typesyms/effect/src!unstable!ai!McpProtocol.ts.types | same-chars | effect McpProtocol Rpc union member order depends on Go check order (oracle nondeterminism)
+# Same Rpc union order case in the mcpProtocol version files (gate r113-full): the Rust output was
+# identical in two gate runs, and the Go output from one run equals it byte for byte.
+typesyms/effect/src!unstable!ai!internal!mcpProtocol!v2025_03_26.ts.types | same-chars | effect mcpProtocol Rpc union member order depends on Go check order (oracle nondeterminism)
+typesyms/effect/src!unstable!ai!internal!mcpProtocol!v2025_11_25.ts.types | same-chars | effect mcpProtocol Rpc union member order depends on Go check order (oracle nondeterminism)

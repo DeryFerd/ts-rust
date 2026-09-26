@@ -6,7 +6,7 @@ set -u
 cd /home/theo/Code/sandbox/ts-rust
 R=$1; O=target/continuation-r97-goport/measure/$R; mkdir -p $O
 WT=target/worktrees/checker-port
-REL=target/continuation-r97-goport/runtime/cargo-target/release
+REL=${GOPORT_REL:-target/continuation-r97-goport/runtime/cargo-target/release}
 test -z "$(git -C $WT status --porcelain crates/ts_goport Cargo.toml Cargo.lock crates/ts_compiler/src/lib.rs)" || { echo "dirty allowed files"; exit 1; }
 for b in goport goport_emit goport_typesyms; do cp $REL/$b $O/$b.bin; done
 export GOPORT_BIN=$PWD/$O/goport.bin
