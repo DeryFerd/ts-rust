@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "status": "active",
   "decision": "REVIEW",
-  "updated": "2026-09-26T06:21:36.394977+00:00",
-  "reason": "Batch go-checker-port-4 accepted at R113. Batch 5 opened at R114 (compat fixes).",
+  "updated": "2026-09-26T07:16:58.185262+00:00",
+  "reason": "R114 measured, not accepted: formatting and one clippy warning. R115 next.",
   "goalAuthorization": {
     "date": "2026-09-07T23:13:28.547569+00:00",
     "instruction": "Continue working toward the active thread goal. Keep iterating on the ts-rust port until it is Able to properly type-check Tanstack Core and Hono.",
@@ -160,9 +160,9 @@
     "normalSourceFingerprint": "777b177a454dec432c77c467839bb3d61deee7be976fab039fa0e00bb01955d3"
   },
   "lastFullResult": {
-    "path": "target/continuation-r113-full-result.json",
-    "sha256": "bbb5e091f5c1fb7bb9cd565de86dd48596a37a427ede783a9a338ffbb32b00df",
-    "sourceFingerprint": "f7284d27b2eab0672867ce35128e6c312107a0fded7e8d911e2a8519637eb62c",
+    "path": "target/continuation-r114-full-result.json",
+    "sha256": "b0177538f35b66d0476abae753e3bb999bb768f1a826aaac212188794d3b65b4",
+    "sourceFingerprint": "8cad22e610fd2a3d5624c4954b8822ab14f650e599896ad1ee18b027495d0bad",
     "pass": 6383,
     "fail": 447,
     "currentSource": true,
@@ -528,7 +528,10 @@
     "knownGaps": [
       "typesyms corpus 00233 regexInvalidUtf8WithUnicodeFlag: Go writes the raw 0x80 byte, Rust writes U+FFFD"
     ],
-    "fullResult": null,
+    "fullResult": {
+      "path": "target/continuation-r114-full-result.json",
+      "sha256": "b0177538f35b66d0476abae753e3bb999bb768f1a826aaac212188794d3b65b4"
+    },
     "corpus": null,
     "ordinaryQuery": null,
     "latestHono": {
@@ -560,10 +563,96 @@
     },
     "compilerAccepted": false,
     "passingCredit": false,
-    "completedRuns": [],
+    "completedRuns": [
+      {
+        "stage": "r114-prebuild",
+        "closure": "target/continuation-r114-prebuild-closure.json",
+        "exitCode": 0,
+        "sourceFingerprint": "8cad22e610fd2a3d5624c4954b8822ab14f650e599896ad1ee18b027495d0bad",
+        "sourceUnchanged": true,
+        "cleanupConfirmed": true
+      },
+      {
+        "stage": "r114-full-checker",
+        "closure": "target/continuation-r114-full-checker-closure.json",
+        "exitCode": 101,
+        "sourceFingerprint": "8cad22e610fd2a3d5624c4954b8822ab14f650e599896ad1ee18b027495d0bad",
+        "sourceUnchanged": true,
+        "cleanupConfirmed": true
+      },
+      {
+        "stage": "r114-full-compiler",
+        "closure": "target/continuation-r114-full-compiler-closure.json",
+        "exitCode": 0,
+        "sourceFingerprint": "8cad22e610fd2a3d5624c4954b8822ab14f650e599896ad1ee18b027495d0bad",
+        "sourceUnchanged": true,
+        "cleanupConfirmed": true
+      },
+      {
+        "stage": "r114-full-fixture",
+        "closure": "target/continuation-r114-full-fixture-closure.json",
+        "exitCode": 101,
+        "sourceFingerprint": "8cad22e610fd2a3d5624c4954b8822ab14f650e599896ad1ee18b027495d0bad",
+        "sourceUnchanged": true,
+        "cleanupConfirmed": true
+      },
+      {
+        "stage": "r114-parser-lib",
+        "closure": "target/continuation-r114-parser-lib-closure.json",
+        "exitCode": 0,
+        "sourceFingerprint": "8cad22e610fd2a3d5624c4954b8822ab14f650e599896ad1ee18b027495d0bad",
+        "sourceUnchanged": true,
+        "cleanupConfirmed": true
+      },
+      {
+        "stage": "r114-binder-lib",
+        "closure": "target/continuation-r114-binder-lib-closure.json",
+        "exitCode": 0,
+        "sourceFingerprint": "8cad22e610fd2a3d5624c4954b8822ab14f650e599896ad1ee18b027495d0bad",
+        "sourceUnchanged": true,
+        "cleanupConfirmed": true
+      },
+      {
+        "stage": "r114-array-control",
+        "closure": "target/continuation-r114-array-control-closure.json",
+        "exitCode": 0,
+        "sourceFingerprint": "8cad22e610fd2a3d5624c4954b8822ab14f650e599896ad1ee18b027495d0bad",
+        "sourceUnchanged": true,
+        "cleanupConfirmed": true
+      },
+      {
+        "stage": "r114-annotation-control",
+        "closure": "target/continuation-r114-annotation-control-closure.json",
+        "exitCode": 0,
+        "sourceFingerprint": "8cad22e610fd2a3d5624c4954b8822ab14f650e599896ad1ee18b027495d0bad",
+        "sourceUnchanged": true,
+        "cleanupConfirmed": true
+      }
+    ],
     "interruptedRuns": [],
     "verdictHistory": [],
-    "focusedResults": [],
+    "focusedResults": [
+      {
+        "path": "target/continuation-r114-parser-lib-result.json",
+        "sha256": "d3976f0979a1e399c3641d116acfa5dddfe2b6778e42dae56f701701ed0d6818",
+        "scope": "focused"
+      },
+      {
+        "path": "target/continuation-r114-binder-lib-result.json",
+        "sha256": "c8aaa6282598b77791c788b12884756adec310439a1490b936b75c228639bbfa",
+        "scope": "focused"
+      },
+      {
+        "path": "target/continuation-r114-array-control-result.json",
+        "sha256": "857a2a5b2a2877ec7081e554a59b3e0a96ba631896316535f00d0c7129626852",
+        "scope": "focused"
+      },
+      {
+        "path": "target/continuation-r114-annotation-control-result.json",
+        "sha256": "633af58dc39d99490bb8403a773658a5fe5eb1b18feb6140170046cc4a6c3fae",
+        "scope": "focused"
+      }
+    ],
     "runtimeToolHandles": [],
     "commands": [],
     "auditor": {
@@ -576,7 +665,169 @@
       "agent": "a0bc38f3370585da3",
       "verdict": "PENDING"
     },
-    "nextPermittedAction": "Clone the R113 regression pipeline for R114, run it, bound runs, gate, quality; then both verdicts."
+    "nextPermittedAction": "R115: R114 plus cargo fmt and the one clippy fix, no semantic change. Re-run the full pipeline on the new source.",
+    "runtime": {
+      "status": "closed",
+      "stage": "annotation-control"
+    },
+    "fullOutcome": {
+      "current": {
+        "tests": 6830,
+        "harnesses": 138,
+        "PASS": 6383,
+        "FAIL": 447,
+        "ABSENT": 0,
+        "UNRUN": 0
+      },
+      "originalAccepted": {
+        "PASS": 5765,
+        "FAIL": 276,
+        "ABSENT": 14,
+        "UNRUN": 0
+      },
+      "versusPrevious": {
+        "previousSourceFingerprint": "777b177a454dec432c77c467839bb3d61deee7be976fab039fa0e00bb01955d3",
+        "previousRevision": 96,
+        "protectedPASS": 6383,
+        "retainedPASS": 6383,
+        "lostPASS": [],
+        "recoveredFAIL": [],
+        "absentNames": [],
+        "addedNames": []
+      },
+      "protectedNamePreservation": {
+        "scope": "exact7153_roster_plus_closed_direct_controls",
+        "sourceFingerprint": "8cad22e610fd2a3d5624c4954b8822ab14f650e599896ad1ee18b027495d0bad",
+        "baseline": {
+          "path": "target/continuation-r96-regression-audit/regression-audit-ledger.json",
+          "sha256": "4db41724a7340fbc6523aad7d171b5861e0e3c133f082b7dc093e97a5785715a",
+          "bytes": 7434504
+        },
+        "directResults": [
+          {
+            "path": "target/continuation-r114-parser-lib-result.json",
+            "sha256": "d3976f0979a1e399c3641d116acfa5dddfe2b6778e42dae56f701701ed0d6818",
+            "scope": "focused"
+          },
+          {
+            "path": "target/continuation-r114-binder-lib-result.json",
+            "sha256": "c8aaa6282598b77791c788b12884756adec310439a1490b936b75c228639bbfa",
+            "scope": "focused"
+          },
+          {
+            "path": "target/continuation-r114-array-control-result.json",
+            "sha256": "857a2a5b2a2877ec7081e554a59b3e0a96ba631896316535f00d0c7129626852",
+            "scope": "focused"
+          },
+          {
+            "path": "target/continuation-r114-annotation-control-result.json",
+            "sha256": "633af58dc39d99490bb8403a773658a5fe5eb1b18feb6140170046cc4a6c3fae",
+            "scope": "focused"
+          }
+        ],
+        "original6055": {
+          "names": 6055,
+          "counts": {
+            "PASS": 5765,
+            "FAIL": 276,
+            "ABSENT": 14,
+            "UNRUN": 0
+          },
+          "retainedPASS": 5765,
+          "recoveredFAIL": [],
+          "lostPASS": [],
+          "absentNames": [
+            "baseline_cli::review_artifact_cli_fatal_preserves_diagnostic_mismatches_and_related_records",
+            "source_ambient_overload_functions::failed_multi_overload_recovery_does_not_publish_a_fake_candidate",
+            "source_inherited_index_properties::inherited_numeric_indexes_reject_incompatible_numeric_names_without_members",
+            "source_overload_calls::multi_overload_failure_recovery_remains_an_atomic_boundary",
+            "ts_checker::lib::semantic::alias_provider::tests::other_merged_ambient_namespace_imports_keep_their_original_target",
+            "ts_checker::lib::semantic::classes::tests::incompatible_forward_rest_method_implementations_remain_unsupported",
+            "ts_checker::lib::semantic::formatter::tests::source_arrow_expando_display_keeps_annotated_function_expression_unsupported",
+            "ts_checker::lib::semantic::production::tests::defers_quoted_ambient_modules_and_retains_patterns_in_stable_order",
+            "ts_checker::lib::semantic::source::tests::anonymous_function_expressions_reject_unsupported_names_parameters_and_bodies",
+            "ts_checker::lib::semantic::source::tests::invalid_derived_constructor_parameter_property_leaves_every_declaration_cold",
+            "ts_checker::lib::semantic::source::tests::parenthesized_object_property_functions_reject_unsupported_function_shapes",
+            "ts_checker::lib::semantic::source::tests::unsupported_object_forms_fail_before_writes",
+            "ts_checker::lib::semantic::source_callables::tests::anonymous_function_expression_plans_reject_names_and_corrupt_owners",
+            "ts_checker::lib::semantic::source_calls::tests::declared_call_set_failure_recovery_remains_an_atomic_boundary"
+          ],
+          "unrunNames": [],
+          "absentPriorPASS": [],
+          "unrunPriorPASS": []
+        },
+        "earlier6330": {
+          "names": 6330,
+          "counts": {
+            "PASS": 6315,
+            "FAIL": 15,
+            "ABSENT": 0,
+            "UNRUN": 0
+          },
+          "retainedPASS": 6315,
+          "recoveredFAIL": [],
+          "lostPASS": [],
+          "absentNames": [],
+          "unrunNames": [],
+          "absentPriorPASS": [],
+          "unrunPriorPASS": []
+        },
+        "prior6856PASS": {
+          "names": 6856,
+          "counts": {
+            "PASS": 6856,
+            "FAIL": 0,
+            "ABSENT": 0,
+            "UNRUN": 0
+          },
+          "retainedPASS": 6856,
+          "recoveredFAIL": [],
+          "lostPASS": [],
+          "absentNames": [],
+          "unrunNames": [],
+          "absentPriorPASS": [],
+          "unrunPriorPASS": []
+        },
+        "protected7153": {
+          "names": 7153,
+          "counts": {
+            "PASS": 6856,
+            "FAIL": 283,
+            "ABSENT": 14,
+            "UNRUN": 0
+          },
+          "retainedPASS": 6856,
+          "recoveredFAIL": [],
+          "lostPASS": [],
+          "absentNames": [
+            "baseline_cli::review_artifact_cli_fatal_preserves_diagnostic_mismatches_and_related_records",
+            "source_ambient_overload_functions::failed_multi_overload_recovery_does_not_publish_a_fake_candidate",
+            "source_inherited_index_properties::inherited_numeric_indexes_reject_incompatible_numeric_names_without_members",
+            "source_overload_calls::multi_overload_failure_recovery_remains_an_atomic_boundary",
+            "ts_checker::lib::semantic::alias_provider::tests::other_merged_ambient_namespace_imports_keep_their_original_target",
+            "ts_checker::lib::semantic::classes::tests::incompatible_forward_rest_method_implementations_remain_unsupported",
+            "ts_checker::lib::semantic::formatter::tests::source_arrow_expando_display_keeps_annotated_function_expression_unsupported",
+            "ts_checker::lib::semantic::production::tests::defers_quoted_ambient_modules_and_retains_patterns_in_stable_order",
+            "ts_checker::lib::semantic::source::tests::anonymous_function_expressions_reject_unsupported_names_parameters_and_bodies",
+            "ts_checker::lib::semantic::source::tests::invalid_derived_constructor_parameter_property_leaves_every_declaration_cold",
+            "ts_checker::lib::semantic::source::tests::parenthesized_object_property_functions_reject_unsupported_function_shapes",
+            "ts_checker::lib::semantic::source::tests::unsupported_object_forms_fail_before_writes",
+            "ts_checker::lib::semantic::source_callables::tests::anonymous_function_expression_plans_reject_names_and_corrupt_owners",
+            "ts_checker::lib::semantic::source_calls::tests::declared_call_set_failure_recovery_remains_an_atomic_boundary"
+          ],
+          "unrunNames": [],
+          "absentPriorPASS": [],
+          "unrunPriorPASS": []
+        },
+        "newPassingNames": [],
+        "acceptanceBlockedByPriorPASS": false,
+        "blockers": [],
+        "protectedChecks": "PASS",
+        "compilerAccepted": false,
+        "independentVerdicts": "PENDING",
+        "rule": "New passes never compensate for lost, absent or unrun prior passes. Raw full counts remain separate."
+      }
+    }
   },
   "parallelModelPreference": {
     "model": "GPT-6 Astra",

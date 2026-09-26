@@ -78,7 +78,7 @@ export GOPORT_BIN=$BINS/goport
 # Python helper: parses logs into items, runs the Python stages, applies the allow-list,
 # writes manifest.json and prints the summary. Called as: py <command> args...
 read -r -d '' PY <<'PYEOF'
-import hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
+import fnmatch, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 import psutil
 
@@ -380,16 +380,20 @@ def apply_allow(row, entries, evidence):
         keys = [(f"{row['id']}/{f}", f) for f in ctx['diffFiles']]
     else:
         keys = [(row['id'], None)]
-    if not all(k in entries for k, _ in keys):
+    # An entry id may be a glob (fnmatch). An exact entry wins over a glob.
+    def entry_for(k):
+        return k if k in entries else next((e for e in entries if '*' in e and fnmatch.fnmatchcase(k, e)), None)
+    matched = [(entry_for(k), f) for k, f in keys]
+    if not all(e for e, _ in matched):
         return
-    for k, f in keys:
-        if not CONDITIONS[entries[k]['condition']](row, f, evidence):
-            row['detail'] += f' (allow entry {k} condition {entries[k]["condition"]} did not hold)'
+    for e, f in matched:
+        if not CONDITIONS[entries[e]['condition']](row, f, evidence):
+            row['detail'] += f' (allow entry {e} condition {entries[e]["condition"]} did not hold for {f})'
             return
-    for k, _ in keys:
-        entries[k]['used'] = True
+    for e, _ in matched:
+        entries[e]['used'] = True
     row['status'] = 'ALLOWED'
-    row['allowedBy'] = [{'id': k, 'condition': entries[k]['condition'], 'reason': entries[k]['reason']} for k, _ in keys]
+    row['allowedBy'] = [{'id': e, 'file': f, 'condition': entries[e]['condition'], 'reason': entries[e]['reason']} for e, f in matched]
 
 
 def cmd_finish(out, meta_json):
