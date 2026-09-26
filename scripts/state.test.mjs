@@ -68,3 +68,22 @@ test("record current refuses to replace a batch without its saved record", () =>
   assert.equal(loadState(state).decision, "REVIEW");
   assert.match(main(["history", "--last", "1"], state), /"kind":"current"/);
 });
+
+test("import applies an edited full state as records", () => {
+  const { state, dir } = legacyDir();
+  const edited = loadState(state);
+  edited.decision = "REVIEW";
+  edited.batch.recoveryHistory.push(row(3));
+  edited.batch.recoveryRevision = 3;
+  edited.additionalPassingResultsForAuditor.push({ path: "q", sha256: hash("c") });
+  edited.newDiagnosis = { note: "added" };
+  const file = join(dir, "edited.json");
+  writeFileSync(file, JSON.stringify(edited));
+  main(["import", file], state);
+  assert.deepEqual(loadState(state), edited);
+  main(["import", file], state);
+  assert.match(main(["import", file], state), /Imported 0 revision rows, 0 passing results, 0 notes, current keys: none/);
+  edited.batch.recoveryHistory[0] = { ...row(1), hypothesis: "rewritten" };
+  writeFileSync(file, JSON.stringify(edited));
+  assert.throws(() => main(["import", file], state), /rewrites an older revision/);
+});

@@ -1,0 +1,27 @@
+# Gate allow-list. Only known tsgo-oracle nondeterminism belongs here.
+# Format: <result id> | <condition> | <reason>
+# The gate checks the condition again in every run. A result stays FAIL when it does not hold.
+#   single-threaded-equal  goport output equals `tsgo-oracle --singleThreaded` for the case
+#   same-chars             typesyms file differs only in order: same line count, and each
+#                          differing line pair has the same characters
+# Typesyms entries name one differing file: typesyms/<project>/<file>.
+
+# traceResolution corpus cases (int2b-plans.md): the oracle prints resolution traces in thread order.
+corpus-diag/00218 | single-threaded-equal | traceResolution case pathsAliasTrailingSlashConflictWithAtTypes: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/03525 | single-threaded-equal | traceResolution case importWithTrailingSlash: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/04591 | single-threaded-equal | traceResolution case moduleResolutionWithExtensions_notSupported3: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/04592 | single-threaded-equal | traceResolution case moduleResolutionWithExtensions_unexpected: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/04630 | single-threaded-equal | traceResolution case moduleResolution_packageJson_yesAtPackageRoot_mainFieldInSubDirectory: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/04931 | single-threaded-equal | traceResolution case nodeColonModuleResolution2: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/05478 | single-threaded-equal | traceResolution case reactJsxReactResolvedNodeNextEsm: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/07615 | single-threaded-equal | traceResolution case typesVersionsDeclarationEmit.multiFileBackReferenceToSelf: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/07616 | single-threaded-equal | traceResolution case typesVersionsDeclarationEmit.multiFileBackReferenceToUnmapped: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/10456 | single-threaded-equal | traceResolution case bundlerImportTsExtensions: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/10463 | single-threaded-equal | traceResolution case customConditions: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/10569 | single-threaded-equal | traceResolution case nodeModulesPackageImports: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/11458 | single-threaded-equal | traceResolution case library-reference-15: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+corpus-diag/11466 | single-threaded-equal | traceResolution case library-reference-scoped-packages: oracle trace order is nondeterministic with threads; goport equals the --singleThreaded oracle
+
+# Effect McpProtocol (typesyms/strord-verify): the Go dumper prints the Rpc union members of
+# ProtocolAdapter in a check-order dependent order.
+typesyms/effect/src!unstable!ai!McpProtocol.ts.types | same-chars | effect McpProtocol Rpc union member order depends on Go check order (oracle nondeterminism)

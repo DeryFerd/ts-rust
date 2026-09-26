@@ -116,8 +116,8 @@ function recordNote(dir, key, value) {
   return `Recorded note ${key}.`;
 }
 
-// Merges top-level keys into current.json and logs the patch to history.jsonl.
-function recordCurrent(dir, patch) {
+// Validates a current.json patch and returns the merged result without writing.
+function checkCurrent(dir, patch) {
   patch && typeof patch === "object" && !Array.isArray(patch) || fail("record current needs a JSON object.");
   for (const key of HISTORY_ONLY) key in patch && fail(`${key} lives in history.jsonl. Use record passing-result.`);
   patch.batch && "recoveryHistory" in patch.batch && fail("batch.recoveryHistory lives in history.jsonl. Use record revision.");
@@ -131,9 +131,56 @@ function recordCurrent(dir, patch) {
   }
   const notes = new Set(readHistory(dir).filter(line => line.kind === "note").map(line => line.key));
   for (const key of Object.keys(patch)) notes.has(key) && fail(`${key} is an archived note. Use record note ${key}.`);
-  writeCurrent(dir, next);
+  return next;
+}
+
+// Merges top-level keys into current.json and logs the patch to history.jsonl.
+function recordCurrent(dir, patch) {
+  writeCurrent(dir, checkCurrent(dir, patch));
   append(dir, { kind: "current", value: patch });
   return `Updated current.json: ${Object.keys(patch).join(", ")}.`;
+}
+
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+// Applies a full legacy-shaped state (from `export` plus edits) as ordinary records, so older
+// scripts that load, edit and save the whole object keep working. Validates everything first.
+function importState(dir, incoming) {
+  const existing = loadState(dir);
+  const current = readJson(paths(dir).current);
+  const { recoveryHistory: rows = [], ...batch } = incoming.batch ?? {};
+  const oldRows = existing.batch?.recoveryHistory ?? [];
+  rows.length >= oldRows.length || fail("Imported history is shorter than the saved history.");
+  oldRows.slice(0, -1).forEach((row, index) => same(row, rows[index]) || fail(`Imported revision ${row.revision} rewrites an older revision.`));
+  const revisions = rows.slice(Math.max(oldRows.length - 1, 0)).filter((row, index) => !(index === 0 && same(row, oldRows.at(-1))));
+  revisions.forEach((row, index) => {
+    const expected = (revisions[0].revision === oldRows.length ? oldRows.length : oldRows.length + 1) + index;
+    row?.revision === expected || fail(`Imported revision ${row?.revision} is out of order.`);
+    typeof row.hypothesis === "string" && row.hypothesis.trim() && HASH.test(row.sourceFingerprint)
+      || fail(`Imported revision ${row.revision} needs a hypothesis and a SHA-256 sourceFingerprint.`);
+  });
+  const oldPassing = existing.additionalPassingResultsForAuditor;
+  const passing = incoming.additionalPassingResultsForAuditor ?? [];
+  oldPassing.every((item, index) => same(item, passing[index])) || fail("Imported passing results rewrite saved entries.");
+  for (const key of Object.keys(existing)) key in incoming || fail(`Imported state drops ${key}. Keys cannot be deleted.`);
+  const patch = {}, notes = [];
+  for (const [key, value] of Object.entries(incoming)) {
+    if (HISTORY_ONLY.includes(key)) continue;
+    const next = key === "batch" ? batch : value;
+    const old = key === "batch" ? current.batch : existing[key];
+    if (key in existing && same(next, old)) continue;
+    if (key in current || key === "batch") patch[key] = next;
+    else notes.push([key, value]);
+  }
+  const changes = Object.keys(patch).length ? checkCurrent(dir, patch) : null;
+  revisions.forEach(row => append(dir, { kind: "revision", value: row }));
+  passing.slice(oldPassing.length).forEach(value => append(dir, { kind: "passing-result", value }));
+  notes.forEach(([key, value]) => append(dir, { kind: "note", key, value }));
+  if (changes) {
+    writeCurrent(dir, changes);
+    append(dir, { kind: "current", value: patch });
+  }
+  return `Imported ${revisions.length} revision rows, ${passing.length - oldPassing.length} passing results, ${notes.length} notes, current keys: ${Object.keys(patch).join(", ") || "none"}.`;
 }
 
 // One-time split of the legacy single-file state. Refuses to overwrite.
@@ -213,6 +260,8 @@ const USAGE = `Usage: scripts/state <command>
   record passing-result <file|->  Append an auditor passing-result reference.
   record note <key> <file|->      Archive a named record (diagnosis, measurement, plan).
   record current <file|->         Merge top-level keys into current.json and log the patch.
+  import <file|->                 Apply an edited full state (export shape) as records.
+                                  For older scripts that load, edit and save the whole state.
   export                          Full legacy-shaped state JSON (for audits).
   verify                          Rebuild the state and check history.jsonl is append-only.
   migrate <legacy.json>           One-time split of the old single-file state.
@@ -247,6 +296,7 @@ export function main(args, dir = process.env.TS_STATE_DIR ?? STATE_DIR) {
       return fail(`Unknown record kind: ${kind ?? "(none)"}.\n\n${USAGE}`);
     }
     case "export": return JSON.stringify(loadState(dir), null, 2);
+    case "import": return importState(dir, readInput(rest[0]));
     case "verify": {
       const state = loadState(dir);
       return `State rebuilds with ${state.batch?.recoveryHistory?.length ?? 0} revisions. ${verifyAppendOnly(dir)}`;
