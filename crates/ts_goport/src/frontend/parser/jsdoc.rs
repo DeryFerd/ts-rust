@@ -402,12 +402,14 @@ impl Parser {
                                 if link_end == start {
                                     remove_leading_newlines(&mut comments);
                                 }
-                                let text = self.factory.new_js_doc_text(comments.clone());
+                                // PERF: `take` moves the strings out and leaves
+                                // `comments` empty, as Go's `comments = comments[:0]`.
+                                let text =
+                                    self.factory.new_js_doc_text(std::mem::take(&mut comments));
                                 let jsdoc_text =
                                     self.finish_node_with_end(text, link_end, comment_end);
                                 comment_parts.push(jsdoc_text);
                                 comment_parts.push(link);
-                                comments.clear();
                                 link_end = self.scanner.token_end();
                                 fall_through = false;
                             }
@@ -441,7 +443,8 @@ impl Parser {
 
         if let Some(last) = comments.last_mut() {
             *last = last.trim_end_matches(char::is_whitespace).to_string();
-            let text = self.factory.new_js_doc_text(comments.clone());
+            // PERF: `comments` is not read after this, so move it.
+            let text = self.factory.new_js_doc_text(std::mem::take(&mut comments));
             let jsdoc_text = self.finish_node_with_end(text, link_end, comments_pos);
             comment_parts.push(jsdoc_text);
         }
@@ -729,11 +732,12 @@ impl Parser {
                             } else {
                                 comments_pos
                             };
-                            let t = self.factory.new_js_doc_text(comments.clone());
+                            // PERF: `take` moves the strings out and leaves
+                            // `comments` empty, as Go's `comments = comments[:0]`.
+                            let t = self.factory.new_js_doc_text(std::mem::take(&mut comments));
                             let text = self.finish_node_with_end(t, comment_start, comment_end);
                             parts.push(text);
                             parts.push(link);
-                            comments.clear();
                             link_end = self.scanner.token_end();
                         } else {
                             push_comment!(self.scanner.token_text());
@@ -793,7 +797,8 @@ impl Parser {
             } else {
                 comments_pos
             };
-            let t = self.factory.new_js_doc_text(comments.clone());
+            // PERF: `comments` is not read after this, so move it.
+            let t = self.factory.new_js_doc_text(std::mem::take(&mut comments));
             let text = self.finish_node(t, comment_start);
             parts.push(text);
         }

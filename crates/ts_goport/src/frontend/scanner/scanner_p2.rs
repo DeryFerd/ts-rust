@@ -11,6 +11,8 @@
 use crate::frontend::prelude::*;
 use std::borrow::Cow;
 
+use crate::scanner_util::push_js_string_rune;
+
 use super::scanner_p1::{
     EscapeSequenceScanningFlags, RUNE_SELF, Scanner, intern_token_value, rune_to_char,
     rune_to_string, utf8_decode_last_rune_in_string, utf8_decode_rune_in_string,
@@ -597,11 +599,11 @@ impl Scanner {
             }
             if ch == '\\' as i32 && !jsx_attribute_string {
                 sb.push_str(&self.text[start as usize..self.scanner_state.pos as usize]);
-                let escaped = self.scan_escape_sequence(
+                self.scan_escape_sequence_into(
                     EscapeSequenceScanningFlags::STRING
                         | EscapeSequenceScanningFlags::REPORT_ERRORS,
+                    &mut sb,
                 );
-                sb.push_str(&escaped);
                 start = self.scanner_state.pos;
                 continue;
             }
@@ -677,8 +679,7 @@ impl Scanner {
                     } else {
                         EscapeSequenceScanningFlags::default()
                     };
-                let escaped = self.scan_escape_sequence(flags);
-                sb.push_str(&escaped);
+                self.scan_escape_sequence_into(flags, &mut sb);
                 start = self.scanner_state.pos;
                 continue;
             }
@@ -707,17 +708,32 @@ impl Scanner {
     }
 
     // Go: scanner/scanner.go:1702 scanEscapeSequence
+    // PORT: the `String` form of `scan_escape_sequence_into`, for regexp.rs.
+    // The string and template scanners call `scan_escape_sequence_into`.
+    pub(crate) fn scan_escape_sequence(&mut self, flags: EscapeSequenceScanningFlags) -> String {
+        let mut out = String::new();
+        self.scan_escape_sequence_into(flags, &mut out);
+        out
+    }
+
+    // Go: scanner/scanner.go:1702 scanEscapeSequence
     // PORT: Go returns strings that can hold a CESU-8 lone surrogate
-    // (`EncodeJSStringRune`). A Rust `String` cannot; `encode_js_string_rune`
+    // (`EncodeJSStringRune`). A Rust `String` cannot; `push_js_string_rune`
     // writes a valid-UTF-8 escape form instead (see
     // `scanner_util::GO_STRING_MARKER`).
-    pub(crate) fn scan_escape_sequence(&mut self, flags: EscapeSequenceScanningFlags) -> String {
+    // PERF: appends the Go return value to `out` (the caller's builder) so a
+    // common escape such as `\n` does not allocate a `String`.
+    pub(crate) fn scan_escape_sequence_into(
+        &mut self,
+        flags: EscapeSequenceScanningFlags,
+        out: &mut String,
+    ) {
         let start = self.scanner_state.pos;
         self.scanner_state.pos += 1;
         let ch = self.char();
         if ch < 0 {
             self.error(diag::Unexpected_end_of_text);
-            return String::new();
+            return;
         }
         self.scanner_state.pos += 1;
         // PORT: the Go `switch` with `fallthrough` from '0' to '1'..'3' to
@@ -728,7 +744,8 @@ impl Scanner {
                 // Although '0' preceding any digit is treated as LegacyOctalEscapeSequence,
                 // '\08' should separately be interpreted as '\0' + '8'.
                 if c == '0' && !is_digit(rune_to_char(self.char())) {
-                    return "\x00".to_string();
+                    out.push('\x00');
+                    return;
                 }
                 // '\01', '\011'
                 if c <= '3' {
@@ -763,9 +780,10 @@ impl Scanner {
                             args![format!("\\x{:02x}", code)],
                         );
                     }
-                    return rune_to_string(code as i32);
+                    out.push(rune_to_char(code as i32));
+                    return;
                 }
-                self.text[start as usize..self.scanner_state.pos as usize].to_string()
+                out.push_str(&self.text[start as usize..self.scanner_state.pos as usize]);
             }
             '8' | '9' => {
                 // the invalid '\8' and '\9'
@@ -788,18 +806,19 @@ impl Scanner {
                             args![&self.text[start as usize..self.scanner_state.pos as usize]],
                         );
                     }
-                    return c.to_string();
+                    out.push(c);
+                    return;
                 }
-                self.text[start as usize..self.scanner_state.pos as usize].to_string()
+                out.push_str(&self.text[start as usize..self.scanner_state.pos as usize]);
             }
-            'b' => "\u{0008}".to_string(),
-            't' => "\t".to_string(),
-            'n' => "\n".to_string(),
-            'v' => "\u{000B}".to_string(),
-            'f' => "\u{000C}".to_string(),
-            'r' => "\r".to_string(),
-            '\'' => "'".to_string(),
-            '"' => "\"".to_string(),
+            'b' => out.push('\u{0008}'),
+            't' => out.push('\t'),
+            'n' => out.push('\n'),
+            'v' => out.push('\u{000B}'),
+            'f' => out.push('\u{000C}'),
+            'r' => out.push('\r'),
+            '\'' => out.push('\''),
+            '"' => out.push('"'),
             'u' => {
                 // '\uDDDD' and '\u{DDDDDD}'
                 let extended = self.char() == '{' as i32;
@@ -818,8 +837,8 @@ impl Scanner {
                         }
                     }
                     if code_point < 0 {
-                        return self.text[start as usize..self.scanner_state.pos as usize]
-                            .to_string();
+                        out.push_str(&self.text[start as usize..self.scanner_state.pos as usize]);
+                        return;
                     }
                     // In string literals, a high surrogate \u{...} followed by a low
                     // surrogate escape forms a single code point, exactly as adjacent
@@ -828,20 +847,24 @@ impl Scanner {
                         && is_high_surrogate(code_point as u32)
                     {
                         if let Some(combined) = self.scan_low_surrogate_escape(code_point) {
-                            return rune_to_string(combined);
+                            out.push(rune_to_char(combined));
+                            return;
                         }
                     }
-                    return encode_js_string_rune(code_point as u32);
+                    push_js_string_rune(out, code_point as u32);
+                    return;
                 }
                 if code_point < 0 {
-                    return self.text[start as usize..self.scanner_state.pos as usize].to_string();
+                    out.push_str(&self.text[start as usize..self.scanner_state.pos as usize]);
+                    return;
                 } else if is_high_surrogate(code_point as u32) {
                     if !flags.intersects(EscapeSequenceScanningFlags::REGULAR_EXPRESSION) {
                         // Combine \uHigh followed by any low surrogate escape (\uLow or
                         // \u{Low}) into a single code point in string literals, matching
                         // how adjacent UTF-16 code units pair in a JavaScript string.
                         if let Some(combined) = self.scan_low_surrogate_escape(code_point) {
-                            return rune_to_string(combined);
+                            out.push(rune_to_char(combined));
+                            return;
                         }
                     } else if flags.intersects(EscapeSequenceScanningFlags::ANY_UNICODE_MODE)
                         && self.char() == '\\' as i32
@@ -857,17 +880,18 @@ impl Scanner {
                                 EscapeSequenceScanningFlags::REPORT_INVALID_ESCAPE_ERRORS,
                             ));
                         if next_code_point >= 0 && is_low_surrogate(next_code_point as u32) {
-                            return rune_to_string(surrogate_pair_to_code_point(
+                            out.push(rune_to_char(surrogate_pair_to_code_point(
                                 code_point as u32,
                                 next_code_point as u32,
-                            ) as i32);
+                            ) as i32));
+                            return;
                         }
                         self.scanner_state.pos = saved_pos;
                     }
                 }
                 // Lone surrogate: encode as CESU-8 so it survives losslessly. In a
                 // non-unicode regex this also lets scanClassRanges compare it numerically.
-                encode_js_string_rune(code_point as u32)
+                push_js_string_rune(out, code_point as u32);
             }
             'x' => {
                 // '\xDD'
@@ -879,8 +903,8 @@ impl Scanner {
                         {
                             self.error(diag::Hexadecimal_digit_expected);
                         }
-                        return self.text[start as usize..self.scanner_state.pos as usize]
-                            .to_string();
+                        out.push_str(&self.text[start as usize..self.scanner_state.pos as usize]);
+                        return;
                     }
                     self.scanner_state.pos += 1;
                 }
@@ -890,7 +914,7 @@ impl Scanner {
                     16,
                     32,
                 );
-                rune_to_string(escaped_value as i32)
+                out.push(rune_to_char(escaped_value as i32));
             }
             '\r' | '\n' => {
                 // when encountering a LineContinuation (i.e. a backslash and a line terminator sequence),
@@ -898,8 +922,7 @@ impl Scanner {
                 if c == '\r' && self.char() == '\n' as i32 {
                     self.scanner_state.pos += 1;
                 }
-                // Go: `case '\r'` falls through to `case '\n'`.
-                String::new()
+                // Go: `case '\r'` falls through to `case '\n'` and returns "".
             }
             _ => {
                 // ch was read as a single byte; for multi-byte UTF-8 characters,
@@ -915,7 +938,7 @@ impl Scanner {
                 }
                 // LineContinuation: a backslash followed by a line terminator is "the empty code unit sequence".
                 if c == '\u{2028}' || c == '\u{2029}' {
-                    return String::new();
+                    return;
                 }
                 if flags.intersects(EscapeSequenceScanningFlags::ANY_UNICODE_MODE)
                     || flags.intersects(EscapeSequenceScanningFlags::REGULAR_EXPRESSION)
@@ -931,8 +954,8 @@ impl Scanner {
                 }
                 // PORT: writes the port form of the rune (see
                 // `scanner_util::GO_STRING_MARKER`). An invalid source byte
-                // decodes as RuneError, and Go returns "\uFFFD" too.
-                crate::scanner_util::encode_js_string_rune(c as u32)
+                // decodes as RuneError, and Go returns "�" too.
+                push_js_string_rune(out, c as u32);
             }
         }
     }

@@ -628,7 +628,10 @@ impl Checker {
             let source_props = self.get_properties_of_type(source);
             for source_prop in self.exclude_properties(source_props, excluded_properties) {
                 let name = self.sym(source_prop).name.clone();
-                if self.get_property_of_object_type(target, &name).is_nil() {
+                if self
+                    .get_property_of_object_type_key(target, TableKey::Name(&name))
+                    .is_nil()
+                {
                     if report_errors {
                         let prop_str = self.symbol_to_string(source_prop);
                         let target_str = self.type_to_string_exported(target);
@@ -1052,7 +1055,7 @@ impl Checker {
         let mut result = Ternary::TRUE;
         for &source_prop in &source_properties {
             let name = self.sym(source_prop).name.clone();
-            let target_prop = self.get_property_of_object_type(target, &name);
+            let target_prop = self.get_property_of_object_type_key(target, TableKey::Name(&name));
             if target_prop.is_nil() {
                 return Ternary::FALSE;
             }

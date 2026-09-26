@@ -1,9 +1,10 @@
-//! Per-file Go node stores: the nodes the ported Go parser creates.
+//! Per-file Go node stores (the nodes the ported Go parser creates) and the
+//! file registry (the published stores and the `GoFile` of each file id).
 //!
 //! Go parser nodes are ordinary `*ast.Node` values made by `ast.NodeFactory`.
-//! Here each parsed file gets one store. The store id is the file index in
-//! `GoProgram::files`, so a store node is a normal `Node` handle: high 32
-//! bits are the store id, low 32 bits are the slot index + 1.
+//! Here each parsed file gets one store. The store id is the file id, so a
+//! store node is a normal `Node` handle: high 32 bits are the file id, low 32
+//! bits are the slot index + 1.
 //!
 //! Each slot has a header (Go kind plus the mutable Go `NodeBase` fields:
 //! parent, flags, loc) and, for a node slot, a leaked `ts_ast::Node` that
@@ -19,31 +20,55 @@
 //! have a store. Files of the legacy loader (ts_parser) never have a store,
 //! so their reads do not change.
 //!
-//! Two phases:
+//! Phases of a store:
 //! - Build: the parser runs on one thread and writes the stores of that
 //!   thread (`BUILD`). The header and the data can change until the parser
 //!   finishes the file (`finishNode`, parent setting, JSDoc flags,
-//!   reparser.go writes). Then the parser freezes the file.
+//!   reparser.go writes). Then the parser freezes the file, which also
+//!   builds the per-store tables that a publish puts in the registry. The
+//!   build stores of a thread get consecutive ids from `BuildStores::base`,
+//!   the published count when its first store was made. The last store
+//!   made on a thread is its `ACTIVE` store: the parser reads and writes it
+//!   without a store lookup.
 //! - Detached: a parse worker (`files_parser.rs` prefetch) parses one file
 //!   into a store with a provisional id (`DETACHED_STORE_BASE` + job) that
 //!   only its thread sees (`DETACHED`). The loading thread adopts the
 //!   finished store when the loader asks for that file
 //!   (`adopt_detached_store`). The store then gets the next real id, so ids
 //!   still follow the serial parse order.
-//! - Frozen: `core::set_prog` calls `freeze_file_stores`, which moves every
-//!   store into one leaked, read-only, process-wide slice (`FROZEN`). Node
-//!   reads then need no thread-local and no `RefCell` borrow, and the slice
-//!   can be read from any thread. Writes and new stores panic after this.
+//! - Published: the loader calls `publish_file_stores` with the `GoFile` of
+//!   each build store before it installs the program. The stores and their
+//!   `GoFile`s move into the process-wide, read-only registry. Node reads
+//!   then need no thread-local and no `RefCell` borrow, and any thread can
+//!   read them. Writes to a published store panic. A table that needs the
+//!   real id of an adopted store is built then, on scoped threads for a
+//!   large publish (`publish_stores`).
+//!
+//! The registry:
+//! - One file id is one file version. Ids only grow (`PUBLISHED` is the
+//!   next unused id), and a published file is never changed or freed. A new
+//!   program version shares the ids of its unchanged files.
+//! - Tier 0 (`FROZEN`) is the first publish: program 1, or the files of the
+//!   legacy loader. The hot node reads in `node.rs` read only its dense
+//!   tables, inline, and return `None` on a miss.
+//! - Tier 1 (`LATER`) holds every later publish (edited files, other
+//!   programs). One slot per id points at the `Frozen` of its publish. Reads
+//!   reach it out of line, after a tier 0 miss.
+//! - After a tier 0 miss, a synthetic id has no store (two compares, no
+//!   call). Any other id takes one cold call: tier 1, then the detached
+//!   store, then the build stores of this thread.
 //!
 //! Binder data is not stored here: it stays in `GoFile::node_bind`, indexed
 //! by slot index.
 //!
-//! PORT: a program is either all legacy files or all store files. File ids
-//! are store ids, so a store can only be made while no legacy program is
-//! installed on this thread. One process installs one program.
+//! PORT: a program is either all legacy files or all store files. A legacy
+//! publish has only `GoFile`s. It must be the only publish: file ids are
+//! store ids, so no store can be made or published after it.
 
 use crate::prelude::*;
+use std::cell::Cell;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use ts_ast::NodeData;
 
 /// Slot 0: Go `nil` stored in a ts_ast field that has no `Option`.
@@ -69,7 +94,7 @@ pub struct NodeHeader {
     pub loc: TextRange,
     pub flags: NodeFlags,
     pub kind: SyntaxKind,
-    /// Set by `freeze_file_stores`: Go `GetSourceFileOfNode(node)` is the
+    /// Set by `mark_source_file_roots`: Go `GetSourceFileOfNode(node)` is the
     /// root of this store (`FileStore::root`). False means "walk the parents".
     source_file_is_root: bool,
 }
@@ -108,6 +133,8 @@ impl NodeHeader {
 }
 
 /// The Go nodes of one parsed file. Slot `i` is `headers[i]` and `nodes[i]`.
+/// The default value is an empty placeholder with no slots.
+#[derive(Default)]
 struct FileStore {
     file_name: &'static str,
     text: &'static str,
@@ -116,7 +143,7 @@ struct FileStore {
     /// slot and alias slots.
     nodes: Vec<Option<&'static ts_ast::Node>>,
     /// Alias slot of each foreign node, so one node gets one slot. Emptied
-    /// by `freeze_file_stores`.
+    /// by `publish_file_stores`.
     aliases: FxHashMap<Node, u32>,
     /// Set when the parser has finished the file.
     frozen: bool,
@@ -127,21 +154,117 @@ struct FileStore {
     /// is frozen. The loader takes it once.
     parser_flags: Option<Vec<NodeFlags>>,
     /// Go `file.jsdocCache`, set by `finishSourceFile`. Node reads use it
-    /// until the program that holds this file is installed, so
-    /// `freeze_file_stores` empties it.
+    /// until the file is published (its `GoFile` holds it then), so
+    /// `publish_file_stores` empties it.
     jsdoc_cache: FxHashMap<Node, &'static [Node]>,
-    /// The SourceFile node of this store, set by `freeze_file_stores`.
+    /// Go `file.LanguageVariant` and the parse `file.Diagnostics()`, set by
+    /// `finishSourceFile`. Reads of a file that is not published use them
+    /// (`ast::source_file_language_variant`, `ast::source_file_diagnostics`),
+    /// for example the format tests, which parse a file with no program.
+    language_variant: LanguageVariant,
+    diagnostics: &'static [Diagnostic],
+    /// The SourceFile node of this store, set by `publish_file_stores`.
     root: Node,
-    /// Go `SourceFile.ECMALineMap()`, computed on first use after freeze
+    /// Go `SourceFile.ECMALineMap()`, computed on first use after publish
     /// and shared by every thread.
     ecma_line_starts: OnceLock<Box<[i32]>>,
+    /// `headers[i].kind` for every slot (`Frozen::kinds`). Made when the
+    /// file is frozen. A length other than `headers.len()` means "not made".
+    kinds: Box<[SyntaxKind]>,
+    /// `resolve_slot` for every slot (`Frozen::resolved`), with the file id
+    /// of the store. Same length rule as `kinds`.
+    resolved: Box<[Node]>,
+}
+
+/// A store that is not published yet. It lives in a leaked cell of the
+/// thread that made it, so `ACTIVE` can keep a plain reference to it.
+type StoreCell = &'static RefCell<FileStore>;
+
+/// The build stores of one thread. `stores[i]` has file id `base + i`.
+#[derive(Default)]
+struct BuildStores {
+    /// `PUBLISHED` when the first of `stores` was made.
+    base: usize,
+    stores: Vec<StoreCell>,
+}
+
+impl BuildStores {
+    /// The file id of the next store of this thread. Only a publish changes
+    /// `PUBLISHED`, so the ids of one build are consecutive.
+    fn next_id(&mut self) -> usize {
+        let published = PUBLISHED.load(Ordering::Acquire);
+        if self.stores.is_empty() {
+            self.base = published;
+        } else {
+            assert_eq!(
+                self.base, published,
+                "another thread published node stores while this thread built stores"
+            );
+        }
+        let id = self.base + self.stores.len();
+        assert!(id < TIER1_LIMIT, "too many file ids");
+        id
+    }
 }
 
 thread_local! {
     /// The stores of this thread, while the parser runs.
-    static BUILD: RefCell<Vec<FileStore>> = const { RefCell::new(Vec::new()) };
+    static BUILD: RefCell<BuildStores> = const {
+        RefCell::new(BuildStores {
+            base: 0,
+            stores: Vec::new(),
+        })
+    };
     /// The detached store of a parse worker and its provisional id.
-    static DETACHED: RefCell<Option<(usize, FileStore)>> = const { RefCell::new(None) };
+    static DETACHED: Cell<Option<(usize, StoreCell)>> = const { Cell::new(None) };
+    /// The emptied cell of the last detached store of this thread. The next
+    /// detached store reuses it.
+    static SPARE_CELL: Cell<Option<StoreCell>> = const { Cell::new(None) };
+    /// The store this thread made or adopted last, and its id: during a
+    /// parse, the store of the file the parser reads and writes. It is also
+    /// in `BUILD` or `DETACHED`, so clearing it is always safe.
+    // PERF: query Q8. Node reads have no parser or factory to ask, so the
+    // store of the parsed file is found here. The type has no destructor,
+    // so a read is one thread-local load and an id compare: no `FROZEN`
+    // check, no detached check and no `RefCell` borrow of `BUILD`.
+    // `publish_file_stores` and `take_detached_file_store` clear it before
+    // they empty its cell, and a thread publishes only its own build
+    // stores, so an active store is never published. (One loading thread
+    // builds at a time: `BuildStores::next_id` and the publish check it.)
+    static ACTIVE: Cell<Option<(usize, StoreCell)>> = const { Cell::new(None) };
+}
+
+/// The cell of store `file` when it is the active store of this thread.
+#[inline]
+fn active_store(file: usize) -> Option<StoreCell> {
+    match ACTIVE.get() {
+        Some((id, store)) if id == file => Some(store),
+        _ => None,
+    }
+}
+
+/// The unpublished store `file` of this thread (active, detached or
+/// built), or `None` when this thread has no such store.
+#[inline]
+fn build_store(file: usize) -> Option<StoreCell> {
+    match active_store(file) {
+        Some(store) => Some(store),
+        None => inactive_build_store(file),
+    }
+}
+
+/// `build_store` without the `ACTIVE` check.
+#[inline(never)]
+fn inactive_build_store(file: usize) -> Option<StoreCell> {
+    if is_detached_id(file) {
+        return DETACHED
+            .get()
+            .and_then(|(id, store)| (id == file).then_some(store));
+    }
+    BUILD.with(|b| {
+        let b = b.borrow();
+        b.stores.get(file.wrapping_sub(b.base)).copied()
+    })
 }
 
 /// File index that marks a parent in the same store inside a stored
@@ -149,36 +272,72 @@ thread_local! {
 /// store keeps its headers when its id changes (`adopt_detached_store`).
 const LOCAL_STORE: usize = 0x7fff_ffff;
 
-/// First provisional store id. Real store ids are file indexes and stay far
-/// below it; synthetic node and flow ids are above every provisional id.
+/// First provisional store id. Real file ids stay below `TIER1_LIMIT`;
+/// synthetic node and flow ids are above every provisional id.
 pub const DETACHED_STORE_BASE: usize = 0x8000_0000;
 /// Number of provisional ids.
 pub const DETACHED_STORE_LIMIT: usize = 0x4000_0000;
+
+/// Every real file id is below this. Tier 1 has one slot per id.
+const TIER1_LIMIT: usize = 1 << 22;
+/// Slots per tier 1 chunk.
+const LATER_CHUNK: usize = 256;
 
 #[inline]
 fn is_detached_id(file: usize) -> bool {
     (DETACHED_STORE_BASE..DETACHED_STORE_BASE + DETACHED_STORE_LIMIT).contains(&file)
 }
 
-/// All stores, read-only, after `freeze_file_stores`, with dense per-store
-/// header and node tables for the hot node reads.
+/// True for an id that never has a store: a synthetic node or flow id, or
+/// any other id at or above `TIER1_LIMIT` that is not a provisional id.
+#[inline]
+fn is_storeless_id(file: usize) -> bool {
+    file >= TIER1_LIMIT && !is_detached_id(file)
+}
+
+/// The stores and `GoFile`s of one publish, read-only, with dense
+/// per-store header and node tables for the hot node reads. File `file` of
+/// the publish is at index `file - base`. Tier 0 has `base` 0, so its hot
+/// reads index the tables by file id.
 struct Frozen {
+    /// The first file id of the publish.
+    base: usize,
     stores: &'static [FileStore],
     headers: Box<[&'static [NodeHeader]]>,
     nodes: Box<[&'static [Option<&'static ts_ast::Node>]]>,
-    /// `headers[file][i].kind`, packed. `Node::kind` reads only this.
-    kinds: Box<[Box<[SyntaxKind]>]>,
-    /// `try_resolve_store_id(file, i)` for every slot, computed once.
-    /// `Node::new` reads only this.
-    resolved: Box<[Box<[Node]>]>,
+    /// `headers[file][i].kind`, packed (`FileStore::kinds`). `Node::kind`
+    /// reads only this.
+    kinds: Box<[&'static [SyntaxKind]]>,
+    /// `try_resolve_store_id(file, i)` for every slot, computed once
+    /// (`FileStore::resolved`). `Node::new` reads only this.
+    resolved: Box<[&'static [Node]]>,
+    /// The `GoFile` of each file id of the publish.
+    go_files: Box<[GoFile]>,
+    /// True for the legacy loader: `go_files` only, no stores.
+    legacy: bool,
 }
 
+/// Tier 0: the first publish.
 static FROZEN: OnceLock<Frozen> = OnceLock::new();
 
-/// The frozen stores, or `None` while the parser runs.
-#[inline]
-fn frozen() -> Option<&'static [FileStore]> {
-    FROZEN.get().map(|f| f.stores)
+/// The tier 1 slots of `LATER_CHUNK` consecutive file ids.
+type LaterChunk = [OnceLock<&'static Frozen>; LATER_CHUNK];
+
+/// Tier 1: the publish of each file id after the first publish. Each later
+/// publish is leaked once, and the slot of each of its ids names it.
+static LATER: [OnceLock<Box<LaterChunk>>; TIER1_LIMIT / LATER_CHUNK] =
+    [const { OnceLock::new() }; TIER1_LIMIT / LATER_CHUNK];
+
+/// The next unused file id. Only `publish_file_stores` changes it.
+static PUBLISHED: AtomicUsize = AtomicUsize::new(0);
+
+/// The tier 1 publish of file `file` and the index of `file` in it.
+#[cold]
+#[inline(never)]
+fn later(file: usize) -> Option<(&'static Frozen, usize)> {
+    let chunk = LATER.get(file / LATER_CHUNK)?.get()?;
+    let frozen: &'static Frozen = *chunk[file % LATER_CHUNK].get()?;
+    Some((frozen, file - frozen.base))
 }
 
 /// The handle of slot `index` in store `file`. Does not resolve aliases.
@@ -192,31 +351,83 @@ fn slot_index(n: Node) -> usize {
     ((n.0 & 0xffff_ffff) - 1) as usize
 }
 
-fn with_store<R>(file: usize, f: impl FnOnce(&FileStore) -> R) -> R {
-    if let Some(stores) = frozen() {
-        return f(&stores[file]);
-    }
-    if is_detached_id(file) {
-        return DETACHED.with(|d| match &*d.borrow() {
-            Some((id, store)) if *id == file => f(store),
-            _ => panic!("store {file:#x} is not the detached store of this thread"),
-        });
-    }
-    BUILD.with(|s| f(&s.borrow()[file]))
+/// Runs `f` on an unpublished store of this thread: its active, detached
+/// or build store. `None` when this thread has no store `file`.
+#[inline]
+fn with_thread_store<R>(file: usize, f: impl FnOnce(&FileStore) -> R) -> Option<R> {
+    build_store(file).map(|store| f(&store.borrow()))
 }
 
-fn with_store_mut<R>(file: usize, f: impl FnOnce(&mut FileStore) -> R) -> R {
-    assert!(
-        frozen().is_none(),
-        "cannot change a node store after freeze"
-    );
-    if is_detached_id(file) {
-        return DETACHED.with(|d| match &mut *d.borrow_mut() {
-            Some((id, store)) if *id == file => f(store),
-            _ => panic!("store {file:#x} is not the detached store of this thread"),
-        });
+/// A store read after a tier 0 miss: a synthetic id (or any id when tier 0
+/// is legacy) has no store; any other id takes one cold call.
+#[inline]
+fn after_tier0_miss<R>(tier0: &Frozen, file: usize, f: impl FnOnce(&FileStore) -> R) -> Option<R> {
+    if is_storeless_id(file) || tier0.legacy {
+        return None;
     }
-    BUILD.with(|s| f(&mut s.borrow_mut()[file]))
+    with_later_store(file, f)
+}
+
+/// The cold part of `after_tier0_miss`: tier 1, then the detached store,
+/// then the build stores of this thread.
+#[cold]
+#[inline(never)]
+fn with_later_store<R>(file: usize, f: impl FnOnce(&FileStore) -> R) -> Option<R> {
+    match later(file) {
+        Some((frozen, local)) => Some(f(&frozen.stores[local])),
+        None => with_thread_store(file, f),
+    }
+}
+
+/// A published tier 1 store, for readers that need it `'static`. `None`
+/// after a tier 0 miss when `file` is not published in tier 1.
+#[inline]
+fn later_store(tier0: &Frozen, file: usize) -> Option<&'static FileStore> {
+    if file >= TIER1_LIMIT || tier0.legacy {
+        return None;
+    }
+    later(file).map(|(frozen, local)| &frozen.stores[local])
+}
+
+/// Runs `f` on store `file`: published, or an unpublished store of this
+/// thread. `None` when this thread cannot see a store `file`.
+#[inline]
+fn try_with_store<R>(file: usize, f: impl FnOnce(&FileStore) -> R) -> Option<R> {
+    match FROZEN.get() {
+        Some(tier0) => match tier0.stores.get(file) {
+            Some(store) => Some(f(store)),
+            None => after_tier0_miss(tier0, file, f),
+        },
+        None => with_thread_store(file, f),
+    }
+}
+
+fn with_store<R>(file: usize, f: impl FnOnce(&FileStore) -> R) -> R {
+    try_with_store(file, f)
+        .unwrap_or_else(|| panic!("file {file:#x} has no node store on this thread"))
+}
+
+/// Runs `f` on unpublished store `file` of this thread. Panics when `file`
+/// is published or this thread has no store `file`.
+fn with_store_mut<R>(file: usize, f: impl FnOnce(&mut FileStore) -> R) -> R {
+    // PERF: query Q8. The parse writes the active store, which is never
+    // published (see `ACTIVE`), so it needs no publish check.
+    let store = match active_store(file) {
+        Some(store) => store,
+        None => inactive_unpublished_store(file),
+    };
+    f(&mut store.borrow_mut())
+}
+
+/// The store that `with_store_mut` writes when it is not the active store.
+#[inline(never)]
+fn inactive_unpublished_store(file: usize) -> StoreCell {
+    assert!(
+        !is_published(file),
+        "cannot change the node store of published file {file:#x}"
+    );
+    inactive_build_store(file)
+        .unwrap_or_else(|| panic!("file {file:#x} has no node store on this thread"))
 }
 
 /// Writes the node slot of a store handle. Panics on a frozen store.
@@ -238,19 +449,29 @@ fn with_slot_mut<R>(
 // Stores
 // ──────────────────────────────────────────────────────────────────────
 
-/// Makes the store of the next parsed file and returns its id. Ids follow
-/// parse order and are the file indexes in `GoProgram::files`.
+/// Makes the store of the next parsed file and returns its file id. Ids
+/// follow parse order (see `BuildStores`). The store becomes the active
+/// store of this thread.
 pub fn new_file_store(file_name: &'static str, text: &'static str) -> usize {
-    assert!(frozen().is_none(), "cannot make a node store after freeze");
-    BUILD.with(|s| {
-        let mut s = s.borrow_mut();
-        assert!(
-            crate::core::try_prog().is_none_or(|p| p.files.len() <= s.len()),
-            "a legacy program is installed; file ids would collide with store ids"
-        );
-        s.push(FileStore::new(file_name, text));
-        s.len() - 1
-    })
+    assert_no_legacy_publish();
+    let store: StoreCell = leak_in_ast_arena(RefCell::new(FileStore::new(file_name, text)));
+    let id = BUILD.with(|b| {
+        let mut b = b.borrow_mut();
+        let id = b.next_id();
+        b.stores.push(store);
+        id
+    });
+    ACTIVE.set(Some((id, store)));
+    id
+}
+
+/// Panics when tier 0 is a legacy publish: its file ids would collide with
+/// store ids.
+fn assert_no_legacy_publish() {
+    assert!(
+        FROZEN.get().is_none_or(|tier0| !tier0.legacy),
+        "a legacy program is published; file ids would collide with store ids"
+    );
 }
 
 impl FileStore {
@@ -260,13 +481,7 @@ impl FileStore {
             text,
             headers: vec![NodeHeader::target(Node::NIL)],
             nodes: vec![None],
-            aliases: FxHashMap::default(),
-            frozen: false,
-            root_slot: NIL_SLOT,
-            parser_flags: None,
-            jsdoc_cache: FxHashMap::default(),
-            root: Node::NIL,
-            ecma_line_starts: OnceLock::new(),
+            ..Self::default()
         }
     }
 }
@@ -302,22 +517,30 @@ impl DetachedStore {
 /// `DETACHED_STORE_BASE + job` and returns that id. A parse worker parses
 /// one file at a time; the store stays until `take_detached_file_store`.
 pub fn new_detached_file_store(job: usize, file_name: &'static str, text: &'static str) -> usize {
-    assert!(frozen().is_none(), "cannot make a node store after freeze");
     assert!(job < DETACHED_STORE_LIMIT, "too many detached stores");
     let id = DETACHED_STORE_BASE + job;
-    DETACHED.with(|d| {
-        let mut d = d.borrow_mut();
-        assert!(d.is_none(), "this thread already has a detached store");
-        *d = Some((id, FileStore::new(file_name, text)));
-    });
+    assert!(
+        DETACHED.get().is_none(),
+        "this thread already has a detached store"
+    );
+    let store = SPARE_CELL
+        .take()
+        .unwrap_or_else(|| leak_in_ast_arena(RefCell::default()));
+    *store.borrow_mut() = FileStore::new(file_name, text);
+    DETACHED.set(Some((id, store)));
+    ACTIVE.set(Some((id, store)));
     id
 }
 
 /// Removes the detached store of this thread, if any.
 pub fn take_detached_file_store() -> Option<DetachedStore> {
-    DETACHED
-        .with(|d| d.borrow_mut().take())
-        .map(|(id, store)| DetachedStore { id, store })
+    let (id, cell) = DETACHED.take()?;
+    if active_store(id).is_some() {
+        ACTIVE.set(None);
+    }
+    let store = cell.take();
+    SPARE_CELL.set(Some(cell));
+    Some(DetachedStore { id, store })
 }
 
 /// Maps the node handles of an adopted detached store to its real id.
@@ -349,23 +572,20 @@ impl StoreRemap {
 
 /// Gives a self-contained detached store the next real store id on this
 /// thread, as `new_file_store` would have at this point, and returns the
-/// handle map for the values the parse returned with it.
+/// handle map for the values the parse returned with it. The store becomes
+/// the active store of this thread.
 pub fn adopt_detached_store(detached: DetachedStore) -> StoreRemap {
-    assert!(frozen().is_none(), "cannot adopt a node store after freeze");
+    assert_no_legacy_publish();
     assert!(
         detached.is_self_contained(),
         "cannot adopt a store that names other stores"
     );
     let DetachedStore { id, mut store } = detached;
-    BUILD.with(|s| {
-        let mut s = s.borrow_mut();
-        assert!(
-            crate::core::try_prog().is_none_or(|p| p.files.len() <= s.len()),
-            "a legacy program is installed; file ids would collide with store ids"
-        );
+    let (remap, cell) = BUILD.with(|b| {
+        let mut b = b.borrow_mut();
         let remap = StoreRemap {
             from: id,
-            to: s.len(),
+            to: b.next_id(),
         };
         store.jsdoc_cache = store
             .jsdoc_cache
@@ -379,26 +599,73 @@ pub fn adopt_detached_store(detached: DetachedStore) -> StoreRemap {
                 (remap.node(node), jsdocs)
             })
             .collect();
-        s.push(store);
-        remap
-    })
+        // The resolved table holds handles of the store id, which changes
+        // here. `publish_file_stores` makes it for the real id.
+        store.resolved = Box::default();
+        let cell: StoreCell = leak_in_ast_arena(RefCell::new(store));
+        b.stores.push(cell);
+        (remap, cell)
+    });
+    ACTIVE.set(Some((remap.to, cell)));
+    remap
 }
 
-/// Number of stores (on this thread while the parser runs).
-#[must_use]
-pub fn file_store_count() -> usize {
-    match frozen() {
-        Some(stores) => stores.len(),
-        None => BUILD.with(|s| s.borrow().len()),
-    }
-}
+// ──────────────────────────────────────────────────────────────────────
+// File registry
+// ──────────────────────────────────────────────────────────────────────
 
-/// True after `freeze_file_stores`. The program is installed then, and it
-/// holds every store file.
+/// The `GoFile` of published file `file`. Panics when it is not published.
 #[inline]
 #[must_use]
-pub fn file_stores_frozen() -> bool {
-    frozen().is_some()
+pub fn go_file(file: usize) -> &'static GoFile {
+    if let Some(tier0) = FROZEN.get()
+        && let Some(go_file) = tier0.go_files.get(file)
+    {
+        return go_file;
+    }
+    go_file_slow(file)
+}
+
+#[cold]
+#[inline(never)]
+fn go_file_slow(file: usize) -> &'static GoFile {
+    try_go_file(file).unwrap_or_else(|| panic!("file {file} is not published"))
+}
+
+/// `go_file`, or `None` for a store still being built, a synthetic id or
+/// an unknown id.
+#[inline]
+#[must_use]
+pub fn try_go_file(file: usize) -> Option<&'static GoFile> {
+    let tier0 = FROZEN.get()?;
+    if let Some(go_file) = tier0.go_files.get(file) {
+        return Some(go_file);
+    }
+    if file >= TIER1_LIMIT || tier0.legacy {
+        return None;
+    }
+    later(file).map(|(frozen, local)| &frozen.go_files[local])
+}
+
+/// True when `file` has a `GoFile` in the registry (tier 0 or tier 1).
+#[inline]
+#[must_use]
+pub fn is_published(file: usize) -> bool {
+    try_go_file(file).is_some()
+}
+
+/// Ids of the stores that this thread built and did not publish, in id
+/// order. The next publish of this thread gives them their `GoFile`s.
+#[must_use]
+pub fn unpublished_file_ids() -> std::ops::Range<usize> {
+    BUILD.with(|b| {
+        let b = b.borrow();
+        if b.stores.is_empty() {
+            let next = PUBLISHED.load(Ordering::Acquire);
+            return next..next;
+        }
+        b.base..b.base + b.stores.len()
+    })
 }
 
 /// True when file `file` was parsed by the ported parser.
@@ -406,11 +673,13 @@ pub fn file_stores_frozen() -> bool {
 #[must_use]
 pub fn has_file_store(file: usize) -> bool {
     match FROZEN.get() {
-        Some(f) => file < f.headers.len(),
-        None if is_detached_id(file) => {
-            DETACHED.with(|d| d.borrow().as_ref().is_some_and(|(id, _)| *id == file))
+        Some(tier0) => {
+            file < tier0.headers.len()
+                || (!tier0.legacy
+                    && !is_storeless_id(file)
+                    && with_later_store(file, |_| ()).is_some())
         }
-        None => BUILD.with(|s| file < s.borrow().len()),
+        None => build_store(file).is_some(),
     }
 }
 
@@ -444,6 +713,35 @@ pub fn set_file_store_js_doc_cache(file: usize, cache: &FxHashMap<Node, Vec<Node
     with_store_mut(file, |s| s.jsdoc_cache = cache);
 }
 
+/// Go `result.LanguageVariant` and `result.diagnostics` in
+/// `finishSourceFile`.
+// PORT: the diagnostics are leaked so reads can return a `&'static` slice,
+// like `GoFile::info.diagnostics` after the publish. A parse without errors
+// leaks nothing.
+pub fn set_file_store_parse_fields(
+    file: usize,
+    language_variant: LanguageVariant,
+    diagnostics: &[Diagnostic],
+) {
+    let diagnostics: &'static [Diagnostic] = Box::leak(diagnostics.to_vec().into_boxed_slice());
+    with_store_mut(file, |s| {
+        s.language_variant = language_variant;
+        s.diagnostics = diagnostics;
+    });
+}
+
+/// Go `file.LanguageVariant` of a store file.
+#[must_use]
+pub fn file_store_language_variant(file: usize) -> LanguageVariant {
+    with_store(file, |s| s.language_variant)
+}
+
+/// Go `file.Diagnostics()` (the parse diagnostics) of a store file.
+#[must_use]
+pub fn file_store_diagnostics(file: usize) -> &'static [Diagnostic] {
+    with_store(file, |s| s.diagnostics)
+}
+
 /// Go `file.jsdocCache[node]` of a store file whose program is not
 /// installed yet.
 #[must_use]
@@ -452,30 +750,150 @@ pub fn file_store_js_doc(file: usize, node: Node) -> Option<&'static [Node]> {
 }
 
 /// True when node reads of store file `file` must use the store, because
-/// no installed program holds the file yet (the parser is still running).
+/// the file is not published yet (the parser is still running).
 #[must_use]
 pub fn is_file_store_before_program(file: usize) -> bool {
-    frozen().is_none()
-        && has_file_store(file)
-        && crate::core::try_prog().is_none_or(|p| p.files.len() <= file)
+    !is_published(file) && has_file_store(file)
 }
 
 /// Ends the parse of a file. Header and data writes panic after this.
 /// Headers cannot change after this, so it also marks the source file roots
-/// (`mark_source_file_roots`) on the parsing thread.
+/// (`mark_source_file_roots`) and builds the tables that the publish puts
+/// in the registry (`FileStore::kinds`, `FileStore::resolved`) on the
+/// parsing thread.
 pub fn freeze_file_store(file: usize) {
-    with_store_mut(file, |s| {
-        s.frozen = true;
-        s.headers.shrink_to_fit();
-        s.nodes.shrink_to_fit();
-        mark_source_file_roots(s);
-        s.parser_flags = Some(s.headers.iter().map(|h| h.flags).collect());
+    with_store_mut(file, |s| s.freeze(file));
+}
+
+impl FileStore {
+    /// `freeze_file_store` for this store, which has id `file`.
+    fn freeze(&mut self, file: usize) {
+        self.end_parse();
+        // One pass over the headers for the parser flags and the kinds.
+        let mut flags = Vec::with_capacity(self.headers.len());
+        let mut kinds = Vec::with_capacity(self.headers.len());
+        for h in &self.headers {
+            flags.push(h.flags);
+            kinds.push(h.kind);
+        }
+        self.parser_flags = Some(flags);
+        self.kinds = kinds.into_boxed_slice();
+        // PERF: query Q7. The table is made here, on the parse thread, not
+        // in `publish_file_stores` on the loader. A detached store gets its
+        // real id only when the loader adopts it, so its table waits for
+        // `publish_file_stores`.
+        if !is_detached_id(file) {
+            self.resolved = self.resolved_table(file);
+        }
+    }
+
+    /// Marks the store finished and marks its source file roots.
+    fn end_parse(&mut self) {
+        self.frozen = true;
+        self.headers.shrink_to_fit();
+        self.nodes.shrink_to_fit();
+        mark_source_file_roots(self);
+    }
+
+    /// `resolve_slot(file, i, ..)` for every slot, for store id `file`.
+    fn resolved_table(&self, file: usize) -> Box<[Node]> {
+        (0..self.headers.len())
+            .map(|i| resolve_slot(file, i, &self.nodes, &self.headers))
+            .collect()
+    }
+
+    /// The part of `publish_file_stores` for this store, which has id
+    /// `file`: drops what only the parse and the loader used, and makes a
+    /// table that `freeze_file_store` did not make or that no longer fits
+    /// the slots.
+    fn publish(&mut self, file: usize) {
+        if !self.frozen {
+            // PORT: a store whose parse did not finish (a parse panic).
+            self.end_parse();
+        }
+        self.aliases = FxHashMap::default();
+        self.jsdoc_cache = FxHashMap::default();
+        self.parser_flags = None;
+        if self.root_slot != NIL_SLOT {
+            self.root = handle(file, self.root_slot);
+        }
+        if self.kinds.len() != self.headers.len() {
+            self.kinds = self.headers.iter().map(|h| h.kind).collect();
+        }
+        if self.resolved.len() != self.headers.len() {
+            self.resolved = self.resolved_table(file);
+        }
+    }
+
+    /// About how much work `publish` does, in slots: a fixed part for the
+    /// maps it drops and one per slot of each table it still makes.
+    fn publish_work(&self) -> usize {
+        let slots = self.headers.len();
+        let mut work = PUBLISH_WORK_PER_STORE;
+        if self.kinds.len() != slots {
+            work += slots;
+        }
+        if self.resolved.len() != slots {
+            work += slots;
+        }
+        work
+    }
+}
+
+/// `FileStore::publish_work` of one store without tables to make: about
+/// the cost of its map drops, in slots.
+const PUBLISH_WORK_PER_STORE: usize = 32;
+/// `publish_stores` uses scoped threads from this much work on. Below it
+/// the thread starts cost more than they save.
+const PARALLEL_PUBLISH_WORK: usize = 1 << 17;
+/// Threads for `publish_stores`, the calling thread included.
+const PUBLISH_THREADS: usize = 4;
+
+/// `FileStore::publish` for every store; store `i` has id `base + i`.
+// PERF: effect R2-13. The stores are independent, so a large program is
+// split into `PUBLISH_THREADS` runs of about equal work, one per scoped
+// thread. The result does not depend on the split.
+fn publish_stores(stores: &mut [FileStore], base: usize) {
+    let total: usize = stores.iter().map(FileStore::publish_work).sum();
+    if total < PARALLEL_PUBLISH_WORK {
+        publish_run(stores, base);
+        return;
+    }
+    let share = total.div_ceil(PUBLISH_THREADS);
+    std::thread::scope(|scope| {
+        let mut rest = stores;
+        let mut first = base;
+        for _ in 1..PUBLISH_THREADS {
+            if rest.is_empty() {
+                break;
+            }
+            let mut end = 0;
+            let mut work = 0;
+            while end < rest.len() && work < share {
+                work += rest[end].publish_work();
+                end += 1;
+            }
+            let (run, tail) = std::mem::take(&mut rest).split_at_mut(end);
+            scope.spawn(move || publish_run(run, first));
+            first += end;
+            rest = tail;
+        }
+        publish_run(rest, first);
     });
 }
 
+/// `FileStore::publish` for `stores`, whose first store has id `first`.
+fn publish_run(stores: &mut [FileStore], first: usize) {
+    for (i, store) in stores.iter_mut().enumerate() {
+        store.publish(first + i);
+    }
+}
+
+/// True when the parse of store file `file` is over: the file is published
+/// or `freeze_file_store` ran.
 #[must_use]
 pub fn is_file_store_frozen(file: usize) -> bool {
-    frozen().is_some() || with_store(file, |s| s.frozen)
+    is_published(file) || with_store(file, |s| s.frozen)
 }
 
 /// Number of slots (nil, alias and node slots). Per-node vectors that are
@@ -491,7 +909,7 @@ pub fn file_store_slot_count(file: usize) -> usize {
 #[must_use]
 pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
     let computed = |s: &FileStore| s.headers.iter().map(|h| h.flags).collect();
-    if frozen().is_some() {
+    if is_published(file) {
         return with_store(file, computed);
     }
     with_store_mut(file, |s| {
@@ -499,51 +917,84 @@ pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
     })
 }
 
-/// Moves every store of this thread into the process-wide read-only slice.
-/// `core::set_prog` calls this once, when the program is installed. After
-/// this, store writes and new stores panic.
-// PORT: Go needs no freeze; its nodes are heap objects. The freeze also
+/// Publishes the build stores of this thread: `go_files[i]` is the
+/// `GoFile` of id `unpublished_file_ids().start + i`. The legacy loader has
+/// no stores and passes its files. The loader calls this once per program,
+/// before `core::set_prog`. The stores are then read-only, and any thread
+/// can read them. The first publish is tier 0; later ones go to tier 1. An
+/// empty later publish does nothing.
+// PORT: Go needs no publish; its nodes are heap objects. The publish also
 // computes `NodeHeader::source_file_is_root` for `get_source_file_of_node`.
-pub fn freeze_file_stores() {
-    let mut stores = BUILD.with(|s| std::mem::take(&mut *s.borrow_mut()));
-    for (file, store) in stores.iter_mut().enumerate() {
-        if !store.frozen {
-            // PORT: a store whose parse did not finish (a parse panic).
-            store.frozen = true;
-            store.headers.shrink_to_fit();
-            store.nodes.shrink_to_fit();
-            mark_source_file_roots(store);
-        }
-        store.aliases = FxHashMap::default();
-        store.jsdoc_cache = FxHashMap::default();
-        store.parser_flags = None;
-        if store.root_slot != NIL_SLOT {
-            store.root = handle(file, store.root_slot);
+pub fn publish_file_stores(go_files: Vec<GoFile>) {
+    // The cells stay leaked and empty. Nothing reads them after this.
+    ACTIVE.set(None);
+    let BuildStores {
+        base,
+        stores: cells,
+    } = BUILD.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let base = if cells.is_empty() {
+        PUBLISHED.load(Ordering::Acquire)
+    } else {
+        base
+    };
+    let legacy = cells.is_empty() && !go_files.is_empty();
+    assert!(
+        legacy || go_files.len() == cells.len(),
+        "a publish needs one GoFile per store ({} stores, {} GoFiles)",
+        cells.len(),
+        go_files.len()
+    );
+    let tier0 = FROZEN.get();
+    if let Some(tier0) = tier0 {
+        assert!(
+            !tier0.legacy && !legacy,
+            "a legacy program must be the only publish; file ids would collide with store ids"
+        );
+        if go_files.is_empty() {
+            return;
         }
     }
+    let count = cells.len().max(go_files.len());
+    assert!(base + count <= TIER1_LIMIT, "too many file ids");
+    if let Err(published) =
+        PUBLISHED.compare_exchange(base, base + count, Ordering::AcqRel, Ordering::Acquire)
+    {
+        panic!(
+            "another thread published file ids while this thread built ids {base}.. (now {published})"
+        );
+    }
+    let mut stores: Vec<FileStore> = cells.iter().map(|cell| cell.take()).collect();
+    publish_stores(&mut stores, base);
     let stores: &'static [FileStore] = Box::leak(stores.into_boxed_slice());
+    // PERF: query Q7. The per-store tables are made already, so this only
+    // collects slices.
     let frozen = Frozen {
+        base,
         stores,
         headers: stores.iter().map(|s| &s.headers[..]).collect(),
         nodes: stores.iter().map(|s| &s.nodes[..]).collect(),
-        kinds: stores
-            .iter()
-            .map(|s| s.headers.iter().map(|h| h.kind).collect())
-            .collect(),
-        resolved: stores
-            .iter()
-            .enumerate()
-            .map(|(file, s)| {
-                (0..s.headers.len())
-                    .map(|i| resolve_slot(file, i, &s.nodes, &s.headers))
-                    .collect()
-            })
-            .collect(),
+        kinds: stores.iter().map(|s| &s.kinds[..]).collect(),
+        resolved: stores.iter().map(|s| &s.resolved[..]).collect(),
+        go_files: go_files.into_boxed_slice(),
+        legacy,
     };
-    assert!(
-        FROZEN.set(frozen).is_ok(),
-        "node stores are already frozen; one process installs one program"
-    );
+    if tier0.is_none() {
+        assert_eq!(base, 0, "the first publish must start at file id 0");
+        assert!(
+            FROZEN.set(frozen).is_ok(),
+            "another thread made the first publish"
+        );
+        return;
+    }
+    let frozen: &'static Frozen = Box::leak(Box::new(frozen));
+    for file in base..base + count {
+        let chunk = LATER[file / LATER_CHUNK]
+            .get_or_init(|| Box::new([const { OnceLock::new() }; LATER_CHUNK]));
+        assert!(
+            chunk[file % LATER_CHUNK].set(frozen).is_ok(),
+            "file {file} is already published"
+        );
+    }
 }
 
 /// Sets `store.root_slot` and `NodeHeader::source_file_is_root` of each node
@@ -627,7 +1078,9 @@ pub fn resolve_store_id(file: usize, id: ts_ast::NodeId) -> Node {
         // The nil slot or an alias slot: the target is in the header.
         None => s.headers[index].parent,
     };
-    if let Some(f) = FROZEN.get() {
+    if let Some(f) = FROZEN.get()
+        && file < f.nodes.len()
+    {
         return match f.nodes[file][index] {
             Some(_) => handle(file, index as u32),
             None => f.headers[file][index].parent,
@@ -642,7 +1095,9 @@ pub fn resolve_store_id(file: usize, id: ts_ast::NodeId) -> Node {
 pub fn store_ast_node(n: Node) -> &'static ts_ast::Node {
     let get =
         |s: &FileStore| s.nodes[slot_index(n)].expect("store handle does not name a node slot");
-    if let Some(f) = FROZEN.get() {
+    if let Some(f) = FROZEN.get()
+        && n.file_index() < f.nodes.len()
+    {
         return f.nodes[n.file_index()][slot_index(n)]
             .expect("store handle does not name a node slot");
     }
@@ -661,7 +1116,9 @@ pub fn store_header(n: Node) -> NodeHeader {
         );
         s.headers[index].read(n.file_index())
     };
-    if let Some(f) = FROZEN.get() {
+    if let Some(f) = FROZEN.get()
+        && n.file_index() < f.headers.len()
+    {
         let (file, index) = (n.file_index(), slot_index(n));
         debug_assert!(
             f.nodes[file][index].is_some(),
@@ -673,34 +1130,53 @@ pub fn store_header(n: Node) -> NodeHeader {
 }
 
 /// The header of `n` when it is a store node (kind, parser flags, parent,
-/// loc): one table lookup after freeze, one thread-local access before.
-/// `None` for nil, synthetic and legacy nodes. With it a node read needs no
+/// loc): one thread-local load for the active store, one table lookup in
+/// tier 0, one more thread-local access before the first publish. `None`
+/// for nil, synthetic and legacy nodes. With it a node read needs no
 /// separate `has_file_store` call.
+// PERF: query Q8. The active store is checked first and inline; every
+// other case is out of line.
 #[inline]
 #[must_use]
 pub fn try_store_header(n: Node) -> Option<NodeHeader> {
     if n.is_nil() {
         return None;
     }
-    let (file, index) = (n.file_index(), slot_index(n));
-    if let Some(f) = FROZEN.get() {
-        return f.headers.get(file).map(|headers| headers[index].read(file));
+    match active_store_header(n) {
+        Some(header) => Some(header),
+        None => try_store_header_slow(n.file_index(), slot_index(n)),
     }
-    if is_detached_id(file) {
-        return DETACHED.with(|d| match &*d.borrow() {
-            Some((id, store)) if *id == file => Some(store.headers[index].read(file)),
-            _ => None,
-        });
-    }
-    BUILD.with(|s| {
-        s.borrow()
-            .get(file)
-            .map(|store| store.headers[index].read(file))
-    })
 }
 
-/// Go `node.Kind` of a store node after freeze. `None` before freeze and
-/// for nil, synthetic and legacy nodes.
+/// `try_store_header` for a node that is not in the active store.
+#[inline(never)]
+fn try_store_header_slow(file: usize, index: usize) -> Option<NodeHeader> {
+    let read = |s: &FileStore| s.headers[index].read(file);
+    match FROZEN.get() {
+        Some(f) => match f.headers.get(file) {
+            Some(headers) => Some(headers[index].read(file)),
+            None => after_tier0_miss(f, file, read),
+        },
+        None => inactive_build_store(file).map(|store| read(&store.borrow())),
+    }
+}
+
+/// The header of `n` when `n` is a node of the active store of this thread
+/// (see `ACTIVE`): the parse fast path of the node reads. That store is not
+/// published. `None` for any other node.
+#[inline]
+#[must_use]
+pub fn active_store_header(n: Node) -> Option<NodeHeader> {
+    if n.is_nil() {
+        return None;
+    }
+    let file = n.file_index();
+    let store = active_store(file)?;
+    Some(store.borrow().headers[slot_index(n)].read(file))
+}
+
+/// Go `node.Kind` of a tier 0 store node. `None` for any other node: nil,
+/// synthetic, legacy, tier 1 and unpublished store nodes.
 #[inline]
 #[must_use]
 pub fn frozen_store_kind(n: Node) -> Option<SyntaxKind> {
@@ -711,8 +1187,8 @@ pub fn frozen_store_kind(n: Node) -> Option<SyntaxKind> {
     Some(kinds[slot_index(n)])
 }
 
-/// The header of a store node after freeze, by reference, so a read of one
-/// field does not copy the whole header. The parent is still in its stored
+/// The header of a tier 0 store node, by reference, so a read of one field
+/// does not copy the whole header. The parent is still in its stored
 /// form (see `LOCAL_STORE`). `None` as for `frozen_store_kind`.
 #[inline]
 fn frozen_header(n: Node) -> Option<&'static NodeHeader> {
@@ -723,30 +1199,30 @@ fn frozen_header(n: Node) -> Option<&'static NodeHeader> {
     Some(&headers[slot_index(n)])
 }
 
-/// Parser `node.Flags` of a store node after freeze (see `frozen_header`).
+/// Parser `node.Flags` of a tier 0 store node (see `frozen_header`).
 #[inline]
 #[must_use]
 pub fn frozen_store_flags(n: Node) -> Option<NodeFlags> {
     frozen_header(n).map(|h| h.flags)
 }
 
-/// Go `node.Loc` of a store node after freeze (see `frozen_header`).
+/// Go `node.Loc` of a tier 0 store node (see `frozen_header`).
 #[inline]
 #[must_use]
 pub fn frozen_store_loc(n: Node) -> Option<TextRange> {
     frozen_header(n).map(|h| h.loc)
 }
 
-/// Go `node.Parent` of a store node after freeze (see `frozen_header`).
+/// Go `node.Parent` of a tier 0 store node (see `frozen_header`).
 #[inline]
 #[must_use]
 pub fn frozen_store_parent(n: Node) -> Option<Node> {
     frozen_header(n).map(|h| h.read(n.file_index()).parent)
 }
 
-/// The ts_ast node of a store node after freeze: the inlined fast path of
-/// `ast_node_of`. `None` before freeze and for nil, synthetic and legacy
-/// nodes. Panics like `try_store_ast_node` on a nil or alias slot.
+/// The ts_ast node of a tier 0 store node: the inlined fast path of
+/// `ast_node_of`. `None` as for `frozen_store_kind`. Panics like
+/// `try_store_ast_node` on a nil or alias slot.
 #[inline]
 #[must_use]
 pub fn frozen_store_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
@@ -766,18 +1242,30 @@ pub fn try_store_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
         return None;
     }
     let (file, index) = (n.file_index(), slot_index(n));
-    let node =
-        |slot: Option<&'static ts_ast::Node>| slot.expect("store handle does not name a node slot");
-    if let Some(f) = FROZEN.get() {
-        return f.nodes.get(file).map(|nodes| node(nodes[index]));
+    // PERF: query Q8, see `ACTIVE`.
+    if let Some(store) = active_store(file) {
+        return Some(slot_node(store.borrow().nodes[index]));
     }
-    if is_detached_id(file) {
-        return DETACHED.with(|d| match &*d.borrow() {
-            Some((id, store)) if *id == file => Some(node(store.nodes[index])),
-            _ => None,
-        });
+    try_store_ast_node_slow(file, index)
+}
+
+/// `try_store_ast_node` for a node that is not in the active store.
+#[inline(never)]
+fn try_store_ast_node_slow(file: usize, index: usize) -> Option<&'static ts_ast::Node> {
+    let read = |s: &FileStore| slot_node(s.nodes[index]);
+    match FROZEN.get() {
+        Some(f) => match f.nodes.get(file) {
+            Some(nodes) => Some(slot_node(nodes[index])),
+            None => after_tier0_miss(f, file, read),
+        },
+        None => inactive_build_store(file).map(|store| read(&store.borrow())),
     }
-    BUILD.with(|s| s.borrow().get(file).map(|store| node(store.nodes[index])))
+}
+
+/// The ts_ast node of a node slot. Panics on the nil slot and alias slots.
+#[inline]
+fn slot_node(slot: Option<&'static ts_ast::Node>) -> &'static ts_ast::Node {
+    slot.expect("store handle does not name a node slot")
 }
 
 /// `resolve_store_id(file, id)` when `file` has a store, in one lookup (see
@@ -786,23 +1274,25 @@ pub fn try_store_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
 #[must_use]
 pub fn try_resolve_store_id(file: usize, id: ts_ast::NodeId) -> Option<Node> {
     let index = id.index();
-    let resolve = |nodes: &[Option<&'static ts_ast::Node>], headers: &[NodeHeader]| {
-        Some(resolve_slot(file, index, nodes, headers))
-    };
-    if let Some(f) = FROZEN.get() {
-        return f.resolved.get(file).map(|resolved| resolved[index]);
+    // PERF: query Q8, see `ACTIVE`.
+    if let Some(store) = active_store(file) {
+        let s = store.borrow();
+        return Some(resolve_slot(file, index, &s.nodes, &s.headers));
     }
-    if is_detached_id(file) {
-        return DETACHED.with(|d| match &*d.borrow() {
-            Some((id, store)) if *id == file => resolve(&store.nodes, &store.headers),
-            _ => None,
-        });
+    try_resolve_store_id_slow(file, index)
+}
+
+/// `try_resolve_store_id` for a file that is not the active store.
+#[inline(never)]
+fn try_resolve_store_id_slow(file: usize, index: usize) -> Option<Node> {
+    let resolve = |s: &FileStore| resolve_slot(file, index, &s.nodes, &s.headers);
+    match FROZEN.get() {
+        Some(f) => match f.resolved.get(file) {
+            Some(resolved) => Some(resolved[index]),
+            None => after_tier0_miss(f, file, resolve),
+        },
+        None => inactive_build_store(file).map(|store| resolve(&store.borrow())),
     }
-    BUILD.with(|s| {
-        s.borrow()
-            .get(file)
-            .and_then(|store| resolve(&store.nodes, &store.headers))
-    })
 }
 
 /// The node for slot `index` of store `file`: the slot itself when it holds
@@ -819,27 +1309,30 @@ fn resolve_slot(
     }
 }
 
-/// `try_resolve_store_id(file, _)` for every slot of store `file`, indexed
-/// by `NodeId::index()`. `None` before freeze and for a file without a
-/// store.
+/// `try_resolve_store_id(file, _)` for every slot of tier 0 store `file`,
+/// indexed by `NodeId::index()`. `None` for any other file.
 #[inline]
 #[must_use]
 pub fn frozen_resolved(file: usize) -> Option<&'static [Node]> {
-    Some(&FROZEN.get()?.resolved.get(file)?[..])
+    FROZEN.get()?.resolved.get(file).copied()
 }
 
-/// Go `SourceFile.ECMALineMap()` of store file `file` after freeze. It is
-/// computed once and shared by every thread. `None` before freeze or for a
-/// file without a store.
+/// Go `SourceFile.ECMALineMap()` of published store file `file`. It is
+/// computed once and shared by every thread. `None` for an unpublished
+/// store or a file without a store.
 #[must_use]
 pub fn frozen_file_ecma_line_starts(file: usize) -> Option<&'static [i32]> {
-    let store = frozen()?.get(file)?;
+    let tier0 = FROZEN.get()?;
+    let store = match tier0.stores.get(file) {
+        Some(store) => store,
+        None => later_store(tier0, file)?,
+    };
     Some(store.ecma_line_starts.get_or_init(|| {
         crate::scanner_util::compute_ecma_line_starts(store.text).into_boxed_slice()
     }))
 }
 
-/// Go `GetSourceFileOfNode(n)` in O(1), when `n` is a frozen store node
+/// Go `GetSourceFileOfNode(n)` in O(1), when `n` is a published store node
 /// whose parent walk ends at its store root. `None` means "walk".
 #[inline]
 #[must_use]
@@ -849,7 +1342,13 @@ pub fn frozen_source_file_of_node(n: Node) -> Option<Node> {
     }
     let f = FROZEN.get()?;
     let file = n.file_index();
-    f.headers.get(file)?[slot_index(n)]
+    let Some(headers) = f.headers.get(file) else {
+        let store = later_store(f, file)?;
+        return store.headers[slot_index(n)]
+            .source_file_is_root
+            .then_some(store.root);
+    };
+    headers[slot_index(n)]
         .source_file_is_root
         .then(|| f.stores[file].root)
 }
@@ -858,40 +1357,52 @@ pub fn frozen_source_file_of_node(n: Node) -> Option<Node> {
 // Go field writes during the parse
 // ──────────────────────────────────────────────────────────────────────
 
-/// Runs `f` on the header of `n` when `n` is a node slot of a store of this
-/// thread (built or detached), with one thread-local access. False when
-/// `n` is not a store node of this thread (for example a synthetic node).
-/// Panics on a finished store, like `with_slot_mut`.
+/// Runs `f` on the header of `n` when `n` is a node slot of an unpublished
+/// store of this thread (built or detached), with one thread-local access.
+/// False when `n` is not such a node (for example a synthetic or a
+/// published node). Panics on a finished store, like `with_slot_mut`.
 fn try_with_build_header(n: Node, f: impl FnOnce(&mut NodeHeader)) -> bool {
-    if n.is_nil() || FROZEN.get().is_some() {
+    if n.is_nil() {
         return false;
     }
     let file = n.file_index();
-    let write = |s: &mut FileStore| {
-        assert!(!s.frozen, "cannot mutate a node of a finished file");
-        let index = slot_index(n);
-        assert!(
-            s.nodes[index].is_some(),
-            "store handle does not name a node slot"
-        );
-        f(&mut s.headers[index]);
-    };
-    if is_detached_id(file) {
-        return DETACHED.with(|d| match &mut *d.borrow_mut() {
-            Some((id, store)) if *id == file => {
-                write(store);
-                true
-            }
-            _ => false,
-        });
+    // A tier 0 node or a synthetic node leaves here, inline: one load and
+    // two compares, as the one-program `FROZEN` check. The active store is
+    // never in tier 0 (its id is at least the published count).
+    if let Some(tier0) = FROZEN.get()
+        && (file < tier0.headers.len() || is_storeless_id(file) || tier0.legacy)
+    {
+        return false;
     }
-    BUILD.with(|s| match s.borrow_mut().get_mut(file) {
-        Some(store) => {
-            write(store);
-            true
-        }
-        None => false,
-    })
+    // PERF: query Q8. The parse writes the active store, which is never
+    // published (see `ACTIVE`).
+    let store = match active_store(file) {
+        Some(store) => store,
+        None => match inactive_thread_store(file) {
+            Some(store) => store,
+            None => return false,
+        },
+    };
+    let mut s = store.borrow_mut();
+    assert!(!s.frozen, "cannot mutate a node of a finished file");
+    let index = slot_index(n);
+    assert!(
+        s.nodes[index].is_some(),
+        "store handle does not name a node slot"
+    );
+    f(&mut s.headers[index]);
+    true
+}
+
+/// `try_with_build_header` for a file that is not in tier 0 and not the
+/// active store: `None` for a tier 1 file (published), else the detached
+/// store, then the build stores of this thread.
+#[inline(never)]
+fn inactive_thread_store(file: usize) -> Option<StoreCell> {
+    if FROZEN.get().is_some() && later(file).is_some() {
+        return None;
+    }
+    inactive_build_store(file)
 }
 
 /// Go `finishNode` writes `node.Loc = loc` and `node.Flags |= flags` on a
@@ -946,16 +1457,42 @@ pub fn replace_store_node_data(n: Node, data: NodeData) {
 // ──────────────────────────────────────────────────────────────────────
 
 thread_local! {
+    /// The size of the first chunk of this thread's AST arena
+    /// (`set_ast_arena_start`).
+    static AST_ARENA_START: Cell<usize> = const { Cell::new(1 << 20) };
+    /// Set when this thread made its AST arena.
+    static AST_ARENA_MADE: Cell<bool> = const { Cell::new(false) };
     /// AST nodes and lists live for the whole process. One leaked bump
     /// arena per thread holds them, so each node costs a pointer bump, not
     /// a malloc. The arena never drops, like the `Box::leak` it replaces.
-    static AST_ARENA: &'static bumpalo::Bump =
-        Box::leak(Box::new(bumpalo::Bump::with_capacity(1 << 20)));
+    static AST_ARENA: &'static bumpalo::Bump = {
+        AST_ARENA_MADE.set(true);
+        Box::leak(Box::new(bumpalo::Bump::with_capacity(AST_ARENA_START.get())))
+    };
 }
 
 /// Moves `value` into this thread's leaked AST arena.
 pub(crate) fn leak_in_ast_arena<T>(value: T) -> &'static T {
     AST_ARENA.with(|arena| &*arena.alloc(value))
+}
+
+/// Sets the size of the first chunk of this thread's AST arena (1 MiB by
+/// default). Later chunks double in size. Call it before the thread makes
+/// its first node. A released program leaks the arenas of its checker
+/// workers, and the part of a chunk that no node uses leaks with them, so
+/// the workers of a later program version size the chunk from what the
+/// workers of a released one used (`program.rs` `worker_arena_start`).
+pub(crate) fn set_ast_arena_start(bytes: usize) {
+    AST_ARENA_START.set(bytes);
+}
+
+/// The bytes that the nodes of this thread's AST arena use, or 0 when the
+/// thread made no arena (asking does not make one).
+pub(crate) fn ast_arena_used() -> usize {
+    if !AST_ARENA_MADE.get() {
+        return 0;
+    }
+    AST_ARENA.with(|arena| arena.allocated_bytes() - arena.chunk_capacity())
 }
 
 /// A leaked ts_ast node. Only kind and data are read for store and

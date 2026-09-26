@@ -26,7 +26,8 @@ pub type ExportCollisionTable = IndexMap<String, ExportCollision>;
 // PORT: state captured by the Go `visit` closure in `getExportsOfModuleWorker`.
 struct ExportsOfModuleVisitState {
     visited_symbols: Vec<SymbolId>,
-    non_type_only_names: FxHashSet<String>,
+    // PERF: interned names, so collecting them copies no text.
+    non_type_only_names: FxHashSet<Name>,
     // PORT: Go nil map is an empty map; Go only reads it with lookups.
     type_only_export_star_map: FxHashMap<String, Node>,
 }
@@ -596,7 +597,7 @@ impl Checker {
             }
         }
         for name in &state.non_type_only_names {
-            state.type_only_export_star_map.remove(name);
+            state.type_only_export_star_map.remove(name.as_str());
         }
         (exports, state.type_only_export_star_map)
     }
@@ -618,7 +619,7 @@ impl Checker {
             // because we might have visited it via an 'export type *', and visiting
             // again with 'export *' will override the type-onlyness of its exports.
             for (name, _) in self.symbols.entries(self.sym(symbol).exports) {
-                state.non_type_only_names.insert(name.to_string());
+                state.non_type_only_names.insert(name);
             }
         }
         if symbol.is_nil()

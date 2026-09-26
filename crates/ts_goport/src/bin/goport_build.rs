@@ -3,7 +3,10 @@
 //! - `goport_build -b [projects...] [options]` (also `--b`, `-build`,
 //!   `--build`): Go `execute.CommandLine` with a build flag, which is
 //!   `tscBuildCompilation` (execute/tsc.go:90). The exit code is the Go
-//!   exit status.
+//!   exit status. With `--watch` the run builds, then stays in the watch
+//!   loop (Go `WatchManager.RunLoop`) until the process is killed: there is
+//!   no signal handling (plan D-W3), so the loop never ends by itself.
+//!   Output goes to stdout as it is written.
 //! - `goport_build --build-worker <config> [the -b command line...]`: the
 //!   build worker (plan D1). It compiles and emits one project the way the
 //!   Go build task does and prints one JSON result line (see
@@ -32,8 +35,11 @@ use ts_goport::execute::build::worker::{
     marshal_worker_program_fs_cache, read_worker_fs_cache,
 };
 use ts_goport::execute::execute_tsc::tsc_build_compilation;
-use ts_goport::execute::tsc::compile::{EXIT_UNPORTED, ExitStatus, System, new_os_system};
+use ts_goport::execute::tsc::compile::{
+    EXIT_UNPORTED, ExitStatus, System, new_os_system, write_go_output,
+};
 use ts_goport::frontend::vfs::CachedFsState;
+use ts_goport::gostd::context;
 use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
@@ -69,11 +75,13 @@ fn run(args: &[String]) -> i32 {
         Ok(sys) => sys,
         Err(status) => return status.code(),
     };
-    let sys: Rc<dyn System> = Rc::new(sys);
 
     if args.first().map(String::as_str) == Some(BUILD_WORKER_FLAG) {
+        let sys: Rc<dyn System> = Rc::new(sys);
         return run_worker(&sys, &args[1..]);
     }
+
+    let sys: Rc<dyn System> = Rc::new(sys.with_writer(Rc::new(RefCell::new(StreamingStdout))));
 
     // Go: execute/tsc.go:52 CommandLine
     let is_build = args.first().is_some_and(|arg| {
@@ -88,7 +96,9 @@ fn run(args: &[String]) -> i32 {
     }
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        tsc_build_compilation(sys.clone(), args)
+        // Go: cmd/tsgo/main.go:31 `signal.NotifyContext(context.Background(), ...)`.
+        // PORT: no signal handling (plan D-W3), so the context never ends.
+        tsc_build_compilation(&context::background(), sys.clone(), args)
     }));
     let _ = sys.writer().borrow_mut().flush();
     let code = match result {
@@ -100,6 +110,26 @@ fn run(args: &[String]) -> i32 {
         }
     };
     finish(code)
+}
+
+/// Go `os.Stdout` is not buffered: each `fmt.Fprint` reaches the terminal
+/// or pipe at once. Rust stdout keeps a partial line until the next
+/// newline, so this writer flushes after each write. A `-b --watch` run
+/// stays in the watch loop and prints as it goes. The bytes are the Go
+/// bytes of the output, as `GoOutput` (the `new_os_system` writer) writes.
+struct StreamingStdout;
+
+impl Write for StreamingStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut stdout = std::io::stdout().lock();
+        write_go_output(&mut stdout, buf)?;
+        stdout.flush()?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stdout().flush()
+    }
 }
 
 /// `--build-worker <config> [command line...]`

@@ -2,6 +2,8 @@
 //! Read `crates/ts_goport/PORTING.md` before editing.
 
 use crate::prelude::*;
+use smallvec::SmallVec;
+use std::borrow::Cow;
 use ts_jsnum::Number;
 
 impl Checker {
@@ -239,56 +241,63 @@ impl Checker {
         if types.contains(&self.wildcard_type) {
             return self.wildcard_type;
         }
-        let mut new_types: Vec<TypeId> = Vec::new();
-        let mut new_texts: Vec<String> = Vec::new();
-        let mut sb = String::new();
-        sb.push_str(&texts[0]);
+        // PERF: Go keeps `sb` and a `newTexts` slice of strings. Here all new
+        // texts sit back to back in `buf`, and text `k` ends at `ends[k]`.
+        // `sb` is the tail of `buf` after the last end. Literal values are
+        // written straight into `buf`, and owned texts are made only for a
+        // new type. The texts, the key and the created type are the same.
+        let mut new_types: SmallVec<[TypeId; 4]> = SmallVec::new();
+        let mut ends: SmallVec<[usize; 5]> = SmallVec::new();
+        let mut buf = String::new();
+        buf.push_str(&texts[0]);
         // PORT: Go uses a recursive closure `addSpans` that captures `sb`,
         // `newTypes` and `newTexts`. Here the captured state is passed explicitly.
         fn add_spans(
             c: &mut Checker,
             texts: &[String],
             types: &[TypeId],
-            sb: &mut String,
-            new_types: &mut Vec<TypeId>,
-            new_texts: &mut Vec<String>,
+            buf: &mut String,
+            ends: &mut SmallVec<[usize; 5]>,
+            new_types: &mut SmallVec<[TypeId; 4]>,
         ) -> bool {
             for (i, &t) in types.iter().enumerate() {
                 let flags = c.ty(t).flags;
                 if flags.intersects(TypeFlags::LITERAL | TypeFlags::NULL | TypeFlags::UNDEFINED) {
-                    let s = c.get_template_string_for_type(t);
-                    sb.push_str(&s);
-                    sb.push_str(&texts[i + 1]);
+                    c.get_template_string_for_type(t, buf);
+                    buf.push_str(&texts[i + 1]);
                 } else if flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
-                    let inner_texts = c.ty(t).as_template_literal_type().texts.clone();
-                    let inner_types = c.ty(t).as_template_literal_type().types.clone();
-                    sb.push_str(&inner_texts[0]);
-                    if !add_spans(c, &inner_texts, &inner_types, sb, new_types, new_texts) {
+                    let (inner_texts, inner_types) = {
+                        let tl = c.ty(t).as_template_literal_type();
+                        (tl.texts.clone(), tl.types.clone())
+                    };
+                    buf.push_str(&inner_texts[0]);
+                    if !add_spans(c, &inner_texts, &inner_types, buf, ends, new_types) {
                         return false;
                     }
-                    sb.push_str(&texts[i + 1]);
+                    buf.push_str(&texts[i + 1]);
                 } else if c.is_generic_index_type(t) || c.is_pattern_literal_placeholder_type(t) {
                     new_types.push(t);
-                    new_texts.push(combine_surrogate_pairs(&go_value(sb)));
-                    sb.clear();
-                    sb.push_str(&texts[i + 1]);
+                    end_template_text(buf, ends);
+                    buf.push_str(&texts[i + 1]);
                 } else {
                     return false;
                 }
             }
             true
         }
-        if !add_spans(self, texts, types, &mut sb, &mut new_types, &mut new_texts) {
+        if !add_spans(self, texts, types, &mut buf, &mut ends, &mut new_types) {
             return self.string_type;
         }
         // PORT: Go joins the texts by bytes. `go_value` gives the port form
         // of the joined Go bytes (see `scanner_util::GO_STRING_MARKER`).
         if new_types.is_empty() {
-            let s = combine_surrogate_pairs(&go_value(&sb));
+            let value = go_value(&buf);
+            let s = combine_surrogate_pairs_cow(&value);
             return self.get_string_literal_type(&s);
         }
-        new_texts.push(combine_surrogate_pairs(&go_value(&sb)));
-        if new_texts.iter().all(|t| t.is_empty()) {
+        end_template_text(&mut buf, &mut ends);
+        // Every new text is empty exactly when `buf` is.
+        if buf.is_empty() {
             if new_types
                 .iter()
                 .all(|&t| self.ty(t).flags.intersects(TypeFlags::STRING))
@@ -300,13 +309,23 @@ impl Checker {
                 return new_types[0];
             }
         }
-        let key = get_template_type_key(&new_texts, &new_types);
+        let key = get_template_type_key_of_buffer(&buf, &ends, &new_types);
         let mut t = self
             .template_literal_types
             .get(&key)
             .copied()
             .unwrap_or_default();
         if t.is_nil() {
+            let mut start = 0;
+            let new_texts: Vec<String> = ends
+                .iter()
+                .map(|&end| {
+                    let text = buf[start..end].to_string();
+                    start = end;
+                    text
+                })
+                .collect();
+            debug_assert_eq!(key, get_template_type_key(&new_texts, &new_types));
             t = self.new_template_literal_type(&new_texts, &new_types);
             self.template_literal_types.insert(key, t);
         }
@@ -314,7 +333,10 @@ impl Checker {
     }
 
     // Go: checker/checker.go:28965 getTemplateStringForType
-    pub fn get_template_string_for_type(&self, t: TypeId) -> String {
+    // PORT: appends the string to `out` instead of returning it, so
+    // `get_template_literal_type` writes straight into its buffer. A string
+    // literal is copied as is, which is what `any_to_string` returns for it.
+    pub fn get_template_string_for_type(&self, t: TypeId, out: &mut String) {
         let flags = self.ty(t).flags;
         if flags.intersects(
             TypeFlags::STRING_LITERAL
@@ -329,12 +351,15 @@ impl Checker {
                 .value
                 .as_ref()
                 .expect("literal type without value");
-            return any_to_string(value);
+            match value {
+                LiteralValue::String(s) => out.push_str(s),
+                _ => out.push_str(&any_to_string(value)),
+            }
+            return;
         }
         if flags.intersects(TypeFlags::NULLABLE) {
-            return self.ty(t).as_intrinsic_type().intrinsic_name.clone();
+            out.push_str(&self.ty(t).as_intrinsic_type().intrinsic_name);
         }
-        String::new()
     }
 
     // Go: checker/checker.go:28975 getStringMappingType
@@ -1551,4 +1576,43 @@ impl Checker {
         }
         self.get_type_of_expression(left)
     }
+}
+
+/// Ends the current text of `get_template_literal_type`: the tail of `buf`
+/// after the last end in `ends`. Applies `go_value` and then
+/// `combine_surrogate_pairs` to it in place (a copy only when it has a
+/// sentinel) and records its end.
+fn end_template_text(buf: &mut String, ends: &mut SmallVec<[usize; 5]>) {
+    let start = ends.last().copied().unwrap_or(0);
+    let value = go_value(&buf[start..]);
+    let changed = match combine_surrogate_pairs_cow(&value) {
+        Cow::Owned(combined) => Some(combined),
+        Cow::Borrowed(_) => None,
+    };
+    let changed = changed.or(match value {
+        Cow::Owned(value) => Some(value),
+        Cow::Borrowed(_) => None,
+    });
+    if let Some(text) = changed {
+        buf.truncate(start);
+        buf.push_str(&text);
+    }
+    ends.push(buf.len());
+}
+
+/// `get_template_type_key` for texts kept back to back in `buf`, where text
+/// `k` ends at `ends[k]`. The key hasher reads one byte stream, so one write
+/// of `buf` equals one write per text, and the key is the same.
+fn get_template_type_key_of_buffer(buf: &str, ends: &[usize], types: &[TypeId]) -> CacheHashKey {
+    let mut b = KeyBuilder::default();
+    b.write_types(types);
+    b.write_byte(b'|');
+    let mut start = 0;
+    for &end in ends {
+        b.write_int((end - start) as i32);
+        start = end;
+    }
+    b.write_byte(b'|');
+    b.write_string(buf);
+    b.hash()
 }

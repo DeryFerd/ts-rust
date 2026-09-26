@@ -5,3 +5,5 @@ pub mod build;
 pub mod execute_tsc;
 pub mod incremental;
 pub mod tsc;
+pub mod watcher;
+pub mod watchmanager;

@@ -11,22 +11,29 @@
 //! the port keeps (`core::go_panic`), also in a build worker, ends the run
 //! as in Go: the output so far, `panic: <message>` on stderr and exit 2.
 //!
+//! `--lsp` and `--api` run `cmd::tsgo::lsp::run_lsp` and
+//! `cmd::tsgo::api::run_api` (Go cmd/tsgo/lsp.go and api.go), the entry
+//! points that `goport --lsp` and `goport --api` run too.
+//!
 //! PORT: Go `signal.NotifyContext(ctx, SIGINT, SIGTERM)` is not ported. The
-//! process keeps the default signal behavior. Only watch and build mode
-//! read that context.
+//! process keeps the default signal behavior. The compile gets
+//! `context::background()`, which never ends; only watch and build mode
+//! read it.
 //! PORT: Go `core.ApplyDebugStackLimit` (`TS_GO_DEBUG_STACK_LIMIT`) is a
 //! debug setting and is skipped. The work runs on a thread with a 1 GiB
 //! stack, like the other goport bins.
 //! PORT: Go `osSys` and `newSystem` (cmd/tsgo/sys.go) are ported as
 //! `OsSystem` and `new_os_system` in execute/tsc/compile.rs.
-//! PORT: cmd/tsgo/isprocessalive_*.go (the `--lsp` parent process check)
-//! and `enablevtprocessing_windows.go` (the Windows console) are not ported.
+//! PORT: `enablevtprocessing_windows.go` (the Windows console) is not
+//! ported.
 
 use std::any::Any;
 use std::io::{IsTerminal, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
 
+use ts_goport::cmd::tsgo::api::run_api;
+use ts_goport::cmd::tsgo::lsp::run_lsp;
 use ts_goport::execute::build::worker::{
     BUILD_WORKER_FLAG, compile_and_emit_worker, marshal_worker_compile_result,
     marshal_worker_program_fs_cache, read_worker_fs_cache,
@@ -34,6 +41,7 @@ use ts_goport::execute::build::worker::{
 use ts_goport::execute::execute_tsc::{GoTsc, command_line};
 use ts_goport::execute::tsc::{EXIT_UNPORTED, ExitStatus, System, new_os_system};
 use ts_goport::frontend::vfs::CachedFsState;
+use ts_goport::gostd::context;
 use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
@@ -128,24 +136,14 @@ fn run_main(start: Instant) -> i32 {
     };
     let sys: Rc<dyn System> = Rc::new(sys.with_start(start));
     let result = catch_unwind(AssertUnwindSafe(|| {
-        command_line(sys.clone(), &args, &GoTsc).status.code()
+        command_line(&context::background(), sys.clone(), &args, &GoTsc)
+            .status
+            .code()
     }));
     // `--showConfig` output has no trailing newline, and
     // `std::process::exit` runs no destructors, so flush here.
     let _ = sys.writer().borrow_mut().flush();
     finish(result)
-}
-
-// Go: cmd/tsgo/lsp.go:20 runLSP
-// PORT: the LSP track wires this later.
-fn run_lsp(_args: &[String]) -> i32 {
-    unported!("--lsp")
-}
-
-// Go: cmd/tsgo/api.go:17 runAPI
-// PORT: the API track wires this later.
-fn run_api(_args: &[String]) -> i32 {
-    unported!("--api")
 }
 
 /// The config and `-b` command line of a build worker run, in the shape

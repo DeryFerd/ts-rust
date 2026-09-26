@@ -8,9 +8,9 @@
 //! `goport` and `goport_emit` pass their own `TscCompilationHooks`.
 //! `goport_build` runs `tsc_build_compilation`.
 //!
-//! PORT: Go `ctx` is only used by watch mode and the build orchestrator,
-//! which take none in the port, and Go `testing` is nil outside Go tests,
-//! so both are dropped (see compile.rs).
+//! PORT: Go `ctx` reaches watch mode (execute/watcher.rs) and the build
+//! orchestrator. Go `testing` is nil outside Go tests, so it is dropped
+//! (see compile.rs).
 //!
 //! PORT: the program state is process-wide, so Go `compiler.NewProgram` is
 //! `crate::program::install_new_program`, as in build/worker.rs (see
@@ -39,8 +39,10 @@ use crate::execute::tsc::{
     create_report_error_summary, emit_and_report_statistics, get_trace_with_writer_from_sys,
     print_build_help, print_help, print_version, write_config_file, write_str,
 };
+use crate::execute::watcher::create_watcher;
 use crate::frontend::json::json_marshal_indent_write;
 use crate::frontend::tsoptions::convert_to_ts_config;
+use crate::gostd::Context;
 
 /// The bin part of the compile step of `tscCompilation`.
 // PORT: no Go equivalent. Go has one `tsc`. `tsgo` uses the defaults
@@ -139,6 +141,7 @@ fn stop_tracing(sys: &dyn System) {
 // (see `tsc_build_compilation`). `hooks.build_mode` and
 // `hooks.command_line_parsed` are the bin's steps (not in Go).
 pub fn command_line(
+    ctx: &Context,
     sys: Rc<dyn System>,
     command_line_args: &[String],
     hooks: &dyn TscCompilationHooks,
@@ -149,7 +152,7 @@ pub fn command_line(
                 if !hooks.build_mode() {
                     unported!("tscBuildCompilation");
                 }
-                return tsc_build_compilation(sys, command_line_args);
+                return tsc_build_compilation(ctx, sys, command_line_args);
             }
             // case "-f":
             // 	return fmtMain(sys, commandLineArgs[1], commandLineArgs[1])
@@ -159,7 +162,7 @@ pub fn command_line(
 
     let mut parsed = parse_command_line(command_line_args, &SystemParseConfigHost(&*sys));
     hooks.command_line_parsed(&mut parsed);
-    tsc_compilation(sys, parsed, hooks)
+    tsc_compilation(ctx, sys, parsed, hooks)
 }
 
 // Go: execute/tsc.go:65 fmtMain
@@ -172,6 +175,7 @@ pub fn command_line(
 // `command_line_args` is the full command line (Go `commandLineArgs`),
 // which the build workers get too (build/worker.rs).
 pub fn tsc_build_compilation(
+    ctx: &Context,
     sys: Rc<dyn System>,
     command_line_args: &[String],
 ) -> CommandLineResult {
@@ -209,17 +213,18 @@ pub fn tsc_build_compilation(
         return result(ExitStatus::Success);
     }
 
-    let mut orchestrator = new_orchestrator(OrchestratorOptions {
+    let orchestrator = Box::new(new_orchestrator(OrchestratorOptions {
         sys,
         command: Rc::new(build_command),
         worker: WorkerLauncher::current(command_line_args.to_vec()),
-    });
-    orchestrator.start()
+    }));
+    orchestrator.start(ctx)
 }
 
 // Go: execute/tsc.go:121 tscCompilation
 // PORT: `hooks.prepare_compilation` is the bin's step (not in Go).
 pub fn tsc_compilation(
+    ctx: &Context,
     sys: Rc<dyn System>,
     command_line: ParsedCommandLine,
     hooks: &dyn TscCompilationHooks,
@@ -415,7 +420,7 @@ pub fn tsc_compilation(
         return result(status);
     }
     if config_for_compilation.compiler_options().watch.is_true() {
-        return create_watcher(
+        let mut watcher = create_watcher(
             sys,
             Rc::new(config_for_compilation),
             compiler_options_from_command_line,
@@ -423,6 +428,11 @@ pub fn tsc_compilation(
             report_diagnostic,
             report_error_summary,
         );
+        watcher.start(ctx);
+        return CommandLineResult {
+            status: ExitStatus::Success,
+            watcher: Some(Box::new(watcher)),
+        };
     } else if config_for_compilation.compiler_options().is_incremental() {
         return perform_incremental_compilation(
             &*sys,
@@ -445,23 +455,6 @@ pub fn tsc_compilation(
     )
 }
 
-// Go: execute/tsc.go:233 createWatcher(...) + watcher.start(ctx), and the
-// `CommandLineResult{Status: ExitStatusSuccess, Watcher: watcher}` return.
-// PORT: watch mode (Go execute/watcher.go) belongs to the watch track,
-// which is still porting it. This is the one place it plugs in: that track
-// replaces the body with Go `createWatcher`, `watcher.start` and the
-// result above. The parameters are Go's, without `testing`.
-fn create_watcher(
-    sys: Rc<dyn System>,
-    config_parse_result: Rc<ParsedCommandLine>,
-    compiler_options_from_command_line: Rc<CompilerOptions>,
-    command_line_raw: Option<IndexMap<String, CompilerOptionsValue>>,
-    report_diagnostic: DiagnosticReporter,
-    report_error_summary: DiagnosticsReporter,
-) -> CommandLineResult {
-    unported!("createWatcher");
-}
-
 // Go: execute/tsc.go:266 findConfigFile
 fn find_config_file(
     search_path: &str,
@@ -482,7 +475,7 @@ fn find_config_file(
 }
 
 // Go: execute/tsc.go:280 getTraceFromSys
-fn get_trace_from_sys(sys: &dyn System, locale: crate::locale::Locale) -> TraceFn {
+pub(crate) fn get_trace_from_sys(sys: &dyn System, locale: crate::locale::Locale) -> TraceFn {
     get_trace_with_writer_from_sys(sys.writer(), locale)
 }
 
@@ -490,16 +483,39 @@ fn get_trace_from_sys(sys: &dyn System, locale: crate::locale::Locale) -> TraceF
 // PORT: the new program is installed for the process (see the module
 // comment). Go `NewProgram` cannot fail; the Rust install fails only when
 // the current directory cannot be read, and that ends the run.
-fn install_program(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) {
-    if let Err(message) = crate::program::install_new_program(ProgramOptions {
+pub(crate) fn install_program(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) {
+    if let Err(message) = crate::program::install_new_program(program_options(host, config)) {
+        panic!("cannot load program: {message}");
+    }
+}
+
+/// Go `compiler.NewProgram(compiler.ProgramOptions{Config, Host})` in a
+/// process that makes a new program for each build (watch mode). The
+/// program is a program version (`program::new_program_version`); it is
+/// not current, and the caller releases it (`program::release_program`).
+pub(crate) fn new_program_version(
+    host: Rc<dyn CompilerHost>,
+    config: Rc<ParsedCommandLine>,
+) -> &'static crate::core::GoProgram {
+    let np: &'static crate::frontend::compiler::NewProgram = {
+        // The frontend parses with no current program, like the first load.
+        let _scope = crate::core::enter_program(None);
+        Box::leak(Box::new(crate::frontend::compiler::new_program(
+            program_options(host, config),
+        )))
+    };
+    crate::program::new_program_version(np, None)
+}
+
+/// The Go `compiler.ProgramOptions` of a tsc program.
+fn program_options(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) -> ProgramOptions {
+    ProgramOptions {
         host,
         config,
         use_source_of_project_reference: false,
         single_threaded: Tristate::Unknown,
         typings_location: String::new(),
         project_name: String::new(),
-    }) {
-        panic!("cannot load program: {message}");
     }
 }
 
@@ -638,7 +654,7 @@ fn show_config(sys: &dyn System, config: &ParsedCommandLine, config_file_name: &
 // calling thread, like `new_task_write_file` in build/worker.rs without the
 // build info tracking. There is no outDir or input guard: tsgo writes next
 // to the sources or into outDir, as Go does.
-fn os_write_file() -> WriteFile {
+pub(crate) fn os_write_file() -> WriteFile {
     Arc::new(
         |file_name: &str, text: &str, _data: &mut WriteFileData| -> Result<(), String> {
             osvfs_fs()

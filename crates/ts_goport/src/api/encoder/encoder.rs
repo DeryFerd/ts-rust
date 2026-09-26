@@ -1,0 +1,1297 @@
+//! Port of Go `api/encoder/encoder.go`: the binary AST encoder.
+//!
+//! PORT notes for the whole file:
+//! - Go `int` byte lengths and offsets are `usize` (they index byte buffers).
+//! - Go `appendUint32s` and the msgpack writers return the grown slice; here
+//!   they append to a `&mut Vec<u8>` in place.
+//! - Go `n := node.AsX()` type assertions are the per-field `Node` accessors,
+//!   which panic on other kinds like the Go assertion.
+//! - Go `sourceFile.Hash`, `ParseOptions()`, `NodeCount` and `TextCount` are
+//!   not on the ts_goport SourceFile node. See `source_file_content_hash` and
+//!   `parsed_source_file_of`.
+
+use crate::api::encoder::prelude::*;
+
+use crate::ast::source_file_ls::{
+    SourceFileDataKey, get_or_compute_source_file_data, new_source_file_data_key,
+};
+use crate::frontend::core_binarysearch::binary_search_unique_func;
+use crate::frontend::parser::{ExternalModuleIndicatorOptions, ParsedSourceFile};
+use std::borrow::Cow;
+use std::cell::OnceCell;
+use std::sync::LazyLock;
+
+// Go: api/encoder/encoder.go:15 init
+// PORT: the Go `init()` guard is a compile-time assertion.
+const _: () = assert!(
+    (SyntaxKind::LAST_UNARY_OPERATOR as u32) <= 0x3f,
+    "KindLastUnaryOperator exceeds the 6-bit commonData capacity (max 63)"
+);
+
+// Go: api/encoder/encoder.go:21 NodeOffsetKind ... NodeSize
+pub const NODE_OFFSET_KIND: usize = 0;
+pub const NODE_OFFSET_POS: usize = 4;
+pub const NODE_OFFSET_END: usize = 8;
+pub const NODE_OFFSET_NEXT: usize = 12;
+pub const NODE_OFFSET_PARENT: usize = 16;
+pub const NODE_OFFSET_DATA: usize = 20;
+pub const NODE_OFFSET_FLAGS: usize = 24;
+/// NodeSize is the number of bytes that represents a single node in the encoded format.
+pub const NODE_SIZE: usize = 28;
+
+// Go: api/encoder/encoder.go:33 NodeDataTypeChildren ...
+pub const NODE_DATA_TYPE_CHILDREN: u32 = 0 << 30;
+pub const NODE_DATA_TYPE_STRING: u32 = 1 << 30;
+pub const NODE_DATA_TYPE_EXTENDED_DATA: u32 = 2 << 30;
+
+// Go: api/encoder/encoder.go:39 NodeDataTypeMask ...
+pub const NODE_DATA_TYPE_MASK: u32 = 0xc0_00_00_00;
+pub const NODE_DATA_CHILD_MASK: u32 = 0x00_00_00_ff;
+pub const NODE_DATA_STRING_INDEX_MASK: u32 = 0x00_ff_ff_ff;
+
+// Go: api/encoder/encoder.go:45 SyntaxKindNodeList
+pub const SYNTAX_KIND_NODE_LIST: u32 = u32::MAX;
+
+// Go: api/encoder/encoder.go:49 HeaderOffsetMetadata ... HeaderSize
+pub const HEADER_OFFSET_METADATA: usize = 0;
+pub const HEADER_OFFSET_HASH_LO0: usize = 4;
+pub const HEADER_OFFSET_HASH_LO1: usize = 8;
+pub const HEADER_OFFSET_HASH_HI0: usize = 12;
+pub const HEADER_OFFSET_HASH_HI1: usize = 16;
+pub const HEADER_OFFSET_PARSE_OPTIONS: usize = 20;
+pub const HEADER_OFFSET_STRING_OFFSETS: usize = 24;
+pub const HEADER_OFFSET_STRING_DATA: usize = 28;
+pub const HEADER_OFFSET_EXTENDED_DATA: usize = 32;
+pub const HEADER_OFFSET_STRUCTURED_DATA: usize = 36;
+pub const HEADER_OFFSET_NODES: usize = 40;
+pub const HEADER_SIZE: usize = 44;
+
+// Go: api/encoder/encoder.go:64 ProtocolVersion
+pub const PROTOCOL_VERSION: u8 = 5;
+
+// Source File Binary Format
+// =========================
+//
+// The following defines a protocol for serializing TypeScript SourceFile objects to a compact binary format. All integer
+// values are little-endian.
+//
+// Overview
+// --------
+//
+// The format comprises seven sections:
+//
+// | Section            | Length             | Description                                                                                     |
+// | ------------------ | ------------------ | ----------------------------------------------------------------------------------------------- |
+// | Header             | 44 bytes           | Contains the content hash, parse options, flags, and byte offsets to the start of each section. |
+// | String offsets     | 8 bytes per string | Pairs of starting byte offsets and ending byte offsets into the **string data** section.        |
+// | String data        | variable           | UTF-8 encoded string data.                                                                      |
+// | Extended node data | variable           | Extra data for some kinds of nodes.                                                             |
+// | Structured data    | variable           | Msgpack-encoded metadata blobs (e.g. file references).                                         |
+// | Nodes              | 28 bytes per node  | Defines the AST structure of the file, with references to strings and extended data.            |
+//
+// Header (44 bytes)
+// -----------------
+//
+// The header contains the following fields:
+//
+// | Byte offset | Type      | Field                                             |
+// | ----------- | --------- | ------------------------------------------------- |
+// | 0           | uint8     | Protocol version                                  |
+// | 1-3         |           | Reserved                                          |
+// | 4-19        | uint128   | Source file content hash (xxh3, LE)               |
+// | 20-23       | uint32    | Parse options (bitmask; bit 0: JSX, bit 1: Force) |
+// | 24-27       | uint32    | Byte offset to string offsets section             |
+// | 28-31       | uint32    | Byte offset to string data section                |
+// | 32-35       | uint32    | Byte offset to extended node data section         |
+// | 36-39       | uint32    | Byte offset to structured data section            |
+// | 40-43       | uint32    | Byte offset to nodes section                      |
+//
+// String offsets (8 bytes per string)
+// -----------------------------------
+//
+// Each string offset entry consists of two 4-byte unsigned integers, representing the start and end byte offsets into the
+// **string data** section.
+//
+// String data (variable)
+// ----------------------
+//
+// The string data section contains UTF-8 encoded string data. In typical cases, the entirety of the string data is the
+// source file text, and individual nodes with string properties reference their positional slice of the file text. In
+// cases where a node's string property is not equal to the slice of file text at its position, the unique string is
+// appended to the string data section after the file text.
+//
+// Extended node data (variable)
+// -----------------------------
+//
+// The extended node data section contains additional data for specific node types. The length and meaning of each entry
+// is defined by the node type.
+//
+// Currently, the only node types that use this section are `TemplateHead`, `TemplateMiddle`, `TemplateTail`, and
+// `SourceFile`. The extended data format for the first three is:
+//
+// | Byte offset | Type   | Field                                            |
+// | ----------- | ------ | ------------------------------------------------ |
+// | 0-4         | uint32 | Index of `text` in the string offsets section    |
+// | 4-8         | uint32 | Index of `rawText` in the string offsets section |
+// | 8-12        | uint32 | Value of `templateFlags`                         |
+//
+// and for `SourceFile` is:
+//
+// | Byte offset | Type   | Field                                                          |
+// | ----------- | ------ | -------------------------------------------------------------- |
+// | 0-4         | uint32 | Index of `text` in the string offsets section                  |
+// | 4-8         | uint32 | Index of `fileName` in the string offsets section              |
+// | 8-12        | uint32 | Index of `path` in the string offsets section                  |
+// | 12-16       | uint32 | Value of `languageVariant`                                    |
+// | 16-20       | uint32 | Value of `scriptKind`                                         |
+// | 20-24       | uint32 | Byte offset of `referencedFiles` in structured data section   |
+// | 24-28       | uint32 | Byte offset of `typeReferenceDirectives` in structured data   |
+// | 28-32       | uint32 | Byte offset of `libReferenceDirectives` in structured data    |
+// | 32-36       | uint32 | Byte offset of `imports` node index array in structured data  |
+// | 36-40       | uint32 | Byte offset of `moduleAugmentations` node index array         |
+// | 40-44       | uint32 | Byte offset of `ambientModuleNames` string array              |
+// | 44-48       | uint32 | Node index of `externalModuleIndicator` (0 = nil)             |
+//
+// Structured data (variable)
+// --------------------------
+//
+// The structured data section contains msgpack-encoded metadata blobs. Each blob is a self-contained
+// msgpack value. File reference arrays use the following tuple format:
+//
+//   [pos: uint, end: uint, fileName: string, resolutionMode: uint, preserve: bool]
+//
+// Node index arrays (imports, moduleAugmentations) are msgpack arrays of uint values, where each
+// value is a node index into the nodes section. String arrays (ambientModuleNames) are msgpack
+// arrays of string values.
+//
+// An offset of 0xFFFFFFFF indicates no data (empty array).
+//
+// Nodes (28 bytes per node)
+// -------------------------
+//
+// The nodes section contains the AST structure of the file. Nodes are represented in a flat array in source order,
+// heavily inspired by https://marvinh.dev/blog/speeding-up-javascript-ecosystem-part-11/. Each node has the following
+// structure:
+//
+// | Byte offset | Type   | Field                      |
+// | ----------- | ------ | -------------------------- |
+// | 0-4         | uint32 | Kind                       |
+// | 4-8         | uint32 | Pos                        |
+// | 8-12        | uint32 | End                        |
+// | 12-16       | uint32 | Node index of next sibling |
+// | 16-20       | uint32 | Node index of parent       |
+// | 20-24       |        | Node data                  |
+// | 24-28       | uint32 | Node flags                 |
+//
+// The first 28 bytes of the nodes section are zeros representing a nil node, such that nodes without a parent or next
+// sibling can unambiuously use `0` for those indices.
+//
+// NodeLists are represented as normal nodes with the special `kind` value `0xff_ff_ff_ff`. They are considered the parent
+// of their contents in the encoded format. A client reconstructing an AST similar to TypeScript's internal representation
+// should instead set the `parent` pointers of a NodeList's children to the NodeList's parent. A NodeList's `data` field
+// is the uint32 length of the list, and does not use one of the data types described below.
+//
+// For node types other than NodeList, the node data field encodes one of the following, determined by the first 2 bits of
+// the field:
+//
+// | Value | Data type | Description                                                                          |
+// | ----- | --------- | ------------------------------------------------------------------------------------ |
+// | 0b00  | Children  | Disambiguates which named properties of the node its children should be assigned to. |
+// | 0b01  | String    | The index of the node's string property in the **string offsets** section.           |
+// | 0b10  | Extended  | The byte offset of the node's extended data into the **extended node data** section. |
+// | 0b11  | Reserved  | Reserved for future use.                                                             |
+//
+// In all node data types, the remaining 6 bits of the first byte are used to encode small values specific to the node
+// type. For most node types, these are individual boolean flags. For unary expressions, all 6 bits encode the operator's
+// SyntaxKind value (e.g., PlusPlusToken=45, TildeToken=54), which fits because KindLastUnaryOperator (54) <= 0x3f (63).
+//
+// | Node type                    | Bits 0-5                              | Notes                          |
+// | ---------------------------- | ------------------------------------- | ------------------------------ |
+// | `ImportSpecifier`            | Bit 0: `isTypeOnly`                   |                                |
+// | `ImportClause`               | Bit 0: `isTypeOnly`, Bit 1: `isDefer` |                                |
+// | `ExportSpecifier`            | Bit 0: `isTypeOnly`                   |                                |
+// | `ImportEqualsDeclaration`    | Bit 0: `isTypeOnly`                   |                                |
+// | `ExportDeclaration`          | Bit 0: `isTypeOnly`                   |                                |
+// | `ImportTypeNode`             | Bit 0: `isTypeOf`                     |                                |
+// | `ExportAssignment`           | Bit 0: `isExportEquals`               |                                |
+// | `Block`                      | Bit 0: `multiline`                    |                                |
+// | `ArrayLiteralExpression`     | Bit 0: `multiline`                    |                                |
+// | `ObjectLiteralExpression`    | Bit 0: `multiline`                    |                                |
+// | `JsxText`                    | Bit 0: `containsOnlyTriviaWhiteSpaces`|                                |
+// | `JSDocTypeLiteral`           | Bit 0: `isArrayType`                  |                                |
+// | `JsDocPropertyTag`           | Bit 0: `isBracketed`, Bit 1: `isNameFirst` |                           |
+// | `JsDocParameterTag`          | Bit 0: `isBracketed`, Bit 1: `isNameFirst` |                           |
+// | `VariableDeclarationList`    | Bit 0: is `let`, Bit 1: is `const`    |                                |
+// | `ImportAttributes`           | Bit 0: `multiline`, Bit 1: is `assert`|                                |
+// | `PrefixUnaryExpression`      | Bits 0-5: operator SyntaxKind         | e.g., `!`, `~`, `++`, `--`    |
+// | `PostfixUnaryExpression`     | Bits 0-5: operator SyntaxKind         | e.g., `++`, `--`               |
+//
+// The remaining 3 bytes of the node data field vary by data type:
+//
+// ### Children (0b00)
+//
+// If a node has fewer children than its type allows, additional data is needed to determine which properties the children
+// correspond to. The last byte of the 4-byte data field is a bitmask representing the child properties of the node type,
+// in visitor order, where `1` indicates that the child at that property is present and `0` indicates that the property is
+// nil. For example, a `MethodDeclaration` has the following child properties:
+//
+// | Property name  | Bit position |
+// | -------------- | ------------ |
+// | modifiers      | 0            |
+// | asteriskToken  | 1            |
+// | name           | 2            |
+// | postfixToken   | 3            |
+// | typeParameters | 4            |
+// | parameters     | 5            |
+// | returnType     | 6            |
+// | body           | 7            |
+//
+// A bitmask with value `0b01100101` would indicate that the next four direct descendants (i.e., node records that have a
+// `parent` set to the node index of the `MethodDeclaration`) of the node are its `modifiers`, `name`, `parameters`, and
+// `body` properties, in that order. The remaining properties are nil. (To reconstruct the node with named properties, the
+// client must consult a static table of each node type's child property names.)
+//
+// The bitmask may be zero for node types that can only have a single child, since no disambiguation is needed.
+// Additionally, the children data type may be used for nodes that can never have children, but do not require other
+// data types.
+//
+// ### String (0b01)
+//
+// The string data type is used for nodes with a single string property. (Currently, the name of that property is always
+// `text`.) The last three bytes of the 4-byte data field form a single 24-bit unsigned integer (i.e.,
+// `uint32(0x00_ff_ff_ff & node.data)`) _N_ that is an index into the **string offsets** section. The *N*th 32-bit
+// unsigned integer in the **string offsets** section is the byte offset of the start of the string in the **string data**
+// section, and the *N+1*th 32-bit unsigned integer is the byte offset of the end of the string in the
+// **string data** section.
+//
+// ### Extended (0b10)
+//
+// The extended data type is used for nodes with properties that don't fit into either the children or string data types.
+// The last three bytes of the 4-byte data field form a single 24-bit unsigned integer (i.e.,
+// `uint32(0x00_ff_ff_ff & node.data)`) _N_ that is a byte offset into the **extended node data** section. The length and
+// meaning of the data at that offset is defined by the node type. See the **Extended node data** section for details on
+// the format of the extended data for specific node types.
+//
+// Encoding Arbitrary Nodes
+// ------------------------
+//
+// The same binary format can be used to encode an arbitrary subtree of a SourceFile, not just a whole SourceFile. When
+// encoding a non-SourceFile node, the format is identical with the following differences:
+//
+// - The content hash fields in the header (bytes 4-19) are zero.
+// - The parse options field in the header (bytes 20-23) is zero.
+// - The root node in the nodes section uses its actual node kind and data encoding (via getNodeData) rather than the
+//   SourceFile-specific extended data format.
+//
+// The string data section contains only the strings referenced by nodes in the subtree, rather than the full source
+// file text. The EncodeNode function provides this entrypoint.
+
+/// Go `xxh3.Uint128`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Uint128 {
+    hi: u64,
+    lo: u64,
+}
+
+/// Go `sourceFile.Hash`.
+// PORT: ts_goport keeps no `SourceFile.Hash` field. The project parse cache
+// sets Go `file.Hash` to `xxh3.HashString128` of the file content, which is
+// the parsed text, so the hash is computed here on demand (the same value).
+fn source_file_content_hash(source_file: Node) -> Uint128 {
+    let h = xxhash_rust::xxh3::xxh3_128(source_file_text(source_file).as_bytes());
+    Uint128 {
+        hi: (h >> 64) as u64,
+        lo: h as u64,
+    }
+}
+
+/// The parsed-file record that holds the Go `SourceFile` fields
+/// `ParseOptions()`, `NodeCount` and `TextCount`, or None.
+// PORT: Go keeps these fields on the SourceFile node. ts_goport keeps them in
+// `ParsedSourceFile`, which the language server programs hold. A factory
+// SourceFile has none.
+fn parsed_source_file_of(source_file: Node) -> Option<Rc<ParsedSourceFile>> {
+    if source_file.is_nil() || is_synthetic_node(source_file) {
+        return None;
+    }
+    crate::program::ls_program::parsed_source_file(source_file)
+}
+
+/// Go `sourceFile.NodeCount`.
+// PORT: Go uses it only as a slice capacity. Without a parsed-file record the
+// capacity is 0; the output does not change.
+fn source_file_node_count(source_file: Node) -> usize {
+    parsed_source_file_of(source_file).map_or(0, |file| file.node_count)
+}
+
+/// Go `sourceFile.TextCount`.
+// PORT: Go uses it only as a slice capacity (see `source_file_node_count`).
+fn source_file_text_count(source_file: Node) -> usize {
+    parsed_source_file_of(source_file).map_or(0, |file| file.text_count)
+}
+
+/// Go `%v` of an `ast.Kind` (the generated stringer): "KindX", or "Kind(N)"
+/// out of range.
+// PORT: `ts_ast::SyntaxKind::as_str` gives the Go names without the `Kind`
+// prefix. Go `ast.Kind` is an `int16`.
+pub fn go_kind_string(kind: i16) -> String {
+    if kind >= 0
+        && let Ok(k) = SyntaxKind::try_from(kind as u16)
+    {
+        return format!("Kind{}", k.as_str());
+    }
+    format!("Kind({kind})")
+}
+
+// Go: api/encoder/encoder.go:286 SourceFileHash
+/// SourceFileHash returns the 128-bit content hash for a source file as a hex string.
+pub fn source_file_hash(source_file: Node) -> String {
+    let h = source_file_content_hash(source_file);
+    format!("{:016x}{:016x}", h.hi, h.lo)
+}
+
+// Go: api/encoder/encoder.go:292 encodeParseOptions
+/// encodeParseOptions encodes the per-file ExternalModuleIndicatorOptions as a uint32 bitmask.
+fn encode_parse_options(opts: ExternalModuleIndicatorOptions) -> u32 {
+    let mut bits: u32 = 0;
+    if opts.jsx {
+        bits |= 1;
+    }
+    if opts.force {
+        bits |= 2;
+    }
+    bits
+}
+
+// Go: api/encoder/encoder.go:304 NodeIndexTable
+/// NodeIndexTable maps between AST nodes and their encoder indices for O(1) node handle resolution.
+// PORT: Go `sortedOnce sync.Once` and `sortedIdx []uint32` are one `OnceCell`.
+pub struct NodeIndexTable {
+    /// index → node (for resolution). `Node::NIL` for a NodeList slot.
+    pub nodes: Vec<Node>,
+    /// indices into Nodes, sorted by node ID; built lazily
+    sorted_idx: OnceCell<Vec<u32>>,
+}
+
+// Go: api/encoder/encoder.go:310 nodeIndexTableKey
+static NODE_INDEX_TABLE_KEY: LazyLock<SourceFileDataKey<Rc<NodeIndexTable>>> =
+    LazyLock::new(new_source_file_data_key::<Rc<NodeIndexTable>>);
+
+impl NodeIndexTable {
+    // Go: api/encoder/encoder.go:316 (*NodeIndexTable).GetIndex
+    /// GetIndex returns the encoder index for the given node.
+    /// On the first call the sortedIdx array is built (O(n log n) sort on a flat []uint32),
+    /// then subsequent calls use binary search (O(log n)). This turns out to be much faster than
+    /// building a map[*ast.Node]uint32 and not significantly slower for lookups.
+    pub fn get_index(&self, node: Node) -> u32 {
+        let sorted_idx = self.sorted_idx.get_or_init(|| {
+            let mut idx: Vec<u32> = Vec::with_capacity(self.nodes.len());
+            for (i, n) in self.nodes.iter().enumerate() {
+                if n.is_some() {
+                    idx.push(i as u32);
+                }
+            }
+            let nodes = &self.nodes;
+            crate::gostd::slices::sort_func(&mut idx, |a: &u32, b: &u32| {
+                get_node_id(nodes[*a as usize]).cmp(&get_node_id(nodes[*b as usize])) as i32
+            });
+            idx
+        });
+        let target = get_node_id(node);
+        let (i, found) = binary_search_unique_func(sorted_idx, |_: i32, el: u32| {
+            get_node_id(self.nodes[el as usize]).cmp(&target) as i32
+        });
+        if found {
+            return sorted_idx[i as usize];
+        }
+        0
+    }
+}
+
+/// PORT: the counter and table that Go `BuildNodeIndexTable` closures
+/// capture. They live in the visitor's `ctx` (see `ast/visitor.rs`).
+struct BuildNodeIndexTableState {
+    node_count: u32,
+    node_table: Vec<Node>,
+    source_file: Node,
+}
+
+// Go: api/encoder/encoder.go:344 BuildNodeIndexTable
+/// BuildNodeIndexTable walks the AST in the same order as encodeTree and builds
+/// a NodeIndexTable without performing the full binary encoding. This is used to
+/// eagerly create index tables for files that need node handles before getSourceFile
+/// is called. The indices produced are guaranteed to match those from EncodeSourceFile.
+pub fn build_node_index_table(source_file: Node) -> Rc<NodeIndexTable> {
+    let node_count: u32 = 0;
+    let mut node_table: Vec<Node> = Vec::with_capacity(source_file_node_count(source_file) + 1);
+    node_table.push(Node::NIL); // index 0 = nil sentinel
+
+    // PORT: Go builds the visitor with only `Hooks` and sets `Visit` after;
+    // the Rust callbacks get the visitor as an argument instead.
+    let hooks: NodeVisitorHooks<'_, BuildNodeIndexTableState> = NodeVisitorHooks {
+        visit_nodes: Some(Rc::new(
+            |node_list: NodeList,
+             visitor: &mut NodeVisitor<'_, BuildNodeIndexTableState>|
+             -> NodeList {
+                if node_list.is_nil() {
+                    return node_list;
+                }
+                visitor.ctx.node_count += 1;
+                visitor.ctx.node_table.push(Node::NIL); // NodeLists are not *ast.Node
+                visitor.visit_slice(&node_list.nodes().to_vec());
+                node_list
+            },
+        )),
+        visit_modifiers: Some(Rc::new(
+            |modifiers: ModifierList,
+             visitor: &mut NodeVisitor<'_, BuildNodeIndexTableState>|
+             -> ModifierList {
+                if modifiers.is_some() && !modifiers.nodes().is_empty() {
+                    let visit_nodes = visitor
+                        .hooks
+                        .visit_nodes
+                        .clone()
+                        .expect("VisitNodes hook is set");
+                    visit_nodes(modifiers.node_list(), visitor);
+                }
+                modifiers
+            },
+        )),
+        ..NodeVisitorHooks::default()
+    };
+    let mut visitor = new_node_visitor(
+        |node: Node, visitor: &mut NodeVisitor<'_, BuildNodeIndexTableState>| -> Node {
+            visitor.ctx.node_count += 1;
+            visitor.ctx.node_table.push(node);
+            visitor.visit_each_child(node);
+            let source_file = visitor.ctx.source_file;
+            for jsdoc in node.js_doc(source_file) {
+                let visit = visitor.visit.clone().expect("NodeVisitor.Visit is nil");
+                visit(jsdoc, visitor);
+            }
+            node
+        },
+        None,
+        hooks,
+        BuildNodeIndexTableState {
+            node_count,
+            node_table,
+            source_file,
+        },
+    );
+
+    let root_node = source_file;
+    // Index 1 = root node (matches encodeTree)
+    visitor.ctx.node_count += 1;
+    visitor.ctx.node_table.push(root_node);
+
+    visitor.visit_each_child(root_node);
+    for jsdoc in root_node.js_doc(source_file) {
+        let visit = visitor.visit.clone().expect("NodeVisitor.Visit is nil");
+        visit(jsdoc, &mut visitor);
+    }
+
+    Rc::new(NodeIndexTable {
+        nodes: visitor.ctx.node_table,
+        sorted_idx: OnceCell::new(),
+    })
+}
+
+// Go: api/encoder/encoder.go:390 GetNodeIndexTable
+pub fn get_node_index_table(source_file: Node) -> Rc<NodeIndexTable> {
+    get_or_compute_source_file_data(source_file, &*NODE_INDEX_TABLE_KEY, build_node_index_table)
+}
+
+// Go: api/encoder/encoder.go:396 EncodeSourceFile
+/// EncodeSourceFile encodes an entire source file AST into the binary format.
+/// Returns the encoded bytes and a NodeIndexTable mapping encoder indices to AST nodes.
+pub fn encode_source_file(source_file: Node) -> Result<(Vec<u8>, Rc<NodeIndexTable>), GoError> {
+    let (data, node_table) = encode_tree(source_file, source_file)?;
+    let node_table =
+        get_or_compute_source_file_data(source_file, &*NODE_INDEX_TABLE_KEY, |_: Node| node_table);
+    Ok((data, node_table))
+}
+
+// Go: api/encoder/encoder.go:411 EncodeNode
+/// EncodeNode encodes an arbitrary AST node and its descendants into the binary format.
+/// The sourceFile is needed to provide the source text for efficient string encoding.
+/// When encoding a non-SourceFile node, the header hash and parse options fields will be zero.
+/// Returns the encoded bytes and a NodeIndexTable mapping encoder indices to AST nodes.
+// PORT: Go nil `sourceFile` is `Node::NIL`.
+pub fn encode_node(
+    node: Node,
+    source_file: Node,
+) -> Result<(Vec<u8>, Rc<NodeIndexTable>), GoError> {
+    encode_tree(node, source_file)
+}
+
+/// PORT: the local variables that Go `encodeTree` closures capture. They
+/// live in the visitor's `ctx` (see `ast/visitor.rs`), so the callbacks
+/// reach them through the visitor they get.
+struct EncodeTreeState {
+    parent_index: u32,
+    node_count: u32,
+    prev_index: u32,
+    extended_data: Vec<u8>,
+    structured_data: Vec<u8>,
+    strs: StringTable,
+    position_map: Cow<'static, PositionMap>,
+    nodes: Vec<u8>,
+    node_table: Vec<Node>,
+    node_index_map: Option<FxHashMap<Node, u32>>,
+    source_file: Node,
+}
+
+impl EncodeTreeState {
+    /// Go closure `utf16` in `encodeTree`.
+    fn utf16(&self, pos: i32) -> u32 {
+        self.position_map.utf8_to_utf16(pos) as u32
+    }
+}
+
+// Go: api/encoder/encoder.go:415 encodeTree
+fn encode_tree(
+    root_node: Node,
+    source_file: Node,
+) -> Result<(Vec<u8>, Rc<NodeIndexTable>), GoError> {
+    let (parent_index, node_count, prev_index): (u32, u32, u32) = (0, 0, 0);
+    let extended_data: Vec<u8> = Vec::new();
+    let structured_data: Vec<u8> = Vec::new();
+    let strs: StringTable;
+    let mut position_map: Option<&'static PositionMap> = None;
+    if root_node.kind() == SyntaxKind::SourceFile {
+        strs = new_string_table(
+            source_file_text(source_file),
+            source_file_text_count(source_file),
+        );
+        position_map = Some(source_file_get_position_map(source_file));
+    } else {
+        strs = new_string_table("", 0);
+        if source_file.is_some() {
+            position_map = Some(source_file_get_position_map(source_file));
+        }
+    }
+    let position_map: Cow<'static, PositionMap> = match position_map {
+        Some(map) => Cow::Borrowed(map),
+        None => Cow::Owned(compute_position_map("")),
+    };
+    let mut initial_node_count: usize = 0;
+    if source_file.is_some() {
+        initial_node_count = source_file_node_count(source_file);
+    }
+    let nodes: Vec<u8> = Vec::with_capacity((initial_node_count + 1) * NODE_SIZE);
+
+    // Build node index table for O(1) handle resolution.
+    // Index 0 is a nil sentinel; real nodes start at index 1.
+    let mut node_table: Vec<Node> = Vec::with_capacity(initial_node_count + 1);
+    node_table.push(Node::NIL); // index 0 = nil sentinel
+
+    // Build a small map of nodes we need to track indices for (imports + moduleAugmentations).
+    // Values start at 0 and are filled in during the walk.
+    let mut node_index_map: Option<FxHashMap<Node, u32>> = None;
+    let sf_extended_data_offset: usize; // byte offset in extendedData where SourceFile fields start
+    if root_node.kind() == SyntaxKind::SourceFile {
+        let sf = root_node;
+        let info = source_file_info(sf);
+        let mut total = source_file_imports(sf).len() + info.module_augmentations.len();
+        if info.external_module_indicator.is_some() && info.external_module_indicator != root_node {
+            total += 1;
+        }
+        if total > 0 {
+            let mut map: FxHashMap<Node, u32> =
+                FxHashMap::with_capacity_and_hasher(total, Default::default());
+            for imp in source_file_imports(sf) {
+                map.insert(imp, 0);
+            }
+            for &aug in &info.module_augmentations {
+                map.insert(aug, 0);
+            }
+            if info.external_module_indicator.is_some()
+                && info.external_module_indicator != root_node
+            {
+                map.insert(info.external_module_indicator, 0);
+            }
+            node_index_map = Some(map);
+        }
+    }
+
+    // PORT: Go builds the visitor with only `Hooks` and sets `Visit` after;
+    // the Rust callbacks get the visitor as an argument instead.
+    let hooks: NodeVisitorHooks<'_, EncodeTreeState> = NodeVisitorHooks {
+        visit_nodes: Some(Rc::new(
+            |node_list: NodeList, visitor: &mut NodeVisitor<'_, EncodeTreeState>| -> NodeList {
+                if node_list.is_nil() {
+                    return node_list;
+                }
+
+                let st = &mut visitor.ctx;
+                st.node_count += 1;
+                st.node_table.push(Node::NIL); // NodeLists are not *ast.Node
+                if st.prev_index != 0 {
+                    // this is the next sibling of `prevNode`
+                    let (b0, b1, b2, b3) = (
+                        st.node_count as u8,
+                        (st.node_count >> 8) as u8,
+                        (st.node_count >> 16) as u8,
+                        (st.node_count >> 24) as u8,
+                    );
+                    let base = st.prev_index as usize * NODE_SIZE + NODE_OFFSET_NEXT;
+                    st.nodes[base + 0] = b0;
+                    st.nodes[base + 1] = b1;
+                    st.nodes[base + 2] = b2;
+                    st.nodes[base + 3] = b3;
+                }
+
+                let values = [
+                    SYNTAX_KIND_NODE_LIST,
+                    st.utf16(node_list.pos()),
+                    st.utf16(node_list.end()),
+                    0,
+                    st.parent_index,
+                    node_list.nodes().len() as u32,
+                    0,
+                ];
+                append_uint32s(&mut st.nodes, &values);
+
+                let save_parent_index = st.parent_index;
+
+                let current_index = st.node_count;
+                st.prev_index = 0;
+                st.parent_index = current_index;
+                visitor.visit_slice(&node_list.nodes().to_vec());
+                visitor.ctx.prev_index = current_index;
+                visitor.ctx.parent_index = save_parent_index;
+
+                node_list
+            },
+        )),
+        visit_modifiers: Some(Rc::new(
+            |modifiers: ModifierList,
+             visitor: &mut NodeVisitor<'_, EncodeTreeState>|
+             -> ModifierList {
+                if modifiers.is_some() && !modifiers.nodes().is_empty() {
+                    let visit_nodes = visitor
+                        .hooks
+                        .visit_nodes
+                        .clone()
+                        .expect("VisitNodes hook is set");
+                    visit_nodes(modifiers.node_list(), visitor);
+                }
+                modifiers
+            },
+        )),
+        ..NodeVisitorHooks::default()
+    };
+    let mut visitor = new_node_visitor(
+        |node: Node, visitor: &mut NodeVisitor<'_, EncodeTreeState>| -> Node {
+            let st = &mut visitor.ctx;
+            st.node_count += 1;
+            st.node_table.push(node);
+            if st.prev_index != 0 {
+                // this is the next sibling of `prevNode`
+                let (b0, b1, b2, b3) = (
+                    st.node_count as u8,
+                    (st.node_count >> 8) as u8,
+                    (st.node_count >> 16) as u8,
+                    (st.node_count >> 24) as u8,
+                );
+                let base = st.prev_index as usize * NODE_SIZE + NODE_OFFSET_NEXT;
+                st.nodes[base + 0] = b0;
+                st.nodes[base + 1] = b1;
+                st.nodes[base + 2] = b2;
+                st.nodes[base + 3] = b3;
+            }
+
+            let kind = node.kind() as u32;
+            let pos = st.utf16(node.pos());
+            let end = st.utf16(node.end());
+            let parent_index = st.parent_index;
+            let data = get_node_data(
+                node,
+                &mut st.strs,
+                &st.position_map,
+                &mut st.extended_data,
+                &mut st.structured_data,
+            );
+            let flags = node.flags().0;
+            append_uint32s(
+                &mut st.nodes,
+                &[kind, pos, end, 0, parent_index, data, flags],
+            );
+
+            let node_count = st.node_count;
+            if let Some(map) = &mut st.node_index_map
+                && map.contains_key(&node)
+            {
+                map.insert(node, node_count);
+            }
+
+            let save_parent_index = st.parent_index;
+
+            let current_index = st.node_count;
+            st.prev_index = 0;
+            st.parent_index = current_index;
+            visitor.visit_each_child(node);
+            let source_file = visitor.ctx.source_file;
+            if source_file.is_some() {
+                for jsdoc in node.js_doc(source_file) {
+                    let visit = visitor.visit.clone().expect("NodeVisitor.Visit is nil");
+                    visit(jsdoc, visitor);
+                }
+            }
+            visitor.ctx.prev_index = current_index;
+            visitor.ctx.parent_index = save_parent_index;
+            node
+        },
+        None,
+        hooks,
+        EncodeTreeState {
+            parent_index,
+            node_count,
+            prev_index,
+            extended_data,
+            structured_data,
+            strs,
+            position_map,
+            nodes,
+            node_table,
+            node_index_map,
+            source_file,
+        },
+    );
+
+    {
+        let st = &mut visitor.ctx;
+        append_uint32s(&mut st.nodes, &[0, 0, 0, 0, 0, 0, 0]);
+
+        st.node_count += 1;
+        st.parent_index += 1;
+        st.node_table.push(root_node); // index 1 = root node
+
+        sf_extended_data_offset = st.extended_data.len();
+        let kind = root_node.kind() as u32;
+        let pos = st.utf16(root_node.pos());
+        let end = st.utf16(root_node.end());
+        let data = get_node_data(
+            root_node,
+            &mut st.strs,
+            &st.position_map,
+            &mut st.extended_data,
+            &mut st.structured_data,
+        );
+        let flags = root_node.flags().0;
+        append_uint32s(&mut st.nodes, &[kind, pos, end, 0, 0, data, flags]);
+    }
+
+    visitor.visit_each_child(root_node);
+    if source_file.is_some() {
+        for jsdoc in root_node.js_doc(source_file) {
+            let visit = visitor.visit.clone().expect("NodeVisitor.Visit is nil");
+            visit(jsdoc, &mut visitor);
+        }
+    }
+
+    let EncodeTreeState {
+        mut extended_data,
+        mut structured_data,
+        strs,
+        nodes,
+        node_table,
+        node_index_map,
+        ..
+    } = visitor.ctx;
+
+    let mut hash = Uint128::default();
+    let mut parse_opts: u32 = 0;
+    if root_node.kind() == SyntaxKind::SourceFile {
+        hash = source_file_content_hash(source_file);
+        let parsed = parsed_source_file_of(source_file)
+            .unwrap_or_else(|| unported!("SourceFile.ParseOptions"));
+        parse_opts = encode_parse_options(parsed.parse_options().external_module_indicator_options);
+
+        // Encode imports, moduleAugmentations, and ambientModuleNames into structured data,
+        // and patch the placeholder offsets in the SourceFile extended data.
+        let sf = root_node;
+        let info = source_file_info(sf);
+        let imports_offset = encode_node_index_array(
+            &source_file_imports(sf).to_vec(),
+            node_index_map.as_ref(),
+            &mut structured_data,
+        );
+        let module_augmentations_offset = encode_module_augmentations(
+            &info.module_augmentations,
+            node_index_map.as_ref(),
+            &mut structured_data,
+        );
+        let ambient_module_names_offset =
+            encode_string_array(&info.ambient_module_names, &mut structured_data);
+        // Patch the 3 placeholder uint32s at sfExtendedDataOffset + 32, 36, 40
+        put_uint32(
+            &mut extended_data,
+            sf_extended_data_offset + 32,
+            imports_offset,
+        );
+        put_uint32(
+            &mut extended_data,
+            sf_extended_data_offset + 36,
+            module_augmentations_offset,
+        );
+        put_uint32(
+            &mut extended_data,
+            sf_extended_data_offset + 40,
+            ambient_module_names_offset,
+        );
+        // Patch externalModuleIndicator node index at offset 44
+        let mut external_module_indicator_index: u32 = 0;
+        if info.external_module_indicator.is_some() {
+            if info.external_module_indicator == root_node {
+                external_module_indicator_index = 1; // root node index
+            } else {
+                external_module_indicator_index = node_index_map
+                    .as_ref()
+                    .and_then(|map| map.get(&info.external_module_indicator).copied())
+                    .unwrap_or(0);
+            }
+        }
+        put_uint32(
+            &mut extended_data,
+            sf_extended_data_offset + 44,
+            external_module_indicator_index,
+        );
+    }
+
+    let metadata = (PROTOCOL_VERSION as u32) << 24;
+    let offset_string_table_offsets = HEADER_SIZE;
+    let offset_string_table_data = HEADER_SIZE + strs.offsets.len() * 4;
+    let offset_extended_data = offset_string_table_data + strs.string_length();
+    let offset_structured_data = offset_extended_data + extended_data.len();
+    let offset_nodes = offset_structured_data + structured_data.len();
+
+    let header: [u32; 11] = [
+        metadata,
+        hash.lo as u32,
+        (hash.lo >> 32) as u32,
+        hash.hi as u32,
+        (hash.hi >> 32) as u32,
+        parse_opts,
+        offset_string_table_offsets as u32,
+        offset_string_table_data as u32,
+        offset_extended_data as u32,
+        offset_structured_data as u32,
+        offset_nodes as u32,
+    ];
+
+    let mut header_bytes: Vec<u8> = Vec::new();
+    append_uint32s(&mut header_bytes, &header);
+    let strs_bytes = strs.encode();
+
+    Ok((
+        [
+            header_bytes.as_slice(),
+            strs_bytes.as_slice(),
+            extended_data.as_slice(),
+            structured_data.as_slice(),
+            nodes.as_slice(),
+        ]
+        .concat(),
+        Rc::new(NodeIndexTable {
+            nodes: node_table,
+            sorted_idx: OnceCell::new(),
+        }),
+    ))
+}
+
+// Go: api/encoder/encoder.go:621 appendUint32s
+pub fn append_uint32s(buf: &mut Vec<u8>, values: &[u32]) {
+    for &value in values {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Go `binary.LittleEndian.PutUint32(buf[offset:], value)`.
+fn put_uint32(buf: &mut [u8], offset: usize, value: u32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+// Go: api/encoder/encoder.go:628 getNodeData
+pub fn get_node_data(
+    node: Node,
+    strs: &mut StringTable,
+    position_map: &PositionMap,
+    extended_data: &mut Vec<u8>,
+    structured_data: &mut Vec<u8>,
+) -> u32 {
+    let t = get_node_data_type(node);
+    match t {
+        NODE_DATA_TYPE_CHILDREN => {
+            t | get_node_common_data(node) | get_children_property_mask(node) as u32
+        }
+        NODE_DATA_TYPE_STRING => t | get_node_common_data(node) | record_node_strings(node, strs),
+        NODE_DATA_TYPE_EXTENDED_DATA => {
+            t | get_node_common_data(node)
+                | record_extended_data(node, strs, position_map, extended_data, structured_data)
+        }
+        _ => panic!("unreachable"),
+    }
+}
+
+// Go: api/encoder/encoder.go:642 noStructuredData
+const NO_STRUCTURED_DATA: u32 = 0xFFFFFFFF;
+
+// Go: api/encoder/encoder.go:644 recordExtendedData_SourceFile
+pub fn record_extended_data_source_file(
+    node: Node,
+    strs: &mut StringTable,
+    position_map: &PositionMap,
+    extended_data: &mut Vec<u8>,
+    structured_data: &mut Vec<u8>,
+) {
+    let sf = node;
+    let info = source_file_info(sf);
+    let text_index = strs.add(source_file_text(sf), sf.kind(), sf.pos(), sf.end());
+    let file_name_index = strs.add(source_file_file_name(sf), SyntaxKind::Unknown, 0, 0);
+    let path_index = strs.add(&info.path, SyntaxKind::Unknown, 0, 0);
+    let referenced_files_offset =
+        encode_file_references(&info.referenced_files, position_map, structured_data);
+    let type_ref_directives_offset = encode_file_references(
+        &info.type_reference_directives,
+        position_map,
+        structured_data,
+    );
+    let lib_ref_directives_offset = encode_file_references(
+        &info.lib_reference_directives,
+        position_map,
+        structured_data,
+    );
+    // imports, moduleAugmentations, ambientModuleNames offsets are placeholders;
+    // they will be patched after the tree walk when node indices are known.
+    append_uint32s(
+        extended_data,
+        &[
+            text_index,
+            file_name_index,
+            path_index,
+            info.language_variant.0 as u32,
+            info.script_kind.0 as u32,
+            referenced_files_offset,
+            type_ref_directives_offset,
+            lib_ref_directives_offset,
+            NO_STRUCTURED_DATA,
+            NO_STRUCTURED_DATA,
+            NO_STRUCTURED_DATA,
+            0,
+        ],
+    );
+}
+
+// Go: api/encoder/encoder.go:657 recordExtendedData_TemplateHead
+pub fn record_extended_data_template_head(
+    node: Node,
+    strs: &mut StringTable,
+    _position_map: &PositionMap,
+    extended_data: &mut Vec<u8>,
+    _structured_data: &mut Vec<u8>,
+) {
+    let n = node;
+    let text_index = strs.add(n.text(), node.kind(), node.pos(), node.end());
+    let raw_text_index = strs.add(n.raw_text(), node.kind(), node.pos(), node.end());
+    append_uint32s(
+        extended_data,
+        &[text_index, raw_text_index, n.template_flags().0 as u32],
+    );
+}
+
+// Go: api/encoder/encoder.go:664 recordExtendedData_TemplateMiddle
+pub fn record_extended_data_template_middle(
+    node: Node,
+    strs: &mut StringTable,
+    _position_map: &PositionMap,
+    extended_data: &mut Vec<u8>,
+    _structured_data: &mut Vec<u8>,
+) {
+    let n = node;
+    let text_index = strs.add(n.text(), node.kind(), node.pos(), node.end());
+    let raw_text_index = strs.add(n.raw_text(), node.kind(), node.pos(), node.end());
+    append_uint32s(
+        extended_data,
+        &[text_index, raw_text_index, n.template_flags().0 as u32],
+    );
+}
+
+// Go: api/encoder/encoder.go:671 recordExtendedData_TemplateTail
+pub fn record_extended_data_template_tail(
+    node: Node,
+    strs: &mut StringTable,
+    _position_map: &PositionMap,
+    extended_data: &mut Vec<u8>,
+    _structured_data: &mut Vec<u8>,
+) {
+    let n = node;
+    let text_index = strs.add(n.text(), node.kind(), node.pos(), node.end());
+    let raw_text_index = strs.add(n.raw_text(), node.kind(), node.pos(), node.end());
+    append_uint32s(
+        extended_data,
+        &[text_index, raw_text_index, n.template_flags().0 as u32],
+    );
+}
+
+// Go: api/encoder/encoder.go:678 boolToByte
+pub fn bool_to_byte(b: bool) -> u8 {
+    if b {
+        return 1;
+    }
+    0
+}
+
+// Go: api/encoder/encoder.go:686 hasModifiers
+/// hasModifiers returns true if the modifier list is non-nil and has at least one modifier.
+pub fn has_modifiers(modifiers: ModifierList) -> bool {
+    modifiers.is_some() && !modifiers.nodes().is_empty()
+}
+
+// Go: api/encoder/encoder.go:693 encodeFileReferences
+/// encodeFileReferences encodes a slice of FileReferences as a msgpack array of tuples
+/// into the structured data buffer. Returns the byte offset into the buffer, or
+/// noStructuredData (0xFFFFFFFF) if the slice is empty.
+fn encode_file_references(
+    refs: &[FileReference],
+    position_map: &PositionMap,
+    buf: &mut Vec<u8>,
+) -> u32 {
+    if refs.is_empty() {
+        return NO_STRUCTURED_DATA;
+    }
+    let offset = buf.len() as u32;
+    msgpack_write_array_header(buf, refs.len());
+    for r in refs {
+        // Each entry is a 5-element tuple: [pos, end, fileName, resolutionMode, preserve]
+        msgpack_write_array_header(buf, 5);
+        msgpack_write_uint(buf, position_map.utf8_to_utf16(r.range.pos()) as u32);
+        msgpack_write_uint(buf, position_map.utf8_to_utf16(r.range.end()) as u32);
+        msgpack_write_string(buf, &r.file_name);
+        msgpack_write_uint(buf, r.resolution_mode.0 as u32);
+        msgpack_write_bool(buf, r.preserve);
+    }
+    offset
+}
+
+// Go: api/encoder/encoder.go:714 encodeNodeIndexArray
+/// encodeNodeIndexArray encodes a slice of LiteralLikeNodes as a msgpack array of
+/// uint node indices. Returns the byte offset into the buffer, or noStructuredData
+/// if the slice is empty.
+// PORT: a nil Go map is `None`; Go reads 0 from it.
+fn encode_node_index_array(
+    nodes: &[Node],
+    index_map: Option<&FxHashMap<Node, u32>>,
+    buf: &mut Vec<u8>,
+) -> u32 {
+    if nodes.is_empty() {
+        return NO_STRUCTURED_DATA;
+    }
+    let offset = buf.len() as u32;
+    msgpack_write_array_header(buf, nodes.len());
+    for &node in nodes {
+        msgpack_write_uint(
+            buf,
+            index_map
+                .and_then(|map| map.get(&node).copied())
+                .unwrap_or(0),
+        );
+    }
+    offset
+}
+
+// Go: api/encoder/encoder.go:729 encodeModuleAugmentations
+/// encodeModuleAugmentations encodes a slice of ModuleName nodes as a msgpack array
+/// of uint node indices. Returns the byte offset into the buffer, or noStructuredData
+/// if the slice is empty.
+// PORT: a nil Go map is `None`; Go reads 0 from it.
+fn encode_module_augmentations(
+    nodes: &[Node],
+    index_map: Option<&FxHashMap<Node, u32>>,
+    buf: &mut Vec<u8>,
+) -> u32 {
+    if nodes.is_empty() {
+        return NO_STRUCTURED_DATA;
+    }
+    let offset = buf.len() as u32;
+    msgpack_write_array_header(buf, nodes.len());
+    for &node in nodes {
+        msgpack_write_uint(
+            buf,
+            index_map
+                .and_then(|map| map.get(&node).copied())
+                .unwrap_or(0),
+        );
+    }
+    offset
+}
+
+// Go: api/encoder/encoder.go:743 encodeStringArray
+/// encodeStringArray encodes a slice of strings as a msgpack array of strings.
+/// Returns the byte offset into the buffer, or noStructuredData if the slice is empty.
+fn encode_string_array(strs: &[String], buf: &mut Vec<u8>) -> u32 {
+    if strs.is_empty() {
+        return NO_STRUCTURED_DATA;
+    }
+    let offset = buf.len() as u32;
+    msgpack_write_array_header(buf, strs.len());
+    for s in strs {
+        msgpack_write_string(buf, s);
+    }
+    offset
+}
+
+// Minimal msgpack writers for the structured data section.
+
+// Go: api/encoder/encoder.go:757 msgpackWriteArrayHeader
+fn msgpack_write_array_header(buf: &mut Vec<u8>, length: usize) {
+    if length <= 0x0f {
+        buf.push(0x90 | length as u8);
+        return;
+    }
+    if length <= 0xffff {
+        buf.extend_from_slice(&[0xdc, (length >> 8) as u8, length as u8]);
+        return;
+    }
+    buf.extend_from_slice(&[
+        0xdd,
+        (length >> 24) as u8,
+        (length >> 16) as u8,
+        (length >> 8) as u8,
+        length as u8,
+    ]);
+}
+
+// Go: api/encoder/encoder.go:767 msgpackWriteUint
+fn msgpack_write_uint(buf: &mut Vec<u8>, value: u32) {
+    if value <= 0x7f {
+        buf.push(value as u8);
+        return;
+    }
+    if value <= 0xff {
+        buf.extend_from_slice(&[0xcc, value as u8]);
+        return;
+    }
+    if value <= 0xffff {
+        buf.extend_from_slice(&[0xcd, (value >> 8) as u8, value as u8]);
+        return;
+    }
+    buf.extend_from_slice(&[
+        0xce,
+        (value >> 24) as u8,
+        (value >> 16) as u8,
+        (value >> 8) as u8,
+        value as u8,
+    ]);
+}
+
+// Go: api/encoder/encoder.go:780 msgpackWriteString
+fn msgpack_write_string(buf: &mut Vec<u8>, s: &str) {
+    let n = s.len();
+    if n <= 0x1f {
+        buf.push(0xa0 | n as u8);
+    } else if n <= 0xff {
+        buf.extend_from_slice(&[0xd9, n as u8]);
+    } else if n <= 0xffff {
+        buf.extend_from_slice(&[0xda, (n >> 8) as u8, n as u8]);
+    } else {
+        buf.extend_from_slice(&[
+            0xdb,
+            (n >> 24) as u8,
+            (n >> 16) as u8,
+            (n >> 8) as u8,
+            n as u8,
+        ]);
+    }
+    buf.extend_from_slice(s.as_bytes());
+}
+
+// Go: api/encoder/encoder.go:794 msgpackWriteBool
+fn msgpack_write_bool(buf: &mut Vec<u8>, value: bool) {
+    if value {
+        buf.push(0xc3);
+        return;
+    }
+    buf.push(0xc2);
+}
+
+// Hand-written commonData encoding functions for nodes whose non-bool data
+// members cannot be automatically encoded by the generator. Each function
+// packs relevant fields into the 6-bit commonData area (bits 24-29) of the
+// 32-bit node data word.
+
+// Go: api/encoder/encoder.go:806 getNodeCommonData_SyntheticExpression
+pub fn get_node_common_data_synthetic_expression(_node: Node) -> u32 {
+    // SyntheticExpression is an internal compiler node that is never part of a parsed AST.
+    // It should never be encoded.
+    panic!("SyntheticExpression should never be encoded")
+}
+
+// Hand-written extended data encoding functions for literal nodes that were
+// previously string-type but whose TokenFlags/TemplateFlags cannot fit in 6 bits.
+
+// Go: api/encoder/encoder.go:815 recordExtendedData_StringLiteral
+pub fn record_extended_data_string_literal(
+    node: Node,
+    strs: &mut StringTable,
+    _position_map: &PositionMap,
+    extended_data: &mut Vec<u8>,
+    _structured_data: &mut Vec<u8>,
+) {
+    let n = node;
+    let text_index = strs.add(n.text(), node.kind(), node.pos(), node.end());
+    append_uint32s(extended_data, &[text_index, n.token_flags().0 as u32]);
+}
+
+// Go: api/encoder/encoder.go:821 recordExtendedData_NumericLiteral
+pub fn record_extended_data_numeric_literal(
+    node: Node,
+    strs: &mut StringTable,
+    _position_map: &PositionMap,
+    extended_data: &mut Vec<u8>,
+    _structured_data: &mut Vec<u8>,
+) {
+    let n = node;
+    let text_index = strs.add(n.text(), node.kind(), node.pos(), node.end());
+    append_uint32s(extended_data, &[text_index, n.token_flags().0 as u32]);
+}
+
+// Go: api/encoder/encoder.go:827 recordExtendedData_BigIntLiteral
+pub fn record_extended_data_big_int_literal(
+    node: Node,
+    strs: &mut StringTable,
+    _position_map: &PositionMap,
+    extended_data: &mut Vec<u8>,
+    _structured_data: &mut Vec<u8>,
+) {
+    let n = node;
+    let text_index = strs.add(n.text(), node.kind(), node.pos(), node.end());
+    append_uint32s(extended_data, &[text_index, n.token_flags().0 as u32]);
+}
+
+// Go: api/encoder/encoder.go:833 recordExtendedData_RegularExpressionLiteral
+pub fn record_extended_data_regular_expression_literal(
+    node: Node,
+    strs: &mut StringTable,
+    _position_map: &PositionMap,
+    extended_data: &mut Vec<u8>,
+    _structured_data: &mut Vec<u8>,
+) {
+    let n = node;
+    let text_index = strs.add(n.text(), node.kind(), node.pos(), node.end());
+    append_uint32s(extended_data, &[text_index, n.token_flags().0 as u32]);
+}
+
+// Go: api/encoder/encoder.go:839 recordExtendedData_NoSubstitutionTemplateLiteral
+pub fn record_extended_data_no_substitution_template_literal(
+    node: Node,
+    strs: &mut StringTable,
+    _position_map: &PositionMap,
+    extended_data: &mut Vec<u8>,
+    _structured_data: &mut Vec<u8>,
+) {
+    let n = node;
+    let text_index = strs.add(n.text(), node.kind(), node.pos(), node.end());
+    append_uint32s(extended_data, &[text_index, n.template_flags().0 as u32]);
+}

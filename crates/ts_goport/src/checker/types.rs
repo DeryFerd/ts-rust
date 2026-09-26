@@ -24,43 +24,102 @@ use ts_jsnum::{Number, PseudoBigInt};
 ///
 /// PORT: Go returns resolved member, signature, index info and type argument
 /// slices without a copy. Callers read the list through `Deref<[T]>`.
+///
+/// PORT: layout only. A list of up to `SHARED_LIST_INLINE` elements is kept
+/// inline, so it needs no `Rc` block and a read does not follow a pointer.
+/// The `Rc` pointer niche holds the variant tag, so the list stays 24 bytes
+/// (asserted below). All element types are `Copy` ids, and `Default` fills
+/// the unused inline slots.
 pub struct SharedList<T> {
-    items: Option<Rc<[T]>>,
-    start: u32,
-    end: u32,
+    repr: SharedListRepr<T>,
 }
 
-impl<T> SharedList<T> {
-    /// The sub-list `range` of this list, sharing the same storage.
+/// Number of elements a `SharedList` keeps inline.
+const SHARED_LIST_INLINE: usize = 3;
+
+enum SharedListRepr<T> {
+    Heap {
+        items: Rc<[T]>,
+        start: u32,
+        end: u32,
+    },
+    /// `items[..len]` is the list. Empty is `len == 0`.
+    Inline {
+        len: u8,
+        items: [T; SHARED_LIST_INLINE],
+    },
+}
+
+// A list must stay 24 bytes, or `Type` grows past 3 cache lines.
+const _: () = assert!(std::mem::size_of::<SharedList<TypeId>>() == 24);
+const _: () = assert!(std::mem::size_of::<SharedList<SymbolId>>() == 24);
+const _: () = assert!(std::mem::size_of::<SharedList<SignatureId>>() == 24);
+const _: () = assert!(std::mem::size_of::<SharedList<IndexInfoId>>() == 24);
+const _: () = assert!(std::mem::size_of::<SharedList<VarianceFlags>>() == 24);
+
+impl<T: Copy + Default> SharedList<T> {
+    /// An inline list of `items`, which has at most `SHARED_LIST_INLINE`
+    /// elements.
+    #[inline]
+    fn inline(items: &[T]) -> Self {
+        let mut buffer = [T::default(); SHARED_LIST_INLINE];
+        buffer[..items.len()].copy_from_slice(items);
+        Self {
+            repr: SharedListRepr::Inline {
+                len: items.len() as u8,
+                items: buffer,
+            },
+        }
+    }
+
+    /// The sub-list `range` of this list. A long sub-list shares the same
+    /// storage; a short one is copied inline.
     pub fn slice(&self, range: std::ops::Range<usize>) -> Self {
         assert!(range.start <= range.end && range.end <= self.len());
-        if range.is_empty() {
-            return Self::default();
+        if range.len() <= SHARED_LIST_INLINE {
+            return Self::inline(&self[range]);
         }
-        Self {
-            items: self.items.clone(),
-            start: self.start + range.start as u32,
-            end: self.start + range.end as u32,
+        match &self.repr {
+            SharedListRepr::Heap { items, start, .. } => Self {
+                repr: SharedListRepr::Heap {
+                    items: items.clone(),
+                    start: start + range.start as u32,
+                    end: start + range.end as u32,
+                },
+            },
+            // An inline list is never longer than `SHARED_LIST_INLINE`.
+            SharedListRepr::Inline { .. } => unreachable!(),
         }
     }
 }
 
-impl<T> Clone for SharedList<T> {
+impl<T: Copy> Clone for SharedList<T> {
+    #[inline]
     fn clone(&self) -> Self {
         Self {
-            items: self.items.clone(),
-            start: self.start,
-            end: self.end,
+            repr: match &self.repr {
+                SharedListRepr::Heap { items, start, end } => SharedListRepr::Heap {
+                    items: items.clone(),
+                    start: *start,
+                    end: *end,
+                },
+                SharedListRepr::Inline { len, items } => SharedListRepr::Inline {
+                    len: *len,
+                    items: *items,
+                },
+            },
         }
     }
 }
 
-impl<T> Default for SharedList<T> {
+impl<T: Copy + Default> Default for SharedList<T> {
+    #[inline]
     fn default() -> Self {
         Self {
-            items: None,
-            start: 0,
-            end: 0,
+            repr: SharedListRepr::Inline {
+                len: 0,
+                items: [T::default(); SHARED_LIST_INLINE],
+            },
         }
     }
 }
@@ -68,41 +127,41 @@ impl<T> Default for SharedList<T> {
 impl<T> std::ops::Deref for SharedList<T> {
     type Target = [T];
 
+    #[inline]
     fn deref(&self) -> &[T] {
-        match &self.items {
-            Some(items) => &items[self.start as usize..self.end as usize],
-            None => &[],
+        match &self.repr {
+            SharedListRepr::Heap { items, start, end } => &items[*start as usize..*end as usize],
+            SharedListRepr::Inline { len, items } => &items[..*len as usize],
         }
     }
 }
 
-impl<T> From<Vec<T>> for SharedList<T> {
+impl<T: Copy + Default> From<Vec<T>> for SharedList<T> {
     fn from(items: Vec<T>) -> Self {
-        if items.is_empty() {
-            return Self::default();
+        Self::from(&items[..])
+    }
+}
+
+impl<T: Copy + Default> From<&[T]> for SharedList<T> {
+    fn from(items: &[T]) -> Self {
+        if items.len() <= SHARED_LIST_INLINE {
+            return Self::inline(items);
         }
         let end = u32::try_from(items.len()).expect("list too long");
         Self {
-            items: Some(items.into()),
-            start: 0,
-            end,
+            repr: SharedListRepr::Heap {
+                items: items.into(),
+                start: 0,
+                end,
+            },
         }
     }
 }
 
-impl<T: Clone> From<&[T]> for SharedList<T> {
-    fn from(items: &[T]) -> Self {
-        if items.is_empty() {
-            return Self::default();
-        }
-        let end = u32::try_from(items.len()).expect("list too long");
-        Self {
-            items: Some(items.into()),
-            start: 0,
-            end,
-        }
-    }
-}
+/// Scratch list for the type set of a union or intersection under
+/// construction. Most sets have at most 16 members, so they stay on the
+/// stack. The created type still stores its own `SharedList` copy.
+pub type TypeSet = smallvec::SmallVec<[TypeId; 16]>;
 
 impl<T: std::fmt::Debug> std::fmt::Debug for SharedList<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1397,6 +1456,14 @@ pub struct LiteralType {
     pub value: Option<LiteralValue>, // string | jsnum.Number | bool | PseudoBigInt | nil (computed enum)
     pub fresh_type: TypeId,          // Fresh version of type
     pub regular_type: TypeId,        // Regular version of type
+    // PORT: no Go field. The property name of a string or number literal,
+    // interned on first use by `get_property_name_from_type_as_name`. The
+    // value never changes, so the name does not either.
+    pub property_name: std::cell::OnceCell<Name>,
+    // PORT: perf, no Go field. For a string literal, true when the value has
+    // no `scanner_util::GO_STRING_MARKER`, so its port form is its Go bytes
+    // (see `Checker::string_literal_go_plain`). Set on first use.
+    pub go_plain: std::cell::OnceCell<bool>,
 }
 
 impl LiteralType {
@@ -1551,6 +1618,22 @@ pub struct TypeReference {
     pub object: ObjectType,
     pub node: Node, // TypeReferenceNode | ArrayTypeNode | TupleTypeNode when deferred, else nil
     pub resolved_type_arguments: SharedList<TypeId>,
+    // PORT: no Go field. Memo of `is_type_reference_with_generic_arguments`
+    // for a non-deferred reference with a non-empty resolved list.
+    pub generic_arguments_memo: GenericArgumentsMemo,
+}
+
+/// Memo state of `Checker::is_type_reference_with_generic_arguments`.
+///
+/// PORT: layout only. An enum (not a `u8`) leaves invalid values that
+/// `TypeData` uses for its tag, so the byte does not grow `Type`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GenericArgumentsMemo {
+    #[default]
+    Unknown = 0,
+    False = 1,
+    True = 2,
 }
 
 // InterfaceType (when generic, serves as reference to instantiation of itself)
@@ -1814,6 +1897,11 @@ pub struct TemplateLiteralType {
     pub constrained: ConstrainedType,
     pub texts: Rc<[String]>,       // Always one element longer than types
     pub types: SharedList<TypeId>, // Always at least one element
+    // PORT: perf, no Go field. True when no text has a
+    // `scanner_util::GO_STRING_MARKER`, so each text's port form is its Go
+    // bytes. Set by `new_template_literal_type`; false (the default) means
+    // "convert first".
+    pub go_plain: bool,
 }
 
 impl TemplateLiteralType {
@@ -1873,7 +1961,9 @@ pub struct ConditionalRoot {
     pub extends_type: TypeId,
     pub is_distributive: bool,
     pub infer_type_parameters: Vec<TypeId>,
-    pub outer_type_parameters: Vec<TypeId>,
+    // PORT: shared, so an instantiation miss hands it to the new mapper
+    // without a copy. It never changes after the root is created.
+    pub outer_type_parameters: SharedList<TypeId>,
     // PORT: Go nil map is `None`.
     pub instantiations: Option<CacheKeyMap<TypeId>>,
     pub alias: Option<Rc<TypeAlias>>,

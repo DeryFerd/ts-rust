@@ -191,8 +191,19 @@ impl Checker {
         name: &str,
         meaning: SymbolFlags,
     ) -> SymbolId {
+        self.get_symbol_key(symbols, TableKey::Text(name), meaning)
+    }
+
+    /// `get_symbol` by a `TableKey`. `NameResolver` passes an interned
+    /// `TableKey::Name`, which finds the entry by id with no text compare.
+    pub fn get_symbol_key(
+        &mut self,
+        symbols: SymbolTable,
+        name: TableKey<'_>,
+        meaning: SymbolFlags,
+    ) -> SymbolId {
         if meaning.intersects(SymbolFlags::ALL) {
-            let found = self.symbols.get(symbols, name);
+            let found = self.symbols.get_key(symbols, name);
             let symbol = self.get_merged_symbol(found);
             if symbol.is_some() {
                 if self.sym(symbol).flags.intersects(meaning) {

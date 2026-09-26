@@ -834,10 +834,10 @@ impl Checker {
         // Two template literal types with differences in their starting or ending text spans are definitely unrelated.
         // PORT: Go slices strings by byte, so this compares the Go bytes of
         // the port forms (see `scanner_util::GO_STRING_MARKER`).
-        let source_start = go_string_bytes(&source.texts[0]);
-        let target_start = go_string_bytes(&target.texts[0]);
-        let source_end = go_string_bytes(&source.texts[source.texts.len() - 1]);
-        let target_end = go_string_bytes(&target.texts[target.texts.len() - 1]);
+        let source_start = go_bytes_of(&source.texts[0], source.go_plain);
+        let target_start = go_bytes_of(&target.texts[0], target.go_plain);
+        let source_end = go_bytes_of(&source.texts[source.texts.len() - 1], source.go_plain);
+        let target_end = go_bytes_of(&target.texts[target.texts.len() - 1], target.go_plain);
         let start_len = source_start.len().min(target_start.len());
         let end_len = source_end.len().min(target_end.len());
         source_start[..start_len] != target_start[..start_len]
@@ -885,18 +885,30 @@ impl Checker {
             // made in the same order as Go `addMatch` makes them.
             // The texts are matched on their Go bytes (see
             // `infer_from_literal_parts_to_template_literal`).
+            // PERF: when the value and the target texts have no marker
+            // (`go_plain`), they are their own Go bytes and are not converted.
+            let source_plain = self.string_literal_go_plain(source);
             let mut spans = LiteralPartMatches::new();
-            let matched = match_literal_parts_to_template_literal(
-                &[go_string_bytes(self.get_string_literal_value_ref(source))],
-                &go_string_bytes_list(&target.texts),
-                &mut spans,
-            );
+            let source_bytes = [go_bytes_of(
+                self.get_string_literal_value_ref(source),
+                source_plain,
+            )];
+            let matched = if target.go_plain {
+                match_literal_parts_to_template_literal(&source_bytes, &target.texts, &mut spans)
+            } else {
+                match_literal_parts_to_template_literal(
+                    &source_bytes,
+                    &go_string_bytes_list(&target.texts),
+                    &mut spans,
+                )
+            };
             let mut result = TemplateLiteralInferences::with_capacity(spans.len());
             for m in &spans {
                 // A string literal is one text part, so every match is inside it.
                 debug_assert!(m.seg == 0 && m.s == 0);
                 let text = combine_surrogate_pairs(&go_value_from_bytes(
-                    &go_string_bytes(self.get_string_literal_value_ref(source))[m.pos..m.p],
+                    &go_bytes_of(self.get_string_literal_value_ref(source), source_plain)
+                        [m.pos..m.p],
                 ));
                 result.push(self.get_string_literal_type(&text));
             }
@@ -906,9 +918,9 @@ impl Checker {
             return result;
         }
         if flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
-            let (source_texts, source_types) = {
+            let (source_texts, source_types, source_plain) = {
                 let tl = self.ty(source).as_template_literal_type();
-                (tl.texts.clone(), tl.types.clone())
+                (tl.texts.clone(), tl.types.clone(), tl.go_plain)
             };
             if source_texts == target.texts {
                 let mut result = TemplateLiteralInferences::with_capacity(source_types.len());
@@ -926,6 +938,7 @@ impl Checker {
             return self.infer_from_literal_parts_to_template_literal(
                 &source_texts,
                 &source_types,
+                source_plain,
                 target,
             );
         }
@@ -962,17 +975,34 @@ impl Checker {
     // (see `scanner_util::GO_STRING_MARKER`), so this works on their Go
     // bytes, and each match is the value form of its bytes
     // (`go_value_from_bytes`). A text without a marker is its own bytes.
+    //
+    // PORT: perf. `source_plain` is the source's `go_plain`: with it and the
+    // target's, the texts are their own Go bytes and are not converted.
     pub fn infer_from_literal_parts_to_template_literal(
         &mut self,
         source_texts: &[String],
         source_types: &[TypeId],
+        source_plain: bool,
         target: &TemplateLiteralType,
     ) -> TemplateLiteralInferences {
-        let source_bytes = go_string_bytes_list(source_texts);
-        let target_bytes = go_string_bytes_list(&target.texts);
+        let source_bytes: SmallVec<[Cow<'_, [u8]>; 4]> = if source_plain {
+            source_texts
+                .iter()
+                .map(|text| Cow::Borrowed(text.as_bytes()))
+                .collect()
+        } else {
+            go_string_bytes_list(source_texts)
+        };
         let mut spans = LiteralPartMatches::new();
-        let matched =
-            match_literal_parts_to_template_literal(&source_bytes, &target_bytes, &mut spans);
+        let matched = if target.go_plain {
+            match_literal_parts_to_template_literal(&source_bytes, &target.texts, &mut spans)
+        } else {
+            match_literal_parts_to_template_literal(
+                &source_bytes,
+                &go_string_bytes_list(&target.texts),
+                &mut spans,
+            )
+        };
         let mut result = TemplateLiteralInferences::with_capacity(spans.len());
         for m in &spans {
             // Go reads `getSourceText(s)`. That text is a prefix of
@@ -1181,31 +1211,49 @@ impl Checker {
     pub fn put_relater(&mut self, r: Rc<RefCell<Relater>>) {
         {
             let mut rb = r.borrow_mut();
-            // PORT: resetMaybeStack already removed every key, and clearing
-            // an empty set still costs time in its capacity.
-            if !rb.maybe_keys_set.is_empty() {
-                rb.maybe_keys_set.clear();
-            }
-            let mut maybe_keys = std::mem::take(&mut rb.maybe_keys);
-            maybe_keys.clear();
-            let maybe_keys_set = std::mem::take(&mut rb.maybe_keys_set);
-            let mut source_stack = std::mem::take(&mut rb.source_stack);
-            source_stack.clear();
-            let mut target_stack = std::mem::take(&mut rb.target_stack);
-            target_stack.clear();
-            // PORT: Go sets `relation` to nil. The pooled relater keeps the
-            // last checker relation instead of allocating a default one on
-            // every put. The next `getRelater` user always sets it first.
-            let relation = rb.relation.clone();
-            *rb = Relater {
-                relation,
+            // PORT: perf. Go rebuilds the struct (`*r = Relater{...}`). This
+            // resets each field in place, because `..Relater::default()`
+            // allocates and drops a default `Rc<RefCell<Relation>>` on every
+            // put. The destructure names every field, so a new field does not
+            // compile until it is reset here.
+            let Relater {
+                // PORT: Go sets `relation` to nil. The pooled relater keeps
+                // the last checker relation. The next `getRelater` user always
+                // sets it first.
+                relation: _,
+                error_node,
+                error_chain,
+                related_info,
                 maybe_keys,
                 maybe_keys_set,
                 source_stack,
                 target_stack,
-                next: self.free_relater.take(),
-                ..Relater::default()
-            };
+                maybe_count,
+                source_depth,
+                target_depth,
+                expanding_flags,
+                overflow,
+                relation_count,
+                next,
+            } = &mut *rb;
+            *error_node = Node::NIL;
+            *error_chain = None;
+            related_info.clear();
+            maybe_keys.clear();
+            // PORT: resetMaybeStack already removed every key, and clearing
+            // an empty set still costs time in its capacity.
+            if !maybe_keys_set.is_empty() {
+                maybe_keys_set.clear();
+            }
+            source_stack.clear();
+            target_stack.clear();
+            *maybe_count = 0;
+            *source_depth = 0;
+            *target_depth = 0;
+            *expanding_flags = ExpandingFlags::NONE;
+            *overflow = false;
+            *relation_count = 0;
+            *next = self.free_relater.take();
         }
         self.free_relater = Some(r);
     }
@@ -1762,6 +1810,16 @@ pub type TemplateLiteralInferences = SmallVec<[TypeId; 4]>;
 /// A text without a marker is borrowed.
 fn go_string_bytes_list(texts: &[String]) -> SmallVec<[Cow<'_, [u8]>; 4]> {
     texts.iter().map(|text| go_string_bytes(text)).collect()
+}
+
+/// PERF: the Go bytes of a port form text whose `go_plain` flag is known.
+/// A plain text is its own Go bytes, so it is not scanned.
+fn go_bytes_of(text: &str, plain: bool) -> Cow<'_, [u8]> {
+    if plain {
+        Cow::Borrowed(text.as_bytes())
+    } else {
+        go_string_bytes(text)
+    }
 }
 
 // PORT: perf. The text matching of Go `inferFromLiteralPartsToTemplateLiteral`

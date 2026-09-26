@@ -8,6 +8,7 @@ use crate::printer::{
     get_single_line_string_writer, new_printer, new_text_writer,
 };
 use std::cell::Cell;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 /// Go `VerbosityContext` (checker/nodebuilder.go). Hover code sets it; the
 /// checker passes nil.
@@ -21,6 +22,35 @@ pub struct VerbosityContext {
     pub max_truncation_length: i32,
     pub can_increase_verbosity: Rc<Cell<bool>>,
     pub truncated: Rc<Cell<bool>>,
+}
+
+/// Rust-only: Go `oldVerbosity := nodeBuilder.verbosity; nodeBuilder.verbosity = vc;
+/// defer func() { nodeBuilder.verbosity = oldVerbosity }()`. It installs `vc` on the
+/// node builder and puts the old value back on drop. A Go defer also runs when
+/// the function panics, and so does this drop, so a caught `unported!` panic
+/// does not leave a hover verbosity on the checker's shared node builder.
+struct VerbosityRestore {
+    node_builder: Rc<RefCell<NodeBuilder>>,
+    old: Option<VerbosityContext>,
+}
+
+impl VerbosityRestore {
+    fn install(node_builder: &Rc<RefCell<NodeBuilder>>, vc: Option<&VerbosityContext>) -> Self {
+        let old = std::mem::replace(&mut node_builder.borrow_mut().verbosity, vc.cloned());
+        VerbosityRestore {
+            node_builder: node_builder.clone(),
+            old,
+        }
+    }
+}
+
+impl Drop for VerbosityRestore {
+    fn drop(&mut self) {
+        // `try_borrow_mut` so a drop during unwinding cannot panic again.
+        if let Ok(mut nb) = self.node_builder.try_borrow_mut() {
+            nb.verbosity = self.old.take();
+        }
+    }
 }
 
 // Go: checker/printer.go:13 createPrinterWithDefaults
@@ -330,21 +360,31 @@ impl Checker {
         // the factory free its arenas. Rust frees nodes by ownership, so there
         // is nothing to release.
         let node_builder = self.get_node_builder();
-        let old_verbosity =
-            std::mem::replace(&mut node_builder.borrow_mut().verbosity, vc.cloned());
+        let _verbosity = VerbosityRestore::install(&node_builder, vc);
         self.serialization_level += 1;
-        let type_node = self.node_builder_type_to_type_node(
-            &node_builder,
-            t,
-            enclosing_declaration,
-            combined_flags,
-            InternalNodeBuilderFlags::NONE,
-            None,
-        );
+        // PORT: Go does not restore serializationLevel when TypeToTypeNode
+        // panics, because Go panics there are fatal. Here an `unported!` panic
+        // is caught per request and the checker lives on, so the level is
+        // lowered before the panic continues. Without this, two caught panics
+        // leave the checker at maxSerializationLevel and every later type
+        // prints as "?".
+        let type_node = match catch_unwind(AssertUnwindSafe(|| {
+            self.node_builder_type_to_type_node(
+                &node_builder,
+                t,
+                enclosing_declaration,
+                combined_flags,
+                InternalNodeBuilderFlags::NONE,
+                None,
+            )
+        })) {
+            Ok(type_node) => type_node,
+            Err(payload) => {
+                self.serialization_level -= 1;
+                resume_unwind(payload);
+            }
+        };
         self.serialization_level -= 1;
-        // PORT: Go restores the verbosity in a defer at function exit. Nothing
-        // below reads it, so it is restored here.
-        node_builder.borrow_mut().verbosity = old_verbosity;
         if type_node.is_nil() {
             panic!("should always get typenode");
         }
@@ -505,8 +545,7 @@ impl Checker {
 
         // PORT: see type_to_string_ex about the release func.
         let node_builder = self.get_node_builder();
-        let old_verbosity =
-            std::mem::replace(&mut node_builder.borrow_mut().verbosity, vc.cloned());
+        let _verbosity = VerbosityRestore::install(&node_builder, vc);
         let combined_flags = to_node_builder_flags(flags)
             | NodeBuilderFlags::IGNORE_ERRORS
             | NodeBuilderFlags::WRITE_TYPE_PARAMETERS_IN_QUALIFIED_NAME;
@@ -519,9 +558,6 @@ impl Checker {
             InternalNodeBuilderFlags::NONE,
             None,
         );
-        // PORT: Go restores the verbosity in a defer; the printer below does
-        // not read it.
-        node_builder.borrow_mut().verbosity = old_verbosity;
         let emit_context = node_builder.borrow().emit_context();
         let mut p = create_printer_with_remove_comments_omit_trailing_semicolon_never_ascii_escape(
             emit_context,
@@ -694,8 +730,7 @@ impl Checker {
     ) -> String {
         // PORT: see type_to_string_ex about the release func.
         let node_builder = self.get_node_builder();
-        let old_verbosity =
-            std::mem::replace(&mut node_builder.borrow_mut().verbosity, vc.cloned());
+        let _verbosity = VerbosityRestore::install(&node_builder, vc);
         let nodes = self.node_builder_expand_symbol_for_hover(&node_builder, symbol, meaning);
         let result = if nodes.is_empty() {
             String::new()
@@ -717,8 +752,6 @@ impl Checker {
             }
             b
         };
-        // PORT: Go restores the verbosity in a defer at function exit.
-        node_builder.borrow_mut().verbosity = old_verbosity;
         result
     }
 
@@ -732,8 +765,7 @@ impl Checker {
     ) -> String {
         // PORT: see type_to_string_ex about the release func.
         let node_builder = self.get_node_builder();
-        let old_verbosity =
-            std::mem::replace(&mut node_builder.borrow_mut().verbosity, vc.cloned());
+        let _verbosity = VerbosityRestore::install(&node_builder, vc);
         let type_param_node = self.node_builder_type_parameter_to_declaration(
             &node_builder,
             t,
@@ -752,7 +784,6 @@ impl Checker {
             let source_file = source_file_of_enclosing(enclosing_declaration);
             p.emit(type_param_node, source_file)
         };
-        node_builder.borrow_mut().verbosity = old_verbosity;
         result
     }
 

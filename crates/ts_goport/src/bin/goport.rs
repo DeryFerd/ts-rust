@@ -46,6 +46,7 @@ use ts_goport::execute::tsc::{
     EXIT_UNPORTED, ExitStatus, ProgramLike, System, Writer, new_os_system, write_go_output,
 };
 use ts_goport::frontend::tsoptions::ParsedCommandLine;
+use ts_goport::gostd::context;
 use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
@@ -67,6 +68,24 @@ fn main() {
     let start = Instant::now();
     let args: Vec<String> = ts_goport::frontend::vfs::os_args();
     install_panic_hook();
+    // Go: cmd/tsgo/main.go runMain sends `--lsp` and `--api` to their own
+    // entry points; everything else continues below. Nothing may write to
+    // stdout before this point (stdout is the LSP channel). The panic hook
+    // keeps recovered unported panics quiet. Exit: the Go status, or
+    // EXIT_UNPORTED with the unported report on stderr when unported code
+    // ran.
+    if let Some(code) = ts_goport::cmd::tsgo::run_main(&args) {
+        let unported = unported_report();
+        if !unported.is_empty() {
+            let mut stderr = std::io::stderr().lock();
+            for (name, count) in &unported {
+                let _ = writeln!(stderr, "unported: {name} {count}");
+            }
+            let _ = stderr.flush();
+            std::process::exit(EXIT_UNPORTED);
+        }
+        std::process::exit(code);
+    }
     // The loading thread keeps the frontend program and the checker pool, so
     // the whole run stays on it. The checkers run on their own threads.
     let worker = std::thread::Builder::new()
@@ -206,7 +225,7 @@ fn run(args: &[String], start: Instant) -> i32 {
     let sys: Rc<dyn System> = Rc::new(sys.with_start(start).with_writer(writer));
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        command_line(sys.clone(), args, &CheckBin)
+        command_line(&context::background(), sys.clone(), args, &CheckBin)
     }));
 
     let mut stdout = std::io::stdout().lock();

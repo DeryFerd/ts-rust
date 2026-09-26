@@ -20,7 +20,9 @@
 //!   fileName | null,pos,end,[args...]]...],"diagnosticFileTexts":
 //!   [[fileName,text]...],"emittedFiles":[...],
 //!   "hasChangedDtsFile":false,"buildInfoFileName":"..." | null,
-//!   "statistics":{...} | null,"fsCache":{...}}`
+//!   "statistics":{...} | null,
+//!   "outputTimeStamps":[["<file>",<unix seconds>,<nanoseconds>],...],
+//!   "fsCache":{...}}`
 //! Before it, right after the program is made, the worker writes one
 //! `{"fsCacheProgram":{...}}` line: the cached file system entries the
 //! program load added. The worker writes nothing else to stdout. On stdin
@@ -50,7 +52,7 @@ use crate::execute::tsc::emit::{
 use crate::execute::tsc::statistics::decode_statistics;
 use crate::frontend::prelude::*;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The first argument that selects the worker entry of the build binary.
 pub const BUILD_WORKER_FLAG: &str = "--build-worker";
@@ -250,9 +252,16 @@ pub fn compile_and_emit_worker(
         .unwrap_or_default();
 
     let written_build_info: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Go: build/buildtask.go:779 (*BuildTask).storeOutputTimeStamp
+    let store_output_time_stamp =
+        command.compiler_options.watch.is_true() && !resolved.compiler_options().is_incremental();
+    let output_time_stamps: Arc<Mutex<Vec<(String, SystemTime)>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let write_file = new_task_write_file(
         resolved.get_build_info_file_name(),
         written_build_info.clone(),
+        store_output_time_stamp,
+        output_time_stamps.clone(),
     );
     // Go keeps the statistics in the task result for the build aggregate
     // (buildtask.go:233); they go back in the worker result.
@@ -273,6 +282,11 @@ pub fn compile_and_emit_worker(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let (diagnostics, diagnostic_file_texts) = worker_diagnostics(&result.diagnostics);
+    let output_time_stamps = std::mem::take(
+        &mut *output_time_stamps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
     WorkerCompileResult {
         exit_status: result.status,
         output,
@@ -282,6 +296,7 @@ pub fn compile_and_emit_worker(
         has_changed_dts_file: program.has_changed_dts_file(),
         build_info_file_name,
         statistics,
+        output_time_stamps,
         fs_cache: host
             .cached_fs
             .state_excluding(&[fs_cache, &program_fs_cache]),
@@ -334,10 +349,14 @@ fn worker_diagnostics(
 // `config.GetBuildInfoFileName()` (incremental/program.go emitBuildInfo),
 // so the file name is compared instead. The worker has no task, so the
 // `onBuildInfoEmit` call is recorded as the written file name and runs in
-// the orchestrator. The `storeOutputTimeStamp` branch is watch only.
+// the orchestrator. The `storeOutputTimeStamp` branch (watch mode) is
+// recorded in `output_time_stamps`, and the orchestrator stores the times
+// (`BuildTask::compile_and_emit_finish`).
 fn new_task_write_file(
     build_info_file_name: String,
     written_build_info: Arc<Mutex<Option<String>>>,
+    store_output_time_stamp: bool,
+    output_time_stamps: Arc<Mutex<Vec<(String, SystemTime)>>>,
 ) -> WriteFile {
     Arc::new(
         move |file_name: &str, text: &str, _data: &mut WriteFileData| -> Result<(), String> {
@@ -348,6 +367,16 @@ fn new_task_write_file(
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             Some(file_name.to_string());
+                    } else if store_output_time_stamp {
+                        // Store time stamps
+                        // PORT: Go `orchestrator.opts.Sys.Now()`. The
+                        // callback runs on a checker thread and cannot hold
+                        // the `Rc` system; the OS system's `Now` is
+                        // `SystemTime::now`.
+                        output_time_stamps
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((file_name.to_string(), SystemTime::now()));
                     }
                     Ok(())
                 }
@@ -407,6 +436,21 @@ impl MarshalerTo for WorkerCompileResult {
             Some(statistics) => statistics.marshal_json_to(enc)?,
             None => enc.push_str("null"),
         }
+        enc.push_str(",\"outputTimeStamps\":[");
+        for (i, (file_name, m_time)) in self.output_time_stamps.iter().enumerate() {
+            if i > 0 {
+                enc.push(',');
+            }
+            let since_epoch = m_time.duration_since(UNIX_EPOCH).unwrap_or_default();
+            enc.push('[');
+            file_name.marshal_json_to(enc)?;
+            enc.push(',');
+            enc.push_str(&since_epoch.as_secs().to_string());
+            enc.push(',');
+            enc.push_str(&since_epoch.subsec_nanos().to_string());
+            enc.push(']');
+        }
+        enc.push(']');
         enc.push_str(",\"fsCache\":");
         marshal_cached_fs_state(&self.fs_cache, enc)?;
         enc.push('}');
@@ -520,6 +564,7 @@ fn decode_worker_compile_result(
         has_changed_dts_file: false,
         build_info_file_name: None,
         statistics: None,
+        output_time_stamps: Vec::new(),
         fs_cache: CachedFsState::default(),
     };
     if dec.read_token()? != JsonToken::BeginObject {
@@ -592,6 +637,28 @@ fn decode_worker_compile_result(
                 } else {
                     result.statistics = Some(decode_statistics(dec)?);
                 }
+            }
+            "outputTimeStamps" => {
+                if dec.read_token()? != JsonToken::BeginArray {
+                    return Err(invalid());
+                }
+                while dec.peek_kind() != b']' {
+                    if dec.read_token()? != JsonToken::BeginArray {
+                        return Err(invalid());
+                    }
+                    let mut file_name = String::new();
+                    json_unmarshal_decode(dec, &mut file_name)?;
+                    let mut seconds = 0.0f64;
+                    json_unmarshal_decode(dec, &mut seconds)?;
+                    let mut nanoseconds = 0.0f64;
+                    json_unmarshal_decode(dec, &mut nanoseconds)?;
+                    if dec.read_token()? != JsonToken::EndArray {
+                        return Err(invalid());
+                    }
+                    let m_time = UNIX_EPOCH + Duration::new(seconds as u64, nanoseconds as u32);
+                    result.output_time_stamps.push((file_name, m_time));
+                }
+                dec.read_token()?;
             }
             "fsCache" => result.fs_cache = decode_cached_fs_state(dec)?,
             _ => dec.skip_value()?,
@@ -729,6 +796,7 @@ impl WorkerLauncher {
                 has_changed_dts_file: false,
                 build_info_file_name: None,
                 statistics: None,
+                output_time_stamps: Vec::new(),
                 fs_cache: CachedFsState::default(),
             }
         };
@@ -867,6 +935,7 @@ mod tests {
             has_changed_dts_file: false,
             build_info_file_name: None,
             statistics: None,
+            output_time_stamps: Vec::new(),
             fs_cache: CachedFsState::default(),
         };
         let line = marshal_worker_compile_result(&result);

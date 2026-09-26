@@ -4,10 +4,12 @@ use crate::prelude::*;
 
 // Go: sourcemap/lineinfo.go:5 ECMALineInfo
 // PORT: Go `core.ECMALineStarts` is a slice of `core.TextPos`; here `Vec<i32>`.
+// The unexported fields are `pub` because source_mapper.rs (same Go package)
+// reads them.
 #[derive(Clone, Debug, Default)]
 pub struct ECMALineInfo {
-    text: String,
-    line_starts: Vec<i32>,
+    pub text: String,
+    pub line_starts: Vec<i32>,
 }
 
 // Go: sourcemap/lineinfo.go:10 CreateECMALineInfo

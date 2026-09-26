@@ -71,14 +71,9 @@ fn binder_get_members(b: &mut Binder, symbol: SymbolId) -> SymbolTable {
 }
 
 /// Go `ast.GetLocals(container)`: creates the table on first use.
+// PERF: `Binder::get_locals` sizes a new table for the container.
 fn binder_get_locals(b: &mut Binder, container: Node) -> SymbolTable {
-    let locals = bound(b, container).locals;
-    if locals.is_some() {
-        return locals;
-    }
-    let table = b.symbols.new_table();
-    bound_mut(b, container).locals = table;
-    table
+    b.get_locals(container)
 }
 
 /// Go `ast.IsExternalOrCommonJSModule(b.file)` while binding: the CommonJS
@@ -185,8 +180,9 @@ impl Binder {
             SyntaxKind::ClassExpression => {
                 let mut name_text: String = INTERNAL_SYMBOL_NAME_CLASS.to_string();
                 if name.is_some() {
+                    // PORT: Go also adds the name to `classifiableNames`,
+                    // which nothing reads (see `Binder`).
                     name_text = name.text().to_string();
-                    self.classifiable_names.insert(Name::from(&name_text));
                 }
                 self.bind_anonymous_declaration(node, SymbolFlags::CLASS, &name_text);
             }
@@ -366,6 +362,9 @@ impl Binder {
         }
         symbol = get_initializer_symbol(self, symbol);
         if symbol.is_some() {
+            // PERF: a superset of "gave `node` a symbol". The declaration
+            // transformer walks for expando assignments only when it is set.
+            self.file_bind.has_expando_assignments = true;
             if has_dynamic_name(node) {
                 self.bind_anonymous_declaration(
                     node,

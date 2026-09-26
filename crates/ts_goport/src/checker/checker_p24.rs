@@ -4,6 +4,7 @@
 
 use crate::checker::utilities_p1::SymbolSortKey;
 use crate::prelude::*;
+use smallvec::SmallVec;
 
 /// Reusable buffers of `get_named_members` (the `Checker` field
 /// `named_members_scratch`), so a call allocates only its result.
@@ -16,6 +17,8 @@ pub(crate) struct NamedMembersScratch {
     keys: Vec<SymbolSortKey>,
     /// Sort keys of the members that are not contained.
     other_keys: Vec<SymbolSortKey>,
+    /// Ranges of the container's declarations, read once per call.
+    container_ranges: Vec<TextRange>,
 }
 
 impl Checker {
@@ -76,12 +79,18 @@ impl Checker {
      */
     // Go: checker/checker.go:21302 getPropertyOfObjectType
     pub fn get_property_of_object_type(&mut self, t: TypeId, name: &str) -> SymbolId {
+        self.get_property_of_object_type_key(t, TableKey::Text(name))
+    }
+
+    /// `get_property_of_object_type` by `TableKey`. A `Name` key compares
+    /// ids and hashes no text.
+    pub fn get_property_of_object_type_key(&mut self, t: TypeId, name: TableKey<'_>) -> SymbolId {
         if self.ty(t).flags.intersects(TypeFlags::OBJECT) {
             // PORT: Go keeps the returned `*StructuredType`; we resolve, then
             // read the members from the arena.
             self.resolve_structured_type_members(t);
             let members = self.ty(t).as_structured_type().members;
-            let symbol = self.symbols.get(members, name);
+            let symbol = self.symbols.get_key(members, name);
             if symbol.is_some() && self.symbol_is_value(symbol) {
                 return symbol;
             }
@@ -96,8 +105,25 @@ impl Checker {
         name: &str,
         skip_object_function_property_augment: bool,
     ) -> SymbolId {
-        let prop =
-            self.get_union_or_intersection_property(t, name, skip_object_function_property_augment);
+        self.get_property_of_union_or_intersection_type_key(
+            t,
+            TableKey::Text(name),
+            skip_object_function_property_augment,
+        )
+    }
+
+    /// `get_property_of_union_or_intersection_type` by `TableKey`.
+    pub fn get_property_of_union_or_intersection_type_key(
+        &mut self,
+        t: TypeId,
+        name: TableKey<'_>,
+        skip_object_function_property_augment: bool,
+    ) -> SymbolId {
+        let prop = self.get_union_or_intersection_property_key(
+            t,
+            name,
+            skip_object_function_property_augment,
+        );
         // We need to filter out partial properties in union types
         if prop.is_some()
             && self
@@ -122,6 +148,22 @@ impl Checker {
         name: &str,
         skip_object_function_property_augment: bool,
     ) -> SymbolId {
+        self.get_union_or_intersection_property_key(
+            t,
+            TableKey::Text(name),
+            skip_object_function_property_augment,
+        )
+    }
+
+    /// `get_union_or_intersection_property` by `TableKey`. The cache and the
+    /// constituent lookups use the key; the stores use one `Name` (the key's
+    /// own, or the text interned once).
+    pub fn get_union_or_intersection_property_key(
+        &mut self,
+        t: TypeId,
+        name: TableKey<'_>,
+        skip_object_function_property_augment: bool,
+    ) -> SymbolId {
         let cache = if skip_object_function_property_augment {
             let mut data = self
                 .ty(t)
@@ -140,7 +182,7 @@ impl Checker {
                 .property_cache = data;
             table
         };
-        let prop = self.symbols.get(cache, name);
+        let prop = self.symbols.get_key(cache, name);
         if prop.is_some() {
             return prop;
         }
@@ -150,7 +192,8 @@ impl Checker {
             skip_object_function_property_augment,
         );
         if prop.is_some() {
-            self.symbols.set(cache, name, prop);
+            let name = table_key_name(name);
+            self.symbols.set(cache, &name, prop);
             // Propagate an entry from the non-augmented cache to the augmented cache unless the property is partial.
             if skip_object_function_property_augment
                 && !self.sym(prop).check_flags.intersects(CheckFlags::PARTIAL)
@@ -160,19 +203,21 @@ impl Checker {
                 self.ty_mut(t)
                     .as_union_or_intersection_type_mut()
                     .property_cache = data;
-                if self.symbols.get(augmented_cache, name).is_nil() {
-                    self.symbols.set(augmented_cache, name, prop);
-                }
+                // PORT: Go `if augmentedCache[name] == nil { ... = prop }` in
+                // one lookup.
+                self.symbols.set_if_absent(augmented_cache, &name, prop);
             }
         }
         prop
     }
 
     // Go: checker/checker.go:21351 createUnionOrIntersectionProperty
+    // PORT: `name` is a `TableKey`, so a `Name` key looks up each constituent
+    // by id and names the new symbol without an intern.
     pub fn create_union_or_intersection_property(
         &mut self,
         containing_type: TypeId,
-        name: &str,
+        name: TableKey<'_>,
         skip_object_function_property_augment: bool,
     ) -> SymbolId {
         let mut prop_flags = SymbolFlags::NONE;
@@ -290,8 +335,8 @@ impl Checker {
                     }
                 } else if is_union {
                     let mut index_info = IndexInfoId::NIL;
-                    if !is_late_bound_name(name) {
-                        index_info = self.get_applicable_index_info_for_name(t, name);
+                    if !is_late_bound_name(name.text()) {
+                        index_info = self.get_applicable_index_info_for_name(t, name.text());
                     }
                     if index_info.is_some() {
                         prop_flags =
@@ -421,7 +466,7 @@ impl Checker {
         prop_types.extend(index_types.iter().copied());
         let result = self.new_symbol_ex(
             prop_flags | optional_flag,
-            name,
+            table_key_name(name),
             check_flags | synthetic_flag,
         );
         self.sym_mut(result).declarations = declarations.into();
@@ -924,19 +969,20 @@ impl Checker {
     /// that never changes once set (constituents, resolved type arguments).
     /// `read(c, owner, i)` reads element `i` in place, so the list is copied
     /// only when an element changes. Each element is mapped once, in order.
-    /// `None` means no element changed.
+    /// `None` means no element changed. Callers only read the result as a
+    /// slice, so a short list stays on the stack.
     pub fn map_stored_types_if_changed(
         &mut self,
         owner: TypeId,
         count: usize,
         read: fn(&Checker, TypeId, usize) -> TypeId,
         map: &mut dyn FnMut(&mut Checker, TypeId) -> TypeId,
-    ) -> Option<Vec<TypeId>> {
+    ) -> Option<SmallVec<[TypeId; 8]>> {
         for i in 0..count {
             let value = read(self, owner, i);
             let mapped = map(self, value);
             if mapped != value {
-                let mut result: Vec<TypeId> = Vec::with_capacity(count);
+                let mut result: SmallVec<[TypeId; 8]> = SmallVec::with_capacity(count);
                 result.extend((0..i).map(|j| read(self, owner, j)));
                 result.push(mapped);
                 for j in i + 1..count {
@@ -1289,10 +1335,12 @@ impl Checker {
             symbols: candidates,
             keys,
             other_keys,
+            container_ranges,
         } = &mut scratch;
         candidates.clear();
         keys.clear();
         other_keys.clear();
+        container_ranges.clear();
         candidates.extend(
             self.symbols
                 .iter(members)
@@ -1304,6 +1352,12 @@ impl Checker {
                 .sym(container)
                 .flags
                 .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE);
+        // `is_declaration_contained_by` reads the container's declaration
+        // ranges for each member. They do not change during the loop, so they
+        // are read once here and each member range is tested against them.
+        if is_class_or_interface_container {
+            container_ranges.extend(self.sym(container).declarations.iter().map(|d| d.loc()));
+        }
         let mut last_file = (Node::NIL, 0);
         for &symbol in candidates.iter() {
             if !self.symbol_is_value(symbol) {
@@ -1311,7 +1365,7 @@ impl Checker {
             }
             let key = self.symbol_sort_key(symbol, &mut last_file);
             if is_class_or_interface_container
-                && !self.is_declaration_contained_by(symbol, container)
+                && !self.is_declaration_contained_in(symbol, container_ranges)
             {
                 other_keys.push(key);
             } else {
@@ -1344,6 +1398,21 @@ impl Checker {
                     return true;
                 }
             }
+        }
+        false
+    }
+
+    /// `is_declaration_contained_by` with the container's declaration ranges
+    /// already read (`get_named_members`).
+    fn is_declaration_contained_in(
+        &self,
+        symbol: SymbolId,
+        container_ranges: &[TextRange],
+    ) -> bool {
+        let declaration = self.sym(symbol).value_declaration;
+        if declaration.is_some() {
+            let range = declaration.loc();
+            return container_ranges.iter().any(|&d| range.contained_by(d));
         }
         false
     }
@@ -1450,9 +1519,12 @@ impl Checker {
         if let Some(&cached_type) = self.active_type_mappers_caches[cache_index].get(&key) {
             return cached_type;
         }
+        // PORT: `instantiation_depth` goes first (perf experiment K). The
+        // limit checks above do not change and no call runs between the
+        // three increments, so only the store order differs.
+        self.instantiation_depth += 1;
         self.total_instantiation_count += 1;
         self.instantiation_count += 1;
-        self.instantiation_depth += 1;
         let result = self.instantiate_type_worker(t, m, alias);
         if index == -1 {
             self.pop_active_mapper();
@@ -1761,6 +1833,15 @@ impl Checker {
             return self.get_intersection_type(&[new_constraint, new_base_type]);
         }
         t
+    }
+}
+
+/// The `Name` of a table key: a `Name` key is copied, a text key is
+/// interned.
+fn table_key_name(key: TableKey<'_>) -> Name {
+    match key {
+        TableKey::Text(text) => Name::from(text),
+        TableKey::Name(name) => name.clone(),
     }
 }
 

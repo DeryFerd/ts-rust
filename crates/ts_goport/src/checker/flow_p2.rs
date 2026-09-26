@@ -6,6 +6,7 @@
 //! held across calls into the checker.
 
 use crate::prelude::*;
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 impl Checker {
@@ -1282,9 +1283,11 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1706 getAccessedPropertyName
-    pub fn get_accessed_property_name(&mut self, access: Node) -> (String, bool) {
+    // PERF: returns a `Cow`. Node text lives for the program, so identifier
+    // and literal names borrow it; only computed names allocate.
+    pub fn get_accessed_property_name(&mut self, access: Node) -> (Cow<'static, str>, bool) {
         if is_property_access_expression(access) {
-            return (access.name().text().to_string(), true);
+            return (Cow::Borrowed(access.name().text()), true);
         }
         if is_element_access_expression(access) {
             return self.try_get_element_access_expression_name(access);
@@ -1300,26 +1303,32 @@ impl Checker {
                 .iter()
                 .position(|&p| p == access)
                 .map_or(-1, |i| i as i32);
-            return (index.to_string(), true);
+            return (Cow::Owned(index.to_string()), true);
         }
-        (String::new(), false)
+        (Cow::Borrowed(""), false)
     }
 
     // Go: checker/flow.go:1722 tryGetElementAccessExpressionName
     // PORT: Go `*ast.ElementAccessExpression` is the element access `Node`.
-    pub fn try_get_element_access_expression_name(&mut self, node: Node) -> (String, bool) {
+    pub fn try_get_element_access_expression_name(
+        &mut self,
+        node: Node,
+    ) -> (Cow<'static, str>, bool) {
         let argument_expression = node.argument_expression();
         if is_string_or_numeric_literal_like(argument_expression) {
-            return (argument_expression.text().to_string(), true);
+            return (Cow::Borrowed(argument_expression.text()), true);
         }
         if is_entity_name_expression(argument_expression) {
             return self.try_get_name_from_entity_name_expression(argument_expression);
         }
-        (String::new(), false)
+        (Cow::Borrowed(""), false)
     }
 
     // Go: checker/flow.go:1732 tryGetNameFromEntityNameExpression
-    pub fn try_get_name_from_entity_name_expression(&mut self, node: Node) -> (String, bool) {
+    pub fn try_get_name_from_entity_name_expression(
+        &mut self,
+        node: Node,
+    ) -> (Cow<'static, str>, bool) {
         let symbol = self.resolve_entity_name(
             node,
             SymbolFlags::VALUE,
@@ -1331,17 +1340,17 @@ impl Checker {
             || !(self.is_constant_variable(symbol)
                 || self.sym(symbol).flags.intersects(SymbolFlags::ENUM_MEMBER))
         {
-            return (String::new(), false);
+            return (Cow::Borrowed(""), false);
         }
         let declaration = self.sym(symbol).value_declaration;
         if declaration.is_nil() {
-            return (String::new(), false);
+            return (Cow::Borrowed(""), false);
         }
         let t = self.try_get_type_from_type_node(declaration);
         if t.is_some() {
             let (name, ok) = try_get_name_from_type(self, t);
             if ok {
-                return (name, true);
+                return (Cow::Owned(name), true);
             }
         }
         // We exclude binding elements because their initializers don't solely determine their types and resolving
@@ -1354,13 +1363,15 @@ impl Checker {
             if initializer.is_some() {
                 let initializer_type = self.get_type_of_expression(initializer);
                 if initializer_type.is_some() {
-                    return try_get_name_from_type(self, initializer_type);
+                    let (name, ok) = try_get_name_from_type(self, initializer_type);
+                    return (Cow::Owned(name), ok);
                 }
             } else if is_enum_member(declaration) {
-                return try_get_text_of_property_name(declaration.name());
+                let (name, ok) = try_get_text_of_property_name(declaration.name());
+                return (Cow::Owned(name), ok);
             }
         }
-        (String::new(), false)
+        (Cow::Borrowed(""), false)
     }
 }
 
@@ -1389,7 +1400,7 @@ pub fn try_get_name_from_type(c: &Checker, t: TypeId) -> (String, bool) {
 
 impl Checker {
     // Go: checker/flow.go:1771 getDestructuringPropertyName
-    pub fn get_destructuring_property_name(&mut self, node: Node) -> (String, bool) {
+    pub fn get_destructuring_property_name(&mut self, node: Node) -> (Cow<'static, str>, bool) {
         let parent = node.parent();
         if is_binding_element(node) && is_object_binding_pattern(parent) {
             return self.get_literal_property_name_text(get_binding_element_property_name(node));
@@ -1404,13 +1415,13 @@ impl Checker {
                 .iter()
                 .position(|&e| e == node)
                 .map_or(-1, |i| i as i32);
-            return (index.to_string(), true);
+            return (Cow::Owned(index.to_string()), true);
         }
-        (String::new(), false)
+        (Cow::Borrowed(""), false)
     }
 
     // Go: checker/flow.go:1785 getLiteralPropertyNameText
-    pub fn get_literal_property_name_text(&mut self, name: Node) -> (String, bool) {
+    pub fn get_literal_property_name_text(&mut self, name: Node) -> (Cow<'static, str>, bool) {
         let t = self.get_literal_type_from_property_name(name);
         if self
             .ty(t)
@@ -1423,9 +1434,23 @@ impl Checker {
                 .value
                 .as_ref()
                 .expect("Unhandled case in AnyToString");
-            return (any_to_string(value), true);
+            // PERF: an identifier or string literal name gives a string literal
+            // type of its own text. When the value is that text, borrow the node
+            // text (it lives for the program) instead of copying the value.
+            if let LiteralValue::String(value) = value
+                && matches!(
+                    name.kind(),
+                    SyntaxKind::Identifier
+                        | SyntaxKind::StringLiteral
+                        | SyntaxKind::NoSubstitutionTemplateLiteral
+                )
+                && name.text() == value.as_str()
+            {
+                return (Cow::Borrowed(name.text()), true);
+            }
+            return (Cow::Owned(any_to_string(value)), true);
         }
-        (String::new(), false)
+        (Cow::Borrowed(""), false)
     }
 
     // Go: checker/flow.go:1793 isConstantReference

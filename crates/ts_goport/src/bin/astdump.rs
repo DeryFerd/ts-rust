@@ -58,7 +58,7 @@ fn dump(out: &mut String, file: Node, n: Node, depth: usize, marker: &str) {
 /// `lib!<basename>` like the Go tool.
 fn out_name(file: Node) -> String {
     let name = source_file_file_name(file);
-    if file.go_file().info.is_default_library {
+    if is_source_file_default_library(&source_file_info(file).path) {
         return format!("lib!{}", name.rsplit('/').next().unwrap_or(name));
     }
     name.replace('/', "!")

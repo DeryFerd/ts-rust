@@ -393,10 +393,12 @@ fn glob_split(input: &[u8]) -> (&[u8], &[u8]) {
 // struct share it like Go pointers do. Go `*TypeAcquisition` is an
 // `Option`. Go `[]*ProjectReference` is `Vec<ProjectReference>`, the type
 // that `parse_project_reference` returns.
-// PORT: the Go `WatchOptions` field is left out. Watch mode is out of scope
-// and the crate has no `WatchOptions` type. Go `ParseJsonConfigFileContent`
-// never sets it.
-#[derive(Clone, Debug, Default)]
+// PORT: the Go `WatchOptions` field is left out. The crate has no
+// `WatchOptions` type, and Go `ParseJsonConfigFileContent` never sets it.
+// PORT: `PartialEq` is Go `reflect.DeepEqual` (execute/watcher.go
+// recheckTsConfig). Go DeepEqual also tells a nil slice from an empty one;
+// a `Vec` has no nil, so those two compare equal here.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParsedOptions {
     pub compiler_options: Rc<CompilerOptions>,
     pub type_acquisition: Option<TypeAcquisition>,

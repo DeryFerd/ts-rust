@@ -23,9 +23,8 @@ use std::time::SystemTime;
 // parallel by using `build_project_start` / `build_project_finish` around
 // `compile_and_emit_in_worker`.
 //
-// PORT: watch mode is out of scope. `updateWatch` and `resetConfig` are
-// not ported; `downStream`, `isInitialCycle`, `dirty` and
-// `updateDownstream` are kept because `buildProject` uses them.
+// PORT: the watch-only `updateWatch` and `resetConfig` are in
+// orchestrator_watch.rs, with the orchestrator watch code.
 //
 // PORT: each worker reports its own project statistics
 // (`tsc.EmitAndReportStatistics`) and sends them back in its result, so
@@ -122,6 +121,9 @@ impl TaskResult {
 //   `data.BuildInfo != nil`, or `None` when no build info was written.
 // - `statistics`: the statistics of `tsc.EmitAndReportStatistics` (`None`
 //   when Go returns nil).
+// - `output_time_stamps`: the files that `writeFile` wrote with
+//   `storeOutputTimeStamp` true, each with its Go `Sys.Now()` time
+//   (watch mode only).
 // - `fs_cache`: the cached file system entries the worker added (see
 //   shared_fs.rs). The orchestrator merges them into its cache.
 #[derive(Clone, Debug)]
@@ -134,6 +136,7 @@ pub struct WorkerCompileResult {
     pub has_changed_dts_file: bool,
     pub build_info_file_name: Option<String>,
     pub statistics: Option<Statistics>,
+    pub output_time_stamps: Vec<(String, SystemTime)>,
     pub fs_cache: CachedFsState,
 }
 
@@ -144,8 +147,8 @@ pub struct WorkerCompileResult {
 //   `Code()`, `Category()` and the message arguments.
 // PORT: the message chain and the related information are not sent. Go
 // reads `t.errors` only for the error summary (`WriteErrorSummaryText`
-// reads the category, the file and the line of `Pos()`) and in watch mode,
-// which is not ported.
+// reads the category, the file and the line of `Pos()`) and in watch mode
+// (see `compile_and_emit_finish`).
 #[derive(Clone, Debug)]
 pub struct WorkerDiagnostic {
     pub file_name: Option<String>,
@@ -543,6 +546,13 @@ impl BuildTask {
             result.builder.push_str(&worker_result.output);
             result.has_changed_dts_file = worker_result.has_changed_dts_file;
         }
+        // Go: build/buildtask.go:783 (*BuildTask).writeFile, the
+        // `storeOutputTimeStamp` branch.
+        // PORT: the worker records the times (worker.rs); they go into the
+        // orchestrator's mTimes cache here.
+        for (file_name, m_time) in &worker_result.output_time_stamps {
+            orchestrator.store_m_time(file_name, *m_time);
+        }
         // Go: build/buildtask.go:785 (*BuildTask).writeFile, build info part.
         // PORT: Go passes the in-memory BuildInfo that was just written; it
         // is read back from the written file here, which has the same
@@ -555,6 +565,16 @@ impl BuildTask {
                 build_info,
                 worker_result.has_changed_dts_file,
             );
+        }
+
+        // PORT: the worker diagnostics in `t.errors` (`worker_errors`) have
+        // no message chain and no related information. Watch mode prints
+        // `t.errors` again for a task that it does not rebuild, so a watch
+        // build with worker diagnostics stops here.
+        if orchestrator.command().compiler_options.watch.is_true()
+            && !worker_result.diagnostics.is_empty()
+        {
+            unported!("BuildTask.reportDiagnostic (build worker diagnostics in watch mode)");
         }
 
         self.result_mut().exit_status = worker_result.exit_status;
@@ -1242,8 +1262,8 @@ impl BuildTask {
         }
     }
 
-    // Go: build/buildtask.go:700 (*BuildTask).updateWatch
-    // PORT: watch mode only; not ported (see top).
+    // Go: build/buildtask.go:698 (*BuildTask).updateWatch
+    // PORT: in orchestrator_watch.rs.
 
     // Go: build/buildtask.go:710 (*BuildTask).resetStatus
     pub fn reset_status(&mut self) {
@@ -1252,8 +1272,8 @@ impl BuildTask {
         self.errors = Vec::new();
     }
 
-    // Go: build/buildtask.go:716 (*BuildTask).resetConfig
-    // PORT: watch mode only; not ported (see top).
+    // Go: build/buildtask.go:714 (*BuildTask).resetConfig
+    // PORT: in orchestrator_watch.rs.
 
     // Go: build/buildtask.go:721 (*BuildTask).loadOrStoreBuildInfo
     pub fn load_or_store_build_info(
@@ -1351,6 +1371,7 @@ impl BuildTask {
 
     // Go: build/buildtask.go:785 (*BuildTask).writeFile
     // PORT: runs in the worker (plan D1). Its build info branch is
-    // `on_build_info_emit` in `compile_and_emit_finish`; its watch-only
-    // `storeMTime` branch is never taken without watch mode.
+    // `on_build_info_emit` in `compile_and_emit_finish`; the worker records
+    // the watch-only `storeMTime` branch in `output_time_stamps`, which
+    // `compile_and_emit_finish` stores.
 }

@@ -1,0 +1,560 @@
+use crate::ls::autoimport::prelude::*;
+
+// Port of Go `ls/autoimport/aliasresolver.go`.
+//
+// PORT: Go `aliasResolver` implements `checker.Program`, so the registry can
+// make a checker (`checker.NewChecker(aliasResolver, nil)`) over node_modules
+// entrypoint files that are not in any program. A ts_goport checker reads
+// its program version (`prog()`), so `new_checker` makes an alias resolver
+// program (`program::new_alias_resolver_program`). The `checker.Program`
+// methods are inherent methods with the Go logic. The `program.rs`
+// functions call the lazy ones through `program::AliasResolverProgram`, and
+// give Go's constant or panic for the others.
+// PORT: the registry host parses the files outside any program. Each file
+// is published with no program and bound into the binder lineage, as
+// sourcedefinition does (`bind_alias_resolver_source_file`).
+
+use crate::frontend::core_ext::HasFileName;
+use crate::frontend::module;
+use crate::frontend::module::ResolutionHost as _;
+use crate::frontend::packagejson;
+use crate::frontend::tsoptions;
+use crate::frontend::tspath;
+use crate::frontend::vfs::Fs as _;
+use crate::modulespecifiers::symlinks::KnownSymlinks;
+use crate::program::{AliasResolverProgram, AliasResolverProgramScope};
+use std::cell::Cell;
+
+// Go: ls/autoimport/aliasresolver.go:16 pathAndFileName
+#[derive(Clone, Debug, Default)]
+pub struct PathAndFileName {
+    pub path: tspath::Path,
+    pub file_name: String,
+}
+
+// Go: ls/autoimport/aliasresolver.go:21 aliasResolver
+// PORT: Go `collections.SyncMap` values are `RefCell<FxHashMap>` (one
+// thread). A Go nil `symlinks` map is an empty map. The last two fields are
+// the port's (see `new_checker`).
+pub struct AliasResolver {
+    pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
+    pub host: Rc<dyn RegistryCloneHost>,
+    pub module_resolver: Rc<module::Resolver>,
+
+    pub root_files: Vec<Node>,
+    // symlinks maps from realpath to symlinked path and file name
+    pub symlinks: FxHashMap<tspath::Path, PathAndFileName>,
+    pub on_failed_ambient_module_lookup: Rc<dyn Fn(&dyn HasFileName, &str)>,
+    pub resolved_modules: RefCell<
+        FxHashMap<
+            tspath::Path,
+            Rc<RefCell<FxHashMap<module::ModeAwareCacheKey, Rc<ResolvedModule>>>>,
+        >,
+    >,
+    /// The resolutions that `new_checker` made before the checker, by file
+    /// path (`prefetch_resolved_module`).
+    pub prefetched_modules:
+        RefCell<FxHashMap<tspath::Path, FxHashMap<module::ModeAwareCacheKey, Rc<ResolvedModule>>>>,
+    /// The program of the checker, once `new_checker` made it.
+    pub checker_program: Cell<Option<&'static GoProgram>>,
+}
+
+// Go: ls/autoimport/aliasresolver.go:33 newAliasResolver
+pub fn new_alias_resolver(
+    root_files: Vec<Node>,
+    symlinks: FxHashMap<tspath::Path, PathAndFileName>,
+    host: Rc<dyn RegistryCloneHost>,
+    module_resolver: Rc<module::Resolver>,
+    to_path: Rc<dyn Fn(&str) -> tspath::Path>,
+    on_failed_ambient_module_lookup: Rc<dyn Fn(&dyn HasFileName, &str)>,
+) -> Rc<AliasResolver> {
+    let r = Rc::new(AliasResolver {
+        to_path,
+        host,
+        module_resolver,
+        root_files,
+        symlinks,
+        on_failed_ambient_module_lookup,
+        resolved_modules: RefCell::new(FxHashMap::default()),
+        prefetched_modules: RefCell::new(FxHashMap::default()),
+        checker_program: Cell::new(None),
+    });
+    r
+}
+
+/// Go `binder.BindSourceFile(file)` on a file that the registry host parsed
+/// for the alias resolver. `current_directory` is the host's.
+// PORT: the file is in no program. It is published with no program
+// (`program::publish_parsed_files`) and bound into the binder lineage
+// (`program::bind_file_outside_program`, Go `BindOnce`).
+pub fn bind_alias_resolver_source_file(current_directory: &str, file: Node) {
+    crate::program::publish_parsed_files(current_directory);
+    crate::program::bind_file_outside_program(file);
+}
+
+/// The module names that a checker of an alias resolver can resolve from
+/// `file` (Go `GetResolvedModule`): the imports and the string literal module
+/// augmentations of the file, the names that a `compiler.Program` resolves
+/// (Go compiler/fileloader.go resolveImportsAndModuleAugmentations).
+fn checker_module_references(file: Node) -> Vec<String> {
+    let info = source_file_info(file);
+    info.imports
+        .iter()
+        .chain(
+            info.module_augmentations
+                .iter()
+                .filter(|name| is_string_literal(**name)),
+        )
+        .map(|name| name.text().to_string())
+        .collect()
+}
+
+/// True when the arena of a checker of `program` holds the symbols of
+/// `file`: the file is bound, and its symbols are older than the program's
+/// copy of the binder lineage.
+fn checker_arena_holds(program: &'static GoProgram, file: Node) -> bool {
+    let Some(go_file) = crate::ast::try_go_file(file.file_index()) else {
+        return false;
+    };
+    if go_file.file_bind.get().is_none() {
+        return false;
+    }
+    let symbol = file.symbol();
+    let count = program
+        .bound_symbols
+        .get()
+        .map_or(0, SymbolArena::symbol_count);
+    symbol.is_nil() || symbol.index() < count
+}
+
+impl AliasResolver {
+    /// Go `checker.NewChecker(aliasResolver, nil)`. The checker's program is
+    /// current on this thread while the returned scope lives; keep the scope
+    /// as long as the checker is used. `also_reads` are files that the caller
+    /// reads with `get_source_file` while the checker lives.
+    // PORT: a checker copies the binder lineage when it is made
+    // (`SymbolArena::for_checker`), so it cannot read a file bound later. Go
+    // binds each file when `GetSourceFile` parses it, while the checker
+    // runs. Here the files that the checker can reach are read and bound
+    // first: the root files, `also_reads`, and from each file the modules
+    // that its imports and module augmentations resolve to. This reads more
+    // files than Go, never fewer. The resolutions are kept
+    // (`prefetch_resolved_module`); `get_resolved_module` fills the Go cache
+    // and reports a failed lookup only when the checker asks, as Go does. A
+    // file that the checker asks for later and that its arena does not hold
+    // is unported (`bind_source_file`).
+    // PORT: Go binds a second-pass root file only if an earlier pass bound
+    // it (registry.go:1078 reads it from the host). Here every root file is
+    // bound.
+    pub fn new_checker(
+        self: &Rc<Self>,
+        also_reads: &[Node],
+    ) -> (Rc<RefCell<Checker>>, AliasResolverProgramScope) {
+        // Go: NewChecker reads each root file; a nil file is a nil dereference.
+        if self.root_files.iter().any(|file| file.is_nil()) {
+            go_panic(
+                "runtime error: invalid memory address or nil pointer dereference".to_string(),
+            );
+        }
+        let current_directory = self.get_current_directory();
+        // The registry reads the second-pass root files from its host.
+        crate::program::publish_parsed_files(&current_directory);
+        let mut files: Vec<Node> = Vec::new();
+        let mut seen: FxHashSet<usize> = FxHashSet::default();
+        for &file in self.root_files.iter().chain(also_reads) {
+            if file.is_some() && seen.insert(file.file_index()) {
+                crate::program::bind_file_outside_program(file);
+                files.push(file);
+            }
+        }
+        // The host gives the same file for a name each time.
+        let mut read_names: FxHashSet<String> = FxHashSet::default();
+        let mut next = 0;
+        while next < files.len() {
+            let file = files[next];
+            next += 1;
+            for module_reference in checker_module_references(file) {
+                let resolved = self.prefetch_resolved_module(file, &module_reference);
+                if !resolved.is_resolved()
+                    || !read_names.insert(resolved.resolved_file_name.clone())
+                {
+                    continue;
+                }
+                // Go: GetSourceFileForResolvedModule
+                let target = self.get_source_file(&resolved.resolved_file_name);
+                if target.is_some() && seen.insert(target.file_index()) {
+                    files.push(target);
+                }
+            }
+        }
+        let scope = crate::program::new_alias_resolver_program(
+            self.options(),
+            &self.root_files,
+            &files,
+            &current_directory,
+            self.use_case_sensitive_file_names(),
+            self.clone(),
+        );
+        self.checker_program.set(Some(scope.program()));
+        let checker = ls_program::new_checker_for_version(scope.program());
+        (Rc::new(RefCell::new(checker)), scope)
+    }
+
+    /// The resolution that Go `GetResolvedModule` gives the checker for
+    /// `module_reference` in `file` (the mode is Go `GetModeForUsageLocation`,
+    /// always ESNext), made before the checker. It does not fill the Go
+    /// cache or report a failed lookup.
+    fn prefetch_resolved_module(&self, file: Node, module_reference: &str) -> Rc<ResolvedModule> {
+        let info = source_file_info(file);
+        let path = tspath::Path(info.path.clone());
+        let key = module::ModeAwareCacheKey {
+            name: module_reference.to_string(),
+            mode: ModuleKind::ES_NEXT,
+        };
+        let cached = self
+            .prefetched_modules
+            .borrow()
+            .get(&path)
+            .and_then(|modules| modules.get(&key).cloned());
+        if let Some(resolved) = cached {
+            return resolved;
+        }
+        let (resolved, _) = self.module_resolver.resolve_module_name(
+            module_reference,
+            &info.file_name,
+            ModuleKind::ES_NEXT,
+            None,
+        );
+        self.prefetched_modules
+            .borrow_mut()
+            .entry(path)
+            .or_default()
+            .insert(key, resolved.clone());
+        resolved
+    }
+
+    /// Go `binder.BindSourceFile(file)` in `GetSourceFile`.
+    // PORT: before the checker exists, the file is published and bound
+    // (`bind_alias_resolver_source_file`). After, the checker's arena must
+    // already hold it (see `new_checker`).
+    fn bind_source_file(&self, file: Node) {
+        let Some(program) = self.checker_program.get() else {
+            bind_alias_resolver_source_file(self.host.get_current_directory(), file);
+            return;
+        };
+        if !checker_arena_holds(program, file) {
+            unported!("aliasResolver.GetSourceFile after NewChecker");
+        }
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:53 BindSourceFiles
+    // BindSourceFiles implements checker.Program.
+    pub fn bind_source_files(&self) {
+        // We will bind as we parse
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:58 SourceFiles
+    // SourceFiles implements checker.Program.
+    pub fn source_files(&self) -> Vec<Node> {
+        self.root_files.clone()
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:63 Options
+    // Options implements checker.Program.
+    pub fn options(&self) -> CompilerOptions {
+        CompilerOptions {
+            no_check: Tristate::True,
+            ..Default::default()
+        }
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:70 GetCurrentDirectory
+    // GetCurrentDirectory implements checker.Program.
+    pub fn get_current_directory(&self) -> String {
+        self.host.get_current_directory().to_string()
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:75 UseCaseSensitiveFileNames
+    // UseCaseSensitiveFileNames implements checker.Program.
+    pub fn use_case_sensitive_file_names(&self) -> bool {
+        self.host.fs().use_case_sensitive_file_names()
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:80 GetSourceFile
+    // GetSourceFile implements checker.Program.
+    pub fn get_source_file(&self, file_name: &str) -> Node {
+        let file = self
+            .host
+            .get_source_file(file_name, &(self.to_path)(file_name));
+        // file may be nil due to symlink/realpath mismatch; see TestAutoImportBuilderFS
+        if file.is_nil() {
+            return Node::NIL;
+        }
+        self.bind_source_file(file);
+        file
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:91 GetDefaultResolutionModeForFile
+    // GetDefaultResolutionModeForFile implements checker.Program.
+    pub fn get_default_resolution_mode_for_file(&self, file: &dyn HasFileName) -> ResolutionMode {
+        ModuleKind::ES_NEXT
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:96 GetEmitModuleFormatOfFile
+    // GetEmitModuleFormatOfFile implements checker.Program.
+    pub fn get_emit_module_format_of_file(&self, source_file: &dyn HasFileName) -> ModuleKind {
+        ModuleKind::ES_NEXT
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:101 GetEmitSyntaxForUsageLocation
+    // GetEmitSyntaxForUsageLocation implements checker.Program.
+    pub fn get_emit_syntax_for_usage_location(
+        &self,
+        source_file: &dyn HasFileName,
+        usage_location: Node,
+    ) -> ResolutionMode {
+        ModuleKind::ES_NEXT
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:106 GetImpliedNodeFormatForEmit
+    // GetImpliedNodeFormatForEmit implements checker.Program.
+    pub fn get_implied_node_format_for_emit(&self, source_file: &dyn HasFileName) -> ModuleKind {
+        ModuleKind::ES_NEXT
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:111 GetModeForUsageLocation
+    // GetModeForUsageLocation implements checker.Program.
+    pub fn get_mode_for_usage_location(
+        &self,
+        file: &dyn HasFileName,
+        module_specifier: Node,
+    ) -> ResolutionMode {
+        ModuleKind::ES_NEXT
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:116 GetResolvedModule
+    // GetResolvedModule implements checker.Program.
+    pub fn get_resolved_module(
+        &self,
+        current_source_file: &dyn HasFileName,
+        module_reference: &str,
+        mode: ResolutionMode,
+    ) -> Rc<ResolvedModule> {
+        // Go: r.resolvedModules.LoadOrStore(currentSourceFile.Path(), &collections.SyncMap{})
+        let cache = self
+            .resolved_modules
+            .borrow_mut()
+            .entry(current_source_file.path())
+            .or_insert_with(|| Rc::new(RefCell::new(FxHashMap::default())))
+            .clone();
+        let key = module::ModeAwareCacheKey {
+            name: module_reference.to_string(),
+            mode,
+        };
+        let cached = cache.borrow().get(&key).cloned();
+        if let Some(resolved) = cached {
+            return resolved;
+        }
+        // PORT: `new_checker` made most resolutions before the checker
+        // (`prefetch_resolved_module`); they are the same.
+        let prefetched = self
+            .prefetched_modules
+            .borrow()
+            .get(&current_source_file.path())
+            .and_then(|modules| modules.get(&key).cloned());
+        let resolved = match prefetched {
+            Some(resolved) => resolved,
+            None => {
+                self.module_resolver
+                    .resolve_module_name(
+                        module_reference,
+                        &current_source_file.file_name(),
+                        mode,
+                        None,
+                    )
+                    .0
+            }
+        };
+        // Go: cache.LoadOrStore(key, resolved)
+        let resolved = cache.borrow_mut().entry(key).or_insert(resolved).clone();
+        if !resolved.is_resolved() && !tspath::path_is_relative(module_reference) {
+            (self.on_failed_ambient_module_lookup)(current_source_file, module_reference);
+        }
+        resolved
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:130 GetSourceFileForResolvedModule
+    // GetSourceFileForResolvedModule implements checker.Program.
+    pub fn get_source_file_for_resolved_module(&self, file_name: &str) -> Node {
+        self.get_source_file(file_name)
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:135 GetResolvedModules
+    // GetResolvedModules implements checker.Program.
+    // PORT: the Go nil map is an empty map.
+    pub fn get_resolved_modules(
+        &self,
+    ) -> FxHashMap<tspath::Path, module::ModeAwareCache<Rc<ResolvedModule>>> {
+        // only used when producing diagnostics, which hopefully the checker won't do
+        FxHashMap::default()
+    }
+
+    // ---
+
+    // Go: ls/autoimport/aliasresolver.go:143 GetSymlinkCache
+    // GetSymlinkCache implements checker.Program.
+    pub fn get_symlink_cache(&self) -> Rc<KnownSymlinks> {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:148 GetSourceFileMetaData
+    // GetSourceFileMetaData implements checker.Program.
+    pub fn get_source_file_meta_data(&self, path: &tspath::Path) -> SourceFileMetaData {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:153 CommonSourceDirectory
+    // CommonSourceDirectory implements checker.Program.
+    pub fn common_source_directory(&self) -> String {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:158 FileExists
+    // FileExists implements checker.Program.
+    pub fn file_exists(&self, file_name: &str) -> bool {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:163 GetGlobalTypingsCacheLocation
+    // GetGlobalTypingsCacheLocation implements checker.Program.
+    pub fn get_global_typings_cache_location(&self) -> String {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:168 GetImportHelpersImportSpecifier
+    // GetImportHelpersImportSpecifier implements checker.Program.
+    pub fn get_import_helpers_import_specifier(&self, path: &tspath::Path) -> Node {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:173 GetJSXRuntimeImportSpecifier
+    // GetJSXRuntimeImportSpecifier implements checker.Program.
+    pub fn get_jsx_runtime_import_specifier(&self, path: &tspath::Path) -> (String, Node) {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:178 GetNearestAncestorDirectoryWithPackageJson
+    // GetNearestAncestorDirectoryWithPackageJson implements checker.Program.
+    pub fn get_nearest_ancestor_directory_with_package_json(&self, dirname: &str) -> String {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:183 GetPackageJsonInfo
+    // GetPackageJsonInfo implements checker.Program.
+    pub fn get_package_json_info(
+        &self,
+        pkg_json_path: &str,
+    ) -> Option<Rc<packagejson::InfoCacheEntry>> {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:188 GetProjectReferenceFromOutputDts
+    // GetProjectReferenceFromOutputDts implements checker.Program.
+    pub fn get_project_reference_from_output_dts(
+        &self,
+        path: &tspath::Path,
+    ) -> Option<Rc<tsoptions::SourceOutputAndProjectReference>> {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:193 GetProjectReferenceFromSource
+    // GetProjectReferenceFromSource implements checker.Program.
+    pub fn get_project_reference_from_source(
+        &self,
+        path: &tspath::Path,
+    ) -> Option<Rc<tsoptions::SourceOutputAndProjectReference>> {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:198 GetRedirectForResolution
+    // GetRedirectForResolution implements checker.Program.
+    pub fn get_redirect_for_resolution(
+        &self,
+        file: &dyn HasFileName,
+    ) -> Option<Rc<tsoptions::ParsedCommandLine>> {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:203 GetRedirectTargets
+    // GetRedirectTargets implements checker.Program.
+    pub fn get_redirect_targets(&self, path: &tspath::Path) -> Vec<String> {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:208 GetResolvedModuleFromModuleSpecifier
+    // GetResolvedModuleFromModuleSpecifier implements checker.Program.
+    pub fn get_resolved_module_from_module_specifier(
+        &self,
+        file: &dyn HasFileName,
+        module_specifier: Node,
+    ) -> Option<Rc<ResolvedModule>> {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:213 GetSourceOfProjectReferenceIfOutputIncluded
+    // GetSourceOfProjectReferenceIfOutputIncluded implements checker.Program.
+    pub fn get_source_of_project_reference_if_output_included(
+        &self,
+        file: &dyn HasFileName,
+    ) -> String {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:218 IsSourceFileDefaultLibrary
+    // IsSourceFileDefaultLibrary implements checker.Program.
+    pub fn is_source_file_default_library(&self, path: &tspath::Path) -> bool {
+        false
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:223 IsSourceFromProjectReference
+    // IsSourceFromProjectReference implements checker.Program.
+    pub fn is_source_from_project_reference(&self, path: &tspath::Path) -> bool {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:228 SourceFileMayBeEmitted
+    // SourceFileMayBeEmitted implements checker.Program.
+    pub fn source_file_may_be_emitted(&self, source_file: Node, force_dts_emit: bool) -> bool {
+        go_panic("unimplemented".to_string())
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:232 GetPackagesMap
+    // PORT: the Go nil map is an empty map.
+    pub fn get_packages_map(&self) -> FxHashMap<String, bool> {
+        FxHashMap::default()
+    }
+}
+
+// Go: ls/autoimport/aliasresolver.go:236 var _ checker.Program = (*aliasResolver)(nil)
+// PORT: the lazy `checker.Program` methods, which the alias resolver
+// program calls (see the file header).
+impl AliasResolverProgram for AliasResolver {
+    fn source_file(&self, file_name: &str) -> Node {
+        self.get_source_file(file_name)
+    }
+
+    fn source_file_for_resolved_module(&self, file_name: &str) -> Node {
+        self.get_source_file_for_resolved_module(file_name)
+    }
+
+    fn resolved_module(
+        &self,
+        file: Node,
+        module_reference: &str,
+        mode: ResolutionMode,
+    ) -> ResolvedModule {
+        let info = source_file_info(file);
+        let current_source_file = new_has_file_name(&info.file_name, &info.path);
+        (*self.get_resolved_module(&current_source_file, module_reference, mode)).clone()
+    }
+}

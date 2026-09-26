@@ -15,6 +15,7 @@ pub mod ast;
 pub mod baseline;
 pub mod binder;
 pub mod checker;
+pub mod cmd;
 pub mod core;
 pub mod declarations;
 pub mod diag;
@@ -37,3 +38,14 @@ pub mod scanner_util;
 pub mod sourcemap;
 pub mod tracing;
 pub mod transformers;
+
+// Language-service port (Go `internal/{ls,lsp,project,format,astnav,fswatch,jsonrpc,api}`).
+pub mod api;
+pub mod astnav;
+pub mod format;
+pub mod fswatch;
+pub mod gostd;
+pub mod jsonrpc;
+pub mod ls;
+pub mod lsp;
+pub mod project;

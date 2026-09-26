@@ -67,6 +67,7 @@ use ts_goport::execute::tsc::{
     EXIT_UNPORTED, ExitStatus, ProgramLike, System, Writer, new_os_system, write_go_output,
 };
 use ts_goport::frontend::tsoptions::ParsedCommandLine;
+use ts_goport::gostd::context;
 use ts_goport::prelude::*;
 use ts_goport::scanner_util::go_string_bytes;
 
@@ -224,7 +225,9 @@ fn run(args: &[String], write_root: Option<String>, start: Instant) -> i32 {
         write_file: OnceCell::new(),
         refused: Arc::new(Mutex::new(Vec::new())),
     };
-    let result = catch_unwind(AssertUnwindSafe(|| command_line(sys.clone(), args, &bin)));
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        command_line(&context::background(), sys.clone(), args, &bin)
+    }));
 
     let refused = bin.refused.lock().map(|r| r.clone()).unwrap_or_default();
     // A refused write is also a TS5033 diagnostic, so the status is the tsc one.

@@ -7,6 +7,7 @@
 //! `InferenceContextId` that owns the list.
 
 use crate::prelude::*;
+use smallvec::SmallVec;
 
 impl Checker {
     // Infer a suitable input type for a homomorphic mapped type { [P in keyof T]: X }. We construct
@@ -704,10 +705,13 @@ impl Checker {
                                 .flags
                                 .intersects(TypeFlags::NEVER | TypeFlags::ANY)
                                 && {
-                                    let contra_candidates = self.inference_context(n).inferences
-                                        [index]
-                                        .contra_candidates
-                                        .clone();
+                                    // PORT: perf. The snapshot (Go ranges over
+                                    // the slice) lives on the stack up to 8.
+                                    let contra_candidates: SmallVec<[TypeId; 8]> =
+                                        SmallVec::from_slice(
+                                            &self.inference_context(n).inferences[index]
+                                                .contra_candidates,
+                                        );
                                     let mut some = false;
                                     for t in contra_candidates {
                                         if self.is_type_assignable_to(inferred_covariant_type, t) {
@@ -728,10 +732,11 @@ impl Checker {
                                                 other_type_parameter,
                                             ) != type_parameter
                                             || {
-                                                let other_candidates =
-                                                    self.inference_context(n).inferences[j]
-                                                        .candidates
-                                                        .clone();
+                                                let other_candidates: SmallVec<[TypeId; 8]> =
+                                                    SmallVec::from_slice(
+                                                        &self.inference_context(n).inferences[j]
+                                                            .candidates,
+                                                    );
                                                 let mut all = true;
                                                 for t in other_candidates {
                                                     if !self.is_type_assignable_to(
@@ -902,10 +907,11 @@ impl Checker {
         inference: usize,
         signature: SignatureId,
     ) -> TypeId {
+        // PORT: perf. The candidate snapshot lives on the stack up to 8.
         let (inference_candidates, type_parameter, top_level, is_fixed, priority) = {
             let info = &self.inference_context(n).inferences[inference];
             (
-                info.candidates.clone(),
+                SmallVec::<[TypeId; 8]>::from_slice(&info.candidates),
                 info.type_parameter,
                 info.top_level,
                 info.is_fixed,
@@ -954,9 +960,13 @@ impl Checker {
         n: InferenceContextId,
         inference: usize,
     ) -> TypeId {
+        // PORT: perf. The candidate snapshot lives on the stack up to 8.
         let (priority, contra_candidates) = {
             let info = &self.inference_context(n).inferences[inference];
-            (info.priority, info.contra_candidates.clone())
+            (
+                info.priority,
+                SmallVec::<[TypeId; 8]>::from_slice(&info.contra_candidates),
+            )
         };
         if priority.intersects(InferencePriority::PRIORITY_IMPLIES_COMBINATION) {
             return self.get_intersection_type(&contra_candidates);
@@ -1059,9 +1069,13 @@ impl Checker {
 
     // Go: checker/inference.go:1452 getTypeFromInference
     pub fn get_type_from_inference(&mut self, n: InferenceContextId, inference: usize) -> TypeId {
+        // PORT: perf. The candidate snapshots live on the stack up to 8.
         let (candidates, contra_candidates) = {
             let info = &self.inference_context(n).inferences[inference];
-            (info.candidates.clone(), info.contra_candidates.clone())
+            (
+                SmallVec::<[TypeId; 8]>::from_slice(&info.candidates),
+                SmallVec::<[TypeId; 8]>::from_slice(&info.contra_candidates),
+            )
         };
         // PORT: Go tests `!= nil`; a nil and an empty candidate list are the
         // same here because candidates only grow by `append` or reset to nil.

@@ -344,13 +344,131 @@ pub(crate) static TEXT_TO_PUNCTUATION: &[(&str, SyntaxKind)] = &[
 
 /// Go `textToKeyword[text]`. Returns `SyntaxKind::Unknown` (the Go zero
 /// value) on a miss.
+// PERF: a match on the length, then on the bytes, so a lookup does not hash
+// the text. It holds the same entries as `TEXT_TO_KEYWORD`
+// (`tests::text_to_keyword_matches_table` checks this). `crate::scanner_util`
+// uses it too.
 pub(crate) fn text_to_keyword(text: &str) -> SyntaxKind {
-    static MAP: std::sync::OnceLock<FxHashMap<&'static str, SyntaxKind>> =
-        std::sync::OnceLock::new();
-    MAP.get_or_init(|| TEXT_TO_KEYWORD.iter().copied().collect())
-        .get(text)
-        .copied()
-        .unwrap_or(SyntaxKind::Unknown)
+    use ts_ast::SyntaxKind as K;
+    let b = text.as_bytes();
+    match b.len() {
+        2 => match b {
+            b"as" => K::AsKeyword,
+            b"do" => K::DoKeyword,
+            b"if" => K::IfKeyword,
+            b"in" => K::InKeyword,
+            b"is" => K::IsKeyword,
+            b"of" => K::OfKeyword,
+            _ => K::Unknown,
+        },
+        3 => match b {
+            b"any" => K::AnyKeyword,
+            b"for" => K::ForKeyword,
+            b"get" => K::GetKeyword,
+            b"let" => K::LetKeyword,
+            b"new" => K::NewKeyword,
+            b"out" => K::OutKeyword,
+            b"set" => K::SetKeyword,
+            b"try" => K::TryKeyword,
+            b"var" => K::VarKeyword,
+            _ => K::Unknown,
+        },
+        4 => match b {
+            b"case" => K::CaseKeyword,
+            b"else" => K::ElseKeyword,
+            b"enum" => K::EnumKeyword,
+            b"from" => K::FromKeyword,
+            b"null" => K::NullKeyword,
+            b"this" => K::ThisKeyword,
+            b"true" => K::TrueKeyword,
+            b"type" => K::TypeKeyword,
+            b"void" => K::VoidKeyword,
+            b"with" => K::WithKeyword,
+            _ => K::Unknown,
+        },
+        5 => match b {
+            b"async" => K::AsyncKeyword,
+            b"await" => K::AwaitKeyword,
+            b"break" => K::BreakKeyword,
+            b"catch" => K::CatchKeyword,
+            b"class" => K::ClassKeyword,
+            b"const" => K::ConstKeyword,
+            b"defer" => K::DeferKeyword,
+            b"false" => K::FalseKeyword,
+            b"infer" => K::InferKeyword,
+            b"keyof" => K::KeyOfKeyword,
+            b"never" => K::NeverKeyword,
+            b"super" => K::SuperKeyword,
+            b"throw" => K::ThrowKeyword,
+            b"using" => K::UsingKeyword,
+            b"while" => K::WhileKeyword,
+            b"yield" => K::YieldKeyword,
+            _ => K::Unknown,
+        },
+        6 => match b {
+            b"assert" => K::AssertKeyword,
+            b"bigint" => K::BigIntKeyword,
+            b"delete" => K::DeleteKeyword,
+            b"export" => K::ExportKeyword,
+            b"global" => K::GlobalKeyword,
+            b"import" => K::ImportKeyword,
+            b"module" => K::ModuleKeyword,
+            b"number" => K::NumberKeyword,
+            b"object" => K::ObjectKeyword,
+            b"public" => K::PublicKeyword,
+            b"return" => K::ReturnKeyword,
+            b"static" => K::StaticKeyword,
+            b"string" => K::StringKeyword,
+            b"switch" => K::SwitchKeyword,
+            b"symbol" => K::SymbolKeyword,
+            b"typeof" => K::TypeOfKeyword,
+            b"unique" => K::UniqueKeyword,
+            _ => K::Unknown,
+        },
+        7 => match b {
+            b"asserts" => K::AssertsKeyword,
+            b"boolean" => K::BooleanKeyword,
+            b"declare" => K::DeclareKeyword,
+            b"default" => K::DefaultKeyword,
+            b"extends" => K::ExtendsKeyword,
+            b"finally" => K::FinallyKeyword,
+            b"package" => K::PackageKeyword,
+            b"private" => K::PrivateKeyword,
+            b"require" => K::RequireKeyword,
+            b"unknown" => K::UnknownKeyword,
+            _ => K::Unknown,
+        },
+        8 => match b {
+            b"abstract" => K::AbstractKeyword,
+            b"accessor" => K::AccessorKeyword,
+            b"continue" => K::ContinueKeyword,
+            b"debugger" => K::DebuggerKeyword,
+            b"function" => K::FunctionKeyword,
+            b"override" => K::OverrideKeyword,
+            b"readonly" => K::ReadonlyKeyword,
+            _ => K::Unknown,
+        },
+        9 => match b {
+            b"immediate" => K::ImmediateKeyword,
+            b"interface" => K::InterfaceKeyword,
+            b"intrinsic" => K::IntrinsicKeyword,
+            b"namespace" => K::NamespaceKeyword,
+            b"protected" => K::ProtectedKeyword,
+            b"satisfies" => K::SatisfiesKeyword,
+            b"undefined" => K::UndefinedKeyword,
+            _ => K::Unknown,
+        },
+        10 => match b {
+            b"implements" => K::ImplementsKeyword,
+            b"instanceof" => K::InstanceOfKeyword,
+            _ => K::Unknown,
+        },
+        11 => match b {
+            b"constructor" => K::ConstructorKeyword,
+            _ => K::Unknown,
+        },
+        _ => K::Unknown,
+    }
 }
 
 /// Go `kind, ok := textToToken[text]`.
@@ -1812,5 +1930,40 @@ impl Scanner {
             self.scanner_state.token = SyntaxKind::RegularExpressionLiteral;
         }
         self.scanner_state.token
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Go `textToKeyword[text]` read from the table.
+    fn table_keyword(text: &str) -> SyntaxKind {
+        TEXT_TO_KEYWORD
+            .iter()
+            .find(|&&(t, _)| t == text)
+            .map_or(SyntaxKind::Unknown, |&(_, kind)| kind)
+    }
+
+    // `text_to_keyword` is a hand-written match. Every keyword and some near
+    // misses (longer, shorter, other case, other last byte) must give the
+    // table result.
+    #[test]
+    fn text_to_keyword_matches_table() {
+        for &(text, kind) in TEXT_TO_KEYWORD {
+            assert_eq!(text_to_keyword(text), kind, "{text}");
+            let last = text.len() - 1;
+            let near = [
+                format!("{text}s"),
+                text[..last].to_string(),
+                text.to_uppercase(),
+                format!("{}z", &text[..last]),
+            ];
+            for miss in &near {
+                assert_eq!(text_to_keyword(miss), table_keyword(miss), "{miss}");
+            }
+        }
+        assert_eq!(text_to_keyword(""), SyntaxKind::Unknown);
+        assert_eq!(text_to_keyword("{"), SyntaxKind::Unknown);
     }
 }

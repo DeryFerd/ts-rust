@@ -85,7 +85,19 @@ pub fn has_readonly_modifier(node: Node) -> bool {
 impl Checker {
     // Go: checker/utilities.go:72 isStaticPrivateIdentifierProperty
     pub fn is_static_private_identifier_property(&self, s: SymbolId) -> bool {
-        let value_declaration = self.sym(s).value_declaration;
+        let sym = self.sym(s);
+        // PERF: the binder names the symbol of a private-identifier class
+        // element `INTERNAL_SYMBOL_NAME_PREFIX` + "#..." (or
+        // `INTERNAL_SYMBOL_NAME_MISSING` outside a class, or "default" when
+        // the element has a `default` modifier, see `declare_symbol_ex`).
+        // Checker copies (instantiated, transient, merged, union and spread
+        // properties) keep the name of a symbol that has that value
+        // declaration. Any other name gives false without a declaration load.
+        let name = sym.name.as_str();
+        if !name.starts_with(INTERNAL_SYMBOL_NAME_PREFIX) && name != INTERNAL_SYMBOL_NAME_DEFAULT {
+            return false;
+        }
+        let value_declaration = sym.value_declaration;
         value_declaration.is_some()
             && is_private_identifier_class_element_declaration(value_declaration)
             && is_static(value_declaration)
@@ -498,11 +510,25 @@ impl Checker {
     /// the ones `sort_symbols` uses, so the comparisons (and the lazy
     /// `get_symbol_id` calls in them) happen in the same order.
     pub(crate) fn sort_symbol_sort_keys(&self, keys: &mut [SymbolSortKey]) {
-        keys.sort_by(|a, b| self.compare_symbol_sort_keys(a, b).cmp(&0));
+        keys.sort_by(|a, b| {
+            // PERF: two different packed orders give the sign that the full
+            // comparator gets from `compare_nodes` (see `SymbolSortKey::order`),
+            // and the full comparator returns there before its name and id
+            // steps. So every comparison has the same result, the stable sort
+            // makes the same comparisons, and `get_symbol_id` runs in the same
+            // order.
+            if a.order != b.order && a.order != NO_SORT_ORDER && b.order != NO_SORT_ORDER {
+                let r = a.order.cmp(&b.order);
+                debug_assert_eq!(r, self.compare_symbol_sort_keys(a, b).cmp(&0));
+                return r;
+            }
+            self.compare_symbol_sort_keys(a, b).cmp(&0)
+        });
     }
 
     /// The `compareSymbolsWorker` inputs of one symbol.
-    /// `last_file` caches the last `(file, file_index_map[file])` lookup.
+    /// `last_file` caches the last `(file, file_index_map[file])` lookup,
+    /// with -1 for a file that is not in the map.
     pub(crate) fn symbol_sort_key(
         &self,
         symbol: SymbolId,
@@ -516,20 +542,30 @@ impl Checker {
                 file: Node::NIL,
                 file_index: 0,
                 pos: 0,
+                order: NO_SORT_ORDER,
                 name: Name::default(),
             };
         }
         let sym = self.sym(symbol);
         let has_declaration = !sym.declarations.is_empty();
         let declaration = sym.declarations.first().copied().unwrap_or(Node::NIL);
-        let (file, file_index, pos) = if declaration.is_some() {
+        let (file, file_index, pos, order) = if declaration.is_some() {
             let file = get_source_file_of_node(declaration);
             if file != last_file.0 || file.is_nil() {
-                *last_file = (file, self.file_index_map.get(&file).copied().unwrap_or(0));
+                *last_file = (file, self.file_index_map.get(&file).copied().unwrap_or(-1));
             }
-            (file, last_file.1, declaration.pos())
+            let pos = declaration.pos();
+            if last_file.1 >= 0 {
+                // The sign bit flip maps `i32` order onto `u32` order.
+                let order =
+                    (u64::from(last_file.1 as u32) << 32) | u64::from(pos as u32 ^ 0x8000_0000);
+                (file, last_file.1, pos, order)
+            } else {
+                // A map miss reads as index 0 (Go map zero value).
+                (file, 0, pos, NO_SORT_ORDER)
+            }
         } else {
-            (Node::NIL, 0, 0)
+            (Node::NIL, 0, 0, NO_SORT_ORDER)
         };
         SymbolSortKey {
             symbol,
@@ -538,6 +574,7 @@ impl Checker {
             file,
             file_index,
             pos,
+            order,
             name: sym.name.clone(),
         }
     }
@@ -656,9 +693,21 @@ pub(crate) struct SymbolSortKey {
     /// `file_index_map[file]`, zero when absent (Go map miss).
     file_index: i32,
     pos: i32,
+    /// `(file_index, pos)` packed so that `u64` order is `(file_index, pos)`
+    /// order, or `NO_SORT_ORDER` when there is no declaration or its file is
+    /// not in `file_index_map`. Map indexes are unique and not negative, so
+    /// two different orders mean `compare_nodes` returns nonzero with the
+    /// same sign: `file_index` difference for different files, `pos`
+    /// difference in one file. Equal orders (same declaration, or the same
+    /// position) fall through to the full comparator.
+    order: u64,
     /// Its text is read only when the declarations tie.
     name: Name,
 }
+
+/// `SymbolSortKey::order` when the packed order does not apply. A real
+/// order is below 2^63.
+const NO_SORT_ORDER: u64 = u64::MAX;
 
 // PORT: Go `strings.Compare` (byte order, returns -1/0/1). It compares the
 // Go bytes, so lone surrogates and the internal symbol name prefix sort as in
@@ -1043,7 +1092,12 @@ impl Checker {
         if s2.is_nil() {
             return -1;
         }
-        compare_strings(&self.sym(s1).name, &self.sym(s2).name)
+        let (name1, name2) = (&self.sym(s1).name, &self.sym(s2).name);
+        // Equal name ids are equal texts, which compare as 0.
+        if name1 == name2 {
+            return 0;
+        }
+        compare_strings(name1, name2)
     }
 
     // Go: checker/utilities.go:582 getTypeNameSymbol

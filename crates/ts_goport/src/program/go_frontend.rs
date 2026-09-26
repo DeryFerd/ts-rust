@@ -6,7 +6,9 @@
 //! Go: execute/tsc.go:213 (config), tsc.go:293 (host), tsc.go:301 (program).
 
 use super::*;
-use crate::ast::store::{file_store_count, file_store_file_name, file_store_parser_flags};
+use crate::ast::store::{
+    file_store_file_name, file_store_parser_flags, publish_file_stores, unpublished_file_ids,
+};
 use crate::frontend::bundled;
 use crate::frontend::compiler::{
     NewProgram, ProgramOptions, TraceFn, new_cached_fs_compiler_host, new_program,
@@ -23,7 +25,7 @@ use std::rc::Rc;
 use ts_diagnostics::Message;
 
 /// The Go frontend program. It is not thread-safe, so only the loading
-/// thread holds it (`GO_FRONTEND`). The checker reads `GoSharedState`.
+/// thread holds it (`FRONTENDS`). The checker reads `GoSharedState`.
 pub(super) struct GoFrontendState {
     pub(super) program: &'static NewProgram,
 }
@@ -34,8 +36,9 @@ pub(super) struct GoFrontendState {
 // Rust frontend uses `Rc` and `RefCell`, so the values the checker asks for
 // are copied here instead.
 pub(super) struct GoSharedState {
-    /// Go `processedFiles.resolvedModules`, by file path.
-    resolved_modules: FxHashMap<String, FxHashMap<ModeAwareCacheKey, ResolvedModule>>,
+    /// Go `processedFiles.resolvedModules`, by file path. Shared with the
+    /// version this one was updated from when the frontend shares the map.
+    resolved_modules: Arc<ResolvedModules>,
     /// Go `processedFiles.jsxRuntimeImportSpecifiers`, by file path.
     jsx_runtime_import_specifiers: FxHashMap<String, (String, Node)>,
     /// Go `processedFiles.importHelpersImportSpecifiers`, by file path.
@@ -43,10 +46,12 @@ pub(super) struct GoSharedState {
     /// Go include processor diagnostics of each program file, by file index.
     include_diagnostics: FxHashMap<usize, Vec<Diagnostic>>,
     /// Parser inputs of each program file, by file index, for lazy JSDoc.
-    parse_inputs: FxHashMap<usize, LazyJsDocInput>,
+    /// A file id is one file version, so versions share the inputs of the
+    /// files they share.
+    parse_inputs: FxHashMap<usize, Arc<LazyJsDocInput>>,
     /// Go `GetParseFileRedirect` of each resolved module file name that is
-    /// not a program file and has a redirect.
-    parse_file_redirects: FxHashMap<String, String>,
+    /// not a program file and has a redirect. Shared like `resolved_modules`.
+    parse_file_redirects: Arc<FxHashMap<String, String>>,
     /// Go `processedFiles.redirectTargetsMap`, by path.
     redirect_targets: FxHashMap<String, Vec<String>>,
     /// Go `GetSourceFileFromReference` of each preserved `/// <reference
@@ -67,10 +72,12 @@ pub(super) struct GoSharedState {
     redirects_for_resolution: FxHashMap<usize, Arc<ResolvedProjectReference>>,
     /// Go `GetResolvedProjectReferences`.
     resolved_project_references: Vec<Option<Arc<ResolvedProjectReference>>>,
-    /// Go `Program.GetSymlinkCache`.
-    known_symlinks: crate::modulespecifiers::symlinks::KnownSymlinks,
+    /// Go `Program.GetSymlinkCache`. Shared with the version this one was
+    /// updated from when the frontend shares the cache.
+    known_symlinks: Arc<crate::modulespecifiers::symlinks::KnownSymlinks>,
     /// Go `processedFiles.sourceFilesFoundSearchingNodeModules`, by path.
-    source_files_found_searching_node_modules: FxHashSet<String>,
+    /// Shared like `resolved_modules`.
+    source_files_found_searching_node_modules: Arc<FxHashSet<String>>,
     /// Go `Program.hasEmitBlockingDiagnostics`, by path.
     has_emit_blocking_diagnostics: FxHashSet<String>,
     /// Go `Program.toPath` inputs.
@@ -79,6 +86,9 @@ pub(super) struct GoSharedState {
 }
 
 type FrontendSourceOutput = crate::frontend::tsoptions::SourceOutputAndProjectReference;
+
+/// `GoSharedState::resolved_modules`.
+type ResolvedModules = FxHashMap<String, FxHashMap<ModeAwareCacheKey, ResolvedModule>>;
 
 /// Thread-safe copies of the frontend project references. Go shares one
 /// `*ParsedCommandLine` per referenced project, so each is copied once.
@@ -173,8 +183,228 @@ pub(super) fn try_load_with(
     edit_options: impl FnOnce(&mut CompilerOptions),
     times: &mut CompileTimes,
 ) -> Result<&'static GoProgram, String> {
+    let opts = load_config(config_path, edit_options, times)?;
+    // Go: tsc.go:298 startTracingIfNeeded. PORT: the warning goes to stdout
+    // (Go `sys.Writer()`) as Go bytes, like `trace_from_sys`. A program
+    // version (`try_load_version`) does not trace, as Go tsc starts tracing
+    // only here.
+    if let Some(warning) = crate::tracing::start_tracing_if_needed(&opts.config, false) {
+        let _ =
+            crate::execute::tsc::write_go_output(&mut std::io::stdout().lock(), warning.as_bytes());
+    }
+    // Go: tsc.go:305 times `NewProgram`. PORT: the port's `NewProgram` is
+    // `install_new_program`, which also builds the Go files, as the build
+    // worker times it.
+    let parse_start = std::time::Instant::now();
+    let program = install_new_program(opts);
+    times.parse_time = parse_start.elapsed();
+    program
+}
+
+/// `try_load_version` (program.rs).
+pub(super) fn try_load_version(
+    config_path: &str,
+    edit_options: impl FnOnce(&mut CompilerOptions),
+) -> Result<&'static GoProgram, String> {
+    // A new version parses with no current program, like the first load.
+    let _scope = crate::core::enter_program(None);
+    let cwd = current_directory()?;
+    let opts = load_config(config_path, edit_options, &mut CompileTimes::default())?;
+    let np: &'static NewProgram = Box::leak(Box::new(new_program(opts)));
+    Ok(build_program(np, Entry::Version, cwd, None))
+}
+
+/// `update_program_version` (program.rs).
+pub(super) fn update_program_version(
+    old: &'static GoProgram,
+    changed_file: &str,
+) -> (&'static GoProgram, bool) {
+    let old_np = FRONTENDS
+        .with(|frontends| frontends.borrow().get(&old.id).copied())
+        .expect("the old program version has no frontend on this thread")
+        .program;
+    let cwd = old.state.get().expect("program not loaded").cwd.clone();
+    // A new version parses with no current program, like the first load.
+    let _scope = crate::core::enter_program(None);
+    // PORT: Go watch gives `UpdateProgram` a host whose cache no longer has
+    // the changed file. A new cached host over the OS file system reads it
+    // again.
+    let host_cwd = old_np.get_current_directory();
+    let host = new_cached_fs_compiler_host(
+        &host_cwd,
+        bundled::wrap_fs(osvfs_fs()),
+        &bundled::lib_path(),
+        None,
+        Some(trace_from_sys()),
+    );
+    let changed_path = crate::frontend::tspath::to_path(
+        changed_file,
+        &host_cwd,
+        old_np.use_case_sensitive_file_names(),
+    );
+    let (np, _, reused) = old_np.update_program(&changed_path, host);
+    let np: &'static NewProgram = Box::leak(Box::new(np));
+    (build_program(np, Entry::Version, cwd, Some(old)), reused)
+}
+
+/// `new_program_version` (program.rs).
+pub(super) fn new_program_version(
+    np: &'static NewProgram,
+    previous: Option<&'static GoProgram>,
+) -> &'static GoProgram {
+    // The files are built and published with no current program, like the
+    // first load. `build_program` makes the new version current for its
+    // state.
+    let _scope = crate::core::enter_program(None);
+    build_program(np, Entry::Version, np.get_current_directory(), previous)
+}
+
+thread_local! {
+    /// Source files that were parsed on this thread outside a program load
+    /// (the language server parse cache) and are not published yet, by
+    /// store id. A program that does not include such a file still
+    /// publishes it, with its parser fields, so a later program can share it.
+    static PARSED_UNPUBLISHED: RefCell<FxHashMap<usize, Rc<ParsedSourceFile>>> =
+        RefCell::new(FxHashMap::default());
+
+    /// Parser inputs of the files of `PARSED_UNPUBLISHED` that a publish
+    /// gave no program, by store id, for lazy JSDoc
+    /// (`resolve_js_doc_outside_program`).
+    static OUTSIDE_PARSE_INPUTS: RefCell<FxHashMap<usize, Arc<LazyJsDocInput>>> =
+        RefCell::new(FxHashMap::default());
+}
+
+/// `note_parsed_source_file` (program.rs).
+pub(super) fn note_parsed_source_file(file: &Rc<ParsedSourceFile>) {
+    if !crate::ast::is_published(file.store) {
+        PARSED_UNPUBLISHED.with(|parsed| parsed.borrow_mut().insert(file.store, file.clone()));
+    }
+}
+
+/// `publish_parsed_files` (program.rs).
+pub(super) fn publish_parsed_files(cwd: &str) {
+    let parsed = FxHashMap::default();
+    let files = go_files_of_unpublished_stores(&parsed, cwd, case_sensitivity());
+    publish_file_stores(files);
+}
+
+/// Go `parseJSDocForNode` for a lazy JSDoc read of `node` (ast/ast.go:2614
+/// `resolveJSDoc`). The result is cached in `LAZY_JSDOC`.
+fn parse_lazy_js_doc(input: &LazyJsDocInput, node: Node) -> &'static [Node] {
+    let jsdocs: &'static [Node] = Box::leak(
+        crate::frontend::parser::parse_js_doc_for_node(
+            &input.parse_options,
+            input.text,
+            input.script_kind,
+            node,
+        )
+        .into_boxed_slice(),
+    );
+    LAZY_JSDOC.with(|cache| cache.borrow_mut().insert(node, jsdocs));
+    jsdocs
+}
+
+/// Go ast/ast.go:2614 `(*SourceFile).resolveJSDoc` (slow path) for a file
+/// of an alias resolver program. Such a file is in no program
+/// (`OUTSIDE_PARSE_INPUTS`) or in a program version loaded on this thread.
+/// None when this thread has no parser inputs for `file`.
+pub(super) fn resolve_js_doc_outside_program(file: Node, node: Node) -> Option<&'static [Node]> {
+    if let Some(jsdocs) = LAZY_JSDOC.with(|cache| cache.borrow().get(&node).copied()) {
+        return Some(jsdocs);
+    }
+    let store = file.file_index();
+    let input = OUTSIDE_PARSE_INPUTS
+        .with(|inputs| inputs.borrow().get(&store).cloned())
+        .or_else(|| {
+            let path = GoPath(source_file_info(file).path.clone());
+            let programs: Vec<&'static NewProgram> = FRONTENDS.with(|frontends| {
+                frontends
+                    .borrow()
+                    .values()
+                    .map(|frontend| frontend.program)
+                    .collect()
+            });
+            programs.into_iter().find_map(|program| {
+                let parsed = program
+                    .get_source_file_by_path(&path)
+                    .filter(|parsed| parsed.store == store)?;
+                Some(Arc::new(LazyJsDocInput {
+                    parse_options: parsed.parse_options.clone(),
+                    text: parsed.text,
+                    script_kind: parsed.script_kind,
+                }))
+            })
+        })?;
+    Some(parse_lazy_js_doc(&input, node))
+}
+
+/// The case sensitivity of the OS file system.
+fn case_sensitivity() -> CaseSensitivity {
+    if osvfs_fs().use_case_sensitive_file_names() {
+        CaseSensitivity::Sensitive
+    } else {
+        CaseSensitivity::Insensitive
+    }
+}
+
+/// The Go files of this thread's unpublished stores, in store id order
+/// (`publish_file_stores`). `parsed` holds the program files by store id.
+/// A store that is not a program file is a file that the language server
+/// parsed outside a program load (`PARSED_UNPUBLISHED`), or a config file.
+fn go_files_of_unpublished_stores(
+    parsed: &FxHashMap<usize, Rc<ParsedSourceFile>>,
+    cwd: &str,
+    case_sensitivity: CaseSensitivity,
+) -> Vec<GoFile> {
+    let outside = PARSED_UNPUBLISHED.with(|outside| std::mem::take(&mut *outside.borrow_mut()));
+    // `files[i]` is the GoFile of store `unpublished_file_ids().start + i`.
+    let mut files = Vec::new();
+    for store in unpublished_file_ids() {
+        if !parsed.contains_key(&store)
+            && let Some(file) = outside.get(&store)
+        {
+            let input = Arc::new(LazyJsDocInput {
+                parse_options: file.parse_options.clone(),
+                text: file.text,
+                script_kind: file.script_kind,
+            });
+            OUTSIDE_PARSE_INPUTS.with(|inputs| inputs.borrow_mut().insert(store, input));
+        }
+        let file = parsed.get(&store).or_else(|| outside.get(&store));
+        let info = match file {
+            Some(file) => program_file_info(store, file),
+            None => other_store_info(store, cwd, case_sensitivity),
+        };
+        // PORT: a store that is not a parsed source file (a config file) is
+        // never bound or checked, so its root is not read.
+        let root = file.map_or(Node::NIL, |file| file.root);
+        files.push(GoFile {
+            source: None,
+            root,
+            parser_flags: file_store_parser_flags(store),
+            info,
+            node_bind: OnceLock::new(),
+            file_bind: OnceLock::new(),
+            flow_nodes: OnceLock::new(),
+        });
+    }
+    files
+}
+
+/// The process current directory, normalized.
+fn current_directory() -> Result<String, String> {
     let cwd = crate::frontend::vfs::os_current_dir().map_err(|e| e.to_string())?;
-    let cwd = ts_path::normalize_path(&cwd.replace('\\', "/"));
+    Ok(ts_path::normalize_path(&cwd.replace('\\', "/")))
+}
+
+/// Go tsc config parsing and compiler host (tsc.go:213 and :293): the
+/// program options of a load. It records the config time in `times`.
+fn load_config(
+    config_path: &str,
+    edit_options: impl FnOnce(&mut CompilerOptions),
+    times: &mut CompileTimes,
+) -> Result<ProgramOptions, String> {
+    let cwd = current_directory()?;
     // Go: sys.FS() is bundled.WrapFS(osvfs.FS()).
     let fs = bundled::wrap_fs(osvfs_fs());
     let mut config_abs = ts_path::resolve_path(&cwd, &[config_path]);
@@ -220,102 +450,122 @@ pub(super) fn try_load_with(
     // Go: tsc.go:293 NewCachedFSCompilerHost, tsc.go:301 NewProgram.
     let host =
         new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, Some(trace_from_sys()));
-    // Go: tsc.go:298 startTracingIfNeeded. PORT: the warning goes to stdout
-    // (Go `sys.Writer()`) as Go bytes, like `trace_from_sys`.
-    if let Some(warning) = crate::tracing::start_tracing_if_needed(&config, false) {
-        let _ =
-            crate::execute::tsc::write_go_output(&mut std::io::stdout().lock(), warning.as_bytes());
-    }
-    // Go: tsc.go:305 times `NewProgram`. PORT: the port's `NewProgram` is
-    // `install_new_program`, which also builds the Go files, as the build
-    // worker times it.
-    let parse_start = std::time::Instant::now();
-    let program = install_new_program(ProgramOptions {
+    Ok(ProgramOptions {
         host,
         config: Rc::new(config),
         use_source_of_project_reference: false,
         single_threaded: Tristate::Unknown,
         typings_location: String::new(),
         project_name: String::new(),
-    });
-    times.parse_time = parse_start.elapsed();
-    program
+    })
 }
 
 /// Go `compiler.NewProgram` for a config that is already parsed. It builds
 /// the Go files and installs the program for the process. Call it once.
 pub(super) fn install_new_program(opts: ProgramOptions) -> Result<&'static GoProgram, String> {
-    let legacy_fs = ts_vfs::OsFileSystem::default();
-    let cwd = crate::frontend::vfs::os_current_dir().map_err(|e| e.to_string())?;
-    let cwd = ts_path::normalize_path(&cwd.replace('\\', "/"));
-    let case_sensitivity = if osvfs_fs().use_case_sensitive_file_names() {
-        CaseSensitivity::Sensitive
-    } else {
-        CaseSensitivity::Insensitive
-    };
+    let cwd = current_directory()?;
     let new_program: &'static NewProgram = Box::leak(Box::new(new_program(opts)));
-    let options = new_program.options().clone();
+    Ok(build_program(new_program, Entry::Only, cwd, None))
+}
+
+/// How `build_program` makes a program known.
+enum Entry {
+    /// The program of a one-program process (`core::set_prog`).
+    Only,
+    /// A program version of a multi-program process
+    /// (`core::register_program_version`). The caller parses and builds it
+    /// inside `core::enter_program(None)`.
+    Version,
+}
+
+/// Builds the Go files of the stores that `np` parsed, publishes them and
+/// makes the `GoProgram` of `np` with its state. Program files that an
+/// earlier version published keep their `GoFile`. `cwd` is the current
+/// directory of the process. `previous` is the version that `np` was
+/// updated from, if it is still loaded; the new state shares its copies of
+/// unchanged frontend data (`GoSharedState::new`).
+fn build_program(
+    np: &'static NewProgram,
+    entry: Entry,
+    cwd: String,
+    previous: Option<&'static GoProgram>,
+) -> &'static GoProgram {
+    let legacy_fs = ts_vfs::OsFileSystem::default();
+    let case_sensitivity = case_sensitivity();
+    let options = np.options().clone();
 
     let mut parsed = FxHashMap::default();
     let mut source_file_order = Vec::new();
-    for file in new_program.source_files() {
+    for file in np.source_files() {
         source_file_order.push(file.store);
         parsed.insert(file.store, file.clone());
     }
 
-    let mut files = Vec::new();
-    let mut file_by_path = FxHashMap::default();
-    for store in 0..file_store_count() {
-        let info = match parsed.get(&store) {
-            Some(file) => {
-                let path = file.path().clone();
-                file_by_path.insert(path.0.clone(), store);
-                program_file_info(store, file, new_program, &path)
-            }
-            None => other_store_info(store, &cwd, case_sensitivity),
-        };
-        // PORT: a store that is not a program file (a config file) is never
-        // bound or checked, so its root is not read.
-        let root = parsed.get(&store).map_or(Node::NIL, |file| file.root);
-        files.push(GoFile {
-            source: None,
-            root,
-            parser_flags: file_store_parser_flags(store),
-            info,
-            node_bind: OnceLock::new(),
-            file_bind: OnceLock::new(),
-            flow_nodes: OnceLock::new(),
-        });
-    }
+    let files = go_files_of_unpublished_stores(&parsed, &cwd, case_sensitivity);
 
+    // Program files in ascending store id, the insert order of the first
+    // load, then the Go program fields of each.
+    let mut stores: Vec<usize> = parsed.keys().copied().collect();
+    stores.sort_unstable();
+    let mut file_by_path = FxHashMap::default();
+    let mut file_meta = FxHashMap::default();
+    for store in stores {
+        let path = parsed[&store].path();
+        file_by_path.insert(path.0.clone(), store);
+        let meta = FileProgramMeta {
+            meta_data: np.get_source_file_meta_data(path),
+            is_default_library: np.is_source_file_default_library(path),
+        };
+        file_meta.insert(store, meta);
+    }
     // Go: filesparser.go:425 `filesByPath[task.path] = packageIdFile`. A
     // package dedup redirect path maps to the first file with the same
     // package id, so `GetSourceFileByPath` finds that file.
-    for (path, file) in new_program.files_by_path() {
+    for (path, file) in np.files_by_path() {
         file_by_path.entry(path.0.clone()).or_insert(file.store);
     }
 
+    let id = next_program_id();
+    let frontend: &'static GoFrontendState = Box::leak(Box::new(GoFrontendState { program: np }));
+    FRONTENDS.with(|frontends| {
+        assert!(
+            frontends.borrow_mut().insert(id, frontend).is_none(),
+            "program {id} already loaded"
+        );
+    });
+    // The stores become read-only here, before the program is installed.
+    publish_file_stores(files);
     let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
+        id,
         program: None,
-        files,
         source_file_order,
         options,
         bound_symbols: OnceLock::new(),
+        state: OnceLock::new(),
     }));
-    let frontend: &'static GoFrontendState = Box::leak(Box::new(GoFrontendState {
-        program: new_program,
-    }));
-    GO_FRONTEND.with(|cell| {
-        assert!(cell.set(frontend).is_ok(), "program already loaded");
+    let _scope = match entry {
+        Entry::Only => {
+            set_prog(program);
+            None
+        }
+        Entry::Version => {
+            register_program_version(program);
+            Some(crate::core::enter_program(Some(program)))
+        }
+    };
+    // With the program current, like the lazy Go reads it replaces.
+    let previous = previous.and_then(|old| {
+        let old_np = FRONTENDS.with(|frontends| frontends.borrow().get(&old.id).copied())?;
+        let old_shared = old.state.get()?.go.as_ref()?;
+        Some((old_np.program, old_shared))
     });
-    set_prog(program);
-    // After `set_prog`, like the lazy Go reads it replaces.
-    let shared = GoSharedState::new(new_program, &parsed);
+    let shared = GoSharedState::new(np, &parsed, previous);
     let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
         cwd,
         case_sensitivity,
         fs: legacy_fs,
         file_by_path,
+        file_meta,
         config_diagnostics: Vec::new(),
         program_diagnostics: Vec::new(),
         external_locations: Vec::new(),
@@ -324,9 +574,10 @@ pub(super) fn install_new_program(opts: ProgramOptions) -> Result<&'static GoPro
         file_associations: OnceLock::new(),
         declaration_diagnostic_cache: Mutex::new(FxHashMap::default()),
         go: Some(shared),
+        alias_resolver: false,
     }));
-    set_state(program_state);
-    Ok(program)
+    assert!(program.state.set(program_state).is_ok());
+    program
 }
 
 /// Go `getTraceFromSys` (tsc.go:280) with no testing hooks:
@@ -344,17 +595,12 @@ fn trace_from_sys() -> TraceFn {
     })
 }
 
-/// `SourceFileInfo` of a program file, from the Go parser fields and the
-/// Go program (metadata, default library).
-fn program_file_info(
-    store: usize,
-    file: &ParsedSourceFile,
-    p: &NewProgram,
-    path: &GoPath,
-) -> SourceFileInfo {
+/// `SourceFileInfo` of a program file, from the Go parser fields. The Go
+/// program fields are in `ProgramState::file_meta`.
+fn program_file_info(store: usize, file: &ParsedSourceFile) -> SourceFileInfo {
     let info = SourceFileInfo {
         file_name: file.file_name().to_string(),
-        path: path.0.clone(),
+        path: file.path().0.clone(),
         is_declaration_file: file.is_declaration_file,
         language_variant: file.language_variant,
         script_kind: file.script_kind,
@@ -368,8 +614,6 @@ fn program_file_info(
         js_diagnostics: file.js_diagnostics.clone(),
         jsdoc_diagnostics: file.jsdoc_diagnostics.clone(),
         has_lazy_js_doc: file.has_lazy_js_doc,
-        is_default_library: p.is_source_file_default_library(path),
-        meta_data: p.get_source_file_meta_data(path),
         trivia: crate::ast::go_view::TriviaRuns::default(),
         late: OnceLock::new(),
     };
@@ -409,8 +653,6 @@ fn other_store_info(store: usize, cwd: &str, case_sensitivity: CaseSensitivity) 
         js_diagnostics: Vec::new(),
         jsdoc_diagnostics: Vec::new(),
         has_lazy_js_doc: false,
-        is_default_library: false,
-        meta_data: SourceFileMetaData::default(),
         trivia: crate::ast::go_view::TriviaRuns::default(),
         late: OnceLock::new(),
     };
@@ -430,30 +672,59 @@ fn other_store_info(store: usize, cwd: &str, case_sensitivity: CaseSensitivity) 
 }
 
 impl GoSharedState {
-    /// Copies what the checker reads from the frontend program.
-    fn new(p: &NewProgram, parsed: &FxHashMap<usize, Rc<ParsedSourceFile>>) -> Self {
+    /// Copies what the checker reads from the frontend program. `previous`
+    /// is the frontend program and shared state of the version that `p` was
+    /// updated from. Its copies are shared where `p` shares the frontend
+    /// data they were copied from, so a new version copies only what
+    /// changed. A version is never freed, so each copy would leak once per
+    /// edit.
+    fn new(
+        p: &NewProgram,
+        parsed: &FxHashMap<usize, Rc<ParsedSourceFile>>,
+        previous: Option<(&NewProgram, &GoSharedState)>,
+    ) -> Self {
         let files = &p.processed_files;
-        let resolved_modules = files
-            .resolved_modules
-            .iter()
-            .map(|(path, cache)| {
-                let cache = cache
+        // Go `UpdateProgram` shares the resolutions and the project
+        // references with the old program and keeps every file path, so
+        // equal pointers mean equal copies.
+        let same_resolutions = previous.filter(|(old, _)| {
+            Rc::ptr_eq(
+                &files.resolved_modules,
+                &old.processed_files.resolved_modules,
+            ) && match (
+                &files.project_reference_file_mapper,
+                &old.processed_files.project_reference_file_mapper,
+            ) {
+                (Some(mapper), Some(old_mapper)) => Rc::ptr_eq(mapper, old_mapper),
+                (mapper, old_mapper) => mapper.is_none() && old_mapper.is_none(),
+            }
+        });
+        let resolved_modules = match same_resolutions {
+            Some((_, old)) => Arc::clone(&old.resolved_modules),
+            None => Arc::new(
+                files
+                    .resolved_modules
                     .iter()
-                    .map(|(key, resolved)| (key.clone(), (**resolved).clone()))
-                    .collect();
-                (path.0.clone(), cache)
-            })
-            .collect();
+                    .map(|(path, cache)| {
+                        let cache = cache
+                            .iter()
+                            .map(|(key, resolved)| (key.clone(), (**resolved).clone()))
+                            .collect();
+                        (path.0.clone(), cache)
+                    })
+                    .collect(),
+            ),
+        };
         let jsx_runtime_import_specifiers = files
             .jsx_runtime_import_specifiers
             .iter()
-            .flatten()
+            .flat_map(|map| map.iter())
             .map(|(path, s)| (path.0.clone(), (s.module_reference.clone(), s.specifier)))
             .collect();
         let import_helpers_import_specifiers = files
             .import_helpers_import_specifiers
             .iter()
-            .flatten()
+            .flat_map(|map| map.iter())
             .map(|(path, &specifier)| (path.0.clone(), specifier))
             .collect();
         let include_diagnostics = parsed
@@ -470,31 +741,42 @@ impl GoSharedState {
         let parse_inputs = parsed
             .iter()
             .map(|(&store, file)| {
-                let input = LazyJsDocInput {
-                    parse_options: file.parse_options.clone(),
-                    text: file.text,
-                    script_kind: file.script_kind,
-                };
+                let shared = previous.and_then(|(_, old)| old.parse_inputs.get(&store));
+                let input = shared.map_or_else(
+                    || {
+                        Arc::new(LazyJsDocInput {
+                            parse_options: file.parse_options.clone(),
+                            text: file.text,
+                            script_kind: file.script_kind,
+                        })
+                    },
+                    Arc::clone,
+                );
                 (store, input)
             })
             .collect();
         // Go reads these lazily from the program. The only file names the
         // checker asks about are resolved module names.
-        let parse_file_redirects = files
-            .resolved_modules
-            .values()
-            .flat_map(|cache| cache.values())
-            .map(|resolved| &resolved.resolved_file_name)
-            .filter(|name| !name.is_empty() && p.get_source_file(name).is_none())
-            .filter_map(|name| {
-                let redirect = p.get_parse_file_redirect(name);
-                (!redirect.is_empty()).then(|| (name.clone(), redirect))
-            })
-            .collect();
+        let parse_file_redirects = match same_resolutions {
+            Some((_, old)) => Arc::clone(&old.parse_file_redirects),
+            None => Arc::new(
+                files
+                    .resolved_modules
+                    .values()
+                    .flat_map(|cache| cache.values())
+                    .map(|resolved| &resolved.resolved_file_name)
+                    .filter(|name| !name.is_empty() && p.get_source_file(name).is_none())
+                    .filter_map(|name| {
+                        let redirect = p.get_parse_file_redirect(name);
+                        (!redirect.is_empty()).then(|| (name.clone(), redirect))
+                    })
+                    .collect(),
+            ),
+        };
         let redirect_targets = files
             .redirect_targets_map
             .iter()
-            .flatten()
+            .flat_map(|map| map.iter())
             .map(|(path, targets)| (path.0.clone(), targets.clone()))
             .collect();
         // Go: the declaration transformer asks only for preserved references
@@ -538,7 +820,7 @@ impl GoSharedState {
         let output_file_to_project_reference_source = files
             .output_file_to_project_reference_source
             .iter()
-            .flatten()
+            .flat_map(|map| map.iter())
             .map(|(path, source)| (path.0.clone(), source.clone()))
             .collect();
         let mut project_references = ProjectReferenceCopies::default();
@@ -567,12 +849,32 @@ impl GoSharedState {
             .collect();
         // PORT: Go builds the symlink cache on first use. It reads only the
         // loaded program, so building it here gives the same value.
-        let known_symlinks = (*p.get_symlink_cache()).clone();
-        let source_files_found_searching_node_modules = files
-            .source_files_found_searching_node_modules
-            .iter()
-            .map(|path| path.0.clone())
-            .collect();
+        let symlinks = p.get_symlink_cache();
+        let known_symlinks = match previous {
+            Some((old_p, old)) if Rc::ptr_eq(&symlinks, &old_p.get_symlink_cache()) => {
+                Arc::clone(&old.known_symlinks)
+            }
+            _ => Arc::new((*symlinks).clone()),
+        };
+        let source_files_found_searching_node_modules = match previous {
+            Some((old_p, old))
+                if Rc::ptr_eq(
+                    &files.source_files_found_searching_node_modules,
+                    &old_p
+                        .processed_files
+                        .source_files_found_searching_node_modules,
+                ) =>
+            {
+                Arc::clone(&old.source_files_found_searching_node_modules)
+            }
+            _ => Arc::new(
+                files
+                    .source_files_found_searching_node_modules
+                    .iter()
+                    .map(|path| path.0.clone())
+                    .collect(),
+            ),
+        };
         let has_emit_blocking_diagnostics = p
             .has_emit_blocking_diagnostics
             .iter()
@@ -693,24 +995,15 @@ impl GoSharedState {
             .parse_inputs
             .get(&file.file_index())
             .expect("not a Go frontend program file");
-        let jsdocs: &'static [Node] = Box::leak(
-            crate::frontend::parser::parse_js_doc_for_node(
-                &input.parse_options,
-                input.text,
-                input.script_kind,
-                node,
-            )
-            .into_boxed_slice(),
-        );
-        LAZY_JSDOC.with(|cache| cache.borrow_mut().insert(node, jsdocs));
-        jsdocs
+        parse_lazy_js_doc(input, node)
     }
 
     // Go: compiler/program.go:122 FileExists
     // PORT: the loading thread asks the program host (with its cache). A
     // checker worker asks its own uncached copy of the same file system.
     pub(super) fn file_exists(&self, path: &str) -> bool {
-        if let Some(go) = GO_FRONTEND.with(|cell| cell.get().copied()) {
+        let id = prog().id;
+        if let Some(go) = FRONTENDS.with(|frontends| frontends.borrow().get(&id).copied()) {
             return go.program.file_exists(path);
         }
         WORKER_FS.with(|fs| fs.file_exists(path))

@@ -27,10 +27,10 @@ pub type EmitHelperRef = &'static EmitHelper;
 #[derive(Default)]
 pub struct EmitContext {
     /// Go `Factory`. Required. The NodeFactory to use to create new nodes.
-    // PORT: the printer factory holds `Rc<EmitContext>` and the context holds
-    // the factory, as in Go. The factory is set once after the `Rc` exists
-    // (see `new_emit_context`). This is an `Rc` cycle, so a context is never
-    // freed; Go pools contexts for the same reason (they are long-lived).
+    // PORT: the printer factory holds a `Weak<EmitContext>` and the context
+    // holds the factory, as in Go. The factory is set once after the `Rc`
+    // exists (see `new_emit_context`). The `Weak` breaks the cycle, so a
+    // context is freed with its last `Rc`.
     pub(crate) factory: EmitContextFactory,
     pub(crate) auto_generate: RefCell<FxHashMap<Node, AutoGenerateInfo>>,
     pub(crate) text_source: RefCell<FxHashMap<Node, Node>>,

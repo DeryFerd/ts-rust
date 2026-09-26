@@ -12,17 +12,52 @@ use super::symlinks::KnownSymlinks;
 use super::tspath;
 use super::types::ModuleSpecifierGenerationHost;
 
-/// The loaded program as a `ModuleSpecifierGenerationHost`. The program
-/// state is global in this crate, so the host has no fields.
+/// The current program (`prog()`) as a `ModuleSpecifierGenerationHost`.
+/// The program state is reached through the current program, so the host has
+/// no fields.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProgramHost;
 
+/// The caches that Go keeps on one program and its module resolver.
+#[derive(Default)]
+struct ProgramCaches {
+    /// Go: module/resolver.go packageJsonInfoCache. Keyed by package.json path.
+    package_json_info: FxHashMap<String, Rc<InfoCacheEntry>>,
+    /// Go: compiler/program.go knownSymlinks (a lazily computed value).
+    known_symlinks: Option<Rc<KnownSymlinks>>,
+}
+
+/// The most programs whose caches a thread keeps. A checker worker serves
+/// one program. A thread that serves several (the language server's) keeps
+/// the most recently used ones; a program found again after it was dropped
+/// fills its caches again, with the same values.
+const CACHED_PROGRAMS: usize = 8;
+
 thread_local! {
-    // Go: module/resolver.go packageJsonInfoCache. Keyed by package.json path.
-    static PACKAGE_JSON_INFO_CACHE: RefCell<FxHashMap<String, Rc<InfoCacheEntry>>> =
-        RefCell::new(FxHashMap::default());
-    // Go: compiler/program.go knownSymlinks (a lazily computed value).
-    static KNOWN_SYMLINKS: RefCell<Option<Rc<KnownSymlinks>>> = const { RefCell::new(None) };
+    /// The caches of the programs that used this thread, by `GoProgram::id`
+    /// (0 without a program), most recently used first.
+    static CACHES: RefCell<Vec<(u32, ProgramCaches)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` on this thread's caches of the current program. `f` must not
+/// reach the caches again.
+fn with_program_caches<R>(f: impl FnOnce(&mut ProgramCaches) -> R) -> R {
+    let program = try_prog().map_or(0, |program| program.id);
+    CACHES.with(|caches| {
+        let mut caches = caches.borrow_mut();
+        match caches.iter().position(|(id, _)| *id == program) {
+            Some(0) => {}
+            Some(position) => {
+                let entry = caches.remove(position);
+                caches.insert(0, entry);
+            }
+            None => {
+                caches.truncate(CACHED_PROGRAMS - 1);
+                caches.insert(0, (program, ProgramCaches::default()));
+            }
+        }
+        f(&mut caches[0].1)
+    })
 }
 
 // Go: module/resolver.go:1757 getPackageJsonInfo
@@ -33,7 +68,7 @@ fn get_package_json_info_for_directory(package_directory: &str) -> Option<Rc<Inf
     let package_json_path = tspath::combine_paths(package_directory, &["package.json"]);
 
     if let Some(existing) =
-        PACKAGE_JSON_INFO_CACHE.with(|c| c.borrow().get(&package_json_path).cloned())
+        with_program_caches(|c| c.package_json_info.get(&package_json_path).cloned())
     {
         if existing.contents.is_some() {
             return Some(existing);
@@ -56,22 +91,24 @@ fn get_package_json_info_for_directory(package_directory: &str) -> Option<Rc<Inf
             contents: Some(PackageJson::new(parsed.unwrap_or_default(), parseable)),
         });
         // Go: packageJsonInfoCache.Set keeps the first stored value.
-        let result = PACKAGE_JSON_INFO_CACHE.with(|c| {
-            c.borrow_mut()
+        let result = with_program_caches(|c| {
+            c.package_json_info
                 .entry(package_json_path)
                 .or_insert(result)
                 .clone()
         });
         return Some(result);
     }
-    PACKAGE_JSON_INFO_CACHE.with(|c| {
-        c.borrow_mut().entry(package_json_path).or_insert_with(|| {
-            Rc::new(InfoCacheEntry {
-                package_directory: package_directory.to_string(),
-                directory_exists,
-                contents: None,
-            })
-        });
+    with_program_caches(|c| {
+        c.package_json_info
+            .entry(package_json_path)
+            .or_insert_with(|| {
+                Rc::new(InfoCacheEntry {
+                    package_directory: package_directory.to_string(),
+                    directory_exists,
+                    contents: None,
+                })
+            });
     });
     None
 }
@@ -148,12 +185,12 @@ impl OutputPathsHost for ProgramHost {
 impl ModuleSpecifierGenerationHost for ProgramHost {
     // Go: compiler/program.go:2017 GetSymlinkCache
     fn get_symlink_cache(&self) -> Option<Rc<KnownSymlinks>> {
-        if let Some(cached) = KNOWN_SYMLINKS.with(|c| c.borrow().clone()) {
+        if let Some(cached) = with_program_caches(|c| c.known_symlinks.clone()) {
             return Some(cached);
         }
         if let Some(go) = crate::program::get_go_symlink_cache() {
             let known_symlinks = Rc::new(go.clone());
-            KNOWN_SYMLINKS.with(|c| *c.borrow_mut() = Some(known_symlinks.clone()));
+            with_program_caches(|c| c.known_symlinks = Some(known_symlinks.clone()));
             return Some(known_symlinks);
         }
         // PORT: the rest is the legacy loader only. It approximates Go with
@@ -235,7 +272,7 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
             }
         }
         let known_symlinks = Rc::new(known_symlinks);
-        KNOWN_SYMLINKS.with(|c| *c.borrow_mut() = Some(known_symlinks.clone()));
+        with_program_caches(|c| c.known_symlinks = Some(known_symlinks.clone()));
         Some(known_symlinks)
     }
 

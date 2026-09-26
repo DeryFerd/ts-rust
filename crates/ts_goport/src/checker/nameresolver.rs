@@ -21,8 +21,10 @@ pub type NameResolverErrorFn =
 /// Go `func(node *ast.Node) *ast.Symbol`.
 pub type NameResolverGetSymbolOfDeclarationFn = Rc<dyn Fn(&mut Checker, Node) -> SymbolId>;
 /// Go `func(symbols ast.SymbolTable, name string, meaning ast.SymbolFlags) *ast.Symbol`.
+/// PORT: the name is a `TableKey`. `resolve` passes `TableKey::Name`, so a
+/// lookup compares name ids and does not hash or compare the text.
 pub type NameResolverLookupFn =
-    Rc<dyn Fn(&mut Checker, SymbolTable, &str, SymbolFlags) -> SymbolId>;
+    Rc<dyn Fn(&mut Checker, SymbolTable, TableKey<'_>, SymbolFlags) -> SymbolId>;
 /// Go `func(symbol *ast.Symbol, meaning ast.SymbolFlags)`.
 pub type NameResolverSymbolReferencedFn = Rc<dyn Fn(&mut Checker, SymbolId, SymbolFlags)>;
 /// Go `func(node *ast.Node, value core.Tristate)`.
@@ -64,9 +66,9 @@ impl NameResolver {
     // Go: binder/nameresolver.go:25 Resolve
     // PORT: Go `nameNotFoundMessage *diagnostics.Message` may be nil, so it is
     // `Option<&'static Message>`.
-    // PORT: the body is `resolve_scopes`. It looks `name` up once per scope,
-    // through `lookup` (a callback that takes `&str`). `with_text_hash`
-    // makes those lookups hash `name` once per resolve, not once per scope.
+    // PERF: `name` is interned once here as `name_key`. Each scope lookup
+    // below uses it, so a table lookup reads the hash the interner keeps and
+    // compares name ids, with no hashing and no text compare per scope.
     pub fn resolve(
         &self,
         c: &mut Checker,
@@ -77,30 +79,7 @@ impl NameResolver {
         is_use: bool,
         exclude_globals: bool,
     ) -> SymbolId {
-        with_text_hash(name, || {
-            self.resolve_scopes(
-                c,
-                location,
-                name,
-                meaning,
-                name_not_found_message,
-                is_use,
-                exclude_globals,
-            )
-        })
-    }
-
-    // PORT: the Go `Resolve` body (see `resolve`).
-    fn resolve_scopes(
-        &self,
-        c: &mut Checker,
-        location: Node,
-        name: &str,
-        meaning: SymbolFlags,
-        name_not_found_message: Option<&'static Message>,
-        is_use: bool,
-        exclude_globals: bool,
-    ) -> SymbolId {
+        let name_key = Name::from(name);
         let mut location = location;
         let mut result = SymbolId::NIL;
         let mut last_location = Node::NIL;
@@ -129,7 +108,7 @@ impl NameResolver {
             let locals = location.locals();
             // Locals of a source file are not in scope (because they get merged into the global symbol table)
             if locals.is_some() && !is_global_source_file(location) {
-                result = self.lookup(c, locals, name, meaning);
+                result = self.lookup(c, locals, &name_key, meaning);
                 if result.is_some() {
                     let mut use_result = true;
                     if is_function_like(location)
@@ -223,7 +202,7 @@ impl NameResolver {
                                     get_local_symbol_for_export_default(&c.symbols, result);
                                 if local_symbol.is_some()
                                     && c.sym(result).flags.intersects(meaning)
-                                    && c.sym(local_symbol).name == name
+                                    && c.sym(local_symbol).name == name_key
                                 {
                                     break 'loop_;
                                 }
@@ -240,7 +219,7 @@ impl NameResolver {
                             //     2. We check === SymbolFlags.Alias in order to check that the symbol is *purely*
                             //        an alias. If we used &, we'd be throwing out symbols that have non alias aspects,
                             //        which is not the desired behavior.
-                            let module_export = c.symbols.get(module_exports, name);
+                            let module_export = c.symbols.get_name(module_exports, &name_key);
                             if module_export.is_some()
                                 && c.sym(module_export).flags == SymbolFlags::ALIAS
                                 && (get_declaration_of_kind(
@@ -263,7 +242,7 @@ impl NameResolver {
                             result = self.lookup(
                                 c,
                                 module_exports,
-                                name,
+                                &name_key,
                                 meaning & SymbolFlags::MODULE_MEMBER,
                             );
                             if result.is_some() {
@@ -286,8 +265,12 @@ impl NameResolver {
                             break 'switch_;
                         }
                         let enum_exports = c.sym(enum_symbol).exports;
-                        result =
-                            self.lookup(c, enum_exports, name, meaning & SymbolFlags::ENUM_MEMBER);
+                        result = self.lookup(
+                            c,
+                            enum_exports,
+                            &name_key,
+                            meaning & SymbolFlags::ENUM_MEMBER,
+                        );
                         if result.is_some() {
                             if name_not_found_message.is_some()
                                 && self.compiler_options.get_isolated_modules()
@@ -319,7 +302,12 @@ impl NameResolver {
                             let ctor = find_constructor_declaration(location.parent());
                             if ctor.is_some() && ctor.locals().is_some() {
                                 if self
-                                    .lookup(c, ctor.locals(), name, meaning & SymbolFlags::VALUE)
+                                    .lookup(
+                                        c,
+                                        ctor.locals(),
+                                        &name_key,
+                                        meaning & SymbolFlags::VALUE,
+                                    )
                                     .is_some()
                                 {
                                     // Remember the property node, it will be used later to report appropriate error
@@ -333,7 +321,7 @@ impl NameResolver {
                     | SyntaxKind::InterfaceDeclaration => {
                         let decl_symbol = self.get_symbol_of_declaration(c, location);
                         let members = c.sym(decl_symbol).members;
-                        result = self.lookup(c, members, name, meaning & SymbolFlags::TYPE);
+                        result = self.lookup(c, members, &name_key, meaning & SymbolFlags::TYPE);
                         if result.is_some() {
                             if !is_type_parameter_symbol_declared_in_container(
                                 &c.symbols, result, location,
@@ -375,7 +363,8 @@ impl NameResolver {
                             if is_class_like(container) {
                                 let container_symbol = self.get_symbol_of_declaration(c, container);
                                 let members = c.sym(container_symbol).members;
-                                result = self.lookup(c, members, name, meaning & SymbolFlags::TYPE);
+                                result =
+                                    self.lookup(c, members, &name_key, meaning & SymbolFlags::TYPE);
                                 if result.is_some() {
                                     if name_not_found_message.is_some() {
                                         self.error(c, original_location, diag::Base_class_expressions_cannot_reference_class_type_parameters, args![]);
@@ -398,7 +387,8 @@ impl NameResolver {
                             // A reference to this grandparent's type parameters would be an error
                             let grandparent_symbol = self.get_symbol_of_declaration(c, grandparent);
                             let members = c.sym(grandparent_symbol).members;
-                            result = self.lookup(c, members, name, meaning & SymbolFlags::TYPE);
+                            result =
+                                self.lookup(c, members, &name_key, meaning & SymbolFlags::TYPE);
                             if result.is_some() {
                                 if name_not_found_message.is_some() {
                                     self.error(
@@ -539,7 +529,12 @@ impl NameResolver {
             }
         }
         if result.is_nil() && !exclude_globals {
-            result = self.lookup(c, self.globals, name, meaning | SymbolFlags::GLOBAL_LOOKUP);
+            result = self.lookup(
+                c,
+                self.globals,
+                &name_key,
+                meaning | SymbolFlags::GLOBAL_LOOKUP,
+            );
         }
         if result.is_nil() {
             if original_location.is_some()
@@ -717,19 +712,20 @@ impl NameResolver {
     }
 
     // Go: binder/nameresolver.go:418 lookup
+    // PORT: takes the name interned (see `resolve`).
     pub fn lookup(
         &self,
         c: &mut Checker,
         symbols: SymbolTable,
-        name: &str,
+        name: &Name,
         meaning: SymbolFlags,
     ) -> SymbolId {
         if let Some(lookup) = &self.lookup {
-            return lookup(c, symbols, name, meaning);
+            return lookup(c, symbols, TableKey::Name(name), meaning);
         }
         // Default implementation does not support following aliases or merged symbols
         if meaning != SymbolFlags::NONE {
-            let symbol = c.symbols.get(symbols, name);
+            let symbol = c.symbols.get_name(symbols, name);
             if symbol.is_some() {
                 if c.sym(symbol).flags.intersects(meaning) {
                     return symbol;

@@ -28,17 +28,18 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25944 getIntersectionTypeEx
-    // PORT: Go `orderedSet[*Type]` is a `Vec<TypeId>` here. It keeps
+    // PORT: Go `orderedSet[*Type]` is a stack `TypeSet` here. It keeps
     // insertion order and `contains`/`add` match Go (Go only adds values it
     // has not seen). Intersections are small, so a linear `contains` is
-    // cheaper than a hash set and the list becomes the type set with no copy.
+    // cheaper than a hash set. The reductions below change the set in place,
+    // and `new_intersection_type` copies it only when it creates the type.
     pub fn get_intersection_type_ex(
         &mut self,
         types: &[TypeId],
         flags: IntersectionFlags,
         alias: Option<Rc<TypeAlias>>,
     ) -> TypeId {
-        let mut type_set: Vec<TypeId> = Vec::with_capacity(types.len());
+        let mut type_set = TypeSet::with_capacity(types.len());
         let includes = self.add_types_to_intersection(&mut type_set, TypeFlags::NONE, types);
         let mut object_flags = ObjectFlags::NONE;
         // An intersection type is considered empty if it contains
@@ -80,8 +81,7 @@ impl Checker {
         if includes.intersects(TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING)
             && includes.intersects(TypeFlags::STRING_LITERAL)
         {
-            let (new_type_set, is_empty_set) = self.extract_redundant_template_literals(&type_set);
-            type_set = new_type_set;
+            let is_empty_set = self.extract_redundant_template_literals(&mut type_set);
             if is_empty_set {
                 return self.never_type;
             }
@@ -119,7 +119,7 @@ impl Checker {
                 && includes.intersects(TypeFlags::DEFINITELY_NON_NULLABLE)
         {
             if !flags.intersects(IntersectionFlags::NO_SUPERTYPE_REDUCTION) {
-                type_set = self.remove_redundant_supertypes(&type_set, includes);
+                self.remove_redundant_supertypes(&mut type_set, includes);
             }
         }
         if includes.intersects(TypeFlags::INCLUDES_MISSING_TYPE) {
@@ -200,8 +200,7 @@ impl Checker {
             .unwrap_or(TypeId::NIL);
         if result.is_nil() {
             if includes.intersects(TypeFlags::UNION) {
-                let (new_type_set, reduced) = self.intersect_unions_of_primitive_types(&type_set);
-                type_set = new_type_set;
+                let reduced = self.intersect_unions_of_primitive_types(&mut type_set);
                 let every_union_with_undefined =
                     type_set.iter().all(|&t| self.is_union_with_undefined(t));
                 if reduced {
@@ -350,7 +349,7 @@ impl Checker {
     // Go: checker/checker.go:26139 addTypesToIntersection
     pub fn add_types_to_intersection(
         &mut self,
-        type_set: &mut Vec<TypeId>,
+        type_set: &mut TypeSet,
         includes: TypeFlags,
         types: &[TypeId],
     ) -> TypeFlags {
@@ -365,7 +364,7 @@ impl Checker {
     // Go: checker/checker.go:26146 addTypeToIntersection
     pub fn add_type_to_intersection(
         &mut self,
-        type_set: &mut Vec<TypeId>,
+        type_set: &mut TypeSet,
         includes: TypeFlags,
         t: TypeId,
     ) -> TypeFlags {
@@ -418,12 +417,8 @@ impl Checker {
     }
 
     // Go: checker/checker.go:26183 removeRedundantSupertypes
-    pub fn remove_redundant_supertypes(
-        &mut self,
-        types: &[TypeId],
-        includes: TypeFlags,
-    ) -> Vec<TypeId> {
-        let mut types = types.to_vec();
+    // PORT: Go returns the filtered slice; Rust filters `types` in place.
+    pub fn remove_redundant_supertypes(&mut self, types: &mut TypeSet, includes: TypeFlags) {
         let mut i = types.len();
         while i > 0 {
             i -= 1;
@@ -448,7 +443,6 @@ impl Checker {
                 types.remove(i);
             }
         }
-        types
     }
 
     /**
@@ -456,8 +450,9 @@ impl Checker {
      * for example `get${string}` & "setX", and should reduce to never.
      */
     // Go: checker/checker.go:26205 extractRedundantTemplateLiterals
-    pub fn extract_redundant_template_literals(&mut self, types: &[TypeId]) -> (Vec<TypeId>, bool) {
-        let mut types = types.to_vec();
+    // PORT: Go returns the filtered slice and the flag; Rust filters `types`
+    // in place and returns the flag.
+    pub fn extract_redundant_template_literals(&mut self, types: &mut TypeSet) -> bool {
         let literals: Vec<TypeId> = types
             .iter()
             .copied()
@@ -481,22 +476,23 @@ impl Checker {
                     break;
                 }
                 if self.is_pattern_literal_type(t) {
-                    return (types, true);
+                    return true;
                 }
             }
         }
-        (types, false)
+        false
     }
 
     // If the given list of types contains more than one union of primitive types, replace the
     // first with a union containing an intersection of those primitive types, then remove the
     // other unions and return true. Otherwise, do nothing and return false.
     // Go: checker/checker.go:26231 intersectUnionsOfPrimitiveTypes
-    pub fn intersect_unions_of_primitive_types(&mut self, types: &[TypeId]) -> (Vec<TypeId>, bool) {
-        let mut types = types.to_vec();
+    // PORT: Go returns the new slice and the flag; Rust changes `types` in
+    // place and returns the flag.
+    pub fn intersect_unions_of_primitive_types(&mut self, types: &mut TypeSet) -> bool {
         let index = match types.iter().position(|&t| self.is_primitive_union(t)) {
             Some(index) => index,
-            None => return (types, false),
+            None => return false,
         };
         // Remove all but the first union of primitive types and collect them in
         // the unionTypes array.
@@ -517,7 +513,7 @@ impl Checker {
         }
         // Return false if there was only one union of primitive types
         if union_types.len() == 1 {
-            return (types, false);
+            return false;
         }
         // We have more than one union of primitive types, now intersect them. For each
         // type in each union we check if the type is matched in every union and if so
@@ -557,7 +553,7 @@ impl Checker {
             None,        /*alias*/
             TypeId::NIL, /*origin*/
         );
-        (types, true)
+        true
     }
 
     // Check that the given type has a match in every union. A given type is matched by

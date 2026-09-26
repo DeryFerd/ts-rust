@@ -1,4 +1,6 @@
 use crate::prelude::*;
+use std::cell::OnceCell;
+use std::rc::Weak;
 
 // Port of internal/checker/emitresolver.go lines 1 to 600. Lines 601 to 1298
 // are in emit_resolver_p2.rs, which adds `impl EmitResolver` blocks.
@@ -9,6 +11,10 @@ use crate::prelude::*;
 //   checker and borrows the checker for each locking call through
 //   `with_checker` (Go `checkerMu.Lock()`). A nested lock panics on the
 //   pool `RefCell`, as the Go mutex would deadlock.
+// - A language-service pool keeps its checkers on the dispatch thread as
+//   `Rc<RefCell<Checker>>`, where there is no compile worker checker. A
+//   resolver from `get_emit_resolver_of_shared_checker` also keeps a weak
+//   link to that `Rc`, and `with_checker` borrows the checker through it.
 // - Go unexported methods take `c: &mut Checker` as their first argument
 //   (the checker that Go reaches through `r.checker`). Callers that already
 //   hold the checker (node builder, symbol accessibility) use them through
@@ -43,7 +49,8 @@ pub struct DeclarationFileLinks {
 }
 
 // Go: checker/emitresolver.go:34 EmitResolver
-// PORT: `checker` and `checkerMu` are `checker_index` (see the file comment).
+// PORT: `checker` and `checkerMu` are `checker_index`, or `shared_checker`
+// for a language-service checker (see the file comment).
 // PORT: Go `isValueAliasDeclaration` and `aliasMarkingVisitor` are method
 // values cached to avoid closure allocation. Here they are plain calls to
 // `is_value_alias_declaration_worker` and `alias_marking_visitor_worker`.
@@ -51,6 +58,10 @@ pub struct DeclarationFileLinks {
 pub struct EmitResolver {
     /// Index of the owning checker in the program checker pool.
     pub checker_index: usize,
+    /// The owning checker when a language-service pool shares it as
+    /// `Rc<RefCell<Checker>>` (set by `get_emit_resolver_of_shared_checker`).
+    /// Weak, because the checker holds the resolver.
+    shared_checker: OnceCell<Weak<RefCell<Checker>>>,
     pub jsx_links: RefCell<LinkStore<Node, JSXLinks>>,
     pub declaration_links: RefCell<LinkStore<Node, DeclarationLinks>>,
     pub declaration_file_links: RefCell<LinkStore<Node, DeclarationFileLinks>>,
@@ -61,6 +72,7 @@ pub struct EmitResolver {
 pub fn new_emit_resolver(checker: &Checker) -> EmitResolver {
     EmitResolver {
         checker_index: checker.id as usize - 1,
+        shared_checker: OnceCell::new(),
         jsx_links: RefCell::new(LinkStore::default()),
         declaration_links: RefCell::new(LinkStore::default()),
         declaration_file_links: RefCell::new(LinkStore::default()),
@@ -78,10 +90,30 @@ impl Checker {
     }
 }
 
+// Go: checker/checker.go:31911 GetEmitResolver, for a checker that a
+// language-service pool shares as `Rc<RefCell<Checker>>`.
+// PORT: the resolver also links to `checker`, so `with_checker` can reach it
+// on the dispatch thread (Go `r.checker`). The checker owns one resolver, so
+// the link never changes.
+pub fn get_emit_resolver_of_shared_checker(checker: &Rc<RefCell<Checker>>) -> Rc<EmitResolver> {
+    let resolver = checker.borrow_mut().get_emit_resolver();
+    resolver
+        .shared_checker
+        .get_or_init(|| Rc::downgrade(checker));
+    resolver
+}
+
 impl EmitResolver {
     /// Go `r.checkerMu.Lock(); defer r.checkerMu.Unlock()` followed by use
-    /// of `r.checker`: borrows the owning checker from the pool for `f`.
+    /// of `r.checker`: borrows the owning checker for `f`, through the
+    /// shared checker link when it is set, otherwise from the compile pool.
     pub(crate) fn with_checker<R>(&self, f: impl FnOnce(&mut Checker) -> R) -> R {
+        if let Some(checker) = self.shared_checker.get() {
+            let checker = checker
+                .upgrade()
+                .expect("the checker of an emit resolver was dropped");
+            return f(&mut *checker.borrow_mut());
+        }
         with_checker_at(self.checker_index, f)
     }
 

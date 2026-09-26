@@ -1744,7 +1744,10 @@ impl Checker {
         }
         // PORT: a resolved list is read in place instead of copied. It does
         // not change once set.
-        let count = self.ty(t).as_type_reference().resolved_type_arguments.len();
+        let (count, memo) = {
+            let d = self.ty(t).as_type_reference();
+            (d.resolved_type_arguments.len(), d.generic_arguments_memo)
+        };
         if count == 0 {
             let type_arguments = self.get_type_arguments(t);
             for t in type_arguments {
@@ -1756,6 +1759,32 @@ impl Checker {
             }
             return false;
         }
+        // PORT: memo, no Go counterpart. A non-deferred reference keeps its
+        // non-empty resolved list for good, and the result depends only on
+        // that list, so the walk runs once per type. Relation keys ask this
+        // on every comparison.
+        if memo != GenericArgumentsMemo::Unknown {
+            debug_assert_eq!(
+                memo == GenericArgumentsMemo::True,
+                self.type_arguments_have_generic_arguments(t, count)
+            );
+            return memo == GenericArgumentsMemo::True;
+        }
+        let result = self.type_arguments_have_generic_arguments(t, count);
+        let memo = if result {
+            GenericArgumentsMemo::True
+        } else {
+            GenericArgumentsMemo::False
+        };
+        self.ty_mut(t)
+            .as_type_reference_mut()
+            .generic_arguments_memo = memo;
+        result
+    }
+
+    /// The walk of `is_type_reference_with_generic_arguments` over the
+    /// first `count` resolved type arguments of `t`.
+    fn type_arguments_have_generic_arguments(&mut self, t: TypeId, count: usize) -> bool {
         for i in 0..count {
             let a = self.ty(t).as_type_reference().resolved_type_arguments[i];
             if self.ty(a).flags.intersects(TypeFlags::TYPE_PARAMETER)

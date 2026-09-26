@@ -383,19 +383,18 @@ impl Checker {
     ) -> TypeId {
         let root = self.ty(t).as_conditional_type().root.clone();
         // PORT: the root's outer type parameters never change after it is
-        // created. They are read in place instead of copied; the mapping can
-        // reenter this root, so no borrow is held across it.
-        let outer_type_parameter_count = root.borrow().outer_type_parameters.len();
-        if outer_type_parameter_count != 0 {
+        // created. The shared list clone copies no elements, and the mapping
+        // can reenter this root, so no borrow is held across it.
+        let outer_type_parameters = root.borrow().outer_type_parameters.clone();
+        if !outer_type_parameters.is_empty() {
             // We are instantiating a conditional type that has one or more type parameters in scope. Apply the
             // mapper to the type parameters to produce the effective list of type arguments, and compute the
             // instantiation cache key from the type IDs of the type arguments.
             // PORT: the type arguments stay on the stack, because a cache hit
             // only hashes them.
             let mut type_arguments: SmallVec<[TypeId; 8]> =
-                SmallVec::with_capacity(outer_type_parameter_count);
-            for i in 0..outer_type_parameter_count {
-                let tp = root.borrow().outer_type_parameters[i];
+                SmallVec::with_capacity(outer_type_parameters.len());
+            for &tp in outer_type_parameters.iter() {
                 type_arguments.push(self.map_with_combined_mappers(m1, m2, tp));
             }
             let key = get_conditional_type_key(
@@ -411,10 +410,12 @@ impl Checker {
                 .and_then(|instantiations| instantiations.get(&key).copied())
                 .unwrap_or_default();
             if result.is_nil() {
-                let new_mapper = {
-                    let root_ref = root.borrow();
-                    self.new_type_mapper(&root_ref.outer_type_parameters, &type_arguments)
-                };
+                // PORT: the mapper keeps the root's list, so a miss copies
+                // only the type arguments.
+                let new_mapper = self.new_type_mapper_shared(
+                    outer_type_parameters,
+                    SharedList::from(&type_arguments[..]),
+                );
                 let check_type = root.borrow().check_type;
                 let is_distributive = root.borrow().is_distributive;
                 let mut distribution_type = TypeId::NIL;
@@ -1525,11 +1526,10 @@ impl Checker {
                 min_type_argument_count,
                 is_js,
             );
-            let mut type_arguments = self
-                .ty(t)
-                .as_interface_type()
-                .outer_type_parameters()
-                .to_vec();
+            // PORT: the arguments stay on the stack; `create_type_reference_ex`
+            // copies them only on a cache miss.
+            let mut type_arguments: SmallVec<[TypeId; 8]> =
+                SmallVec::from_slice(self.ty(t).as_interface_type().outer_type_parameters());
             type_arguments.extend(local_type_arguments);
             return self.create_type_reference_ex(t, &type_arguments, ObjectFlags::FROM_TYPE_NODE);
         }

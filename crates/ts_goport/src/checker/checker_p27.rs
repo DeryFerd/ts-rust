@@ -193,9 +193,9 @@ impl Checker {
             let alias = self.get_alias_for_type_node(node);
             let all_outer_type_parameters =
                 self.get_outer_type_parameters(node, true /*includeThisTypes*/);
-            let outer_type_parameters: Vec<TypeId> =
+            let outer_type_parameters: SharedList<TypeId> =
                 if alias.is_some() && !alias.type_arguments().is_empty() {
-                    all_outer_type_parameters
+                    all_outer_type_parameters.into()
                 } else {
                     let mut filtered = Vec::with_capacity(all_outer_type_parameters.len());
                     for tp in all_outer_type_parameters {
@@ -203,7 +203,7 @@ impl Checker {
                             filtered.push(tp);
                         }
                     }
-                    filtered
+                    filtered.into()
                 };
             let extends_type = self.get_type_from_type_node(node.extends_type());
             let is_distributive = self
@@ -506,6 +506,8 @@ impl Checker {
     ) -> (Option<Rc<RefCell<ConditionalRoot>>>, MapperId) {
         if self.ty(new_type).flags.intersects(TypeFlags::CONDITIONAL) && new_mapper.is_some() {
             let new_root = self.ty(new_type).as_conditional_type().root.clone();
+            // PORT: the shared list clone copies no elements, and the new
+            // mapper keeps it as its sources.
             let (outer_type_parameters, is_distributive, root_check_type) = {
                 let r = new_root.borrow();
                 (
@@ -522,7 +524,8 @@ impl Checker {
                 for &t in &outer_type_parameters {
                     type_arguments.push(self.mapper_map(type_param_mapper, t));
                 }
-                let new_root_mapper = self.new_type_mapper(&outer_type_parameters, &type_arguments);
+                let new_root_mapper =
+                    self.new_type_mapper_shared(outer_type_parameters, type_arguments.into());
                 let mut new_check_type = TypeId::NIL;
                 if is_distributive {
                     new_check_type = self.mapper_map(new_root_mapper, root_check_type);
@@ -1539,6 +1542,8 @@ impl Checker {
             value,
             fresh_type: TypeId::NIL,
             regular_type: TypeId::NIL,
+            property_name: std::cell::OnceCell::new(),
+            go_plain: std::cell::OnceCell::new(),
         };
         let t = self.new_type(flags, ObjectFlags::NONE, TypeData::Literal(data));
         let regular = if regular_type.is_some() {

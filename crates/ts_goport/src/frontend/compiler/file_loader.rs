@@ -67,12 +67,14 @@ pub struct RedirectsFile {
 }
 
 // Go: fileloader.go:70 DuplicateSourceFile
-// PORT: Go also keeps `Hash xxh3.Uint128` of the file text for the parse
-// cache. The port has no parse cache and no xxh3 dependency, so the field is
-// not here.
+// PORT: Go keeps `Hash xxh3.Uint128` of the file text for the language
+// server parse cache. The frontend has no hash, so the field is the text,
+// and the language server hashes it (Go `SourceFile.Hash` is the hash of
+// the text).
 #[derive(Clone, Debug)]
 pub struct DuplicateSourceFile {
     pub parse_options: SourceFileParseOptions,
+    pub text: &'static str,
     pub script_kind: ScriptKind,
 }
 
@@ -90,7 +92,11 @@ impl RedirectsFile {
 
 // Go: fileloader.go:86 processedFiles
 // PORT: Go nil maps that stay nil until first use are `Option`. Go
-// `*includeProcessor` is owned by value.
+// `*includeProcessor` is owned by value. Go `UpdateProgram` copies this
+// struct and so shares its maps with the old program. The maps that stay
+// the same after loading are behind `Rc`, so a clone shares them too: a
+// program version leaks its frontend program, and a deep copy leaked the
+// maps once per edit.
 #[derive(Clone)]
 pub struct ProcessedFiles {
     pub resolver: Option<Rc<Resolver>>,
@@ -104,23 +110,23 @@ pub struct ProcessedFiles {
     pub files_by_path: FxHashMap<Path, Rc<ParsedSourceFile>>,
     pub project_reference_file_mapper: Option<Rc<RefCell<ProjectReferenceFileMapper>>>,
     pub missing_files: Vec<String>,
-    pub resolved_modules: FxHashMap<Path, ModeAwareCache<Rc<ResolvedModule>>>,
+    pub resolved_modules: Rc<FxHashMap<Path, ModeAwareCache<Rc<ResolvedModule>>>>,
     pub type_resolutions_in_file:
-        FxHashMap<Path, ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>>,
-    pub source_file_meta_datas: FxHashMap<Path, SourceFileMetaData>,
-    pub jsx_runtime_import_specifiers: Option<FxHashMap<Path, Rc<JsxRuntimeImportSpecifier>>>,
-    pub import_helpers_import_specifiers: Option<FxHashMap<Path, Node>>,
-    pub lib_files: FxHashMap<Path, Rc<LibFile>>,
+        Rc<FxHashMap<Path, ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>>>,
+    pub source_file_meta_datas: Rc<FxHashMap<Path, SourceFileMetaData>>,
+    pub jsx_runtime_import_specifiers: Option<Rc<FxHashMap<Path, Rc<JsxRuntimeImportSpecifier>>>>,
+    pub import_helpers_import_specifiers: Option<Rc<FxHashMap<Path, Node>>>,
+    pub lib_files: Rc<FxHashMap<Path, Rc<LibFile>>>,
     // List of present unsupported extensions
-    pub source_files_found_searching_node_modules: FxHashSet<Path>,
+    pub source_files_found_searching_node_modules: Rc<FxHashSet<Path>>,
     pub include_processor: IncludeProcessor,
     // if file was included using source file and its output is actually part of program
     // this contains mapping from output to source file
-    pub output_file_to_project_reference_source: Option<FxHashMap<Path, String>>,
+    pub output_file_to_project_reference_source: Option<Rc<FxHashMap<Path, String>>>,
     // Key is a file path. Value is the list of files that redirect to it (same package, different install location)
-    pub redirect_targets_map: Option<FxHashMap<Path, Vec<String>>>,
+    pub redirect_targets_map: Option<Rc<FxHashMap<Path, Vec<String>>>>,
     // filesByPath for redirect files
-    pub redirect_files_by_path: Option<FxHashMap<Path, RedirectsFile>>,
+    pub redirect_files_by_path: Option<Rc<FxHashMap<Path, RedirectsFile>>>,
     pub finished_processing: bool,
 }
 

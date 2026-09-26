@@ -1,0 +1,1069 @@
+//! Port of internal/lsp/lsproto/lsp_json_test.go.
+//!
+//! PORT: Go `t.Parallel()` is dropped (cargo runs tests in parallel). A Go
+//! table test is one `#[test]` with a loop that names the case in every
+//! assert message. A Go `t.Run` subtest with its own body is one `#[test]`
+//! named `<test>_<subtest>`. Go `json.Unmarshal` / `json.Marshal` are
+//! `json_unmarshal` / `json_marshal` over the generated arshalers.
+
+use crate::lsp::lsproto::prelude::*;
+
+use std::any::Any;
+
+// gotest.tools assert.NilError
+#[track_caller]
+fn assert_nil_error<T>(name: &str, err: &Result<T, JsonError>) {
+    if let Err(err) = err {
+        panic!("{name}: expected no error, got {err}");
+    }
+}
+
+// gotest.tools assert.ErrorContains
+#[track_caller]
+fn assert_error_contains(name: &str, err: &Result<(), JsonError>, substring: &str) {
+    match err {
+        Ok(()) => panic!("{name}: expected an error containing {substring:?}, got nil"),
+        Err(err) => {
+            let text = err.to_string();
+            assert!(
+                text.contains(substring),
+                "{name}: expected error to contain {substring:?}, got {text:?}"
+            );
+        }
+    }
+}
+
+// PORT: Go `target any` holds a pointer that `check` type-asserts. The
+// trait object keeps both the unmarshaler and the type assertion.
+trait Target: UnmarshalerFrom + Any {
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: UnmarshalerFrom + Any> Target for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// Go: lsp_json_test.go:11 TestUnmarshalRejectsNullForOptionalNonNullableFields
+#[test]
+fn test_unmarshal_rejects_null_for_optional_non_nullable_fields() {
+    struct Test {
+        name: &'static str,
+        input: &'static str,
+        target: Box<dyn UnmarshalerFrom>,
+        err_text: &'static str,
+    }
+
+    let tests: Vec<Test> = vec![
+        Test {
+            name: "InlayHint kind null",
+            input: r#"{"position": {"line": 0, "character": 0}, "label": "foo", "kind": null}"#,
+            target: Box::new(InlayHint::default()),
+            err_text: r#"null value is not allowed for field "kind""#,
+        },
+        Test {
+            name: "InlayHint textEdits null",
+            input: r#"{"position": {"line": 0, "character": 0}, "label": "foo", "textEdits": null}"#,
+            target: Box::new(InlayHint::default()),
+            err_text: r#"null value is not allowed for field "textEdits""#,
+        },
+        Test {
+            name: "InlayHint paddingLeft null",
+            input: r#"{"position": {"line": 0, "character": 0}, "label": "foo", "paddingLeft": null}"#,
+            target: Box::new(InlayHint::default()),
+            err_text: r#"null value is not allowed for field "paddingLeft""#,
+        },
+        Test {
+            name: "FoldingRange kind null",
+            input: r#"{"startLine": 0, "endLine": 10, "kind": null}"#,
+            target: Box::new(FoldingRange::default()),
+            err_text: r#"null value is not allowed for field "kind""#,
+        },
+        Test {
+            name: "FoldingRange startCharacter null",
+            input: r#"{"startLine": 0, "endLine": 10, "startCharacter": null}"#,
+            target: Box::new(FoldingRange::default()),
+            err_text: r#"null value is not allowed for field "startCharacter""#,
+        },
+        Test {
+            name: "CompletionItem insertTextFormat null",
+            input: r#"{"label": "test", "insertTextFormat": null}"#,
+            target: Box::new(CompletionItem::default()),
+            err_text: r#"null value is not allowed for field "insertTextFormat""#,
+        },
+        Test {
+            name: "Hover range null",
+            input: r#"{"contents": {"kind": "plaintext", "value": "hi"}, "range": null}"#,
+            target: Box::new(Hover::default()),
+            err_text: r#"null value is not allowed for field "range""#,
+        },
+        Test {
+            name: "WorkDoneProgressOptions workDoneProgress null",
+            input: r#"{"workDoneProgress": null}"#,
+            target: Box::new(WorkDoneProgressOptions::default()),
+            err_text: r#"null value is not allowed for field "workDoneProgress""#,
+        },
+        Test {
+            name: "CallHierarchyIncomingCallsParams item null",
+            input: r#"{"item": null}"#,
+            target: Box::new(CallHierarchyIncomingCallsParams::default()),
+            err_text: r#"null value is not allowed for field "item""#,
+        },
+        Test {
+            name: "CallHierarchyIncomingCall from null",
+            input: r#"{"from": null, "fromRanges": []}"#,
+            target: Box::new(CallHierarchyIncomingCall::default()),
+            err_text: r#"null value is not allowed for field "from""#,
+        },
+        Test {
+            name: "InitializeParams capabilities null",
+            input: r#"{"processId": null, "rootUri": null, "capabilities": null}"#,
+            target: Box::new(InitializeParams::default()),
+            err_text: r#"null value is not allowed for field "capabilities""#,
+        },
+        Test {
+            name: "InitializeResult capabilities null",
+            input: r#"{"capabilities": null}"#,
+            target: Box::new(InitializeResult::default()),
+            err_text: r#"null value is not allowed for field "capabilities""#,
+        },
+        Test {
+            name: "SemanticTokens data null (required slice)",
+            input: r#"{"data": null}"#,
+            target: Box::new(SemanticTokens::default()),
+            err_text: r#"null value is not allowed for field "data""#,
+        },
+        Test {
+            name: "TextDocumentEdit edits null (required slice)",
+            input: r#"{"textDocument": {"uri": "file:///a.ts", "version": 1}, "edits": null}"#,
+            target: Box::new(TextDocumentEdit::default()),
+            err_text: r#"null value is not allowed for field "edits""#,
+        },
+    ];
+
+    for mut tt in tests {
+        let err = json_unmarshal(tt.input.as_bytes(), &mut *tt.target, &[]);
+        assert_error_contains(tt.name, &err, tt.err_text);
+    }
+}
+
+// Go: lsp_json_test.go:115 TestUnmarshalAcceptsNullForNullableFields
+#[test]
+fn test_unmarshal_accepts_null_for_nullable_fields() {
+    struct Test {
+        name: &'static str,
+        input: &'static str,
+        target: Box<dyn UnmarshalerFrom>,
+    }
+
+    let tests: Vec<Test> = vec![
+        Test {
+            name: "InitializeParams rootUri null",
+            input: r#"{"processId": null, "rootUri": null, "capabilities": {}}"#,
+            target: Box::new(InitializeParams::default()),
+        },
+        Test {
+            name: "InitializeParams workspaceFolders null",
+            input: r#"{"processId": null, "rootUri": null, "capabilities": {}, "workspaceFolders": null}"#,
+            target: Box::new(InitializeParams::default()),
+        },
+        Test {
+            name: "InitializeParams processId null",
+            input: r#"{"processId": null, "rootUri": null, "capabilities": {}}"#,
+            target: Box::new(InitializeParams::default()),
+        },
+        Test {
+            name: "InitializationOptions userPreferences null",
+            input: r#"{"userPreferences": null}"#,
+            target: Box::new(InitializationOptions::default()),
+        },
+        Test {
+            name: "InitializeParams initializationOptions null",
+            input: r#"{"processId": null, "rootUri": null, "capabilities": {}, "initializationOptions": null}"#,
+            target: Box::new(InitializeParams::default()),
+        },
+    ];
+
+    for mut tt in tests {
+        let err = json_unmarshal(tt.input.as_bytes(), &mut *tt.target, &[]);
+        assert_nil_error(tt.name, &err);
+    }
+}
+
+// Go: lsp_json_test.go:159 TestUnmarshalAcceptsOmittedOptionalFields
+#[test]
+fn test_unmarshal_accepts_omitted_optional_fields() {
+    struct Test {
+        name: &'static str,
+        input: &'static str,
+        target: Box<dyn Target>,
+        check: fn(name: &str, target: &dyn Any),
+    }
+
+    let tests: Vec<Test> = vec![
+        Test {
+            name: "InlayHint with only required fields",
+            input: r#"{"position": {"line": 1, "character": 5}, "label": "test"}"#,
+            target: Box::new(InlayHint::default()),
+            check: |name, target| {
+                let hint = target
+                    .downcast_ref::<InlayHint>()
+                    .expect("interface conversion: target is not *InlayHint");
+                assert!(hint.kind.is_none(), "{name}");
+                assert!(hint.text_edits.is_none(), "{name}");
+                assert!(hint.tooltip.is_none(), "{name}");
+                assert!(hint.padding_left.is_none(), "{name}");
+                assert!(hint.padding_right.is_none(), "{name}");
+                assert!(hint.data.is_none(), "{name}");
+                assert_eq!(hint.position.line, 1u32, "{name}");
+                assert_eq!(hint.position.character, 5u32, "{name}");
+            },
+        },
+        Test {
+            name: "FoldingRange with only required fields",
+            input: r#"{"startLine": 5, "endLine": 10}"#,
+            target: Box::new(FoldingRange::default()),
+            check: |name, target| {
+                let fr = target
+                    .downcast_ref::<FoldingRange>()
+                    .expect("interface conversion: target is not *FoldingRange");
+                assert!(fr.kind.is_none(), "{name}");
+                assert!(fr.start_character.is_none(), "{name}");
+                assert!(fr.end_character.is_none(), "{name}");
+                assert!(fr.collapsed_text.is_none(), "{name}");
+                assert_eq!(fr.start_line, 5u32, "{name}");
+                assert_eq!(fr.end_line, 10u32, "{name}");
+            },
+        },
+    ];
+
+    for mut tt in tests {
+        let err = json_unmarshal(tt.input.as_bytes(), &mut *tt.target, &[]);
+        assert_nil_error(tt.name, &err);
+        (tt.check)(tt.name, (*tt.target).as_any());
+    }
+}
+
+// Go: lsp_json_test.go:212 TestUnmarshalRejectsIncompleteObjects
+#[test]
+fn test_unmarshal_rejects_incomplete_objects() {
+    struct Test {
+        name: &'static str,
+        input: &'static str,
+        target: Box<dyn UnmarshalerFrom>,
+        err_text: &'static str,
+    }
+
+    let tests: Vec<Test> = vec![
+        Test {
+            name: "InlayHint missing position",
+            input: r#"{"label": "test"}"#,
+            target: Box::new(InlayHint::default()),
+            err_text: "missing required properties: position",
+        },
+        Test {
+            name: "InlayHint missing label",
+            input: r#"{"position": {"line": 0, "character": 0}}"#,
+            target: Box::new(InlayHint::default()),
+            err_text: "missing required properties: label",
+        },
+        Test {
+            name: "Location missing uri",
+            input: r#"{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}}"#,
+            target: Box::new(Location::default()),
+            err_text: "missing required properties: uri",
+        },
+        Test {
+            name: "Location empty object",
+            input: r#"{}"#,
+            target: Box::new(Location::default()),
+            err_text: "missing required properties: uri, range",
+        },
+    ];
+
+    for mut tt in tests {
+        let err = json_unmarshal(tt.input.as_bytes(), &mut *tt.target, &[]);
+        assert_error_contains(tt.name, &err, tt.err_text);
+    }
+}
+
+// PORT: Go `value any` holds one of four pointer types, and the test
+// switches on the dynamic type. This closed enum stands in for `any`. Its
+// `MarshalerTo` forwards to the held value, as Go dispatches on the dynamic
+// type.
+#[derive(Debug)]
+enum RoundTripValue {
+    InlayHint(InlayHint),
+    FoldingRange(FoldingRange),
+    Location(Location),
+    InitializeParams(InitializeParams),
+}
+
+impl MarshalerTo for RoundTripValue {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        match self {
+            RoundTripValue::InlayHint(v) => v.marshal_json_to(enc),
+            RoundTripValue::FoldingRange(v) => v.marshal_json_to(enc),
+            RoundTripValue::Location(v) => v.marshal_json_to(enc),
+            RoundTripValue::InitializeParams(v) => v.marshal_json_to(enc),
+        }
+    }
+}
+
+// Go: lsp_json_test.go:256 TestMarshalUnmarshalRoundTrip
+#[test]
+fn test_marshal_unmarshal_round_trip() {
+    struct Test {
+        name: &'static str,
+        value: RoundTripValue,
+    }
+
+    let tests: Vec<Test> = vec![
+        Test {
+            name: "InlayHint with kind",
+            value: RoundTripValue::InlayHint(InlayHint {
+                position: Position {
+                    line: 1,
+                    character: 5,
+                },
+                label: StringOrInlayHintLabelParts {
+                    string: Some("param".to_string()),
+                    ..Default::default()
+                },
+                kind: Some(InlayHintKind::PARAMETER),
+                ..Default::default()
+            }),
+        },
+        Test {
+            name: "InlayHint minimal",
+            value: RoundTripValue::InlayHint(InlayHint {
+                position: Position {
+                    line: 0,
+                    character: 0,
+                },
+                label: StringOrInlayHintLabelParts {
+                    string: Some("x".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        },
+        Test {
+            name: "FoldingRange with all fields",
+            value: RoundTripValue::FoldingRange(FoldingRange {
+                start_line: 1,
+                start_character: Some(0u32),
+                end_line: 10,
+                end_character: Some(5u32),
+                kind: Some(FoldingRangeKind::REGION),
+                collapsed_text: Some("...".to_string()),
+            }),
+        },
+        Test {
+            name: "Location",
+            value: RoundTripValue::Location(Location {
+                uri: DocumentUri("file:///test.ts".to_string()),
+                range: Range {
+                    start: Position {
+                        line: 1,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 4,
+                    },
+                },
+            }),
+        },
+        Test {
+            name: "InitializeParams with null processId",
+            value: RoundTripValue::InitializeParams(InitializeParams {
+                process_id: IntegerOrNull::default(),
+                root_uri: DocumentUriOrNull {
+                    document_uri: Some(DocumentUri("file:///workspace".to_string())),
+                },
+                capabilities: Some(ClientCapabilities::default()),
+                ..Default::default()
+            }),
+        },
+    ];
+
+    for tt in tests {
+        let data = json_marshal(&tt.value, &[]);
+        assert_nil_error(tt.name, &data);
+        let data = data.unwrap();
+
+        // Unmarshal into a new value of the same type
+        match &tt.value {
+            RoundTripValue::InlayHint(v) => {
+                let mut result = InlayHint::default();
+                let err = json_unmarshal(data.as_bytes(), &mut result, &[]);
+                assert_nil_error(tt.name, &err);
+                assert_eq!(*v, result, "{}", tt.name);
+            }
+            RoundTripValue::FoldingRange(v) => {
+                let mut result = FoldingRange::default();
+                let err = json_unmarshal(data.as_bytes(), &mut result, &[]);
+                assert_nil_error(tt.name, &err);
+                assert_eq!(*v, result, "{}", tt.name);
+            }
+            RoundTripValue::Location(v) => {
+                let mut result = Location::default();
+                let err = json_unmarshal(data.as_bytes(), &mut result, &[]);
+                assert_nil_error(tt.name, &err);
+                assert_eq!(*v, result, "{}", tt.name);
+            }
+            RoundTripValue::InitializeParams(v) => {
+                let mut result = InitializeParams::default();
+                let err = json_unmarshal(data.as_bytes(), &mut result, &[]);
+                assert_nil_error(tt.name, &err);
+                assert_eq!(*v, result, "{}", tt.name);
+            }
+        }
+        // PORT: Go `default: t.Fatalf("unhandled type %T", tt.value)` cannot
+        // happen; the enum is closed.
+    }
+}
+
+// Go: lsp_json_test.go:344 TestUnmarshalUnionTypes, "IntegerOrString with integer"
+#[test]
+fn test_unmarshal_union_types_integer_or_string_with_integer() {
+    let mut v = IntegerOrString::default();
+    let err = json_unmarshal(b"42", &mut v, &[]);
+    assert_nil_error("IntegerOrString with integer", &err);
+    assert!(v.integer.is_some());
+    assert_eq!(v.integer.unwrap(), 42i32);
+    assert!(v.string.is_none());
+}
+
+// Go: lsp_json_test.go:344 TestUnmarshalUnionTypes, "IntegerOrString with string"
+#[test]
+fn test_unmarshal_union_types_integer_or_string_with_string() {
+    let mut v = IntegerOrString::default();
+    let err = json_unmarshal(br#""hello""#, &mut v, &[]);
+    assert_nil_error("IntegerOrString with string", &err);
+    assert!(v.string.is_some());
+    assert_eq!(v.string.as_deref().unwrap(), "hello");
+    assert!(v.integer.is_none());
+}
+
+// Go: lsp_json_test.go:344 TestUnmarshalUnionTypes, "IntegerOrNull with integer"
+#[test]
+fn test_unmarshal_union_types_integer_or_null_with_integer() {
+    let mut v = IntegerOrNull::default();
+    let err = json_unmarshal(b"42", &mut v, &[]);
+    assert_nil_error("IntegerOrNull with integer", &err);
+    assert!(v.integer.is_some());
+    assert_eq!(v.integer.unwrap(), 42i32);
+}
+
+// Go: lsp_json_test.go:344 TestUnmarshalUnionTypes, "IntegerOrNull with null"
+#[test]
+fn test_unmarshal_union_types_integer_or_null_with_null() {
+    let mut v = IntegerOrNull::default();
+    let err = json_unmarshal(b"null", &mut v, &[]);
+    assert_nil_error("IntegerOrNull with null", &err);
+    assert!(v.integer.is_none());
+}
+
+// Go: lsp_json_test.go:344 TestUnmarshalUnionTypes, "DocumentUriOrNull with string"
+#[test]
+fn test_unmarshal_union_types_document_uri_or_null_with_string() {
+    let mut v = DocumentUriOrNull::default();
+    let err = json_unmarshal(br#""file:///test.ts""#, &mut v, &[]);
+    assert_nil_error("DocumentUriOrNull with string", &err);
+    assert!(v.document_uri.is_some());
+    assert_eq!(
+        *v.document_uri.as_ref().unwrap(),
+        DocumentUri("file:///test.ts".to_string())
+    );
+}
+
+// Go: lsp_json_test.go:344 TestUnmarshalUnionTypes, "DocumentUriOrNull with null"
+#[test]
+fn test_unmarshal_union_types_document_uri_or_null_with_null() {
+    let mut v = DocumentUriOrNull::default();
+    let err = json_unmarshal(b"null", &mut v, &[]);
+    assert_nil_error("DocumentUriOrNull with null", &err);
+    assert!(v.document_uri.is_none());
+}
+
+// Go: lsp_json_test.go:402 TestMarshalUnionTypes, "IntegerOrNull with value"
+#[test]
+fn test_marshal_union_types_integer_or_null_with_value() {
+    let v = IntegerOrNull {
+        integer: Some(42i32),
+    };
+    let data = json_marshal(&v, &[]);
+    assert_nil_error("IntegerOrNull with value", &data);
+    assert_eq!(data.unwrap(), "42");
+}
+
+// Go: lsp_json_test.go:402 TestMarshalUnionTypes, "IntegerOrNull with null"
+#[test]
+fn test_marshal_union_types_integer_or_null_with_null() {
+    let v = IntegerOrNull::default();
+    let data = json_marshal(&v, &[]);
+    assert_nil_error("IntegerOrNull with null", &data);
+    assert_eq!(data.unwrap(), "null");
+}
+
+// Go: lsp_json_test.go:402 TestMarshalUnionTypes, "IntegerOrString with integer"
+#[test]
+fn test_marshal_union_types_integer_or_string_with_integer() {
+    let v = IntegerOrString {
+        integer: Some(7i32),
+        ..Default::default()
+    };
+    let data = json_marshal(&v, &[]);
+    assert_nil_error("IntegerOrString with integer", &data);
+    assert_eq!(data.unwrap(), "7");
+}
+
+// Go: lsp_json_test.go:402 TestMarshalUnionTypes, "IntegerOrString with string"
+#[test]
+fn test_marshal_union_types_integer_or_string_with_string() {
+    let v = IntegerOrString {
+        string: Some("tok".to_string()),
+        ..Default::default()
+    };
+    let data = json_marshal(&v, &[]);
+    assert_nil_error("IntegerOrString with string", &data);
+    assert_eq!(data.unwrap(), r#""tok""#);
+}
+
+// Go: lsp_json_test.go:438 TestUnmarshalIgnoresUnknownFields, "Location with extra fields"
+#[test]
+fn test_unmarshal_ignores_unknown_fields_location_with_extra_fields() {
+    let mut loc = Location::default();
+    let err = json_unmarshal(
+        br#"{
+			"uri": "file:///test.ts",
+			"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+			"someUnknownField": 42,
+			"anotherUnknown": {"nested": true}
+		}"#,
+        &mut loc,
+        &[],
+    );
+    assert_nil_error("Location with extra fields", &err);
+    assert_eq!(loc.uri, DocumentUri("file:///test.ts".to_string()));
+}
+
+// Go: lsp_json_test.go:438 TestUnmarshalIgnoresUnknownFields, "InlayHint with extra fields"
+#[test]
+fn test_unmarshal_ignores_unknown_fields_inlay_hint_with_extra_fields() {
+    let mut hint = InlayHint::default();
+    let err = json_unmarshal(
+        br#"{
+			"position": {"line": 0, "character": 0},
+			"label": "x",
+			"futureField": [1, 2, 3]
+		}"#,
+        &mut hint,
+        &[],
+    );
+    assert_nil_error("InlayHint with extra fields", &err);
+}
+
+// Go: lsp_json_test.go:466 TestUnmarshalRejectsWrongTypes
+#[test]
+fn test_unmarshal_rejects_wrong_types() {
+    struct Test {
+        name: &'static str,
+        input: &'static str,
+        target: Box<dyn UnmarshalerFrom>,
+    }
+
+    let tests: Vec<Test> = vec![
+        Test {
+            name: "Location receives array",
+            input: r#"[]"#,
+            target: Box::new(Location::default()),
+        },
+        Test {
+            name: "Location receives string",
+            input: r#""not an object""#,
+            target: Box::new(Location::default()),
+        },
+        Test {
+            name: "Location receives number",
+            input: r#"42"#,
+            target: Box::new(Location::default()),
+        },
+        Test {
+            name: "Location receives null",
+            input: r#"null"#,
+            target: Box::new(Location::default()),
+        },
+        Test {
+            name: "FoldingRange receives boolean",
+            input: r#"true"#,
+            target: Box::new(FoldingRange::default()),
+        },
+    ];
+
+    for mut tt in tests {
+        let err = json_unmarshal(tt.input.as_bytes(), &mut *tt.target, &[]);
+        assert!(
+            err.is_err(),
+            "{}: expected error for input {}",
+            tt.name,
+            tt.input
+        );
+    }
+}
+
+// Go: lsp_json_test.go:510 TestUnmarshalUnionTypeWrongKind, "IntegerOrString rejects boolean"
+#[test]
+fn test_unmarshal_union_type_wrong_kind_integer_or_string_rejects_boolean() {
+    let mut v = IntegerOrString::default();
+    let err = json_unmarshal(b"true", &mut v, &[]);
+    assert!(err.is_err());
+}
+
+// Go: lsp_json_test.go:510 TestUnmarshalUnionTypeWrongKind, "IntegerOrString rejects null"
+#[test]
+fn test_unmarshal_union_type_wrong_kind_integer_or_string_rejects_null() {
+    let mut v = IntegerOrString::default();
+    let err = json_unmarshal(b"null", &mut v, &[]);
+    assert!(err.is_err());
+}
+
+// Go: lsp_json_test.go:510 TestUnmarshalUnionTypeWrongKind, "IntegerOrString rejects object"
+#[test]
+fn test_unmarshal_union_type_wrong_kind_integer_or_string_rejects_object() {
+    let mut v = IntegerOrString::default();
+    let err = json_unmarshal(b"{}", &mut v, &[]);
+    assert!(err.is_err());
+}
+
+// Go: lsp_json_test.go:510 TestUnmarshalUnionTypeWrongKind, "IntegerOrString rejects array"
+#[test]
+fn test_unmarshal_union_type_wrong_kind_integer_or_string_rejects_array() {
+    let mut v = IntegerOrString::default();
+    let err = json_unmarshal(b"[]", &mut v, &[]);
+    assert!(err.is_err());
+}
+
+// Go: lsp_json_test.go:510 TestUnmarshalUnionTypeWrongKind, "StringOrInlayHintLabelParts rejects number"
+#[test]
+fn test_unmarshal_union_type_wrong_kind_string_or_inlay_hint_label_parts_rejects_number() {
+    let mut v = StringOrInlayHintLabelParts::default();
+    let err = json_unmarshal(b"42", &mut v, &[]);
+    assert!(err.is_err());
+}
+
+// Go: lsp_json_test.go:510 TestUnmarshalUnionTypeWrongKind, "StringOrInlayHintLabelParts rejects boolean"
+#[test]
+fn test_unmarshal_union_type_wrong_kind_string_or_inlay_hint_label_parts_rejects_boolean() {
+    let mut v = StringOrInlayHintLabelParts::default();
+    let err = json_unmarshal(b"true", &mut v, &[]);
+    assert!(err.is_err());
+}
+
+// Go: lsp_json_test.go:556 TestUnmarshalBooleanUnionTypes, "BooleanOrHoverOptions with true"
+#[test]
+fn test_unmarshal_boolean_union_types_boolean_or_hover_options_with_true() {
+    let mut v = BooleanOrHoverOptions::default();
+    let err = json_unmarshal(b"true", &mut v, &[]);
+    assert_nil_error("BooleanOrHoverOptions with true", &err);
+    assert!(v.boolean.is_some());
+    assert!(v.boolean.unwrap());
+    assert!(v.hover_options.is_none());
+}
+
+// Go: lsp_json_test.go:556 TestUnmarshalBooleanUnionTypes, "BooleanOrHoverOptions with false"
+#[test]
+fn test_unmarshal_boolean_union_types_boolean_or_hover_options_with_false() {
+    let mut v = BooleanOrHoverOptions::default();
+    let err = json_unmarshal(b"false", &mut v, &[]);
+    assert_nil_error("BooleanOrHoverOptions with false", &err);
+    assert!(v.boolean.is_some());
+    assert!(!v.boolean.unwrap());
+    assert!(v.hover_options.is_none());
+}
+
+// Go: lsp_json_test.go:556 TestUnmarshalBooleanUnionTypes, "BooleanOrHoverOptions with object"
+#[test]
+fn test_unmarshal_boolean_union_types_boolean_or_hover_options_with_object() {
+    let mut v = BooleanOrHoverOptions::default();
+    let err = json_unmarshal(b"{}", &mut v, &[]);
+    assert_nil_error("BooleanOrHoverOptions with object", &err);
+    assert!(v.boolean.is_none());
+    assert!(v.hover_options.is_some());
+}
+
+// Go: lsp_json_test.go:556 TestUnmarshalBooleanUnionTypes, "BooleanOrHoverOptions rejects string"
+#[test]
+fn test_unmarshal_boolean_union_types_boolean_or_hover_options_rejects_string() {
+    let mut v = BooleanOrHoverOptions::default();
+    let err = json_unmarshal(br#""nope""#, &mut v, &[]);
+    assert!(err.is_err());
+}
+
+// Go: lsp_json_test.go:596 TestUnmarshalDiscriminatorUnion, "WorkDoneProgressBegin"
+#[test]
+fn test_unmarshal_discriminator_union_work_done_progress_begin() {
+    let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
+    let err = json_unmarshal(br#"{"kind": "begin", "title": "Indexing"}"#, &mut v, &[]);
+    assert_nil_error("WorkDoneProgressBegin", &err);
+    assert!(v.begin.is_some());
+    assert!(v.report.is_none());
+    assert!(v.end.is_none());
+    assert_eq!(v.begin.as_ref().unwrap().title, "Indexing");
+}
+
+// Go: lsp_json_test.go:596 TestUnmarshalDiscriminatorUnion, "WorkDoneProgressReport"
+#[test]
+fn test_unmarshal_discriminator_union_work_done_progress_report() {
+    let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
+    let err = json_unmarshal(br#"{"kind": "report", "message": "50%"}"#, &mut v, &[]);
+    assert_nil_error("WorkDoneProgressReport", &err);
+    assert!(v.begin.is_none());
+    assert!(v.report.is_some());
+    assert!(v.end.is_none());
+    assert!(v.report.as_ref().unwrap().message.is_some());
+    assert_eq!(
+        v.report.as_ref().unwrap().message.as_deref().unwrap(),
+        "50%"
+    );
+}
+
+// Go: lsp_json_test.go:596 TestUnmarshalDiscriminatorUnion, "WorkDoneProgressEnd"
+#[test]
+fn test_unmarshal_discriminator_union_work_done_progress_end() {
+    let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
+    let err = json_unmarshal(br#"{"kind": "end"}"#, &mut v, &[]);
+    assert_nil_error("WorkDoneProgressEnd", &err);
+    assert!(v.begin.is_none());
+    assert!(v.report.is_none());
+    assert!(v.end.is_some());
+}
+
+// Go: lsp_json_test.go:596 TestUnmarshalDiscriminatorUnion, "invalid discriminator"
+#[test]
+fn test_unmarshal_discriminator_union_invalid_discriminator() {
+    let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
+    let err = json_unmarshal(br#"{"kind": "invalid"}"#, &mut v, &[]);
+    assert!(err.is_err());
+}
+
+// Go: lsp_json_test.go:640 TestUnmarshalPresenceDiscriminatorUnion, "TextEdit via range field"
+#[test]
+fn test_unmarshal_presence_discriminator_union_text_edit_via_range_field() {
+    let mut v = TextEditOrInsertReplaceEdit::default();
+    let err = json_unmarshal(
+        br#"{
+			"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+			"newText": "x"
+		}"#,
+        &mut v,
+        &[],
+    );
+    assert_nil_error("TextEdit via range field", &err);
+    assert!(v.text_edit.is_some());
+    assert!(v.insert_replace_edit.is_none());
+    assert_eq!(v.text_edit.as_ref().unwrap().new_text, "x");
+}
+
+// Go: lsp_json_test.go:640 TestUnmarshalPresenceDiscriminatorUnion, "InsertReplaceEdit via insert field"
+#[test]
+fn test_unmarshal_presence_discriminator_union_insert_replace_edit_via_insert_field() {
+    let mut v = TextEditOrInsertReplaceEdit::default();
+    let err = json_unmarshal(
+        br#"{
+			"insert": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+			"replace": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+			"newText": "y"
+		}"#,
+        &mut v,
+        &[],
+    );
+    assert_nil_error("InsertReplaceEdit via insert field", &err);
+    assert!(v.text_edit.is_none());
+    assert!(v.insert_replace_edit.is_some());
+    assert_eq!(v.insert_replace_edit.as_ref().unwrap().new_text, "y");
+}
+
+// Go: lsp_json_test.go:671 TestUnmarshalStringOrArrayUnion, "StringOrInlayHintLabelParts with string"
+#[test]
+fn test_unmarshal_string_or_array_union_string_or_inlay_hint_label_parts_with_string() {
+    let mut v = StringOrInlayHintLabelParts::default();
+    let err = json_unmarshal(br#""hello""#, &mut v, &[]);
+    assert_nil_error("StringOrInlayHintLabelParts with string", &err);
+    assert!(v.string.is_some());
+    assert_eq!(v.string.as_deref().unwrap(), "hello");
+    assert!(v.inlay_hint_label_parts.is_none());
+}
+
+// Go: lsp_json_test.go:671 TestUnmarshalStringOrArrayUnion, "StringOrInlayHintLabelParts with array"
+#[test]
+fn test_unmarshal_string_or_array_union_string_or_inlay_hint_label_parts_with_array() {
+    let mut v = StringOrInlayHintLabelParts::default();
+    let err = json_unmarshal(
+        br#"[{"value": "param"}, {"value": ": "}, {"value": "string"}]"#,
+        &mut v,
+        &[],
+    );
+    assert_nil_error("StringOrInlayHintLabelParts with array", &err);
+    assert!(v.string.is_none());
+    assert!(v.inlay_hint_label_parts.is_some());
+    assert_eq!(v.inlay_hint_label_parts.as_ref().unwrap().len(), 3);
+    assert_eq!(v.inlay_hint_label_parts.as_ref().unwrap()[0].value, "param");
+}
+
+// Go: lsp_json_test.go:696 TestUnmarshalDocumentEditUnion, "TextDocumentEdit without kind"
+#[test]
+fn test_unmarshal_document_edit_union_text_document_edit_without_kind() {
+    let mut v = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();
+    let err = json_unmarshal(
+        br#"{
+			"textDocument": {"uri": "file:///a.ts", "version": 1},
+			"edits": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "x"}]
+		}"#,
+        &mut v,
+        &[],
+    );
+    assert_nil_error("TextDocumentEdit without kind", &err);
+    assert!(v.text_document_edit.is_some());
+    assert!(v.create_file.is_none());
+    assert!(v.rename_file.is_none());
+    assert!(v.delete_file.is_none());
+}
+
+// Go: lsp_json_test.go:696 TestUnmarshalDocumentEditUnion, "CreateFile with kind create"
+#[test]
+fn test_unmarshal_document_edit_union_create_file_with_kind_create() {
+    let mut v = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();
+    let err = json_unmarshal(
+        br#"{"kind": "create", "uri": "file:///new.ts"}"#,
+        &mut v,
+        &[],
+    );
+    assert_nil_error("CreateFile with kind create", &err);
+    assert!(v.text_document_edit.is_none());
+    assert!(v.create_file.is_some());
+    assert_eq!(
+        v.create_file.as_ref().unwrap().uri,
+        DocumentUri("file:///new.ts".to_string())
+    );
+}
+
+// Go: lsp_json_test.go:696 TestUnmarshalDocumentEditUnion, "RenameFile with kind rename"
+#[test]
+fn test_unmarshal_document_edit_union_rename_file_with_kind_rename() {
+    let mut v = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();
+    let err = json_unmarshal(
+        br#"{"kind": "rename", "oldUri": "file:///old.ts", "newUri": "file:///new.ts"}"#,
+        &mut v,
+        &[],
+    );
+    assert_nil_error("RenameFile with kind rename", &err);
+    assert!(v.rename_file.is_some());
+    assert_eq!(
+        v.rename_file.as_ref().unwrap().old_uri,
+        DocumentUri("file:///old.ts".to_string())
+    );
+}
+
+// Go: lsp_json_test.go:696 TestUnmarshalDocumentEditUnion, "DeleteFile with kind delete"
+#[test]
+fn test_unmarshal_document_edit_union_delete_file_with_kind_delete() {
+    let mut v = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();
+    let err = json_unmarshal(
+        br#"{"kind": "delete", "uri": "file:///gone.ts"}"#,
+        &mut v,
+        &[],
+    );
+    assert_nil_error("DeleteFile with kind delete", &err);
+    assert!(v.delete_file.is_some());
+    assert_eq!(
+        v.delete_file.as_ref().unwrap().uri,
+        DocumentUri("file:///gone.ts".to_string())
+    );
+}
+
+// Go: lsp_json_test.go:742 TestUnmarshalFieldOrdering, "Location with reversed field order"
+#[test]
+fn test_unmarshal_field_ordering_location_with_reversed_field_order() {
+    let mut loc = Location::default();
+    let err = json_unmarshal(
+        br#"{
+			"range": {"start": {"line": 1, "character": 2}, "end": {"line": 3, "character": 4}},
+			"uri": "file:///test.ts"
+		}"#,
+        &mut loc,
+        &[],
+    );
+    assert_nil_error("Location with reversed field order", &err);
+    assert_eq!(loc.uri, DocumentUri("file:///test.ts".to_string()));
+    assert_eq!(loc.range.start.line, 1u32);
+}
+
+// Go: lsp_json_test.go:742 TestUnmarshalFieldOrdering, "InlayHint with kind before label"
+#[test]
+fn test_unmarshal_field_ordering_inlay_hint_with_kind_before_label() {
+    let mut hint = InlayHint::default();
+    let err = json_unmarshal(
+        br#"{
+			"kind": 1,
+			"label": "x",
+			"position": {"line": 0, "character": 0}
+		}"#,
+        &mut hint,
+        &[],
+    );
+    assert_nil_error("InlayHint with kind before label", &err);
+    assert!(hint.kind.is_some());
+    assert_eq!(hint.kind.unwrap(), InlayHintKind::TYPE);
+}
+
+// Go: lsp_json_test.go:771 TestUnmarshalEmptyObject, "WorkDoneProgressOptions empty"
+#[test]
+fn test_unmarshal_empty_object_work_done_progress_options_empty() {
+    let mut v = WorkDoneProgressOptions::default();
+    let err = json_unmarshal(b"{}", &mut v, &[]);
+    assert_nil_error("WorkDoneProgressOptions empty", &err);
+    assert!(v.work_done_progress.is_none());
+}
+
+// Go: lsp_json_test.go:771 TestUnmarshalEmptyObject, "InitializationOptions empty"
+#[test]
+fn test_unmarshal_empty_object_initialization_options_empty() {
+    let mut v = InitializationOptions::default();
+    let err = json_unmarshal(b"{}", &mut v, &[]);
+    assert_nil_error("InitializationOptions empty", &err);
+}
+
+// Go: lsp_json_test.go:771 TestUnmarshalEmptyObject, "ClientCapabilities empty"
+#[test]
+fn test_unmarshal_empty_object_client_capabilities_empty() {
+    let mut v = ClientCapabilities::default();
+    let err = json_unmarshal(b"{}", &mut v, &[]);
+    assert_nil_error("ClientCapabilities empty", &err);
+}
+
+// Go: lsp_json_test.go:771 TestUnmarshalEmptyObject, "ServerCapabilities empty"
+#[test]
+fn test_unmarshal_empty_object_server_capabilities_empty() {
+    let mut v = ServerCapabilities::default();
+    let err = json_unmarshal(b"{}", &mut v, &[]);
+    assert_nil_error("ServerCapabilities empty", &err);
+}
+
+// Go: lsp_json_test.go:804 TestMarshalOmitsZeroOptionalFields, "InlayHint omits nil fields"
+#[test]
+fn test_marshal_omits_zero_optional_fields_inlay_hint_omits_nil_fields() {
+    let hint = InlayHint {
+        position: Position {
+            line: 0,
+            character: 0,
+        },
+        label: StringOrInlayHintLabelParts {
+            string: Some("x".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let data = json_marshal(&hint, &[]);
+    assert_nil_error("InlayHint omits nil fields", &data);
+    let s = data.unwrap();
+    assert!(!s.contains("kind"), "should not contain 'kind', got: {s}");
+    assert!(
+        !s.contains("textEdits"),
+        "should not contain 'textEdits', got: {s}"
+    );
+    assert!(
+        !s.contains("paddingLeft"),
+        "should not contain 'paddingLeft', got: {s}"
+    );
+    assert!(
+        s.contains("position"),
+        "should contain 'position', got: {s}"
+    );
+    assert!(s.contains("label"), "should contain 'label', got: {s}");
+}
+
+// Go: lsp_json_test.go:804 TestMarshalOmitsZeroOptionalFields, "FoldingRange omits nil optional fields"
+#[test]
+fn test_marshal_omits_zero_optional_fields_folding_range_omits_nil_optional_fields() {
+    let fr = FoldingRange {
+        start_line: 1,
+        end_line: 10,
+        ..Default::default()
+    };
+    let data = json_marshal(&fr, &[]);
+    assert_nil_error("FoldingRange omits nil optional fields", &data);
+    let s = data.unwrap();
+    assert!(!s.contains("kind"), "should not contain 'kind', got: {s}");
+    assert!(
+        !s.contains("startCharacter"),
+        "should not contain 'startCharacter', got: {s}"
+    );
+    assert!(
+        s.contains("startLine"),
+        "should contain 'startLine', got: {s}"
+    );
+    assert!(s.contains("endLine"), "should contain 'endLine', got: {s}");
+}
+
+// Go: lsp_json_test.go:836 TestLiteralTypes, "StringLiteralCreate marshal"
+#[test]
+fn test_literal_types_string_literal_create_marshal() {
+    let v = StringLiteralCreate;
+    let data = json_marshal(&v, &[]);
+    assert_nil_error("StringLiteralCreate marshal", &data);
+    assert_eq!(data.unwrap(), r#""create""#);
+}
+
+// Go: lsp_json_test.go:836 TestLiteralTypes, "StringLiteralCreate unmarshal"
+#[test]
+fn test_literal_types_string_literal_create_unmarshal() {
+    let mut v = StringLiteralCreate;
+    let err = json_unmarshal(br#""create""#, &mut v, &[]);
+    assert_nil_error("StringLiteralCreate unmarshal", &err);
+}
+
+// Go: lsp_json_test.go:836 TestLiteralTypes, "StringLiteralCreate rejects wrong value"
+#[test]
+fn test_literal_types_string_literal_create_rejects_wrong_value() {
+    let mut v = StringLiteralCreate;
+    let err = json_unmarshal(br#""delete""#, &mut v, &[]);
+    assert!(err.is_err());
+}
+
+// Go: lsp_json_test.go:836 TestLiteralTypes, "StringLiteralCreate rejects wrong type"
+#[test]
+fn test_literal_types_string_literal_create_rejects_wrong_type() {
+    let mut v = StringLiteralCreate;
+    let err = json_unmarshal(b"42", &mut v, &[]);
+    assert!(err.is_err());
+}
+
+// Go: lsp_json_test.go:869 TestEnumStringValues, "InlayHintKind values"
+#[test]
+fn test_enum_string_values_inlay_hint_kind_values() {
+    assert_eq!(InlayHintKind::TYPE.string(), "Type");
+    assert_eq!(InlayHintKind::PARAMETER.string(), "Parameter");
+}
+
+// Go: lsp_json_test.go:869 TestEnumStringValues, "SymbolKind values"
+#[test]
+fn test_enum_string_values_symbol_kind_values() {
+    assert_eq!(SymbolKind::FILE.string(), "File");
+    assert_eq!(SymbolKind::FUNCTION.string(), "Function");
+    assert_eq!(SymbolKind::VARIABLE.string(), "Variable");
+}
+
+// Go: lsp_json_test.go:869 TestEnumStringValues, "unknown enum value"
+#[test]
+fn test_enum_string_values_unknown_enum_value() {
+    let v = InlayHintKind(999);
+    let s = v.string();
+    assert!(
+        s.contains("999"),
+        "should contain the numeric value, got: {s}"
+    );
+}

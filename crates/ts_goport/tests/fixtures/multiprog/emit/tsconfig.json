@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "es2015",
+    "lib": ["es5"],
+    "types": [],
+    "declaration": true,
+    "rootDir": "src"
+  },
+  "include": ["src"]
+}

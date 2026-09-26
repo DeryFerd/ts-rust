@@ -300,6 +300,9 @@ impl Checker {
         let mut data = TemplateLiteralType::default();
         data.texts = texts.into();
         data.types = types.into();
+        data.go_plain = !texts
+            .iter()
+            .any(|text| crate::scanner_util::contains_go_string_marker(text));
         self.new_type(
             TypeFlags::TEMPLATE_LITERAL,
             ObjectFlags::NONE,
@@ -427,7 +430,9 @@ impl Checker {
 
     // Returns the origin of the type parameter list of `sig`, giving the
     // list one first when Go is about to share its slice with another
-    // signature. Empty lists need none (`core.Same` compares lengths first).
+    // signature. Empty lists need none (`core.Same` compares lengths first),
+    // but an empty list that already has one (a non-nil empty Go slice, see
+    // `class_type_parameters_origin`) keeps it.
     pub fn share_type_parameters_origin(&mut self, sig: SignatureId) -> u32 {
         let s = self.sig(sig);
         if s.type_parameters.is_empty() || s.type_parameters_origin != 0 {
@@ -439,11 +444,15 @@ impl Checker {
     }
 
     // Origin of the Go slice `classType.AsInterfaceType().LocalTypeParameters()`.
+    // Go returns nil only when `allTypeParameters` is empty. A class always
+    // holds its this-type there, so a non-generic class gets a non-nil empty
+    // slice, and the origin marks it as non-nil (read by the language
+    // service `getPossibleGenericSignatures`, `TypeParameters() != nil`).
     pub fn class_type_parameters_origin(&mut self, class_type: TypeId) -> u32 {
         if self
             .ty(class_type)
             .as_interface_type()
-            .local_type_parameters()
+            .all_type_parameters
             .is_empty()
         {
             return 0;
@@ -618,6 +627,19 @@ impl Checker {
             Some(LiteralValue::String(s)) => s,
             _ => panic!("interface conversion: interface {{}} is not string"),
         }
+    }
+
+    // PORT: perf, no Go function. True when the string literal type `t` has
+    // a value with no `scanner_util::GO_STRING_MARKER`, so the value is its own
+    // Go bytes and needs no `go_string_bytes`. Computed once per type.
+    pub fn string_literal_go_plain(&self, t: TypeId) -> bool {
+        let literal = self.ty(t).as_literal_type();
+        *literal
+            .go_plain
+            .get_or_init(|| match literal.value.as_ref() {
+                Some(LiteralValue::String(s)) => !crate::scanner_util::contains_go_string_marker(s),
+                _ => false,
+            })
     }
 
     // Go: checker/checker.go:25252 getNumberLiteralValue
@@ -1108,8 +1130,11 @@ impl Checker {
         origin: TypeId,
     ) -> TypeId {
         let mut origin = origin;
-        let (mut type_set, includes) =
-            self.add_types_to_union(Vec::with_capacity(types.len()), TypeFlags::NONE, types);
+        // PORT: the set is built in a stack `TypeSet` and reduced in place.
+        // `get_union_type_from_sorted_list` copies it only when it creates
+        // the union.
+        let mut type_set = TypeSet::with_capacity(types.len());
+        let includes = self.add_types_to_union(&mut type_set, TypeFlags::NONE, types);
         if union_reduction != UnionReduction::NONE {
             if includes.intersects(TypeFlags::ANY_OR_UNKNOWN) {
                 if includes.intersects(TypeFlags::ANY) {
@@ -1140,8 +1165,8 @@ impl Checker {
             ) || includes.intersects(TypeFlags::VOID)
                 && includes.intersects(TypeFlags::UNDEFINED)
             {
-                type_set = self.remove_redundant_literal_types(
-                    type_set,
+                self.remove_redundant_literal_types(
+                    &mut type_set,
                     includes,
                     (union_reduction.0 & UnionReduction::SUBTYPE.0) != 0,
                 );
@@ -1149,16 +1174,15 @@ impl Checker {
             if includes.intersects(TypeFlags::STRING_LITERAL)
                 && includes.intersects(TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING)
             {
-                type_set = self.remove_string_literals_matched_by_template_literals(type_set);
+                self.remove_string_literals_matched_by_template_literals(&mut type_set);
             }
             if includes.intersects(TypeFlags::INCLUDES_CONSTRAINED_TYPE_VARIABLE) {
-                type_set = self.remove_constrained_type_variables(type_set);
+                self.remove_constrained_type_variables(&mut type_set);
             }
-            if union_reduction == UnionReduction::SUBTYPE {
-                match self.remove_subtypes(type_set, includes.intersects(TypeFlags::OBJECT)) {
-                    Some(reduced) => type_set = reduced,
-                    None => return self.error_type,
-                }
+            if union_reduction == UnionReduction::SUBTYPE
+                && !self.remove_subtypes(&mut type_set, includes.intersects(TypeFlags::OBJECT))
+            {
+                return self.error_type;
             }
             if type_set.is_empty() {
                 if includes.intersects(TypeFlags::NULL) {
@@ -1266,15 +1290,14 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25663 addTypesToUnion
-    // PORT: Go threads the slice through and returns it; Rust takes and
-    // returns an owned `Vec`.
+    // PORT: Go threads the slice through and returns it; Rust grows the
+    // caller's set in place and returns only `includes`.
     pub fn add_types_to_union(
         &mut self,
-        type_set: Vec<TypeId>,
+        type_set: &mut TypeSet,
         includes: TypeFlags,
         types: &[TypeId],
-    ) -> (Vec<TypeId>, TypeFlags) {
-        let mut type_set = type_set;
+    ) -> TypeFlags {
         let mut includes = includes;
         let mut last_type = TypeId::NIL;
         for &t in types {
@@ -1292,24 +1315,23 @@ impl Checker {
                     if has_alias || origin.is_some() {
                         includes |= TypeFlags::UNION;
                     }
-                    (type_set, includes) = self.add_types_to_union(type_set, includes, &u_types);
+                    includes = self.add_types_to_union(type_set, includes, &u_types);
                 } else {
-                    (type_set, includes) = self.add_type_to_union(type_set, includes, t);
+                    includes = self.add_type_to_union(type_set, includes, t);
                 }
                 last_type = t;
             }
         }
-        (type_set, includes)
+        includes
     }
 
     // Go: checker/checker.go:25682 addTypeToUnion
     pub fn add_type_to_union(
         &mut self,
-        type_set: Vec<TypeId>,
+        type_set: &mut TypeSet,
         includes: TypeFlags,
         t: TypeId,
-    ) -> (Vec<TypeId>, TypeFlags) {
-        let mut type_set = type_set;
+    ) -> TypeFlags {
         let mut includes = includes;
         let flags = self.ty(t).flags;
         let object_flags = self.ty(t).object_flags;
@@ -1344,7 +1366,7 @@ impl Checker {
                 }
             }
         }
-        (type_set, includes)
+        includes
     }
 
     // Go: checker/checker.go:25712 addNamedUnions
@@ -1369,13 +1391,13 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25726 removeRedundantLiteralTypes
+    // PORT: Go returns the filtered slice; Rust filters `types` in place.
     pub fn remove_redundant_literal_types(
         &mut self,
-        types: Vec<TypeId>,
+        types: &mut TypeSet,
         includes: TypeFlags,
         reduce_void_undefined: bool,
-    ) -> Vec<TypeId> {
-        let mut types = types;
+    ) {
         let mut i = types.len();
         while i > 0 {
             i -= 1;
@@ -1394,20 +1416,16 @@ impl Checker {
                     && flags.intersects(TypeFlags::UNDEFINED)
                     && includes.intersects(TypeFlags::VOID)
                 || self.is_fresh_literal_type(t)
-                    && self.contains_type(&types, self.ty(t).as_literal_type().regular_type);
+                    && self.contains_type(types, self.ty(t).as_literal_type().regular_type);
             if remove {
                 types.remove(i);
             }
         }
-        types
     }
 
     // Go: checker/checker.go:25745 removeStringLiteralsMatchedByTemplateLiterals
-    pub fn remove_string_literals_matched_by_template_literals(
-        &mut self,
-        types: Vec<TypeId>,
-    ) -> Vec<TypeId> {
-        let mut types = types;
+    // PORT: Go returns the filtered slice; Rust filters `types` in place.
+    pub fn remove_string_literals_matched_by_template_literals(&mut self, types: &mut TypeSet) {
         let templates: Vec<TypeId> = types
             .iter()
             .copied()
@@ -1427,7 +1445,6 @@ impl Checker {
                 }
             }
         }
-        types
     }
 
     // Go: checker/checker.go:25762 isTypeMatchedByTemplateLiteralOrStringMapping
@@ -1453,11 +1470,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25769 removeConstrainedTypeVariables
-    pub fn remove_constrained_type_variables(&mut self, types: Vec<TypeId>) -> Vec<TypeId> {
-        let mut types = types;
+    // PORT: Go returns the new slice; Rust changes `types` in place.
+    pub fn remove_constrained_type_variables(&mut self, types: &mut TypeSet) {
         let mut type_variables: Vec<TypeId> = Vec::new();
         // First collect a list of the type variables occurring in constraining intersections.
-        for &t in &types {
+        for &t in types.iter() {
             if let Some((variable, _)) = self.constrained_type_variable_parts_p28(t) {
                 if !type_variables.contains(&variable) {
                     type_variables.push(variable);
@@ -1470,7 +1487,7 @@ impl Checker {
         for type_variable in type_variables {
             let mut primitives: Vec<TypeId> = Vec::new();
             // First collect the primitive types from the constraining intersections.
-            for &t in &types {
+            for &t in types.iter() {
                 if let Some((variable, primitive)) = self.constrained_type_variable_parts_p28(t) {
                     if variable == type_variable {
                         (primitives, _) = self.insert_type(&primitives, primitive);
@@ -1498,10 +1515,14 @@ impl Checker {
                         }
                     }
                 }
-                (types, _) = self.insert_type(&types, type_variable);
+                // Go `insertType(types, typeVariable)`, in place.
+                if let Err(index) = types
+                    .binary_search_by(|&probe| self.compare_types(probe, type_variable).cmp(&0))
+                {
+                    types.insert(index, type_variable);
+                }
             }
         }
-        types
     }
 
     // PORT: shared helper for the three identical blocks in Go
@@ -1531,27 +1552,25 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25822 removeSubtypes
-    // PORT: Go returns nil when the union is too complex; Rust returns None.
-    pub fn remove_subtypes(
-        &mut self,
-        types: Vec<TypeId>,
-        has_object_types: bool,
-    ) -> Option<Vec<TypeId>> {
-        let mut types = types;
+    // PORT: Go returns the reduced slice, or nil when the union is too
+    // complex. Rust reduces `types` in place and returns false for nil.
+    pub fn remove_subtypes(&mut self, types: &mut TypeSet, has_object_types: bool) -> bool {
         // [] and [T] immediately reduce to [] and [T] respectively
         if types.len() < 2 {
-            return Some(types);
+            return true;
         }
-        let key = self.get_type_list_key(&types);
+        let key = self.get_type_list_key(types);
         if let Some(cached) = self.subtype_reduction_cache.get(&key) {
-            return Some(cached.clone());
+            types.clear();
+            types.extend_from_slice(cached);
+            return true;
         }
         // We assume that redundant primitive types have already been removed from the types array and that there
         // are no any and unknown types in the array. Thus, the only possible supertypes for primitive types are empty
         // object types, and if none of those are present we can exclude primitive types from the subtype check.
         let mut has_empty_object = false;
         if has_object_types {
-            for &t in &types {
+            for &t in types.iter() {
                 if self.ty(t).flags.intersects(TypeFlags::OBJECT) && !self.is_generic_mapped_type(t)
                 {
                     self.resolve_structured_type_members(t);
@@ -1635,7 +1654,7 @@ impl Checker {
                                 }
                                 let node = self.current_node;
                                 self.error(node, diag::Expression_produces_a_union_type_that_is_too_complex_to_represent, args![]);
-                                return None;
+                                return false;
                             }
                         }
                         count += 1;
@@ -1681,7 +1700,7 @@ impl Checker {
                 }
             }
         }
-        self.subtype_reduction_cache.insert(key, types.clone());
-        Some(types)
+        self.subtype_reduction_cache.insert(key, types.to_vec());
+        true
     }
 }

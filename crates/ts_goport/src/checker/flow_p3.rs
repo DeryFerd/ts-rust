@@ -23,7 +23,9 @@ impl Checker {
 
     // Go: checker/flow.go:1865 hasMatchingArgument
     pub fn has_matching_argument(&mut self, expression: Node, reference: Node) -> bool {
-        for argument in expression.arguments().to_vec() {
+        // PERF: the argument list is program data (`NodeSlice` is `Copy`), so
+        // the loop reads it in place with no copy.
+        for argument in expression.arguments() {
             if self.is_or_contains_matching_reference(reference, argument)
                 || self.optional_chain_contains_reference(argument, reference)
             {

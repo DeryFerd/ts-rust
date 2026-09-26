@@ -4,6 +4,7 @@
 //! signature instantiation.
 
 use crate::prelude::*;
+use smallvec::SmallVec;
 
 impl Checker {
     // Go: checker/checker.go:18536 addOptionality
@@ -397,12 +398,19 @@ impl Checker {
             let t_flags = self.ty(t).flags;
             for i in 0..self.ty(t).types().len() {
                 let current = self.type_at(t, i);
-                for prop in self.get_properties_of_type(current) {
+                let current_props = self.get_properties_of_type(current);
+                // PORT: room for this constituent's properties up front. A
+                // union usually stops after its first constituent, so the set
+                // and the list grow once.
+                checked.reserve(current_props.len());
+                props.reserve(current_props.len());
+                for prop in current_props {
                     let prop_name = self.sym(prop).name.clone();
                     if checked.insert(prop_name.clone()) {
-                        let combined_prop = self.get_property_of_union_or_intersection_type(
+                        // PORT: a `Name` key, so the lookups compare ids.
+                        let combined_prop = self.get_property_of_union_or_intersection_type_key(
                             t,
-                            &prop_name,
+                            TableKey::Name(&prop_name),
                             t_flags.intersects(TypeFlags::INTERSECTION), /*skipObjectFunctionPropertyAugment*/
                         );
                         if combined_prop.is_some() {
@@ -503,35 +511,35 @@ impl Checker {
             } else {
                 TypeId::NIL
             };
+            // PORT: the fallbacks below get the key, not its text, so a
+            // `Name` key stays an id compare down the whole lookup.
             if function_type.is_some() {
-                symbol = self.get_property_of_object_type(function_type, name.text());
+                symbol = self.get_property_of_object_type_key(function_type, name);
                 if symbol.is_some() {
                     return symbol;
                 }
             }
             let global_object_type = self.global_object_type;
-            return self.get_property_of_object_type(global_object_type, name.text());
+            return self.get_property_of_object_type_key(global_object_type, name);
         } else if flags.intersects(TypeFlags::INTERSECTION) {
-            let prop = self.get_property_of_union_or_intersection_type(
-                t,
-                name.text(),
-                true, /*skipObjectFunctionPropertyAugment*/
+            let prop = self.get_property_of_union_or_intersection_type_key(
+                t, name, true, /*skipObjectFunctionPropertyAugment*/
             );
             if prop.is_some() {
                 return prop;
             }
             if !skip_object_function_property_augment {
-                return self.get_property_of_union_or_intersection_type(
+                return self.get_property_of_union_or_intersection_type_key(
                     t,
-                    name.text(),
+                    name,
                     skip_object_function_property_augment,
                 );
             }
             return SymbolId::NIL;
         } else if flags.intersects(TypeFlags::UNION) {
-            return self.get_property_of_union_or_intersection_type(
+            return self.get_property_of_union_or_intersection_type_key(
                 t,
-                name.text(),
+                name,
                 skip_object_function_property_augment,
             );
         }
@@ -676,7 +684,9 @@ impl Checker {
     ) -> IndexInfoId {
         // Index signatures for type 'string' are considered only when no other index signatures apply.
         let mut string_index_info = IndexInfoId::NIL;
-        let mut applicable_infos: Vec<IndexInfoId> = Vec::with_capacity(8);
+        // PORT: most types have a few index infos, so the lists stay on the
+        // stack.
+        let mut applicable_infos: SmallVec<[IndexInfoId; 8]> = SmallVec::new();
         for &info in index_infos {
             let info_key_type = self.index_info(info).key_type;
             if info_key_type == self.string_type {
@@ -701,7 +711,8 @@ impl Checker {
             1 => applicable_infos[0],
             _ => {
                 let mut is_readonly = true;
-                let mut types: Vec<TypeId> = Vec::with_capacity(applicable_infos.len());
+                let mut types: SmallVec<[TypeId; 8]> =
+                    SmallVec::with_capacity(applicable_infos.len());
                 for &info in &applicable_infos {
                     types.push(self.index_info(info).value_type);
                     if !self.index_info(info).is_readonly {
@@ -793,16 +804,18 @@ impl Checker {
             .as_interface_type()
             .all_type_parameters
             .clone();
-        // One allocation with room for the padding `t`.
-        let mut padded_type_arguments = {
+        // One exact-size allocation: the arguments, then `t` as the `this`
+        // argument when only that one is missing.
+        let padded_type_arguments = {
             let type_arguments = self.type_arguments_of(t);
-            let mut padded = Vec::with_capacity(type_arguments.len() + 1);
+            let pad = type_arguments.len() == type_parameters.len().wrapping_sub(1);
+            let mut padded = Vec::with_capacity(type_arguments.len() + usize::from(pad));
             padded.extend_from_slice(&type_arguments);
+            if pad {
+                padded.push(t);
+            }
             padded
         };
-        if padded_type_arguments.len() == type_parameters.len().wrapping_sub(1) {
-            padded_type_arguments.push(t);
-        }
         self.resolve_object_type_members(t, source, &type_parameters, &padded_type_arguments);
     }
 
@@ -1448,8 +1461,7 @@ impl Checker {
 
     // Go: checker/checker.go:19337 getBaseSignature
     pub fn get_base_signature(&mut self, signature: SignatureId) -> SignatureId {
-        let type_parameters = self.sig(signature).type_parameters.clone();
-        if type_parameters.is_empty() {
+        if self.sig(signature).type_parameters.is_empty() {
             return signature;
         }
         let key = CachedSignatureKey {
@@ -1461,6 +1473,8 @@ impl Checker {
                 return cached;
             }
         }
+        // PORT: copied only on a cache miss, like `get_erased_signature`.
+        let type_parameters = self.sig(signature).type_parameters.clone();
         let mut constraints = Vec::with_capacity(type_parameters.len());
         for &tp in &type_parameters {
             let constraint = self.get_constraint_of_type_parameter(tp);
