@@ -583,7 +583,10 @@ impl Checker {
                 .as_interface_type()
                 .local_type_parameters()
                 .to_vec();
-            (type_parameters, self.class_type_parameters_origin(class_type))
+            (
+                type_parameters,
+                self.class_type_parameters_origin(class_type),
+            )
         } else {
             self.get_type_parameters_from_declaration_ex(declaration)
         };

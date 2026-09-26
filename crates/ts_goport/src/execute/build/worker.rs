@@ -197,7 +197,9 @@ pub fn compile_and_emit_worker(
         emitted_files: result.emit_result.emitted_files.clone(),
         has_changed_dts_file: program.has_changed_dts_file(),
         build_info_file_name,
-        fs_cache: host.cached_fs.state_excluding(&[fs_cache, &program_fs_cache]),
+        fs_cache: host
+            .cached_fs
+            .state_excluding(&[fs_cache, &program_fs_cache]),
     }
 }
 

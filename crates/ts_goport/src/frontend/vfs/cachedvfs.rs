@@ -142,7 +142,10 @@ impl CachedFs {
             ),
             realpath: entries_excluding(
                 &self.realpath_cache,
-                &excluded.iter().map(|state| &state.realpath).collect::<Vec<_>>(),
+                &excluded
+                    .iter()
+                    .map(|state| &state.realpath)
+                    .collect::<Vec<_>>(),
             ),
             stat: entries_excluding(
                 &self.stat_cache,

@@ -256,8 +256,8 @@ impl Checker {
                     // getUniqueTypeParameters itself, or a copy).
                     if !unique_type_parameters.is_empty() {
                         let origin = self.new_type_parameters_origin();
-                        self.inference_context_mut(context).inferred_type_parameters_origin =
-                            origin;
+                        self.inference_context_mut(context)
+                            .inferred_type_parameters_origin = origin;
                     }
                     self.inference_context_mut(context)
                         .inferred_type_parameters

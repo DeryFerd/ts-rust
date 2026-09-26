@@ -50,7 +50,9 @@ pub fn marshal_cached_fs_state(state: &CachedFsState, enc: &mut String) -> Resul
         value.marshal_json_to(enc)
     })?;
     enc.push_str(",\"f\":");
-    marshal_entries(enc, &state.file_exists, |enc, value| value.marshal_json_to(enc))?;
+    marshal_entries(enc, &state.file_exists, |enc, value| {
+        value.marshal_json_to(enc)
+    })?;
     enc.push_str(",\"e\":");
     marshal_entries(enc, &state.get_accessible_entries, |enc, entries| {
         entries.files.marshal_json_to(enc)?;
@@ -71,7 +73,9 @@ pub fn marshal_cached_fs_state(state: &CachedFsState, enc: &mut String) -> Resul
         }
     })?;
     enc.push_str(",\"r\":");
-    marshal_entries(enc, &state.realpath, |enc, value| value.marshal_json_to(enc))?;
+    marshal_entries(enc, &state.realpath, |enc, value| {
+        value.marshal_json_to(enc)
+    })?;
     enc.push_str(",\"s\":");
     marshal_entries(enc, &state.stat, |enc, info| match info {
         None => {
@@ -145,7 +149,8 @@ fn time_from_parts(secs: i64, nanos: u32) -> SystemTime {
     if secs >= 0 {
         UNIX_EPOCH + Duration::new(secs as u64, nanos)
     } else {
-        UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs()) + Duration::from_nanos(u64::from(nanos))
+        UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
+            + Duration::from_nanos(u64::from(nanos))
     }
 }
 
@@ -293,11 +298,16 @@ mod tests {
                 symlinks: Some(std::iter::once("node_modules".to_string()).collect()),
             },
         );
-        state.get_accessible_entries.insert("/b".to_string(), Entries::default());
+        state
+            .get_accessible_entries
+            .insert("/b".to_string(), Entries::default());
         state.realpath.insert("/l".to_string(), "/r".to_string());
         state.stat.insert("/missing".to_string(), None);
         for (path, time) in [
-            ("/new", Some(UNIX_EPOCH + Duration::new(1_758_000_000, 123_456_789))),
+            (
+                "/new",
+                Some(UNIX_EPOCH + Duration::new(1_758_000_000, 123_456_789)),
+            ),
             ("/old", Some(UNIX_EPOCH - Duration::new(5, 250))),
             ("/zero", None),
         ] {
@@ -322,7 +332,10 @@ mod tests {
         assert_eq!(back.stat, state.stat);
         let entries = &back.get_accessible_entries["/a"];
         assert_eq!(entries.files, state.get_accessible_entries["/a"].files);
-        assert_eq!(entries.symlinks, state.get_accessible_entries["/a"].symlinks);
+        assert_eq!(
+            entries.symlinks,
+            state.get_accessible_entries["/a"].symlinks
+        );
         assert!(back.get_accessible_entries["/b"].symlinks.is_none());
         let mut again = String::new();
         marshal_cached_fs_state(&back, &mut again).unwrap();

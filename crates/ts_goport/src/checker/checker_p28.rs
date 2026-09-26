@@ -425,7 +425,8 @@ impl Checker {
             return origin;
         }
         let origin = self.new_type_parameters_origin();
-        self.class_type_parameters_origins.insert(class_type, origin);
+        self.class_type_parameters_origins
+            .insert(class_type, origin);
         origin
     }
 

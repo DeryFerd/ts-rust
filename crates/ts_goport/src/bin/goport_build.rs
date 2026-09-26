@@ -107,7 +107,7 @@ fn run_worker(sys: &Rc<dyn System>, args: &[String]) -> i32 {
     let build_command_line = &args[1..];
     let stdin = std::io::stdin();
     let fs_cache = if stdin.is_terminal() {
-        Ok(Default::default())
+        Ok(CachedFsState::default())
     } else {
         read_worker_fs_cache(&mut stdin.lock())
     };

@@ -1335,9 +1335,15 @@ impl Checker {
         let left_type_parameters = self.sig(left).type_parameters.clone();
         let right_type_parameters = self.sig(right).type_parameters.clone();
         let (type_params, type_params_origin) = if left_type_parameters.is_empty() {
-            (right_type_parameters.clone(), self.share_type_parameters_origin(right))
+            (
+                right_type_parameters.clone(),
+                self.share_type_parameters_origin(right),
+            )
         } else {
-            (left_type_parameters.clone(), self.share_type_parameters_origin(left))
+            (
+                left_type_parameters.clone(),
+                self.share_type_parameters_origin(left),
+            )
         };
         let mut param_mapper = MapperId::NIL;
         if !left_type_parameters.is_empty() && !right_type_parameters.is_empty() {
