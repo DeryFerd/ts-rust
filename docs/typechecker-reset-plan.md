@@ -2,7 +2,9 @@
 
 Date: September 5, 2026.
 
-Status: saved recovery plan. The [accountability rules](typechecker-accountability.md) and [current state](typechecker-accountability-state.json) control execution. Compiler work remains paused until Theo sets the goal. This plan does not discard existing work or accept the current compiler.
+Status: the initial recovery trial is complete. Theo has authorized continued work under the standing authorization in the [accountability rules](typechecker-accountability.md). The [current state](typechecker-accountability-state.json) records the complete history. This plan does not discard existing work or accept the current compiler.
+
+The four-revision trial and seven-role limit below describe the initial plan. The standing continuation authorization supersedes those execution limits for later work. Protected results, source preservation, ordinary project inputs and complete project requirements remain in force.
 
 ## Decision
 

@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 // This checks saved evidence. It does not run Cargo or authenticate agent identities.
 export const CHECKPOINT_SHA256 = "60a372581586cb3c8d0046ba6e4ab0af65b515267485a0a01bdfe90695f7a538";
 export const BASELINE_SHA256 = "f562cd3ca338de7203c6ae12693dfc4a726a6478b3da7f1393374c36194bdcba";
+// Theo's opt-in crate rule (2026-09-25) pins the inherited losses to the R96 full result.
+export const INHERITED_PIN = { sha256: "e7838ed863c42bc2271981c680d2fc46bb6a98f3171c8554b2d040ca9277d6b7", originalAccepted: 290, laterPasses: 15 };
 const ROOT = fileURLToPath(new URL("../", import.meta.url));
 const HASH = /^[a-f0-9]{64}$/;
 const STAGES = ["checker", "compiler", "fixture"];
@@ -67,27 +69,55 @@ export function readPinnedJson(reference) {
   }
 }
 
+// Theo-approved rule changes live in state.acceptanceRuleChanges. Each entry is bound
+// to one batch id. Rules that do not name this batch have no effect.
+function approvedRule(state, id) {
+  const rules = Array.isArray(state.acceptanceRuleChanges) ? state.acceptanceRuleChanges : [];
+  const rule = rules.find(item => item?.id === id && item.batchId === state.batch?.id);
+  if (!rule) return null;
+  requireValue(rule.approvedBy === "Theo" && text(rule.instruction) && text(rule.date) && Number.isFinite(Date.parse(rule.date)),
+    `Rule ${id} needs Theo's saved approval, instruction and date.`);
+  return rule;
+}
+
 function validateBatch(state) {
   requireValue(state?.schemaVersion === 1, "Unsupported state schema.");
-  requireValue(state.phase === "initial-recovery", "STOP: this guard supports initial-recovery only.");
+  const continuation = state.phase === "recovery-continuation";
+  requireValue(state.phase === "initial-recovery" || continuation, "Unsupported recovery phase.");
   requireValue(state.status === "ready", "State is not ready. Paused or missing state means STOP.");
   requireValue(state.decision === "REVIEW" || state.decision === "PASS", "Ready state cannot keep a STOP or missing decision.");
   requireValue(text(state.goalAuthorization) || (state.goalAuthorization !== null && typeof state.goalAuthorization === "object"
     && !Array.isArray(state.goalAuthorization) && Object.keys(state.goalAuthorization).length > 0), "Missing goal authorization.");
+  if (continuation) {
+    const authorization = state.continuationAuthorization;
+    requireValue(authorization?.authorized === true && text(authorization.instruction) && text(authorization.scope)
+      && text(authorization.date) && /^\d{4}-\d{2}-\d{2}T/.test(authorization.date) && Number.isFinite(Date.parse(authorization.date)),
+    "Continuation requires explicit saved authorization, instruction, scope, and a valid date.");
+  }
   requireValue(HASH.test(state.preservedCandidateSourceFingerprint), "Missing preserved candidate fingerprint.");
   const batch = state.batch;
   requireValue(batch && text(batch.id) && text(batch.implementer) && text(batch.hypothesis), "Missing authorized batch, implementer, or hypothesis.");
   requireValue(HASH.test(batch.sourceFingerprint), "Missing batch source fingerprint.");
   requireValue(text(batch.fullResult?.path) && HASH.test(batch.fullResult?.sha256), "Missing completed full result.");
   const history = batch.recoveryHistory;
-  requireValue(Array.isArray(history) && history.length >= 1 && history.length <= 4, "Recovery history must contain 1 to 4 measured revisions.");
+  requireValue(Array.isArray(history) && (continuation ? history.length >= 5 : history.length >= 1 && history.length <= 4),
+    continuation ? "Continuation history must retain all four initial revisions and each later measured revision."
+      : "Recovery history must contain 1 to 4 measured revisions.");
   requireValue(batch.recoveryRevision === history.length, "Recovery revision must equal the retained history length.");
-  requireValue(batch.maxRecoveryRevisions === undefined || batch.maxRecoveryRevisions === 4, "The recovery limit is fixed at 4.");
+  if (!continuation) {
+    requireValue(batch.maxRecoveryRevisions === undefined || batch.maxRecoveryRevisions === 4, "The recovery limit is fixed at 4.");
+  }
+  const unbound = approvedRule(state, "unbound-history-rows");
+  const unboundRevisions = new Set(Array.isArray(unbound?.revisions) ? unbound.revisions : []);
   const hypotheses = new Map();
   for (const [index, row] of history.entries()) {
-    requireValue(row?.revision === index + 1 && text(row.hypothesis) && HASH.test(row.sourceFingerprint), "Invalid or reset recovery history.");
+    // An approved unbound row keeps a null source and a null result. It can never be the current row.
+    const sourceOk = HASH.test(row?.sourceFingerprint)
+      || (row?.sourceFingerprint === null && row.fullResultSha256 === null && unboundRevisions.has(row.revision) && index < history.length - 1);
+    requireValue(row?.revision === index + 1 && text(row.hypothesis) && sourceOk, "Invalid or reset recovery history.");
     requireValue(row.fullResultSha256 === null || HASH.test(row.fullResultSha256), "History needs a result hash or explicit null.");
-    hypotheses.set(row.hypothesis, (hypotheses.get(row.hypothesis) ?? 0) + 1);
+    // Later authorization does not change the initial four-revision trial.
+    if (index < 4) hypotheses.set(row.hypothesis, (hypotheses.get(row.hypothesis) ?? 0) + 1);
   }
   requireValue(hypotheses.size <= 2 && [...hypotheses.values()].every(value => value <= 2), "Limit: two hypotheses, two revisions per hypothesis.");
   const last = history.at(-1);
@@ -157,6 +187,14 @@ function currentResults(report, sourceFingerprint) {
   return map;
 }
 
+// Exact outcomes of a saved full result, for the inherited-loss comparison.
+function ledgerStatuses(report) {
+  requireValue(Array.isArray(report?.versusFullBaseline?.exactLedger) && Array.isArray(report.addedNames), "Inherited result ledger is missing.");
+  const rows = [...report.versusFullBaseline.exactLedger.map(row => ({ harness: row.harness, name: row.name, status: row.current?.status })),
+    ...report.addedNames.map(row => ({ harness: row.harness, name: row.name, status: row.status }))];
+  return rowsByKey(rows, "Inherited result");
+}
+
 function losses(baseline, current) {
   return baseline.flatMap(row => {
     const status = current.get(key(row))?.status ?? "ABSENT";
@@ -164,8 +202,9 @@ function losses(baseline, current) {
   });
 }
 
-// Tests may supply parsed synthetic evidence. The CLI always uses readPinnedJson.
-export function checkBatch(state, readEvidence = readPinnedJson) {
+// Tests may supply parsed synthetic evidence and a synthetic pin. The CLI always uses
+// readPinnedJson and INHERITED_PIN.
+export function checkBatch(state, readEvidence = readPinnedJson, inheritedPin = INHERITED_PIN) {
   try {
     const batch = validateBatch(state);
     requireValue(state.acceptedBaseline?.sha256 === CHECKPOINT_SHA256, "Accepted checkpoint identity changed.");
@@ -189,11 +228,28 @@ export function checkBatch(state, readEvidence = readPinnedJson) {
       requireValue(row.current?.status === (current.get(id)?.status ?? "ABSENT"), "Candidate accepted ledger disagrees with exact current outcomes.");
     }
     const originalLosses = losses(accepted, current), laterLosses = losses(later, current);
+    // Opt-in crate rule: losses already present in the pinned inherited result are reported,
+    // not blocking. The inherited counts must equal the approved counts exactly.
+    const optIn = approvedRule(state, "opt-in-crate-no-new-loss");
+    let inherited = null;
+    if (optIn) {
+      requireValue(optIn.inheritedResult?.sha256 === inheritedPin.sha256
+        && optIn.inheritedLosses?.originalAccepted === inheritedPin.originalAccepted
+        && optIn.inheritedLosses?.laterPasses === inheritedPin.laterPasses, "Inherited loss rule differs from the pinned constants.");
+      const statuses = ledgerStatuses(readEvidence(optIn.inheritedResult));
+      inherited = { originalAccepted: losses(accepted, statuses), laterPasses: losses(later, statuses) };
+      requireValue(inherited.originalAccepted.length === optIn.inheritedLosses?.originalAccepted
+        && inherited.laterPasses.length === optIn.inheritedLosses?.laterPasses, "Inherited loss counts differ from the approved rule.");
+    }
+    const isNew = (loss, list) => !list || !list.some(row => key(row) === key(loss));
+    const newOriginal = originalLosses.filter(loss => isNew(loss, inherited?.originalAccepted));
+    const newLater = laterLosses.filter(loss => isNew(loss, inherited?.laterPasses));
     const reasons = [];
-    if (originalLosses.length) reasons.push(`${originalLosses.length} original accepted PASS names are FAIL or ABSENT.`);
-    if (laterLosses.length) reasons.push(`${laterLosses.length} later baseline PASS names are FAIL or ABSENT.`);
-    return { verdict: reasons.length ? "STOP" : "PASS", scope: SCOPE, reasons,
-      counts: { originalAccepted: 6055, originalRetained: 6055 - originalLosses.length, laterPasses: 6330, laterRetained: 6330 - laterLosses.length },
+    if (newOriginal.length) reasons.push(`${newOriginal.length} original accepted PASS names are FAIL or ABSENT${inherited ? " and not inherited" : ""}.`);
+    if (newLater.length) reasons.push(`${newLater.length} later baseline PASS names are FAIL or ABSENT${inherited ? " and not inherited" : ""}.`);
+    return { verdict: reasons.length ? "STOP" : "PASS", scope: SCOPE, reasons, rule: optIn ? optIn.id : null,
+      counts: { originalAccepted: 6055, originalRetained: 6055 - originalLosses.length, laterPasses: 6330, laterRetained: 6330 - laterLosses.length,
+        inheritedOriginal: inherited?.originalAccepted.length ?? null, inheritedLater: inherited?.laterPasses.length ?? null },
       losses: { originalAccepted: originalLosses, laterPasses: laterLosses } };
   } catch (error) {
     return { verdict: "STOP", scope: SCOPE, reasons: [error.message], counts: null };
@@ -207,15 +263,20 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 Read-only pre-acceptance check. Exit 0 means the protected-name and review
 prerequisites pass. Exit 1 means STOP. This is not a Cargo wrapper.
 
-State requires schemaVersion 1, phase initial-recovery, status ready,
+State requires schemaVersion 1, phase initial-recovery or recovery-continuation, status ready,
 decision REVIEW or PASS, goalAuthorization, and a preserved candidate hash.
 acceptedBaseline, originalAccepted, and laterPassBaseline need pinned path/SHA-256
 references. Original expectedNames is 6055. Later expectedPasses is 6330.
 
 batch needs id, implementer, hypothesis, sourceFingerprint, fullResult path/hash,
 recoveryRevision, recoveryHistory, auditor, and reviewer. History retains all
-measured revisions, including failures. Limits are 4 revisions, 2 hypotheses,
-and 2 revisions per hypothesis. Each history row needs revision, hypothesis,
+measured revisions, including failures. Initial recovery limits are 4 revisions,
+2 hypotheses, and 2 revisions per hypothesis. Continuation requires a saved
+continuationAuthorization with authorized true, instruction, scope, and a valid
+ISO date. Its history must keep all four initial revisions and each later
+revision, numbered from 1 without gaps or resets. Initial limits still apply
+to the first four rows. Later revisions have no fixed count or hypothesis limit.
+Each history row needs revision, hypothesis,
 sourceFingerprint, and fullResultSha256. A past result hash may be null.
 The final row must match this completed full result.
 
@@ -224,7 +285,13 @@ sourceFingerprint, and fullResultSha256. Neither may be the implementer.
 The auditor role is audit_accepted_roster. Missing evidence, STOP, source
 mismatch, renamed/missing protected names, or expectation exceptions stop.
 
+Theo-approved rules in acceptanceRuleChanges apply only to the named batch id:
+- unbound-history-rows: listed past revisions may keep a null source and result.
+- opt-in-crate-no-new-loss: losses already in the pinned inheritedResult are
+  reported, not blocking. Inherited counts must equal the approved counts.
+
 ${SCOPE}
+Independent review must compare retained history against saved batchRecords.
 This check cannot prevent arbitrary direct commands or edits to state history.`);
   } else {
   let result;
