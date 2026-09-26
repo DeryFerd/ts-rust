@@ -10,6 +10,7 @@
 #
 # Stages (serial, one gate run at a time through /tmp/goport-gate.lock):
 #   measure, measure-extra, sweep, sweep-extra2, sweep-hono-runtime   (existing scripts)
+#   sweep-wide    (--full) 292 configs of 51 more real projects (sweep-wide.sh)
 #   f1            sample-f1/run-f1.py (R104 conformance sample)
 #   emit          emit/compare-emit.sh
 #   typesyms      Go vs Rust dumps for query and hono (+ effect in --full)
@@ -175,7 +176,7 @@ def parse_build(stage, log, runs):
     return items
 
 
-PARSERS = {'measure': parse_measure, 'measure-extra': parse_sweep, 'sweep': parse_sweep, 'sweep-extra2': parse_sweep,
+PARSERS = {'measure': parse_measure, 'measure-extra': parse_sweep, 'sweep': parse_sweep, 'sweep-extra2': parse_sweep, 'sweep-wide': parse_sweep,
            'sweep-hono-runtime': parse_sweep, 'emit': parse_emit, 'build': parse_build}
 
 
@@ -468,6 +469,11 @@ stage measure-extra bash "$TP/measure-extra.sh" "$RUNS_REL/measure-extra"; parse
 stage sweep bash "$TP/sweep.sh" "$RUNS_REL/sweep"; parse sweep "$OUT/runs/sweep" 12
 stage sweep-extra2 bash "$X/sweep-extra2.sh" "../../continuation-r97-goport/compat/gate/$LABEL/runs/extra2"
 parse sweep-extra2 "$OUT/runs/extra2" 31
+# Wide real-world sweep (51 projects, 292 configs; target/project-inputs-wide), full mode only.
+if [[ $MODE == full ]]; then
+  stage sweep-wide bash "$HERE/sweep-wide.sh" "../../continuation-r97-goport/compat/gate/$LABEL/runs/wide"
+  parse sweep-wide "$OUT/runs/wide" 292
+fi
 stage sweep-hono-runtime bash "$TP/sweep-hono-runtime.sh" "$RUNS_REL/hono-rt"; parse sweep-hono-runtime "$OUT/runs/hono-rt" 7
 stage f1 python3 "$R/sample-f1/run-f1.py" "$BINS/goport" "$OUT/runs/f1"
 py f1 "$OUT/runs/f1/summary.json" "$OUT/items/f1.jsonl" >> "$OUT/logs/f1.log" 2>&1
@@ -493,7 +499,7 @@ label, mode, started, commit_in, commit, bins, gate, allow = sys.argv[1:]
 R = Path('/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport')
 sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
 scripts = [R / 'tools-port/measure.sh', R / 'tools-port/measure-extra.sh', R / 'tools-port/sweep.sh',
-           R.parent / 'project-inputs-extra/sweep-extra2.sh', R / 'tools-port/sweep-hono-runtime.sh',
+           R.parent / 'project-inputs-extra/sweep-extra2.sh', Path(gate).parent / 'sweep-wide.sh', R / 'tools-port/sweep-hono-runtime.sh',
            R / 'sample-f1/run-f1.py', R / 'emit/compare-emit.sh', R / 'typesyms/compare-int.py',
            R / 'build-mode/compare-build.sh', R / 'corpus-full/run_shard.py', R / 'corpus-full/run_shard_parallel.py',
            R / 'emit-corpus/run_emit_shard2.py']
