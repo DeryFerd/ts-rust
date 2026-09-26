@@ -106,11 +106,14 @@ pub fn get_wildcard_directories(
 }
 
 // Go: tsoptions/wildcarddirectories.go:87 toCanonicalKey
+// PORT: Go `strings.ToLower` maps each rune with the one-rune
+// `unicode.ToLower` (the first char of the Rust mapping) and each byte that
+// is not valid UTF-8 to U+FFFD (`go_map_runes`).
 fn to_canonical_key(path: &str, use_case_sensitive_file_names: bool) -> String {
     if use_case_sensitive_file_names {
         return path.to_string();
     }
-    path.to_lowercase()
+    go_map_runes(path, |c| c.to_lowercase().next().unwrap_or(c))
 }
 
 /// Go `wildcardDirectoryMatch`: the result of a wildcard directory match.

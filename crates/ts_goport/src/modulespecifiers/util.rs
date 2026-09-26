@@ -226,8 +226,9 @@ pub(crate) fn index_of(endings: &[ModuleSpecifierEnding], value: ModuleSpecifier
 }
 
 // Go: modulespecifiers/util.go:264 replaceFirstStar
+// PORT: Go joins the bytes (see `scanner_util::go_value`).
 pub(crate) fn replace_first_star(s: &str, replacement: &str) -> String {
-    s.replacen('*', replacement, 1)
+    go_value_owned(s.replacen('*', replacement, 1))
 }
 
 // Go: modulespecifiers/util.go:268 NodeModulePathParts

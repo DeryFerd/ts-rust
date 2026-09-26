@@ -1448,14 +1448,17 @@ fn try_get_module_name_from_paths(
             if let Some((prefix, suffix)) = star {
                 for c in &candidates {
                     let value = &c.value;
-                    if value.len() >= prefix.len() + suffix.len()
+                    // PORT: Go byte lengths and slices (see
+                    // `scanner_util::GO_STRING_MARKER`).
+                    if go_len(value) >= go_len(prefix) + go_len(suffix)
                         && deps::has_prefix(value, prefix, case_sensitive) // TODO: possible strada bug: these are not case-switched in strada
                         && deps::has_suffix(value, suffix, case_sensitive)
                         && validate_ending(c, relative_to_base_url, compiler_options, host)
                     {
-                        let matched_star = &value[prefix.len()..value.len() - suffix.len()];
-                        if !tspath::path_is_relative(matched_star) {
-                            return replace_first_star(key, matched_star);
+                        let matched_star =
+                            go_slice(value, go_len(prefix), go_len(value) - go_len(suffix));
+                        if !tspath::path_is_relative(&matched_star) {
+                            return replace_first_star(key, &matched_star);
                         }
                     }
                 }
@@ -1644,8 +1647,13 @@ fn try_get_module_name_from_exports_or_imports(
                         .split_once('*')
                         .unwrap_or((path_or_pattern.as_str(), ""));
                     let case_sensitive = host.use_case_sensitive_file_names();
-                    fn star_replacement<'s>(s: &'s str, leading: &str, trailing: &str) -> &'s str {
-                        &s[leading.len()..s.len() - trailing.len()]
+                    // PORT: Go slices bytes (see `scanner_util::go_slice`).
+                    fn star_replacement<'s>(
+                        s: &'s str,
+                        leading: &str,
+                        trailing: &str,
+                    ) -> std::borrow::Cow<'s, str> {
+                        go_slice(s, go_len(leading), go_len(s) - go_len(trailing))
                     }
                     if can_try_ts_extension
                         && deps::has_prefix_and_suffix_without_overlap(
@@ -1657,7 +1665,7 @@ fn try_get_module_name_from_exports_or_imports(
                     {
                         return replace_first_star(
                             package_name,
-                            star_replacement(target_file_path, leading_slice, trailing_slice),
+                            &star_replacement(target_file_path, leading_slice, trailing_slice),
                         );
                     }
                     if !extension_swapped_target.is_empty()
@@ -1670,7 +1678,7 @@ fn try_get_module_name_from_exports_or_imports(
                     {
                         return replace_first_star(
                             package_name,
-                            star_replacement(
+                            &star_replacement(
                                 &extension_swapped_target,
                                 leading_slice,
                                 trailing_slice,
@@ -1687,7 +1695,7 @@ fn try_get_module_name_from_exports_or_imports(
                     {
                         return replace_first_star(
                             package_name,
-                            star_replacement(target_file_path, leading_slice, trailing_slice),
+                            &star_replacement(target_file_path, leading_slice, trailing_slice),
                         );
                     }
                     if !output_file.is_empty()
@@ -1700,7 +1708,7 @@ fn try_get_module_name_from_exports_or_imports(
                     {
                         return replace_first_star(
                             package_name,
-                            star_replacement(&output_file, leading_slice, trailing_slice),
+                            &star_replacement(&output_file, leading_slice, trailing_slice),
                         );
                     }
                     if !declaration_file.is_empty()
@@ -1713,7 +1721,7 @@ fn try_get_module_name_from_exports_or_imports(
                     {
                         let substituted = replace_first_star(
                             package_name,
-                            star_replacement(&declaration_file, leading_slice, trailing_slice),
+                            &star_replacement(&declaration_file, leading_slice, trailing_slice),
                         );
                         let js_extension =
                             deps::try_get_js_extension_for_file(&declaration_file, options);

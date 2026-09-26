@@ -71,10 +71,7 @@ pub fn get_trace_with_writer_from_sys(
 ) -> Rc<dyn Fn(&'static ts_diagnostics::Message, Vec<String>)> {
     Rc::new(
         move |msg: &'static ts_diagnostics::Message, args: Vec<String>| {
-            let text = match msg.format(&args) {
-                Ok(text) => text,
-                Err(_) => panic!("Invalid formatting placeholder"),
-            };
+            let text = format_message(msg, &args);
             write_str(&w, &format!("{text}\n"));
         },
     )

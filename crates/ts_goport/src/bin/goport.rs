@@ -27,7 +27,7 @@ use ts_goport::emitter::program_emit::{EmitOptions, EmitResult, emit_with};
 use ts_goport::execute::tsc::{
     CompileTimes, EXIT_UNPORTED, EmitInput, ExitStatus, ProgramLike, Writer,
     create_diagnostic_reporter, create_report_error_summary, emit_and_report_statistics,
-    new_os_system,
+    new_os_system, write_go_output,
 };
 use ts_goport::prelude::*;
 
@@ -48,7 +48,7 @@ fn main() {
     // Go: `System.SinceStart` counts from the process start. The tunables
     // step above may exec the binary again, so the clock starts after it.
     let start = Instant::now();
-    let config = match parse_args(std::env::args().skip(1).collect()) {
+    let config = match parse_args(ts_goport::frontend::vfs::os_args()) {
         Ok(config) => config,
         Err(message) => {
             eprintln!("goport: {message}");
@@ -268,7 +268,7 @@ fn run(config: &str, start: Instant) -> i32 {
     }
 
     let mut stdout = std::io::stdout().lock();
-    let _ = stdout.write_all(&buffer.borrow());
+    let _ = write_go_output(&mut stdout, &buffer.borrow());
     let _ = stdout.flush();
 
     let unported = unported_report();

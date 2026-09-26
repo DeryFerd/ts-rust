@@ -1218,11 +1218,7 @@ fn has_proto(obj: Node) -> bool {
 fn add_line_of_jsx_text(b: &mut String, trimmed_line: &str, is_initial: bool) {
     // We do not escape the string here as that is handled by the printer
     // when it emits the literal. We do, however, need to decode JSX entities.
-    // PORT: JSX text is raw source text, so a real U+FDD0 is escaped as it
-    // enters the string value (see `scanner_util::LONE_SURROGATE_MARKER`).
-    let decoded = decode_entities(&crate::scanner_util::escape_lone_surrogate_markers(
-        trimmed_line,
-    ));
+    let decoded = decode_entities(trimmed_line);
     if !is_initial {
         b.push(' ');
     }

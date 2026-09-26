@@ -39,6 +39,8 @@
 //! `d` is DirectoryExists, `f` FileExists, `e` GetAccessibleEntries, `r`
 //! Realpath and `s` Stat. Times are seconds and nanoseconds from the Unix
 //! epoch (`secs` is negative before it; `nanos` is always 0 to 999999999).
+//! Strings keep the port form (`append_json_quote_port_form`,
+//! `json_new_port_form_decoder`).
 
 use crate::frontend::prelude::*;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -55,16 +57,17 @@ pub fn marshal_cached_fs_state(state: &CachedFsState, enc: &mut String) -> Resul
     })?;
     enc.push_str(",\"e\":");
     marshal_entries(enc, &state.get_accessible_entries, |enc, entries| {
-        entries.files.marshal_json_to(enc)?;
+        append_json_quote_port_form_list(enc, &entries.files);
         enc.push(',');
-        entries.directories.marshal_json_to(enc)?;
+        append_json_quote_port_form_list(enc, &entries.directories);
         enc.push(',');
         match &entries.symlinks {
             Some(symlinks) => {
                 // Sorted so the same state gives the same text.
                 let mut symlinks: Vec<&String> = symlinks.iter().collect();
                 symlinks.sort();
-                symlinks.marshal_json_to(enc)
+                append_json_quote_port_form_list(enc, &symlinks);
+                Ok(())
             }
             None => {
                 enc.push_str("null");
@@ -74,7 +77,8 @@ pub fn marshal_cached_fs_state(state: &CachedFsState, enc: &mut String) -> Resul
     })?;
     enc.push_str(",\"r\":");
     marshal_entries(enc, &state.realpath, |enc, value| {
-        value.marshal_json_to(enc)
+        append_json_quote_port_form(enc, value);
+        Ok(())
     })?;
     enc.push_str(",\"s\":");
     marshal_entries(enc, &state.stat, |enc, info| match info {
@@ -84,7 +88,7 @@ pub fn marshal_cached_fs_state(state: &CachedFsState, enc: &mut String) -> Resul
         }
         Some(info) => {
             enc.push('[');
-            info.name.marshal_json_to(enc)?;
+            append_json_quote_port_form(enc, &info.name);
             enc.push(',');
             enc.push_str(&info.size.to_string());
             enc.push(',');
@@ -120,7 +124,7 @@ fn marshal_entries<V>(
             enc.push(',');
         }
         enc.push('[');
-        key.marshal_json_to(enc)?;
+        append_json_quote_port_form(enc, key);
         enc.push(',');
         value(enc, &map[key])?;
         enc.push(']');
@@ -323,7 +327,7 @@ mod tests {
         }
         let mut text = String::new();
         marshal_cached_fs_state(&state, &mut text).unwrap();
-        let mut dec = json_new_decoder(text.as_bytes());
+        let mut dec = json_new_port_form_decoder(text.as_bytes());
         let back = decode_cached_fs_state(&mut dec).unwrap();
         dec.check_eof().unwrap();
         assert_eq!(back.directory_exists, state.directory_exists);

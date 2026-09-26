@@ -5,11 +5,50 @@
 //! `os.RemoveAll`, `filepath.Abs`, `filepath.Clean`) are ported here too.
 
 use crate::frontend::prelude::*;
+use std::borrow::Cow;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write as _};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
+use std::path::{Path as OsPath, PathBuf};
 use std::sync::OnceLock;
 use std::time::SystemTime;
+
+// PORT: a Go path is a Go string, so it can hold any bytes, and Go passes
+// those bytes to the OS unchanged. A port string is the port form of a Go
+// string (see `scanner_util::GO_STRING_MARKER`). `os_path` gives the OS the
+// Go bytes, and `go_string_from_os` turns OS bytes (file names, link
+// targets, the working directory, arguments) into the port form. Every OS
+// call in the port goes through them.
+
+/// The OS path of the port form path `path`: its Go bytes.
+pub fn os_path(path: &str) -> Cow<'_, OsPath> {
+    match crate::scanner_util::go_string_bytes(path) {
+        Cow::Borrowed(bytes) => Cow::Borrowed(OsPath::new(OsStr::from_bytes(bytes))),
+        Cow::Owned(bytes) => Cow::Owned(PathBuf::from(OsString::from_vec(bytes))),
+    }
+}
+
+/// The value form of the OS string `s` (see `os_path` and
+/// `scanner_util::go_value_from_bytes`).
+pub fn go_string_from_os(s: impl Into<OsString>) -> String {
+    match String::from_utf8(s.into().into_vec()) {
+        Ok(text) => crate::scanner_util::go_string_from_utf8(text),
+        Err(err) => crate::scanner_util::go_value_from_bytes(err.as_bytes()).into_owned(),
+    }
+}
+
+/// The process arguments after the program name, in the port form (Go
+/// `os.Args[1:]`, see `os_path`).
+pub fn os_args() -> Vec<String> {
+    std::env::args_os().skip(1).map(go_string_from_os).collect()
+}
+
+/// The current directory in the port form (Go `os.Getwd`, see `os_path`).
+pub fn os_current_dir() -> io::Result<String> {
+    std::env::current_dir().map(go_string_from_os)
+}
 
 // PORT: the Go semaphores `blockingOpSema`, `readSema` and `writeSema`
 // (os.go:20) limit concurrent syscalls. The port is single-threaded, so they
@@ -52,13 +91,13 @@ fn is_file_system_case_sensitive() -> bool {
         // This is not entirely correct, since different OSs can have differing case sensitivity in different paths,
         // but this is largely good enough for our purposes (and what sys.ts used to do with __filename).
         let exe = match std::env::current_exe() {
-            Ok(exe) => os_string_to_string(exe.into_os_string()),
+            Ok(exe) => go_string_from_os(exe),
             Err(err) => panic!("vfs: failed to get executable path: {err}"),
         };
 
         // If the current executable exists under a different case, we must be case-insensitive.
         let swapped = swap_case(&exe);
-        if let Err(err) = std::fs::metadata(&swapped) {
+        if let Err(err) = std::fs::metadata(os_path(&swapped)) {
             if err.kind() == io::ErrorKind::NotFound {
                 return true;
             }
@@ -174,7 +213,8 @@ impl Fs for OsFs {
         a_time: Option<SystemTime>,
         m_time: Option<SystemTime>,
     ) -> Result<(), FsError> {
-        let file = std::fs::File::open(path).map_err(|err| FsError::path("chtimes", path, err))?;
+        let file = std::fs::File::open(os_path(path))
+            .map_err(|err| FsError::path("chtimes", path, err))?;
         let mut times = std::fs::FileTimes::new();
         if let Some(a_time) = a_time {
             times = times.set_accessed(a_time);
@@ -227,13 +267,13 @@ impl OsFs {
             WriteFlag::Append => options.append(true),
         };
         let mut file = options
-            .open(path)
+            .open(os_path(path))
             .map_err(|err| FsError::path("open", path, err))?;
 
-        // PORT: Go writes the string bytes unchanged. `raw_file_bytes` gives
-        // those bytes: it writes each invalid source byte sentinel (see
-        // `decode_bytes`) as its raw byte.
-        file.write_all(&raw_file_bytes(content))
+        // PORT: Go writes the string bytes unchanged. `content` is the port
+        // form of the Go string (see `scanner_util::GO_STRING_MARKER`), so
+        // write its Go bytes.
+        file.write_all(&crate::scanner_util::go_string_bytes(content))
             .map_err(|err| FsError::path("write", path, err))?;
 
         Ok(())
@@ -245,7 +285,7 @@ impl OsFs {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o777)
-            .create(directory_path)
+            .create(os_path(directory_path))
             .map_err(|err| FsError::path("mkdir", directory_path, err))
     }
 
@@ -294,8 +334,8 @@ fn realpath(path: &str) -> Result<String, FsError> {
     if !has_proc_self_fd() {
         // PORT: Go `filepath.EvalSymlinks`. For the rooted paths that reach
         // here, `std::fs::canonicalize` gives the same result.
-        return std::fs::canonicalize(path)
-            .map(|p| os_string_to_string(p.into_os_string()))
+        return std::fs::canonicalize(os_path(path))
+            .map(go_string_from_os)
             .map_err(|err| FsError::path("lstat", path, err));
     }
 
@@ -305,7 +345,7 @@ fn realpath(path: &str) -> Result<String, FsError> {
         std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(O_PATH)
-            .open(path)
+            .open(os_path(path))
     })
     .map_err(|err| FsError::path("open", path, err))?;
 
@@ -315,7 +355,7 @@ fn realpath(path: &str) -> Result<String, FsError> {
     // `std::fs::read_link` does the same internally.
     let target = ignoring_eintr(|| std::fs::read_link(&proc_path))
         .map_err(|err| FsError::path("readlink", path, err))?;
-    Ok(os_string_to_string(target.into_os_string()))
+    Ok(go_string_from_os(target))
 }
 
 // Go: eintr_unix.go:7 ignoringEINTR
@@ -325,15 +365,6 @@ fn ignoring_eintr<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             result => return result,
         }
-    }
-}
-
-// PORT: Go strings hold any bytes. OS names that are not UTF-8 are
-// converted with U+FFFD replacements.
-fn os_string_to_string(s: std::ffi::OsString) -> String {
-    match s.into_string() {
-        Ok(s) => s,
-        Err(s) => s.to_string_lossy().into_owned(),
     }
 }
 
@@ -374,7 +405,7 @@ impl IoFs for DirFs {
     fn stat(&self, name: &str) -> Result<FileInfo, FsError> {
         let fullname = self.join(name)?;
         // Go os.Stat follows symlinks.
-        match std::fs::metadata(&fullname) {
+        match std::fs::metadata(os_path(&fullname)) {
             Ok(md) => Ok(file_info_from_metadata(basename(&fullname), &md)),
             Err(err) => Err(FsError::path("stat", name, err)),
         }
@@ -389,7 +420,7 @@ impl IoFs for DirFs {
     // Go: os/file.go dirFS.ReadFile
     fn read_file(&self, name: &str) -> Result<Vec<u8>, FsError> {
         let fullname = self.join(name)?;
-        std::fs::read(&fullname).map_err(|err| FsError::path("open", name, err))
+        std::fs::read(os_path(&fullname)).map_err(|err| FsError::path("open", name, err))
     }
 }
 
@@ -401,7 +432,7 @@ impl IoFs for DirFs {
 // only the error (callers here drop the entries on error).
 fn os_read_dir(dirname: &str) -> io::Result<Vec<DirEntry>> {
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(dirname)? {
+    for entry in std::fs::read_dir(os_path(dirname))? {
         let entry = entry?;
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
@@ -425,7 +456,7 @@ fn os_read_dir(dirname: &str) -> io::Result<Vec<DirEntry>> {
         } else {
             FileMode::IRREGULAR
         };
-        let name = os_string_to_string(entry.file_name());
+        let name = go_string_from_os(entry.file_name());
         let full_path = format!("{}/{}", dirname, name);
         entries.push(DirEntry {
             name,
@@ -433,7 +464,11 @@ fn os_read_dir(dirname: &str) -> io::Result<Vec<DirEntry>> {
             info: DirEntryInfo::Lstat(full_path),
         });
     }
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    // Go sorts by the name bytes.
+    entries.sort_by(|a, b| {
+        crate::scanner_util::go_string_bytes(&a.name)
+            .cmp(&crate::scanner_util::go_string_bytes(&b.name))
+    });
     Ok(entries)
 }
 
@@ -458,10 +493,11 @@ fn os_remove_all(path: &str) -> Result<(), FsError> {
         ));
     }
 
-    let result = match std::fs::symlink_metadata(path) {
+    let os = os_path(path);
+    let result = match std::fs::symlink_metadata(&os) {
         Err(err) => Err(err),
-        Ok(md) if md.is_dir() => std::fs::remove_dir_all(path),
-        Ok(_) => std::fs::remove_file(path),
+        Ok(md) if md.is_dir() => std::fs::remove_dir_all(&os),
+        Ok(_) => std::fs::remove_file(&os),
     };
     match result {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -485,8 +521,7 @@ fn filepath_abs(path: &str) -> Result<String, FsError> {
     if path.starts_with('/') {
         return Ok(filepath_clean(path));
     }
-    let wd = std::env::current_dir().map_err(|err| FsError::path("getwd", path, err))?;
-    let wd = os_string_to_string(wd.into_os_string());
+    let wd = os_current_dir().map_err(|err| FsError::path("getwd", path, err))?;
     // Go: filepath.Join(wd, path)
     if path.is_empty() {
         return Ok(filepath_clean(&wd));

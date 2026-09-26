@@ -369,15 +369,16 @@ impl Checker {
         if no_truncation {
             max_length = NO_TRUNCATION_MAXIMUM_TRUNCATION_LENGTH * 2;
         }
-        // PORT: Go `len(result)` and the slice are byte based. The slice here
-        // is byte based too, so it panics where Go would cut a UTF-8 sequence.
-        // Go keeps the broken bytes; Rust `String` cannot hold them.
+        // PORT: Go `len(result)` and the slice count Go bytes. `result` is a
+        // port form (see `scanner_util::GO_STRING_MARKER`), so this uses its
+        // Go length, and `go_slice` keeps the bytes of a cut char as invalid
+        // bytes, as Go does.
         let max_length = usize::try_from(max_length).unwrap_or(0);
-        if max_length > 0 && !result.is_empty() && result.len() >= max_length {
+        if max_length > 0 && !result.is_empty() && go_len(&result) >= max_length {
             if let Some(vc) = vc {
                 vc.truncated.set(true);
             }
-            return result[0..max_length - "...".len()].to_string() + "...";
+            return go_slice(&result, 0, max_length - "...".len()).into_owned() + "...";
         }
         result
     }

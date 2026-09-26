@@ -86,9 +86,9 @@ impl Checker {
 }
 
 // Go: checker/utilities.go:963 isLateBoundName
-// PORT: Go checks `name[0] == '\xfe' && name[1] == '@'`. The port spells the
-// internal prefix as U+FFFE (see `ast::misc`), so this checks for that prefix
-// followed by the byte '@'.
+// PORT: Go checks `name[0] == '\xfe' && name[1] == '@'`. The byte 0xFE is
+// INTERNAL_SYMBOL_NAME_PREFIX in the port form (see `ast::misc`), so this
+// checks for that prefix followed by the byte '@'.
 pub fn is_late_bound_name(name: &str) -> bool {
     match name.strip_prefix(INTERNAL_SYMBOL_NAME_PREFIX) {
         Some(rest) => !rest.is_empty() && rest.as_bytes()[0] == b'@',
@@ -1196,8 +1196,9 @@ pub fn get_any_import_syntax(node: Node) -> Node {
 // A reserved member name consists of the byte 0xFE (which is an invalid UTF-8 encoding) followed by one or more
 // characters where the first character is not '@' or '#'. The '@' character indicates that the name is denoted by
 // a well known ES Symbol instance and the '#' character indicates that the name is a PrivateIdentifier.
-// PORT: the port spells the internal prefix as U+FFFE (see `ast::misc`), so
-// "name[0]" is that prefix and "name[1]" is the first byte after it.
+// PORT: the byte 0xFE is INTERNAL_SYMBOL_NAME_PREFIX in the port form (see
+// `ast::misc`), so "name[0]" is that prefix and "name[1]" is the first byte
+// after it.
 pub fn is_reserved_member_name(name: &str) -> bool {
     match name.strip_prefix(INTERNAL_SYMBOL_NAME_PREFIX) {
         Some(rest) => !rest.is_empty() && rest.as_bytes()[0] != b'@' && rest.as_bytes()[0] != b'#',

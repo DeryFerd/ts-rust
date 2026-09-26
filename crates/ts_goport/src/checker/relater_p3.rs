@@ -1,6 +1,7 @@
 //! Port of typescript-go `checker/relater.go` lines 1827-2795.
 
 use crate::prelude::*;
+use std::borrow::Cow;
 use ts_diagnostics::Message;
 
 impl Checker {
@@ -830,11 +831,12 @@ impl Checker {
         target: &TemplateLiteralType,
     ) -> bool {
         // Two template literal types with differences in their starting or ending text spans are definitely unrelated.
-        // PORT: Go slices strings by byte; compare bytes so no char-boundary check applies.
-        let source_start = source.texts[0].as_bytes();
-        let target_start = target.texts[0].as_bytes();
-        let source_end = source.texts[source.texts.len() - 1].as_bytes();
-        let target_end = target.texts[target.texts.len() - 1].as_bytes();
+        // PORT: Go slices strings by byte, so this compares the Go bytes of
+        // the port forms (see `scanner_util::GO_STRING_MARKER`).
+        let source_start = go_string_bytes(&source.texts[0]);
+        let target_start = go_string_bytes(&target.texts[0]);
+        let source_end = go_string_bytes(&source.texts[source.texts.len() - 1]);
+        let target_end = go_string_bytes(&target.texts[target.texts.len() - 1]);
         let start_len = source_start.len().min(target_start.len());
         let end_len = source_end.len().min(target_end.len());
         source_start[..start_len] != target_start[..start_len]
@@ -929,19 +931,31 @@ impl Checker {
     // inference, the template literal type `<${number}-${number}>`.
     // Go: checker/relater.go:2385 inferFromLiteralPartsToTemplateLiteral
     // PORT: returns an empty Vec where Go returns nil (a match is never empty).
+    // Go matches and slices the bytes of the texts. The texts are port forms
+    // (see `scanner_util::GO_STRING_MARKER`), so this works on their Go
+    // bytes, and each match is the value form of its bytes
+    // (`go_value_from_bytes`). A text without a marker is its own bytes.
     pub fn infer_from_literal_parts_to_template_literal(
         &mut self,
         source_texts: &[String],
         source_types: &[TypeId],
         target: &TemplateLiteralType,
     ) -> Vec<TypeId> {
-        let last_source_index = source_texts.len() - 1;
-        let source_start_text = source_texts[0].as_str();
-        let source_end_text = source_texts[last_source_index].as_str();
-        let target_texts = &target.texts;
-        let last_target_index = target_texts.len() - 1;
-        let target_start_text = target_texts[0].as_str();
-        let target_end_text = target_texts[last_target_index].as_str();
+        let source_bytes: Vec<Cow<'_, [u8]>> = source_texts
+            .iter()
+            .map(|text| go_string_bytes(text))
+            .collect();
+        let target_bytes: Vec<Cow<'_, [u8]>> = target
+            .texts
+            .iter()
+            .map(|text| go_string_bytes(text))
+            .collect();
+        let last_source_index = source_bytes.len() - 1;
+        let source_start_text: &[u8] = &source_bytes[0];
+        let source_end_text: &[u8] = &source_bytes[last_source_index];
+        let last_target_index = target_bytes.len() - 1;
+        let target_start_text: &[u8] = &target_bytes[0];
+        let target_end_text: &[u8] = &target_bytes[last_target_index];
         if last_source_index == 0
             && source_start_text.len() < target_start_text.len() + target_end_text.len()
             || !source_start_text.starts_with(target_start_text)
@@ -955,18 +969,18 @@ impl Checker {
         let mut matches: Vec<TypeId> = Vec::new();
         // Go closure `getSourceText`.
         fn source_text_at<'a>(
-            source_texts: &'a [String],
-            remaining_end_text: &'a str,
+            source_bytes: &'a [Cow<'a, [u8]>],
+            remaining_end_text: &'a [u8],
             last_source_index: usize,
             index: usize,
-        ) -> &'a str {
+        ) -> &'a [u8] {
             if index < last_source_index {
-                return source_texts[index].as_str();
+                return &source_bytes[index];
             }
             remaining_end_text
         }
         let get_source_text = |index: usize| {
-            source_text_at(source_texts, remaining_end_text, last_source_index, index)
+            source_text_at(&source_bytes, remaining_end_text, last_source_index, index)
         };
         // PORT: Go `addMatch` closes over `seg`, `pos` and `matches`; here they
         // are passed explicitly so the checker can be borrowed mutably.
@@ -977,12 +991,14 @@ impl Checker {
                          s: usize,
                          p: usize| {
             let match_type = if s == *seg {
-                c.get_string_literal_type(&combine_surrogate_pairs(&get_source_text(s)[*pos..p]))
+                c.get_string_literal_type(&combine_surrogate_pairs(&go_value_from_bytes(
+                    &get_source_text(s)[*pos..p],
+                )))
             } else {
                 let mut match_texts: Vec<String> = Vec::with_capacity(s - *seg + 1);
-                match_texts.push(source_texts[*seg][*pos..].to_string());
+                match_texts.push(go_value_from_bytes(&source_bytes[*seg][*pos..]).into_owned());
                 match_texts.extend(source_texts[*seg + 1..s].iter().cloned());
-                match_texts.push(get_source_text(s)[..p].to_string());
+                match_texts.push(go_value_from_bytes(&get_source_text(s)[..p]).into_owned());
                 c.get_template_literal_type(&match_texts, &source_types[*seg..s])
             };
             matches.push(match_type);
@@ -990,12 +1006,12 @@ impl Checker {
             *pos = p;
         };
         for i in 1..last_target_index {
-            let delim = target_texts[i].as_str();
+            let delim: &[u8] = &target_bytes[i];
             if !delim.is_empty() {
                 let mut s = seg;
                 let mut p = pos;
                 loop {
-                    if let Some(d) = get_source_text(s)[p..].find(delim) {
+                    if let Some(d) = memchr::memmem::find(&get_source_text(s)[p..], delim) {
                         p += d;
                         break;
                     }
@@ -1025,8 +1041,8 @@ impl Checker {
                 // helper (the inverse of CombineSurrogatePairs) and decode by code
                 // unit here; the CombineSurrogatePairs call in addMatch already
                 // recombines captured halves back into canonical form.
-                let (_, size) = decode_js_string_rune(&source_text[pos..]);
-                let (s0, p0) = (seg, pos + size as usize);
+                let (_, size) = go_decode_js_string_rune_bytes(&source_text[pos..]);
+                let (s0, p0) = (seg, pos + size);
                 add_match(self, &mut seg, &mut pos, &mut matches, s0, p0);
             } else if seg < last_source_index {
                 let s0 = seg + 1;

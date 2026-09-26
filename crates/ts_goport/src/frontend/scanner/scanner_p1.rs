@@ -42,9 +42,11 @@ pub(crate) const RUNE_SELF: i32 = 0x80;
 /// Go `utf8.DecodeRuneInString(text[pos:])`. Returns `(RuneError, 0)` at the
 /// end and `(RuneError, 1)` for an invalid sequence (for example `pos` inside
 /// a multi-byte character).
-// PORT: an invalid source byte is a 3-byte sentinel char in the text (see
-// `vfs::decode_bytes`). It decodes as `(RuneError, 3)`, not Go's
-// `(RuneError, 1)`: its width in the text is 3.
+// PORT: `text` is the port form of the Go text (see
+// `scanner_util::GO_STRING_MARKER`). A unit decodes as one rune with its
+// size in `text`: a real U+FDD0 as `(0xFDD0, 6)`, an invalid byte as
+// `(RuneError, 7)` where Go gives `(RuneError, 1)`, and a lone surrogate
+// (only in values, never in source text) as `(RuneError, 7)`.
 pub(crate) fn utf8_decode_rune_in_string(text: &str, pos: usize) -> (i32, i32) {
     let bytes = text.as_bytes();
     if pos >= bytes.len() {
@@ -54,31 +56,14 @@ pub(crate) fn utf8_decode_rune_in_string(text: &str, pos: usize) -> (i32, i32) {
     if i32::from(b) < RUNE_SELF {
         return (i32::from(b), 1);
     }
-    let width = if b & 0xE0 == 0xC0 {
-        2
-    } else if b & 0xF0 == 0xE0 {
-        3
-    } else if b & 0xF8 == 0xF0 {
-        4
-    } else {
-        return (RUNE_ERROR, 1);
-    };
-    if pos + width > bytes.len() {
-        return (RUNE_ERROR, 1);
+    if b == GO_STRING_MARKER_LEAD {
+        return go_unit_rune(go_unit_at(text, pos));
     }
-    match std::str::from_utf8(&bytes[pos..pos + width])
-        .ok()
-        .and_then(|s| s.chars().next())
-    {
-        Some(ch) if is_invalid_byte_sentinel(ch) => (RUNE_ERROR, width as i32),
-        Some(ch) => (ch as i32, width as i32),
-        None => (RUNE_ERROR, 1),
-    }
+    decode_rune_in_bytes(&bytes[pos..])
 }
 
 /// Go `utf8.DecodeLastRuneInString(text[:end])`.
-// PORT: an invalid source byte sentinel decodes as `(RuneError, 3)`, as in
-// `utf8_decode_rune_in_string`.
+// PORT: a unit of the port form decodes as in `utf8_decode_rune_in_string`.
 pub(crate) fn utf8_decode_last_rune_in_string(text: &str, end: usize) -> (i32, i32) {
     let bytes = text.as_bytes();
     if end == 0 {
@@ -87,6 +72,9 @@ pub(crate) fn utf8_decode_last_rune_in_string(text: &str, end: usize) -> (i32, i
     let b = bytes[end - 1];
     if i32::from(b) < RUNE_SELF {
         return (i32::from(b), 1);
+    }
+    if text.is_char_boundary(end) {
+        return go_unit_rune(go_unit_before(text, end));
     }
     let lim = end.saturating_sub(4);
     let mut start = end - 1;
@@ -99,6 +87,18 @@ pub(crate) fn utf8_decode_last_rune_in_string(text: &str, end: usize) -> (i32, i
         return (RUNE_ERROR, 1);
     }
     (r, size)
+}
+
+/// First UTF-8 byte of `GO_STRING_MARKER` (U+FDD0 is EF B7 90).
+const GO_STRING_MARKER_LEAD: u8 = 0xEF;
+
+/// The Go rune of a port form unit and its size in the text (see
+/// `utf8_decode_rune_in_string`).
+fn go_unit_rune((unit, size): (GoUnit, usize)) -> (i32, i32) {
+    match unit {
+        GoUnit::Char(ch) => (ch as i32, size as i32),
+        GoUnit::Surrogate(_) | GoUnit::InvalidByte(_) => (RUNE_ERROR, size as i32),
+    }
 }
 
 /// Go `utf8.DecodeRune(b)` on a byte slice.
@@ -126,7 +126,6 @@ fn decode_rune_in_bytes(bytes: &[u8]) -> (i32, i32) {
         .ok()
         .and_then(|s| s.chars().next())
     {
-        Some(ch) if is_invalid_byte_sentinel(ch) => (RUNE_ERROR, width as i32),
         Some(ch) => (ch as i32, width as i32),
         None => (RUNE_ERROR, 1),
     }

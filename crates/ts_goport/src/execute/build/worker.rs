@@ -255,16 +255,19 @@ impl MarshalerTo for WorkerCompileResult {
         enc.push_str("{\"exitStatus\":");
         enc.push_str(&self.exit_status.code().to_string());
         enc.push_str(",\"output\":");
-        self.output.marshal_json_to(enc)?;
+        // PORT: the protocol keeps each string in the port form (see
+        // `scanner_util::GO_STRING_MARKER`, `json_new_port_form_decoder`).
+        // The parent writes the output's Go bytes.
+        append_json_quote_port_form(enc, &self.output);
         enc.push_str(",\"diagnosticsCount\":");
         enc.push_str(&self.diagnostics_count.to_string());
         enc.push_str(",\"emittedFiles\":");
-        self.emitted_files.marshal_json_to(enc)?;
+        append_json_quote_port_form_list(enc, &self.emitted_files);
         enc.push_str(",\"hasChangedDtsFile\":");
         self.has_changed_dts_file.marshal_json_to(enc)?;
         enc.push_str(",\"buildInfoFileName\":");
         match &self.build_info_file_name {
-            Some(name) => name.marshal_json_to(enc)?,
+            Some(name) => append_json_quote_port_form(enc, name),
             None => enc.push_str("null"),
         }
         enc.push_str(",\"fsCache\":");
@@ -281,7 +284,7 @@ pub fn marshal_worker_compile_result(result: &WorkerCompileResult) -> String {
 
 /// Reads a protocol line back. `None` when the line is not a valid result.
 pub fn parse_worker_compile_result(line: &str) -> Option<WorkerCompileResult> {
-    let mut dec = json_new_decoder(line.as_bytes());
+    let mut dec = json_new_port_form_decoder(line.as_bytes());
     let result = decode_worker_compile_result(&mut dec).ok()?;
     dec.check_eof().ok()?;
     Some(result)
@@ -390,8 +393,13 @@ impl WorkerLauncher {
     ) -> WorkerCompileResult {
         let output = std::process::Command::new(&self.exe)
             .arg(BUILD_WORKER_FLAG)
-            .arg(config)
-            .args(&self.build_command_line)
+            // The worker reads its arguments into the port form again.
+            .arg(os_path(config).as_os_str())
+            .args(
+                self.build_command_line
+                    .iter()
+                    .map(|arg| os_path(arg).into_owned()),
+            )
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -471,7 +479,7 @@ pub fn read_worker_fs_cache(input: &mut dyn std::io::Read) -> Result<CachedFsSta
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Ok(CachedFsState::default());
     }
-    let mut dec = json_new_decoder(&bytes);
+    let mut dec = json_new_port_form_decoder(&bytes);
     let state = decode_cached_fs_state(&mut dec).map_err(|err| err.message)?;
     dec.check_eof().map_err(|err| err.message)?;
     Ok(state)
@@ -492,7 +500,7 @@ fn parse_worker_program_fs_cache(line: &[u8]) -> Option<CachedFsState> {
     if !line.starts_with(PROGRAM_FS_CACHE_PREFIX.as_bytes()) {
         return None;
     }
-    let mut dec = json_new_decoder(line);
+    let mut dec = json_new_port_form_decoder(line);
     let mut state = None;
     if dec.read_token().ok()? != JsonToken::BeginObject {
         return None;

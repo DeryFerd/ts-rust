@@ -672,7 +672,9 @@ fn get_error_summary(diags: &[Diagnostic]) -> ErrorSummary<'_> {
     // !!!
     // Need an ordered map here, but sorting for consistency.
     let mut sorted_files: Vec<Node> = errors_by_file.keys().copied().collect();
-    sorted_files.sort_by(|a, b| source_file_file_name(*a).cmp(source_file_file_name(*b)));
+    // PORT: Go compares the bytes of the names (see `compare_go_bytes`).
+    sorted_files
+        .sort_by(|a, b| compare_go_bytes(source_file_file_name(*a), source_file_file_name(*b)));
 
     ErrorSummary {
         total_error_count,
@@ -848,12 +850,9 @@ pub fn try_clear_screen(output: &Writer, diag: &Diagnostic, options: &CompilerOp
 
 // Go: diagnostics/diagnostics.go:67 (*Message).Localize
 // PORT: the port has only the default (English) messages, so the locale is
-// dropped. Go `Format` panics on a bad placeholder.
+// dropped and this is Go `Format` (`format_message`).
 fn localize(message: &'static Message, args: &[String]) -> String {
-    match message.format(args) {
-        Ok(text) => text,
-        Err(_) => panic!("Invalid formatting placeholder"),
-    }
+    format_message(message, args)
 }
 
 /// Go `fmt.Sprintf("%*s", width, s)`, or `"%-*s"` when `left` is true. Go

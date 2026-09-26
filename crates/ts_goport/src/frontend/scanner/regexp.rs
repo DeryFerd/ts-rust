@@ -7,9 +7,9 @@
 //! `DecodeJSStringRune`), so they are `Vec<u8>` here, and the private
 //! `encode_js_string_rune_bytes`, `decode_js_string_rune_bytes` and
 //! `decode_rune_in_bytes` helpers do the Go byte math on them. Lone
-//! surrogates use the valid-UTF-8 escape form from
+//! surrogates use the valid-UTF-8 port form from
 //! `scanner_util::encode_js_string_rune` (see
-//! `scanner_util::LONE_SURROGATE_MARKER`) instead of Go's WTF-8 bytes.
+//! `scanner_util::GO_STRING_MARKER`) instead of Go's WTF-8 bytes.
 //!
 //! Go `rune` values from `Scanner.char()` and `Scanner.charAt()` are `i32`
 //! (a raw byte, or -1 at the end). `match rune(ch)` stands in for a Go
@@ -1560,6 +1560,16 @@ impl<'a> RegExpParser<'a> {
             let (ch, size) = self.decode_rune_at_pos();
             if ch == RUNE_ERROR || size == 0 {
                 // Not a valid rune; consume one raw byte.
+                // PORT: an invalid byte is one unit of the port form (see
+                // `scanner_util::GO_STRING_MARKER`) that holds the Go byte.
+                if size > 3 {
+                    if let (GoUnit::InvalidByte(byte), unit_size) =
+                        go_unit_at(self.text(), self.pos() as usize)
+                    {
+                        self.inc_pos(unit_size as i32);
+                        return rune_to_bytes(i32::from(byte));
+                    }
+                }
                 self.inc_pos(1);
                 let byte = self.text().as_bytes()[self.pos() as usize - 1];
                 return rune_to_bytes(i32::from(byte));
@@ -1721,7 +1731,7 @@ fn code_point_to_surrogate_pair_i32(ch: i32) -> (i32, i32) {
 
 // Go: stringutil/util.go:323 EncodeJSStringRune
 // PORT: byte form of `scanner_util::encode_js_string_rune`. A lone surrogate
-// becomes the same escape unit (see `scanner_util::LONE_SURROGATE_MARKER`), so
+// becomes the same port form unit (see `scanner_util::GO_STRING_MARKER`), so
 // these bytes match what `scan_escape_sequence` returns. Other runes are their
 // UTF-8 bytes. A lone U+FDD0 decodes as itself, so it needs no escape here.
 fn encode_js_string_rune_bytes(ch: i32) -> Vec<u8> {
@@ -1735,14 +1745,15 @@ fn encode_js_string_rune_bytes(ch: i32) -> Vec<u8> {
 
 // Go: stringutil/util.go:334 DecodeJSStringRune
 // PORT: byte form of `scanner_util::decode_js_string_rune`. It reads one
-// escape unit (see `scanner_util::LONE_SURROGATE_MARKER`) from the valid
+// port form unit (see `scanner_util::GO_STRING_MARKER`) from the valid
 // UTF-8 prefix, and keeps the Go `utf8.DecodeRuneInString` results for
 // invalid bytes.
 fn decode_js_string_rune_bytes(s: &[u8]) -> (i32, usize) {
     let (ch, size) = decode_rune_in_bytes(s);
     if ch != RUNE_ERROR && size > 0 {
-        // An escape unit is at most two chars (8 bytes).
-        let head = &s[..s.len().min(8)];
+        // A unit is at most 7 bytes, and Go reads the WTF-8 bytes of a
+        // surrogate from 3 invalid byte units.
+        let head = &s[..s.len().min(21)];
         let valid = match std::str::from_utf8(head) {
             Ok(text) => text,
             Err(err) => std::str::from_utf8(&head[..err.valid_up_to()]).unwrap_or_default(),

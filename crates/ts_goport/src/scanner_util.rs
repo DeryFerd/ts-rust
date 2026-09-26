@@ -80,11 +80,12 @@ fn unicode_to_upper(ch: char) -> char {
     }
 }
 
-/// Go `strings.EqualFold(a, b)`.
+/// Go `strings.EqualFold(a, b)` on the runes of two strings. Go reads each
+/// invalid byte as U+FFFD (see `go_runes`).
 // PORT: approximates Go simple case folding with single-char lower/upper maps.
-fn equal_fold(a: &str, b: &str) -> bool {
-    let mut left = a.chars();
-    let mut right = b.chars();
+fn equal_fold(a: &[char], b: &[char]) -> bool {
+    let mut left = a.iter().copied();
+    let mut right = b.iter().copied();
     loop {
         match (left.next(), right.next()) {
             (None, None) => return true,
@@ -257,34 +258,498 @@ pub fn surrogate_pair_to_code_point(high: u32, low: u32) -> u32 {
     }
 }
 
-// PORT: Go stores a lone surrogate (U+D800..U+DFFF) in a string value as the
-// 3-byte WTF-8 form 0xED 0xA0..0xBF 0x80..0xBF. Those bytes are not valid
-// UTF-8, so a Rust `String` cannot hold them. This port uses an escape with a
-// marker character M = LONE_SURROGATE_MARKER (U+FDD0, a Unicode
-// noncharacter). One "unit" of a string value is one of:
+// PORT: a Go string is a byte string. Two kinds of Go bytes are not valid
+// UTF-8, so a Rust `String` cannot hold them:
+// - a lone surrogate (U+D800..U+DFFF), which Go `EncodeJSStringRune` stores
+//   as its 3-byte WTF-8 form `ED A0..BF 80..BF`;
+// - a source byte that is not valid UTF-8 (always 0x80..=0xFF), which Go
+//   keeps unchanged and decodes as `utf8.RuneError` of size 1.
+// This port stores a Go string in a "port form" with one escape. The marker
+// M = GO_STRING_MARKER (U+FDD0, a Unicode noncharacter) starts a unit of two
+// chars:
 // - M + char(LONE_SURROGATE_UNIT_BASE + (cp - 0xD800)): the lone surrogate
-//   `cp`. The second char is in U+10F800..U+10FFFF (7 bytes in total).
-// - M + M: a real U+FDD0 (6 bytes). `encode_js_string_rune` and the scanner
-//   write a real U+FDD0 in this form, so the encoding is injective.
-// - Any other char: itself. A real U+10F800..U+10FFFF char is itself, so it
-//   does not collide with a lone surrogate.
-// `decode_js_string_rune` reads one unit. A lone M that is not followed by
-// M or a surrogate char also decodes as a real U+FDD0 (3 bytes), so a raw
-// text slice that was not escaped still reads correctly unless it holds U+FDD0
-// followed by U+FDD0 or U+10F800..U+10FFFF.
-// Divergences from Go: unit sizes are 7 and 6 bytes, not 3; callers only use
-// them to slice the same string. A real U+FDD0 in a string value that is
-// written without `escape_string_worker` (for example a symbol name) prints
-// twice. A substring search can match inside a unit.
-pub const LONE_SURROGATE_MARKER: char = '\u{FDD0}';
-const LONE_SURROGATE_MARKER_STR: &str = "\u{FDD0}";
+//   `cp`. The second char is in U+10F800..U+10FFFF.
+// - M + char(INVALID_BYTE_UNIT_BASE + b): the invalid byte `b`. The second
+//   char is in U+10F780..U+10F7FF.
+// - M + M: a real U+FDD0.
+// Every other char is itself, including a real U+10F780..U+10FFFF char. So
+// each Go string has one port form and each port form one Go string.
+// `go_unit_at` reads one unit and `go_string_bytes` gives the Go bytes back.
+// Where the port form comes from:
+// - `vfs::decode_bytes` writes source text in it (`go_string_from_bytes`),
+//   with one invalid byte unit for each byte that Go decodes as RuneError of
+//   size 1. That includes each byte of a WTF-8 surrogate, as the Go scanner
+//   reads them.
+// - The scanner copies source text into token values. A string value fuses
+//   the 3 invalid byte units of a WTF-8 surrogate into one lone surrogate
+//   unit (`fuse_surrogate_bytes`). This fused form is the "value form": each
+//   Go string has exactly one, so equal Go strings have equal value forms.
+// - The OS gives file names, the working directory and arguments in the
+//   value form (`vfs::go_string_from_os`), and takes the Go bytes back
+//   (`vfs::os_path`).
+// - A decoded JSON string is valid UTF-8, with each real U+FDD0 written
+//   twice (`frontend::json`).
+// - `push_js_string_rune` writes one rune.
+// Go bytes leave the port only through file writes, OS paths, the process
+// output and JSON strings, which all convert the port form
+// (`go_string_bytes`, `frontend::json::append_json_quote`).
+// A lone M that is not followed by M or a unit char (for example from Go
+// `string(rune)`) reads as a real U+FDD0.
+// Go works on the bytes of a string in places. The port does the same:
+// - A unit is 6 or 7 bytes, not 3 or 1. Offsets in port text after a unit
+//   differ from Go byte offsets. Callers use them to slice the same text.
+//   `utf16_len` counts Go runes, so lines and columns match Go.
+//   `go_byte_offset` and `port_byte_offset` convert an offset where Go
+//   writes or reads it (build info diagnostics and declaration signatures).
+//   `go_len` is Go `len`, for lengths that Go compares or limits.
+// - Go joins strings by bytes, so joined invalid bytes can form a valid char
+//   or a WTF-8 surrogate. `go_value` gives the value form of a join.
+// - A byte search on the port form can match inside a unit, and a Go byte
+//   search can match inside a char. `go_has_prefix`, `go_has_suffix` and
+//   `go_slice` work on the Go bytes, as Go does.
+pub const GO_STRING_MARKER: char = '\u{FDD0}';
+const GO_STRING_MARKER_BYTES: &[u8] = "\u{FDD0}".as_bytes();
 const LONE_SURROGATE_UNIT_BASE: u32 = 0x10F800;
+const INVALID_BYTE_UNIT_BASE: u32 = 0x10F700;
 
-/// Appends the port string form of the Go rune `ch` (see
-/// `LONE_SURROGATE_MARKER`) to `out`.
+/// One unit of the port form of a Go string (see `GO_STRING_MARKER`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GoUnit {
+    /// A char. A real U+FDD0 is `Char('\u{FDD0}')`.
+    Char(char),
+    /// A lone surrogate: Go bytes `ED A0..BF 80..BF`.
+    Surrogate(u32),
+    /// A Go byte that is not valid UTF-8 (0x80..=0xFF).
+    InvalidByte(u8),
+}
+
+impl GoUnit {
+    /// The number of Go bytes in the unit.
+    pub fn go_len(self) -> usize {
+        match self {
+            GoUnit::Char(ch) => ch.len_utf8(),
+            GoUnit::Surrogate(_) => 3,
+            GoUnit::InvalidByte(_) => 1,
+        }
+    }
+
+    /// Go `core.UTF16Len` of the unit's Go bytes. Go `range` reads each
+    /// byte that is not valid UTF-8 as one RuneError, which is one UTF-16
+    /// unit. The 3 bytes of a lone surrogate are 3 such bytes.
+    pub fn go_utf16_len(self) -> usize {
+        match self {
+            GoUnit::Char(ch) => ch.len_utf16(),
+            GoUnit::Surrogate(_) => 3,
+            GoUnit::InvalidByte(_) => 1,
+        }
+    }
+
+    /// Appends the unit's Go bytes to `out`.
+    pub fn push_go_bytes(self, out: &mut Vec<u8>) {
+        match self {
+            GoUnit::Char(ch) => out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes()),
+            GoUnit::Surrogate(cp) => out.extend_from_slice(&[
+                0xED,
+                0x80 | ((cp >> 6) & 0x3F) as u8,
+                0x80 | (cp & 0x3F) as u8,
+            ]),
+            GoUnit::InvalidByte(b) => out.push(b),
+        }
+    }
+}
+
+/// Reports whether `bytes[i..]` starts with `GO_STRING_MARKER`.
+#[inline]
+fn go_string_marker_at(bytes: &[u8], i: usize) -> bool {
+    bytes.get(i..i + GO_STRING_MARKER_BYTES.len()) == Some(GO_STRING_MARKER_BYTES)
+}
+
+/// The byte offset of the first `GO_STRING_MARKER` at or after `from`. The
+/// marker starts with a lead byte, so a match starts a char.
+#[inline]
+fn find_go_string_marker(bytes: &[u8], from: usize) -> Option<usize> {
+    memchr::memmem::find(&bytes[from..], GO_STRING_MARKER_BYTES).map(|i| from + i)
+}
+
+/// Reports whether `text` holds `GO_STRING_MARKER`, which means that its
+/// port form differs from plain UTF-8 (see `GO_STRING_MARKER`).
+#[inline]
+pub fn contains_go_string_marker(text: &str) -> bool {
+    find_go_string_marker(text.as_bytes(), 0).is_some()
+}
+
+/// The unit that starts at byte `i` of the port form `s`, and its size in
+/// `s` (see `GO_STRING_MARKER`). `i` must be a char boundary before the end.
+pub fn go_unit_at(s: &str, i: usize) -> (GoUnit, usize) {
+    let marker_len = GO_STRING_MARKER_BYTES.len();
+    if go_string_marker_at(s.as_bytes(), i) {
+        if let Some(next) = s[i + marker_len..].chars().next() {
+            let size = marker_len + next.len_utf8();
+            let code = next as u32;
+            if next == GO_STRING_MARKER {
+                return (GoUnit::Char(GO_STRING_MARKER), size);
+            }
+            if code >= LONE_SURROGATE_UNIT_BASE {
+                let cp = code - LONE_SURROGATE_UNIT_BASE + SURROGATE_HIGH_START;
+                return (GoUnit::Surrogate(cp), size);
+            }
+            if code >= INVALID_BYTE_UNIT_BASE + 0x80 {
+                return (
+                    GoUnit::InvalidByte((code - INVALID_BYTE_UNIT_BASE) as u8),
+                    size,
+                );
+            }
+        }
+        return (GoUnit::Char(GO_STRING_MARKER), marker_len);
+    }
+    let ch = s[i..].chars().next().expect("go_unit_at before the end");
+    (GoUnit::Char(ch), ch.len_utf8())
+}
+
+/// The unit that ends at byte `end` of the port form `s`, and its size in
+/// `s`. `end` must be a unit boundary after the start.
+pub fn go_unit_before(s: &str, end: usize) -> (GoUnit, usize) {
+    let marker_len = GO_STRING_MARKER_BYTES.len();
+    let ch = s[..end]
+        .chars()
+        .next_back()
+        .expect("go_unit_before after the start");
+    let start = end - ch.len_utf8();
+    // A run of M chars starts at a unit start, and its units pair up from
+    // there. Count the M chars before `ch`.
+    let bytes = s.as_bytes();
+    let mut run = 0usize;
+    while start >= marker_len * (run + 1)
+        && go_string_marker_at(bytes, start - marker_len * (run + 1))
+    {
+        run += 1;
+    }
+    if ch == GO_STRING_MARKER {
+        // `ch` ends the run. An even run ends with an M + M unit.
+        let size = if run % 2 == 1 {
+            2 * marker_len
+        } else {
+            marker_len
+        };
+        return (GoUnit::Char(GO_STRING_MARKER), size);
+    }
+    if run % 2 == 1 && ch as u32 >= INVALID_BYTE_UNIT_BASE + 0x80 {
+        return go_unit_at(s, start - marker_len);
+    }
+    (GoUnit::Char(ch), ch.len_utf8())
+}
+
+/// The Go bytes of the port form `s` (see `GO_STRING_MARKER`): the bytes
+/// that Go writes to a file or the output. Text without a marker is
+/// borrowed.
+pub fn go_string_bytes(s: &str) -> Cow<'_, [u8]> {
+    let bytes = s.as_bytes();
+    let Some(first) = find_go_string_marker(bytes, 0) else {
+        return Cow::Borrowed(bytes);
+    };
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut start = 0usize;
+    let mut next = Some(first);
+    while let Some(at) = next {
+        out.extend_from_slice(&bytes[start..at]);
+        let (unit, size) = go_unit_at(s, at);
+        unit.push_go_bytes(&mut out);
+        start = at + size;
+        next = find_go_string_marker(bytes, start);
+    }
+    out.extend_from_slice(&bytes[start..]);
+    Cow::Owned(out)
+}
+
+/// Go `strings.ToValidUTF8(s, "\u{FFFD}")` on the Go bytes of the port form
+/// `s` (see `GO_STRING_MARKER`): each run of bytes that are not valid UTF-8
+/// becomes one U+FFFD. A lone surrogate unit is 3 such bytes. Text without
+/// a marker is borrowed.
+pub fn go_to_valid_utf8(s: &str) -> Cow<'_, str> {
+    let bytes = s.as_bytes();
+    let mut out: Option<String> = None;
+    let mut start = 0usize;
+    // The end of the last replaced unit. A unit that starts there is in the
+    // same run.
+    let mut run_end = None;
+    let mut next = find_go_string_marker(bytes, 0);
+    while let Some(at) = next {
+        let (unit, size) = go_unit_at(s, at);
+        if matches!(unit, GoUnit::InvalidByte(_) | GoUnit::Surrogate(_)) {
+            let out = out.get_or_insert_with(|| String::with_capacity(s.len()));
+            out.push_str(&s[start..at]);
+            if run_end != Some(at) {
+                out.push(char::REPLACEMENT_CHARACTER);
+            }
+            start = at + size;
+            run_end = Some(start);
+        }
+        next = find_go_string_marker(bytes, at + size);
+    }
+    match out {
+        None => Cow::Borrowed(s),
+        Some(mut out) => {
+            out.push_str(&s[start..]);
+            Cow::Owned(out)
+        }
+    }
+}
+
+/// The port form of the Go bytes `bytes` (see `GO_STRING_MARKER`). Each
+/// byte that Go `utf8.DecodeRuneInString` reads as RuneError of size 1
+/// becomes one invalid byte unit, and each real U+FDD0 becomes M + M.
+pub fn go_string_from_bytes(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => go_string_from_utf8(text),
+        Err(err) => {
+            let bytes = err.into_bytes();
+            let mut out = String::with_capacity(bytes.len() + bytes.len() / 8);
+            // Every byte of an invalid chunk is one Go RuneError of size 1:
+            // the bytes after its first are continuation bytes, which never
+            // start a valid sequence.
+            for chunk in bytes.utf8_chunks() {
+                push_go_string_from_utf8(&mut out, chunk.valid());
+                for &b in chunk.invalid() {
+                    out.push(GO_STRING_MARKER);
+                    out.push(
+                        char::from_u32(INVALID_BYTE_UNIT_BASE + u32::from(b))
+                            .expect("U+10F780..U+10F7FF are chars"),
+                    );
+                }
+            }
+            out
+        }
+    }
+}
+
+/// The port form of the valid UTF-8 Go string `text`: each real U+FDD0
+/// becomes M + M (see `GO_STRING_MARKER`).
+pub fn go_string_from_utf8(text: String) -> String {
+    if !contains_go_string_marker(&text) {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    push_go_string_from_utf8(&mut out, &text);
+    out
+}
+
+/// Appends the port form of the valid UTF-8 Go string `text` to `out`.
+fn push_go_string_from_utf8(out: &mut String, text: &str) {
+    let mut start = 0usize;
+    while let Some(at) = find_go_string_marker(text.as_bytes(), start) {
+        let end = at + GO_STRING_MARKER_BYTES.len();
+        out.push_str(&text[start..end]);
+        out.push(GO_STRING_MARKER);
+        start = end;
+    }
+    out.push_str(&text[start..]);
+}
+
+/// Fuses the 3 invalid byte units of each WTF-8 surrogate
+/// (`ED A0..BF 80..BF`) in the port form `s` into one lone surrogate unit,
+/// the port form of the same Go bytes (see `GO_STRING_MARKER`). Source text
+/// keeps the 3 units, as the Go scanner reads 3 bytes there. A string value
+/// needs the one form. Text without a marker is borrowed.
+pub fn fuse_surrogate_bytes(s: &str) -> Cow<'_, str> {
+    let bytes = s.as_bytes();
+    let mut out: Option<String> = None;
+    let mut start = 0usize;
+    let mut next = find_go_string_marker(bytes, 0);
+    while let Some(at) = next {
+        let (unit, size) = go_unit_at(s, at);
+        let mut end = at + size;
+        if let GoUnit::InvalidByte(0xED) = unit {
+            let (code, triple_size, _) = decode_go_js_string_rune(&s[at..]);
+            if is_surrogate(code) {
+                let out = out.get_or_insert_with(|| String::with_capacity(s.len()));
+                out.push_str(&s[start..at]);
+                push_js_string_rune(out, code);
+                end = at + triple_size;
+                start = end;
+            }
+        }
+        next = find_go_string_marker(bytes, end);
+    }
+    match out {
+        None => Cow::Borrowed(s),
+        Some(mut out) => {
+            out.push_str(&s[start..]);
+            Cow::Owned(out)
+        }
+    }
+}
+
+/// The value form (see `GO_STRING_MARKER`) of the Go string with bytes
+/// `bytes`: `go_string_from_bytes` with each WTF-8 surrogate fused into one
+/// unit (`fuse_surrogate_bytes`). Valid UTF-8 without U+FDD0 is borrowed.
+pub fn go_value_from_bytes(bytes: &[u8]) -> Cow<'_, str> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) if !contains_go_string_marker(text) => Cow::Borrowed(text),
+        _ => {
+            let text = go_string_from_bytes(bytes.to_vec());
+            Cow::Owned(match fuse_surrogate_bytes(&text) {
+                Cow::Borrowed(_) => text,
+                Cow::Owned(fused) => fused,
+            })
+        }
+    }
+}
+
+/// The value form of the port form `s` (see `GO_STRING_MARKER`). Go joins
+/// strings by bytes: invalid byte units that a join puts next to each other
+/// can hold the bytes of a valid char or a WTF-8 surrogate. Text without a
+/// marker is borrowed.
+pub fn go_value(s: &str) -> Cow<'_, str> {
+    if !contains_go_string_marker(s) {
+        return Cow::Borrowed(s);
+    }
+    let bytes = go_string_bytes(s);
+    let value = go_value_from_bytes(&bytes);
+    if value == s {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(value.into_owned())
+    }
+}
+
+/// `go_value` for an owned string.
+pub fn go_value_owned(s: String) -> String {
+    match go_value(&s) {
+        Cow::Borrowed(_) => s,
+        Cow::Owned(value) => value,
+    }
+}
+
+/// Go `len(s)`: the number of Go bytes of the port form `s` (see
+/// `GO_STRING_MARKER`).
+pub fn go_len(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut extra = 0usize;
+    let mut next = find_go_string_marker(bytes, 0);
+    while let Some(at) = next {
+        let (unit, size) = go_unit_at(s, at);
+        extra += size - unit.go_len();
+        next = find_go_string_marker(bytes, at + size);
+    }
+    bytes.len() - extra
+}
+
+/// Go `strings.Compare(a, b)` on the Go bytes of two port forms.
+/// `compare_go_strings` gives the same order without the copies.
+pub fn compare_go_bytes(a: &str, b: &str) -> std::cmp::Ordering {
+    go_string_bytes(a).cmp(&go_string_bytes(b))
+}
+
+/// Go `slices.Compare` of two string slices, each compared by Go bytes
+/// (`compare_go_bytes`).
+pub fn compare_go_bytes_slices(a: &[String], b: &[String]) -> std::cmp::Ordering {
+    for (x, y) in a.iter().zip(b) {
+        let c = compare_go_bytes(x, y);
+        if c.is_ne() {
+            return c;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Go `strings.HasPrefix(s, prefix)` on the Go bytes of two port forms.
+pub fn go_has_prefix(s: &str, prefix: &str) -> bool {
+    go_string_bytes(s).starts_with(&go_string_bytes(prefix))
+}
+
+/// Go `strings.HasSuffix(s, suffix)` on the Go bytes of two port forms.
+pub fn go_has_suffix(s: &str, suffix: &str) -> bool {
+    go_string_bytes(s).ends_with(&go_string_bytes(suffix))
+}
+
+/// Go `s[from:to]` with Go byte offsets, in the value form (see
+/// `go_value_from_bytes`). A cut inside a char leaves invalid bytes, as in
+/// Go. Text without a marker, cut at char boundaries, is borrowed.
+pub fn go_slice(s: &str, from: usize, to: usize) -> Cow<'_, str> {
+    match go_string_bytes(s) {
+        Cow::Borrowed(bytes) => go_value_from_bytes(&bytes[from..to]),
+        Cow::Owned(bytes) => Cow::Owned(go_value_from_bytes(&bytes[from..to]).into_owned()),
+    }
+}
+
+/// Go `[]rune(s)` on the Go bytes of the port form `s`: each byte that is
+/// not valid UTF-8 is one U+FFFD. A lone surrogate unit is 3 such bytes.
+pub fn go_runes(s: &str) -> Vec<char> {
+    if !contains_go_string_marker(s) {
+        return s.chars().collect();
+    }
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < s.len() {
+        let (unit, size) = go_unit_at(s, i);
+        match unit {
+            GoUnit::Char(ch) => out.push(ch),
+            GoUnit::InvalidByte(_) => out.push(char::REPLACEMENT_CHARACTER),
+            GoUnit::Surrogate(_) => out.extend([char::REPLACEMENT_CHARACTER; 3]),
+        }
+        i += size;
+    }
+    out
+}
+
+/// Go `strings.Map(mapping, s)` on the Go bytes of the port form `s` (see
+/// `GO_STRING_MARKER`). Go passes each byte that is not valid UTF-8 to
+/// `mapping` as U+FFFD and writes the result, so the result has no invalid
+/// byte or lone surrogate unit. A lone surrogate unit is 3 such bytes.
+pub fn go_map_runes(s: &str, mapping: impl Fn(char) -> char) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < s.len() {
+        let (unit, size) = go_unit_at(s, i);
+        let (ch, count) = match unit {
+            GoUnit::Char(ch) => (ch, 1),
+            GoUnit::InvalidByte(_) => (char::REPLACEMENT_CHARACTER, 1),
+            GoUnit::Surrogate(_) => (char::REPLACEMENT_CHARACTER, 3),
+        };
+        for _ in 0..count {
+            let mapped = mapping(ch);
+            out.push(mapped);
+            if mapped == GO_STRING_MARKER {
+                out.push(GO_STRING_MARKER);
+            }
+        }
+        i += size;
+    }
+    out
+}
+
+/// Go `utf8.DecodeRune(bytes)`: the rune and its size. An invalid byte is
+/// `(RuneError, 1)`, and an empty slice `(RuneError, 0)`.
+pub fn go_decode_rune_bytes(bytes: &[u8]) -> (u32, usize) {
+    // A valid first char fits in 4 bytes.
+    let head = &bytes[..bytes.len().min(4)];
+    match head.utf8_chunks().next() {
+        None => (char::REPLACEMENT_CHARACTER as u32, 0),
+        Some(chunk) => match chunk.valid().chars().next() {
+            Some(ch) => (ch as u32, ch.len_utf8()),
+            None => (char::REPLACEMENT_CHARACTER as u32, 1),
+        },
+    }
+}
+
+// Go: stringutil/util.go:334 DecodeJSStringRune
+/// Go `DecodeJSStringRune` on Go bytes: the WTF-8 bytes of a lone
+/// surrogate are one rune of size 3.
+pub fn go_decode_js_string_rune_bytes(bytes: &[u8]) -> (u32, usize) {
+    if let [0xED, b1 @ 0xA0..=0xBF, b2 @ 0x80..=0xBF, ..] = *bytes {
+        return (
+            0xD000 | (u32::from(b1) & 0x3F) << 6 | (u32::from(b2) & 0x3F),
+            3,
+        );
+    }
+    go_decode_rune_bytes(bytes)
+}
+
+/// Appends the port form of the Go rune `ch` (see `GO_STRING_MARKER`) to
+/// `out`.
 pub fn push_js_string_rune(out: &mut String, ch: u32) {
     if is_surrogate(ch) {
-        out.push(LONE_SURROGATE_MARKER);
+        out.push(GO_STRING_MARKER);
         // The unit base maps the surrogate range onto valid chars.
         out.push(
             char::from_u32(LONE_SURROGATE_UNIT_BASE + (ch - SURROGATE_HIGH_START))
@@ -293,73 +758,74 @@ pub fn push_js_string_rune(out: &mut String, ch: u32) {
         return;
     }
     let c = char::from_u32(ch).unwrap_or(char::REPLACEMENT_CHARACTER);
-    if c == LONE_SURROGATE_MARKER {
-        out.push(LONE_SURROGATE_MARKER);
+    if c == GO_STRING_MARKER {
+        out.push(GO_STRING_MARKER);
     }
     out.push(c);
 }
 
 // Go: stringutil/util.go:323 EncodeJSStringRune
-// PORT: writes the escape form (see LONE_SURROGATE_MARKER), not WTF-8.
+// PORT: writes the port form (see GO_STRING_MARKER), not WTF-8.
 pub fn encode_js_string_rune(ch: u32) -> String {
     let mut out = String::with_capacity(8);
     push_js_string_rune(&mut out, ch);
     out
 }
 
-/// Escapes each real U+FDD0 in raw source text as it enters a string value
-/// (see `LONE_SURROGATE_MARKER`). Text without U+FDD0 is borrowed.
-pub fn escape_lone_surrogate_markers(text: &str) -> Cow<'_, str> {
-    if !contains_lone_surrogate_marker(text) {
-        return Cow::Borrowed(text);
-    }
-    Cow::Owned(text.replace(LONE_SURROGATE_MARKER_STR, "\u{FDD0}\u{FDD0}"))
-}
-
-/// Reports whether `text` holds U+FDD0 (bytes EF B7 90).
-#[inline]
-pub fn contains_lone_surrogate_marker(text: &str) -> bool {
-    // The lead byte check is one fast pass. Most text has no 0xEF byte.
-    let bytes = text.as_bytes();
-    memchr::memchr(0xEF, bytes).is_some_and(|first| {
-        memchr::memmem::find(&bytes[first..], LONE_SURROGATE_MARKER_STR.as_bytes()).is_some()
-    })
-}
-
 // Go: stringutil/util.go:334 DecodeJSStringRune
 // PORT: returns the Go `rune` as `u32`, because a lone surrogate is not a
-// valid Rust `char`. It reads one unit of the escape form (see
-// LONE_SURROGATE_MARKER) instead of the WTF-8 bytes. Invalid UTF-8 cannot
-// occur in a `&str`, so the other results come from the first `char`
-// (U+FFFD with size 0 for an empty string, as `utf8.DecodeRuneInString`).
+// valid Rust `char`, and the size in `s`. It reads one unit of the port form
+// (see GO_STRING_MARKER). An empty string gives U+FFFD with size 0, as
+// `utf8.DecodeRuneInString`. `decode_go_js_string_rune` also gives the Go
+// size.
 pub fn decode_js_string_rune(s: &str) -> (u32, i32) {
-    let (ch, size) = decode_rune_at(s, 0);
-    if ch == LONE_SURROGATE_MARKER {
-        let (next, next_size) = decode_rune_at(s, size);
-        let code = next as u32;
-        if next_size > 0 && code >= LONE_SURROGATE_UNIT_BASE {
-            return (
-                code - LONE_SURROGATE_UNIT_BASE + SURROGATE_HIGH_START,
-                (size + next_size) as i32,
-            );
-        }
-        if next_size > 0 && next == LONE_SURROGATE_MARKER {
-            return (ch as u32, (size + next_size) as i32);
+    let (code, size, _) = decode_go_js_string_rune(s);
+    (code, size as i32)
+}
+
+/// Go `DecodeJSStringRune(s)` on the Go bytes of the port form `s`: the rune,
+/// its size in `s` and its size in Go bytes. An invalid byte is
+/// `(RuneError, size, 1)`, and a real U+FFFD is `(RuneError, 3, 3)`.
+pub fn decode_go_js_string_rune(s: &str) -> (u32, usize, usize) {
+    if s.is_empty() {
+        return (char::REPLACEMENT_CHARACTER as u32, 0, 0);
+    }
+    let (unit, size) = go_unit_at(s, 0);
+    match unit {
+        GoUnit::Char(ch) => (ch as u32, size, ch.len_utf8()),
+        GoUnit::Surrogate(cp) => (cp, size, 3),
+        GoUnit::InvalidByte(b) => {
+            // Go checks for the WTF-8 bytes of a surrogate first. They are 3
+            // invalid byte units here when they came from source text.
+            if b == 0xED && size < s.len() {
+                if let (GoUnit::InvalidByte(b1), size1) = go_unit_at(s, size) {
+                    if (0xA0..=0xBF).contains(&b1) && size + size1 < s.len() {
+                        if let (GoUnit::InvalidByte(b2), size2) = go_unit_at(s, size + size1) {
+                            if (0x80..=0xBF).contains(&b2) {
+                                let cp =
+                                    0xD000 | (u32::from(b1) & 0x3F) << 6 | (u32::from(b2) & 0x3F);
+                                return (cp, size + size1 + size2, 3);
+                            }
+                        }
+                    }
+                }
+            }
+            (char::REPLACEMENT_CHARACTER as u32, size, 1)
         }
     }
-    (ch as u32, size as i32)
 }
 
 // PORT: Go `strings.Compare` on the Go bytes of a string. Plain `str` order
 // differs from Go in two places, because this port stores two Go byte forms
-// in other ways:
-// - A lone surrogate unit (see LONE_SURROGATE_MARKER) is the 3-byte WTF-8
-//   form `ED A0..BF 80..BF` in Go. A real U+FDD0 unit (M + M) is `EF B7 90`.
-// - `INTERNAL_SYMBOL_NAME_PREFIX_CHAR` (U+FFFE) is the single byte `\xFE` in
-//   Go, so it sorts above every other lead byte. A real U+FFFE in source text
-//   also sorts as `\xFE` here (U+FFFE is a noncharacter, so this is rare).
-// Go byte encodings are prefix free, so comparing the first different unit
-// by its Go bytes gives the Go result.
+// in other ways (see GO_STRING_MARKER):
+// - A lone surrogate unit is the 3-byte WTF-8 form `ED A0..BF 80..BF` in Go.
+//   A real U+FDD0 unit (M + M) is `EF B7 90`.
+// - An invalid byte unit is one byte 0x80..=0xFF in Go. This includes the
+//   internal symbol name prefix `\xFE` (`ast::INTERNAL_SYMBOL_NAME_PREFIX`).
+// The Go bytes of chars and lone surrogates are prefix free, so comparing the
+// first different unit by its Go bytes gives the Go result. An invalid byte
+// can be a prefix of another unit's bytes, so then the Go bytes of the rest
+// of both strings are compared.
 pub fn compare_go_strings(a: &str, b: &str) -> std::cmp::Ordering {
     // Equal bytes are equal characters, so skip the common byte prefix and
     // step back to the start of the first different character.
@@ -370,46 +836,105 @@ pub fn compare_go_strings(a: &str, b: &str) -> std::cmp::Ordering {
     // Step back to the start of the unit. Every M starts a unit or is the
     // second M of an M + M unit, so a run of M chars before `p` starts at a
     // unit start. An odd run means `p` is the second char of a unit.
-    let marker = LONE_SURROGATE_MARKER_STR.as_bytes();
+    let marker_len = GO_STRING_MARKER_BYTES.len();
     let mut run = 0usize;
-    while p >= marker.len() * (run + 1)
-        && &a.as_bytes()[p - marker.len() * (run + 1)..p - marker.len() * run] == marker
+    while p >= marker_len * (run + 1)
+        && go_string_marker_at(a.as_bytes(), p - marker_len * (run + 1))
     {
         run += 1;
     }
     if run % 2 == 1 {
-        p -= marker.len();
+        p -= marker_len;
     }
     let (ra, rb) = (&a[p..], &b[p..]);
     match (ra.is_empty(), rb.is_empty()) {
         (false, false) => {
+            let (ua, _) = go_unit_at(ra, 0);
+            let (ub, _) = go_unit_at(rb, 0);
+            if matches!(ua, GoUnit::InvalidByte(_)) || matches!(ub, GoUnit::InvalidByte(_)) {
+                return go_string_bytes(ra).cmp(&go_string_bytes(rb));
+            }
             let (mut bx, mut by) = ([0u8; 4], [0u8; 4]);
-            go_unit_bytes(ra, &mut bx).cmp(go_unit_bytes(rb, &mut by))
+            go_unit_bytes(ua, &mut bx).cmp(go_unit_bytes(ub, &mut by))
         }
         (x, y) => y.cmp(&x),
     }
 }
 
-/// The Go bytes of the first unit of a non-empty port string (see
+/// The Go bytes of a unit that is not an invalid byte (see
 /// `compare_go_strings`).
-fn go_unit_bytes<'a>(s: &str, buf: &'a mut [u8; 4]) -> &'a [u8] {
-    let (code, _) = decode_js_string_rune(s);
-    if is_surrogate(code) {
-        *buf = [
-            0xED,
-            0x80 | ((code >> 6) & 0x3F) as u8,
-            0x80 | (code & 0x3F) as u8,
-            0,
-        ];
-        return &buf[..3];
+fn go_unit_bytes(unit: GoUnit, buf: &mut [u8; 4]) -> &[u8] {
+    match unit {
+        GoUnit::Surrogate(cp) => {
+            *buf = [
+                0xED,
+                0x80 | ((cp >> 6) & 0x3F) as u8,
+                0x80 | (cp & 0x3F) as u8,
+                0,
+            ];
+            &buf[..3]
+        }
+        GoUnit::Char(ch) => {
+            let len = ch.encode_utf8(&mut buf[..]).len();
+            &buf[..len]
+        }
+        GoUnit::InvalidByte(b) => {
+            buf[0] = b;
+            &buf[..1]
+        }
     }
-    let ch = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
-    if ch == crate::ast::INTERNAL_SYMBOL_NAME_PREFIX_CHAR {
-        buf[0] = 0xFE;
-        return &buf[..1];
+}
+
+/// The Go byte offset of the port offset `pos` in the port form `text` (see
+/// `GO_STRING_MARKER`). Go writes byte offsets into build info and
+/// declaration signatures. A negative offset is kept.
+pub fn go_byte_offset(text: &str, pos: i32) -> i32 {
+    if pos <= 0 {
+        return pos;
     }
-    let len = ch.encode_utf8(&mut buf[..]).len();
-    &buf[..len]
+    let bytes = text.as_bytes();
+    let end = (pos as usize).min(bytes.len());
+    // The port bytes of the units before `end` that Go does not have.
+    let mut extra = 0usize;
+    let mut next = find_go_string_marker(&bytes[..end], 0);
+    while let Some(at) = next {
+        let (unit, size) = go_unit_at(text, at);
+        if at + size > end {
+            // `pos` is inside the unit. Go has no such offset; keep it in
+            // the unit.
+            extra += (end - at).saturating_sub(unit.go_len());
+            break;
+        }
+        extra += size - unit.go_len();
+        next = find_go_string_marker(&bytes[..end], at + size);
+    }
+    pos - extra as i32
+}
+
+/// The port offset of the Go byte offset `go_pos` in the port form `text`,
+/// the inverse of `go_byte_offset`. An offset inside a unit's Go bytes gives
+/// the start of the unit. A negative offset is kept.
+pub fn port_byte_offset(text: &str, go_pos: i32) -> i32 {
+    if go_pos <= 0 {
+        return go_pos;
+    }
+    let go_pos = go_pos as usize;
+    let bytes = text.as_bytes();
+    // `port` and `go` are the same point in both texts.
+    let (mut port, mut go) = (0usize, 0usize);
+    while let Some(at) = find_go_string_marker(bytes, port) {
+        if go + (at - port) >= go_pos {
+            break;
+        }
+        go += at - port;
+        let (unit, size) = go_unit_at(text, at);
+        if go + unit.go_len() > go_pos {
+            return at as i32;
+        }
+        go += unit.go_len();
+        port = at + size;
+    }
+    (port + (go_pos - go)) as i32
 }
 
 // PORT: converts a legacy `ts_scanner` UTF-16 token value to the Go string
@@ -433,9 +958,9 @@ pub(crate) fn js_string_to_token_value(value: &ts_core::JsString) -> String {
 // written by EncodeJSStringRune) into the single supplementary code point they
 // represent. Strings without a lone-surrogate sentinel (the common case) are
 // returned unchanged.
-// PORT: the sentinel check looks for LONE_SURROGATE_MARKER.
+// PORT: the sentinel check looks for GO_STRING_MARKER.
 pub fn combine_surrogate_pairs(s: &str) -> String {
-    if !contains_lone_surrogate_marker(s) {
+    if !contains_go_string_marker(s) {
         return s.to_string();
     }
     let mut b = String::with_capacity(s.len());
@@ -541,7 +1066,7 @@ pub fn to_lower_js(str: &str) -> String {
                 builder.push_str(lower);
             }
         } else {
-            // PORT: keeps the U+FDD0 escape (see LONE_SURROGATE_MARKER).
+            // PORT: keeps the U+FDD0 escape (see GO_STRING_MARKER).
             push_js_string_rune(&mut builder, code);
         }
         if !is_unicode_case_ignorable(r) {
@@ -573,7 +1098,7 @@ pub fn to_upper_js(str: &str) -> String {
         {
             builder.push_str(upper);
         } else {
-            // PORT: keeps the U+FDD0 escape (see LONE_SURROGATE_MARKER).
+            // PORT: keeps the U+FDD0 escape (see GO_STRING_MARKER).
             push_js_string_rune(&mut builder, code);
         }
         i += size;
@@ -689,6 +1214,8 @@ pub fn compute_ecma_line_starts(text: &str) -> Vec<i32> {
 // Go: core/core.go:486 UTF16Len
 // UTF16Len returns the number of UTF-16 code units needed to
 // represent the given UTF-8 encoded string.
+// PORT: `s` is the port form of a Go string. Each unit counts as its Go bytes
+// do (see `GoUnit::go_utf16_len`).
 pub fn utf16_len(s: &str) -> i32 {
     // Fast path: scan for non-ASCII bytes. For ASCII-only strings,
     // each byte is one UTF-16 code unit, so we can return len(s) directly.
@@ -696,8 +1223,19 @@ pub fn utf16_len(s: &str) -> i32 {
         if b >= 0x80 {
             // Found non-ASCII; count the ASCII prefix, then decode the rest.
             let mut n = i as i32;
-            for r in s[i..].chars() {
-                n += r.len_utf16() as i32;
+            let rest = &s[i..];
+            let mut chars = rest.char_indices();
+            while let Some((j, r)) = chars.next() {
+                if r != GO_STRING_MARKER {
+                    n += r.len_utf16() as i32;
+                    continue;
+                }
+                let (unit, size) = go_unit_at(rest, j);
+                n += unit.go_utf16_len() as i32;
+                if size > r.len_utf8() {
+                    // Skip the second char of the unit.
+                    chars.next();
+                }
             }
             return n;
         }
@@ -710,13 +1248,15 @@ pub fn utf16_len(s: &str) -> i32 {
 // closest to `name`, or `T::default()` (Go zero value) when none is close
 // enough.
 // PORT: Go `iter.Seq[T]` -> `IntoIterator`; `getName(T)` -> `FnMut(&T)`.
+// Names are port forms (see `GO_STRING_MARKER`). Go counts their bytes
+// (`go_len`) and runes (`go_runes`, where each invalid byte is U+FFFD).
 pub fn get_spelling_suggestion<T: Clone + Default>(
     name: &str,
     candidates: impl IntoIterator<Item = T>,
     mut get_name: impl FnMut(&T) -> String,
     mut compare: impl FnMut(&T, &T) -> i32,
 ) -> T {
-    let rune_name: Vec<char> = name.chars().collect();
+    let rune_name: Vec<char> = go_runes(name);
     let maximum_length_difference = 2i64.max((rune_name.len() as f64 * 0.34) as i64);
     let mut best_distance = (rune_name.len() as f64 * 0.4).floor() + 0.9; // If the best result is worse than this, don't bother.
     let mut best_candidate = T::default();
@@ -724,18 +1264,19 @@ pub fn get_spelling_suggestion<T: Clone + Default>(
     for candidate in candidates {
         let candidate_name = get_name(&candidate);
         // PORT: Go compares the candidate byte length with the name rune count.
-        let max_len = candidate_name.len().max(rune_name.len()) as i64;
-        let min_len = candidate_name.len().min(rune_name.len()) as i64;
+        let candidate_len = go_len(&candidate_name);
+        let max_len = candidate_len.max(rune_name.len()) as i64;
+        let min_len = candidate_len.min(rune_name.len()) as i64;
         if !candidate_name.is_empty() && max_len - min_len <= maximum_length_difference {
             if candidate_name == name {
                 continue;
             }
+            let candidate_runes: Vec<char> = go_runes(&candidate_name);
             // Only consider candidates less than 3 characters long when they differ by case.
             // Otherwise, don't bother, since a user would usually notice differences of a 2-character name.
-            if candidate_name.len() < 3 && !equal_fold(&candidate_name, name) {
+            if candidate_len < 3 && !equal_fold(&candidate_runes, &rune_name) {
                 continue;
             }
-            let candidate_runes: Vec<char> = candidate_name.chars().collect();
             let distance = levenshtein_with_max(&rune_name, &candidate_runes, best_distance);
             if distance < 0.0 {
                 continue;
@@ -1955,11 +2496,21 @@ pub fn get_ecma_line_of_position(source_file: Node, pos: i32) -> i32 {
 // GetECMALineAndUTF16CharacterOfPosition returns the 0-based line number and the
 // UTF-16 code unit offset from the start of that line for the given byte position.
 // Uses ECMAScript line separators (LF, CR, CRLF, LS, PS).
+// PORT: `pos` can be inside a char. The regular expression scanner reads
+// a real U+FFFD as three single bytes in a non-Unicode pattern, as Go does,
+// and reports errors there. Go `range` reads each byte of the cut char as
+// one RuneError, which is one UTF-16 unit.
 pub fn get_ecma_line_and_utf16_character_of_position(source_file: Node, pos: i32) -> (i32, i32) {
     let line_map = get_ecma_line_starts(source_file);
     let line = compute_line_of_position(line_map, pos);
+    let text = source_file_text(source_file);
+    let end = pos as usize;
+    let mut boundary = end;
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
     let character =
-        utf16_len(&source_file_text(source_file)[line_map[line as usize] as usize..pos as usize]);
+        utf16_len(&text[line_map[line as usize] as usize..boundary]) + (end - boundary) as i32;
     (line, character)
 }
 
@@ -23834,8 +24385,11 @@ static UNICODE_CASE_IGNORABLE_RANGES: &[(u32, u32, u32)] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        combine_surrogate_pairs, compare_go_strings, compute_ecma_line_starts,
-        decode_js_string_rune, encode_js_string_rune, is_line_break,
+        GoUnit, combine_surrogate_pairs, compare_go_strings, compute_ecma_line_starts,
+        decode_js_string_rune, encode_js_string_rune, fuse_surrogate_bytes, go_byte_offset,
+        go_has_suffix, go_len, go_map_runes, go_runes, go_slice, go_string_bytes,
+        go_string_from_bytes, go_string_from_utf8, go_to_valid_utf8, go_unit_at, go_unit_before,
+        go_value, go_value_from_bytes, is_line_break, port_byte_offset, utf16_len,
     };
 
     /// Go (WTF-8) bytes of a rune, as Go `EncodeJSStringRune` writes it.
@@ -23850,7 +24404,7 @@ mod tests {
         char::from_u32(ch).unwrap().to_string().into_bytes()
     }
 
-    // Runes near the lone surrogate escape form (see LONE_SURROGATE_MARKER).
+    // Runes near the lone surrogate escape form (see GO_STRING_MARKER).
     const RUNES: [u32; 10] = [
         0x61, 0xD800, 0xDBFF, 0xDC00, 0xDFFF, 0xFDD0, 0xFFFD, 0x10F800, 0x10FFFF, 0x1F600,
     ];
@@ -23897,6 +24451,189 @@ mod tests {
         let real = encode_js_string_rune(0x10FFFF) + &encode_js_string_rune(0xFDD0);
         assert_eq!(decode_js_string_rune(&real), (0x10FFFF, 4));
         assert_eq!(combine_surrogate_pairs(&real), real);
+    }
+
+    /// Pieces of Go source bytes near the port form escapes (see
+    /// GO_STRING_MARKER): chars that look like units, invalid bytes, a
+    /// truncated sequence and the WTF-8 bytes of a surrogate.
+    const GO_PIECES: [&[u8]; 16] = [
+        b"a",
+        "\u{EF80}".as_bytes(),
+        "\u{EFFF}".as_bytes(),
+        "\u{FDD0}".as_bytes(),
+        "\u{FFFE}".as_bytes(),
+        b"\xFE",
+        "\u{10F780}".as_bytes(),
+        "\u{10F7FF}".as_bytes(),
+        "\u{10FFFF}".as_bytes(),
+        "\u{FFFD}".as_bytes(),
+        "\u{1F600}".as_bytes(),
+        b"\x80",
+        b"\xFF",
+        b"\xE2\x82",
+        b"\xED\xA0\x80",
+        b"\xED\xBF\xBF",
+    ];
+
+    /// Go `core.UTF16Len` on Go bytes: each byte that is not valid UTF-8 is
+    /// one RuneError, one UTF-16 unit.
+    fn go_utf16_len(bytes: &[u8]) -> i32 {
+        bytes
+            .utf8_chunks()
+            .map(|chunk| chunk.valid().encode_utf16().count() + chunk.invalid().len())
+            .sum::<usize>() as i32
+    }
+
+    fn random_go_bytes(seed: &mut u64) -> Vec<u8> {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        let mut bits = *seed;
+        let mut out = Vec::new();
+        for _ in 0..(bits % 7) {
+            bits = bits.rotate_right(5) ^ *seed;
+            out.extend_from_slice(GO_PIECES[(bits % GO_PIECES.len() as u64) as usize]);
+        }
+        out
+    }
+
+    // Every Go byte string has one port form that gives the same bytes back,
+    // counts the same UTF-16 units and offsets, and sorts as Go.
+    #[test]
+    fn go_string_port_form_is_injective() {
+        let mut seed = 0x51_7CC1_B727_220Au64;
+        let mut values: Vec<(Vec<u8>, String)> = Vec::new();
+        for _ in 0..4_000 {
+            let bytes = random_go_bytes(&mut seed);
+            let text = go_string_from_bytes(bytes.clone());
+            assert_eq!(&*go_string_bytes(&text), &bytes[..], "{text:?}");
+            assert_eq!(utf16_len(&text), go_utf16_len(&bytes), "{text:?}");
+            assert_eq!(go_byte_offset(&text, text.len() as i32), bytes.len() as i32);
+            // Walk the units forward, check offsets and the backward read.
+            let mut boundaries = vec![0usize];
+            let mut i = 0;
+            while i < text.len() {
+                let (unit, size) = go_unit_at(&text, i);
+                i += size;
+                assert_eq!(go_unit_before(&text, i), (unit, size), "{text:?} at {i}");
+                boundaries.push(i);
+            }
+            for &at in &boundaries {
+                let go = go_byte_offset(&text, at as i32);
+                assert_eq!(port_byte_offset(&text, go), at as i32, "{text:?} at {at}");
+                assert_eq!(&*go_string_bytes(&text[..at]), &bytes[..go as usize]);
+            }
+            values.push((bytes, text));
+        }
+        for pair in values.windows(2) {
+            let (ga, a) = &pair[0];
+            let (gb, b) = &pair[1];
+            assert_eq!(compare_go_strings(a, b), ga.cmp(gb), "{a:?} {b:?}");
+            assert_eq!(a == b, ga == gb, "{a:?} {b:?}");
+        }
+    }
+
+    // A WTF-8 surrogate in source text is 3 invalid byte units. A string
+    // value fuses them into the lone surrogate unit that an escape gives,
+    // and `decode_js_string_rune` reads both as the surrogate, as Go.
+    #[test]
+    fn surrogate_bytes_fuse_into_one_unit() {
+        let source = go_string_from_bytes(b"a\xED\xA0\x80\xED\xB0\x80\xEDb".to_vec());
+        let (unit, _) = go_unit_at(&source, 1);
+        assert_eq!(unit, GoUnit::InvalidByte(0xED));
+        assert_eq!(decode_js_string_rune(&source[1..]).0, 0xD800);
+        let value = fuse_surrogate_bytes(&source);
+        let escaped = format!(
+            "a{}{}{}b",
+            encode_js_string_rune(0xD800),
+            encode_js_string_rune(0xDC00),
+            &source[source.len() - 8..source.len() - 1]
+        );
+        assert_eq!(value, escaped);
+        assert_eq!(go_string_bytes(&value), go_string_bytes(&source));
+        assert_eq!(
+            combine_surrogate_pairs(&value),
+            format!("a\u{10000}{}b", &source[source.len() - 8..source.len() - 1])
+        );
+        assert!(matches!(
+            fuse_surrogate_bytes("a\u{FDD0}\u{FDD0}"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    // Go `strings.ToValidUTF8` replaces each run of invalid bytes once and
+    // keeps real U+FFFD and U+FDD0 chars.
+    #[test]
+    fn to_valid_utf8_replaces_runs() {
+        let text = go_string_from_bytes(
+            "a\u{FFFD}\u{FDD0}"
+                .bytes()
+                .chain(*b"\xFF\xED\xA0\x80b\x80")
+                .collect(),
+        );
+        assert_eq!(
+            go_to_valid_utf8(&text),
+            "a\u{FFFD}\u{FDD0}\u{FDD0}\u{FFFD}b\u{FFFD}"
+        );
+        let fused = fuse_surrogate_bytes(&text);
+        assert_eq!(go_to_valid_utf8(&fused), go_to_valid_utf8(&text));
+    }
+
+    // Go `strings.Map` passes each invalid byte as U+FFFD and writes the
+    // result. A real U+FDD0 keeps its port form.
+    #[test]
+    fn map_runes_maps_invalid_bytes() {
+        let text = go_string_from_bytes("A\u{FDD0}".bytes().chain(*b"\x80\xED\xA0\x80").collect());
+        let lower = |ch: char| ch.to_ascii_lowercase();
+        assert_eq!(
+            go_map_runes(&text, lower),
+            "a\u{FDD0}\u{FDD0}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}"
+        );
+        let fused = fuse_surrogate_bytes(&text);
+        assert_eq!(go_map_runes(&fused, lower), go_map_runes(&text, lower));
+    }
+
+    // Go joins, searches and slices the bytes of strings. The Go byte helpers
+    // do the same on port forms, and joins give the one value form.
+    #[test]
+    fn go_byte_helpers_follow_go_bytes() {
+        let value = |bytes: &[u8]| go_value_from_bytes(bytes).into_owned();
+        // A join of invalid bytes can be a valid char or a lone surrogate.
+        let joined = format!("{}{}", value(b"\xC3"), value(b"\xA9"));
+        assert_eq!(go_value(&joined), "\u{E9}");
+        let joined = format!("{}{}", value(b"\xED"), value(b"\xA0\x80"));
+        assert_eq!(go_value(&joined), encode_js_string_rune(0xD800));
+        // A search never matches inside a unit, and can match inside a char.
+        let a80 = value(b"a\x80");
+        assert!(!go_has_suffix(&a80, "\u{10F780}"));
+        assert!(go_has_suffix(&a80, &value(b"\x80")));
+        assert!(go_has_suffix("\u{E9}", &value(b"\xA9")));
+        assert_eq!(go_slice("\u{E9}", 0, 1), value(b"\xC3"));
+        // Go `len` and `[]rune`.
+        let fdd0 = value("\u{FDD0}".as_bytes());
+        assert_eq!((go_len(&a80), go_len(&fdd0)), (2, 3));
+        assert_eq!(go_runes(&a80), ['a', '\u{FFFD}']);
+        assert_eq!(go_runes(&fdd0), ['\u{FDD0}']);
+    }
+
+    // Go's internal symbol name prefix is the byte 0xFE. Its port form is
+    // the invalid byte unit, so source text with that byte names the same
+    // symbols as in Go, and a real U+FFFE stays an ordinary char.
+    #[test]
+    fn internal_symbol_name_prefix_is_byte_fe() {
+        let prefix = crate::ast::INTERNAL_SYMBOL_NAME_PREFIX;
+        assert_eq!(go_string_from_bytes(b"\xFE".to_vec()), prefix);
+        assert_eq!(
+            go_unit_at(prefix, 0),
+            (GoUnit::InvalidByte(0xFE), prefix.len())
+        );
+        assert_eq!(go_runes("\u{FFFE}"), ['\u{FFFE}']);
+        // Go replaces each byte 0xFE, and a U+FDD0 unit before a real
+        // U+10F7FE char holds no such byte.
+        let escape = crate::ast::escape_all_internal_symbol_names;
+        assert_eq!(escape(&format!("{prefix}type{prefix}")), "__type__");
+        let fdd0_then_char = go_string_from_utf8("\u{FDD0}\u{10F7FE}".to_string());
+        assert_eq!(escape(&fdd0_then_char), fdd0_then_char);
     }
 
     /// `compute_ecma_line_starts` written as a plain char scan.

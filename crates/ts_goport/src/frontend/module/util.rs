@@ -103,11 +103,13 @@ pub fn get_package_name_from_types_package_name(mangled_name: &str) -> String {
 
 // Go: module/util.go:89 ComparePatternKeys
 #[must_use]
+// PORT: lengths and offsets are Go byte counts of the port forms (see
+// `scanner_util::GO_STRING_MARKER`).
 pub fn compare_pattern_keys(a: &str, b: &str) -> i32 {
     let a_pattern_index = a.find('*');
     let b_pattern_index = b.find('*');
-    let base_len_a = a_pattern_index.map_or(a.len(), |i| i + 1);
-    let base_len_b = b_pattern_index.map_or(b.len(), |i| i + 1);
+    let base_len_a = a_pattern_index.map_or(go_len(a), |i| go_len(&a[..i]) + 1);
+    let base_len_b = b_pattern_index.map_or(go_len(b), |i| go_len(&b[..i]) + 1);
 
     if base_len_a > base_len_b {
         return -1;
@@ -121,10 +123,10 @@ pub fn compare_pattern_keys(a: &str, b: &str) -> i32 {
     if b_pattern_index.is_none() {
         return -1;
     }
-    if a.len() > b.len() {
+    if go_len(a) > go_len(b) {
         return -1;
     }
-    if b.len() > a.len() {
+    if go_len(b) > go_len(a) {
         return 1;
     }
     0

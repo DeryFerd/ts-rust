@@ -423,7 +423,7 @@ impl Checker {
         if !self.finalize_boundary(b, &bound) {
             return Node::NIL;
         }
-        nb_ctx(b).borrow_mut().approximate_length += existing.loc().end() - existing.loc().pos();
+        nb_ctx(b).borrow_mut().approximate_length += go_node_text_len(existing);
         transformed
     }
 
@@ -1490,5 +1490,26 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         let res = self.visit_node(node);
         self.ctx.non_local_node = old_non_local_node;
         res
+    }
+}
+
+/// Go `node.End() - node.Pos()`: the number of Go bytes of the node's text.
+// PORT: source text is a port form (see `scanner_util::GO_STRING_MARKER`),
+// whose offsets differ from Go byte offsets after a unit. Node positions are
+// unit boundaries, so the Go length of the text between them is the Go
+// difference.
+fn go_node_text_len(node: Node) -> i32 {
+    let loc = node.loc();
+    let port_len = loc.end() - loc.pos();
+    if loc.pos() < 0 {
+        return port_len;
+    }
+    let file = get_source_file_of_node(node);
+    if file.is_nil() {
+        return port_len;
+    }
+    match source_file_text(file).get(loc.pos() as usize..loc.end() as usize) {
+        Some(text) => go_len(text) as i32,
+        None => port_len,
     }
 }

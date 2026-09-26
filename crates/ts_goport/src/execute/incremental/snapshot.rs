@@ -55,6 +55,34 @@ pub struct BuildInfoDiagnosticWithFileName {
     pub repopulate_info: Option<RepopulateInfoRef>,
 }
 
+/// The Go byte offsets of the port text range `loc` in `file`.
+// PORT: Go keeps diagnostic positions as byte offsets of the file text, and
+// `BuildInfoDiagnosticWithFileName` holds them as Go does. The port text is
+// the port form of the Go text (see `scanner_util::GO_STRING_MARKER`), whose
+// offsets differ after a unit, so a `Diagnostic` range is converted when it
+// becomes one (`go_text_range`) and back (`port_text_range`). A nil file
+// keeps the range.
+pub fn go_text_range(file: Node, loc: TextRange) -> (i32, i32) {
+    if file.is_nil() {
+        return (loc.pos(), loc.end());
+    }
+    let text = source_file_text(file);
+    (
+        go_byte_offset(text, loc.pos()),
+        go_byte_offset(text, loc.end()),
+    )
+}
+
+/// The port text range of the Go byte offsets `pos` and `end` in `file` (see
+/// `go_text_range`).
+pub fn port_text_range(file: Node, pos: i32, end: i32) -> TextRange {
+    if file.is_nil() {
+        return TextRange::new(pos, end);
+    }
+    let text = source_file_text(file);
+    TextRange::new(port_byte_offset(text, pos), port_byte_offset(text, end))
+}
+
 // Go: incremental/snapshot.go:151 DiagnosticsOrBuildInfoDiagnosticsWithFileName
 // PORT: Go nil `diagnostics` is `None`; it marks "not converted yet".
 #[derive(Clone, Debug, Default)]
@@ -90,7 +118,7 @@ impl BuildInfoDiagnosticWithFileName {
             .collect();
         new_diagnostic_from_serialized(
             file_for_diagnostic,
-            TextRange::new(self.pos, self.end),
+            port_text_range(file_for_diagnostic, self.pos, self.end),
             self.code,
             category_from_raw(self.category),
             &self.message_key,
@@ -118,7 +146,7 @@ impl BuildInfoDiagnosticWithFileName {
             .collect();
         new_diagnostic_from_serialized(
             file,
-            TextRange::new(self.pos, self.end),
+            port_text_range(file, self.pos, self.end),
             self.code,
             category_from_raw(self.category),
             &self.message_key,
@@ -171,7 +199,7 @@ pub fn repopulate_mode_mismatch_chain(
 
     new_diagnostic_from_serialized(
         file,
-        TextRange::new(b.pos, b.end),
+        port_text_range(file, b.pos, b.end),
         details.message.code() as i32,
         details.message.category(),
         details.message.key(),
@@ -216,7 +244,7 @@ pub fn repopulate_module_not_found_chain(
 
     new_diagnostic_from_serialized(
         file,
-        TextRange::new(b.pos, b.end),
+        port_text_range(file, b.pos, b.end),
         details.message.code() as i32,
         details.message.category(),
         details.message.key(),
@@ -451,7 +479,9 @@ pub fn diagnostic_to_string_builder(
         ));
     }
     if diagnostic.file().is_some() {
-        builder.push_str(&format!("({},{}): ", diagnostic.pos(), diagnostic.len()));
+        // PORT: Go writes byte offsets (see `go_text_range`).
+        let (pos, end) = go_text_range(diagnostic.file(), diagnostic.loc());
+        builder.push_str(&format!("({},{}): ", pos, end - pos));
     }
     builder.push_str(diagnostic.category().name());
     builder.push_str(&format!("{}: ", diagnostic.code()));

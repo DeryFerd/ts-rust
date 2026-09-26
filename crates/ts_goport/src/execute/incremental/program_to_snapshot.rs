@@ -500,9 +500,11 @@ pub fn repopulate_diagnostic_message_chain(
     for c in chain {
         if let Some(repopulate_info) = c.repopulate_info() {
             // Convert to buildInfoDiagnosticWithFileName and repopulate
+            // PORT: `repopulate_diagnostic_chain` reads the Go offsets in `file`.
+            let (pos, end) = go_text_range(file, c.loc());
             let mut b = BuildInfoDiagnosticWithFileName {
-                pos: c.pos(),
-                end: c.end(),
+                pos,
+                end,
                 code: c.code(),
                 category: c.category() as i32,
                 message_key: c.message_key().to_string(),
@@ -537,9 +539,11 @@ pub fn repopulate_diagnostic_message_chain(
 // Go: incremental/programtosnapshot.go:382 astDiagToBuildInfoDiag
 #[must_use]
 pub fn ast_diag_to_build_info_diag(d: &Diagnostic) -> BuildInfoDiagnosticWithFileName {
+    // PORT: Go byte offsets (see `go_text_range`).
+    let (pos, end) = go_text_range(d.file(), d.loc());
     let mut b = BuildInfoDiagnosticWithFileName {
-        pos: d.pos(),
-        end: d.end(),
+        pos,
+        end,
         code: d.code(),
         category: d.category() as i32,
         message_key: d.message_key().to_string(),

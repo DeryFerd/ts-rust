@@ -694,7 +694,7 @@ impl Checker {
         }
         let property_name = self.get_property_name_node_for_symbol(b, property_symbol);
         nb_ctx_mut(b, |c| c.enclosing_declaration = save_enclosing_declaration);
-        let name_length = symbol_name(&self.symbols, property_symbol).len() as i32;
+        let name_length = go_len(&symbol_name(&self.symbols, property_symbol)) as i32;
         nb_ctx_mut(b, |c| c.approximate_length += name_length + 1);
 
         let e = nb_e(b);

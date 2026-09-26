@@ -116,14 +116,25 @@ impl Pattern {
     }
 
     // Go: core/pattern.go:22 Matches
+    // PORT: Go compares bytes. `text` and `candidate` are port forms, so
+    // this compares their Go bytes (see `scanner_util::GO_STRING_MARKER`).
+    // `star_index` is the port offset of the star.
     pub fn matches(&self, candidate: &str) -> bool {
         if self.star_index == -1 {
             return self.text == candidate;
         }
         let star = self.star_index as usize;
-        candidate.len() + 1 >= self.text.len()
-            && candidate.starts_with(&self.text[..star])
-            && candidate.ends_with(&self.text[star + 1..])
+        go_len(candidate) + 1 >= go_len(&self.text)
+            && go_has_prefix(candidate, &self.text[..star])
+            && go_has_suffix(candidate, &self.text[star + 1..])
+    }
+
+    /// Go `StarIndex`: the Go byte offset of the star, or -1.
+    fn go_star_index(&self) -> isize {
+        if self.star_index == -1 {
+            return -1;
+        }
+        go_len(&self.text[..self.star_index as usize]) as isize
     }
 }
 
@@ -148,11 +159,12 @@ pub fn find_best_pattern_match(values: &[Pattern], candidate: &str) -> Pattern {
     let mut best_pattern = Pattern::default();
     let mut longest_match_prefix_length: isize = -1;
     for pattern in values {
-        if (pattern.star_index == -1 || pattern.star_index > longest_match_prefix_length)
+        let star_index = pattern.go_star_index();
+        if (star_index == -1 || star_index > longest_match_prefix_length)
             && pattern.matches(candidate)
         {
             best_pattern = pattern.clone();
-            longest_match_prefix_length = pattern.star_index;
+            longest_match_prefix_length = star_index;
         }
     }
     best_pattern
@@ -221,25 +233,30 @@ pub fn compare_booleans(a: bool, b: bool) -> i32 {
 }
 
 // Go: stringutil/compare.go:74 HasPrefix
+// PORT: compares the Go bytes of the port forms (see
+// `scanner_util::GO_STRING_MARKER`).
 pub fn has_prefix(s: &str, prefix: &str, case_sensitive: bool) -> bool {
+    let (s, prefix) = (go_string_bytes(s), go_string_bytes(prefix));
     if case_sensitive {
-        return s.starts_with(prefix);
+        return s.starts_with(&prefix);
     }
     if prefix.len() > s.len() {
         return false;
     }
-    s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    s[..prefix.len()].eq_ignore_ascii_case(&prefix)
 }
 
 // Go: stringutil/compare.go:84 HasSuffix
+// PORT: see `has_prefix`.
 pub fn has_suffix(s: &str, suffix: &str, case_sensitive: bool) -> bool {
+    let (s, suffix) = (go_string_bytes(s), go_string_bytes(suffix));
     if case_sensitive {
-        return s.ends_with(suffix);
+        return s.ends_with(&suffix);
     }
     if suffix.len() > s.len() {
         return false;
     }
-    s.as_bytes()[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+    s[s.len() - suffix.len()..].eq_ignore_ascii_case(&suffix)
 }
 // PORT: Go uses strings.EqualFold (Unicode simple folding). This compares
 // ASCII case only, which matches for the ASCII paths in practice.
@@ -251,7 +268,7 @@ pub fn has_prefix_and_suffix_without_overlap(
     suffix: &str,
     case_sensitive: bool,
 ) -> bool {
-    if prefix.len() + suffix.len() > s.len() {
+    if go_len(prefix) + go_len(suffix) > go_len(s) {
         return false;
     }
     has_prefix(s, prefix, case_sensitive) && has_suffix(s, suffix, case_sensitive)

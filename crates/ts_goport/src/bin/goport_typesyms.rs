@@ -22,8 +22,9 @@ use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use ts_goport::baseline::type_symbol::{TestFile, generate_baseline, new_type_writer_walker};
-use ts_goport::frontend::vfs::raw_file_bytes;
+use ts_goport::frontend::vfs::os_path;
 use ts_goport::prelude::*;
+use ts_goport::scanner_util::go_string_bytes;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
 
@@ -37,7 +38,7 @@ const STACK_SIZE: usize = 1 << 30;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = ts_goport::frontend::vfs::os_args();
     let (mut project, mut out_dir) = (None, None);
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -186,8 +187,8 @@ fn project_dir(project: &str) -> String {
     if dir.starts_with('/') {
         return format!("/{}", clean_components(dir).join("/"));
     }
-    let cwd = std::env::current_dir().expect("current directory");
-    let joined = format!("{}/{dir}", cwd.to_string_lossy());
+    let cwd = ts_goport::frontend::vfs::os_current_dir().expect("current directory");
+    let joined = format!("{cwd}/{dir}");
     format!("/{}", clean_components(&joined).join("/"))
 }
 
@@ -234,7 +235,7 @@ fn run(project: &str, out_dir: &str) -> i32 {
         })
         .collect();
 
-    std::fs::create_dir_all(out_dir).expect("create output directory");
+    std::fs::create_dir_all(os_path(out_dir)).expect("create output directory");
     let mut walker = new_type_writer_walker(had_error_baseline);
     walker.catch_panics = true;
     for is_symbol in [false, true] {
@@ -246,11 +247,12 @@ fn run(project: &str, out_dir: &str) -> i32 {
                 &unit.header,
                 is_symbol,
             );
-            // Go writes the baseline string bytes unchanged, so write each
-            // invalid source byte sentinel as its raw byte.
+            // Go writes the baseline string bytes unchanged. `text` and the
+            // file name are the port form of Go strings, so write their Go
+            // bytes.
             std::fs::write(
-                format!("{out_dir}/{}{ext}", unit.name),
-                raw_file_bytes(&text),
+                os_path(&format!("{out_dir}/{}{ext}", unit.name)),
+                go_string_bytes(&text),
             )
             .expect("write baseline");
         }
@@ -264,7 +266,11 @@ fn run(project: &str, out_dir: &str) -> i32 {
     list.push_str("hadErrorBaseline ");
     list.push_str(if had_error_baseline { "true" } else { "false" });
     list.push('\n');
-    std::fs::write(format!("{out_dir}/files.txt"), list).expect("write files.txt");
+    std::fs::write(
+        os_path(&format!("{out_dir}/files.txt")),
+        go_string_bytes(&list),
+    )
+    .expect("write files.txt");
 
     let unported = unported_report();
     let mut stderr = std::io::stderr().lock();

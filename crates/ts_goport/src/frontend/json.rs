@@ -52,10 +52,17 @@ pub enum JsonOption {
 }
 
 /// Resolved decoder and encoder flags.
+// PORT: `port_form` is not a Go option. A decoded string is a Go string, so
+// the decoder writes it in the port form (see
+// `scanner_util::GO_STRING_MARKER`): each real U+FDD0 becomes two. With
+// `port_form`, the JSON text already holds port form strings (the port's
+// own build worker protocol, `append_json_quote_port_form`), and each char
+// is kept.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct JsonOptions {
     pub allow_duplicate_names: bool,
     pub allow_invalid_utf8: bool,
+    pub port_form: bool,
 }
 
 impl JsonOptions {
@@ -397,7 +404,16 @@ impl<'a> JsonDecoder<'a> {
 
     // Go `jsonwire.ConsumeString` plus unquoting. Returns the end offset and
     // the unquoted text.
+    // PORT: the text is in the port form (see `JsonOptions::port_form`).
     fn consume_string(&self, p: usize) -> Result<(usize, String), JsonError> {
+        let (end, out) = self.consume_string_chars(p)?;
+        if self.options.port_form {
+            return Ok((end, out));
+        }
+        Ok((end, crate::scanner_util::go_string_from_utf8(out)))
+    }
+
+    fn consume_string_chars(&self, p: usize) -> Result<(usize, String), JsonError> {
         let b = self.buf;
         let mut out = String::new();
         let mut i = p + 1;
@@ -681,29 +697,78 @@ impl<V: UnmarshalerFrom + Default + Clone> UnmarshalerFrom for FxHashMap<String,
 // Go v2 string marshaler: escapes `"`, `\` and control characters only.
 impl MarshalerTo for str {
     fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        enc.push('"');
-        for c in self.chars() {
-            match c {
-                '"' => enc.push_str("\\\""),
-                '\\' => enc.push_str("\\\\"),
-                '\u{8}' => enc.push_str("\\b"),
-                '\u{C}' => enc.push_str("\\f"),
-                '\n' => enc.push_str("\\n"),
-                '\r' => enc.push_str("\\r"),
-                '\t' => enc.push_str("\\t"),
-                c if (c as u32) < 0x20 => {
-                    let b = c as usize;
-                    enc.push_str("\\u00");
-                    enc.push(char::from(HEX[b >> 4]));
-                    enc.push(char::from(HEX[b & 0xF]));
-                }
-                c => enc.push(c),
-            }
-        }
-        enc.push('"');
+        append_json_quote(enc, self);
         Ok(())
     }
+}
+
+/// Go jsonwire `AppendQuote` with the flags of `internal/json` Marshal: it
+/// escapes `"`, `\` and control characters only.
+// PORT: `s` is the port form of a Go string (see
+// `scanner_util::GO_STRING_MARKER`). Go writes U+FFFD for each byte that is
+// not valid UTF-8: one for an invalid byte unit and three for a lone
+// surrogate unit. Other units keep their port form.
+pub fn append_json_quote(enc: &mut String, s: &str) {
+    append_json_quote_with(enc, s, true);
+}
+
+/// `append_json_quote` that keeps every unit of the port form. The port's
+/// own worker protocol uses it to pass Go strings between processes, and
+/// `json_new_port_form_decoder` reads them back.
+pub fn append_json_quote_port_form(enc: &mut String, s: &str) {
+    append_json_quote_with(enc, s, false);
+}
+
+/// A JSON array of `append_json_quote_port_form` strings.
+pub fn append_json_quote_port_form_list(enc: &mut String, list: &[impl AsRef<str>]) {
+    enc.push('[');
+    for (i, s) in list.iter().enumerate() {
+        if i > 0 {
+            enc.push(',');
+        }
+        append_json_quote_port_form(enc, s.as_ref());
+    }
+    enc.push(']');
+}
+
+fn append_json_quote_with(enc: &mut String, s: &str, replace_invalid: bool) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    enc.push('"');
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => enc.push_str("\\\""),
+            '\\' => enc.push_str("\\\\"),
+            '\u{8}' => enc.push_str("\\b"),
+            '\u{C}' => enc.push_str("\\f"),
+            '\n' => enc.push_str("\\n"),
+            '\r' => enc.push_str("\\r"),
+            '\t' => enc.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let b = c as usize;
+                enc.push_str("\\u00");
+                enc.push(char::from(HEX[b >> 4]));
+                enc.push(char::from(HEX[b & 0xF]));
+            }
+            GO_STRING_MARKER => {
+                let (unit, size) = go_unit_at(s, i);
+                if size > c.len_utf8() {
+                    // Skip the second char of the unit.
+                    chars.next();
+                }
+                match unit {
+                    GoUnit::InvalidByte(_) | GoUnit::Surrogate(_) if replace_invalid => {
+                        for _ in 0..unit.go_len() {
+                            enc.push(char::REPLACEMENT_CHARACTER);
+                        }
+                    }
+                    _ => enc.push_str(&s[i..i + size]),
+                }
+            }
+            c => enc.push(c),
+        }
+    }
+    enc.push('"');
 }
 
 impl MarshalerTo for String {
@@ -770,8 +835,9 @@ const ALLOW_INVALID: &[JsonOption] = &[JsonOption::AllowInvalidUtf8(true)];
 
 // Go: json/json.go:14 Marshal
 // PORT: named `json_marshal` so the glob export stays unambiguous. Go returns
-// bytes; the output here is always UTF-8 text. Rust strings are always valid
-// UTF-8, so `AllowInvalidUTF8` has no effect on output.
+// bytes; the output here is always UTF-8 text. With `AllowInvalidUTF8`, Go
+// writes U+FFFD for each invalid byte of a string, which the string
+// marshaler does for the port form (`append_json_quote`).
 pub fn json_marshal<T: MarshalerTo + ?Sized>(
     input: &T,
     opts: &[JsonOption],
@@ -1100,6 +1166,19 @@ pub fn json_allow_duplicate_names(allow: bool) -> JsonOption {
 #[must_use]
 pub fn json_new_decoder(r: &[u8]) -> JsonDecoder<'_> {
     JsonDecoder::new(r, JsonOptions::default())
+}
+
+/// A decoder for the port's own protocol text, whose strings are already
+/// in the port form (see `JsonOptions::port_form`).
+#[must_use]
+pub fn json_new_port_form_decoder(r: &[u8]) -> JsonDecoder<'_> {
+    JsonDecoder::new(
+        r,
+        JsonOptions {
+            port_form: true,
+            ..JsonOptions::default()
+        },
+    )
 }
 
 // Go: json/json.go:85 type aliases (Value, Kind, UnmarshalerFrom,

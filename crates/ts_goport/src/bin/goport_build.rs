@@ -46,7 +46,7 @@ const STACK_SIZE: usize = 1 << 30;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = ts_goport::frontend::vfs::os_args();
     install_panic_hook();
     let work = std::thread::Builder::new()
         .name("goport_build".to_string())

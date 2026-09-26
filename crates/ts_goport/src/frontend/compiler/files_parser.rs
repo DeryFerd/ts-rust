@@ -864,7 +864,8 @@ impl FilesParser {
             .keys()
             .cloned()
             .collect();
-        keys.sort();
+        // PORT: Go sorts by the bytes of the paths (see `compare_go_bytes`).
+        keys.sort_by(|a, b| compare_go_bytes(a.as_str(), b.as_str()));
         for key in keys {
             let value = loader
                 .path_for_lib_file_resolutions

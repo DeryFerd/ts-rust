@@ -43,7 +43,8 @@ impl BuildInfoReader for BuildInfoReaderImpl {
 #[must_use]
 pub fn parse_build_info(data: &str) -> Option<BuildInfo> {
     let mut build_info = BuildInfo::default();
-    if json_unmarshal(data.as_bytes(), &mut build_info, &[]).is_err() {
+    // `data` is the port form of the Go text; Go parses its bytes.
+    if json_unmarshal(&go_string_bytes(data), &mut build_info, &[]).is_err() {
         return None;
     }
     Some(build_info)

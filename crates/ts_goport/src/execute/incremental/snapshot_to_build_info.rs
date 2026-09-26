@@ -214,11 +214,13 @@ impl ToBuildInfo<'_> {
                 } else if source_file_info(d.file()).path != file_path.as_str() {
                     file = self.to_file_id(&Path(source_file_info(d.file()).path.clone()));
                 }
+                // PORT: Go byte offsets (see `go_text_range`).
+                let (pos, end) = go_text_range(d.file(), d.loc());
                 BuildInfoDiagnostic {
                     file,
                     no_file,
-                    pos: d.loc().pos(),
-                    end: d.loc().end(),
+                    pos,
+                    end,
                     code: d.code(),
                     category: d.category() as i32,
                     message_key: d.message_key().to_string(),
@@ -441,7 +443,8 @@ impl ToBuildInfo<'_> {
     fn set_referenced_map(&mut self) {
         let snapshot = self.snapshot;
         let mut keys = snapshot.referenced_map.get_paths_with_references();
-        keys.sort();
+        // PORT: Go sorts by the bytes of the paths (see `compare_go_bytes`).
+        keys.sort_by(|a, b| compare_go_bytes(a.as_str(), b.as_str()));
         let entries: Vec<BuildInfoReferenceMapEntry> = keys
             .iter()
             .map(|file_path| {
@@ -461,7 +464,7 @@ impl ToBuildInfo<'_> {
     // Go: incremental/snapshottobuildinfo.go:309 setChangeFileSet
     fn set_change_file_set(&mut self) {
         let mut files: Vec<Path> = self.snapshot.changed_files_set.iter().cloned().collect();
-        files.sort();
+        files.sort_by(|a, b| compare_go_bytes(a.as_str(), b.as_str()));
         let ids: Vec<BuildInfoFileId> = files.iter().map(|file| self.to_file_id(file)).collect();
         self.build_info.change_file_set = non_empty(ids);
     }
@@ -506,7 +509,7 @@ impl ToBuildInfo<'_> {
     fn set_emit_diagnostics(&mut self) {
         let snapshot = self.snapshot;
         let mut files: Vec<Path> = snapshot.emit_diagnostics_per_file.keys().cloned().collect();
-        files.sort();
+        files.sort_by(|a, b| compare_go_bytes(a.as_str(), b.as_str()));
         let mut entries = Vec::with_capacity(files.len());
         for file_path in &files {
             let value = &snapshot.emit_diagnostics_per_file[file_path];
@@ -525,7 +528,7 @@ impl ToBuildInfo<'_> {
             .keys()
             .cloned()
             .collect();
-        files.sort();
+        files.sort_by(|a, b| compare_go_bytes(a.as_str(), b.as_str()));
         let full_emit_kind = get_file_emit_kind(snapshot.options);
         for file_path in &files {
             let file = get_source_file_by_path(file_path);

@@ -49,26 +49,11 @@ impl OptionsSyntax {
 
 /// Go `json.Marshal` (internal/json) of a `string`.
 // PORT: U17 owns internal/json, which has no string entry point. This is the
-// go-json-experiment `jsonwire.AppendQuote` with the default Marshal flags:
-// no HTML escaping, no JS escaping of U+2028/U+2029. A Rust `&str` is always
-// valid UTF-8, so the invalid UTF-8 branch cannot happen.
+// go-json-experiment `jsonwire.AppendQuote` with the default Marshal flags
+// (`append_json_quote`).
 fn marshal_json_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
+    append_json_quote(&mut out, value);
     out
 }
 

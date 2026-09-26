@@ -662,7 +662,7 @@ impl Binder {
     // Go: binder/binder.go:306 getDeclarationName
     // PORT: returns the interned name, so a declaration interns its text once
     // and allocates nothing for an identifier name. `&mut self` only to note
-    // a private identifier name in the arena (`note_id_in_name`).
+    // a private identifier name in the arena (`note_private_name`).
     pub fn get_declaration_name(&mut self, node: Node) -> Name {
         if is_export_assignment(node) {
             return if node.is_export_equals() {
@@ -687,12 +687,13 @@ impl Binder {
                     // we can get here in cases where there is already a parse error.
                     return Name::from(INTERNAL_SYMBOL_NAME_MISSING);
                 }
-                self.symbols.note_id_in_name();
-                return Name::from(get_symbol_name_for_private_identifier(
+                let private_name = Name::from(get_symbol_name_for_private_identifier(
                     &self.symbols,
                     self.node_symbol(containing_class),
                     name.text(),
                 ));
+                self.symbols.note_private_name(&private_name);
+                return private_name;
             }
             if is_property_name_literal(name) || is_jsx_namespaced_name(name) {
                 return Name::from(name.text());

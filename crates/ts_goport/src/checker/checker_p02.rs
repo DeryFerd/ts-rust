@@ -1409,11 +1409,11 @@ impl Checker {
         meaning: SymbolFlags,
     ) -> String {
         let candidate_name = symbol_name(&self.symbols, candidate);
-        // PORT: Go compares the first byte with '\xFE'; the Rust internal
-        // symbol name prefix is INTERNAL_SYMBOL_NAME_PREFIX_CHAR.
+        // PORT: Go compares the first byte with '\xFE', which is
+        // INTERNAL_SYMBOL_NAME_PREFIX in the port form.
         if candidate_name.is_empty()
             || candidate_name.starts_with('"')
-            || candidate_name.starts_with(INTERNAL_SYMBOL_NAME_PREFIX_CHAR)
+            || candidate_name.starts_with(INTERNAL_SYMBOL_NAME_PREFIX)
         {
             return String::new();
         }

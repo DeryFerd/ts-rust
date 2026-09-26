@@ -68,7 +68,7 @@ impl Checker {
         symbol: SymbolId,
     ) -> Node {
         let name = symbol_name(&self.symbols, symbol);
-        hv_ctx(b).borrow_mut().approximate_length += 9 + name.len() as i32;
+        hv_ctx(b).borrow_mut().approximate_length += 9 + go_len(&name) as i32;
         let symbol_type = self.get_type_of_symbol(symbol);
         let member_props: Vec<SymbolId> = self
             .get_properties_of_type(symbol_type)
@@ -112,7 +112,7 @@ impl Checker {
             let bb = b.borrow();
             {
                 let mut c = bb.ctx.borrow_mut();
-                c.approximate_length += 4 + p_name.len() as i32;
+                c.approximate_length += 4 + go_len(&p_name) as i32;
                 if initializer.is_some() {
                     c.approximate_length += 5; // " = " + value estimate
                 }
@@ -175,7 +175,7 @@ impl Checker {
         symbol: SymbolId,
     ) -> Node {
         let name = symbol_name(&self.symbols, symbol);
-        hv_ctx(b).borrow_mut().approximate_length += 9 + name.len() as i32;
+        hv_ctx(b).borrow_mut().approximate_length += 9 + go_len(&name) as i32;
 
         let class_like_declarations: Vec<Node> = self
             .sym(symbol)
@@ -344,7 +344,7 @@ impl Checker {
         symbol: SymbolId,
     ) -> Node {
         let name = symbol_name(&self.symbols, symbol);
-        hv_ctx(b).borrow_mut().approximate_length += 14 + name.len() as i32;
+        hv_ctx(b).borrow_mut().approximate_length += 14 + go_len(&name) as i32;
 
         let interface_type = self.get_declared_type_of_class_or_interface(symbol);
         let interface_declarations: Vec<Node> = self
@@ -634,7 +634,7 @@ impl Checker {
         } else {
             let symbol_type = self.get_type_of_symbol(resolved);
             let t = self.get_widened_type(symbol_type);
-            hv_ctx(b).borrow_mut().approximate_length += name.len() as i32 + 5;
+            hv_ctx(b).borrow_mut().approximate_length += go_len(&name) as i32 + 5;
             let type_node = self.serialize_type_for_declaration(b, Node::NIL, t, resolved, true);
             let bb = b.borrow();
             let declaration = bb.f().new_variable_declaration(
@@ -731,7 +731,8 @@ impl Checker {
                         let target_type = self.get_type_of_symbol(target);
                         let local_type = self.get_widened_type(target_type);
                         let target_name = self.sym(target).name.clone();
-                        hv_ctx(b).borrow_mut().approximate_length += target_name.len() as i32 + 5;
+                        hv_ctx(b).borrow_mut().approximate_length +=
+                            go_len(&target_name) as i32 + 5;
                         let type_node = self.serialize_type_for_declaration(
                             b,
                             Node::NIL,
@@ -760,7 +761,7 @@ impl Checker {
                     }
                     let target_name = self.sym(target).name.clone();
                     let bb = b.borrow();
-                    bb.ctx.borrow_mut().approximate_length += 16 + m_name.len() as i32;
+                    bb.ctx.borrow_mut().approximate_length += 16 + go_len(&m_name) as i32;
                     let mut property_name = Node::NIL;
                     if m_name != target_name {
                         property_name = bb.f().new_identifier(target_name);
@@ -916,7 +917,7 @@ impl Checker {
             c.flags = saved_flags;
             c.internal_flags = saved_internal_flags;
             c.depth = saved_depth;
-            c.approximate_length += 8 + name.len() as i32;
+            c.approximate_length += 8 + go_len(&name) as i32;
         }
         let bb = b.borrow();
         bb.f().new_type_alias_declaration(
