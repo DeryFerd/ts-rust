@@ -190,8 +190,11 @@ fn evaluate_expression(
                 if right_is_num {
                     right_str = right_num.to_string();
                 }
+                // PORT: Go joins the bytes; `go_value_owned` gives the port
+                // form of the joined Go string (see
+                // `scanner_util::GO_STRING_MARKER`).
                 return new_result(
-                    Some(LiteralValue::String(left_str + &right_str)),
+                    Some(LiteralValue::String(go_value_owned(left_str + &right_str))),
                     is_syntactically_string,
                     resolved_other_files,
                     has_external_references,
@@ -256,8 +259,9 @@ fn evaluate_template_expression(
         resolved_other_files = resolved_other_files || span_result.resolved_other_files;
         has_external_references = has_external_references || span_result.has_external_references;
     }
+    // PORT: see the `+` case in `evaluate`.
     new_result(
-        Some(LiteralValue::String(sb)),
+        Some(LiteralValue::String(go_value_owned(sb))),
         true,
         resolved_other_files,
         has_external_references,

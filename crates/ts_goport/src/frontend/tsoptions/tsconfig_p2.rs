@@ -580,36 +580,19 @@ fn spec_list_value(specs: &Option<Vec<CompilerOptionsValue>>) -> CompilerOptions
 /// `"`, `\` and control characters are escaped.
 // PORT: only the value kinds that JSON conversion makes are handled.
 fn stringify_json(value: &CompilerOptionsValue, out: &mut String) {
-    fn string(s: &str, out: &mut String) {
-        out.push('"');
-        for c in s.chars() {
-            match c {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                '\u{8}' => out.push_str("\\b"),
-                '\t' => out.push_str("\\t"),
-                '\n' => out.push_str("\\n"),
-                '\u{c}' => out.push_str("\\f"),
-                '\r' => out.push_str("\\r"),
-                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-                c => out.push(c),
-            }
-        }
-        out.push('"');
-    }
     match value {
         CompilerOptionsValue::Nil => out.push_str("[]"),
         CompilerOptionsValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         CompilerOptionsValue::Int(i) => out.push_str(&i.to_string()),
         CompilerOptionsValue::Number(n) => out.push_str(&ts_jsnum::Number(*n).to_string()),
-        CompilerOptionsValue::String(s) => string(s, out),
+        CompilerOptionsValue::String(s) => append_json_quote(out, s),
         CompilerOptionsValue::StringList(list) => {
             out.push('[');
             for (i, s) in list.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
-                string(s, out);
+                append_json_quote(out, s);
             }
             out.push(']');
         }
@@ -633,7 +616,7 @@ fn stringify_json(value: &CompilerOptionsValue, out: &mut String) {
                 if i > 0 {
                     out.push(',');
                 }
-                string(k, out);
+                append_json_quote(out, k);
                 out.push(':');
                 if v.is_nil() {
                     out.push_str("null");

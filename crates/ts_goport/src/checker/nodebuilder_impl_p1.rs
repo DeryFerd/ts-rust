@@ -363,19 +363,39 @@ impl Checker {
     // isExpandableType reports whether t has a named representation that could be inlined
     // as its structural form during hover expansion. Filters out lib types.
     // When isAlias is true, checks whether t's alias symbol is from user code (not lib).
-    // PORT: both Go branches first call a lib check that is not ported. The
-    // rest of Go (enum-like, reference, class/interface and anonymous
-    // class/enum/module/function/method checks) is ported when those land.
     pub fn is_expandable_type(
         &mut self,
         _b: &Rc<RefCell<NodeBuilderImpl>>,
-        _t: TypeId,
+        t: TypeId,
         is_alias: bool,
     ) -> bool {
         if is_alias {
-            unported!("IsLibSymbolForHoverVerbosity")
+            return !self.is_lib_symbol_for_hover_verbosity(self.ty(t).alias.symbol());
         }
-        unported!("IsLibTypeForHoverVerbosity")
+        if self.is_lib_type_for_hover_verbosity(t) {
+            return false;
+        }
+        let ty = self.ty(t);
+        let object_flags = ty.object_flags;
+        if ty.flags.intersects(TypeFlags::ENUM_LIKE)
+            || object_flags.intersects(ObjectFlags::REFERENCE)
+            || object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE)
+        {
+            return true;
+        }
+        if object_flags.intersects(ObjectFlags::ANONYMOUS)
+            && ty.symbol.is_some()
+            && self.sym(ty.symbol).flags.intersects(
+                SymbolFlags::CLASS
+                    | SymbolFlags::ENUM
+                    | SymbolFlags::VALUE_MODULE
+                    | SymbolFlags::FUNCTION
+                    | SymbolFlags::METHOD,
+            )
+        {
+            return true;
+        }
+        false
     }
 
     // Go: checker/nodebuilderimpl.go:191 isTypeOnStack
@@ -1128,7 +1148,7 @@ impl Checker {
             }
 
             let lit = f.new_literal_type_node(self.nb_new_string_literal(b, &specifier));
-            p1_add_length(b, specifier.len() + 10); // specifier + import("")
+            p1_add_length(b, go_len(&specifier) + 10); // specifier + import("")
             if non_root_parts.is_nil() || is_entity_name(non_root_parts) {
                 // !!! TODO: smuggle type arguments out
                 // const lastId = isIdentifier(nonRootParts) ? nonRootParts : nonRootParts.right;
@@ -1206,7 +1226,7 @@ impl Checker {
                 c.flags = c.flags | NodeBuilderFlags::IN_INITIAL_ENTITY_NAME;
             }
             symbol_name = self.get_name_of_symbol_as_written(b, symbol);
-            p1_add_length(b, symbol_name.len() + 1);
+            p1_add_length(b, go_len(&symbol_name) + 1);
             let mut c = ctx.borrow_mut();
             c.flags = NodeBuilderFlags(c.flags.0 ^ NodeBuilderFlags::IN_INITIAL_ENTITY_NAME.0);
         } else {
@@ -1278,7 +1298,7 @@ impl Checker {
             }
             symbol_name = self.get_name_of_symbol_as_written(b, symbol);
         }
-        p1_add_length(b, symbol_name.len() + 1);
+        p1_add_length(b, go_len(&symbol_name) + 1);
 
         if !p1_flags(b).intersects(NodeBuilderFlags::FORBID_INDEXED_ACCESS_SYMBOL_REFERENCES)
             && parent.is_some()
@@ -1379,14 +1399,14 @@ impl Checker {
                 .any(|&d| has_non_global_augmentation_external_module_symbol(d))
         {
             let specifier = self.get_specifier_for_module_symbol(b, symbol, ResolutionMode::NONE);
-            p1_add_length(b, 2 + specifier.len());
+            p1_add_length(b, 2 + go_len(&specifier));
             return self.nb_new_string_literal(b, &specifier);
         }
 
         if index == 0 || can_use_property_access(&symbol_name) {
             let identifier = self.nb_new_identifier(b, &symbol_name, symbol);
             e.add_emit_flags(identifier, EmitFlags::NO_ASCII_ESCAPING);
-            p1_add_length(b, 1 + symbol_name.len());
+            p1_add_length(b, 1 + go_len(&symbol_name));
             if index > 0 {
                 let left = self.create_expression_from_symbol_chain(b, chain, index - 1);
                 let result =
@@ -1406,17 +1426,17 @@ impl Checker {
             && !self.sym(symbol).flags.intersects(SymbolFlags::ENUM_MEMBER)
         {
             let literal_text = unquote_string(&symbol_name);
-            p1_add_length(b, literal_text.len() + 2);
+            p1_add_length(b, go_len(&literal_text) + 2);
             expression =
                 self.nb_new_string_literal_ex(b, &literal_text, symbol_name.starts_with('\''));
         } else if ts_jsnum::from_string(&symbol_name).to_string() == symbol_name {
             // TODO: the follwing in strada would assert if the number is negative, but no such assertion exists here
             // Moreover, what's even guaranteeing the name *isn't* -1 here anyway? Needs double-checking.
-            p1_add_length(b, symbol_name.len());
+            p1_add_length(b, go_len(&symbol_name));
             expression = f.new_numeric_literal(symbol_name.clone(), TokenFlags::NONE);
         }
         if expression.is_nil() {
-            p1_add_length(b, symbol_name.len());
+            p1_add_length(b, go_len(&symbol_name));
             expression = self.nb_new_identifier(b, &symbol_name, symbol);
             e.add_emit_flags(expression, EmitFlags::NO_ASCII_ESCAPING);
         }

@@ -42,30 +42,31 @@ impl Symbol {
     }
 }
 
-// PORT: Go uses the byte 0xFE, which is invalid UTF-8. Rust `String` must be
-// valid UTF-8, so the port uses the noncharacter U+FFFE. It can never occur in
-// an IdentifierName. Go byte checks such as `name[0] == '\xFE'` port to
-// `name.starts_with(INTERNAL_SYMBOL_NAME_PREFIX)` (or compare the first char
-// with `INTERNAL_SYMBOL_NAME_PREFIX_CHAR`).
-pub const INTERNAL_SYMBOL_NAME_PREFIX: &str = "\u{FFFE}"; // Invalid as IdentifierName
-pub const INTERNAL_SYMBOL_NAME_PREFIX_CHAR: char = '\u{FFFE}';
+// PORT: Go uses the byte 0xFE, which is invalid UTF-8. A Rust `String` holds
+// it in the port form of Go strings (see `scanner_util::GO_STRING_MARKER`):
+// U+FDD0 + U+10F7FE, the invalid byte unit for 0xFE. Source text with the
+// byte 0xFE has the same port form, so it names the same internal symbols as
+// in Go, and a real U+FFFE char stays an ordinary char. Go byte checks such as
+// `name[0] == '\xFE'` port to `name.starts_with(INTERNAL_SYMBOL_NAME_PREFIX)`.
+pub const INTERNAL_SYMBOL_NAME_PREFIX: &str = "\u{FDD0}\u{10F7FE}"; // Invalid as IdentifierName
 
-pub const INTERNAL_SYMBOL_NAME_CALL: &str = "\u{FFFE}call"; // Call signatures
-pub const INTERNAL_SYMBOL_NAME_CONSTRUCTOR: &str = "\u{FFFE}constructor"; // Constructor implementations
-pub const INTERNAL_SYMBOL_NAME_NEW: &str = "\u{FFFE}new"; // Constructor signatures
-pub const INTERNAL_SYMBOL_NAME_INDEX: &str = "\u{FFFE}index"; // Index signatures
-pub const INTERNAL_SYMBOL_NAME_EXPORT_STAR: &str = "\u{FFFE}export"; // Module export * declarations
-pub const INTERNAL_SYMBOL_NAME_GLOBAL: &str = "\u{FFFE}global"; // Global self-reference
-pub const INTERNAL_SYMBOL_NAME_MISSING: &str = "\u{FFFE}missing"; // Indicates missing symbol
-pub const INTERNAL_SYMBOL_NAME_TYPE: &str = "\u{FFFE}type"; // Anonymous type literal symbol
-pub const INTERNAL_SYMBOL_NAME_OBJECT: &str = "\u{FFFE}object"; // Anonymous object literal declaration
-pub const INTERNAL_SYMBOL_NAME_JSX_ATTRIBUTES: &str = "\u{FFFE}jsxAttributes"; // Anonymous JSX attributes object literal declaration
-pub const INTERNAL_SYMBOL_NAME_CLASS: &str = "\u{FFFE}class"; // Unnamed class expression
-pub const INTERNAL_SYMBOL_NAME_FUNCTION: &str = "\u{FFFE}function"; // Unnamed function expression
-pub const INTERNAL_SYMBOL_NAME_COMPUTED: &str = "\u{FFFE}computed"; // Computed property name declaration with dynamic name
-pub const INTERNAL_SYMBOL_NAME_ASSIGNMENT_DECLARATION: &str = "\u{FFFE}assignment"; // Assignment declarations
-pub const INTERNAL_SYMBOL_NAME_INSTANTIATION_EXPRESSION: &str = "\u{FFFE}instantiationExpression"; // Instantiation expressions
-pub const INTERNAL_SYMBOL_NAME_IMPORT_ATTRIBUTES: &str = "\u{FFFE}importAttributes";
+pub const INTERNAL_SYMBOL_NAME_CALL: &str = "\u{FDD0}\u{10F7FE}call"; // Call signatures
+pub const INTERNAL_SYMBOL_NAME_CONSTRUCTOR: &str = "\u{FDD0}\u{10F7FE}constructor"; // Constructor implementations
+pub const INTERNAL_SYMBOL_NAME_NEW: &str = "\u{FDD0}\u{10F7FE}new"; // Constructor signatures
+pub const INTERNAL_SYMBOL_NAME_INDEX: &str = "\u{FDD0}\u{10F7FE}index"; // Index signatures
+pub const INTERNAL_SYMBOL_NAME_EXPORT_STAR: &str = "\u{FDD0}\u{10F7FE}export"; // Module export * declarations
+pub const INTERNAL_SYMBOL_NAME_GLOBAL: &str = "\u{FDD0}\u{10F7FE}global"; // Global self-reference
+pub const INTERNAL_SYMBOL_NAME_MISSING: &str = "\u{FDD0}\u{10F7FE}missing"; // Indicates missing symbol
+pub const INTERNAL_SYMBOL_NAME_TYPE: &str = "\u{FDD0}\u{10F7FE}type"; // Anonymous type literal symbol
+pub const INTERNAL_SYMBOL_NAME_OBJECT: &str = "\u{FDD0}\u{10F7FE}object"; // Anonymous object literal declaration
+pub const INTERNAL_SYMBOL_NAME_JSX_ATTRIBUTES: &str = "\u{FDD0}\u{10F7FE}jsxAttributes"; // Anonymous JSX attributes object literal declaration
+pub const INTERNAL_SYMBOL_NAME_CLASS: &str = "\u{FDD0}\u{10F7FE}class"; // Unnamed class expression
+pub const INTERNAL_SYMBOL_NAME_FUNCTION: &str = "\u{FDD0}\u{10F7FE}function"; // Unnamed function expression
+pub const INTERNAL_SYMBOL_NAME_COMPUTED: &str = "\u{FDD0}\u{10F7FE}computed"; // Computed property name declaration with dynamic name
+pub const INTERNAL_SYMBOL_NAME_ASSIGNMENT_DECLARATION: &str = "\u{FDD0}\u{10F7FE}assignment"; // Assignment declarations
+pub const INTERNAL_SYMBOL_NAME_INSTANTIATION_EXPRESSION: &str =
+    "\u{FDD0}\u{10F7FE}instantiationExpression"; // Instantiation expressions
+pub const INTERNAL_SYMBOL_NAME_IMPORT_ATTRIBUTES: &str = "\u{FDD0}\u{10F7FE}importAttributes";
 pub const INTERNAL_SYMBOL_NAME_EXPORT_EQUALS: &str = "export="; // Export assignment symbol
 pub const INTERNAL_SYMBOL_NAME_DEFAULT: &str = "default"; // Default export symbol (technically not wholly internal, but included here for usability)
 pub const INTERNAL_SYMBOL_NAME_THIS: &str = "this";
@@ -85,9 +86,26 @@ pub fn symbol_name(symbols: &SymbolArena, symbol: SymbolId) -> String {
 
 // Go: ast/symbol.go:80 EscapeAllInternalSymbolNames
 // EscapeAllInternalSymbolNames replaces internal symbol name markers ("\xFE") with "__".
+// PORT: each byte 0xFE is the unit INTERNAL_SYMBOL_NAME_PREFIX in the port
+// form. A plain text search could also match a U+FDD0 unit (U+FDD0 twice)
+// followed by a real U+10F7FE char, so this reads the units.
 #[must_use]
 pub fn escape_all_internal_symbol_names(name: &str) -> String {
-    name.replace(INTERNAL_SYMBOL_NAME_PREFIX, "__")
+    if !contains_go_string_marker(name) {
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(name.len());
+    let mut i = 0usize;
+    while i < name.len() {
+        let (unit, size) = go_unit_at(name, i);
+        if unit == GoUnit::InvalidByte(0xFE) {
+            out.push_str("__");
+        } else {
+            out.push_str(&name[i..i + size]);
+        }
+        i += size;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -274,21 +292,36 @@ impl Diagnostic {
     // exist, so the locale parameter is dropped.
     #[must_use]
     pub fn localize(&self) -> String {
-        localize_message(self.message, &self.message_args)
+        format_message(self.message, &self.message_args)
     }
 
     // Go: ast/diagnostic.go:106 String
     // For debugging only.
     #[must_use]
     pub fn string(&self) -> String {
-        localize_message(self.message, &self.message_args)
+        format_message(self.message, &self.message_args)
     }
 }
 
-// PORT: shared body of Go `diagnostics.Localize` with the default locale and
-// `diagnostics.Format`: Go replaces invalid UTF-8 in args (Rust strings are
-// always valid) and panics on a bad placeholder.
-fn localize_message(message: &'static ts_diagnostics::Message, args: &[String]) -> String {
+// Go: diagnostics/diagnostics.go:117 Format
+// PORT: also Go `diagnostics.Localize` with the default locale; the port has
+// only the English messages. `Message::format` replaces the placeholders,
+// and Go panics on a bad placeholder.
+pub fn format_message(message: &'static ts_diagnostics::Message, args: &[String]) -> String {
+    // Replace invalid UTF-8 with Unicode replacement character
+    // PORT: each arg is the port form of a Go string (see
+    // `scanner_util::GO_STRING_MARKER`), so only an arg with a marker can
+    // hold invalid bytes.
+    let valid: Vec<String>;
+    let args = if args.iter().any(|arg| contains_go_string_marker(arg)) {
+        valid = args
+            .iter()
+            .map(|arg| go_to_valid_utf8(arg).into_owned())
+            .collect();
+        &valid[..]
+    } else {
+        args
+    };
     match message.format(args) {
         Ok(text) => text,
         Err(_) => panic!("Invalid formatting placeholder"),
@@ -568,7 +601,10 @@ fn compare_message_chain_size(c1: &[Diagnostic], c2: &[Diagnostic]) -> i32 {
 // Go: ast/diagnostic.go:299 compareMessageChainContent
 fn compare_message_chain_content(c1: &[Diagnostic], c2: &[Diagnostic]) -> i32 {
     for i in 0..c1.len() {
-        let mut c = ordering_to_int(c1[i].message_args().cmp(c2[i].message_args()));
+        let mut c = ordering_to_int(compare_go_bytes_slices(
+            c1[i].message_args(),
+            c2[i].message_args(),
+        ));
         if c != 0 {
             return c;
         }
@@ -605,7 +641,12 @@ pub fn compare_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> i32 {
     if std::ptr::eq(d1, d2) {
         return 0;
     }
-    let mut c = ordering_to_int(get_diagnostic_path(d1).cmp(get_diagnostic_path(d2)));
+    // PORT: Go compares the bytes of the strings, which are port forms here
+    // (see `scanner_util::compare_go_bytes`).
+    let mut c = ordering_to_int(compare_go_bytes(
+        get_diagnostic_path(d1),
+        get_diagnostic_path(d2),
+    ));
     if c != 0 {
         return c;
     }
@@ -621,7 +662,10 @@ pub fn compare_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> i32 {
     if c != 0 {
         return c;
     }
-    c = ordering_to_int(d1.message_args().cmp(d2.message_args()));
+    c = ordering_to_int(compare_go_bytes_slices(
+        d1.message_args(),
+        d2.message_args(),
+    ));
     if c != 0 {
         return c;
     }

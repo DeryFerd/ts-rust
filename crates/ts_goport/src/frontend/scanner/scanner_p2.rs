@@ -9,11 +9,7 @@
 //! through `set_token_value` (interned `&'static str`, see scanner_p1.rs).
 
 use crate::frontend::prelude::*;
-
-use crate::scanner_util::{LONE_SURROGATE_MARKER, contains_lone_surrogate_marker};
-
-/// First UTF-8 byte of `LONE_SURROGATE_MARKER` (U+FDD0 is EF B7 90).
-const LONE_SURROGATE_MARKER_LEAD: i32 = 0xEF;
+use std::borrow::Cow;
 
 use super::scanner_p1::{
     EscapeSequenceScanningFlags, RUNE_SELF, Scanner, intern_token_value, rune_to_char,
@@ -551,10 +547,12 @@ impl Scanner {
 
     // Go: scanner/scanner.go:1598 scanString
     // PORT: returns the token value. A plain string is a slice of the source
-    // text (see `text_token_value`), so it needs no copy or intern. A real
-    // U+FDD0 in the source is written twice in the value (see
-    // `scanner_util::LONE_SURROGATE_MARKER`), so a string that holds it takes
-    // the slow path.
+    // text (see `text_token_value`), so it needs no copy or intern. The
+    // source text is in the port form (see `scanner_util::GO_STRING_MARKER`),
+    // and the value is in the value form (`string_token_value`,
+    // `scanner_util::go_value`): Go joins the bytes of the parts around an
+    // escape, so the invalid bytes before and after a line continuation can
+    // form one char.
     pub(crate) fn scan_string(&mut self, jsx_attribute_string: bool) -> &'static str {
         let quote = self.char();
         if quote == '\'' as i32 {
@@ -575,12 +573,11 @@ impl Scanner {
         if str_len > 0 {
             let from = self.scanner_state.pos as usize;
             let to = from + str_len as usize;
-            if (jsx_attribute_string
-                || memchr::memchr3(b'\\', b'\r', b'\n', &self.text.as_bytes()[from..to]).is_none())
-                && !contains_lone_surrogate_marker(&self.text[from..to])
+            if jsx_attribute_string
+                || memchr::memchr3(b'\\', b'\r', b'\n', &self.text.as_bytes()[from..to]).is_none()
             {
                 self.scanner_state.pos += str_len + 1;
-                return self.text_token_value(from, to);
+                return self.string_token_value(from, to);
             }
         }
         let mut sb = String::new();
@@ -614,30 +611,20 @@ impl Scanner {
                 self.error(diag::Unterminated_string_literal);
                 break;
             }
-            if ch == LONE_SURROGATE_MARKER_LEAD && self.at_lone_surrogate_marker() {
-                self.push_escaped_marker(&mut sb, &mut start);
-                continue;
-            }
             self.scanner_state.pos += 1;
         }
-        intern_token_value(&sb)
+        intern_token_value(&go_value(&sb))
     }
 
-    /// Reports whether a real U+FDD0 starts at `pos`.
-    fn at_lone_surrogate_marker(&self) -> bool {
-        self.text.as_bytes()[self.scanner_state.pos as usize..]
-            .starts_with(LONE_SURROGATE_MARKER.encode_utf8(&mut [0; 3]).as_bytes())
-    }
-
-    /// Writes the text before `pos` and the escaped U+FDD0 at `pos` to `sb`,
-    /// then moves `pos` and `start` past it (see
-    /// `scanner_util::LONE_SURROGATE_MARKER`).
-    fn push_escaped_marker(&mut self, sb: &mut String, start: &mut i32) {
-        sb.push_str(&self.text[*start as usize..self.scanner_state.pos as usize]);
-        sb.push(LONE_SURROGATE_MARKER);
-        sb.push(LONE_SURROGATE_MARKER);
-        self.scanner_state.pos += LONE_SURROGATE_MARKER.len_utf8() as i32;
-        *start = self.scanner_state.pos;
+    /// The string value `text[from..to]`: the source slice in the value form,
+    /// with the bytes of each WTF-8 surrogate fused into one unit (see
+    /// `scanner_util::go_value`).
+    // PORT: Go uses the slice as is. It holds the same Go bytes.
+    fn string_token_value(&self, from: usize, to: usize) -> &'static str {
+        match go_value(&self.text[from..to]) {
+            Cow::Borrowed(_) => self.text_token_value(from, to),
+            Cow::Owned(value) => intern_token_value(&value),
+        }
     }
 
     // Go: scanner/scanner.go:1650 scanTemplateAndSetTokenValue
@@ -707,18 +694,14 @@ impl Scanner {
                 start = self.scanner_state.pos;
                 continue;
             }
-            if ch == LONE_SURROGATE_MARKER_LEAD && self.at_lone_surrogate_marker() {
-                self.push_escaped_marker(&mut sb, &mut start);
-                continue;
-            }
             self.scanner_state.pos += 1;
         }
         if sb.is_empty() {
             self.scanner_state.token_value =
-                self.text_token_value(start as usize, value_end as usize);
+                self.string_token_value(start as usize, value_end as usize);
         } else {
             sb.push_str(&self.text[start as usize..value_end as usize]);
-            self.set_token_value(&sb);
+            self.set_token_value(&go_value(&sb));
         }
         token
     }
@@ -727,7 +710,7 @@ impl Scanner {
     // PORT: Go returns strings that can hold a CESU-8 lone surrogate
     // (`EncodeJSStringRune`). A Rust `String` cannot; `encode_js_string_rune`
     // writes a valid-UTF-8 escape form instead (see
-    // `scanner_util::LONE_SURROGATE_MARKER`).
+    // `scanner_util::GO_STRING_MARKER`).
     pub(crate) fn scan_escape_sequence(&mut self, flags: EscapeSequenceScanningFlags) -> String {
         let start = self.scanner_state.pos;
         self.scanner_state.pos += 1;
@@ -946,8 +929,9 @@ impl Scanner {
                         Vec::new(),
                     );
                 }
-                // PORT: a real U+FDD0 is escaped in string values (see
-                // `scanner_util::LONE_SURROGATE_MARKER`).
+                // PORT: writes the port form of the rune (see
+                // `scanner_util::GO_STRING_MARKER`). An invalid source byte
+                // decodes as RuneError, and Go returns "\uFFFD" too.
                 crate::scanner_util::encode_js_string_rune(c as u32)
             }
         }

@@ -3,6 +3,7 @@
 
 use crate::prelude::*;
 
+use crate::frontend::json::append_json_quote;
 use crate::frontend::tspath::{ComparePathsOptions, get_relative_path_to_directory_or_url};
 
 /// Go `sourcemap.SourceIndex`.
@@ -73,15 +74,15 @@ impl RawSourceMap {
         out.push_str("{\"version\":");
         out.push_str(&self.version.to_string());
         out.push_str(",\"file\":");
-        append_json_string(&mut out, &self.file);
+        append_json_quote(&mut out, &self.file);
         out.push_str(",\"sourceRoot\":");
-        append_json_string(&mut out, &self.source_root);
+        append_json_quote(&mut out, &self.source_root);
         out.push_str(",\"sources\":");
         append_json_string_array(&mut out, &self.sources);
         out.push_str(",\"names\":");
         append_json_string_array(&mut out, &self.names);
         out.push_str(",\"mappings\":");
-        append_json_string(&mut out, &self.mappings);
+        append_json_quote(&mut out, &self.mappings);
         if let Some(sources_content) = &self.sources_content {
             out.push_str(",\"sourcesContent\":[");
             for (i, content) in sources_content.iter().enumerate() {
@@ -89,7 +90,7 @@ impl RawSourceMap {
                     out.push(',');
                 }
                 match content {
-                    Some(content) => append_json_string(&mut out, content),
+                    Some(content) => append_json_quote(&mut out, content),
                     None => out.push_str("null"),
                 }
             }
@@ -106,36 +107,9 @@ fn append_json_string_array(out: &mut String, values: &[String]) {
         if i > 0 {
             out.push(',');
         }
-        append_json_string(out, value);
+        append_json_quote(out, value);
     }
     out.push(']');
-}
-
-/// go-json-experiment `jsonwire.AppendQuote` with the default flags: only
-/// `"`, `\` and control characters are escaped; `<`, `>`, `&`, U+2028 and
-/// U+2029 are written as is.
-fn append_json_string(out: &mut String, s: &str) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let x = c as u32;
-                out.push_str("\\u00");
-                out.push(HEX[((x >> 4) & 0xf) as usize] as char);
-                out.push(HEX[(x & 0xf) as usize] as char);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
 }
 
 // Go: sourcemap/generator.go:65 NewGenerator
@@ -511,7 +485,9 @@ impl Generator {
         let data = self.bytes();
         let mut sb = String::with_capacity(PREFIX.len() + data.len().div_ceil(3) * 4);
         sb.push_str(PREFIX);
-        base64_std_encode(&mut sb, data.as_bytes());
+        // PORT: `data` is in the port form (see
+        // `scanner_util::GO_STRING_MARKER`); Go encodes its bytes.
+        base64_std_encode(&mut sb, &go_string_bytes(&data));
         sb
     }
 }

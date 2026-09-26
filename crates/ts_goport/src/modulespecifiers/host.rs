@@ -4,7 +4,7 @@
 
 use crate::prelude::*;
 
-use ts_vfs::FileSystem;
+use crate::frontend::vfs::osvfs_fs;
 
 use super::deps::{self, OutputPathsHost};
 use super::packagejson::{self, InfoCacheEntry, PackageJson};
@@ -41,12 +41,14 @@ fn get_package_json_info_for_directory(package_directory: &str) -> Option<Rc<Inf
         return None;
     }
 
-    let fs = ts_vfs::OsFileSystem::default();
+    // PORT: the OS file system in the port form (see
+    // `scanner_util::GO_STRING_MARKER`); Go parses the file's bytes.
+    let fs = osvfs_fs();
     let directory_exists = fs.directory_exists(package_directory);
     if directory_exists && fs.file_exists(&package_json_path) {
         // Ignore error
-        let contents = fs.read_file(&package_json_path).unwrap_or_default();
-        let parsed = packagejson::parse(&contents);
+        let (contents, _) = fs.read_file(&package_json_path);
+        let parsed = packagejson::parse(&crate::scanner_util::go_string_bytes(&contents));
         let parseable = parsed.is_ok();
         let result = Rc::new(InfoCacheEntry {
             package_directory: package_directory.to_string(),
@@ -95,7 +97,7 @@ fn resolve_package_directory(
     package_name: &str,
     containing_file: &str,
 ) -> Option<(String, String)> {
-    let fs = ts_vfs::OsFileSystem::default();
+    let fs = osvfs_fs();
     let containing_directory = tspath::get_directory_path(containing_file);
     tspath::for_each_ancestor_directory_stopping_at_global_cache(
         "",

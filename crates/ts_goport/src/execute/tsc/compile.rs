@@ -18,8 +18,37 @@ use crate::frontend::vfs::Fs;
 pub type Writer = Rc<RefCell<dyn std::io::Write>>;
 
 /// Writes `text` to `w`. Go ignores the `fmt.Fprint` error, so this does too.
+// PORT: `text` is the port form of a Go string (see
+// `scanner_util::GO_STRING_MARKER`), and a writer keeps that form. The
+// process output writes the Go bytes (`GoOutput`, `write_go_output`).
 pub fn write_str(w: &Writer, text: &str) {
     let _ = w.borrow_mut().write_all(text.as_bytes());
+}
+
+/// Writes the Go bytes of the port form output `bytes` to `out` (see
+/// `scanner_util::GO_STRING_MARKER`). Bytes that are not UTF-8 are written
+/// unchanged.
+pub fn write_go_output(out: &mut dyn std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => out.write_all(&go_string_bytes(text)),
+        Err(_) => out.write_all(bytes),
+    }
+}
+
+/// Go `os.Stdout` as the system writer: it writes the Go bytes of each port
+/// form write (see `write_go_output`). `write_str` writes whole strings, so a
+/// write never splits a unit.
+pub struct GoOutput;
+
+impl std::io::Write for GoOutput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        write_go_output(&mut std::io::stdout().lock(), buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stdout().flush()
+    }
 }
 
 // Go: execute/tsc/compile.go:17 System
@@ -139,7 +168,7 @@ pub struct OsSystem {
 // PORT: Go exits with `ExitStatusInvalidProject_OutputsSkipped` when the
 // current directory cannot be read; this returns that status instead.
 pub fn new_os_system() -> Result<OsSystem, ExitStatus> {
-    let cwd = match std::env::current_dir() {
+    let cwd = match crate::frontend::vfs::os_current_dir() {
         Ok(cwd) => cwd,
         Err(err) => {
             eprintln!("Error getting current directory: {err}");
@@ -147,10 +176,10 @@ pub fn new_os_system() -> Result<OsSystem, ExitStatus> {
         }
     };
     Ok(OsSystem {
-        cwd: crate::frontend::tspath::normalize_path(&cwd.to_string_lossy()),
+        cwd: crate::frontend::tspath::normalize_path(&cwd),
         fs: crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs()),
         default_library_path: crate::frontend::bundled::lib_path(),
-        writer: Rc::new(RefCell::new(std::io::stdout())),
+        writer: Rc::new(RefCell::new(GoOutput)),
         start: std::time::Instant::now(),
     })
 }

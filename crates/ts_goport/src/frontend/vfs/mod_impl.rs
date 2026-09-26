@@ -210,7 +210,7 @@ impl DirEntry {
     pub fn info(&self) -> Result<FileInfo, FsError> {
         match &self.info {
             DirEntryInfo::Known(info) => Ok(info.clone()),
-            DirEntryInfo::Lstat(full_path) => match std::fs::symlink_metadata(full_path) {
+            DirEntryInfo::Lstat(full_path) => match std::fs::symlink_metadata(os_path(full_path)) {
                 Ok(md) => Ok(file_info_from_metadata(basename(full_path), &md)),
                 Err(err) => Err(FsError::path("lstat", full_path, err)),
             },
@@ -458,12 +458,25 @@ impl Common {
 }
 
 // Go: internal.go:170 decodeBytes
-// PORT: takes the bytes instead of a Go string that holds them.
+// PORT: takes the bytes instead of a Go string that holds them. Go returns
+// the bytes unchanged, so a Go string can hold invalid UTF-8. A Rust String
+// cannot, so the text is the port form of the Go string
+// (`scanner_util::go_string_from_bytes`, see `scanner_util::GO_STRING_MARKER`).
 fn decode_bytes(mut s: Vec<u8>) -> (String, bool) {
     if s.len() >= 2 {
         match [s[0], s[1]] {
-            [0xFF, 0xFE] => return (decode_utf16(&s[2..], false), true),
-            [0xFE, 0xFF] => return (decode_utf16(&s[2..], true), true),
+            [0xFF, 0xFE] => {
+                return (
+                    crate::scanner_util::go_string_from_utf8(decode_utf16(&s[2..], false)),
+                    true,
+                );
+            }
+            [0xFE, 0xFF] => {
+                return (
+                    crate::scanner_util::go_string_from_utf8(decode_utf16(&s[2..], true)),
+                    true,
+                );
+            }
             _ => {}
         }
     }
@@ -471,15 +484,7 @@ fn decode_bytes(mut s: Vec<u8>) -> (String, bool) {
         s.drain(..3);
     }
 
-    // PORT: a Go string can hold invalid UTF-8 and the Go scanner decodes
-    // each invalid byte as one RuneError of width 1. A Rust String cannot
-    // hold invalid UTF-8, so invalid sequences become U+FFFD (3 bytes each).
-    // Positions after an invalid sequence differ from Go in that case.
-    let contents = match String::from_utf8(s) {
-        Ok(contents) => contents,
-        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
-    };
-    (contents, true)
+    (crate::scanner_util::go_string_from_bytes(s), true)
 }
 
 // Go: internal.go:188 decodeUtf16
@@ -569,8 +574,16 @@ fn io_fs_walk_dir_inner(
 }
 
 // Go: io/fs/fs.go ValidPath
-// PORT: Go standard library, used by the `os.DirFS` port.
+// PORT: Go standard library, used by the `os.DirFS` port. `name` is a port
+// form (see `scanner_util::GO_STRING_MARKER`); its Go bytes are valid UTF-8
+// when it has no invalid byte or lone surrogate unit.
 pub fn io_fs_valid_path(name: &str) -> bool {
+    if crate::scanner_util::contains_go_string_marker(name)
+        && std::str::from_utf8(&crate::scanner_util::go_string_bytes(name)).is_err()
+    {
+        return false;
+    }
+
     if name == "." {
         // special case
         return true;
@@ -661,4 +674,63 @@ pub fn basename(name: &str) -> &str {
         }
     }
     name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scanner_util::{GoUnit, go_string_bytes, go_unit_at};
+
+    /// The units of a port form string.
+    fn units(text: &str) -> Vec<GoUnit> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < text.len() {
+            let (unit, size) = go_unit_at(text, i);
+            out.push(unit);
+            i += size;
+        }
+        out
+    }
+
+    // Each invalid byte is one unit, as Go reads one RuneError per byte. Real
+    // U+EF80..U+EFFF, U+FDD0 and U+10F7xx chars stay chars. A file write
+    // gives the source bytes back.
+    #[test]
+    fn invalid_utf8_bytes_round_trip() {
+        let source: Vec<u8> = [
+            &b"/\x80/u \xE2\x82A \xF0\x90\x80 \xFF\xE2\x82\xAC \xED\xA0\x80 "[..],
+            "\u{EF80}\u{EFFF}\u{FDD0}\u{FDD0}\u{10F7FF}\u{10FFFF}\u{FDD0}".as_bytes(),
+        ]
+        .concat();
+        let (text, ok) = decode_bytes(source.clone());
+        assert!(ok);
+        let units = units(&text);
+        let invalid: Vec<u8> = units
+            .iter()
+            .filter_map(|unit| match unit {
+                GoUnit::InvalidByte(b) => Some(*b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            invalid,
+            [0x80, 0xE2, 0x82, 0xF0, 0x90, 0x80, 0xFF, 0xED, 0xA0, 0x80]
+        );
+        assert!(units.contains(&GoUnit::Char('\u{20AC}')));
+        assert!(units.contains(&GoUnit::Char('\u{EF80}')));
+        assert!(units.contains(&GoUnit::Char('\u{10F7FF}')));
+        assert_eq!(
+            units
+                .iter()
+                .filter(|&&unit| unit == GoUnit::Char('\u{FDD0}'))
+                .count(),
+            3
+        );
+        assert_eq!(&*go_string_bytes(&text), &source[..]);
+        assert!(matches!(
+            go_string_bytes("a\u{EF80}\u{EE00}b"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 }

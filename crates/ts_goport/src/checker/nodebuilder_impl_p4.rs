@@ -360,7 +360,8 @@ impl Checker {
                 Some(LiteralValue::String(s)) => s.clone(),
                 _ => panic!("interface conversion: literal value is not string"),
             };
-            nb_add_length(b, value.len() as i32 + 2);
+            // PORT: Go `len` counts Go bytes (see `scanner_util::go_len`).
+            nb_add_length(b, go_len(&value) as i32 + 2);
             let lit = self.nb_new_string_literal(b, &value);
             e.add_emit_flags(lit, EmitFlags::NO_ASCII_ESCAPING);
             return f.new_literal_type_node(lit);
@@ -547,7 +548,7 @@ impl Checker {
             if t_flags.intersects(TypeFlags::TYPE_PARAMETER)
                 && ctx.borrow().infer_type_parameters.contains(&t)
             {
-                nb_add_length(b, symbol_name(&self.symbols, t_symbol).len() as i32 + 6);
+                nb_add_length(b, go_len(&symbol_name(&self.symbols, t_symbol)) as i32 + 6);
                 let mut constraint_node = Node::NIL;
                 let constraint = self.get_constraint_of_type_parameter(t);
                 if constraint.is_some() {
@@ -574,7 +575,7 @@ impl Checker {
             {
                 let name = self.type_parameter_to_name(b, t);
                 let text = name.text();
-                nb_add_length(b, text.len() as i32);
+                nb_add_length(b, go_len(text) as i32);
                 let id = self.nb_new_identifier(b, text, t_symbol);
                 return f.new_type_reference_node(id, NodeList::NIL /*typeArguments*/);
             }

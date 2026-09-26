@@ -360,7 +360,12 @@ impl GlobPattern {
                     if comp.skip_package_folders && is_package_folder(path_part) {
                         panic!("unreachable: literal components never have skipPackageFolders");
                     }
-                    if !self.strings_equal(comp.literal.as_bytes(), path_part.as_bytes()) {
+                    // PORT: Go compares bytes. The names are port forms, so
+                    // this compares their Go bytes (see
+                    // `scanner_util::GO_STRING_MARKER`).
+                    if !self
+                        .strings_equal(&go_string_bytes(&comp.literal), &go_string_bytes(path_part))
+                    {
                         return false;
                     }
                 }
@@ -368,7 +373,7 @@ impl GlobPattern {
                     if comp.skip_package_folders && is_package_folder(path_part) {
                         return false;
                     }
-                    if !self.match_wildcard(&comp.segments, path_part.as_bytes()) {
+                    if !self.match_wildcard(&comp.segments, &go_string_bytes(path_part)) {
                         return false;
                     }
                 }
@@ -470,6 +475,8 @@ fn next_path_part_parts<'a>(
 impl GlobPattern {
     // Go: vfs/vfsmatch/vfsmatch.go:361 (*globPattern).matchWildcard
     /// Matches a path component against wildcard segments.
+    // PORT: `s` is the Go bytes of the component, and each literal segment
+    // is compared by its Go bytes (see `scanner_util::GO_STRING_MARKER`).
     fn match_wildcard(&self, segs: &[Segment], s: &[u8]) -> bool {
         // Include patterns: wildcards at start cannot match hidden files
         if !self.is_exclude
@@ -485,8 +492,9 @@ impl GlobPattern {
             && segs[0].kind == SegmentKind::Star
             && segs[1].kind == SegmentKind::Literal
         {
-            let suffix = segs[1].literal.as_bytes();
-            if s.len() < suffix.len() || !self.strings_equal(suffix, &s[s.len() - suffix.len()..]) {
+            let suffix = go_string_bytes(&segs[1].literal);
+            if s.len() < suffix.len() || !self.strings_equal(&suffix, &s[s.len() - suffix.len()..])
+            {
                 return false;
             }
             return self.should_include_min_js(s, segs);
@@ -509,9 +517,9 @@ impl GlobPattern {
                 let seg = &segs[seg_idx];
                 match seg.kind {
                     SegmentKind::Literal => {
-                        let lit = seg.literal.as_bytes();
+                        let lit = go_string_bytes(&seg.literal);
                         let end = s_idx + lit.len();
-                        if end <= s.len() && self.strings_equal(lit, &s[s_idx..end]) {
+                        if end <= s.len() && self.strings_equal(&lit, &s[s_idx..end]) {
                             s_idx = end;
                             seg_idx += 1;
                             continue;

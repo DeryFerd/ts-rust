@@ -80,11 +80,11 @@ fn encode_utf16_escape_sequence(b: &mut String, char_code: u32) {
 // Based heavily on the abstract 'Quote'/'QuoteJSONString' operation from ECMA-262 (24.3.2.2),
 // but augmented for a few select characters (e.g. lineSeparator, paragraphSeparator, nextLine)
 // Note that this doesn't actually wrap the input in double quotes.
-// PORT: a Rust `&str` is valid UTF-8, so the invalid-byte branch runs only
-// for U+FFFE, the port form of Go's `\xFE` prefix byte. Lone surrogates use
-// the escape unit from `encode_js_string_rune` (see
-// `scanner_util::LONE_SURROGATE_MARKER`), which `decode_js_string_rune` maps
-// back to the surrogate, so they print as `\uD800` like Go. `ch` is the
+// PORT: `s` is the port form of the Go string (see
+// `scanner_util::GO_STRING_MARKER`). `decode_go_js_string_rune` reads one
+// unit and also gives its Go size, so the invalid byte check is Go's. A lone
+// surrogate unit prints as `\uD800` like Go. Text that this worker copies
+// keeps the port form, and the file write writes its Go bytes. `ch` is the
 // `char` form of `code`. For a surrogate it is U+FFFD, which matches no `ch`
 // case, the same as the surrogate rune in Go.
 fn escape_string_worker(
@@ -97,17 +97,8 @@ fn escape_string_worker(
     let mut pos = 0usize;
     let mut i = 0usize;
     while i < s.len() {
-        let (mut code, size) = decode_js_string_rune(&s[i..]);
-        let mut size = size as usize;
-        // PORT: Go stores the internal symbol name prefix as the invalid byte
-        // `\xFE`, which decodes as `utf8.RuneError` with size 1. This port
-        // stores it as U+FFFE (INTERNAL_SYMBOL_NAME_PREFIX_CHAR), so print it
-        // as that invalid byte: U+FFFD, always escaped. A real U+FFFE in source
-        // text also prints this way (Go prints it as itself).
-        let invalid_byte = code == crate::ast::INTERNAL_SYMBOL_NAME_PREFIX_CHAR as u32;
-        if invalid_byte {
-            code = char::REPLACEMENT_CHARACTER as u32;
-        }
+        let (code, mut size, go_size) = decode_go_js_string_rune(&s[i..]);
+        let invalid_byte = code == char::REPLACEMENT_CHARACTER as u32 && go_size == 1;
         let ch = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
 
         let mut escape = false;
@@ -197,12 +188,6 @@ fn escape_string_worker(
             } else {
                 encode_utf16_escape_sequence(b, code);
             }
-            pos = i + size;
-        } else if size > ch.len_utf8() {
-            // PORT: an unescaped U+FDD0 unit is stored as two chars (see
-            // `scanner_util::LONE_SURROGATE_MARKER`). Write it once.
-            b.push_str(&s[pos..i]);
-            b.push(ch);
             pos = i + size;
         }
 
@@ -1089,20 +1074,26 @@ fn tspath_get_base_file_name(path: &str) -> String {
 }
 
 // Go: printer/utilities.go:691 makeIdentifierFromModuleName
+// PORT: Go reads the bytes of the Go string. `module_name` is a port form
+// (see `scanner_util::GO_STRING_MARKER`), so this reads its Go bytes. Each
+// byte that is not ASCII becomes '_', so the kept bytes are ASCII.
 pub(crate) fn make_identifier_from_module_name(module_name: &str) -> String {
     let module_name = tspath_get_base_file_name(module_name);
-    let bytes = module_name.as_bytes();
+    let bytes = go_string_bytes(&module_name);
+    let push_ascii = |builder: &mut String, kept: &[u8]| {
+        builder.extend(kept.iter().map(|&b| char::from(b)));
+    };
     let mut builder = String::new();
     let mut start = 0usize;
     let mut pos = 0usize;
-    while pos < module_name.len() {
+    while pos < bytes.len() {
         // PORT: Go `rune(moduleName[pos])` converts one byte.
         let ch = char::from(bytes[pos]);
         if pos == 0 && is_digit(ch) {
             builder.push('_');
         } else if !is_ascii_word_character(ch) {
             if start < pos {
-                builder.push_str(&module_name[start..pos]);
+                push_ascii(&mut builder, &bytes[start..pos]);
             }
             builder.push('_');
             start = pos + 1;
@@ -1110,10 +1101,8 @@ pub(crate) fn make_identifier_from_module_name(module_name: &str) -> String {
         pos += 1;
     }
     if start < pos {
-        builder.push_str(&module_name[start..]);
+        push_ascii(&mut builder, &bytes[start..pos]);
     }
-    // PORT: Go builds a byte string. Non-ASCII bytes are each replaced by
-    // '_', so every retained slice ends on an ASCII byte and stays valid UTF-8.
     builder
 }
 

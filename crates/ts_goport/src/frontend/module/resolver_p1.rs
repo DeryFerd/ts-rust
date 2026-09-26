@@ -1191,6 +1191,9 @@ impl ResolutionState<'_> {
         // is. Both use insertion sort (stable) for up to 12 keys.
         expanding_keys.sort_by(|a, b| compare_pattern_keys(a, b).cmp(&0));
 
+        // PORT: Go matches and slices bytes. The names are port forms, so
+        // this works on their Go bytes (see `scanner_util::GO_STRING_MARKER`).
+        let module_name_len = go_len(module_name);
         for potential_target in expanding_keys {
             if self
                 .features
@@ -1198,44 +1201,48 @@ impl ResolutionState<'_> {
                 && matches_pattern_with_trailer(potential_target, module_name)
             {
                 let target = &lookup_table[potential_target];
-                let star_pos = potential_target.find('*').unwrap();
-                let subpath = &module_name
-                    [star_pos..module_name.len() - (potential_target.len() - 1 - star_pos)];
+                let star = potential_target.find('*').unwrap();
+                let star_pos = go_len(&potential_target[..star]);
+                let subpath = go_slice(
+                    module_name,
+                    star_pos,
+                    module_name_len - (go_len(potential_target) - 1 - star_pos),
+                );
                 return self.load_module_from_target_export_or_import(
                     extensions,
                     module_name,
                     scope,
                     is_imports,
                     target,
-                    subpath,
+                    &subpath,
                     true,
                     potential_target,
                 );
             } else if potential_target.ends_with('*')
-                && module_name.starts_with(&potential_target[..potential_target.len() - 1])
+                && go_has_prefix(module_name, &potential_target[..potential_target.len() - 1])
             {
                 let target = &lookup_table[potential_target];
-                let subpath = &module_name[potential_target.len() - 1..];
+                let subpath = go_slice(module_name, go_len(potential_target) - 1, module_name_len);
                 return self.load_module_from_target_export_or_import(
                     extensions,
                     module_name,
                     scope,
                     is_imports,
                     target,
-                    subpath,
+                    &subpath,
                     true,
                     potential_target,
                 );
-            } else if module_name.starts_with(potential_target.as_str()) {
+            } else if go_has_prefix(module_name, potential_target) {
                 let target = &lookup_table[potential_target];
-                let subpath = &module_name[potential_target.len()..];
+                let subpath = go_slice(module_name, go_len(potential_target), module_name_len);
                 return self.load_module_from_target_export_or_import(
                     extensions,
                     module_name,
                     scope,
                     is_imports,
                     target,
-                    subpath,
+                    &subpath,
                     false,
                     potential_target,
                 );

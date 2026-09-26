@@ -10,13 +10,383 @@ use std::rc::Weak;
 // whole sequence.
 
 // Go: tsoptions/parsedcommandline.go:22 fileGlobPattern
-// PORT: used only by `WildcardDirectoryGlobs`, which is not ported
-// (`internal/glob` is out of scope).
-#[allow(dead_code)]
 const FILE_GLOB_PATTERN: &str = "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json}";
 // Go: tsoptions/parsedcommandline.go:23 recursiveFileGlobPattern
-#[allow(dead_code)]
 const RECURSIVE_FILE_GLOB_PATTERN: &str = "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json}";
+
+// ---------------------------------------------------------------------------
+// Go: glob/glob.go
+// PORT: `internal/glob` has one compiler caller,
+// `ParsedCommandLine.WildcardDirectoryGlobs`, so it is ported in this file.
+// Package-level names get a `glob_` prefix (like `json_marshal`) so the glob
+// export stays unambiguous. `Parse` returns the Go error text as `Err`.
+// ---------------------------------------------------------------------------
+
+// Go: glob/glob.go:41 Glob
+/// A Glob is an LSP-compliant glob pattern, as defined by the spec:
+/// https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#documentFilter
+///
+/// Glob patterns can have the following syntax:
+///   - `*` to match one or more characters in a path segment
+///   - `?` to match on one character in a path segment
+///   - `**` to match any number of path segments, including none
+///   - `{}` to group sub patterns into an OR expression. (e.g. `**/*.{ts,js}`
+///     matches all TypeScript and JavaScript files)
+///   - `[]` to declare a range of characters to match in a path segment
+///     (e.g., `example.[0-9]` to match on `example.0`, `example.1`, …)
+///   - `[!...]` to negate a range of characters to match in a path segment
+///     (e.g., `example.[!0-9]` to match on `example.a`, `example.b`, but
+///     not `example.0`)
+///
+/// Expanding on this:
+///   - '/' matches one or more literal slashes.
+///   - any other character matches itself literally.
+#[derive(Clone, Debug, Default)]
+pub struct Glob {
+    elems: Vec<GlobElement>, // pattern elements
+}
+
+// Go: glob/glob.go:181 element and :184 element types
+/// element holds a glob pattern element.
+// PORT: the Go `element` interface and its seven types are one enum.
+#[derive(Clone, Debug)]
+pub enum GlobElement {
+    /// One or more '/' separators
+    Slash,
+    /// string literal, not containing /, *, ?, {}, or []
+    Literal(String),
+    /// *
+    Star,
+    /// ?
+    AnyChar,
+    /// **
+    StarStar,
+    /// {foo, bar, ...} grouping
+    Group(Vec<Glob>),
+    /// [a-z] character range
+    CharRange { negate: bool, low: char, high: char },
+}
+
+// Go: glob/glob.go:47 Parse
+/// Parse builds a Glob for the given pattern, returning an error if the pattern
+/// is invalid.
+pub fn glob_parse(pattern: &str) -> Result<Glob, String> {
+    let (g, _) = glob_parse_nested(pattern, false)?;
+    Ok(g)
+}
+
+// Go: glob/glob.go:52 parse
+// PORT: Go indexes `pattern[0]` as a byte. Every byte it tests is ASCII, so
+// the `&str` slices below stay on character boundaries.
+fn glob_parse_nested(mut pattern: &str, nested: bool) -> Result<(Glob, &str), String> {
+    let mut g = Glob::default();
+    while !pattern.is_empty() {
+        match pattern.as_bytes()[0] {
+            b'/' => {
+                pattern = &pattern[1..];
+                g.elems.push(GlobElement::Slash);
+            }
+
+            b'*' => {
+                let bytes = pattern.as_bytes();
+                if bytes.len() > 1 && bytes[1] == b'*' {
+                    if (!g.elems.is_empty()
+                        && !matches!(g.elems[g.elems.len() - 1], GlobElement::Slash))
+                        || (bytes.len() > 2 && bytes[2] != b'/')
+                    {
+                        return Err("** may only be adjacent to '/'".to_string());
+                    }
+                    pattern = &pattern[2..];
+                    g.elems.push(GlobElement::StarStar);
+                    continue;
+                }
+                pattern = &pattern[1..];
+                g.elems.push(GlobElement::Star);
+            }
+
+            b'?' => {
+                pattern = &pattern[1..];
+                g.elems.push(GlobElement::AnyChar);
+            }
+
+            b'{' => {
+                let mut gs: Vec<Glob> = Vec::new();
+                while pattern.as_bytes()[0] != b'}' {
+                    pattern = &pattern[1..];
+                    let (group_g, pat) = glob_parse_nested(pattern, true)?;
+                    if pat.is_empty() {
+                        return Err("unmatched '{'".to_string());
+                    }
+                    pattern = pat;
+                    gs.push(group_g);
+                }
+                pattern = &pattern[1..];
+                g.elems.push(GlobElement::Group(gs));
+            }
+
+            b'}' | b',' => {
+                if nested {
+                    return Ok((g, pattern));
+                }
+                pattern = g.parse_literal(pattern, false);
+            }
+
+            b'[' => {
+                pattern = &pattern[1..];
+                if pattern.is_empty() {
+                    return Err(GLOB_ERR_BAD_RANGE.to_string());
+                }
+                let mut negate = false;
+                if pattern.as_bytes()[0] == b'!' {
+                    pattern = &pattern[1..];
+                    negate = true;
+                }
+                let (low, sz) = glob_read_range_rune(pattern)?;
+                pattern = &pattern[sz..];
+                if pattern.is_empty() || pattern.as_bytes()[0] != b'-' {
+                    return Err(GLOB_ERR_BAD_RANGE.to_string());
+                }
+                pattern = &pattern[1..];
+                let (high, sz) = glob_read_range_rune(pattern)?;
+                pattern = &pattern[sz..];
+                if pattern.is_empty() || pattern.as_bytes()[0] != b']' {
+                    return Err(GLOB_ERR_BAD_RANGE.to_string());
+                }
+                pattern = &pattern[1..];
+                g.elems.push(GlobElement::CharRange { negate, low, high });
+            }
+
+            _ => {
+                pattern = g.parse_literal(pattern, nested);
+            }
+        }
+    }
+    Ok((g, ""))
+}
+
+// Go: glob/glob.go:137 readRangeRune
+/// helper for decoding a rune in range elements, e.g. [a-z]
+// PORT: a Rust `&str` is valid UTF-8, so Go's `errInvalidUTF8` case (a
+// one-byte `RuneError`) cannot happen. An encoded U+FFFD is a valid rune in
+// both.
+fn glob_read_range_rune(input: &str) -> Result<(char, usize), String> {
+    match input.chars().next() {
+        Some(r) => Ok((r, r.len_utf8())),
+        None => Err(GLOB_ERR_BAD_RANGE.to_string()),
+    }
+}
+
+// Go: glob/glob.go:152 errBadRange
+const GLOB_ERR_BAD_RANGE: &str = "'[' patterns must be of the form [x-y]";
+
+impl Glob {
+    // Go: glob/glob.go:157 (*Glob).parseLiteral
+    fn parse_literal<'a>(&mut self, pattern: &'a str, nested: bool) -> &'a str {
+        let special_chars: &[char] = if nested {
+            &['*', '?', '{', '[', '/', '}', ',']
+        } else {
+            &['*', '?', '{', '[', '/']
+        };
+        let end = pattern.find(special_chars).unwrap_or(pattern.len());
+        self.elems
+            .push(GlobElement::Literal(pattern[..end].to_string()));
+        &pattern[end..]
+    }
+
+    // Go: glob/glob.go:215 (*Glob).Match
+    /// Match reports whether the input string matches the glob pattern.
+    // PORT: Go matches byte by byte (`?` skips one byte), so the input is
+    // matched as bytes.
+    pub fn match_(&self, input: &str) -> bool {
+        let elems: Vec<&GlobElement> = self.elems.iter().collect();
+        glob_match(&elems, input.as_bytes())
+    }
+}
+
+// Go: glob/glob.go:172 (*Glob).String
+// PORT: Go `fmt.Stringer` is `Display`.
+impl std::fmt::Display for Glob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for e in &self.elems {
+            write!(f, "{e}")?;
+        }
+        Ok(())
+    }
+}
+
+// Go: glob/glob.go:197-213 element String methods
+// PORT: like Go, a negated range prints without the `!`.
+impl std::fmt::Display for GlobElement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GlobElement::Slash => f.write_str("/"),
+            GlobElement::Literal(l) => f.write_str(l),
+            GlobElement::Star => f.write_str("*"),
+            GlobElement::AnyChar => f.write_str("?"),
+            GlobElement::StarStar => f.write_str("**"),
+            GlobElement::Group(g) => {
+                let parts: Vec<String> = g.iter().map(ToString::to_string).collect();
+                write!(f, "{{{}}}", parts.join(","))
+            }
+            GlobElement::CharRange { low, high, .. } => write!(f, "[{low}-{high}]"),
+        }
+    }
+}
+
+// Go: glob/glob.go:219 match
+// PORT: Go slices `[]element`; a group branch appends the rest of the
+// pattern to a member's elements. Elements are borrowed here so a branch is a
+// list of references. Go ignores `charRange.negate` when matching, and so
+// does this port. Like Go, a `/` element that consumes the rest of the input
+// indexes past the end and panics.
+fn glob_match(mut elems: &[&GlobElement], mut input: &[u8]) -> bool {
+    while !elems.is_empty() {
+        let elem = elems[0];
+        elems = &elems[1..];
+        match elem {
+            GlobElement::Slash => {
+                if input.is_empty() || input[0] != b'/' {
+                    return false;
+                }
+                while input[0] == b'/' {
+                    input = &input[1..];
+                }
+            }
+
+            GlobElement::StarStar => {
+                // Special cases:
+                //  - **/a matches "a"
+                //  - **/ matches everything
+                //
+                // Note that if ** is followed by anything, it must be '/' (this is
+                // enforced by Parse).
+                if !elems.is_empty() {
+                    elems = &elems[1..];
+                }
+
+                // A trailing ** matches anything.
+                if elems.is_empty() {
+                    return true;
+                }
+
+                // Backtracking: advance pattern segments until the remaining pattern
+                // elements match.
+                while !input.is_empty() {
+                    if glob_match(elems, input) {
+                        return true;
+                    }
+                    input = glob_split(input).1;
+                }
+                return false;
+            }
+
+            GlobElement::Literal(literal) => {
+                if !input.starts_with(literal.as_bytes()) {
+                    return false;
+                }
+                input = &input[literal.len()..];
+            }
+
+            GlobElement::Star => {
+                let (seg_input, rest) = glob_split(input);
+                input = rest;
+
+                let elem_end = elems
+                    .iter()
+                    .position(|e| matches!(e, GlobElement::Slash))
+                    .unwrap_or(elems.len());
+                let seg_elems = &elems[..elem_end];
+                elems = &elems[elem_end..];
+
+                // A trailing * matches the entire segment.
+                if seg_elems.is_empty() {
+                    continue;
+                }
+
+                // Backtracking: advance characters until remaining subpattern elements
+                // match.
+                let mut matched = false;
+                for i in 0..seg_input.len() {
+                    if glob_match(seg_elems, &seg_input[i..]) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    return false;
+                }
+            }
+
+            GlobElement::AnyChar => {
+                if input.is_empty() || input[0] == b'/' {
+                    return false;
+                }
+                input = &input[1..];
+            }
+
+            GlobElement::Group(group) => {
+                // Append remaining pattern elements to each group member looking for a
+                // match.
+                let mut branch: Vec<&GlobElement> = Vec::new();
+                for m in group {
+                    branch.clear();
+                    branch.extend(m.elems.iter());
+                    branch.extend_from_slice(elems);
+                    if glob_match(&branch, input) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            GlobElement::CharRange { low, high, .. } => {
+                if input.is_empty() || input[0] == b'/' {
+                    return false;
+                }
+                let (c, sz) = glob_decode_rune(input);
+                if c < *low || c > *high {
+                    return false;
+                }
+                input = &input[sz..];
+            }
+        }
+    }
+
+    input.is_empty()
+}
+
+// Go `utf8.DecodeRuneInString` for a non-empty input: an invalid encoding
+// gives `(RuneError, 1)`.
+// PORT: Go `match` can split a rune (`?` skips one byte), so the input can
+// start mid-rune. Rust and Go accept the same UTF-8 encodings.
+fn glob_decode_rune(input: &[u8]) -> (char, usize) {
+    let head = &input[..input.len().min(4)];
+    let valid = match std::str::from_utf8(head) {
+        Ok(s) => s,
+        Err(e) => std::str::from_utf8(&head[..e.valid_up_to()]).unwrap_or_default(),
+    };
+    match valid.chars().next() {
+        Some(c) => (c, c.len_utf8()),
+        None => (char::REPLACEMENT_CHARACTER, 1),
+    }
+}
+
+// Go: glob/glob.go:337 split
+/// split returns the portion before and after the first slash
+/// (or sequence of consecutive slashes). If there is no slash
+/// it returns (input, nil).
+fn glob_split(input: &[u8]) -> (&[u8], &[u8]) {
+    let Some(i) = input.iter().position(|&c| c == b'/') else {
+        return (input, &[]);
+    };
+    let first = &input[..i];
+    for j in i..input.len() {
+        if input[j] != b'/' {
+            return (first, &input[j..]);
+        }
+    }
+    (first, &[])
+}
 
 // Go: core/parsedoptions.go:3 ParsedOptions
 // PORT: Go `*CompilerOptions` is `Rc<CompilerOptions>`, so copies of the
@@ -47,9 +417,8 @@ pub struct SourceAndOutputMaps {
 // tsconfig parser) writes the unexported fields.
 // PORT: Go `ConfigFile *TsConfigSourceFile` is `Option<Rc<...>>`, because
 // `ReloadFileNamesOfParsedCommandLine` shares it with the new value.
-// PORT: `includeGlobs` and its `Once` are left out (`internal/glob` is out
-// of scope). `locale` and its `Once` are left out (`internal/locale` is out
-// of scope); see `locale`.
+// PORT: `locale` and its `Once` are left out (`internal/locale` is out of
+// scope); see `locale`.
 #[derive(Debug, Default)]
 pub struct ParsedCommandLine {
     pub parsed_config: ParsedOptions,
@@ -62,6 +431,7 @@ pub struct ParsedCommandLine {
 
     pub compare_paths_options: ComparePathsOptions,
     pub wildcard_directories: OnceCell<FxHashMap<String, bool>>,
+    pub include_globs: OnceCell<Vec<Glob>>,
     pub extra_file_extensions: Vec<FileExtensionInfo>,
 
     pub source_and_output_maps: OnceCell<SourceAndOutputMaps>,
@@ -336,8 +706,27 @@ impl ParsedCommandLine {
     }
 
     // Go: tsoptions/parsedcommandline.go:241 (*ParsedCommandLine).WildcardDirectoryGlobs
-    // PORT: not ported. `internal/glob` is out of scope. See
-    // `possibly_matches_file_name`, its only caller.
+    // PORT: Go returns nil when `WildcardDirectories` is a nil map. The Rust
+    // map is empty there, which gives an empty list; the caller only tests
+    // the length and the members. Go builds the list in map order, which
+    // only changes which glob matches first.
+    pub fn wildcard_directory_globs(&self) -> &[Glob] {
+        let wildcard_directories = self.wildcard_directories();
+        self.include_globs.get_or_init(|| {
+            let mut globs = Vec::with_capacity(wildcard_directories.len());
+            for (dir, recursive) in wildcard_directories {
+                let pattern = if *recursive {
+                    RECURSIVE_FILE_GLOB_PATTERN
+                } else {
+                    FILE_GLOB_PATTERN
+                };
+                if let Ok(parsed) = glob_parse(&format!("{}/{}", normalize_path(dir), pattern)) {
+                    globs.push(parsed);
+                }
+            }
+            globs
+        })
+    }
 
     // Go: tsoptions/parsedcommandline.go:263 (*ParsedCommandLine).LiteralFileNames
     /// Normalized file names explicitly specified in `files`
@@ -438,10 +827,6 @@ impl ParsedCommandLine {
     // Go: tsoptions/parsedcommandline.go:337 (*ParsedCommandLine).PossiblyMatchesFileName
     /// A fast check to see if a file is currently included by a config
     /// or would be included if the file were to be created. It may return false positives.
-    /// PORT: Go builds globs from the wildcard directories with
-    /// `internal/glob`, which is out of scope. A config with no wildcard
-    /// directories has no globs, so that case is exact. Otherwise this stops
-    /// with `unported!`.
     pub fn possibly_matches_file_name(&self, file_name: &str) -> bool {
         let path = to_path(
             file_name,
@@ -469,8 +854,13 @@ impl ParsedCommandLine {
                 }
             }
         }
-        if !self.wildcard_directories().is_empty() {
-            unported!("glob.Parse");
+        let wildcard_directory_globs = self.wildcard_directory_globs();
+        if !wildcard_directory_globs.is_empty() {
+            for glob in wildcard_directory_globs {
+                if glob.match_(file_name) {
+                    return true;
+                }
+            }
         }
         false
     }
@@ -527,8 +917,8 @@ impl ParsedCommandLine {
     }
 
     // Go: tsoptions/parsedcommandline.go:393 (*ParsedCommandLine).ReloadFileNamesOfParsedCommandLine
-    // PORT: Go copies the cached `wildcardDirectories` map pointer; this
-    // clones the cache cell. `includeGlobs` is not ported.
+    // PORT: Go copies the cached `wildcardDirectories` map pointer and the
+    // `includeGlobs` slice; this clones both cache cells.
     pub fn reload_file_names_of_parsed_command_line(&self, fs: &dyn Fs) -> ParsedCommandLine {
         let mut parsed_config = self.parsed_config.clone();
         let (file_names, literal_file_names_len) = get_file_names_from_config_specs(
@@ -547,6 +937,7 @@ impl ParsedCommandLine {
             compile_on_save: self.compile_on_save,
             compare_paths_options: self.compare_paths_options.clone(),
             wildcard_directories: self.wildcard_directories.clone(),
+            include_globs: self.include_globs.clone(),
             extra_file_extensions: self.extra_file_extensions.clone(),
             literal_file_names_len,
             ..Default::default()
@@ -554,7 +945,10 @@ impl ParsedCommandLine {
     }
 
     // Go: tsoptions/parsedcommandline.go:418 (*ParsedCommandLine).Locale
-    // PORT: `internal/locale` is out of scope.
+    // PORT: `internal/locale` is out of scope. `locale.Parse` is
+    // `golang.org/x/text/language.Parse`: a BCP 47 parser, canonicalizer and
+    // subtag lookup (about 1,500 Go lines) over generated registry tables
+    // (about 4,500 lines). No Rust caller reads the locale.
     pub fn locale(&self) -> ! {
         let _ = &self.parsed_config.compiler_options.locale;
         unported!("locale.Parse")
@@ -581,5 +975,58 @@ impl OutputPathsHost for ParsedCommandLine {
     }
     fn use_case_sensitive_file_names(&self) -> bool {
         ParsedCommandLine::use_case_sensitive_file_names(self)
+    }
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::*;
+
+    // Expected values come from the pinned Go `internal/glob`.
+    #[test]
+    fn wildcard_directory_patterns_match_like_go() {
+        let flat = glob_parse(&format!("/a/b/{FILE_GLOB_PATTERN}")).unwrap();
+        let deep = glob_parse(&format!("/a/b/{RECURSIVE_FILE_GLOB_PATTERN}")).unwrap();
+        assert_eq!(
+            flat.to_string(),
+            "/a/b/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json}"
+        );
+        let cases = [
+            ("/a/b/c.ts", true, true),
+            ("/a/b/c/d.ts", false, true),
+            ("/a/b/c.d.ts", true, true),
+            ("/a/b/c.tsx", true, true),
+            ("/a/b/c.css", false, false),
+            ("/a//b/c.ts", true, true),
+            ("/a/b/.ts", true, true),
+            ("/a/b/c/d/e.json", false, true),
+        ];
+        for (input, in_flat, in_deep) in cases {
+            assert_eq!(flat.match_(input), in_flat, "{input}");
+            assert_eq!(deep.match_(input), in_deep, "{input}");
+        }
+    }
+
+    #[test]
+    fn parse_errors_and_elements_match_go() {
+        assert_eq!(
+            glob_parse("a**").unwrap_err(),
+            "** may only be adjacent to '/'"
+        );
+        assert_eq!(glob_parse("{a").unwrap_err(), "unmatched '{'");
+        assert_eq!(glob_parse("[a").unwrap_err(), GLOB_ERR_BAD_RANGE);
+        let m = |pattern: &str, input: &str| glob_parse(pattern).unwrap().match_(input);
+        assert!(m("a/[0-9]x", "a/5x"));
+        assert!(!m("a/[0-9]x", "a/xx"));
+        assert!(m("a/?", "a/b"));
+        assert!(m("{a,b/c}d", "ad"));
+        assert!(m("{a,b/c}d", "b/cd"));
+        assert!(m("**/x", "x"));
+        assert!(m("**/x", "q/r/x"));
+        assert!(m("a/**", "a/b/c"));
+        assert!(!m("*.ts", "a/b"));
+        // Go ignores the negation when matching.
+        assert!(m("[!a-c]", "b"));
+        assert!(!m("[!a-c]", "é"));
     }
 }

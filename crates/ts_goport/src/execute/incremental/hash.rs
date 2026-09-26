@@ -48,10 +48,12 @@ impl FileInfo {
 // Go: incremental/snapshot.go:32 ComputeHash
 // PORT: Go `xxh3.HashString128(text).Bytes()` is big endian, Hi before Lo.
 // `xxh3_128` returns the same 128 bits as a `u128` (Hi in the high half),
-// so `{:032x}` is `hex.EncodeToString` of those bytes.
+// so `{:032x}` is `hex.EncodeToString` of those bytes. Go hashes the bytes of
+// the Go string, and `text` is its port form (see
+// `scanner_util::GO_STRING_MARKER`).
 #[must_use]
 pub fn compute_hash(text: &str, hash_with_text: bool) -> String {
-    let hash_bytes = xxhash_rust::xxh3::xxh3_128(text.as_bytes());
+    let hash_bytes = xxhash_rust::xxh3::xxh3_128(&crate::scanner_util::go_string_bytes(text));
     let mut hash = format!("{hash_bytes:032x}");
     if hash_with_text {
         hash.push('-');

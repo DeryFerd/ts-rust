@@ -20,9 +20,10 @@
 //! are merged back when its program is made and when its result arrives
 //! (see shared_fs.rs, which also says what stays timing dependent).
 //!
-//! PORT: the aggregate `--extendedDiagnostics` statistics are not
-//! collected (see build_task.rs); `report` calls `unported!` when they are
-//! asked for.
+//! PORT: a build worker does not send its project statistics back (see
+//! build_task.rs), so the aggregate `--diagnostics` and
+//! `--extendedDiagnostics` statistics cannot add them. `report_task` calls
+//! `unported!` for a task that built a program when they are asked for.
 //! `opts.Testing` is always nil.
 
 use crate::execute::build::build_task::*;
@@ -37,7 +38,9 @@ use crate::execute::tsc::compile::{CommandLineResult, ExitStatus, System, Writer
 use crate::execute::tsc::diagnostics::{
     DiagnosticReporter, DiagnosticsReporter, create_builder_status_reporter,
     create_diagnostic_reporter, create_report_error_summary, create_watch_status_reporter,
+    print_build_help, print_version,
 };
+use crate::execute::tsc::statistics::Statistics;
 use crate::frontend::prelude::*;
 use std::sync::mpsc;
 use std::time::SystemTime;
@@ -52,18 +55,19 @@ pub struct Options {
 }
 
 // Go: build/orchestrator.go:31 orchestratorResult
-// PORT: `statistics` is dropped (see top). Go `filesToDelete` is nil until
-// a task adds a file, so an empty `Vec` is the Go nil.
+// PORT: Go `filesToDelete` is nil until a task adds a file, so an empty
+// `Vec` is the Go nil.
 #[derive(Default)]
 struct OrchestratorResult {
     result: CommandLineResult,
     errors: Vec<Diagnostic>,
+    statistics: Statistics,
     files_to_delete: Vec<String>,
 }
 
 impl OrchestratorResult {
     // Go: build/orchestrator.go:38 (*orchestratorResult).report
-    fn report(&self, o: &Orchestrator) {
+    fn report(&mut self, o: &Orchestrator) {
         if o.opts.command.compiler_options.watch.is_true() {
             let message = if self.errors.len() == 1 {
                 diag::Found_1_error_Watching_for_file_changes
@@ -102,7 +106,12 @@ impl OrchestratorResult {
         {
             return;
         }
-        unported!("Statistics.Report");
+        self.statistics.set_total_time(o.opts.sys.since_start());
+        // PORT: `Statistics::report` writes to a string; Go writes to
+        // `o.opts.Sys.Writer()`.
+        let mut w = String::new();
+        self.statistics.report(&mut w);
+        write_str(&o.opts.sys.writer(), &w);
     }
 }
 
@@ -344,6 +353,7 @@ impl Orchestrator {
         }
         let mut build_result = OrchestratorResult::default();
         if self.errors.is_empty() {
+            build_result.statistics.projects = self.order().len() as i32;
             self.build_all_tasks(&mut build_result);
         } else {
             // Circularity errors prevent any project from being built
@@ -494,7 +504,23 @@ impl Orchestrator {
         if result.exit_status.code() > build_result.result.status.code() {
             build_result.result.status = result.exit_status;
         }
-        // PORT: the `buildKind` statistics counts are dropped (see top).
+        // PORT: Go aggregates `t.result.statistics` here. A task has them
+        // when it built a program, but the worker does not send them back
+        // (see top). Without them the aggregate is only wrong when it is
+        // reported, so stop only then.
+        let options = &self.opts.command.compiler_options;
+        if result.build_kind == BuildKind::Program
+            && (options.diagnostics.is_true() || options.extended_diagnostics.is_true())
+        {
+            unported!("Statistics.Aggregate of a build worker's statistics");
+        }
+        // If we built the program, or updated timestamps, or had errors, we need to
+        // delete files that are no longer needed
+        match result.build_kind {
+            BuildKind::Program => build_result.statistics.projects_built += 1,
+            BuildKind::Pseudo => build_result.statistics.timestamp_updates += 1,
+            BuildKind::None => {}
+        }
         build_result.files_to_delete.extend(result.files_to_delete);
     }
 
@@ -640,8 +666,9 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
 }
 
 // Go: execute/tsc.go:90 tscBuildCompilation
-// PORT: the locale is dropped (see command_line.rs), the pprof session is
-// not ported, and `--help` output is out of scope (plan D3).
+// PORT: the locale is dropped (see command_line.rs). The pprof session is
+// not ported: Go `runtime/pprof` writes Go runtime CPU and allocation
+// profiles, which a Rust process does not have.
 // `command_line_args` is the full command line (Go `commandLineArgs`); the
 // build workers get the same arguments.
 pub fn tsc_build_compilation(
@@ -667,7 +694,12 @@ pub fn tsc_build_compilation(
     }
 
     if build_command.compiler_options.help.is_true() {
-        unported!("PrintBuildHelp");
+        print_version(&*sys);
+        print_build_help(&*sys, BUILD_OPTS.as_slice());
+        return CommandLineResult {
+            status: ExitStatus::Success,
+            watcher: None,
+        };
     }
 
     let mut orchestrator = new_orchestrator(Options {

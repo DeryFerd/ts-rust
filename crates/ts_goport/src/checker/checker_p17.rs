@@ -2210,7 +2210,8 @@ pub(crate) mod tspath_p17 {
     // Go: tspath/path.go:638 ToFileNameLowerCase
     // PORT: Go `unicode.ToLower` maps one rune to one rune. Rust
     // `char::to_lowercase` can yield several; a multi-rune result keeps the
-    // original rune, which matches Go for those runes.
+    // original rune, which matches Go for those runes. Go `strings.Map`
+    // writes each byte that is not valid UTF-8 as U+FFFD (`go_map_runes`).
     fn to_file_name_lower_case(file_name: &str) -> String {
         const I_WITH_DOT: char = '\u{0130}';
 
@@ -2218,19 +2219,16 @@ pub(crate) mod tspath_p17 {
             return file_name.to_ascii_lowercase();
         }
 
-        file_name
-            .chars()
-            .map(|r| {
-                if r == I_WITH_DOT {
-                    return r;
-                }
-                let mut l = r.to_lowercase();
-                match (l.next(), l.next()) {
-                    (Some(single), None) => single,
-                    _ => r,
-                }
-            })
-            .collect()
+        crate::scanner_util::go_map_runes(file_name, |r| {
+            if r == I_WITH_DOT {
+                return r;
+            }
+            let mut l = r.to_lowercase();
+            match (l.next(), l.next()) {
+                (Some(single), None) => single,
+                _ => r,
+            }
+        })
     }
 
     // Go: tspath/path.go:687 ToPath
@@ -2637,12 +2635,14 @@ mod core_p17 {
     ) -> Option<&'a PatternAmbientModule> {
         let mut best_pattern = None;
         let mut longest_match_prefix_length: isize = -1;
+        // PORT: Go compares bytes. The texts are port forms, so this
+        // compares their Go bytes (see `scanner_util::GO_STRING_MARKER`).
         for value in values {
-            let star_index = value.pattern_prefix.len() as isize;
-            let matches = candidate.len()
-                >= value.pattern_prefix.len() + value.pattern_suffix.len()
-                && candidate.starts_with(value.pattern_prefix.as_str())
-                && candidate.ends_with(value.pattern_suffix.as_str());
+            let star_index = go_len(&value.pattern_prefix) as isize;
+            let matches = go_len(candidate)
+                >= go_len(&value.pattern_prefix) + go_len(&value.pattern_suffix)
+                && go_has_prefix(candidate, &value.pattern_prefix)
+                && go_has_suffix(candidate, &value.pattern_suffix);
             if star_index > longest_match_prefix_length && matches {
                 best_pattern = Some(value);
                 longest_match_prefix_length = star_index;

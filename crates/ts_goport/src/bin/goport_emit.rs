@@ -48,9 +48,10 @@ use ts_goport::emitter::program_emit::{EmitOptions, EmitResult, WriteFile, Write
 use ts_goport::execute::tsc::{
     CompileTimes, EXIT_UNPORTED, EmitInput, ExitStatus, ProgramLike, Writer,
     create_diagnostic_reporter, create_report_error_summary, emit_and_report_statistics,
-    new_os_system,
+    new_os_system, write_go_output,
 };
 use ts_goport::prelude::*;
+use ts_goport::scanner_util::go_string_bytes;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
 
@@ -110,7 +111,7 @@ fn apply_flag(options: &mut CompilerOptions, flag: &str, value: bool) {
 fn main() {
     // Go: `System.SinceStart` counts from the process start.
     let start = Instant::now();
-    let config = match parse_args(std::env::args().skip(1).collect()) {
+    let config = match parse_args(ts_goport::frontend::vfs::os_args()) {
         Ok(config) => config,
         Err(message) => {
             eprintln!("goport_emit: {message}");
@@ -191,8 +192,8 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
 
 /// `path` made absolute against the current directory and normalized.
 fn absolute(path: &str) -> String {
-    let cwd = std::env::current_dir()
-        .map(|d| d.to_string_lossy().replace('\\', "/"))
+    let cwd = ts_goport::frontend::vfs::os_current_dir()
+        .map(|d| d.replace('\\', "/"))
         .unwrap_or_default();
     ts_path::normalize_path(&ts_path::resolve_path(&cwd, &[path]))
 }
@@ -380,11 +381,14 @@ fn new_write_file(
                 }
                 return Err(format!("{path} is outside the output directory"));
             }
-            let target = std::path::Path::new(&path);
+            // `path` is the port form of the Go path; the OS gets its Go bytes.
+            let target = ts_goport::frontend::vfs::os_path(&path);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            std::fs::write(target, text).map_err(|e| e.to_string())
+            // Go writes the string bytes unchanged. `text` is the port form
+            // of the Go string, so write its Go bytes.
+            std::fs::write(&target, go_string_bytes(text)).map_err(|e| e.to_string())
         },
     )
 }
@@ -399,7 +403,7 @@ fn finish(
     status: ExitStatus,
 ) -> i32 {
     let mut stdout = std::io::stdout().lock();
-    let _ = stdout.write_all(&buffer.borrow());
+    let _ = write_go_output(&mut stdout, &buffer.borrow());
     let _ = stdout.flush();
 
     for path in refused {

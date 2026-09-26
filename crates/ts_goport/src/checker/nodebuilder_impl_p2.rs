@@ -1040,7 +1040,7 @@ impl Checker {
             parameter_type_node,
             Node::NIL, // initializer
         );
-        let name_len = self.sym(parameter_symbol).name.len() as i32;
+        let name_len = go_len(&self.sym(parameter_symbol).name) as i32;
         nb_add_approximate_length(b, name_len + 3);
         parameter_node
     }
@@ -1834,7 +1834,7 @@ impl Checker {
         {
             nb_ctx(b).borrow_mut().encountered_error = true;
         }
-        nb_add_approximate_length(b, name.len() as i32 + 4);
+        nb_add_approximate_length(b, go_len(&name) as i32 + 4);
         let mut modifiers = ModifierList::NIL;
         if is_readonly {
             nb_add_approximate_length(b, 9);

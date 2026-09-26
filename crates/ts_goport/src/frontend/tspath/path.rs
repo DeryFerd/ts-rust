@@ -158,8 +158,10 @@ fn compare_strings_case_insensitive(a: &str, b: &str) -> i32 {
 }
 
 // Go: stringutil/compare.go:63 CompareStringsCaseSensitive
+// PORT: Go compares bytes; the strings are port forms (see
+// `scanner_util::compare_go_bytes`).
 fn compare_strings_case_sensitive(a: &str, b: &str) -> i32 {
-    a.cmp(b) as i32
+    compare_go_bytes(a, b) as i32
 }
 
 // Go: stringutil/compare.go:67 GetStringComparer
@@ -631,7 +633,12 @@ pub fn get_normalized_absolute_path(file_name: &str, current_directory: &str) ->
                 }
             } else if !changed {
                 if normalized_up_to as isize - 1 >= 0 {
-                    let last = last_index_byte(&file_name[..normalized_up_to - 1], b'/');
+                    // PORT: Go slices bytes; the byte before `normalizedUpTo`
+                    // can be inside a char, so search the bytes.
+                    let last = fb[..normalized_up_to - 1]
+                        .iter()
+                        .rposition(|&b| b == b'/')
+                        .map_or(-1, |i| i as isize);
                     normalized = file_name[..(root_length as isize).max(last) as usize].to_string();
                 } else {
                     normalized = file_name[..normalized_up_to].to_string();
@@ -810,6 +817,9 @@ pub fn get_canonical_file_name(file_name: &str, use_case_sensitive_file_names: b
 // Rest special characters are either already in lower case format or
 // they have corresponding upper case character so they dont need special handling
 // PORT: the Go `unsafe.String` fast path is a plain ASCII lowercase copy.
+// `file_name` is a port form (see `scanner_util::GO_STRING_MARKER`). Go
+// `strings.Map` writes each byte that is not valid UTF-8 as U+FFFD, and
+// `go_map_runes` does the same.
 pub fn to_file_name_lower_case(file_name: &str) -> String {
     const I_WITH_DOT: char = '\u{0130}';
 
@@ -831,16 +841,13 @@ pub fn to_file_name_lower_case(file_name: &str) -> String {
         return file_name.to_ascii_lowercase();
     }
 
-    file_name
-        .chars()
-        .map(|r| {
-            if r == I_WITH_DOT {
-                r
-            } else {
-                simple_to_lower(r)
-            }
-        })
-        .collect()
+    go_map_runes(file_name, |r| {
+        if r == I_WITH_DOT {
+            r
+        } else {
+            simple_to_lower(r)
+        }
+    })
 }
 
 // Go: tspath/path.go:687 ToPath
@@ -1428,7 +1435,8 @@ fn get_common_parents_worker(
                         entry.0 = g[..last_common_index + 1].to_vec();
                         entry.1.push(g[last_common_index + 1..].to_vec());
                     }
-                    ordered_groups.sort();
+                    // PORT: Go sorts by bytes (see `compare_go_bytes`).
+                    ordered_groups.sort_by(|a, b| compare_go_bytes(a.as_str(), b.as_str()));
                     let mut result = Vec::with_capacity(new_groups.len());
                     for key in &ordered_groups {
                         let (head, tails) = &new_groups[key];

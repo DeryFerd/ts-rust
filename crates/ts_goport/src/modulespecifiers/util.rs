@@ -44,9 +44,11 @@ pub fn is_excluded_by_regex(module_specifier: &str, excludes: &[String]) -> bool
     if excludes.is_empty() {
         return false;
     }
-    // PORT: Go compiles each pattern with `stringToRegex` (a regexp, with an
-    // optional /.../i form) and tests `module_specifier`. This crate has no
-    // regex engine. The declaration emitter always passes no excludes.
+    // PORT: Go compiles each pattern with `stringToRegex` (a Go `regexp`
+    // (RE2) pattern, with an optional /.../i form) and tests
+    // `module_specifier`. This crate has no regex engine, and Go `regexp`
+    // plus `regexp/syntax` is about 6,600 lines. Only language-service
+    // preferences set excludes; the declaration emitter always passes none.
     let _ = module_specifier;
     unported!("stringToRegex")
 }
@@ -224,8 +226,9 @@ pub(crate) fn index_of(endings: &[ModuleSpecifierEnding], value: ModuleSpecifier
 }
 
 // Go: modulespecifiers/util.go:264 replaceFirstStar
+// PORT: Go joins the bytes (see `scanner_util::go_value`).
 pub(crate) fn replace_first_star(s: &str, replacement: &str) -> String {
-    s.replacen('*', replacement, 1)
+    go_value_owned(s.replacen('*', replacement, 1))
 }
 
 // Go: modulespecifiers/util.go:268 NodeModulePathParts

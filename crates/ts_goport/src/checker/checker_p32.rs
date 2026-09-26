@@ -269,7 +269,7 @@ impl Checker {
                     sb.push_str(&texts[i + 1]);
                 } else if c.is_generic_index_type(t) || c.is_pattern_literal_placeholder_type(t) {
                     new_types.push(t);
-                    new_texts.push(combine_surrogate_pairs(&*sb));
+                    new_texts.push(combine_surrogate_pairs(&go_value(sb)));
                     sb.clear();
                     sb.push_str(&texts[i + 1]);
                 } else {
@@ -281,11 +281,13 @@ impl Checker {
         if !add_spans(self, texts, types, &mut sb, &mut new_types, &mut new_texts) {
             return self.string_type;
         }
+        // PORT: Go joins the texts by bytes. `go_value` gives the port form
+        // of the joined Go bytes (see `scanner_util::GO_STRING_MARKER`).
         if new_types.is_empty() {
-            let s = combine_surrogate_pairs(&sb);
+            let s = combine_surrogate_pairs(&go_value(&sb));
             return self.get_string_literal_type(&s);
         }
-        new_texts.push(combine_surrogate_pairs(&sb));
+        new_texts.push(combine_surrogate_pairs(&go_value(&sb)));
         if new_texts.iter().all(|t| t.is_empty()) {
             if new_types
                 .iter()

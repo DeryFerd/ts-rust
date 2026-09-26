@@ -68,7 +68,7 @@ impl Checker {
         symbol: SymbolId,
     ) -> Node {
         let name = symbol_name(&self.symbols, symbol);
-        hv_ctx(b).borrow_mut().approximate_length += 9 + name.len() as i32;
+        hv_ctx(b).borrow_mut().approximate_length += 9 + go_len(&name) as i32;
         let symbol_type = self.get_type_of_symbol(symbol);
         let member_props: Vec<SymbolId> = self
             .get_properties_of_type(symbol_type)
@@ -112,7 +112,7 @@ impl Checker {
             let bb = b.borrow();
             {
                 let mut c = bb.ctx.borrow_mut();
-                c.approximate_length += 4 + p_name.len() as i32;
+                c.approximate_length += 4 + go_len(&p_name) as i32;
                 if initializer.is_some() {
                     c.approximate_length += 5; // " = " + value estimate
                 }
@@ -142,7 +142,7 @@ impl Checker {
     // Go: checker/nodebuilder_hover.go:88 enumMemberInitializer
     pub(crate) fn enum_member_initializer(
         &mut self,
-        _b: &Rc<RefCell<NodeBuilderImpl>>,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
         p: SymbolId,
     ) -> Node {
         let member_decl = self
@@ -155,9 +155,17 @@ impl Checker {
         if member_decl.is_nil() {
             return Node::NIL;
         }
-        // PORT: Go then returns a string or numeric literal for the constant
-        // value, or nil. That is ported when GetConstantValue lands.
-        unported!("GetConstantValue")
+        // PORT: Go `any` result is `Option<LiteralValue>`; `None` is Go nil.
+        let val = self.get_constant_value(member_decl);
+        let bb = b.borrow();
+        match val {
+            None => Node::NIL,
+            Some(LiteralValue::String(v)) => bb.f().new_string_literal(v, TokenFlags::NONE),
+            Some(LiteralValue::Number(v)) => {
+                bb.f().new_numeric_literal(v.to_string(), TokenFlags::NONE)
+            }
+            Some(_) => Node::NIL,
+        }
     }
 
     // Go: checker/nodebuilder_hover.go:108 expandClassDecl
@@ -167,7 +175,7 @@ impl Checker {
         symbol: SymbolId,
     ) -> Node {
         let name = symbol_name(&self.symbols, symbol);
-        hv_ctx(b).borrow_mut().approximate_length += 9 + name.len() as i32;
+        hv_ctx(b).borrow_mut().approximate_length += 9 + go_len(&name) as i32;
 
         let class_like_declarations: Vec<Node> = self
             .sym(symbol)
@@ -336,7 +344,7 @@ impl Checker {
         symbol: SymbolId,
     ) -> Node {
         let name = symbol_name(&self.symbols, symbol);
-        hv_ctx(b).borrow_mut().approximate_length += 14 + name.len() as i32;
+        hv_ctx(b).borrow_mut().approximate_length += 14 + go_len(&name) as i32;
 
         let interface_type = self.get_declared_type_of_class_or_interface(symbol);
         let interface_declarations: Vec<Node> = self
@@ -626,7 +634,7 @@ impl Checker {
         } else {
             let symbol_type = self.get_type_of_symbol(resolved);
             let t = self.get_widened_type(symbol_type);
-            hv_ctx(b).borrow_mut().approximate_length += name.len() as i32 + 5;
+            hv_ctx(b).borrow_mut().approximate_length += go_len(&name) as i32 + 5;
             let type_node = self.serialize_type_for_declaration(b, Node::NIL, t, resolved, true);
             let bb = b.borrow();
             let declaration = bb.f().new_variable_declaration(
@@ -723,7 +731,8 @@ impl Checker {
                         let target_type = self.get_type_of_symbol(target);
                         let local_type = self.get_widened_type(target_type);
                         let target_name = self.sym(target).name.clone();
-                        hv_ctx(b).borrow_mut().approximate_length += target_name.len() as i32 + 5;
+                        hv_ctx(b).borrow_mut().approximate_length +=
+                            go_len(&target_name) as i32 + 5;
                         let type_node = self.serialize_type_for_declaration(
                             b,
                             Node::NIL,
@@ -752,7 +761,7 @@ impl Checker {
                     }
                     let target_name = self.sym(target).name.clone();
                     let bb = b.borrow();
-                    bb.ctx.borrow_mut().approximate_length += 16 + m_name.len() as i32;
+                    bb.ctx.borrow_mut().approximate_length += 16 + go_len(&m_name) as i32;
                     let mut property_name = Node::NIL;
                     if m_name != target_name {
                         property_name = bb.f().new_identifier(target_name);
@@ -908,7 +917,7 @@ impl Checker {
             c.flags = saved_flags;
             c.internal_flags = saved_internal_flags;
             c.depth = saved_depth;
-            c.approximate_length += 8 + name.len() as i32;
+            c.approximate_length += 8 + go_len(&name) as i32;
         }
         let bb = b.borrow();
         bb.f().new_type_alias_declaration(
@@ -970,6 +979,41 @@ impl Checker {
                 || (s.value_declaration.is_some()
                     && has_static_modifier(s.value_declaration)
                     && is_class_like(s.value_declaration.parent())))
+    }
+
+    // Go: checker/services.go:1113 IsLibSymbolForHoverVerbosity
+    // IsLibSymbolForHoverVerbosity returns true if a symbol is declared in a lib file.
+    // PORT: the Go function lives in services.go. It is here because the hover
+    // node builder is its only caller in this crate.
+    pub fn is_lib_symbol_for_hover_verbosity(&self, symbol: SymbolId) -> bool {
+        if symbol.is_nil() {
+            return false;
+        }
+        for &decl in &self.sym(symbol).declarations {
+            let sf = get_source_file_of_node(decl);
+            // PORT: Go `c.program.IsSourceFileDefaultLibrary(sf.Path())` is the
+            // Program method ported as a free function (see relater_p1.rs).
+            if sf.is_some() && is_source_file_default_library(&source_file_info(sf).path) {
+                return true;
+            }
+        }
+        false
+    }
+
+    // Go: checker/services.go:1127 IsLibTypeForHoverVerbosity
+    // IsLibTypeForHoverVerbosity returns true if a type is declared in a lib file.
+    // Don't expand types like Array or Promise, instead treating them as opaque.
+    pub fn is_lib_type_for_hover_verbosity(&self, t: TypeId) -> bool {
+        let ty = self.ty(t);
+        let symbol = if ty.object_flags.intersects(ObjectFlags::REFERENCE) {
+            self.ty(ty.target()).symbol
+        } else {
+            ty.symbol
+        };
+        if self.is_lib_symbol_for_hover_verbosity(symbol) {
+            return true;
+        }
+        self.is_tuple_type(t)
     }
 }
 

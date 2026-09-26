@@ -640,6 +640,21 @@ impl Checker {
             let mut lookup_table: ExportCollisionTable = IndexMap::new();
             let declarations = self.sym(export_stars).declarations.clone();
             for &node in declarations.iter() {
+                // PORT: Go `node.ModuleSpecifier()` panics for other kinds,
+                // and the port returns nil. An export specifier named with the
+                // byte 0xFE + "export" declares this symbol too.
+                if !matches!(
+                    node.kind(),
+                    SyntaxKind::ImportDeclaration
+                        | SyntaxKind::JsImportDeclaration
+                        | SyntaxKind::ExportDeclaration
+                        | SyntaxKind::JsDocImportTag
+                ) {
+                    panic!(
+                        "Unhandled case in Node.ModuleSpecifier: Kind{:?}",
+                        node.kind()
+                    );
+                }
                 let resolved_module = self.resolve_external_module_name(
                     node,
                     node.module_specifier(),

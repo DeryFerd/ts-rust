@@ -673,10 +673,12 @@ fn get_source_root(map_options: &CompilerOptions) -> String {
 }
 
 // Go: stringutil/util.go:144 EncodeURI
+// PORT: Go escapes the bytes of the Go string. `s` is a port form (see
+// `scanner_util::GO_STRING_MARKER`), so this escapes its Go bytes.
 pub fn encode_uri(s: &str) -> String {
     const UPPERHEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut builder = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
+    for &b in go_string_bytes(s).iter() {
         if !should_escape_for_encode_uri(b) {
             builder.push(b as char);
             continue;

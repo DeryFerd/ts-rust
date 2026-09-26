@@ -70,12 +70,13 @@ pub const PROPERTY_LIKE_PARSE_CALLBACK_PARAMETER: PropertyLikeParse = 1 << 2;
 
 /// Go `s[i:]` on a byte offset.
 // PORT: Go strings are bytes, so `s[i:]` can split a UTF-8 sequence. Rust
-// `&str` slicing panics there. JSDoc whitespace is almost always ASCII; for
-// the other case the split bytes are decoded lossily.
+// `&str` slicing panics there. `s` is whitespace, which has no port form unit
+// (see `scanner_util::GO_STRING_MARKER`), so the split bytes become invalid
+// byte units, the Go bytes.
 fn byte_suffix(s: &str, i: usize) -> String {
     match s.get(i..) {
         Some(t) => t.to_string(),
-        None => String::from_utf8_lossy(&s.as_bytes()[i..]).into_owned(),
+        None => crate::scanner_util::go_string_from_bytes(s.as_bytes()[i..].to_vec()),
     }
 }
 

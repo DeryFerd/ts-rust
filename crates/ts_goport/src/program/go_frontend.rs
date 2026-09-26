@@ -19,7 +19,6 @@ use crate::frontend::tsoptions::{
 use crate::frontend::tspath::Path as GoPath;
 use crate::frontend::vfs::{Fs, osvfs_fs};
 use rustc_hash::FxHashSet;
-use std::io::Write;
 use std::rc::Rc;
 use ts_diagnostics::Message;
 
@@ -174,8 +173,8 @@ pub(super) fn try_load_with(
     edit_options: impl FnOnce(&mut CompilerOptions),
     times: &mut CompileTimes,
 ) -> Result<&'static GoProgram, String> {
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let cwd = ts_path::normalize_path(&cwd.to_string_lossy().replace('\\', "/"));
+    let cwd = crate::frontend::vfs::os_current_dir().map_err(|e| e.to_string())?;
+    let cwd = ts_path::normalize_path(&cwd.replace('\\', "/"));
     // Go: sys.FS() is bundled.WrapFS(osvfs.FS()).
     let fs = bundled::wrap_fs(osvfs_fs());
     let mut config_abs = ts_path::resolve_path(&cwd, &[config_path]);
@@ -235,8 +234,8 @@ pub(super) fn try_load_with(
 /// the Go files and installs the program for the process. Call it once.
 pub(super) fn install_new_program(opts: ProgramOptions) -> Result<&'static GoProgram, String> {
     let legacy_fs = ts_vfs::OsFileSystem::default();
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let cwd = ts_path::normalize_path(&cwd.to_string_lossy().replace('\\', "/"));
+    let cwd = crate::frontend::vfs::os_current_dir().map_err(|e| e.to_string())?;
+    let cwd = ts_path::normalize_path(&cwd.replace('\\', "/"));
     let case_sensitivity = if osvfs_fs().use_case_sensitive_file_names() {
         CaseSensitivity::Sensitive
     } else {
@@ -323,11 +322,13 @@ pub(super) fn install_new_program(opts: ProgramOptions) -> Result<&'static GoPro
 /// trace message and a newline to `sys.Writer()`, which is stdout.
 fn trace_from_sys() -> TraceFn {
     Rc::new(|msg: &'static Message, args: Vec<String>| {
-        let text = match msg.format(&args) {
-            Ok(text) => text,
-            Err(_) => panic!("Invalid formatting placeholder"),
-        };
-        let _ = writeln!(std::io::stdout().lock(), "{text}");
+        let text = format_message(msg, &args);
+        // PORT: `text` is in the port form (see
+        // `scanner_util::GO_STRING_MARKER`); stdout gets its Go bytes.
+        let _ = crate::execute::tsc::write_go_output(
+            &mut std::io::stdout().lock(),
+            format!("{text}\n").as_bytes(),
+        );
     })
 }
 

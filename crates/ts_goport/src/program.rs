@@ -453,6 +453,7 @@ fn try_load_legacy(
     }));
     set_state(program_state);
     install(program);
+    record_legacy_import_helpers_import_specifiers();
     Ok(program)
 }
 
@@ -2521,21 +2522,61 @@ pub fn get_jsx_runtime_import_specifier(path: &str) -> (String, Node) {
 }
 
 // Go: compiler/program.go:1923 GetImportHelpersImportSpecifier
-// Go: compiler/fileloader.go:541 (the value the loader records)
-// PORT: the Go frontend loader records the synthetic import. On the legacy
-// path `createSyntheticImport` is not ported.
+// PORT: the Go frontend loader records the synthetic imports. On the legacy
+// path `record_legacy_import_helpers_import_specifiers` records them.
 pub fn get_import_helpers_import_specifier(path: &str) -> Node {
     if let Some(go) = &state().go {
         return go.get_import_helpers_import_specifier(path);
     }
-    let Some(info) = file_info_by_path(path) else {
-        return Node::NIL;
-    };
-    let file = prog().files[info.file_index].root;
-    if needs_import_helpers_import_specifier(file) {
-        unported!("createSyntheticImport")
+    LEGACY_IMPORT_HELPERS_IMPORT_SPECIFIERS
+        .get()
+        .and_then(|specifiers| specifiers.get(path).copied())
+        .unwrap_or(Node::NIL)
+}
+
+/// Go `processedFiles.importHelpersImportSpecifiers` on the legacy path, by
+/// file path.
+static LEGACY_IMPORT_HELPERS_IMPORT_SPECIFIERS: OnceLock<FxHashMap<String, Node>> = OnceLock::new();
+
+// Go: compiler/fileloader.go:541 (the import helpers part of
+// resolveImportsAndModuleAugmentations)
+// PORT: the legacy ts_compiler loader resolves `tslib` but makes no node for
+// it. This makes the Go synthetic import of each file that needs one. It runs
+// on the loading thread before binding, so the checker workers get the nodes
+// with the synthetic seed. The legacy path has no project reference
+// redirects, so the Go `optionsForFile` are the program options, and the
+// condition is `needsImportHelpersImportSpecifier`.
+fn record_legacy_import_helpers_import_specifiers() {
+    let factory = NodeFactory::new();
+    let mut specifiers = FxHashMap::default();
+    for file in prog().source_files() {
+        if needs_import_helpers_import_specifier(file.root) {
+            let specifier =
+                create_synthetic_import(&factory, EXTERNAL_HELPERS_MODULE_NAME_TEXT, file.root);
+            specifiers.insert(file.info.path.clone(), specifier);
+        }
     }
-    Node::NIL
+    assert!(
+        LEGACY_IMPORT_HELPERS_IMPORT_SPECIFIERS
+            .set(specifiers)
+            .is_ok(),
+        "legacy import helpers specifiers recorded twice"
+    );
+}
+
+// Go: compiler/fileloader.go:634 (*fileLoader).createSyntheticImport
+// PORT: the legacy path has no fileLoader, so the factory is a parameter.
+fn create_synthetic_import(factory: &NodeFactory, text: &str, file: Node) -> Node {
+    let external_helpers_module_reference = factory.new_string_literal(text, TokenFlags::NONE);
+    let import_decl = factory.new_import_declaration(
+        ModifierList::NIL,
+        Node::NIL,
+        external_helpers_module_reference,
+        Node::NIL,
+    );
+    set_node_parent(external_helpers_module_reference, import_decl);
+    set_node_parent(import_decl, file);
+    external_helpers_module_reference
 }
 
 // Go: compiler/program.go:367 needsImportHelpersImportSpecifier

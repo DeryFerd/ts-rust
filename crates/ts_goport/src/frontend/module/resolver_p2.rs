@@ -27,6 +27,7 @@
 //! (language service). They are not ported.
 
 use crate::frontend::prelude::*;
+use std::borrow::Cow;
 
 /// Go `if r.tracer != nil { r.tracer.write(diag, args...) }`.
 macro_rules! trace_write {
@@ -239,7 +240,8 @@ impl ResolutionState<'_> {
                 .flatten()
                 .unwrap_or_default();
             for subst in &substitutions {
-                let path = subst.replacen('*', matched_star, 1);
+                // PORT: Go joins the bytes (see `scanner_util::go_value`).
+                let path = go_value_owned(subst.replacen('*', &matched_star, 1));
                 let candidate = normalize_path(&combine_paths(containing_directory, &[&path]));
                 trace_write!(
                     self,
@@ -1007,7 +1009,8 @@ impl ResolutionState<'_> {
             // Ignore error
             let (contents, _) = self.resolver.host.fs().read_file(&package_json_path);
             // PORT: Go `packagejson.Parse` returns zero `Fields` and an error for an invalid file.
-            let parsed = crate::frontend::packagejson::parse(contents.as_bytes());
+            // `contents` is the port form of the Go text; Go parses its bytes.
+            let parsed = crate::frontend::packagejson::parse(&go_string_bytes(&contents));
             let parseable = parsed.is_ok();
             let package_json_content = parsed.unwrap_or_default();
             trace_write!(self, diag::Found_package_json_at_0, package_json_path);
@@ -1098,7 +1101,8 @@ impl ResolutionState<'_> {
             &package_directory[..node_modules_index + "/node_modules".len()]
         );
         let mut names: Vec<String> = peer_dependencies.value.keys().cloned().collect();
-        names.sort();
+        // PORT: Go sorts by the bytes of the names (see `compare_go_bytes`).
+        names.sort_by(|a, b| compare_go_bytes(a, b));
         let mut builder = String::new();
         for name in &names {
             let peer_package_json = self.get_package_json_info(&format!("{node_modules}{name}"));
@@ -1294,26 +1298,40 @@ impl Pattern {
     }
 
     // Go: core/pattern.go:22 Matches
+    // PORT: Go compares bytes. `text` and `candidate` are port forms, so
+    // this compares their Go bytes (see `scanner_util::GO_STRING_MARKER`).
+    // `star_index` is the port offset of the star.
     pub fn matches(&self, candidate: &str) -> bool {
         if self.star_index == -1 {
             return self.text == candidate;
         }
         let star = self.star_index as usize;
-        candidate.len() + 1 >= self.text.len()
-            && candidate.starts_with(&self.text[..star])
-            && candidate.ends_with(&self.text[star + 1..])
+        go_len(candidate) + 1 >= go_len(&self.text)
+            && go_has_prefix(candidate, &self.text[..star])
+            && go_has_suffix(candidate, &self.text[star + 1..])
     }
 
     // Go: core/pattern.go:31 MatchedText
-    pub fn matched_text<'c>(&self, candidate: &'c str) -> &'c str {
+    // PORT: Go slices the candidate bytes (see `matches`).
+    pub fn matched_text<'c>(&self, candidate: &'c str) -> Cow<'c, str> {
         if !self.matches(candidate) {
             panic!("candidate does not match pattern");
         }
         if self.star_index == -1 {
-            return "";
+            return Cow::Borrowed("");
         }
         let star = self.star_index as usize;
-        &candidate[star..candidate.len() + star + 1 - self.text.len()]
+        let prefix = go_len(&self.text[..star]);
+        let suffix = go_len(&self.text[star + 1..]);
+        go_slice(candidate, prefix, go_len(candidate) - suffix)
+    }
+
+    /// Go `StarIndex`: the Go byte offset of the star, or -1.
+    fn go_star_index(&self) -> i32 {
+        if self.star_index == -1 {
+            return -1;
+        }
+        go_len(&self.text[..self.star_index as usize]) as i32
     }
 }
 
@@ -1339,11 +1357,12 @@ pub fn find_best_pattern_match(values: &[Pattern], candidate: &str) -> Pattern {
     let mut best_pattern = Pattern::default();
     let mut longest_match_prefix_length: i32 = -1;
     for pattern in values {
-        if (pattern.star_index == -1 || pattern.star_index > longest_match_prefix_length)
+        let star_index = pattern.go_star_index();
+        if (star_index == -1 || star_index > longest_match_prefix_length)
             && pattern.matches(candidate)
         {
             best_pattern = pattern.clone();
-            longest_match_prefix_length = pattern.star_index;
+            longest_match_prefix_length = star_index;
         }
     }
     best_pattern
@@ -1445,6 +1464,8 @@ pub fn normalize_path_for_cjs_resolution(containing_directory: &str, module_name
 }
 
 // Go: module/resolver.go:2051 matchesPatternWithTrailer
+// PORT: compares the Go bytes of the port forms (see
+// `scanner_util::GO_STRING_MARKER`).
 pub fn matches_pattern_with_trailer(target: &str, name: &str) -> bool {
     if target.ends_with('*') {
         return false;
@@ -1452,7 +1473,7 @@ pub fn matches_pattern_with_trailer(target: &str, name: &str) -> bool {
     let Some((before, after)) = target.split_once('*') else {
         return false;
     };
-    name.starts_with(before) && name.ends_with(after)
+    go_has_prefix(name, before) && go_has_suffix(name, after)
 }
 
 // Go: module/resolver.go:2063 extensionIsOk
@@ -1516,7 +1537,7 @@ pub fn get_automatic_type_directive_names(
                 if host.fs().file_exists(&package_json_path) {
                     let (contents, _) = host.fs().read_file(&package_json_path);
                     let package_json_content =
-                        crate::frontend::packagejson::parse(contents.as_bytes())
+                        crate::frontend::packagejson::parse(&go_string_bytes(&contents))
                             .unwrap_or_default();
                     // `types-publisher` sometimes creates packages with `"typings": null` for packages that don't provide their own types.
                     // See `createNotNeededPackageJSON` in the types-publisher` repo.

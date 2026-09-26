@@ -213,12 +213,11 @@ impl Fields {
 }
 
 // Go: packagejson/packagejson.go:116 Parse
-pub fn parse(data: &str) -> Result<Fields, String> {
-    let value = JsonParser {
-        s: data.as_bytes(),
-        pos: 0,
-    }
-    .parse_document()?;
+// PORT: `data` is the file's Go bytes. Go fails on invalid UTF-8 in a
+// string. Each string value is in the port form (see
+// `scanner_util::GO_STRING_MARKER`).
+pub fn parse(data: &[u8]) -> Result<Fields, String> {
+    let value = JsonParser { s: data, pos: 0 }.parse_document()?;
     let mut f = Fields::default();
     let JSONValue::Object(obj) = value else {
         return Err("package.json must be an object".to_string());
@@ -545,7 +544,9 @@ impl JsonParser<'_> {
             match c {
                 b'"' => {
                     self.pos += 1;
-                    return String::from_utf8(out).map_err(|_| self.err("invalid UTF-8"));
+                    return String::from_utf8(out)
+                        .map(crate::scanner_util::go_string_from_utf8)
+                        .map_err(|_| self.err("invalid UTF-8"));
                 }
                 b'\\' => {
                     self.pos += 1;

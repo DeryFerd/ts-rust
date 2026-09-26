@@ -76,6 +76,15 @@ fn go_token_flags(flags: ts_scanner::TokenFlags) -> TokenFlags {
     TokenFlags(bits)
 }
 
+/// A Go rune as a char. Go `string(r)` and `WriteRune(r)` write U+FFFD for
+/// an invalid rune (negative, a surrogate or above U+10FFFF).
+fn rune_to_char(r: i32) -> char {
+    u32::try_from(r)
+        .ok()
+        .and_then(char::from_u32)
+        .unwrap_or(char::REPLACEMENT_CHARACTER)
+}
+
 impl Sc {
     fn new(text: &'static str) -> Self {
         Sc {
@@ -235,7 +244,19 @@ impl Sc {
             '.' => SyntaxKind::DotToken,
             '`' => SyntaxKind::BacktickToken,
             '#' => SyntaxKind::HashToken,
-            '\\' => unported!("ScanJSDocToken unicode escape"),
+            '\\' => {
+                self.st.pos -= 1;
+                let cp = self.peek_unicode_escape();
+                if cp >= 0 && is_identifier_start(rune_to_char(cp)) {
+                    let escaped = rune_to_char(self.scan_unicode_escape(true));
+                    let parts = self.scan_identifier_parts();
+                    self.st.value = format!("{escaped}{parts}");
+                    get_identifier_token(&self.st.value)
+                } else {
+                    self.st.pos += 1;
+                    SyntaxKind::Unknown
+                }
+            }
             _ if is_identifier_start(ch) => {
                 let mut c = ch;
                 loop {
@@ -252,7 +273,8 @@ impl Sc {
                 self.st.value =
                     self.text[self.st.token_start as usize..self.st.pos as usize].to_string();
                 if c == '\\' {
-                    unported!("scanIdentifierParts");
+                    let parts = self.scan_identifier_parts();
+                    self.st.value.push_str(&parts);
                 }
                 get_identifier_token(&self.st.value)
             }
@@ -260,6 +282,196 @@ impl Sc {
         };
         self.st.token = token;
         token
+    }
+
+    // Go: scanner.go:421 error
+    // PORT: see `error_at`.
+    fn error(&mut self, message: &'static ts_diagnostics::Message) {
+        self.error_at(message, self.st.pos, 0);
+    }
+
+    // Go: scanner.go:425 errorAt
+    // PORT: Go calls the parser's `scanError`, which adds a parse error. This
+    // scanner has no error callback, as the errors of the Rust scans in
+    // `scan` are not reported either. The JSDoc scans below never reach it:
+    // `scan_unicode_escape(true)` runs only after `peek_unicode_escape`
+    // accepted the same escape, and `scan_hex_digits` is called without
+    // separators.
+    fn error_at(&mut self, _message: &'static ts_diagnostics::Message, _pos: i32, _length: i32) {}
+
+    // Go: scanner.go:434 char
+    // NOTE: even though this returns a rune, it only decodes the current byte.
+    fn char(&self) -> i32 {
+        match self.text.as_bytes().get(self.st.pos as usize) {
+            Some(&b) => i32::from(b),
+            None => -1,
+        }
+    }
+
+    // Go: scanner.go:442 charAt
+    // NOTE: this returns a rune, but only decodes the byte at the offset.
+    fn char_at(&self, offset: i32) -> i32 {
+        match self.text.as_bytes().get((self.st.pos + offset) as usize) {
+            Some(&b) => i32::from(b),
+            None => -1,
+        }
+    }
+
+    // Go: scanner.go:1574 scanIdentifierParts
+    fn scan_identifier_parts(&mut self) -> String {
+        let mut sb = String::new();
+        let mut start = self.st.pos;
+        loop {
+            let (ch, size) = self.char_and_size();
+            if is_identifier_part(ch) {
+                self.st.pos += size;
+                continue;
+            }
+            if ch == '\\' {
+                let escaped = self.peek_unicode_escape();
+                if escaped >= 0 && is_identifier_part(rune_to_char(escaped)) {
+                    sb.push_str(&self.text[start as usize..self.st.pos as usize]);
+                    sb.push(rune_to_char(self.scan_unicode_escape(true)));
+                    start = self.st.pos;
+                    continue;
+                }
+            }
+            break;
+        }
+        sb.push_str(&self.text[start as usize..self.st.pos as usize]);
+        sb
+    }
+
+    // Go: scanner.go:1868 scanUnicodeEscape
+    // Known to be at \u
+    fn scan_unicode_escape(&mut self, should_emit_invalid_escape_error: bool) -> i32 {
+        self.st.pos += 2;
+        let start = self.st.pos;
+        let extended = self.char() == '{' as i32;
+        let hex_digits = if extended {
+            self.st.pos += 1;
+            self.scan_hex_digits(1, true, false)
+        } else {
+            self.st.flags = self.st.flags | TokenFlags::UNICODE_ESCAPE;
+            self.scan_hex_digits(4, false, false)
+        };
+        if hex_digits.is_empty() {
+            self.st.flags = self.st.flags | TokenFlags::CONTAINS_INVALID_ESCAPE;
+            if should_emit_invalid_escape_error {
+                self.error(diag::Hexadecimal_digit_expected);
+            }
+            return -1;
+        }
+        // Go: strconv.ParseInt(hexDigits, 16, 32). The digits are hex digits
+        // and not empty, so the only error is out of range, where Go returns
+        // the largest int32.
+        let hex_value = i32::from_str_radix(&hex_digits, 16).unwrap_or(i32::MAX);
+        if extended {
+            let mut is_invalid_extended_escape = false;
+            if hex_value > 0x10FFFF {
+                if should_emit_invalid_escape_error {
+                    self.error_at(
+                        diag::An_extended_Unicode_escape_value_must_be_between_0x0_and_0x10FFFF_inclusive,
+                        start + 1,
+                        self.st.pos - start - 1,
+                    );
+                }
+                is_invalid_extended_escape = true;
+            }
+            if self.st.pos as usize >= self.text.len() {
+                if should_emit_invalid_escape_error {
+                    self.error(diag::Unexpected_end_of_text);
+                }
+                is_invalid_extended_escape = true;
+            } else if self.char() == '}' as i32 {
+                self.st.pos += 1;
+            } else {
+                if should_emit_invalid_escape_error {
+                    self.error(diag::Unterminated_Unicode_escape_sequence);
+                }
+                is_invalid_extended_escape = true;
+            }
+            if is_invalid_extended_escape {
+                self.st.flags = self.st.flags | TokenFlags::CONTAINS_INVALID_ESCAPE;
+                return -1;
+            }
+            self.st.flags = self.st.flags | TokenFlags::EXTENDED_UNICODE_ESCAPE;
+        }
+        hex_value
+    }
+
+    // Go: scanner.go:1945 peekUnicodeEscape
+    // Current character is known to be a backslash. Check for Unicode escape of the form '\uXXXX'
+    // or '\u{XXXXXX}' and return code point value if valid Unicode escape is found. Otherwise return -1.
+    fn peek_unicode_escape(&mut self) -> i32 {
+        if self.char_at(1) == 'u' as i32 {
+            let save_pos = self.st.pos;
+            let save_token_flags = self.st.flags;
+            let code_point = self.scan_unicode_escape(false);
+            self.st.pos = save_pos;
+            self.st.flags = save_token_flags;
+            return code_point;
+        }
+        -1
+    }
+
+    // Go: scanner.go:2115 scanHexDigits
+    // PORT: Go memoizes the result in `hexDigitCache`. The cache only saves
+    // work for these callers, which never pass separators, so it is not kept.
+    fn scan_hex_digits(
+        &mut self,
+        min_count: i32,
+        scan_as_many_as_possible: bool,
+        can_have_separators: bool,
+    ) -> String {
+        let mut digit_count = 0;
+        let start = self.st.pos;
+        let mut allow_separator = false;
+        let mut is_previous_token_separator = false;
+        while digit_count < min_count || scan_as_many_as_possible {
+            let ch = self.char();
+            if ch >= 0 && is_hex_digit(char::from(ch as u8)) {
+                allow_separator = can_have_separators;
+                is_previous_token_separator = false;
+                digit_count += 1;
+            } else if can_have_separators && ch == '_' as i32 {
+                self.st.flags = self.st.flags | TokenFlags::CONTAINS_SEPARATOR;
+                if allow_separator {
+                    allow_separator = false;
+                    is_previous_token_separator = true;
+                } else if is_previous_token_separator {
+                    self.error_at(
+                        diag::Multiple_consecutive_numeric_separators_are_not_permitted,
+                        self.st.pos,
+                        1,
+                    );
+                } else {
+                    self.error_at(
+                        diag::Numeric_separators_are_not_allowed_here,
+                        self.st.pos,
+                        1,
+                    );
+                }
+            } else {
+                break;
+            }
+            self.st.pos += 1;
+        }
+        if is_previous_token_separator {
+            self.error_at(
+                diag::Numeric_separators_are_not_allowed_here,
+                self.st.pos - 1,
+                1,
+            );
+        }
+        if digit_count < min_count {
+            return String::new();
+        }
+        let mut digits = self.text[start as usize..self.st.pos as usize].to_string();
+        if self.st.flags.intersects(TokenFlags::CONTAINS_SEPARATOR) {
+            digits = digits.replace('_', "");
+        }
+        digits.to_lowercase() // standardize hex literals to lowercase
     }
 
     // Go: scanner.go:1025 ReScanLessThanToken
@@ -551,6 +763,8 @@ struct ParserState {
 // are, because Go compares the last position and counts them.
 struct Parser {
     sc: Sc,
+    /// Go `p.sourceText`: the whole file text. `sc.text` ends at the comment.
+    source_text: &'static str,
     factory: NodeFactory,
     ctx: NodeFlags,
     has_parse_error: bool,
@@ -870,8 +1084,9 @@ impl Parser {
             ParsingContext::SwitchClauses => {
                 self.token == SyntaxKind::CaseKeyword || self.token == SyntaxKind::DefaultKeyword
             }
+            // PORT: inErrorRecovery is always false (see above).
             ParsingContext::ClassMembers => {
-                self.look_ahead(|_| unported!("scanClassMemberStart"))
+                self.look_ahead(Self::scan_class_member_start)
                     || self.token == SyntaxKind::SemicolonToken
             }
             ParsingContext::EnumMembers => {
@@ -4266,6 +4481,72 @@ impl Parser {
         false
     }
 
+    // Go: parser.go:5978 scanClassMemberStart
+    fn scan_class_member_start(&mut self) -> bool {
+        let mut id_token = SyntaxKind::Unknown;
+        if self.token == SyntaxKind::AtToken {
+            return true;
+        }
+        // Eat up all modifiers, but hold on to the last one in case it is actually an identifier.
+        while is_modifier_kind(self.token) {
+            id_token = self.token;
+            // If the idToken is a class modifier (protected, private, public, and static), it is
+            // certain that we are starting to parse class member. This allows better error recovery
+            // Example:
+            //      public foo() ...     // true
+            //      public @dec blah ... // true; we will then report an error later
+            //      export public ...    // true; we will then report an error later
+            if is_class_member_modifier(id_token) {
+                return true;
+            }
+            self.next_token();
+        }
+        if self.token == SyntaxKind::AsteriskToken {
+            return true;
+        }
+        // Try to get the first property-like token following all modifiers.
+        // This can either be an identifier or the 'get' or 'set' keywords.
+        if self.is_literal_property_name() {
+            id_token = self.token;
+            self.next_token();
+        }
+        // Index signatures and computed properties are class members; we can parse.
+        if self.token == SyntaxKind::OpenBracketToken {
+            return true;
+        }
+        // If we were able to get any potential identifier...
+        if id_token != SyntaxKind::Unknown {
+            // If we have a non-keyword identifier, or if we have an accessor, then it's safe to parse.
+            if !is_keyword(id_token)
+                || id_token == SyntaxKind::SetKeyword
+                || id_token == SyntaxKind::GetKeyword
+            {
+                return true;
+            }
+            // If it *is* a keyword, but not an accessor, check a little farther along
+            // to see if it should actually be parsed as a class member.
+            match self.token {
+                SyntaxKind::OpenParenToken // Method declaration
+                | SyntaxKind::LessThanToken // Generic Method declaration
+                | SyntaxKind::ExclamationToken // Non-null assertion on property name
+                | SyntaxKind::ColonToken // Type Annotation for declaration
+                | SyntaxKind::EqualsToken // Initializer for declaration
+                | SyntaxKind::QuestionToken => {
+                    // Not valid, but permitted so that it gets caught later on.
+                    return true;
+                }
+                _ => {}
+            }
+            // Covers
+            //  - Semicolons     (declaration termination)
+            //  - Closing braces (end-of-class, must be declaration)
+            //  - End-of-files   (not valid, but permitted so that it gets caught later on)
+            //  - Line-breaks    (enabling *automatic semicolon insertion*)
+            return self.can_parse_semicolon();
+        }
+        false
+    }
+
     // Go: parser.go:6205 isStartOfType
     fn is_start_of_type(&mut self, in_start_of_parameter: bool) -> bool {
         match self.token {
@@ -4382,6 +4663,7 @@ fn parse_jsdoc_comment(
             .map_or(0, |i| i as i32 + 1);
     let mut p = Parser {
         sc: Sc::new(&source_text[..(end - 2) as usize]),
+        source_text,
         factory: NodeFactory::new(),
         ctx: ctx | NodeFlags::JS_DOC,
         has_parse_error: false,
@@ -6841,9 +7123,7 @@ impl Parser {
         }
         let heritage_clauses = self.parse_heritage_clauses();
         let members = if self.parse_expected(SyntaxKind::OpenBraceToken) {
-            let members = self.parse_list(ParsingContext::ClassMembers, |_| {
-                unported!("parseClassElement")
-            });
+            let members = self.parse_list(ParsingContext::ClassMembers, Self::parse_class_element);
             self.parse_expected(SyntaxKind::CloseBraceToken);
             members
         } else {
@@ -6921,6 +7201,372 @@ impl Parser {
             .factory
             .new_expression_with_type_arguments(expression, type_arguments);
         self.finish_node(n, pos)
+    }
+
+    // Go: parser.go:1850 parseClassElement
+    // PORT: the diagnostic message is not kept. checkJSSyntax is not ported;
+    // this parser only parses TS files.
+    fn parse_class_element(&mut self) -> Node {
+        let pos = self.node_pos();
+        let jsdoc = self.jsdoc_scanner_info();
+        if self.token == SyntaxKind::SemicolonToken {
+            self.next_token();
+            let n = self.factory.new_semicolon_class_element();
+            let result = self.finish_node(n, pos);
+            self.with_jsdoc(result, jsdoc);
+            return result;
+        }
+        let modifiers = self.parse_modifiers_ex(
+            true, /*allowDecorators*/
+            true, /*permitConstAsModifier*/
+            true, /*stopOnStartOfClassStaticBlock*/
+        );
+        if self.token == SyntaxKind::StaticKeyword
+            && self.look_ahead(Self::next_token_is_open_brace)
+        {
+            return self.parse_class_static_block_declaration(pos, jsdoc, modifiers);
+        }
+        if self.parse_contextual_modifier(SyntaxKind::GetKeyword) {
+            return self.parse_accessor_declaration(
+                pos,
+                jsdoc,
+                modifiers,
+                SyntaxKind::GetAccessor,
+                PARSE_FLAGS_NONE,
+            );
+        }
+        if self.parse_contextual_modifier(SyntaxKind::SetKeyword) {
+            return self.parse_accessor_declaration(
+                pos,
+                jsdoc,
+                modifiers,
+                SyntaxKind::SetAccessor,
+                PARSE_FLAGS_NONE,
+            );
+        }
+        if self.token == SyntaxKind::ConstructorKeyword || self.token == SyntaxKind::StringLiteral {
+            let constructor_declaration =
+                self.try_parse_constructor_declaration(pos, jsdoc, modifiers);
+            if !constructor_declaration.is_nil() {
+                return constructor_declaration;
+            }
+        }
+        if self.is_index_signature() {
+            return self.parse_index_signature_declaration(pos, jsdoc, modifiers);
+        }
+        // It is very important that we check this *after* checking indexers because
+        // the [ token can start an index signature or a computed property name
+        if token_is_identifier_or_keyword(self.token)
+            || self.token == SyntaxKind::StringLiteral
+            || self.token == SyntaxKind::NumericLiteral
+            || self.token == SyntaxKind::BigIntLiteral
+            || self.token == SyntaxKind::AsteriskToken
+            || self.token == SyntaxKind::OpenBracketToken
+        {
+            let is_ambient =
+                !modifiers.is_nil() && modifiers.nodes().iter().any(is_declare_modifier);
+            if is_ambient {
+                for m in modifiers.nodes().iter() {
+                    set_node_flags(m, m.flags() | NodeFlags::AMBIENT);
+                }
+                let save_context_flags = self.ctx;
+                self.set_context_flags(NodeFlags::AMBIENT, true);
+                let result = self.parse_property_or_method_declaration(pos, jsdoc, modifiers);
+                self.ctx = save_context_flags;
+                return result;
+            } else {
+                return self.parse_property_or_method_declaration(pos, jsdoc, modifiers);
+            }
+        }
+        if !modifiers.is_nil() {
+            // treat this as a property declaration with a missing name.
+            let node_pos = self.node_pos();
+            self.parse_error_at(node_pos, node_pos);
+            let name = self.create_missing_identifier();
+            return self.parse_property_declaration(
+                pos,
+                jsdoc,
+                modifiers,
+                name,
+                Node::NIL, /*questionToken*/
+            );
+        }
+        // 'isClassMemberStart' should have hinted not to attempt parsing.
+        panic!("Should not have attempted to parse class member declaration.");
+    }
+
+    // Go: parser.go:1905 parseClassStaticBlockDeclaration
+    fn parse_class_static_block_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: u8,
+        modifiers: ModifierList,
+    ) -> Node {
+        self.parse_expected_token(SyntaxKind::StaticKeyword);
+        let body = self.parse_class_static_block_body();
+        let n = self
+            .factory
+            .new_class_static_block_declaration(modifiers, body);
+        let result = self.finish_node(n, pos);
+        self.with_jsdoc(result, jsdoc);
+        result
+    }
+
+    // Go: parser.go:1913 parseClassStaticBlockBody
+    fn parse_class_static_block_body(&mut self) -> Node {
+        let save_context_flags = self.ctx;
+        self.set_context_flags(NodeFlags::YIELD_CONTEXT, false);
+        self.set_context_flags(NodeFlags::AWAIT_CONTEXT, true);
+        let body = self.parse_block(false /*ignoreMissingOpenBrace*/);
+        self.ctx = save_context_flags;
+        body
+    }
+
+    // Go: parser.go:1922 tryParseConstructorDeclaration
+    // PORT: the diagnostic message argument is not kept. checkJSSyntax is
+    // not ported; this parser only parses TS files.
+    fn try_parse_constructor_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: u8,
+        modifiers: ModifierList,
+    ) -> Node {
+        let state = self.mark();
+        if self.token == SyntaxKind::ConstructorKeyword
+            || self.token == SyntaxKind::StringLiteral
+                && self.sc.st.value == "constructor"
+                && self.look_ahead(Self::next_token_is_open_paren)
+        {
+            self.next_token();
+            let type_parameters = self.parse_type_parameters();
+            let parameters = self.parse_parameters(PARSE_FLAGS_NONE);
+            let return_type = self.parse_return_type(SyntaxKind::ColonToken, false /*isType*/);
+            let body = self.parse_function_block_or_semicolon(PARSE_FLAGS_NONE);
+            let n = self.factory.new_constructor_declaration(
+                modifiers,
+                type_parameters,
+                parameters,
+                return_type,
+                Node::NIL, /*fullSignature*/
+                body,
+            );
+            let result = self.finish_node(n, pos);
+            self.with_jsdoc(result, jsdoc);
+            return result;
+        }
+        self.rewind(state);
+        Node::NIL
+    }
+
+    // Go: parser.go:1939 nextTokenIsOpenParen
+    fn next_token_is_open_paren(&mut self) -> bool {
+        self.next_token() == SyntaxKind::OpenParenToken
+    }
+
+    // Go: parser.go:4055 nextTokenIsOpenBrace
+    fn next_token_is_open_brace(&mut self) -> bool {
+        self.next_token() == SyntaxKind::OpenBraceToken
+    }
+
+    // Go: parser.go:1943 parsePropertyOrMethodDeclaration
+    // PORT: the diagnostic message argument of parseMethodDeclaration is not
+    // kept.
+    fn parse_property_or_method_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: u8,
+        modifiers: ModifierList,
+    ) -> Node {
+        let asterisk_token = self.parse_optional_token(SyntaxKind::AsteriskToken);
+        let name = self.parse_property_name();
+        // Note: this is not legal as per the grammar.  But we allow it in the parser and
+        // report an error in the grammar checker.
+        let question_token = self.parse_optional_token(SyntaxKind::QuestionToken);
+        if !asterisk_token.is_nil()
+            || self.token == SyntaxKind::OpenParenToken
+            || self.token == SyntaxKind::LessThanToken
+        {
+            return self.parse_method_declaration(
+                pos,
+                jsdoc,
+                modifiers,
+                asterisk_token,
+                name,
+                question_token,
+            );
+        }
+        self.parse_property_declaration(pos, jsdoc, modifiers, name, question_token)
+    }
+
+    // Go: parser.go:1971 parsePropertyDeclaration
+    // PORT: checkJSSyntax is not ported; this parser only parses TS files.
+    fn parse_property_declaration(
+        &mut self,
+        pos: i32,
+        jsdoc: u8,
+        modifiers: ModifierList,
+        name: Node,
+        question_token: Node,
+    ) -> Node {
+        let mut postfix_token = question_token;
+        if postfix_token.is_nil() && !self.has_preceding_line_break() {
+            postfix_token = self.parse_optional_token(SyntaxKind::ExclamationToken);
+        }
+        let type_node = self.parse_type_annotation();
+        let initializer = self.do_in_context(
+            NodeFlags::YIELD_CONTEXT | NodeFlags::AWAIT_CONTEXT | NodeFlags::DISALLOW_IN_CONTEXT,
+            false,
+            Self::parse_initializer,
+        );
+        self.parse_semicolon_after_property_name(name, type_node, initializer);
+        let n = self.factory.new_property_declaration(
+            modifiers,
+            name,
+            postfix_token,
+            type_node,
+            initializer,
+        );
+        let result = self.finish_node(n, pos);
+        self.with_jsdoc(result, jsdoc);
+        result
+    }
+
+    // Go: parser.go:1985 parseSemicolonAfterPropertyName
+    // PORT: the diagnostic messages are not kept, so both branches of the
+    // type-node case report at the current token.
+    fn parse_semicolon_after_property_name(
+        &mut self,
+        name: Node,
+        type_node: Node,
+        initializer: Node,
+    ) {
+        if self.token == SyntaxKind::AtToken && !self.has_preceding_line_break() {
+            // Go: Decorators_must_precede_the_name_and_all_keywords_of_property_declarations
+            self.parse_error_at_current_token();
+            return;
+        }
+        if self.token == SyntaxKind::OpenParenToken {
+            // Go: Cannot_start_a_function_call_in_a_type_annotation
+            self.parse_error_at_current_token();
+            self.next_token();
+            return;
+        }
+        if !type_node.is_nil() && !self.can_parse_semicolon() {
+            if !initializer.is_nil() {
+                // Go: X_0_expected with ";"
+                self.parse_error_at_current_token();
+            } else {
+                // Go: Expected_for_property_initializer
+                self.parse_error_at_current_token();
+            }
+            return;
+        }
+        if self.try_parse_semicolon() {
+            return;
+        }
+        if !initializer.is_nil() {
+            // Go: X_0_expected with ";"
+            self.parse_error_at_current_token();
+            return;
+        }
+        self.parse_error_for_missing_semicolon_after(name);
+    }
+
+    // Go: parser.go:2013 parseErrorForMissingSemicolonAfter
+    // PORT: the diagnostic messages and their arguments are not kept. The
+    // spelling suggestion is still computed, because an unknown token is only
+    // skipped when there is no suggestion.
+    fn parse_error_for_missing_semicolon_after(&mut self, node: Node) {
+        // Tagged template literals are sometimes used in places where only simple strings are allowed, i.e.:
+        //   module `M1` {
+        //   ^^^^^^^^^^^ This block is parsed as a template literal like module`M1`.
+        if node.kind() == SyntaxKind::TaggedTemplateExpression {
+            let range = self.skip_range_trivia(node.template().loc());
+            // Go: Module_declaration_names_may_only_use_or_quoted_strings
+            self.parse_error_at_range(range.pos());
+            return;
+        }
+        // Otherwise, if this isn't a well-known keyword-like identifier, give the generic fallback message.
+        let mut expression_text = "";
+        if node.kind() == SyntaxKind::Identifier {
+            expression_text = node.text();
+        }
+        if expression_text.is_empty() {
+            // Go: X_0_expected with ";"
+            self.parse_error_at_current_token();
+            return;
+        }
+        let pos = skip_trivia(self.source_text, node.pos());
+        // Some known keywords are likely signs of syntax being used improperly.
+        match expression_text {
+            "const" | "let" | "var" => {
+                // Go: Variable_declaration_not_allowed_at_this_location
+                self.parse_error_at(pos, node.end());
+                return;
+            }
+            "declare" => {
+                // If a declared node failed to parse, it would have emitted a diagnostic already.
+                return;
+            }
+            "interface" => {
+                self.parse_error_for_invalid_name(SyntaxKind::OpenBraceToken);
+                return;
+            }
+            "is" => {
+                // Go: A_type_predicate_is_only_allowed_in_return_type_position_for_functions_and_methods
+                let token_start = self.sc.st.token_start;
+                self.parse_error_at(pos, token_start);
+                return;
+            }
+            "module" | "namespace" => {
+                self.parse_error_for_invalid_name(SyntaxKind::OpenBraceToken);
+                return;
+            }
+            "type" => {
+                self.parse_error_for_invalid_name(SyntaxKind::EqualsToken);
+                return;
+            }
+            _ => {}
+        }
+        // The user alternatively might have misspelled or forgotten to add a space after a common keyword.
+        let mut suggestion = get_spelling_suggestion_for_strings(
+            expression_text,
+            VIABLE_KEYWORD_SUGGESTIONS.iter().cloned(),
+        );
+        if suggestion.is_empty() {
+            suggestion = get_space_suggestion(expression_text);
+        }
+        if !suggestion.is_empty() {
+            // Go: Unknown_keyword_or_identifier_Did_you_mean_0
+            self.parse_error_at(pos, node.end());
+            return;
+        }
+        // Unknown tokens are handled with their own errors in the scanner
+        if self.token == SyntaxKind::Unknown {
+            return;
+        }
+        // Otherwise, we know this some kind of unknown word, not just a missing expected semicolon.
+        // Go: Unexpected_keyword_or_identifier
+        self.parse_error_at(pos, node.end());
+    }
+
+    // Go: parser.go:2078 parseErrorForInvalidName
+    // PORT: the diagnostic messages are not kept; both report at the current
+    // token.
+    fn parse_error_for_invalid_name(&mut self, token_if_blank_name: SyntaxKind) {
+        if self.token == token_if_blank_name {
+            self.parse_error_at_current_token();
+        } else {
+            self.parse_error_at_current_token();
+        }
+    }
+
+    // Go: parser.go:6409 skipRangeTrivia
+    fn skip_range_trivia(&self, text_range: TextRange) -> TextRange {
+        TextRange::new(
+            skip_trivia(self.source_text, text_range.pos()),
+            text_range.end(),
+        )
     }
 
     // Go: parser.go:1210 parseBlock
@@ -7196,6 +7842,27 @@ impl Parser {
         }
         Node::NIL
     }
+}
+
+// Go: parser.go:112 viableKeywordSuggestions
+static VIABLE_KEYWORD_SUGGESTIONS: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(get_viable_keyword_suggestions);
+
+// Go: parser.go:1195 isDeclareModifier
+fn is_declare_modifier(modifier: Node) -> bool {
+    modifier.kind() == SyntaxKind::DeclareKeyword
+}
+
+// Go: parser.go:2069 getSpaceSuggestion
+fn get_space_suggestion(expression_text: &str) -> String {
+    for keyword in VIABLE_KEYWORD_SUGGESTIONS.iter() {
+        if expression_text.len() > keyword.len() + 2
+            && expression_text.starts_with(keyword.as_str())
+        {
+            return format!("{} {}", keyword, &expression_text[keyword.len()..]);
+        }
+    }
+    String::new()
 }
 
 // Go: parser.go:1967 modifierListHasAsync
