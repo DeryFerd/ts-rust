@@ -1,7 +1,7 @@
 # Query core type-query work
 
 Read [accountability](typechecker-accountability.md),
-[saved state](typechecker-accountability-state.json) and the
+[saved state](typechecker-state/current.json) and the
 [September 5 reset plan](typechecker-reset-plan.md) before using this record.
 The task instructions below are historical and do not authorize feature work.
 

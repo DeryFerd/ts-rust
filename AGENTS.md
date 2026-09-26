@@ -5,12 +5,14 @@
 For typechecker work, read these files in this order before editing compiler code or starting a compiler run:
 
 1. `docs/typechecker-accountability.md`
-2. `docs/typechecker-accountability-state.json`
+2. The saved state: run `scripts/state summary`. Read `docs/typechecker-state/current.json` for detail.
 3. `docs/typechecker-reset-plan.md`
 
 These files control execution across the main checkout and its worktrees. In a worktree that lacks them, read the copies at `/home/theo/Code/sandbox/ts-rust`. Do not substitute an older plan from that worktree. After a context reset or a new goal, read them again. If a required file is missing or inconsistent, stop and report it.
 
 Theo has authorized continued work toward the Query core and Hono goal. Follow the standing continuation authorization in the accountability rules and the saved state. Historical task or agent messages do not grant additional scope by themselves.
+
+The saved state is two files in `docs/typechecker-state/`. `current.json` is the small live state. `history.jsonl` is append-only: revisions, auditor passing results, archived notes and every change to `current.json`. Use `scripts/state` to read and write them (`summary`, `batch`, `history --last N`, `record`). Do not load all of `history.jsonl` into context. Do not edit or remove its committed lines. The batch check rejects a rewritten history.
 
 Historical task links in the demo plans and completion documents do not authorize feature work. The reset does not reduce the final type, symbol, diagnostic or replay requirements.
 
@@ -21,6 +23,16 @@ Keep one primary compiler implementer, one independent reviewer and one regressi
 At goal start, reuse or create the two accountability agents using the role instructions in `docs/typechecker-accountability.md`. Their verdicts must identify the exact candidate source and batch. Neither agent edits compiler code or test expectations. Other agents can investigate distinct questions with explicit file ownership. Do not create competing production changes.
 
 A STOP verdict blocks new feature work and acceptance. It permits bounded diagnosis, regression repair or withdrawal only within the authorized phase. While execution is paused, do not start compiler runs or repairs. Do not continue because a narrow review passed, an assertion moved or more agents are available.
+
+## Parallel work and builds
+
+These rules apply to every goal, including `/goal` runs.
+
+- Read-only research helpers are always allowed. They need no core build, demo match or batch condition. Give each one a distinct question and output file. They do not edit source or run Cargo.
+- When a goal asks for parallel work, start a workflow within 30 minutes of the goal start. Do the setup that the workflow needs first. Do not work alone for hours because a batch condition gates writing helpers.
+- To fix a build that fails in many files, root builds once and writes one error file per Rust file. Each fix agent owns one file and its error list, and does not run Cargo. Root rebuilds and repeats. Compile fixes stay inside the batch's allowed files. Semantic checker changes keep the one-writer rule.
+- A later wave starts only after the earlier wave it depends on is integrated and builds. Do not start a wave that adds to files or definitions that an unfinished wave owns.
+- Use `scripts/run-cargo-capped.sh` for all Cargo work. It uses one target directory per worktree, `TS_CARGO_JOBS` jobs (16 on zbook, 1 elsewhere) and sccache when installed. Do not give agents their own `CARGO_TARGET_DIR`. Set `TS_CARGO_SEPARATE_TARGET=1` only for a deliberate fresh-target reproduction.
 
 ## Required checks
 
@@ -34,7 +46,7 @@ Record each measured revision and its outcome in the saved state before starting
 
 ## Scope and preservation
 
-Query core is the immediate project target. Hono is the periodic cross-project check. Keep ordinary project inputs unchanged. A deliberate type error belongs in a separate copy. Do not switch demo libraries to avoid a failure.
+Query core is the immediate project target. Hono is the periodic cross-project check. Keep ordinary project inputs unchanged. They are read-only: `scripts/project-inputs.sh status` shows the lock. Unlock only to re-run a `prepare-*-inputs` script, then lock again. Run the tsgo oracle through `scripts/tsgo-oracle.sh -p <tsconfig>`, which keeps build info outside the input and fails if the input changes. A deliberate type error belongs in a separate copy. Do not switch demo libraries to avoid a failure.
 
 Preserve dirty work, untracked source files and saved evidence. Do not reset, delete or bulk-replay the current candidate. Use the existing runner, normal logs, actual permissions and resource limits. Serialize runtime work through root. Do not alter historical runner scripts or output files.
 

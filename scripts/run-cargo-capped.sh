@@ -4,15 +4,27 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
-# A virtual-memory limit applies per process. Serializing Cargo and forcing one
-# build/test worker keeps separate rustc and test processes from multiplying
-# that limit across this repository. Use enough memory for the full checker
-# suite on larger machines while leaving headroom on smaller hosts.
-default_memory_limit_kib=8388608
+# Build jobs. TS_CARGO_JOBS overrides the per-host default: 16 on zbook (32
+# cores, 94 GB), 1 elsewhere. Tests keep one thread either way.
+case "$(hostname)" in
+  zbook) default_jobs=16 ;;
+  *) default_jobs=1 ;;
+esac
+jobs="${TS_CARGO_JOBS:-$default_jobs}"
+if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TS_CARGO_JOBS must be a positive integer" >&2
+  exit 2
+fi
+
+# A virtual-memory limit applies per process. Serializing Cargo keeps separate
+# rustc and test processes from multiplying that limit across this repository.
+# Allow 8 GiB for one job and 4 GiB per job above that, capped at three quarters
+# of available memory.
+default_memory_limit_kib=$((jobs == 1 ? 8388608 : jobs * 4194304))
 if [[ -r /proc/meminfo ]]; then
   available_memory_kib="$(awk '$1 == "MemAvailable:" { print $2; exit }' /proc/meminfo)"
   if [[ "$available_memory_kib" =~ ^[1-9][0-9]*$ ]] &&
-    ((available_memory_kib < default_memory_limit_kib)); then
+    ((available_memory_kib * 3 / 4 < default_memory_limit_kib)); then
     default_memory_limit_kib=$((available_memory_kib * 3 / 4))
   fi
 fi
@@ -57,12 +69,24 @@ if [[ "${TS_CARGO_CGROUP_ACTIVE:-0}" != 1 ]]; then
     "$0" "$@"
 fi
 
+# One target directory per worktree. Separate cold targets per agent cost a
+# full rebuild each. A deliberate fresh-target reproduction sets
+# TS_CARGO_SEPARATE_TARGET=1 and its own CARGO_TARGET_DIR.
+default_target_dir="${repo_root}/target"
+if [[ -n "${CARGO_TARGET_DIR:-}" && "${TS_CARGO_SEPARATE_TARGET:-0}" != 1 &&
+  "$(realpath -m -- "$CARGO_TARGET_DIR")" != "$default_target_dir" ]]; then
+  echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR} is not this worktree's target (${default_target_dir})." >&2
+  echo "Unset it to share the worktree build, or set TS_CARGO_SEPARATE_TARGET=1 for a deliberate fresh target." >&2
+  exit 2
+fi
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$default_target_dir}"
+
 exec 9>"${TMPDIR:-/tmp}/ts-rust-cargo-${lock_id}.lock"
 flock 9
 
 ulimit -v "$virtual_memory_limit_kib"
 ulimit -c 0
-export CARGO_BUILD_JOBS=1
+export CARGO_BUILD_JOBS="$jobs"
 export CARGO_INCREMENTAL=0
 export RUST_TEST_THREADS=1
 export CARGO_PROFILE_DEV_DEBUG=0
@@ -70,6 +94,23 @@ export CARGO_PROFILE_TEST_DEBUG=0
 export CARGO_PROFILE_DEV_CODEGEN_UNITS="${CARGO_PROFILE_DEV_CODEGEN_UNITS:-256}"
 export CARGO_PROFILE_TEST_CODEGEN_UNITS="${CARGO_PROFILE_TEST_CODEGEN_UNITS:-256}"
 unset CARGO_ENCODED_RUSTFLAGS
-export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C debuginfo=0 -C llvm-args=--threads=1 -C link-arg=-Wl,--threads=1"
+thread_flags=""
+if ((jobs == 1)); then
+  thread_flags=" -C llvm-args=--threads=1 -C link-arg=-Wl,--threads=1"
+fi
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C debuginfo=0${thread_flags}"
+
+# sccache shares compiled crates across worktrees. Its server runs inside this
+# capped scope on a private socket, without the lock descriptor, and stops with
+# the build. TS_CARGO_SCCACHE=0 disables it.
+if [[ "${TS_CARGO_SCCACHE:-1}" == 1 ]] && command -v sccache >/dev/null; then
+  export RUSTC_WRAPPER=sccache
+  export SCCACHE_SERVER_UDS="${TMPDIR:-/tmp}/ts-rust-sccache-${lock_id}.sock"
+  export SCCACHE_IDLE_TIMEOUT=120
+  sccache --start-server >/dev/null 9>&-
+  trap 'sccache --stop-server >/dev/null 2>&1 || true' EXIT
+  cargo "$@"
+  exit
+fi
 
 exec cargo "$@"

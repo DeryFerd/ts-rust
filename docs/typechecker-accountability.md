@@ -1,6 +1,6 @@
 # Typechecker accountability
 
-These rules were installed on September 5, 2026, at Theo's request. The machine-readable status is [typechecker-accountability-state.json](typechecker-accountability-state.json).
+These rules were installed on September 5, 2026, at Theo's request. The machine-readable status is in [typechecker-state](typechecker-state/current.json): a small `current.json` and an append-only `history.jsonl`. Use `scripts/state` to read and write it.
 
 The [reset plan](typechecker-reset-plan.md) explains the failure and recovery choices. These rules control execution if an older plan conflicts with them. They do not change the full port requirements.
 
@@ -17,6 +17,8 @@ Keep experiments focused. After two measured attempts without useful recovery or
 Necessary repository source, tests, helpers and project inputs may be read for this work. Use bounded production reads and fresh metadata. Keep raw type graphs and large failure payloads out of reports and conversation output. Keep ordinary project inputs unchanged.
 
 Use as many independent analysis agents as the work needs, up to the available 40. Give each one separate file ownership. Keep one compiler writer and the root runtime queue while shared checker state remains under repair.
+
+Read-only research helpers are always allowed and need no build or demo gate. A goal that asks for parallel work starts a workflow within 30 minutes. For a build that fails in many files, root builds once and gives each fix agent one file and its error list. Fix agents do not run Cargo. A later wave waits until the earlier wave it depends on is integrated and builds. [AGENTS.md](../AGENTS.md) has the details.
 
 This authorization does not waive protected tests, corpus preservation, pinned Go evidence, exact source identity, independent verdicts or complete Query/Hono diagnostics, types, symbols and replay. STOP still blocks acceptance and unrelated feature work. It permits continued diagnosis and regression repair under this authorization.
 
@@ -80,9 +82,9 @@ Reaching a limit does not prove that restarting from green is cheaper. Use the r
 
 ## One batch record
 
-Root maintains one state file and one record per batch. Update the state before starting a revision and after its measured result. Do not rely on conversation memory or subagent messages alone.
+Root maintains one saved state and one record per batch. Write it through `scripts/state record`. `record revision` appends a revision row, `record note` archives a named record, `record passing-result` appends an auditor result and `record current` changes `current.json`. Each write adds a line to `history.jsonl`. The last line for a revision number is its current row. Update the state before starting a revision and after its measured result. Do not rely on conversation memory or subagent messages alone.
 
-Before replacing `state.batch`, save its record at `docs/typechecker-batches/<batch-id>.json` and add that path to `batchRecords`. Keep the complete initial-phase `recoveryHistory` in the next batch. The auditor compares it with the prior saved records. Do not delete old revisions or start the history again at one.
+Before replacing `state.batch`, save its record at `docs/typechecker-batches/<batch-id>.json` (`scripts/state batch --with-history`) and add that path to `batchRecords`. `record current` refuses a new batch until both exist. Keep the complete initial-phase `recoveryHistory` in the next batch. The auditor compares it with the prior saved records. Do not delete old revisions or start the history again at one.
 
 The record must identify the source, hypothesis, changed scope, exact expected recoveries, commands, completed runs, result paths and hashes, ordinary Query outcome, latest Hono result, both independent verdicts and the next permitted action. Each verdict names its agent, batch and exact source. A verdict from another source is stale.
 
@@ -97,13 +99,13 @@ The local entry point is `node scripts/check-typechecker-batch.mjs --help`. The 
 Run the real check from the main repository root:
 
 ```sh
-node scripts/check-typechecker-batch.mjs docs/typechecker-accountability-state.json
+node scripts/check-typechecker-batch.mjs docs/typechecker-state
 ```
 
-Run the tooling tests with all 14 named results visible:
+Run the tooling tests with all named results visible:
 
 ```sh
-node --test --test-isolation=none --test-reporter=spec scripts/check-typechecker-batch.test.mjs
+node --test --test-isolation=none --test-reporter=spec scripts/check-typechecker-batch.test.mjs scripts/state.test.mjs
 ```
 
 The first version automatically compares the fixed 6,055 accepted names and the later 6,330 passing names. The regression auditor must also compare passing names added after that reference. Their starting evidence is in `additionalPassingResultsForAuditor`. Append later measured results there. The script does not itself prove this extra comparison, corpus parity, Go equivalence or Query completion. The independent verdicts must address those requirements. A script PASS alone is not compiler acceptance.
@@ -114,13 +116,13 @@ The current invocation must return STOP because no recovery batch is authorized 
 
 The original check supports `phase: "initial-recovery"`. The authorized continuation requires an explicit reviewed extension for `phase: "recovery-continuation"`. Keep the complete history and require the saved continuation authorization. Do not add an ignore-regressions path or use an unrecorded phase change to bypass the initial limit.
 
-The script checks limits in the supplied history. It cannot detect that someone discarded earlier state or rewrote its history. The auditor must verify carry-forward against `batchRecords`. This limitation is not permission to reset a counter.
+The script checks limits in the supplied history. For a state directory it also stops when `history.jsonl` no longer starts with its committed copy. It cannot detect a rewrite that was committed. The auditor must verify carry-forward against `batchRecords`. This limitation is not permission to reset a counter.
 
 ## Approved rule changes
 
 Theo approved two scoped rule changes on 2026-09-25 for batch
 `recovery-continuation-go-checker-port-1`. They are saved in
-`acceptanceRuleChanges` in the state file. The check script applies them only to
+`acceptanceRuleChanges` in `current.json`. The check script applies them only to
 that batch id.
 
 - **Opt-in crate rule.** An additive opt-in crate (`ts_goport`) can be accepted
