@@ -247,7 +247,11 @@ never as a tsgo status.
 
 ## Release builds
 
-- The release profile uses `lto = "fat"` and `codegen-units = 1`.
+- Build release binaries with the workspace `goport` profile:
+  `scripts/run-cargo-capped.sh build --profile goport -p ts_goport --bins`.
+  It inherits `release` and adds `lto = "fat"` and `codegen-units = 1`.
+  Other crates keep the default release settings. The binaries land in
+  `<target>/goport/`, not `<target>/release/`.
 - Allocator: glibc malloc is the default. `bin/goport.rs`
   `set_malloc_tunables` re-execs once with `GLIBC_TUNABLES` set. The
   `jemalloc` feature is faster (about 10% on query, 5% on zod and effect)
@@ -258,15 +262,18 @@ never as a tsgo status.
   (`-Cprofile-generate`), trains on query, hono, zod, effect, elysia and
   about 200 corpus cases (plus `goport_emit` on query and hono), merges with
   `llvm-profdata` and builds with `-Cprofile-use`. Output must stay
-  byte-identical to the plain release; verify the PGO binary like any other.
+  byte-identical to the plain `goport` build; verify the PGO binary like
+  any other. The binaries land in `<out-dir>/target-use/goport/`.
   Round 5 (1.95): 9% faster on query and 12 to 15% on hono, zod, effect and
   elysia, with the same peak RSS.
-  Retrain when the allocator or hot code changes. `llvm-profdata` must not
-  be newer than the LLVM of the rustc in use: rustc 1.93 (LLVM 21) cannot
-  read the indexed format 13 that LLVM 22 writes, and it only warns and
-  builds without the profile. The script stops on that mismatch. Use
-  `rustup component add llvm-tools` for the toolchain, set `LLVM_PROFDATA`,
-  or use a toolchain whose LLVM matches (1.95 has LLVM 22).
+  Retrain when the allocator or hot code changes.
+- PGO toolchain: the script sets `RUSTUP_TOOLCHAIN=1.95.0` unless it is
+  already set. The system `llvm-profdata` is LLVM 22, which matches rustc
+  1.95 (LLVM 22). rustc 1.93 (LLVM 21) cannot read the indexed format 13
+  that LLVM 22 writes, and it only warns and builds without the profile.
+  The script checks that `llvm-profdata` is not newer than rustc's LLVM and
+  stops on a mismatch. For another toolchain, use
+  `rustup component add llvm-tools` or set `LLVM_PROFDATA`.
 
 ## Style
 

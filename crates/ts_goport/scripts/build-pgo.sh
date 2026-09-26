@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
-# Builds a PGO (profile-guided) release of the goport binaries on stable Rust.
+# Builds a PGO (profile-guided) release of the goport binaries on stable Rust,
+# with the workspace `goport` cargo profile (fat LTO, one codegen unit).
 #
 # Usage: build-pgo.sh [out-dir]
 #   out-dir  default: <data-root>/target/goport-pgo
 #
 # Steps:
-#   1. Release build with -Cprofile-generate (instrumented).
+#   1. goport-profile build with -Cprofile-generate (instrumented).
 #   2. Training runs: goport on query, hono, zod, effect and elysia plus a
 #      spread of corpus cases, and goport_emit on query and hono.
 #   3. Merge the .profraw files with llvm-profdata.
-#   4. Release build with -Cprofile-use. The binaries land in
-#      <out-dir>/target-use/release.
+#   4. goport-profile build with -Cprofile-use. The binaries land in
+#      <out-dir>/target-use/goport.
 #
 # Environment:
+#   RUSTUP_TOOLCHAIN  default 1.95.0. Its LLVM 22 matches the system
+#                     llvm-profdata (LLVM 22). 1.93 has LLVM 21 and cannot read
+#                     the profile that LLVM 22 writes.
 #   GOPORT_DATA_ROOT  checkout that holds target/project-inputs and the corpus
 #                     (default: the main checkout of this repository)
 #   LLVM_PROFDATA     llvm-profdata to use. Default: the rustup llvm-tools copy
@@ -33,9 +37,11 @@ data_root="${GOPORT_DATA_ROOT:-$(cd -- "$(git -C "$repo" rev-parse --path-format
 out="${1:-$data_root/target/goport-pgo}"
 features="${CARGO_FEATURES:-}"
 corpus_step="${PGO_CORPUS_STEP:-60}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.95.0}"
 mkdir -p "$out"
 out="$(cd -- "$out" && pwd)"
-# Run rustc and cargo from the repository so its toolchain choice applies.
+# Run rustc and cargo from the repository. RUSTUP_TOOLCHAIN overrides any
+# toolchain file there.
 cd "$repo"
 
 # llvm-profdata must read the raw profiles of rustc's LLVM and write an
@@ -76,13 +82,13 @@ build() { # build <target-subdir> <rustflags>
   echo "== build $1 ($2)"
   # shellcheck disable=SC2086
   env CARGO_TARGET_DIR="$target" RUSTFLAGS="$2" \
-    "${cargo_cmd[@]}" build --release --offline --locked -p ts_goport --bins $features \
+    "${cargo_cmd[@]}" build --profile goport --offline --locked -p ts_goport --bins $features \
     > "$out/build-$1.log" 2>&1 || { tail -20 "$out/build-$1.log" >&2; exit 1; }
 }
 
 # 1. Instrumented build.
 build target-gen "-Cprofile-generate=$profiles"
-gen="$out/target-gen/release"
+gen="$out/target-gen/goport"
 
 # 2. Training. Exit codes are ignored: some inputs have diagnostics on purpose.
 P="$data_root/target/project-inputs"
@@ -130,4 +136,4 @@ if grep -q "profile format version\|profile-use" "$out/build-target-use.log"; th
   echo "error: rustc did not use the profile; the binaries are not PGO builds" >&2
   exit 1
 fi
-echo "PGO binaries: $out/target-use/release/{goport,goport_emit,goport_build,goport_typesyms}"
+echo "PGO binaries: $out/target-use/goport/{goport,goport_emit,goport_build,goport_typesyms}"
