@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "status": "ready",
-  "decision": "PASS",
-  "updated": "2026-09-26T16:25:19.699279+00:00",
-  "reason": "Batch go-checker-port-7 accepted at R118.",
+  "status": "active",
+  "decision": "REVIEW",
+  "updated": "2026-09-26T23:00:16.385722+00:00",
+  "reason": "Batch recovery-continuation-go-checker-port-7 accepted at R118. Batch recovery-continuation-go-checker-port-8 opened at R119.",
   "goalAuthorization": {
     "date": "2026-09-07T23:13:28.547569+00:00",
     "instruction": "Continue working toward the active thread goal. Keep iterating on the ts-rust port until it is Able to properly type-check Tanstack Core and Hono.",
@@ -458,6 +458,11 @@
       "path": "docs/typechecker-batches/recovery-continuation-go-checker-port-6.json",
       "sha256": "80f04ac6f5c5a1c713be0e14dc890f4f478bb23b3fc092686c045935d2e873c0",
       "bytes": 329671
+    },
+    {
+      "path": "docs/typechecker-batches/recovery-continuation-go-checker-port-7.json",
+      "sha256": "99bc0a9695b1be69a9f6c5a44688b376116a9fd0fcf357538a7a22d30e7b849d",
+      "bytes": 329342
     }
   ],
   "batch": {
@@ -507,74 +512,14 @@
       "move LTO to [profile.goport]",
       "bind stats count comparison vs tsgo --diagnostics on Query and Hono"
     ],
-    "id": "recovery-continuation-go-checker-port-7",
-    "recoveryRevision": 118,
-    "hypothesis": "Drop-in tsgo binary and tsc CLI parity (execute/tsc.go port, --locale, --generateTrace, pretty reporter, error summary, build-worker stats and TTY, -b local time, tsbuildinfo for -p, Go panic parity), compat round 2 and perf round 6.1 in ts_goport, merged with the accepted injective string encoding. Byte-identical to tsgo on every gated suite; no protected loss.",
-    "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-    "beforeEditingSourceFingerprint": "f5ad9b792ae3add9635c94a158682d338cc077738d2d14da857beef9c10ecc92",
-    "sourceBindingStatus": "SOURCE_BOUND",
-    "commit": "8d94fefbb",
-    "origin": "goport-int6 4bff4dafc (workflows goport-compat-b2, goport-tsgo-binary, goport-cli-complete, goport-int6-utf8-merge; perf round 6.1 from goport-perf6 3064adf23)",
+    "id": "recovery-continuation-go-checker-port-8",
     "previousBatch": {
-      "id": "recovery-continuation-go-checker-port-6",
+      "id": "recovery-continuation-go-checker-port-7",
       "archive": {
-        "path": "docs/typechecker-batches/recovery-continuation-go-checker-port-6.json",
-        "sha256": "80f04ac6f5c5a1c713be0e14dc890f4f478bb23b3fc092686c045935d2e873c0",
-        "bytes": 329671
+        "path": "docs/typechecker-batches/recovery-continuation-go-checker-port-7.json",
+        "sha256": "99bc0a9695b1be69a9f6c5a44688b376116a9fd0fcf357538a7a22d30e7b849d",
+        "bytes": 329342
       }
-    },
-    "compilerEditsAuthorized": true,
-    "productionEditsAuthorized": true,
-    "semanticEditsAuthorized": true,
-    "testEditsAuthorized": false,
-    "runtimeAuthorized": true,
-    "expectedCompilerRecoveries": [],
-    "expectationUpdates": [],
-    "fullResult": {
-      "path": "target/continuation-r118-check-result.json",
-      "sha256": "53c7dad72c6be195a5677610b70bddb05c0059d388114e64370146135315041e",
-      "derivedFrom": "target/continuation-r118-full-result.json",
-      "converter": "target/continuation-r118-check-result.py"
-    },
-    "corpus": {
-      "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-      "diagnostics": {
-        "comparison": "target/continuation-r118-current-source-corpus/diagnostics-comparison.json",
-        "sha256": "20b2e063f372623e454c1413f1f1eaf513b9349950f7eb33a3e16d01516cc5ad",
-        "protected": 404,
-        "retained": 404,
-        "lost": 0
-      },
-      "semantic": {
-        "comparison": "target/continuation-r118-current-source-corpus/semantic-comparison.json",
-        "sha256": "91cb34d37398a0bfe407892c093e0ec7e1aa832f6ffec91884fabe9f871c5560",
-        "records": "62/62",
-        "types": "56/56",
-        "symbols": "61/61",
-        "lost": 0
-      }
-    },
-    "ordinaryQuery": {
-      "runner": "goport --profile goport (8d94fefbb), bound runs r22 and r22b",
-      "runs": [
-        {
-          "manifest": "target/continuation-r97-goport/measure/r22/manifest.json",
-          "sha256": "b571e73c70e2246f5e24ad3c6c3d1be1da8b5c117f186e341d10cb5b47fac57f"
-        },
-        {
-          "manifest": "target/continuation-r97-goport/measure/r22b/manifest.json",
-          "sha256": "49c77f02f9a7428ebc62b7be96d2a9141c42baa017352cec3bae751491eded6d"
-        }
-      ],
-      "config": "target/project-inputs/query/source/packages/query-core/tsconfig.prod.json",
-      "complete": true,
-      "exitCode": 0,
-      "diagnostics": 0,
-      "oracleDiagnostics": 0,
-      "matchesOracle": true,
-      "repeatIdentical": true,
-      "date": "2026-09-26",
-      "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7"
     },
     "latestHono": {
       "runner": "goport --profile goport (8d94fefbb), bound runs r22 and r22b",
@@ -598,340 +543,48 @@
       "date": "2026-09-26",
       "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7"
     },
-    "compilerAccepted": true,
-    "passingCredit": true,
-    "completedRuns": [
-      {
-        "stage": "r118-prebuild",
-        "closure": "target/continuation-r118-prebuild-closure.json",
-        "exitCode": 0,
-        "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-        "sourceUnchanged": true,
-        "cleanupConfirmed": true
-      },
-      {
-        "stage": "r118-full-checker",
-        "closure": "target/continuation-r118-full-checker-closure.json",
-        "exitCode": 101,
-        "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-        "sourceUnchanged": true,
-        "cleanupConfirmed": true
-      },
-      {
-        "stage": "r118-full-compiler",
-        "closure": "target/continuation-r118-full-compiler-closure.json",
-        "exitCode": 0,
-        "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-        "sourceUnchanged": true,
-        "cleanupConfirmed": true
-      },
-      {
-        "stage": "r118-full-fixture",
-        "closure": "target/continuation-r118-full-fixture-closure.json",
-        "exitCode": 101,
-        "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-        "sourceUnchanged": true,
-        "cleanupConfirmed": true
-      },
-      {
-        "stage": "r118-parser-lib",
-        "closure": "target/continuation-r118-parser-lib-closure.json",
-        "exitCode": 0,
-        "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-        "sourceUnchanged": true,
-        "cleanupConfirmed": true
-      },
-      {
-        "stage": "r118-binder-lib",
-        "closure": "target/continuation-r118-binder-lib-closure.json",
-        "exitCode": 0,
-        "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-        "sourceUnchanged": true,
-        "cleanupConfirmed": true
-      },
-      {
-        "stage": "r118-array-control",
-        "closure": "target/continuation-r118-array-control-closure.json",
-        "exitCode": 0,
-        "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-        "sourceUnchanged": true,
-        "cleanupConfirmed": true
-      },
-      {
-        "stage": "r118-annotation-control",
-        "closure": "target/continuation-r118-annotation-control-closure.json",
-        "exitCode": 0,
-        "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-        "sourceUnchanged": true,
-        "cleanupConfirmed": true
-      }
-    ],
-    "interruptedRuns": [],
-    "verdictHistory": [
-      {
-        "role": "audit_accepted_roster",
-        "agent": "aae6dbb734c07335a",
-        "verdict": "PASS",
-        "batchId": "recovery-continuation-go-checker-port-7",
-        "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-        "fullResultSha256": "53c7dad72c6be195a5677610b70bddb05c0059d388114e64370146135315041e",
-        "utc": "2026-09-26T16:25:19.323717+00:00"
-      },
-      {
-        "role": "independent_reviewer",
-        "agent": "a0bc38f3370585da3",
-        "verdict": "PASS",
-        "batchId": "recovery-continuation-go-checker-port-7",
-        "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-        "fullResultSha256": "53c7dad72c6be195a5677610b70bddb05c0059d388114e64370146135315041e",
-        "utc": "2026-09-26T16:25:19.323717+00:00"
-      }
-    ],
-    "focusedResults": [
-      {
-        "path": "target/continuation-r118-parser-lib-result.json",
-        "sha256": "1965d1341ea845c63d8933819f241fb707f86b227012b9bd4a3526d4cb584699",
-        "scope": "focused"
-      },
-      {
-        "path": "target/continuation-r118-binder-lib-result.json",
-        "sha256": "cbfa2fca3ab164815611f4117191155c24071919044d7eeeb0a87e575cb858a2",
-        "scope": "focused"
-      },
-      {
-        "path": "target/continuation-r118-array-control-result.json",
-        "sha256": "2fb368e3a3a626363d56cba5217566c1f7e99c7577b00824d0d8fac27cbd5fb6",
-        "scope": "focused"
-      },
-      {
-        "path": "target/continuation-r118-annotation-control-result.json",
-        "sha256": "5192cf0742ba62984d558f69326d12c152762e4c06ad661efd4e5a8b08687a59",
-        "scope": "focused"
-      }
-    ],
+    "origin": "goport-int7 ff3739a85 (workflows goport-ls-port, goport-ls-parity, goport-multiprogram 1-2, goport-int7-ls-multiprog; wide fix 42e222478)",
+    "compilerEditsAuthorized": true,
+    "productionEditsAuthorized": true,
+    "semanticEditsAuthorized": true,
+    "testEditsAuthorized": false,
+    "runtimeAuthorized": true,
+    "expectedCompilerRecoveries": [],
+    "expectationUpdates": [],
+    "verdictHistory": [],
+    "focusedResults": [],
     "runtimeToolHandles": [],
     "commands": [],
+    "interruptedRuns": [],
+    "recoveryRevision": 119,
+    "hypothesis": "Language service (lsproto, lsp, ls, project, format, astnav, fswatch, api), several programs per process (global file registry), tsgo --lsp/--api/--watch, perf 6.2 and the wide-sweep loader fix in ts_goport. Compiler output byte-identical to tsgo on every gated suite; language-server oracle 242,452/242,452; no protected loss.",
+    "sourceFingerprint": "f6d70bb557bdd7cb54cc3beed0edd9322347fd4fba78c5b8ffd1e86dd24cba94",
+    "beforeEditingSourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
+    "sourceBindingStatus": "SOURCE_BOUND",
+    "commit": "d0ac0c8f4",
+    "fullResult": null,
+    "fullOutcome": null,
+    "corpus": null,
+    "ordinaryQuery": null,
+    "completedRuns": [],
+    "compilerAccepted": false,
+    "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
       "agent": "aae6dbb734c07335a",
-      "verdict": "PASS",
-      "batchId": "recovery-continuation-go-checker-port-7",
-      "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-      "fullResultSha256": "53c7dad72c6be195a5677610b70bddb05c0059d388114e64370146135315041e",
-      "utc": "2026-09-26T16:25:19.323717+00:00"
+      "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
       "agent": "a0bc38f3370585da3",
-      "verdict": "PASS",
-      "batchId": "recovery-continuation-go-checker-port-7",
-      "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-      "fullResultSha256": "53c7dad72c6be195a5677610b70bddb05c0059d388114e64370146135315041e",
-      "utc": "2026-09-26T16:25:19.323717+00:00"
+      "verdict": "PENDING"
     },
-    "nextPermittedAction": "R118 accepted. Next: multi-program (goport-multiprog) and the language service (goport-ls) on top, then perf rounds 6.2 and 7.",
+    "nextPermittedAction": "Run the R119 pipeline.",
     "runtime": {
-      "status": "closed",
-      "stage": "annotation-control"
-    },
-    "fullOutcome": {
-      "current": {
-        "tests": 6830,
-        "harnesses": 138,
-        "PASS": 6383,
-        "FAIL": 447,
-        "ABSENT": 0,
-        "UNRUN": 0
-      },
-      "originalAccepted": {
-        "PASS": 5765,
-        "FAIL": 276,
-        "ABSENT": 14,
-        "UNRUN": 0
-      },
-      "versusPrevious": {
-        "previousSourceFingerprint": "777b177a454dec432c77c467839bb3d61deee7be976fab039fa0e00bb01955d3",
-        "previousRevision": 96,
-        "protectedPASS": 6383,
-        "retainedPASS": 6383,
-        "lostPASS": [],
-        "recoveredFAIL": [],
-        "absentNames": [],
-        "addedNames": []
-      },
-      "protectedNamePreservation": {
-        "scope": "exact7153_roster_plus_closed_direct_controls",
-        "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-        "baseline": {
-          "path": "target/continuation-r96-regression-audit/regression-audit-ledger.json",
-          "sha256": "4db41724a7340fbc6523aad7d171b5861e0e3c133f082b7dc093e97a5785715a",
-          "bytes": 7434504
-        },
-        "directResults": [
-          {
-            "path": "target/continuation-r118-parser-lib-result.json",
-            "sha256": "1965d1341ea845c63d8933819f241fb707f86b227012b9bd4a3526d4cb584699",
-            "scope": "focused"
-          },
-          {
-            "path": "target/continuation-r118-binder-lib-result.json",
-            "sha256": "cbfa2fca3ab164815611f4117191155c24071919044d7eeeb0a87e575cb858a2",
-            "scope": "focused"
-          },
-          {
-            "path": "target/continuation-r118-array-control-result.json",
-            "sha256": "2fb368e3a3a626363d56cba5217566c1f7e99c7577b00824d0d8fac27cbd5fb6",
-            "scope": "focused"
-          },
-          {
-            "path": "target/continuation-r118-annotation-control-result.json",
-            "sha256": "5192cf0742ba62984d558f69326d12c152762e4c06ad661efd4e5a8b08687a59",
-            "scope": "focused"
-          }
-        ],
-        "original6055": {
-          "names": 6055,
-          "counts": {
-            "PASS": 5765,
-            "FAIL": 276,
-            "ABSENT": 14,
-            "UNRUN": 0
-          },
-          "retainedPASS": 5765,
-          "recoveredFAIL": [],
-          "lostPASS": [],
-          "absentNames": [
-            "baseline_cli::review_artifact_cli_fatal_preserves_diagnostic_mismatches_and_related_records",
-            "source_ambient_overload_functions::failed_multi_overload_recovery_does_not_publish_a_fake_candidate",
-            "source_inherited_index_properties::inherited_numeric_indexes_reject_incompatible_numeric_names_without_members",
-            "source_overload_calls::multi_overload_failure_recovery_remains_an_atomic_boundary",
-            "ts_checker::lib::semantic::alias_provider::tests::other_merged_ambient_namespace_imports_keep_their_original_target",
-            "ts_checker::lib::semantic::classes::tests::incompatible_forward_rest_method_implementations_remain_unsupported",
-            "ts_checker::lib::semantic::formatter::tests::source_arrow_expando_display_keeps_annotated_function_expression_unsupported",
-            "ts_checker::lib::semantic::production::tests::defers_quoted_ambient_modules_and_retains_patterns_in_stable_order",
-            "ts_checker::lib::semantic::source::tests::anonymous_function_expressions_reject_unsupported_names_parameters_and_bodies",
-            "ts_checker::lib::semantic::source::tests::invalid_derived_constructor_parameter_property_leaves_every_declaration_cold",
-            "ts_checker::lib::semantic::source::tests::parenthesized_object_property_functions_reject_unsupported_function_shapes",
-            "ts_checker::lib::semantic::source::tests::unsupported_object_forms_fail_before_writes",
-            "ts_checker::lib::semantic::source_callables::tests::anonymous_function_expression_plans_reject_names_and_corrupt_owners",
-            "ts_checker::lib::semantic::source_calls::tests::declared_call_set_failure_recovery_remains_an_atomic_boundary"
-          ],
-          "unrunNames": [],
-          "absentPriorPASS": [],
-          "unrunPriorPASS": []
-        },
-        "earlier6330": {
-          "names": 6330,
-          "counts": {
-            "PASS": 6315,
-            "FAIL": 15,
-            "ABSENT": 0,
-            "UNRUN": 0
-          },
-          "retainedPASS": 6315,
-          "recoveredFAIL": [],
-          "lostPASS": [],
-          "absentNames": [],
-          "unrunNames": [],
-          "absentPriorPASS": [],
-          "unrunPriorPASS": []
-        },
-        "prior6856PASS": {
-          "names": 6856,
-          "counts": {
-            "PASS": 6856,
-            "FAIL": 0,
-            "ABSENT": 0,
-            "UNRUN": 0
-          },
-          "retainedPASS": 6856,
-          "recoveredFAIL": [],
-          "lostPASS": [],
-          "absentNames": [],
-          "unrunNames": [],
-          "absentPriorPASS": [],
-          "unrunPriorPASS": []
-        },
-        "protected7153": {
-          "names": 7153,
-          "counts": {
-            "PASS": 6856,
-            "FAIL": 283,
-            "ABSENT": 14,
-            "UNRUN": 0
-          },
-          "retainedPASS": 6856,
-          "recoveredFAIL": [],
-          "lostPASS": [],
-          "absentNames": [
-            "baseline_cli::review_artifact_cli_fatal_preserves_diagnostic_mismatches_and_related_records",
-            "source_ambient_overload_functions::failed_multi_overload_recovery_does_not_publish_a_fake_candidate",
-            "source_inherited_index_properties::inherited_numeric_indexes_reject_incompatible_numeric_names_without_members",
-            "source_overload_calls::multi_overload_failure_recovery_remains_an_atomic_boundary",
-            "ts_checker::lib::semantic::alias_provider::tests::other_merged_ambient_namespace_imports_keep_their_original_target",
-            "ts_checker::lib::semantic::classes::tests::incompatible_forward_rest_method_implementations_remain_unsupported",
-            "ts_checker::lib::semantic::formatter::tests::source_arrow_expando_display_keeps_annotated_function_expression_unsupported",
-            "ts_checker::lib::semantic::production::tests::defers_quoted_ambient_modules_and_retains_patterns_in_stable_order",
-            "ts_checker::lib::semantic::source::tests::anonymous_function_expressions_reject_unsupported_names_parameters_and_bodies",
-            "ts_checker::lib::semantic::source::tests::invalid_derived_constructor_parameter_property_leaves_every_declaration_cold",
-            "ts_checker::lib::semantic::source::tests::parenthesized_object_property_functions_reject_unsupported_function_shapes",
-            "ts_checker::lib::semantic::source::tests::unsupported_object_forms_fail_before_writes",
-            "ts_checker::lib::semantic::source_callables::tests::anonymous_function_expression_plans_reject_names_and_corrupt_owners",
-            "ts_checker::lib::semantic::source_calls::tests::declared_call_set_failure_recovery_remains_an_atomic_boundary"
-          ],
-          "unrunNames": [],
-          "absentPriorPASS": [],
-          "unrunPriorPASS": []
-        },
-        "newPassingNames": [],
-        "acceptanceBlockedByPriorPASS": false,
-        "blockers": [],
-        "protectedChecks": "PASS",
-        "compilerAccepted": false,
-        "independentVerdicts": "PENDING",
-        "rule": "New passes never compensate for lost, absent or unrun prior passes. Raw full counts remain separate."
-      }
-    },
-    "fullResultRaw": {
-      "path": "target/continuation-r118-full-result.json",
-      "sha256": "3c84686e1205aeeeccd8d422c404669cf087520b1d53291c9a0d775bb8971f84"
-    },
-    "gate": {
-      "manifest": "target/continuation-r97-goport/compat/gate/r118-full/manifest.json",
-      "sha256": "bb7e85b75eb073c1ecae44303485cfe5692414a1d45766a7cbd4eb9b13e1486e",
-      "result": "PASS 3651 match, 3 allowed (single-threaded-equal corpus trace cases), 0 fail"
-    },
-    "qualityEvidence": {
-      "sourceFingerprint": "bc4691c0aa5233f32ed1ab898a0a05e2b56f2ab0373e2bebb0ac3bc2aa3e64c7",
-      "fingerprintBeforeAfter": "equal",
-      "rustfmtGoport": {
-        "exit": 0
-      },
-      "clippy": {
-        "exit": 0,
-        "tsGoportWarnings": 0
-      }
-    },
-    "cliAudit": {
-      "report": "target/continuation-r97-goport/int6-utf8/cli",
-      "runs": 830,
-      "result": "only expected differences (--lsp/--api/--watch not wired into tsgo yet, memory numbers, trace event interleaving, pprof bytes, tsgo union-order nondeterminism)"
-    },
-    "localCheck": {
-      "command": "node scripts/check-typechecker-batch.mjs docs/typechecker-state",
-      "exit": 0,
-      "verdict": "PASS",
-      "rule": "opt-in-crate-no-new-loss",
-      "ranUtc": "2026-09-26T16:25:19.699279+00:00"
-    },
-    "acceptance": {
-      "acceptedUtc": "2026-09-26T16:25:19.699279+00:00",
-      "scope": "ts_goport at 8d94fefbb: drop-in tsgo binary and tsc CLI parity, compat round 2, perf round 6.1, with the injective string encoding. ts_checker unchanged; inherited 290/15 remain.",
-      "rules": [
-        "opt-in-crate-no-new-loss",
-        "unbound-history-rows (extension to batch 7 by root under delegation-2026-09-25)"
-      ],
-      "acceptedBy": "root, with both independent PASS verdicts"
+      "status": "running",
+      "stage": "prebuild",
+      "sourceFingerprint": "f6d70bb557bdd7cb54cc3beed0edd9322347fd4fba78c5b8ffd1e86dd24cba94",
+      "startedUtc": "2026-09-26T23:00:18.297033+00:00"
     }
   },
   "parallelModelPreference": {
@@ -1273,6 +926,46 @@
       "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
       "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
       "extendedUtc": "2026-09-26T15:44:29.358665+00:00"
+    },
+    {
+      "id": "opt-in-crate-no-new-loss",
+      "batchId": "recovery-continuation-go-checker-port-8",
+      "approvedBy": "Theo",
+      "date": "2026-09-26T00:42:45.334459+00:00",
+      "instruction": "Theo chose \"Opt-in crate rule (Recommended)\": accept an additive opt-in crate on no new loss in the protected tests plus its own Go parity. The inherited 290 + 15 names in ts_checker stay a separate known deficit. Extended to recovery-continuation-go-checker-port-2, then to recovery-continuation-go-checker-port-3, then to recovery-continuation-go-checker-port-4, by root under Theo's delegation of 2026-09-25: \"You are running in an autonomous goal. I can't answer questions. I trust your judgment. Going forward, answer every question yourself.\" Same pins and scope; no widening.",
+      "scope": "crates/ts_goport (new opt-in crate), additive-only crates/ts_compiler/src/lib.rs accessors, Cargo.toml member, Cargo.lock additions. ts_checker unchanged.",
+      "inheritedResult": {
+        "path": "target/continuation-r96-full-result.json",
+        "sha256": "e7838ed863c42bc2271981c680d2fc46bb6a98f3171c8554b2d040ca9277d6b7"
+      },
+      "inheritedLosses": {
+        "originalAccepted": 290,
+        "laterPasses": 15
+      },
+      "reason": "The inherited losses predate R97 and are in ts_checker, which the opt-in crate does not change. Protected names must still all be present, run, and not newly lost.",
+      "extendedFrom": "recovery-continuation-go-checker-port-3",
+      "extendedBy": "root under delegation-2026-09-25; same pins and scope",
+      "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
+      "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
+      "extendedUtc": "2026-09-26T23:00:16.385722+00:00"
+    },
+    {
+      "id": "unbound-history-rows",
+      "batchId": "recovery-continuation-go-checker-port-8",
+      "approvedBy": "Theo",
+      "date": "2026-09-26T00:42:45.334459+00:00",
+      "instruction": "Theo chose \"Accept as recorded gaps (Recommended)\": keep rows with no saved source fingerprint as unaccepted measurements. Extended to recovery-continuation-go-checker-port-2, then to recovery-continuation-go-checker-port-3, then to recovery-continuation-go-checker-port-4, by root under Theo's delegation of 2026-09-25: \"You are running in an autonomous goal. I can't answer questions. I trust your judgment. Going forward, answer every question yourself.\" Same pins and scope; no widening.",
+      "revisions": [
+        97,
+        98,
+        99
+      ],
+      "reason": "r97-m1 to r97-m3 were measured before source binding was saved. They carry no credit.",
+      "extendedFrom": "recovery-continuation-go-checker-port-3",
+      "extendedBy": "root under delegation-2026-09-25; same pins and scope",
+      "approvalBasis": "delegation-2026-09-25 (theoInstructions); not a new direct approval by Theo",
+      "note": "approvedBy stays \"Theo\" because the check requires the approving authority; the underlying approval is Theo's batch-1 answer plus his delegation. Same pins and scope; the check script rejects any change to the pin.",
+      "extendedUtc": "2026-09-26T23:00:16.385722+00:00"
     }
   ]
 }
