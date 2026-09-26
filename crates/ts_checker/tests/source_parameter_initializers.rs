@@ -140,7 +140,7 @@ fn default_parameter_initializers_check_assignability_scope_calls_and_warm_state
             (
                 2345,
                 "'bad'",
-                "Argument of type '\"bad\"' is not assignable to parameter of type 'number | undefined'."
+                "Argument of type 'string' is not assignable to parameter of type 'number'."
                     .to_owned(),
             ),
         ]
@@ -260,6 +260,67 @@ fn unsupported_initializer_and_arrow_body_retries_do_not_publish_partial_state()
             context.store().mapper_len(),
             context.store().signature_len(),
         );
+
+        if index == 1 {
+            let counts = |context: &CanonicalCheckerContext<'_>| {
+                (
+                    context.store().type_len(),
+                    context.store().mapper_len(),
+                    context.store().signature_len(),
+                )
+            };
+            context.check_source_file(file).unwrap();
+            let cold = counts(&context);
+            assert!(cold.0 <= before.0 + 2);
+            assert_eq!(cold.1, before.1);
+            assert!(cold.2 <= before.2 + 1);
+            assert!(context.diagnostics().is_empty());
+            context.check_source_file(file).unwrap();
+            assert_eq!(counts(&context), cold);
+            assert!(context.diagnostics().is_empty());
+
+            let callable = "(seed: number, value?: number) => string";
+            let typeof_display = concat!(
+                "\"bigint\" | \"boolean\" | \"function\" | \"number\" | ",
+                "\"object\" | \"string\" | \"symbol\" | \"undefined\"",
+            );
+            for (kind, start, end, display, expected_symbol) in [
+                (SyntaxKind::Identifier, 6, 17, callable, Some("unsupported")),
+                (SyntaxKind::ArrowFunction, 20, 80, callable, None),
+                (SyntaxKind::Parameter, 21, 33, "number", None),
+                (SyntaxKind::Identifier, 21, 25, "number", Some("seed")),
+                (SyntaxKind::Parameter, 35, 55, "number", None),
+                (SyntaxKind::Identifier, 35, 40, "number", Some("value")),
+                (SyntaxKind::Identifier, 51, 55, "number", Some("seed")),
+                (SyntaxKind::TypeOfExpression, 68, 80, typeof_display, None),
+                (SyntaxKind::Identifier, 75, 80, "number", Some("value")),
+            ] {
+                let node = parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == kind
+                            && record.range.start.get() == start
+                            && record.range.end.get() == end)
+                            .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                    })
+                    .unwrap();
+                let type_ = context.get_type_at_location(node).unwrap();
+                let symbol = context.get_symbol_at_location(node).unwrap();
+                assert_eq!(context.type_to_string(type_).unwrap(), display);
+                if kind != SyntaxKind::Parameter {
+                    let symbol_name = symbol
+                        .and_then(|symbol| context.store().symbol(symbol))
+                        .and_then(|symbol| symbol.name().as_utf8());
+                    assert_eq!(symbol_name, expected_symbol);
+                }
+                assert_eq!(context.get_type_at_location(node), Ok(type_));
+                assert_eq!(context.get_symbol_at_location(node), Ok(symbol));
+            }
+            assert_eq!(counts(&context), cold);
+            assert!(context.diagnostics().is_empty());
+            continue;
+        }
 
         let first = context.check_source_file(file).unwrap_err();
         assert!(matches!(first, SourceCheckError::Unsupported(_)));

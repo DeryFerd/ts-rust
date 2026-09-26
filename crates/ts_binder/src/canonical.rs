@@ -3802,6 +3802,7 @@ pub fn module_declaration_has_value_meaning(arena: &NodeArena, node: NodeId) -> 
 
 /// Returns the local export marker for a namespace declaration.
 /// Ambient modules have no local export placeholder. Const-enum-only namespaces do.
+#[must_use]
 pub fn module_declaration_local_export_flags(
     arena: &NodeArena,
     node: NodeId,

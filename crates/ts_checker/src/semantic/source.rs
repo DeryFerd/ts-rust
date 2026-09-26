@@ -2953,6 +2953,7 @@ struct ClassBodyExecutionState<'plan> {
     class: &'plan PlannedSourceClass,
     prepared: &'plan PreparedSourceClass,
     base_flow_types: HashMap<SemanticSymbolId, TypeId>,
+    base_declared_types: HashMap<SemanticSymbolId, TypeId>,
     type_import_capabilities: &'plan HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     active: HashSet<NodeRef>,
     checked: HashSet<NodeRef>,
@@ -6155,7 +6156,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         if grammar.declaration != statement || grammar.symbol != symbol {
                             return Err(SourceCheckError::Class(statement));
                         }
-                        statements.push(PlannedStatement::ClassGrammar(grammar));
+                        if grammar
+                            .diagnostics
+                            .iter()
+                            .any(|diagnostic| matches!(diagnostic.code, 1183 | 2300 | 2369))
+                        {
+                            statements.push(PlannedStatement::ClassGrammar(grammar));
+                        } else {
+                            let source = self
+                                .try_plan_source_class(statement, symbol)?
+                                .ok_or(SourceCheckError::Class(statement))?;
+                            statements.push(PlannedStatement::SourceClass(Box::new(source)));
+                        }
                         continue;
                     }
                     if (self.needs_early_source_constructor_plan(&class.members.nodes)
@@ -34523,6 +34535,12 @@ fn zero_argument_class_condition_target(
     let PlannedExpressionKind::Call(call) = &expression.unparenthesized().kind else {
         return None;
     };
+    zero_argument_class_call_target(call)
+}
+
+pub(super) fn zero_argument_class_call_target(
+    call: &SourceCallPlan,
+) -> Option<(&SourcePropertyPlan, ClassAccessContext)> {
     if !call.arguments.is_empty() {
         return None;
     }
@@ -34663,15 +34681,12 @@ fn class_flow_snapshot_at(
     flow: &mut ClassInitializationFrame<'_, '_>,
     node: NodeRef,
 ) -> Result<super::source_flow::SourceFlowSnapshot, SourceFlowError> {
-    let mut relate = |store: &mut CanonicalTypeMapperStore, session: &mut InstantiationSession, left, right| {
-        source_type_is_related_to(
-            store, host, globals, options, session, diagnostics,
-            left, right, super::RelationKind::Comparable,
-        )
-    };
     flow.snapshot_at_with_source(
         store, host, globals, node,
-        super::source_flow::SourceFlowCaller { session, relate: &mut relate },
+        super::source_flow::SourceFlowCaller {
+            session,
+            context: super::source_flow::SourceFlowContext { host, globals, options, diagnostics },
+        },
     )
 }
 
@@ -38120,6 +38135,47 @@ fn missing_source_identifier_diagnostic(
         .ok_or(SourceCheckError::Provenance(
             SourceCheckProvenanceError::MissingNode(expression.node),
         ))?;
+    let mut ancestor = expression.node;
+    let mut ancestors = HashSet::new();
+    loop {
+        if !ancestors.insert(ancestor) {
+            return Err(SourceCheckError::Class(expression.node));
+        }
+        let record = host.node(ancestor).ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingNode(ancestor),
+        ))?;
+        if record.kind == SyntaxKind::ClassDeclaration {
+            let owner = host
+                .bound_file(ancestor)
+                .and_then(|bound| bound.symbol(ancestor))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .ok_or(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MissingDeclarationSymbol(ancestor),
+                ))?;
+            if let Some(grammar) = plan_class_grammar_diagnostics(store, host, owner)
+                && grammar.declaration == ancestor
+                && grammar.symbol == owner
+                && let Some(diagnostic) = grammar
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.code == 2662 && diagnostic.node == expression.node)
+            {
+                return Ok(CanonicalCheckerDiagnostic {
+                    node: Some(expression.node),
+                    range_override: diagnostic.range_override,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(2662).ok_or(SourceCheckError::MissingDiagnostic(2662))?,
+                        diagnostic.arguments.clone(),
+                    ),
+                    related_information: Vec::new(),
+                });
+            }
+        }
+        let Some(parent) = record.parent else {
+            break;
+        };
+        ancestor = NodeRef::new(ancestor.arena, ancestor.file, parent);
+    }
     let mut namespace_host = host.name_resolver_host(store)?;
     let namespace_symbol =
         CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut namespace_host)
@@ -40835,7 +40891,7 @@ fn check_expression_type_with_capture_context_worker(
             } else {
                 let mut demanded = HashSet::new();
                 loop {
-                    match super::source_properties::check_direct_source_property_with_class_context_and_relation(
+                    match super::source_properties::check_direct_source_property_with_class_context_and_source(
                         store,
                         host,
                         Some(global_types),
@@ -40844,11 +40900,8 @@ fn check_expression_type_with_capture_context_worker(
                         receiver.result,
                         session,
                         class_flow.as_deref_mut().map(|context| &mut context.flow),
-                        Some(&mut |store, session, left, right| {
-                            source_type_is_related_to(
-                                store, host, global_types, options, session, diagnostics,
-                                left, right, super::RelationKind::Comparable,
-                            )
+                        Some(super::source_flow::SourceFlowContext {
+                            host, globals: global_types, options, diagnostics,
                         }),
                     ) {
                         Ok(checked) => break checked,
@@ -42799,8 +42852,6 @@ fn check_expression_type_with_capture_context_worker(
                 })?
             };
             if let Some(context) = class_flow.as_deref_mut()
-                && (context.flow.has_property_conditions()
-                    || context.flow.is_expression_condition_call(call.node))
                 && !context.flow.is_predicate_condition_call(call.node)
             {
                 context
@@ -43509,6 +43560,7 @@ fn check_planned_source_class(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    declared_types: &HashMap<SemanticSymbolId, TypeId>,
     type_import_execution: &SourceTypeImportExecution<'_>,
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
@@ -43563,16 +43615,21 @@ fn check_planned_source_class(
             .and_then(|links| links.resolved_type)
             .ok_or(SourceCheckError::Class(declaration))?;
         let mut base_flow_types = flow_types.clone();
+        let mut base_declared_types = function_declaration_flow_types(flow_types, declared_types);
         if base_flow_types
             .insert(class.source.symbol(), value_type)
             .is_some()
         {
             return Err(SourceCheckError::Class(declaration));
         }
+        if base_declared_types.insert(class.source.symbol(), value_type).is_some() {
+            return Err(SourceCheckError::Class(declaration));
+        }
         let mut state = ClassBodyExecutionState {
             class,
             prepared: &prepared,
             base_flow_types,
+            base_declared_types,
             type_import_capabilities,
             active: HashSet::new(),
             checked: HashSet::new(),
@@ -43835,6 +43892,7 @@ fn check_planned_class_body(
             .bound_file(body.declaration)
             .ok_or(SourceCheckError::Class(body.declaration))?;
         let mut base = state.base_flow_types.clone();
+        let mut declared = state.base_declared_types.clone();
         for parameter in &body.parameters {
             let cached = store
                 .value_symbol_links(parameter.symbol)
@@ -43847,6 +43905,9 @@ fn check_planned_class_body(
                 return Err(SourceCheckError::Class(parameter.declaration));
             }
             if base.insert(parameter.symbol, type_).is_some() {
+                return Err(SourceCheckError::Class(parameter.declaration));
+            }
+            if declared.insert(parameter.symbol, type_).is_some() {
                 return Err(SourceCheckError::Class(parameter.declaration));
             }
             publish_expression_type(store, parameter.name_node, type_)?;
@@ -43875,7 +43936,9 @@ fn check_planned_class_body(
                 );
             }
         }
-        let flow = ClassInitializationFrame::new(body, &planned.flow, bound, access.clone(), base)
+        let mut flow = ClassInitializationFrame::new(body, &planned.flow, bound, access.clone(), base)
+            .map_err(|error| class_body_flow_error(body.declaration, error))?;
+        flow.set_declared_entry_types(store, &declared)
             .map_err(|error| class_body_flow_error(body.declaration, error))?;
         let is_async = super::classes::source_class_body_is_async(store, host, body)
             .map_err(|error| SourcePlanner::class_plan_error(body.declaration, error))?;
@@ -45306,7 +45369,10 @@ fn check_class_statements(
                     )?;
                     context
                         .flow
-                        .complete_assignment(variable.declaration, variable.symbol, current)
+                        .complete_declaration(
+                            store, host, variable.declaration, variable.symbol,
+                            assignment.declared_type, current,
+                        )
                         .map_err(|error| class_body_flow_error(variable.declaration, error))?;
                 }
             }
@@ -50142,7 +50208,7 @@ fn check_assignment_with_expression_type(
         ));
     }
     let limit_mark = session.limit_event_mark();
-    let assignable = source_type_is_assignable_to(
+    let relation = source_type_is_related_to_with_recovery(
         store,
         host,
         global_types,
@@ -50151,7 +50217,14 @@ fn check_assignment_with_expression_type(
         diagnostics,
         source_type,
         target,
+        super::RelationKind::Assignable,
+        super::relater::SourceRelationRecoveryDisposition::Assignment,
+        Some(limit_mark),
     )?;
+    let assignable = relation.related();
+    if relation.completion_mark().is_some_and(|mark| session.limit_event_occurred_since(mark)) {
+        return Err(RelationUnavailable::UnsupportedStructuredType(source_type).into());
+    }
     if session.limit_event_occurred_since(limit_mark) {
         merge_retry_diagnostic(
             diagnostics,
@@ -50166,7 +50239,7 @@ fn check_assignment_with_expression_type(
         );
     }
     if !assignable {
-        let staged = super::object_diagnostics::diagnostics_for_failed_assignment(
+        let staged = super::object_diagnostics::diagnostics_for_failed_assignment_with_mapped_recovery(
             store,
             host,
             global_types,
@@ -50176,6 +50249,7 @@ fn check_assignment_with_expression_type(
             fallback_node,
             options,
             session,
+            &relation,
         )?;
         let union_detail = union_assignment_detail(
             store,
@@ -50250,6 +50324,9 @@ fn check_assignment_with_expression_type(
             }
             merge_retry_diagnostic(diagnostics, diagnostic);
         }
+    }
+    if relation.completion_mark().is_some_and(|mark| session.limit_event_occurred_since(mark)) {
+        return Err(RelationUnavailable::UnsupportedStructuredType(source_type).into());
     }
     Ok((
         CheckedAssignment {
@@ -50793,6 +50870,79 @@ fn source_type_is_assignable_to(
 }
 
 #[allow(clippy::too_many_arguments)] // Each retry keeps the caller's source state and session.
+/// Reads one real receiver property and services its existing source demands.
+pub(super) fn source_object_property_by_name(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    receiver: TypeId,
+    name: EscapedNameRef<'_>,
+) -> Result<Option<super::relater::ResolvedOwnProperty>, SourceCheckError> {
+    let limit_mark = session.limit_event_mark();
+    let mut resolved_members = HashSet::new();
+    let mut resolved_properties = HashSet::new();
+    let mut resolved_returns = HashSet::new();
+    loop {
+        if session.limit_event_occurred_since(limit_mark) {
+            return Err(RelationUnavailable::UnresolvedStructuredMembers(receiver).into());
+        }
+        let mut read_diagnostics = CanonicalCheckerDiagnostics::default();
+        let result = CanonicalTypeQuery::new_with_global_types_and_session(
+            store, host, global_types, options, session, &mut read_diagnostics,
+        )?
+        .get_property_of_source_object(receiver, name);
+        merge_retry_diagnostics(diagnostics, read_diagnostics);
+        if session.limit_event_occurred_since(limit_mark) {
+            return result.and_then(|_| {
+                Err(RelationUnavailable::UnresolvedStructuredMembers(receiver).into())
+            });
+        }
+        match result {
+            Err(SourceCheckError::RelationUnavailable(
+                error @ (RelationUnavailable::UnresolvedStructuredMembers(_)
+                | RelationUnavailable::UnresolvedPropertyType(_)),
+            )) => {
+                retry_source_generic_member_failure(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    error,
+                    &[receiver],
+                    &mut resolved_members,
+                    &mut resolved_properties,
+                )?;
+            }
+            Err(SourceCheckError::RelationUnavailable(
+                error @ RelationUnavailable::UnresolvedSignatureReturn(signature),
+            )) => {
+                if !resolved_returns.insert(signature) {
+                    return Err(error.into());
+                }
+                let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
+                let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store, host, global_types, options, session, &mut return_diagnostics,
+                )?
+                .get_return_type_of_signature(signature);
+                merge_retry_diagnostics(diagnostics, return_diagnostics);
+                let type_ = result?;
+                if store.intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| type_ == bootstrap.error_type)
+                {
+                    return Err(error.into());
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Each retry keeps the caller's source state and session.
 pub(super) fn source_type_is_related_to(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -50804,6 +50954,26 @@ pub(super) fn source_type_is_related_to(
     target: TypeId,
     relation: super::RelationKind,
 ) -> Result<bool, SourceCheckError> {
+    source_type_is_related_to_with_recovery(
+        store, host, global_types, options, session, diagnostics, source, target, relation,
+        super::relater::SourceRelationRecoveryDisposition::Unavailable, None,
+    ).map(|result| result.related())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_type_is_related_to_with_recovery(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    source: TypeId,
+    target: TypeId,
+    relation: super::RelationKind,
+    disposition: super::relater::SourceRelationRecoveryDisposition,
+    assignment_mark: Option<super::instantiate::InstantiationLimitEventMark>,
+) -> Result<super::relater::SourceAssignmentRelationResult, SourceCheckError> {
     if relation == super::RelationKind::Assignable
         && authenticated_active_recursive_arrow_query(store, host, target)
     {
@@ -50842,7 +51012,7 @@ pub(super) fn source_type_is_related_to(
                 resolved?;
             }
         }
-        return Ok(assignable);
+        return Ok(super::relater::SourceAssignmentRelationResult::ordinary(assignable));
     }
     prepare_source_array_relation_target(
         store,
@@ -50864,17 +51034,17 @@ pub(super) fn source_type_is_related_to(
     let mut resolved_members = HashSet::new();
     let mut resolved_properties = HashSet::new();
     loop {
-        let result = match super::source_properties::relate_source_types_with_global_this(
-            store,
-            host,
-            global_types,
-            options,
-            source,
-            target,
-            relation,
-            session,
-            diagnostics,
-        ) {
+        let comparison = if disposition == super::relater::SourceRelationRecoveryDisposition::Assignment {
+            super::source_properties::relate_source_types_for_assignment(
+                store, host, global_types, options, source, target, session, diagnostics,
+                assignment_mark.expect("the assignment entry retains its original mark"),
+            )
+        } else {
+            super::source_properties::relate_source_types_with_global_this(
+                store, host, global_types, options, source, target, relation, session, diagnostics,
+            ).map(super::relater::SourceAssignmentRelationResult::ordinary)
+        };
+        let result = match comparison {
             Ok(assignable) => Ok(assignable),
             Err(super::relater::SourceRelationError::Relation(error)) => Err(error),
             Err(super::relater::SourceRelationError::Source(error)) => {
@@ -50882,6 +51052,11 @@ pub(super) fn source_type_is_related_to(
             }
         };
         match result {
+            Err(error) if disposition == super::relater::SourceRelationRecoveryDisposition::Assignment
+                && assignment_mark.is_some_and(|mark| session.limit_event_occurred_since(mark)) =>
+            {
+                return Err(error.into());
+            }
             Ok(assignable) => return Ok(assignable),
             Err(RelationUnavailable::UnresolvedSignatureReturn(signature)) => {
                 if !resolved_signatures.insert(signature) {
@@ -50983,7 +51158,7 @@ pub(super) fn source_type_is_related_to(
                 && relation == super::RelationKind::Assignable
                 && is_unconstrained_jsdoc_callable_type_parameter(store, host, target) =>
             {
-                return Ok(false);
+                return Ok(super::relater::SourceAssignmentRelationResult::ordinary(false));
             }
             Err(error) => {
                 let error = error.into();
@@ -61966,42 +62141,44 @@ fn filtered_assignment_union_type(
         let origin_record = store
             .type_payload(origin)
             .ok_or(RelationUnavailable::Type(origin))?;
-        let TypeData::Union(origin_union) = origin_record.data() else {
-            return Err(RelationUnavailable::MalformedUnion(origin).into());
-        };
-        let origin_constituents = origin_union.union.types.clone();
-        let mut filtered_origin = Vec::with_capacity(origin_constituents.len());
-        for constituent in &origin_constituents {
-            let flags = store
-                .type_payload(*constituent)
-                .map(TypeRecord::flags)
-                .ok_or(RelationUnavailable::Type(*constituent))?;
-            if flags.intersects(TypeFlags::UNION)
-                || assignment_type_maybe_assignable_to(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    diagnostics,
-                    assigned_constituents,
-                    *constituent,
-                )?
-            {
-                filtered_origin.push(*constituent);
+        if let TypeData::Union(origin_union) = origin_record.data() {
+            let origin_constituents = origin_union.union.types.clone();
+            let mut filtered_origin = Vec::with_capacity(origin_constituents.len());
+            for constituent in &origin_constituents {
+                let flags = store
+                    .type_payload(*constituent)
+                    .map(TypeRecord::flags)
+                    .ok_or(RelationUnavailable::Type(*constituent))?;
+                if flags.intersects(TypeFlags::UNION)
+                    || assignment_type_maybe_assignable_to(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        assigned_constituents,
+                        *constituent,
+                    )?
+                {
+                    filtered_origin.push(*constituent);
+                }
             }
+            if origin_constituents.len() - filtered_origin.len()
+                == declared_constituents.len() - reduced.len()
+            {
+                return store
+                    .expression_union_type_with_global_types(
+                        global_types,
+                        &filtered_origin,
+                        UnionReduction::None,
+                    )
+                    .map_err(Into::into);
+            }
+        } else if !matches!(origin_record.data(), TypeData::Index(_)) {
+            return Err(RelationUnavailable::MalformedUnion(origin).into());
         }
-        if origin_constituents.len() - filtered_origin.len()
-            == declared_constituents.len() - reduced.len()
-        {
-            return store
-                .expression_union_type_with_global_types(
-                    global_types,
-                    &filtered_origin,
-                    UnionReduction::None,
-                )
-                .map_err(Into::into);
-        }
+        // A validated keyof origin is not a constituent list. Use the reduced keys.
     }
 
     store
@@ -62024,10 +62201,11 @@ fn map_fresh_boolean_type(
         let origin_record = store
             .type_payload(origin)
             .ok_or(RelationUnavailable::Type(origin))?;
-        let TypeData::Union(origin_union) = origin_record.data() else {
-            return Err(RelationUnavailable::MalformedUnion(origin).into());
-        };
-        origin_union.union.types.clone()
+        match origin_record.data() {
+            TypeData::Union(origin_union) => origin_union.union.types.clone(),
+            TypeData::Index(_) => union.union.types.clone(),
+            _ => return Err(RelationUnavailable::MalformedUnion(origin).into()),
+        }
     } else {
         union.union.types.clone()
     };
@@ -81644,6 +81822,7 @@ fn check_source_plan(
                     session,
                     diagnostics,
                     &current_flow_types,
+                    &top_level_declared_types,
                     &type_import_execution,
                     &type_import_capabilities,
                     &mut deferred,
@@ -142741,6 +142920,7 @@ class Foo2 {
         let base = HashMap::from([(class.source.symbol(), class_type)]);
         let capabilities = HashMap::new();
         let mut state = ClassBodyExecutionState {
+            base_declared_types: Default::default(),
             class: &class,
             prepared: &prepared,
             base_flow_types: base.clone(),

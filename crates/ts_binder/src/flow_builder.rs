@@ -802,14 +802,12 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
     }
 
     fn bind_catch_clause(&mut self, node_id: NodeId) {
-        let (variable_declaration, block) = match self.ast.get(node_id).map(|node| &node.data) {
-            Some(NodeData::CatchClause(data)) => (data.variable_declaration, data.block),
-            _ => {
-                self.mark_unsupported(node_id, UnsupportedFlowKind::TryStatement);
-                self.bind_children_without_flow(node_id);
-                return;
-            }
+        let Some(NodeData::CatchClause(data)) = self.ast.get(node_id).map(|node| &node.data) else {
+            self.mark_unsupported(node_id, UnsupportedFlowKind::TryStatement);
+            self.bind_children_without_flow(node_id);
+            return;
         };
+        let (variable_declaration, block) = (data.variable_declaration, data.block);
         if let Some(variable_declaration) = variable_declaration {
             self.bind_node(variable_declaration);
         }

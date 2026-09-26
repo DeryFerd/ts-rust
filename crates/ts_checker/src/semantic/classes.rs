@@ -8388,10 +8388,30 @@ pub(super) fn check_class_implementation_compatibility(
             return Err(SourceCheckError::Class(implementation.expression));
         }
         if implementation.source_type
-            && !super::interface_heritage::interface_base_has_statically_known_members(
-                store,
-                target_type,
-            )?
+            && !{
+                let _query_observation = super::store::CurrentQueryRequestScope::enter(
+                    "static_members.class_implements",
+                    || super::store::CurrentQueryFrame {
+                        request: Some(implementation.node),
+                        owner: Some(declaration),
+                        expression: Some(implementation.expression),
+                        receiver: Some(target_type),
+                        context: super::store::CurrentQueryContext {
+                            host: Some(true),
+                            globals: Some(true),
+                            options: Some(true),
+                            diagnostics: Some(true),
+                            session: Some(true),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
+                super::interface_heritage::interface_base_has_statically_known_members(
+                    store,
+                    target_type,
+                )?
+            }
         {
             diagnostics.lookup_or_issue(
                 Some(implementation.node),
@@ -8467,10 +8487,30 @@ pub(super) fn check_class_implementation_compatibility(
                     return Err(SourceCheckError::Class(implementation.expression));
                 }
                 // Resolving members can reduce a cold intersection to never.
-                if !super::interface_heritage::interface_base_has_statically_known_members(
-                    store,
-                    target_type,
-                )? {
+                if !{
+                    let _query_observation = super::store::CurrentQueryRequestScope::enter(
+                        "static_members.class_reduced_intersection",
+                        || super::store::CurrentQueryFrame {
+                            request: Some(implementation.node),
+                            owner: Some(declaration),
+                            expression: Some(implementation.expression),
+                            receiver: Some(target_type),
+                            context: super::store::CurrentQueryContext {
+                                host: Some(true),
+                                globals: Some(true),
+                                options: Some(true),
+                                diagnostics: Some(true),
+                                session: Some(true),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    );
+                    super::interface_heritage::interface_base_has_statically_known_members(
+                        store,
+                        target_type,
+                    )?
+                } {
                     diagnostics.lookup_or_issue(
                         Some(implementation.node),
                         Diagnostic::new(

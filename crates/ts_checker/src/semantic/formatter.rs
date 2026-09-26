@@ -388,6 +388,30 @@ pub(super) fn type_to_string_with_host_global_types_and_flags(
     )
 }
 
+pub(super) fn type_to_string_with_checker_options_and_flags(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: super::production::CanonicalCheckerOptions,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<String, TypeDisplayUnavailable> {
+    type_to_string_with_read_context_and_flags(store, Some(host), Some(global_types),
+        Some(options), None, type_id, flags)
+}
+
+pub(super) fn type_to_string_with_source_and_flags(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: &dyn super::conditional_types::ConditionalBranchSource,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<String, TypeDisplayUnavailable> {
+    type_to_string_with_read_context_and_flags(store, Some(host), Some(global_types),
+        None, Some(source), type_id, flags)
+}
+
 fn type_to_string_with_optional_context_and_flags(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
@@ -395,7 +419,23 @@ fn type_to_string_with_optional_context_and_flags(
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
 ) -> Result<String, TypeDisplayUnavailable> {
-    let mut state = DisplayState::default();
+    type_to_string_with_read_context_and_flags(store, host, global_types, None, None, type_id, flags)
+}
+
+fn type_to_string_with_read_context_and_flags(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    checker_options: Option<super::production::CanonicalCheckerOptions>,
+    source: Option<&dyn super::conditional_types::ConditionalBranchSource>,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<String, TypeDisplayUnavailable> {
+    let mut state = DisplayState {
+        checker_options,
+        source: source.zip(global_types).map(|(source, globals)| (globals, source)),
+        ..DisplayState::default()
+    };
     let mut visiting = HashSet::new();
     let displayed = display_type_worker(
         store,
@@ -470,7 +510,7 @@ pub fn get_type_names_for_assignability_error_with_flags(
     flags: CanonicalTypeFormatFlags,
 ) -> Result<AssignabilityErrorDisplay, TypeDisplayUnavailable> {
     get_type_names_for_assignability_error_with_optional_host_and_flags(
-        store, None, None, source, target, flags,
+        store, None, None, None, source, target, flags,
     )
 }
 
@@ -513,6 +553,7 @@ pub fn get_type_names_for_assignability_error_with_global_types_and_flags(
         store,
         None,
         Some(global_types),
+        None,
         source,
         target,
         flags,
@@ -534,6 +575,7 @@ pub(super) fn get_type_names_for_assignability_error_with_host_and_flags(
         store,
         Some(host),
         None,
+        None,
         source,
         target,
         flags,
@@ -552,9 +594,25 @@ pub(super) fn get_type_names_for_assignability_error_with_host_global_types_and_
         store,
         Some(host),
         Some(global_types),
+        None,
         source,
         target,
         flags,
+    )
+}
+
+/// Keeps actual checker options on each readonly display in the existing pair algorithm.
+pub(super) fn get_type_names_for_assignability_error_with_checker_options_and_flags(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: super::production::CanonicalCheckerOptions,
+    source: TypeId,
+    target: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<AssignabilityErrorDisplay, TypeDisplayUnavailable> {
+    get_type_names_for_assignability_error_with_optional_host_and_flags(
+        store, Some(host), Some(global_types), Some(options), source, target, flags,
     )
 }
 
@@ -786,6 +844,7 @@ fn get_type_names_for_assignability_error_with_optional_host_and_flags(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
     global_types: Option<&CanonicalGlobalTypes>,
+    checker_options: Option<super::production::CanonicalCheckerOptions>,
     source: TypeId,
     target: TypeId,
     flags: CanonicalTypeFormatFlags,
@@ -797,10 +856,12 @@ fn get_type_names_for_assignability_error_with_optional_host_and_flags(
     let target_record = store
         .type_payload(target)
         .ok_or(TypeDisplayUnavailable::Type(target))?;
-    let mut source_name =
-        type_to_string_with_optional_context_and_flags(store, host, global_types, source, flags)?;
-    let mut target_name =
-        type_to_string_with_optional_context_and_flags(store, host, global_types, target, flags)?;
+    let mut source_name = type_to_string_with_read_context_and_flags(
+        store, host, global_types, checker_options, None, source, flags,
+    )?;
+    let mut target_name = type_to_string_with_read_context_and_flags(
+        store, host, global_types, checker_options, None, target, flags,
+    )?;
 
     // The pinned fallback asks for fully qualified names when the ordinary
     // strings collide. Primitive/literal names are invariant under that flag.
@@ -843,10 +904,12 @@ fn get_type_names_for_assignability_error_with_optional_host_and_flags(
             let host = host.ok_or(TypeDisplayUnavailable::UniqueSymbolName(generalized))?;
             source_name = display_unique_symbol_reference(store, host, generalized)?;
         } else {
-            source_name = type_to_string_with_optional_context_and_flags(
+            source_name = type_to_string_with_read_context_and_flags(
                 store,
                 host,
                 global_types,
+                checker_options,
+                None,
                 generalized,
                 flags,
             )?;
@@ -865,7 +928,7 @@ fn display_type_worker(
     global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let record = store
@@ -1140,7 +1203,7 @@ fn display_conditional_type_alias(
     global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let projection = conditional_alias_projection_with_array_targets(
@@ -1195,7 +1258,7 @@ fn display_index_type(
     global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let record = store
@@ -1241,7 +1304,9 @@ fn display_index_type(
 }
 
 #[derive(Default)]
-struct DisplayState {
+struct DisplayState<'source> {
+    checker_options: Option<super::production::CanonicalCheckerOptions>,
+    source: Option<(&'source CanonicalGlobalTypes, &'source dyn super::conditional_types::ConditionalBranchSource)>,
     approximate_length: usize,
     truncating: bool,
     // Fresh method parameters are named only while their validated signature is in scope.
@@ -1250,7 +1315,7 @@ struct DisplayState {
     format_flags: CanonicalTypeFormatFlags,
 }
 
-impl DisplayState {
+impl DisplayState<'_> {
     fn add(&mut self, amount: usize) {
         self.approximate_length = self.approximate_length.saturating_add(amount);
     }
@@ -1316,7 +1381,7 @@ fn display_object_type(
     type_id: TypeId,
     record: &TypeRecord,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if record.flags() != TypeFlags::OBJECT {
@@ -1999,7 +2064,7 @@ fn display_source_object(
     type_id: TypeId,
     object: &SourceObjectDisplay,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if state.check_truncation(flags) {
@@ -2127,7 +2192,7 @@ fn display_source_index_only_type(
     global_types: Option<&CanonicalGlobalTypes>,
     index: &SourceIndexOnlyDisplay,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if state.check_truncation(flags) {
@@ -2161,7 +2226,7 @@ fn append_source_index_signature(
     global_types: Option<&CanonicalGlobalTypes>,
     index: &SourceIndexOnlyDisplay,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
     result: &mut String,
 ) -> Result<(), TypeDisplayUnavailable> {
@@ -2201,7 +2266,7 @@ fn display_validated_enum_value(
     host: &DeclaredTypeHost<'_>,
     type_id: TypeId,
     record: &TypeRecord,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
 ) -> Result<Option<String>, TypeDisplayUnavailable> {
     let Some(owner) = record.symbol() else {
         return Ok(None);
@@ -2332,7 +2397,7 @@ fn display_source_class_method_overloads(
     type_id: TypeId,
     overloads: &SourceClassMethodOverloads,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if !visiting.insert(type_id) {
@@ -2619,7 +2684,7 @@ fn display_declared_method_signatures(
     projection: &CallableSetProjection,
     style: DeclaredMethodDisplayStyle,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let type_id = projection.owner;
@@ -2949,7 +3014,7 @@ fn append_declared_method_type_parameters(
     owner: TypeId,
     signature: SignatureId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
     result: &mut String,
 ) -> Result<(), TypeDisplayUnavailable> {
@@ -3126,7 +3191,7 @@ fn display_source_file_module_name(
     host: &DeclaredTypeHost<'_>,
     type_id: TypeId,
     owner: SemanticSymbolId,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if state.location.is_some() {
         let name = display_location_symbol_name(store, host, owner, SymbolFlags::VALUE, state)?;
@@ -3157,7 +3222,7 @@ fn display_validated_module_namespace(
     host: &DeclaredTypeHost<'_>,
     type_id: TypeId,
     record: &TypeRecord,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
 ) -> Result<Option<String>, TypeDisplayUnavailable> {
     let source_function = store
         .source_callable_provenance(type_id)
@@ -3529,7 +3594,7 @@ fn display_validated_class_type(
     host: &DeclaredTypeHost<'_>,
     type_id: TypeId,
     record: &TypeRecord,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
 ) -> Result<Option<String>, TypeDisplayUnavailable> {
     let Some(symbol) = record.symbol() else {
         return Ok(None);
@@ -3648,7 +3713,7 @@ fn display_mapped_type_alias(
     global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let record = store
@@ -3672,15 +3737,6 @@ fn display_mapped_type_alias(
             != Some(declared_type)
         || mapped
             .type_parameter
-            .is_none_or(|type_| store.type_payload(type_).is_none())
-        || mapped
-            .constraint_type
-            .is_none_or(|type_| store.type_payload(type_).is_none())
-        || mapped
-            .template_type
-            .is_none_or(|type_| store.type_payload(type_).is_none())
-        || mapped
-            .modifiers_type
             .is_none_or(|type_| store.type_payload(type_).is_none())
         || mapped
             .name_type
@@ -3726,9 +3782,20 @@ fn display_mapped_type_alias(
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
 
-    let identity = store
-        .mapped_alias_display_identity(type_id, symbol)
-        .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+    let identity = if let Some(identity) = store.complete_any_display_identity(
+        type_id, host, global_types, state.checker_options, state.source,
+    ).map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))? {
+        identity
+    } else {
+        store.mapped_alias_display_identity(type_id, symbol)
+            .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
+    };
+    if !identity.deferred_operands
+        && [mapped.constraint_type, mapped.template_type, mapped.modifiers_type]
+            .into_iter().any(|operand| operand.is_none_or(|type_| store.type_payload(type_).is_none()))
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
     for owner in [symbol, identity.symbol] {
         let owner_record = store
             .symbol(owner)
@@ -3804,7 +3871,7 @@ fn display_generic_source_callable(
     global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if !matches!(
@@ -3887,7 +3954,7 @@ fn append_source_signature_type_parameters(
     type_id: TypeId,
     signature_id: SignatureId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
     result: &mut String,
 ) -> Result<(), TypeDisplayUnavailable> {
@@ -3972,7 +4039,7 @@ fn display_source_overload_set(
     global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if !matches!(
@@ -4064,7 +4131,7 @@ fn display_declared_construct_signatures(
     global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let record = store
@@ -4187,7 +4254,7 @@ fn append_source_signature_parameters(
     owner: TypeId,
     signature: SignatureId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
     result: &mut String,
 ) -> Result<(), TypeDisplayUnavailable> {
@@ -4303,7 +4370,7 @@ fn append_validated_signature_parameters(
     signature: SignatureId,
     parameter_types: &[TypeId],
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
     result: &mut String,
 ) -> Result<(), TypeDisplayUnavailable> {
@@ -4517,7 +4584,7 @@ fn display_tuple_type(
     global_types: Option<&CanonicalGlobalTypes>,
     tuple: TupleShape<'_>,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if !visiting.insert(tuple.type_()) {
@@ -4607,7 +4674,7 @@ fn display_direct_generic_reference(
     global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let reference = validate_direct_generic_reference(store, type_id)
@@ -5424,7 +5491,7 @@ fn append_function_type_parameters(
     global_types: Option<&CanonicalGlobalTypes>,
     owner: TypeId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
     result: &mut String,
 ) -> Result<(), TypeDisplayUnavailable> {
@@ -6102,7 +6169,7 @@ fn display_single_call_signature(
     global_types: Option<&CanonicalGlobalTypes>,
     projection: &ValidatedSingleCallSignatureDisplay,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let properties =
@@ -6211,7 +6278,7 @@ fn display_signature_return(
     signature: SignatureId,
     return_type: TypeId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let signature = store
@@ -6279,7 +6346,7 @@ fn display_array_type(
     element_type: TypeId,
     readonly: bool,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if !visiting.insert(type_id) {
@@ -6340,7 +6407,7 @@ fn display_interface_name(
     host: Option<&DeclaredTypeHost<'_>>,
     type_id: TypeId,
     record: &TypeRecord,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let TypeData::Interface(interface) = record.data() else {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
@@ -7689,7 +7756,7 @@ fn display_structural_properties(
     record: &TypeRecord,
     proof: StructuralObjectProof,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let structured = record
@@ -7741,7 +7808,7 @@ fn append_structural_properties(
     type_id: TypeId,
     properties: &[StructuralPropertyDisplay],
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
     result: &mut String,
 ) -> Result<(), TypeDisplayUnavailable> {
@@ -7790,7 +7857,7 @@ fn append_structural_property(
     global_types: Option<&CanonicalGlobalTypes>,
     property: &StructuralPropertyDisplay,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
     result: &mut String,
 ) -> Result<(), TypeDisplayUnavailable> {
@@ -7853,7 +7920,7 @@ fn display_property_type(
     property_type: TypeId,
     optional: bool,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if optional
@@ -8376,7 +8443,7 @@ fn display_symbol_name(
     host: Option<&DeclaredTypeHost<'_>>,
     type_id: TypeId,
     symbol: SemanticSymbolId,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if state.location.is_some()
         && !store
@@ -8438,7 +8505,7 @@ fn display_location_symbol_name(
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
     meaning: SymbolFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let location = state
         .location
@@ -8562,7 +8629,7 @@ fn display_intersection_type(
     global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let record = store
@@ -8632,7 +8699,7 @@ fn display_type_arguments(
     global_types: Option<&CanonicalGlobalTypes>,
     arguments: &[TypeId],
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if arguments.is_empty() {
@@ -8665,7 +8732,7 @@ fn display_union_type(
     global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     ensure_acyclic_union_graph(store, type_id)?;
@@ -8748,7 +8815,7 @@ fn display_alias_name(
     host: Option<&DeclaredTypeHost<'_>>,
     type_id: TypeId,
     alias: TypeAliasId,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let alias_record = store
         .type_alias(alias)
@@ -8924,7 +8991,7 @@ fn display_union_list(
     union: TypeId,
     types: &[TypeId],
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if types.len() == 1 {
@@ -8989,7 +9056,7 @@ fn display_union_constituent(
     global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
-    state: &mut DisplayState,
+    state: &mut DisplayState<'_>,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let displayed =
@@ -14049,16 +14116,27 @@ mod tests {
             .unwrap();
         assert_eq!(identity.symbol, alias);
         assert_eq!(identity.arguments.len(), 2);
-        context
-            .store()
-            .validate_pick_mapped_alias_instantiation(
-                alias,
-                declared,
-                parameters,
+        let projection = crate::semantic::mapped_types::supported_mapped_alias_projection(
+            context.store(),
+            declared,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(projection.alias, alias);
+        assert_eq!(projection.declared_type, declared);
+        assert_eq!(&projection.type_parameters, parameters);
+        assert_eq!(
+            crate::semantic::mapped_types::cached_supported_mapped_alias_instance(
+                context.store(),
+                &projection,
                 &identity.arguments,
-                type_,
+                (alias, &identity.arguments),
+                None,
             )
-            .unwrap();
+            .unwrap(),
+            Some(type_)
+        );
         let before = alias_display_cache_counts(&context);
         for _ in 0..2 {
             assert_eq!(

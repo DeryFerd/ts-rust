@@ -1425,3 +1425,390 @@ fn hono_bound_types_keep_schema_and_optional_input_identities() {
         }
     }
 }
+
+#[test]
+fn source_object_union_defaults_keep_their_proof_during_conditional_replay() {
+    // The pinned Go checker accepts this source and reports TS2322 for its
+    // string annotation. Both requests below omit all type arguments.
+    const POSITIVE: &str = concat!(
+        "export type Left = { value: number; left: boolean };\n",
+        "export type Right = { value: number; right: boolean };\n",
+        "export type Defaulted<T = Left | Right> = T;\n",
+        "export type Choose<C> = C extends true ? Defaulted : never;\n",
+        "export declare const seed: Defaulted;\n",
+        "export declare const value: Choose<true>;\n",
+        "export const check: number = value.value;\n",
+    );
+    for negative in [false, true] {
+        let source = if negative {
+            POSITIVE.replace("check: number", "check: string")
+        } else {
+            POSITIVE.to_owned()
+        };
+        let parsed = parse_source_file(&source);
+        let mut checker = local_context(&parsed);
+        let node_ref = |node| NodeRef::new(parsed.arena.id(), SOURCE, node);
+        let variable = |expected: &str| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::VariableDeclaration(data) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &parsed.arena.get(data.name)?.data else {
+                        return None;
+                    };
+                    (name.text == expected).then(|| {
+                        (
+                            node_ref(data.name),
+                            node_ref(data.type_.unwrap()),
+                            data.initializer.map(node_ref),
+                        )
+                    })
+                })
+                .unwrap_or_else(|| panic!("missing variable {expected}"))
+        };
+        let (_, seed_node, _) = variable("seed");
+        let (_, value_node, _) = variable("value");
+        let (check_name, _, read) = variable("check");
+        let read = read.unwrap();
+        assert_eq!(text_at(&parsed, &source, read), "value.value");
+        assert_eq!(text_at(&parsed, &source, check_name), "check");
+        assert_eq!(
+            parsed.arena.get(check_name.node).unwrap().range.start.get(),
+            306
+        );
+        let NodeData::TypeReferenceNode(seed) = &parsed.arena.get(seed_node.node).unwrap().data
+        else {
+            panic!("seed must have a written alias reference");
+        };
+        assert!(seed.type_arguments.is_none());
+        let defaulted = alias(&parsed, SOURCE, "Defaulted");
+        let default_node = defaulted.parameters[0].default.unwrap();
+        let NodeData::UnionTypeNode(union) = &parsed.arena.get(default_node.node).unwrap().data
+        else {
+            panic!("the default must retain its written union");
+        };
+        let [left, right] = union.types.nodes.as_slice() else {
+            panic!("the default must reference two source objects");
+        };
+        let references = [node_ref(*left), node_ref(*right)];
+        let objects = [alias(&parsed, SOURCE, "Left"), alias(&parsed, SOURCE, "Right")];
+        let children = [objects[0].body, objects[1].body];
+        for ((reference, object), name) in references.into_iter().zip(&objects).zip(["Left", "Right"]) {
+            assert_parent(&parsed, reference, default_node);
+            assert_eq!(text_at(&parsed, &source, reference), name);
+            let NodeData::TypeReferenceNode(data) = &parsed.arena.get(reference.node).unwrap().data
+            else {
+                panic!("the default must contain named references");
+            };
+            assert!(data.type_arguments.is_none());
+            assert_parent(&parsed, object.body, object.declaration);
+            assert!(matches!(
+                parsed.arena.get(object.body.node).unwrap().data,
+                NodeData::TypeLiteralNode(_)
+            ));
+        }
+
+        assert_eq!(checker.store().source_alias_default_graph_count(), 0);
+        let seed_type = checker.get_type_from_type_node(seed_node).unwrap();
+        assert_eq!(checker.store().source_alias_default_graph_count(), 1);
+        assert_checked(&checker, SOURCE, false);
+        let raw_default = checker.get_type_from_type_node(default_node).unwrap();
+        let formal = assert_formal(&mut checker, &parsed, &defaulted, 0, None, Some(raw_default));
+        assert_eq!(query_alias(&mut checker, &defaulted), formal);
+        let TypeData::TypeParameter(parameter) =
+            checker.store().type_payload(formal).unwrap().data()
+        else {
+            panic!("the alias keeps its declared formal");
+        };
+        assert_eq!(parameter.resolved_default_type, Some(raw_default));
+        let TypeData::Union(data) = checker.store().type_payload(raw_default).unwrap().data()
+        else {
+            panic!("the raw default must remain a union");
+        };
+        let mut raw_members = data.union.types.clone();
+        let object_types = children.map(|node| checker.get_type_from_type_node(node).unwrap());
+        for ((reference, object), type_) in references.into_iter().zip(&objects).zip(object_types) {
+            assert_eq!(checker.get_type_from_type_node(reference), Ok(type_));
+            assert_eq!(query_alias(&mut checker, object), type_);
+            assert_alias_identity(&checker, object, type_);
+        }
+        let mut expected_members = object_types.to_vec();
+        raw_members.sort_unstable();
+        expected_members.sort_unstable();
+        assert_eq!(raw_members, expected_members);
+        assert_ne!(object_types[0], object_types[1]);
+        let bootstrap = checker.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let boolean = bootstrap.boolean_type;
+        for ((node, type_), extra) in children.into_iter().zip(object_types).zip(["left", "right"]) {
+            assert_eq!(
+                checker.store().type_payload(type_).unwrap().symbol(),
+                Some(symbol(&checker, node))
+            );
+            assert_property(&mut checker, &parsed, node, type_, "value", number, false);
+            assert_property(&mut checker, &parsed, node, type_, extra, boolean, false);
+        }
+
+        // Alias request keys use the written arguments, not the filled defaults.
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+        hasher.update(&0_u64.to_le_bytes());
+        hasher.update(&[0]);
+        let request_key = ts_checker::semantic::CacheHashKey::new(hasher.digest128());
+        let owner = symbol(&checker, defaulted.declaration);
+        let request = |checker: &CanonicalCheckerContext<'_>| {
+            checker
+                .store()
+                .type_alias_links(owner)
+                .unwrap()
+                .instantiations
+                .as_ref()
+                .unwrap()
+                .get(&request_key)
+                .copied()
+        };
+        assert_eq!(request(&checker), Some(seed_type));
+        assert_eq!(
+            checker.store().type_node_links(value_node).and_then(|links| links.resolved_type),
+            None
+        );
+        let value_type = checker.get_type_from_type_node(value_node).unwrap();
+        for request_type in [seed_type, value_type] {
+            let TypeData::Union(data) = checker.store().type_payload(request_type).unwrap().data()
+            else {
+                panic!("both alias requests must retain the complete object union");
+            };
+            let mut members = data.union.types.clone();
+            members.sort_unstable();
+            assert_eq!(members, expected_members);
+        }
+        checker.check_source_file(SOURCE).unwrap();
+        assert_checked(&checker, SOURCE, true);
+        assert_eq!(checker.get_type_at_location(read), Ok(number));
+        assert_eq!(checker.diagnostics().as_slice().len(), usize::from(negative));
+        if negative {
+            assert_diagnostic(&checker, 0, check_name, 2322, &["number", "string"]);
+        }
+        let warm = snapshot(&checker, &[(SOURCE, &parsed)]);
+        let graph_count = checker.store().source_alias_default_graph_count();
+        assert_eq!(graph_count, 1);
+        for _ in 0..2 {
+            assert_eq!(checker.get_type_from_type_node(seed_node), Ok(seed_type));
+            assert_eq!(checker.get_type_from_type_node(value_node), Ok(value_type));
+            assert_eq!(checker.get_type_at_location(read), Ok(number));
+            checker.recheck_source_file(SOURCE).unwrap();
+            assert_eq!(request(&checker), Some(seed_type));
+            assert_eq!(
+                checker.store().source_alias_default_graph_count(),
+                graph_count
+            );
+            assert!(snapshot(&checker, &[(SOURCE, &parsed)]) == warm);
+        }
+    }
+}
+
+#[test]
+fn mapped_alias_cache_replays_preserve_properties_and_diagnostics() {
+    const ORDINARY: &str = concat!(
+        "export type Shape = { value: number; label: string };\n",
+        "export type Copy<T> = { [K in keyof T]: T[K] };\n",
+        "export declare const seed: Copy<Shape>;\n",
+        "export declare const value: Copy<Shape>;\n",
+        "export const first: number = seed.value;\n",
+        "export const again: number = value.value;\n",
+        "export const label: string = value.label;\n",
+        "export const check: number = value.value;\n",
+    );
+    const CONDITIONAL: &str = concat!(
+        "export type Shape = { value: number; label: string };\n",
+        "export type Copy<T> = { [K in keyof T]: T[K] };\n",
+        "export type Choose<C> = C extends true ? Copy<Shape> : never;\n",
+        "export declare const seed: Copy<Shape>;\n",
+        "export declare const value: Choose<true>;\n",
+        "export const first: number = seed.value;\n",
+        "export const again: number = value.value;\n",
+        "export const label: string = value.label;\n",
+        "export const check: number = value.value;\n",
+    );
+    const DEFAULT: &str = concat!(
+        "export type Shape = { value: number; label: string };\n",
+        "export type Copy<T = Shape> = { [K in keyof T]: T[K] };\n",
+        "export type Choose<C> = C extends true ? Copy : never;\n",
+        "export declare const seed: Copy;\n",
+        "export declare const value: Choose<true>;\n",
+        "export const first: number = seed.value;\n",
+        "export const again: number = value.value;\n",
+        "export const label: string = value.label;\n",
+        "export const check: number = value.value;\n",
+    );
+    // Pinned Go gives no positive diagnostics and exactly TS2322 on each check.
+    for (case, positive, check_start, defaulted) in [
+        ("ordinary", ORDINARY, 321, false),
+        ("conditional", CONDITIONAL, 384, false),
+        ("defaulted", DEFAULT, 378, true),
+    ] {
+        for negative in [false, true] {
+            for source_first in [false, true] {
+                let source = if negative {
+                    positive.replace("check: number", "check: string")
+                } else {
+                    positive.to_owned()
+                };
+                let parsed = parse_source_file(&source);
+                let mut checker = local_context(&parsed);
+                let node_ref = |node| NodeRef::new(parsed.arena.id(), SOURCE, node);
+                let variable = |expected: &str| {
+                    parsed
+                        .arena
+                        .iter()
+                        .find_map(|(_, record)| {
+                            let NodeData::VariableDeclaration(data) = &record.data else {
+                                return None;
+                            };
+                            let NodeData::Identifier(name) = &parsed.arena.get(data.name)?.data
+                            else {
+                                return None;
+                            };
+                            (name.text == expected).then(|| {
+                                (
+                                    node_ref(data.name),
+                                    node_ref(data.type_.unwrap()),
+                                    data.initializer.map(node_ref),
+                                )
+                            })
+                        })
+                        .unwrap_or_else(|| panic!("missing variable {expected}"))
+                };
+                let (_, seed_node, _) = variable("seed");
+                let (_, value_node, _) = variable("value");
+                let (check_name, _, _) = variable("check");
+                let reads =
+                    ["first", "again", "label", "check"].map(|name| variable(name).2.unwrap());
+                for (read, text) in reads.into_iter().zip([
+                    "seed.value",
+                    "value.value",
+                    "value.label",
+                    "value.value",
+                ]) {
+                    assert_eq!(text_at(&parsed, &source, read), text);
+                }
+                assert_eq!(
+                    parsed.arena.get(check_name.node).unwrap().range.start.get(),
+                    check_start
+                );
+                let copy = alias(&parsed, SOURCE, "Copy");
+                assert!(matches!(
+                    parsed.arena.get(copy.body.node).unwrap().data,
+                    NodeData::MappedTypeNode(_)
+                ));
+                assert_parent(&parsed, copy.body, copy.declaration);
+                if defaulted {
+                    let choose = alias(&parsed, SOURCE, "Choose");
+                    let NodeData::ConditionalTypeNode(data) =
+                        &parsed.arena.get(choose.body.node).unwrap().data
+                    else {
+                        panic!("Choose must retain its conditional");
+                    };
+                    for reference in [seed_node, node_ref(data.true_type)] {
+                        let NodeData::TypeReferenceNode(data) =
+                            &parsed.arena.get(reference.node).unwrap().data
+                        else {
+                            panic!("Copy must remain a written reference");
+                        };
+                        assert!(data.type_arguments.is_none());
+                    }
+                }
+                if source_first {
+                    checker.check_source_file(SOURCE).unwrap();
+                }
+                let seed_type = checker.get_type_from_type_node(seed_node).unwrap();
+                assert_checked(&checker, SOURCE, source_first);
+                let owner = symbol(&checker, copy.declaration);
+                let copy_links = checker.store().type_alias_links(owner).unwrap().clone();
+                let declared = copy_links.declared_type.unwrap();
+                let TypeData::Mapped(original) =
+                    checker.store().type_payload(declared).unwrap().data()
+                else {
+                    panic!("Copy must retain its mapped declaration");
+                };
+                assert_eq!(original.declaration, Some(copy.body));
+                let TypeData::Mapped(instance) =
+                    checker.store().type_payload(seed_type).unwrap().data()
+                else {
+                    panic!("Copy<Shape> must be a mapped instance");
+                };
+                assert_eq!(instance.declaration, Some(copy.body));
+                assert_eq!(instance.object.target, Some(declared));
+                assert!(instance.object.mapper.is_some());
+                assert_ne!(seed_type, declared);
+                if defaulted {
+                    let default = copy.parameters[0].default.unwrap();
+                    let default_type = checker.get_type_from_type_node(default).unwrap();
+                    let formal = copy_links.type_parameters.as_ref().unwrap()[0];
+                    let TypeData::TypeParameter(data) =
+                        checker.store().type_payload(formal).unwrap().data()
+                    else {
+                        panic!("Copy must retain its declared formal");
+                    };
+                    assert_eq!(data.resolved_default_type, Some(default_type));
+                    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+                    hasher.update(&0_u64.to_le_bytes());
+                    hasher.update(&[0]);
+                    let key = ts_checker::semantic::CacheHashKey::new(hasher.digest128());
+                    assert_eq!(
+                        copy_links.instantiations.as_ref().unwrap().get(&key),
+                        Some(&seed_type)
+                    );
+                }
+                assert_eq!(
+                    checker.get_type_from_type_node(seed_node),
+                    Ok(seed_type),
+                    "case={case}, negative={negative}, source_first={source_first}"
+                );
+                if !source_first {
+                    assert_eq!(
+                        checker
+                            .store()
+                            .type_node_links(value_node)
+                            .and_then(|links| links.resolved_type),
+                        None
+                    );
+                }
+                let value_type = checker.get_type_from_type_node(value_node).unwrap();
+                assert_eq!(value_type, seed_type);
+                assert!(checker.store().type_alias_links(owner) == Some(&copy_links));
+                checker.check_source_file(SOURCE).unwrap();
+                assert_checked(&checker, SOURCE, true);
+                let bootstrap = checker.store().intrinsic_bootstrap().unwrap();
+                let expected = [
+                    bootstrap.number_type,
+                    bootstrap.number_type,
+                    bootstrap.string_type,
+                    bootstrap.number_type,
+                ];
+                for (read, type_) in reads.into_iter().zip(expected) {
+                    assert_eq!(checker.get_type_at_location(read), Ok(type_));
+                }
+                assert_eq!(
+                    checker.diagnostics().as_slice().len(),
+                    usize::from(negative)
+                );
+                if negative {
+                    assert_diagnostic(&checker, 0, check_name, 2322, &["number", "string"]);
+                }
+                let warm = snapshot(&checker, &[(SOURCE, &parsed)]);
+                for _ in 0..2 {
+                    assert_eq!(checker.get_type_from_type_node(seed_node), Ok(seed_type));
+                    assert_eq!(checker.get_type_from_type_node(value_node), Ok(value_type));
+                    for (read, type_) in reads.into_iter().zip(expected) {
+                        assert_eq!(checker.get_type_at_location(read), Ok(type_));
+                    }
+                    checker.recheck_source_file(SOURCE).unwrap();
+                    assert!(snapshot(&checker, &[(SOURCE, &parsed)]) == warm);
+                }
+            }
+        }
+    }
+}

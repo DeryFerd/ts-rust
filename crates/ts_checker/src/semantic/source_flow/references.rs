@@ -43,6 +43,7 @@ struct CheckedOperand {
     reference: Option<ReferenceKey>,
     type_: TypeId,
     symbol: Option<SemanticSymbolId>,
+    access: Option<(NodeRef, bool)>,
 }
 
 pub(super) struct CheckedReferenceCondition {
@@ -246,6 +247,7 @@ impl CheckedReferenceCondition {
                     .and_then(|links| links.resolved_symbol)
                     != operand.symbol
                 || reference_key(store, host, bound, body, operand.node)? != operand.reference
+                || discriminants::access_node(store, host, operand.node)? != operand.access
             {
                 return Err(SourceFlowInvariant::UnknownCondition(self.expression).into());
             }
@@ -259,6 +261,7 @@ impl CheckedReferenceCondition {
         flow: FlowRef,
         flags: FlowFlags,
         reference: &ReferenceKey,
+        declared: Option<TypeId>,
         mut current: TypeId,
         assume_true: bool,
     ) -> Result<TypeId, SourceFlowError> {
@@ -266,11 +269,14 @@ impl CheckedReferenceCondition {
             store,
             globals: Some(globals),
             mut session,
-            mut relate,
+            mut context,
         }) = types.read_types()
         else {
             return Err(SourceFlowUnsupported::FlowKind { flow, flags }.into());
         };
+        if store.intrinsic_bootstrap().is_some_and(|bootstrap| current == bootstrap.never_type) {
+            return Ok(current);
+        }
         match self.syntax {
             ConditionSyntax::Truthiness { negated, .. } => {
                 if self.operands[0].reference.as_ref() == Some(reference) {
@@ -292,7 +298,13 @@ impl CheckedReferenceCondition {
                 }
             }
             ConditionSyntax::Equality { strict, equal, .. } => {
+                let direct = (0..2).find(|&index| {
+                    self.operands[index].reference.as_ref() == Some(reference)
+                });
                 for index in 0..2 {
+                    if direct.is_some_and(|direct| direct != index) {
+                        continue;
+                    }
                     let Some(operand) = self.operands[index].reference.as_ref() else {
                         continue;
                     };
@@ -305,6 +317,30 @@ impl CheckedReferenceCondition {
                     } else {
                         continue;
                     };
+                    if let Some(name) = discriminant && context.is_some() {
+                        let Some((access, _)) = self.operands[index].access else { continue; };
+                        let declared = declared.ok_or(SourceFlowInvariant::InvalidClassProperty(
+                            self.operands[index].node,
+                        ))?;
+                        let (Some(session), Some(context)) =
+                            (session.as_deref_mut(), context.as_mut())
+                        else {
+                            return Err(SourceFlowUnsupported::FlowKind { flow, flags }.into());
+                        };
+                        if !context.discriminant_property_access(
+                            store, session, access, declared, current, name,
+                        ).map_err(SourceFlowError::Source)? {
+                            continue;
+                        }
+                        return context.narrow_discriminant_equality(
+                            store, session, access, current, name,
+                            self.operands[1 - index].type_, strict, assume_true == equal,
+                        ).map_err(|error| match error {
+                            SourceEqualityNarrowingError::Source(error) => SourceFlowError::Source(error),
+                            SourceEqualityNarrowingError::Union(error) => SourceFlowError::Join { flow, error },
+                            error => SourceFlowInvariant::EqualityNarrowing(error).into(),
+                        });
+                    }
                     current = narrow_by_equality_worker(
                         store,
                         globals,
@@ -314,7 +350,7 @@ impl CheckedReferenceCondition {
                         assume_true == equal,
                         discriminant,
                         session.as_deref_mut(),
-                        relate.as_deref_mut(),
+                        context.as_mut(),
                     )
                     .map_err(|error| match error {
                         SourceEqualityNarrowingError::Source(error) => SourceFlowError::Source(error),
@@ -323,6 +359,7 @@ impl CheckedReferenceCondition {
                         }
                         error => SourceFlowInvariant::EqualityNarrowing(error).into(),
                     })?;
+                    break;
                 }
             }
         }
@@ -336,6 +373,7 @@ impl CheckedReferenceCondition {
         flow: FlowRef,
         flags: FlowFlags,
         mut snapshot: SourceFlowSnapshot,
+        declared_types: &SourceFlowTypes,
         selected: Option<SemanticSymbolId>,
         assume_true: bool,
         caller: &mut Option<SourceFlowCaller<'_, '_>>,
@@ -351,15 +389,16 @@ impl CheckedReferenceCondition {
                 root: ClassPropertyFlowReceiver::Named(symbol),
                 path: Vec::new(),
             };
-            let (session, relate) = match caller.as_mut() {
-                Some(caller) => (Some(&mut *caller.session), Some(&mut *caller.relate)),
+            let (session, context) = match caller.as_mut() {
+                Some(caller) => (Some(&mut *caller.session), Some(caller.context.reborrow())),
                 None => (None, None),
             };
             let narrowed = self.narrow(
-                &mut ClassPropertyFlowTypes::with_source(store, Some(globals), session, relate),
+                &mut ClassPropertyFlowTypes::with_source(store, Some(globals), session, context),
                 flow,
                 flags,
                 &reference,
+                declared_types.get(&symbol).copied(),
                 current,
                 assume_true,
             )?;
@@ -455,6 +494,7 @@ impl ClassInitializationFrame<'_, '_> {
                 symbol: store
                     .symbol_node_links(node)
                     .and_then(|links| links.resolved_symbol),
+                access: discriminants::access_node(store, host, node)?,
             });
         }
         let checked = CheckedReferenceCondition {
@@ -491,7 +531,7 @@ impl ClassInitializationFrame<'_, '_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::semantic) fn reference_read_type_with_relation(
+    pub(in crate::semantic) fn reference_read_type_with_source(
         &self,
         store: &mut CanonicalTypeMapperStore,
         host: &DeclaredTypeHost<'_>,
@@ -499,9 +539,9 @@ impl ClassInitializationFrame<'_, '_> {
         session: &mut InstantiationSession,
         access: NodeRef,
         declared: TypeId,
-        relate: &mut SourceFlowRelation<'_>,
+        source_context: SourceFlowContext<'_, '_>,
     ) -> Result<TypeId, SourceFlowError> {
-        self.reference_read_type_worker(store, host, globals, session, access, declared, Some(relate))
+        self.reference_read_type_worker(store, host, globals, session, access, declared, Some(source_context))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -513,7 +553,7 @@ impl ClassInitializationFrame<'_, '_> {
         session: &mut InstantiationSession,
         access: NodeRef,
         declared: TypeId,
-        relate: Option<&mut SourceFlowRelation<'_>>,
+        source_context: Option<SourceFlowContext<'_, '_>>,
     ) -> Result<TypeId, SourceFlowError> {
         let Some(reference) = reference_key(store, host, self.flow.bound, self.body, access)?
         else {
@@ -533,7 +573,7 @@ impl ClassInitializationFrame<'_, '_> {
             return Err(SourceFlowInvariant::InvalidClassProperty(access).into());
         }
         self.reference_type_at(
-            &mut ClassPropertyFlowTypes::with_source(store, Some(globals), Some(session), relate),
+            &mut ClassPropertyFlowTypes::with_source(store, Some(globals), Some(session), source_context),
             host,
             flow,
             &reference,
@@ -659,6 +699,7 @@ impl ClassInitializationFrame<'_, '_> {
                             flow,
                             node.flags,
                             reference,
+                            Some(declared),
                             current,
                             kind == SourceFlowKind::TrueCondition,
                         )?

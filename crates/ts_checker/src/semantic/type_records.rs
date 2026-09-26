@@ -2582,6 +2582,14 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         )
     }
 
+    /// Checks the record header without resolving its members or operands.
+    pub(super) fn type_record_header_is_valid(&self, type_: TypeId) -> bool {
+        self.type_payload(type_).is_some_and(|record| {
+            Self::valid_type_flags_for_record(record, record.flags)
+                && Self::valid_object_flags_for_record(record, record.object_flags)
+        })
+    }
+
     fn valid_type_flags_for_record(record: &TypeRecord, flags: TypeFlags) -> bool {
         match &record.data {
             TypeData::Intrinsic(_) => Self::valid_intrinsic_flags(flags),

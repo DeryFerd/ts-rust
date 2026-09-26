@@ -564,31 +564,6 @@ fn matching_inherited_property_contract(
                 && matching_interface_method_contract(store, first, second))
 }
 
-/// The callers authenticate the property key and retained index before this check.
-/// Applicable properties keep the required-property and exact-type boundary.
-fn inherited_index_property_compatible(
-    store: &CanonicalTypeMapperStore,
-    index: IndexInfoId,
-    name: EscapedNameRef<'_>,
-    property_type: TypeId,
-    optional: bool,
-) -> Option<bool> {
-    let info = store.index_info(index)?;
-    let bootstrap = store.intrinsic_bootstrap()?;
-    store.type_payload(property_type)?;
-    store.type_payload(info.value_type())?;
-    let string_index = info.key_type() == bootstrap.string_type;
-    if !string_index && info.key_type() != bootstrap.number_type {
-        return Some(false);
-    }
-    let applies = match name.as_utf8() {
-        Some(name) => string_index || ts_jsnum::from_string(name).to_string() == name,
-        None if name.is_late_bound() => false,
-        None => return None,
-    };
-    Some(!applies || !optional && property_type == info.value_type())
-}
-
 /// Resolves and publishes the ordered direct interface base contributions.
 ///
 /// `base_types` must match the canonical symbols retained by the syntax plan.
@@ -872,22 +847,6 @@ pub(super) fn resolve_direct_interface_members_with_declared_indexes(
                             .is_none())
         {
             return Err(invalid(plan, type_));
-        }
-        for &index in inherited_index_infos {
-            if !inherited_index_property_compatible(
-                store,
-                index,
-                record.name(),
-                *property_type,
-                property.optional,
-            )
-            .ok_or_else(|| invalid(plan, type_))?
-            {
-                return Err(PropertyObjectError::UnsupportedMember {
-                    node: plan.node,
-                    kind: SyntaxKind::InterfaceDeclaration,
-                });
-            }
         }
         let name = record.name().to_owned();
         if !seen_names.insert(name.clone()) {
@@ -1768,6 +1727,16 @@ fn validate_property_interface_with_query_context(
     )
 }
 
+/// Reads the ordered properties of a completed ordinary interface.
+pub(super) fn validated_interface_properties(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<Vec<SemanticSymbolId>> {
+    let view = validate_property_interface(store, type_, false, array_targets)?;
+    Some(view.properties)
+}
+
 /// Reads a key only after the complete nongeneric interface has been validated.
 #[allow(clippy::option_option)] // Distinguishes unavailable validation, a missing property, and a value.
 pub(super) fn validated_interface_property_by_key(
@@ -1812,6 +1781,19 @@ pub(super) fn validated_interface_property_by_key_with_query_context(
         optional: record.flags().contains(SymbolFlags::OPTIONAL),
         readonly: record.check_flags().contains(CheckFlags::READONLY),
     }))
+}
+
+pub(super) fn validated_interface_index_infos_with_query_context(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
+) -> Option<Vec<IndexInfoId>> {
+    let inherited = store.direct_interface_heritage_provenance(type_).is_some();
+    let view = validate_property_interface_with_query_context(
+        store, type_, inherited, array_targets, query,
+    )?;
+    Some(view.index_infos)
 }
 
 fn validate_property_interface_worker(
@@ -2134,21 +2116,6 @@ fn validate_property_interface_worker(
         let record = store.symbol(*property)?;
         if seen_names.insert(record.name().to_owned()) {
             expected.push(*property);
-        }
-    }
-    for &index in &inherited_index_infos {
-        for &property in &declared.properties {
-            let record = store.symbol(property)?;
-            let property_type = store.value_symbol_links(property)?.resolved_type?;
-            if !inherited_index_property_compatible(
-                store,
-                index,
-                record.name(),
-                property_type,
-                record.flags().contains(SymbolFlags::OPTIONAL),
-            )? {
-                return None;
-            }
         }
     }
     let mut expected_index_infos = declared.index_infos.clone();

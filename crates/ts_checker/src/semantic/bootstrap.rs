@@ -786,6 +786,32 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    /// Keeps explicit Array targets and the caller's session during preparation.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_type_query_types_with_array_targets_and_session(
+        &mut self,
+        strings: &[String],
+        numbers: &[Number],
+        bigints: &[PseudoBigInt],
+        union_operations: usize,
+        named_union_operations: usize,
+        targets: Option<CanonicalArrayTargets>,
+        session: Option<&mut InstantiationSession>,
+    ) -> Result<PreparedTypeQueryTypes, LiteralTypeCacheError> {
+        self.prepare_type_query_types_worker(
+            strings,
+            numbers,
+            bigints,
+            union_operations,
+            named_union_operations,
+            targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets),
+            &[],
+            0,
+            0,
+            session,
+        )
+    }
+
     pub(super) fn prepare_type_query_types_with_global_types(
         &mut self,
         strings: &[String],
@@ -7296,6 +7322,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    pub(super) fn literal_union_type_prepared_with_array_targets_and_session(
+        &mut self,
+        types: &[TypeId],
+        alias_symbol: Option<SemanticSymbolId>,
+        prepared: &mut PreparedTypeQueryTypes,
+        targets: Option<CanonicalArrayTargets>,
+        session: Option<&mut InstantiationSession>,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        self.union_type_prepared(
+            types,
+            UnionReduction::Literal,
+            alias_symbol.map(|symbol| UnionAliasCacheKey::new(symbol, &[])),
+            prepared,
+            targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets),
+            session,
+        )
+    }
+
     pub(super) fn preflight_prepared_union_constituent(
         &self,
         type_: TypeId,
@@ -7552,7 +7596,22 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         origin: TypeId,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, LiteralTypeCacheError> {
-        prepared.consume_union(self.id(), false, None)?;
+        self.literal_union_type_prepared_with_index_origin_and_array_targets(
+            types, origin, prepared, None, None,
+        )
+    }
+
+    pub(super) fn literal_union_type_prepared_with_index_origin_and_array_targets(
+        &mut self,
+        types: &[TypeId],
+        origin: TypeId,
+        prepared: &mut PreparedTypeQueryTypes,
+        targets: Option<CanonicalArrayTargets>,
+        session: Option<&mut InstantiationSession>,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        let array_validation =
+            targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets);
+        prepared.consume_union(self.id(), false, targets)?;
         if !prepared.pending_function_types.is_empty() {
             self.mark_union_cache_validation_dirty();
         }
@@ -7562,7 +7621,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         for type_ in types {
             self.validate_union_constituent_worker(
                 *type_,
-                UnionArrayValidation::None,
+                array_validation,
                 &mut HashSet::new(),
                 &mut CachedArrayWalk::default(),
                 &prepared.pending_function_types,
@@ -7578,7 +7637,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if types.len() == 1 {
             return Ok(types[0]);
         }
-        match self.plan_union_type(types, UnionReduction::Literal, None, None, false, None)? {
+        match self.plan_union_type(types, UnionReduction::Literal, None, None, false, session)? {
             UnionPlan::Existing(existing) => Ok(existing),
             UnionPlan::Union {
                 types,
@@ -7590,7 +7649,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 object_flags,
                 None,
                 Some(UnionOriginPlan::ExistingIndex(origin)),
-                UnionArrayValidation::None,
+                array_validation,
                 &prepared.pending_function_types,
             ),
             UnionPlan::Union { alias: Some(_), .. } => Err(LiteralTypeCacheError::InvalidValue),

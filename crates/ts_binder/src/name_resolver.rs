@@ -693,7 +693,8 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                         }
                     }
                     truncated |= write!(line, "\"").is_err();
-                    let length = line.position() as usize;
+                    let length = usize::try_from(line.position())
+                        .expect("alias trace fits its fixed buffer");
                     let suffix: &[u8] = if truncated {
                         b" record_truncated=1\n"
                     } else {

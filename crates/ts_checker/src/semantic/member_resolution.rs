@@ -27,10 +27,10 @@ use super::{
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     instantiate::InstantiationSession,
-    links::ValueSymbolLinks,
+    links::{DeferredSymbolLinks, ValueSymbolLinks},
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
-        validate_resolved_declared_property_object,
+        validate_resolved_closed_alias_property_object, validate_resolved_declared_property_object,
     },
     relater::ResolvedOwnProperty,
     store::SourceNodeParent,
@@ -74,6 +74,19 @@ impl ResolvedUnionProperty {
     #[must_use]
     pub const fn is_readonly(&self) -> bool {
         self.readonly
+    }
+}
+
+/// The raw lookup retains partial properties for discriminant selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedRawUnionProperty {
+    pub(super) property: ResolvedUnionProperty,
+    pub(super) check_flags: CheckFlags,
+}
+
+impl ResolvedRawUnionProperty {
+    fn readable(self) -> Option<ResolvedUnionProperty> {
+        (!self.check_flags.contains(CheckFlags::READ_PARTIAL)).then_some(self.property)
     }
 }
 
@@ -291,12 +304,15 @@ struct SourceProperty {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SyntheticPropertyPlan {
     sources: Vec<SourceProperty>,
+    index_types: Vec<TypeId>,
     optional: bool,
     readonly: bool,
     partial: bool,
     declarations: Option<Vec<NodeRef>>,
     value_declaration: Option<NodeRef>,
     parent: Option<SemanticSymbolId>,
+    name_type: Option<TypeId>,
+    synthetic_kind: CheckFlags,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -333,17 +349,18 @@ type ValidatedUnionShell = (
 struct PreparedColdQuery {
     cache: Option<PreparedSymbolTable>,
     types: Option<PreparedTypeQueryTypes>,
+    effective: Vec<TypeId>,
+    deferred: Vec<TypeId>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct EffectiveTypes {
-    values: [TypeId; 2],
-    len: usize,
+    values: Vec<TypeId>,
 }
 
 impl EffectiveTypes {
     fn as_slice(&self) -> &[TypeId] {
-        &self.values[..self.len]
+        &self.values
     }
 }
 
@@ -369,13 +386,23 @@ impl CanonicalTypeMapperStore {
         global_types: Option<&CanonicalGlobalTypes>,
         session: Option<&mut InstantiationSession>,
     ) -> Result<Option<ResolvedUnionProperty>, UnionPropertyError> {
+        self.resolve_union_property_plan_raw(plan, global_types, session)
+            .map(|property| property.and_then(ResolvedRawUnionProperty::readable))
+    }
+
+    fn resolve_union_property_plan_raw(
+        &mut self,
+        plan: &UnionPropertyPlan,
+        global_types: Option<&CanonicalGlobalTypes>,
+        session: Option<&mut InstantiationSession>,
+    ) -> Result<Option<ResolvedRawUnionProperty>, UnionPropertyError> {
         if let Some(cache) = plan.cache {
             let cached = self
                 .symbol_table(cache)
                 .ok_or(UnionPropertyError::InvalidCache(plan.union))?
                 .get(plan.name.as_ref());
             if let Some(cached) = cached {
-                return validate_cached_property(self, plan, cached);
+                return validate_cached_property_raw(self, plan, cached).map(Some);
             }
         }
 
@@ -404,7 +431,11 @@ impl CanonicalTypeMapperStore {
                     prepared.types.as_mut(),
                     global_types,
                 );
-                Ok(Some(project_source_property(*property, type_)))
+                Ok(Some(ResolvedRawUnionProperty {
+                    property: project_source_property(*property, type_),
+                    check_flags: self.symbol(property.symbol)
+                        .expect("the selected source symbol was validated").check_flags(),
+                }))
             }
             PropertyOutcome::Synthetic(synthetic) => {
                 let property = publish_synthetic_property(
@@ -416,16 +447,18 @@ impl CanonicalTypeMapperStore {
                         .as_mut()
                         .expect("a synthetic property prepared its type unions"),
                     global_types,
+                    std::mem::take(&mut prepared.effective),
+                    std::mem::take(&mut prepared.deferred),
                 );
                 assert_eq!(
                     self.insert_symbol(cache, plan.name.clone(), property.symbol),
                     Some(None)
                 );
-                if synthetic.partial {
-                    Ok(None)
-                } else {
-                    Ok(Some(property))
-                }
+                Ok(Some(ResolvedRawUnionProperty {
+                    check_flags: self.symbol(property.symbol)
+                        .expect("the synthetic symbol was published").check_flags(),
+                    property,
+                }))
             }
         }
     }
@@ -443,6 +476,23 @@ pub(super) fn resolve_source_union_property(
     union: TypeId,
     name: &str,
 ) -> Result<Option<ResolvedUnionProperty>, SourceCheckError> {
+    resolve_source_union_property_raw(
+        store, host, global_types, options, session, diagnostics, node, union, name,
+    ).map(|property| property.and_then(ResolvedRawUnionProperty::readable))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_source_union_property_raw(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    node: NodeRef,
+    union: TypeId,
+    name: &str,
+) -> Result<Option<ResolvedRawUnionProperty>, SourceCheckError> {
     let error = |error| super::source::source_union_property_error(node, error);
     let targets = CanonicalArrayTargets::from_global_types(global_types);
     let record = store
@@ -451,23 +501,14 @@ pub(super) fn resolve_source_union_property(
     let TypeData::Union(data) = record.data() else {
         return Err(error(UnionPropertyError::UnsupportedUnion(union)));
     };
-    if data.union.types.len() != 2 {
+    if data.union.types.len() < 2 {
         return Err(error(UnionPropertyError::UnsupportedUnion(union)));
     }
     let constituents = data.union.types.clone();
-    let alias = record
-        .alias()
-        .map(|alias| {
-            store
-                .type_alias(alias)
-                .and_then(super::type_records::TypeAlias::symbol)
-                .ok_or_else(|| error(UnionPropertyError::InvalidUnion(union)))
-        })
-        .transpose()?;
     store
-        .validate_cached_union_result_with_array_targets(targets, union, alias)
+        .validate_union_query_metadata(union)
         .map_err(|cause| error(cause.into()))?;
-    for constituent in constituents {
+    for &constituent in &constituents {
         if store
             .type_payload(constituent)
             .is_some_and(|record| record.flags() == TypeFlags::INTERSECTION)
@@ -486,17 +527,160 @@ pub(super) fn resolve_source_union_property(
             }
         }
     }
-    let plan = plan_union_property(
-        store,
-        union,
-        name,
-        Some(global_types),
-        Some(&mut *session),
-    )
-    .map_err(error)?;
+    let mut properties = Vec::new();
+    properties.try_reserve_exact(constituents.len())
+        .map_err(|_| error(UnionPropertyError::Capacity(union)))?;
+    let mut index_types = Vec::new();
+    index_types.try_reserve_exact(constituents.len())
+        .map_err(|_| error(UnionPropertyError::Capacity(union)))?;
+    let mut index_readonly = false;
+    let mut partial = false;
+    for constituent in constituents {
+        let property = resolve_source_union_constituent_property(
+            store, host, global_types, options, session, diagnostics, node, constituent, name,
+        )?;
+        if let Some(property) = property {
+            let record = store.symbol(property.symbol)
+                .ok_or_else(|| error(UnionPropertyError::InvalidProperty(property.symbol)))?;
+            properties.push(Some(SourceProperty {
+                symbol: property.symbol,
+                raw_type: property.type_,
+                optional: property.optional,
+                readonly: property.readonly,
+                declaration: record.declarations().and_then(|declarations| declarations.first()).copied(),
+                value_declaration: record.value_declaration(),
+                parent: record.parent(),
+            }));
+        } else if let Some(index) = resolve_source_union_constituent_index(
+            store, host, global_types, options, session, diagnostics, node, constituent, name,
+        )? {
+            index_readonly |= index.readonly;
+            index_types.push(index.value_type);
+        } else {
+            partial = true;
+        }
+    }
+    let data = store.type_payload(union).and_then(|record| match record.data() {
+        TypeData::Union(data) => Some(data),
+        _ => None,
+    }).ok_or_else(|| error(UnionPropertyError::InvalidUnion(union)))?;
+    let mut plan = finish_union_property_plan(
+        store, union, EscapedName::source(name), data.union.property_cache,
+        data.union.property_cache_without_function_property_augment, Some(targets), properties,
+    ).map_err(error)?;
+    if partial || !index_types.is_empty() {
+        let sources = match plan.outcome {
+            PropertyOutcome::Missing => Vec::new(),
+            PropertyOutcome::Borrowed(property) => vec![property],
+            PropertyOutcome::Synthetic(synthetic) => synthetic.sources,
+        };
+        plan.outcome = if sources.is_empty() {
+            PropertyOutcome::Missing
+        } else {
+            let mut synthetic = synthetic_plan(store, union, sources, partial).map_err(error)?;
+            synthetic.index_types = index_types;
+            synthetic.readonly |= index_readonly;
+            PropertyOutcome::Synthetic(synthetic)
+        };
+    }
     store
-        .resolve_union_property_plan(&plan, Some(global_types), Some(session))
+        .resolve_union_property_plan_raw(&plan, Some(global_types), Some(session))
         .map_err(error)
+}
+
+/// Selects the canonical member symbol, including cold source-owned members.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_source_union_constituent_property(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    node: NodeRef,
+    receiver: TypeId,
+    name: &str,
+) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
+    let error = |error| super::source::source_union_property_error(node, error);
+    if source_union_interface_target(store, receiver).map_err(error)?.is_some() {
+        let heritage = store.source_interface_heritage_header(receiver).is_some()
+            || store.direct_interface_heritage_provenance(receiver).is_some();
+        let mut query = super::type_nodes::CanonicalTypeQuery::new_with_global_types_and_session(
+            store, host, globals, options, session, diagnostics,
+        )?;
+        if heritage {
+            return query.get_property_of_source_interface(receiver, EscapedName::source(name).as_ref());
+        }
+        query.prepare_source_class_interface_members(receiver)?;
+        return super::object_members::resolve_object_property_by_key_with_source(
+            store, host, globals, options, receiver, EscapedName::source(name).as_ref(), session, diagnostics,
+        );
+    }
+    let flags = store.type_payload(receiver)
+        .ok_or_else(|| error(UnionPropertyError::InvalidUnion(receiver)))?.flags();
+    if flags.intersects(TypeFlags::NULL | TypeFlags::UNDEFINED) {
+        store.validate_union_constituent(receiver).map_err(|cause| error(cause.into()))?;
+        return Ok(None);
+    }
+    let targets = Some(CanonicalArrayTargets::from_global_types(globals));
+    let mode = classify_union_constituent(store, receiver, receiver, targets).map_err(error)?;
+    let property = super::object_members::resolve_object_property_by_key_with_source(
+        store, host, globals, options, receiver, EscapedName::source(name).as_ref(), session, diagnostics,
+    )?;
+    if let Some(property) = property {
+        validate_source_property(store, receiver, mode, property, EscapedName::source(name).as_ref(), targets)
+            .map_err(error)?;
+    }
+    Ok(property)
+}
+
+fn source_union_interface_target(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+) -> Result<Option<TypeId>, UnionPropertyError> {
+    let record = store.type_payload(receiver).ok_or(UnionPropertyError::InvalidUnion(receiver))?;
+    let target = match record.data() {
+        TypeData::Interface(_) => receiver,
+        TypeData::TypeReference(reference) => reference.object.target
+            .ok_or(UnionPropertyError::UnsupportedConstituent(receiver))?,
+        _ => return Ok(None),
+    };
+    let record = store.type_payload(target).ok_or(UnionPropertyError::InvalidUnion(receiver))?;
+    if matches!(record.data(), TypeData::Interface(_)) && !record.object_flags().contains(ObjectFlags::CLASS) {
+        Ok(Some(target))
+    } else {
+        Err(UnionPropertyError::UnsupportedConstituent(receiver))
+    }
+}
+
+/// Called only after a proved named miss on this same receiver.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_source_union_constituent_index(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    node: NodeRef,
+    receiver: TypeId,
+    name: &str,
+) -> Result<Option<super::object_members::ResolvedSourceIndexRead>, SourceCheckError> {
+    let error = |error| super::source::source_union_property_error(node, error);
+    if source_union_interface_target(store, receiver).map_err(error)?.is_some() {
+        return super::object_members::resolve_source_property_index_read(
+            store, host, globals, options, receiver, EscapedName::source(name).as_ref(), session, diagnostics,
+        );
+    }
+    let record = store.type_payload(receiver).ok_or_else(|| error(UnionPropertyError::InvalidUnion(receiver)))?;
+    if record.flags().intersects(TypeFlags::NULL | TypeFlags::UNDEFINED) {
+        store.validate_union_constituent(receiver).map_err(|cause| error(cause.into()))?;
+    } else {
+        // The legacy property-only proof includes an empty index table.
+        classify_union_constituent(store, receiver, receiver, Some(CanonicalArrayTargets::from_global_types(globals)))
+            .map_err(error)?;
+    }
+    Ok(None)
 }
 
 fn plan_union_property(
@@ -612,11 +796,20 @@ fn finish_union_property_plan(
     array_targets: Option<CanonicalArrayTargets>,
     properties: Vec<Option<SourceProperty>>,
 ) -> Result<UnionPropertyPlan, UnionPropertyError> {
-    let mut found = Vec::new();
+    let partial = properties.iter().any(Option::is_none);
+    let mut found: Vec<SourceProperty> = Vec::new();
     found
-        .try_reserve_exact(2)
+        .try_reserve_exact(properties.len())
         .map_err(|_| UnionPropertyError::Capacity(union))?;
-    found.extend(properties.into_iter().flatten());
+    for property in properties.into_iter().flatten() {
+        if let Some(previous) = found.iter().find(|previous| previous.symbol == property.symbol) {
+            if previous != &property {
+                return Err(UnionPropertyError::InvalidProperty(property.symbol));
+            }
+        } else {
+            found.push(property);
+        }
+    }
     let options = store
         .intrinsic_bootstrap()
         .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?
@@ -629,15 +822,11 @@ fn finish_union_property_plan(
     }
     let outcome = match found.as_slice() {
         [] => PropertyOutcome::Missing,
-        [property, other] if property.symbol == other.symbol => {
+        [property] if !partial => {
             PropertyOutcome::Borrowed(*property)
         }
         _ => {
-            if found.len() > 2 {
-                return Err(UnionPropertyError::UnsupportedUnion(union));
-            }
-            let partial = found.len() != 2;
-            PropertyOutcome::Synthetic(synthetic_plan(union, found, partial)?)
+            PropertyOutcome::Synthetic(synthetic_plan(store, union, found, partial)?)
         }
     };
     Ok(UnionPropertyPlan {
@@ -885,13 +1074,14 @@ fn validate_union_shell(
     let TypeData::Union(data) = record.data() else {
         return Err(UnionPropertyError::UnsupportedUnion(union));
     };
-    if data.union.types.len() != 2 {
+    if data.union.types.len() < 2 {
         return Err(UnionPropertyError::UnsupportedUnion(union));
     }
     let left_mode = classify_union_constituent(store, union, data.union.types[0], array_targets)?;
-    let right_mode = classify_union_constituent(store, union, data.union.types[1], array_targets)?;
-    if left_mode != right_mode {
-        return Err(UnionPropertyError::UnsupportedUnion(union));
+    for constituent in &data.union.types[1..] {
+        if left_mode != classify_union_constituent(store, union, *constituent, array_targets)? {
+            return Err(UnionPropertyError::UnsupportedUnion(union));
+        }
     }
     let mode = left_mode;
     if record.flags() != TypeFlags::UNION
@@ -899,7 +1089,7 @@ fn validate_union_shell(
         || record.symbol().is_some()
         || mode == UnionMemberMode::Raw && record.alias().is_some()
         || data.union.structured != StructuredTypeData::default()
-        || mode == UnionMemberMode::Raw && data.union.types[0] >= data.union.types[1]
+        || mode == UnionMemberMode::Raw && data.union.types.windows(2).any(|pair| pair[0] >= pair[1])
         || data.union.resolved_properties.is_some()
         || data.resolved_reduced_type.is_some()
         || data.regular_type.is_some()
@@ -967,7 +1157,23 @@ fn classify_union_constituent(
             DeclaredPropertyObjectProof::TypeLiteral | DeclaredPropertyObjectProof::Interface,
         ) => Ok(UnionMemberMode::Declared),
         DeclaredPropertyObjectValidation::NotDeclared => {
-            Err(UnionPropertyError::UnsupportedConstituent(type_))
+            match validate_resolved_closed_alias_property_object(store, type_) {
+                DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::TypeLiteral) => {
+                    // Ownership permits the read. Nested types still need the
+                    // caller's Array identities and complete cache validation.
+                    match array_targets {
+                        Some(targets) => {
+                            store.validate_union_constituent_with_array_targets(targets, type_)?;
+                        }
+                        None => store.validate_union_constituent(type_)?,
+                    }
+                    Ok(UnionMemberMode::Declared)
+                }
+                DeclaredPropertyObjectValidation::Malformed => {
+                    Err(UnionPropertyError::InvalidUnion(union))
+                }
+                _ => Err(UnionPropertyError::UnsupportedConstituent(type_)),
+            }
         }
         DeclaredPropertyObjectValidation::Malformed => Err(UnionPropertyError::InvalidUnion(union)),
     }
@@ -1249,43 +1455,48 @@ fn supported_terminal_property_type(store: &CanonicalTypeMapperStore, type_: Typ
 }
 
 fn synthetic_plan(
+    store: &CanonicalTypeMapperStore,
     union: TypeId,
     sources: Vec<SourceProperty>,
     partial: bool,
 ) -> Result<SyntheticPropertyPlan, UnionPropertyError> {
     debug_assert!(!sources.is_empty(), "a synthetic property has a source");
-    debug_assert!(
-        sources.len() <= 2,
-        "the exact leaf has at most two property sources"
-    );
     let mut declarations = Vec::new();
-    declarations
-        .try_reserve_exact(sources.len())
-        .map_err(|_| UnionPropertyError::Capacity(union))?;
     for source in &sources {
-        if let Some(declaration) = source.declaration
-            && !declarations.contains(&declaration)
-        {
-            declarations.push(declaration);
-        }
+        let source_declarations = store.symbol(source.symbol)
+            .ok_or(UnionPropertyError::InvalidProperty(source.symbol))?.declarations().unwrap_or_default();
+        declarations.try_reserve(source_declarations.len()).map_err(|_| UnionPropertyError::Capacity(union))?;
+        declarations.extend_from_slice(source_declarations);
     }
-    let first_value_declaration = sources.first().and_then(|source| source.value_declaration);
+    let first_value_source = sources.iter().find(|source| source.value_declaration.is_some());
+    let first_value_declaration = first_value_source.and_then(|source| source.value_declaration);
     let uniform_value_declaration = first_value_declaration.is_some()
         && sources
             .iter()
-            .all(|source| source.value_declaration == first_value_declaration);
+            .all(|source| source.value_declaration.is_none() || source.value_declaration == first_value_declaration);
     let value_declaration = uniform_value_declaration
         .then_some(first_value_declaration)
         .flatten();
-    let parent = value_declaration.and_then(|_| sources.first().and_then(|source| source.parent));
+    let parent = value_declaration.and_then(|_| first_value_source.and_then(|source| source.parent));
+    let name_type = sources.first().and_then(|source| store.value_symbol_links(source.symbol))
+        .and_then(|links| links.name_type);
+    let synthetic_kind = if sources.iter().all(|source| {
+        store.symbol(source.symbol).is_some_and(|record| {
+            record.flags().intersects(SymbolFlags::METHOD)
+                || record.check_flags().intersects(CheckFlags::SYNTHETIC_METHOD)
+        })
+    }) { CheckFlags::SYNTHETIC_METHOD } else { CheckFlags::SYNTHETIC_PROPERTY };
     Ok(SyntheticPropertyPlan {
         optional: sources.iter().any(|source| source.optional),
         readonly: sources.iter().any(|source| source.readonly),
         sources,
+        index_types: Vec::new(),
         partial,
         declarations: (!declarations.is_empty()).then_some(declarations),
         value_declaration,
         parent,
+        name_type,
+        synthetic_kind,
     })
 }
 
@@ -1295,10 +1506,28 @@ fn prepare_cold_query(
     global_types: Option<&CanonicalGlobalTypes>,
     session: Option<&mut InstantiationSession>,
 ) -> Result<PreparedColdQuery, UnionPropertyError> {
+    let validate_input = |type_| {
+        match plan.array_targets {
+            Some(targets) => store.validate_union_constituent_with_array_targets(targets, type_),
+            None => store.validate_union_constituent(type_),
+        }.map_err(UnionPropertyError::TypeCache)?;
+        store.is_template_pattern_literal_type(type_, &mut std::collections::HashSet::new())
+            .map_err(|_| UnionPropertyError::UnsupportedPropertyType(type_))?;
+        Ok::<_, UnionPropertyError>(())
+    };
+    match &plan.outcome {
+        PropertyOutcome::Missing => {},
+        PropertyOutcome::Borrowed(source) => validate_input(source.raw_type)?,
+        PropertyOutcome::Synthetic(synthetic) => {
+            for source in &synthetic.sources { validate_input(source.raw_type)?; }
+            for type_ in &synthetic.index_types { validate_input(*type_)?; }
+        }
+    }
     let table_count = usize::from(plan.cache.is_none());
     let symbol_count = usize::from(matches!(&plan.outcome, PropertyOutcome::Synthetic(_)));
     if !store.try_reserve_checker_symbol_allocations(symbol_count, table_count)
         || !store.try_reserve_value_symbol_links(symbol_count)
+        || !store.try_reserve_deferred_symbol_links(symbol_count)
     {
         return Err(UnionPropertyError::Capacity(plan.union));
     }
@@ -1345,7 +1574,18 @@ fn prepare_cold_query(
     } else {
         None
     };
-    Ok(PreparedColdQuery { cache, types })
+    let count = match &plan.outcome {
+        PropertyOutcome::Synthetic(synthetic) => synthetic.sources.len().checked_add(synthetic.index_types.len())
+            .ok_or(UnionPropertyError::Capacity(plan.union))?,
+        _ => 0,
+    };
+    let mut effective = Vec::new();
+    effective.try_reserve_exact(count).map_err(|_| UnionPropertyError::Capacity(plan.union))?;
+    let mut deferred = Vec::new();
+    if count > 2 {
+        deferred.try_reserve_exact(count).map_err(|_| UnionPropertyError::Capacity(plan.union))?;
+    }
+    Ok(PreparedColdQuery { cache, types, effective, deferred })
 }
 
 fn publish_property_cache(
@@ -1369,9 +1609,12 @@ fn publish_synthetic_property(
     synthetic: &SyntheticPropertyPlan,
     prepared: &mut PreparedTypeQueryTypes,
     global_types: Option<&CanonicalGlobalTypes>,
+    effective: Vec<TypeId>,
+    mut deferred: Vec<TypeId>,
 ) -> ResolvedUnionProperty {
-    let effective = materialize_effective_types(store, synthetic, prepared, global_types);
-    let check_flags = synthetic_check_flags(store, synthetic, effective.as_slice());
+    let effective = materialize_effective_types(store, synthetic, prepared, global_types, effective);
+    let check_flags = synthetic_check_flags(store, synthetic, effective.as_slice())
+        .expect("the selected property pattern types were validated before publication");
     let flags = SymbolFlags::PROPERTY
         | if synthetic.optional {
             SymbolFlags::OPTIONAL
@@ -1397,9 +1640,18 @@ fn publish_synthetic_property(
         ValueSymbolLinks {
             resolved_type: Some(type_),
             containing_type: Some(plan.union),
+            name_type: synthetic.name_type,
             ..ValueSymbolLinks::default()
         },
     ));
+    if effective.values.len() > 2 {
+        deferred.extend_from_slice(effective.as_slice());
+        assert!(store.set_deferred_symbol_links(symbol, DeferredSymbolLinks {
+            parent: Some(plan.union),
+            constituents: Some(deferred),
+            write_constituents: None,
+        }));
+    }
     ResolvedUnionProperty {
         symbol,
         type_,
@@ -1413,19 +1665,18 @@ fn materialize_effective_types(
     synthetic: &SyntheticPropertyPlan,
     prepared: &mut PreparedTypeQueryTypes,
     global_types: Option<&CanonicalGlobalTypes>,
+    mut values: Vec<TypeId>,
 ) -> EffectiveTypes {
-    let (strict, sentinel, filler) = {
+    let (strict, sentinel) = {
         let bootstrap = store
             .intrinsic_bootstrap()
             .expect("a prepared property query retains bootstrap");
         (
             bootstrap.options.strict_null_checks,
             bootstrap.undefined_or_missing_type,
-            bootstrap.never_type,
         )
     };
-    let mut values = [filler; 2];
-    for (index, source) in synthetic.sources.iter().enumerate() {
+    for source in &synthetic.sources {
         let type_ = if strict && source.optional {
             store
                 .literal_union_type_with_alias_prepared(
@@ -1435,11 +1686,11 @@ fn materialize_effective_types(
         } else {
             source.raw_type
         };
-        values[index] = type_;
+        values.push(type_);
     }
+    values.extend_from_slice(&synthetic.index_types);
     EffectiveTypes {
         values,
-        len: synthetic.sources.len(),
     }
 }
 
@@ -1476,14 +1727,21 @@ fn synthetic_check_flags(
     store: &CanonicalTypeMapperStore,
     synthetic: &SyntheticPropertyPlan,
     effective: &[TypeId],
-) -> CheckFlags {
-    let mut flags = CheckFlags::SYNTHETIC_PROPERTY | CheckFlags::CONTAINS_PUBLIC;
+) -> Result<CheckFlags, UnionPropertyError> {
+    let mut flags = synthetic.synthetic_kind | CheckFlags::CONTAINS_PUBLIC;
     if synthetic.readonly {
         flags |= CheckFlags::READONLY;
     }
     if synthetic.partial {
         flags |= CheckFlags::READ_PARTIAL;
     }
+    if !synthetic.index_types.is_empty() {
+        flags |= CheckFlags::WRITE_PARTIAL;
+    }
+    if effective.len() > 2 {
+        flags |= CheckFlags::DEFERRED_TYPE;
+    }
+    let effective = &effective[..synthetic.sources.len()];
     if effective
         .first()
         .is_some_and(|first| effective.iter().any(|type_| type_ != first))
@@ -1502,6 +1760,12 @@ fn synthetic_check_flags(
     }) {
         flags |= CheckFlags::HAS_LITERAL_TYPE;
     }
+    for type_ in effective {
+        if store.is_template_pattern_literal_type(*type_, &mut std::collections::HashSet::new())
+            .map_err(|_| UnionPropertyError::UnsupportedPropertyType(*type_))? {
+            flags |= CheckFlags::HAS_LITERAL_TYPE;
+        }
+    }
     if effective.iter().any(|type_| {
         store
             .type_payload(*type_)
@@ -1509,7 +1773,7 @@ fn synthetic_check_flags(
     }) {
         flags |= CheckFlags::HAS_NEVER_TYPE;
     }
-    flags
+    Ok(flags)
 }
 
 fn validate_cached_property(
@@ -1517,6 +1781,15 @@ fn validate_cached_property(
     plan: &UnionPropertyPlan,
     cached: SemanticSymbolId,
 ) -> Result<Option<ResolvedUnionProperty>, UnionPropertyError> {
+    validate_cached_property_raw(store, plan, cached)
+        .map(ResolvedRawUnionProperty::readable)
+}
+
+fn validate_cached_property_raw(
+    store: &CanonicalTypeMapperStore,
+    plan: &UnionPropertyPlan,
+    cached: SemanticSymbolId,
+) -> Result<ResolvedRawUnionProperty, UnionPropertyError> {
     match &plan.outcome {
         PropertyOutcome::Missing => Err(UnionPropertyError::InvalidCache(plan.union)),
         PropertyOutcome::Borrowed(source) => {
@@ -1524,7 +1797,11 @@ fn validate_cached_property(
                 return Err(UnionPropertyError::InvalidCache(plan.union));
             }
             let type_ = cached_source_read_type(store, plan.union, *source, plan.array_targets)?;
-            Ok(Some(project_source_property(*source, type_)))
+            Ok(ResolvedRawUnionProperty {
+                property: project_source_property(*source, type_),
+                check_flags: store.symbol(source.symbol)
+                    .ok_or(UnionPropertyError::InvalidProperty(source.symbol))?.check_flags(),
+            })
         }
         PropertyOutcome::Synthetic(synthetic) => {
             let effective =
@@ -1544,7 +1821,7 @@ fn validate_cached_property(
                 .ok_or(UnionPropertyError::InvalidCache(plan.union))?;
             if record.flags() != expected_flags
                 || record.check_flags()
-                    != synthetic_check_flags(store, synthetic, effective.as_slice())
+                    != synthetic_check_flags(store, synthetic, effective.as_slice())?
                 || record.name() != plan.name.as_ref()
                 || record.declarations() != synthetic.declarations.as_deref()
                 || record.value_declaration() != synthetic.value_declaration
@@ -1557,9 +1834,22 @@ fn validate_cached_property(
                     != Some(&ValueSymbolLinks {
                         resolved_type: Some(expected_type),
                         containing_type: Some(plan.union),
+                        name_type: synthetic.name_type,
                         ..ValueSymbolLinks::default()
                     })
             {
+                return Err(UnionPropertyError::InvalidCache(plan.union));
+            }
+            let deferred = store.deferred_symbol_links(cached);
+            if if effective.values.len() > 2 {
+                deferred.is_none_or(|links| {
+                    links.parent != Some(plan.union)
+                        || links.constituents.as_deref() != Some(effective.as_slice())
+                        || links.write_constituents.is_some()
+                })
+            } else {
+                deferred.is_some()
+            } {
                 return Err(UnionPropertyError::InvalidCache(plan.union));
             }
             let property = ResolvedUnionProperty {
@@ -1568,11 +1858,7 @@ fn validate_cached_property(
                 optional: synthetic.optional,
                 readonly: synthetic.readonly,
             };
-            if synthetic.partial {
-                Ok(None)
-            } else {
-                Ok(Some(property))
-            }
+            Ok(ResolvedRawUnionProperty { property, check_flags: record.check_flags() })
         }
     }
 }
@@ -1583,18 +1869,20 @@ fn cached_effective_types(
     synthetic: &SyntheticPropertyPlan,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<EffectiveTypes, UnionPropertyError> {
-    let (strict, sentinel, filler) = {
+    let (strict, sentinel) = {
         let bootstrap = store
             .intrinsic_bootstrap()
             .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
         (
             bootstrap.options.strict_null_checks,
             bootstrap.undefined_or_missing_type,
-            bootstrap.never_type,
         )
     };
-    let mut values = [filler; 2];
-    for (index, source) in synthetic.sources.iter().enumerate() {
+    let mut values = Vec::new();
+    values.try_reserve_exact(synthetic.sources.len().checked_add(synthetic.index_types.len())
+        .ok_or(UnionPropertyError::Capacity(union))?)
+        .map_err(|_| UnionPropertyError::Capacity(union))?;
+    for source in &synthetic.sources {
         let type_ = if strict && source.optional {
             cached_terminal_union_identity(
                 store, union, &[source.raw_type, sentinel], array_targets,
@@ -1602,11 +1890,11 @@ fn cached_effective_types(
         } else {
             source.raw_type
         };
-        values[index] = type_;
+        values.push(type_);
     }
+    values.extend_from_slice(&synthetic.index_types);
     Ok(EffectiveTypes {
         values,
-        len: synthetic.sources.len(),
     })
 }
 

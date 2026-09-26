@@ -376,3 +376,414 @@ fn source_keyof_distributes_over_object_unions_and_intersections() {
         warm,
     );
 }
+
+const PROPERTY_KEYS: &str = concat!(
+    "type Keys<T> = keyof T;\n",
+    "type Box<T> = { value: T };\n",
+    "type Result = Keys<Box<number>>;\n",
+    "declare const key: Result;\n",
+    "const exact: \"value\" = key;\n",
+    "const check: Result = \"value\";\n",
+);
+
+const WRAPPED_PROPERTY_KEYS: &str = concat!(
+    "type Keys<T> = keyof T;\n",
+    "type Inner<T> = ({ value: T });\n",
+    "type Outer<U> = (Inner<U>);\n",
+    "type Result = Keys<Outer<number>>;\n",
+    "declare const key: Result;\n",
+    "const exact: \"value\" = key;\n",
+    "const check: Result = \"value\";\n",
+);
+
+const SHAPE_KEYS: &str = concat!(
+    "type Keys<T> = keyof T;\n",
+    "type Shape<T> = {\n",
+    "  first: T;\n",
+    "  second: () => T;\n",
+    "  readonly third: number;\n",
+    "  fourth?: T;\n",
+    "};\n",
+    "type Result = Keys<Shape<string>>;\n",
+    "declare const key: Result;\n",
+    "const exact: \"first\" | \"second\" | \"third\" | \"fourth\" = key;\n",
+    "declare const expected: \"first\" | \"second\" | \"third\" | \"fourth\";\n",
+    "const complete: Result = expected;\n",
+    "const check: Result = \"first\";\n",
+);
+
+const DIRECT_PROPERTY_KEYS: &str = concat!(
+    "type Box<T> = { value: T };\n",
+    "type Result = keyof Box<number>;\n",
+    "declare const key: Result;\n",
+    "const exact: \"value\" = key;\n",
+    "const check: Result = \"value\";\n",
+);
+
+const UNION_PROPERTY_KEYS: &str = concat!(
+    "type Keys<T> = keyof T;\n",
+    "type Left<T> = { shared: T; left: number };\n",
+    "type Right<T> = { shared: T; right: boolean };\n",
+    "type Result = Keys<Left<string> | Right<number>>;\n",
+    "declare const key: Result;\n",
+    "const exact: \"shared\" = key;\n",
+    "const check: Result = \"shared\";\n",
+);
+
+fn property_key_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/project/property-keys.ts\""),
+                CanonicalSourceLanguage::TypeScript,
+                false,
+                CanonicalModuleState::Script,
+            ),
+        )
+        .unwrap();
+    binder
+        .bind_typescript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    CanonicalCheckerContext::new(
+        binder.finish(),
+        vec![(file, &parsed.arena)],
+        CanonicalCheckerOptions {
+            intrinsic: ts_checker::semantic::IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+            strict_function_types: true,
+            strict_property_initialization: true,
+            no_implicit_any: true,
+            no_implicit_this: true,
+            no_emit: true,
+            ..CanonicalCheckerOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+fn property_key_snapshot(
+    context: &CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    file: FileId,
+) -> impl std::fmt::Debug + PartialEq + use<> {
+    let store = context.store();
+    let bootstrap = store.intrinsic_bootstrap().unwrap();
+    (
+        [
+            store.type_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.type_alias_len(),
+            store.index_info_len(),
+            store.properties_type_cache_len(),
+            bootstrap.string_literal_cache_len(),
+            bootstrap.union_cache_len(),
+        ],
+        parsed
+            .arena
+            .iter()
+            .map(|(node, _)| {
+                let node = NodeRef::new(parsed.arena.id(), file, node);
+                (
+                    store.node_links(node).cloned(),
+                    store.type_node_links(node).cloned(),
+                    store.symbol_node_links(node).cloned(),
+                    store.signature_links(node).cloned(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        context.diagnostics().clone(),
+    )
+}
+
+fn check_property_keys(source: &str, keys: &[&str], display: &str) {
+    let valid_assignment = format!("const check: Result = {:?};", keys[0]);
+    assert_eq!(source.matches(&valid_assignment).count(), 1);
+    let invalid = source.replace(&valid_assignment, "const check: Result = \"missing\";");
+    for (source, negative) in [(source, false), (invalid.as_str(), true)] {
+        for query_first in [false, true] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(9_022);
+            let mut context = property_key_context(&parsed, file);
+            let (alias, rhs) = alias_parts(&parsed, file, &context, "Result");
+            let cold = query_first.then(|| context.get_type_from_type_node(rhs).unwrap());
+            context.check_source_file(file).unwrap();
+            assert!(
+                context
+                    .store()
+                    .source_file_links(context.source_file(file).unwrap())
+                    .unwrap()
+                    .type_checked
+            );
+            let result = alias_type(&context, alias);
+            assert_eq!(context.get_type_from_type_node(rhs), Ok(result));
+            if let Some(cold) = cold {
+                assert_eq!(cold, result);
+            }
+
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let mut expected = keys
+                .iter()
+                .map(|key| bootstrap.cached_string_literal_type(key).unwrap())
+                .collect::<Vec<_>>();
+            expected.sort_unstable();
+            if keys.len() == 1 {
+                assert_eq!(result, expected[0]);
+            } else {
+                let (mut actual, origin) = union_parts(&context, result);
+                actual.sort_unstable();
+                assert_eq!(actual, expected);
+                let NodeData::TypeReferenceNode(reference) =
+                    &parsed.arena.get(rhs.node).unwrap().data
+                else {
+                    panic!("Result must reference Keys");
+                };
+                let [argument] = reference.type_arguments.as_ref().unwrap().nodes.as_slice() else {
+                    panic!("Keys must have one argument");
+                };
+                let target = context
+                    .get_type_from_type_node(NodeRef::new(parsed.arena.id(), file, *argument))
+                    .unwrap();
+                let Some(TypeData::Index(index)) = context
+                    .store()
+                    .type_payload(origin.expect("named keys retain their receiver origin"))
+                    .map(TypeRecord::data)
+                else {
+                    panic!("key origin must be an Index type");
+                };
+                assert_eq!(index.target, target);
+            }
+
+            let errors = context.diagnostics().as_slice();
+            assert_eq!(errors.len(), usize::from(negative), "{errors:?}");
+            if negative {
+                let error = &errors[0];
+                assert_eq!(error.diagnostic.code(), 2322);
+                assert_eq!(
+                    error.diagnostic.arguments,
+                    ["\"missing\"", display]
+                );
+                let record = parsed.arena.get(error.node.unwrap().node).unwrap();
+                assert_eq!(record.kind, SyntaxKind::Identifier);
+                assert_eq!(
+                    record.range.start.get() as usize,
+                    source.rfind("check:").unwrap()
+                );
+                assert_eq!(
+                    &source[record.range.start.get() as usize..record.range.end.get() as usize],
+                    "check"
+                );
+                assert!(error.range_override.is_none());
+                assert!(error.related_information.is_empty());
+            }
+
+            let warm = property_key_snapshot(&context, &parsed, file);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(context.get_type_from_type_node(rhs), Ok(result));
+                assert_eq!(alias_type(&context, alias), result);
+                assert_eq!(property_key_snapshot(&context, &parsed, file), warm);
+            }
+        }
+    }
+}
+
+#[test]
+fn source_keyof_instantiated_property_alias_keeps_keys_and_cached_queries() {
+    check_property_keys(PROPERTY_KEYS, &["value"], "\"value\"");
+}
+
+#[test]
+fn source_keyof_wrapped_property_alias_keeps_keys_and_cached_queries() {
+    check_property_keys(WRAPPED_PROPERTY_KEYS, &["value"], "\"value\"");
+}
+
+#[test]
+fn source_keyof_instantiated_shape_keeps_all_keys_and_receiver_origin() {
+    check_property_keys(
+        SHAPE_KEYS,
+        &["first", "second", "third", "fourth"],
+        "keyof Shape<string>",
+    );
+}
+
+#[test]
+fn source_direct_keyof_instantiated_property_alias_keeps_cached_queries() {
+    check_property_keys(DIRECT_PROPERTY_KEYS, &["value"], "\"value\"");
+}
+
+#[test]
+fn source_keyof_property_alias_union_keeps_only_shared_keys() {
+    check_property_keys(UNION_PROPERTY_KEYS, &["shared"], "\"shared\"");
+}
+
+#[test]
+fn source_keyof_alias_default_maps_only_earlier_parameters() {
+    let source = concat!(
+        "type Keys<T, K = keyof T> = K;\n",
+        "type Box<T> = { value: T };\n",
+        "type Result = Keys<Box<number>>;\n",
+        "declare const key: Result;\n",
+        "const exact: \"value\" = key;\n",
+        "const check: Result = \"value\";\n",
+    );
+    check_property_keys(source, &["value"], "\"value\"");
+}
+
+#[test]
+fn source_keyof_keeps_array_context_through_preparation_and_replay() {
+    let library = "interface IArguments {} interface Object {} interface Function {} interface String {} interface Number {} interface Boolean {} interface RegExp {} interface Array<T> { length: number; [index: number]: T; } interface ReadonlyArray<T> { readonly length: number; readonly [index: number]: T; } interface ThisType<T> {}\n";
+    let consumer = concat!(
+        "type Seed = Array<number> | undefined;\n",
+        "type ReadonlySeed = ReadonlyArray<number> | undefined;\n",
+        "type Keys<T> = keyof T;\n",
+        "type Pair<T> = { first: T; second: T };\n",
+        "type Result = Keys<Pair<number>>;\n",
+        "type Plain = keyof { first: number; second: number };\n",
+        "declare const result: Result;\n",
+        "const exact: \"first\" | \"second\" = result;\n",
+        "declare const expected: \"first\" | \"second\";\n",
+        "const complete: Result = expected;\n",
+    );
+    for negative in [false, true] {
+        let consumer = if negative {
+            consumer.replace(
+                "const complete: Result = expected;",
+                "const complete: Result = \"missing\";",
+            )
+        } else {
+            consumer.to_owned()
+        };
+        let source = format!("{library}{consumer}");
+        for query_first in [false, true] {
+            let parsed = parse_source_file(&source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(9_023);
+            let mut context = property_key_context(&parsed, file);
+            let mut targets = Vec::new();
+            let mut seeds = Vec::new();
+            for (name, seed) in [("Array", "Seed"), ("ReadonlyArray", "ReadonlySeed")] {
+                let symbol = named_symbol(
+                    &parsed,
+                    file,
+                    &context,
+                    SyntaxKind::InterfaceDeclaration,
+                    name,
+                );
+                let target = context.get_declared_type_of_symbol(symbol).unwrap();
+                targets.push(target);
+                let (_, rhs) = alias_parts(&parsed, file, &context, seed);
+                let type_ = context.get_type_from_type_node(rhs).unwrap();
+                let (members, _) = union_parts(&context, type_);
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                assert_eq!(members.len(), 2);
+                assert!(members.contains(&bootstrap.undefined_type));
+                let reference = *members
+                    .iter()
+                    .find(|member| **member != bootstrap.undefined_type)
+                    .unwrap();
+                let Some(TypeData::TypeReference(reference)) = context
+                    .store()
+                    .type_payload(reference)
+                    .map(TypeRecord::data)
+                else {
+                    panic!("the seed must retain its source array reference");
+                };
+                assert_eq!(reference.object.target, Some(target));
+                assert_eq!(
+                    reference.resolved_type_arguments.as_deref(),
+                    Some(&[bootstrap.number_type][..])
+                );
+                assert_ne!(target, bootstrap.empty_generic_type);
+                seeds.push((rhs, type_));
+            }
+            assert_ne!(targets[0], targets[1]);
+
+            let (alias, rhs) = alias_parts(&parsed, file, &context, "Result");
+            let (_, plain_rhs) = alias_parts(&parsed, file, &context, "Plain");
+            let cold = query_first.then(|| {
+                (
+                    context.get_type_from_type_node(rhs).unwrap(),
+                    context.get_type_from_type_node(plain_rhs).unwrap(),
+                )
+            });
+            context.check_source_file(file).unwrap();
+            let result = context.get_type_from_type_node(rhs).unwrap();
+            let plain = context.get_type_from_type_node(plain_rhs).unwrap();
+            assert_eq!(alias_type(&context, alias), result);
+            if let Some(cold) = cold {
+                assert_eq!(cold, (result, plain));
+            }
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let mut expected =
+                ["first", "second"].map(|name| bootstrap.cached_string_literal_type(name).unwrap());
+            expected.sort_unstable();
+            for type_ in [result, plain] {
+                let (mut keys, _) = union_parts(&context, type_);
+                keys.sort_unstable();
+                assert_eq!(keys, expected);
+            }
+            assert!(union_parts(&context, plain).1.is_none());
+            let NodeData::TypeReferenceNode(reference) = &parsed.arena.get(rhs.node).unwrap().data
+            else {
+                panic!("Result must reference Keys");
+            };
+            let [argument] = reference.type_arguments.as_ref().unwrap().nodes.as_slice() else {
+                panic!("Keys must have one argument");
+            };
+            let target = context
+                .get_type_from_type_node(NodeRef::new(parsed.arena.id(), file, *argument))
+                .unwrap();
+            let origin = union_parts(&context, result)
+                .1
+                .expect("named keys retain their origin");
+            let Some(TypeData::Index(index)) =
+                context.store().type_payload(origin).map(TypeRecord::data)
+            else {
+                panic!("named keys must retain an Index origin");
+            };
+            assert_eq!(index.target, target);
+
+            let errors = context.diagnostics().as_slice();
+            assert_eq!(errors.len(), usize::from(negative), "{errors:?}");
+            if negative {
+                let error = &errors[0];
+                assert_eq!(error.diagnostic.code(), 2322);
+                assert_eq!(
+                    error.diagnostic.arguments,
+                    ["\"missing\"", "keyof Pair<number>"]
+                );
+                let node = parsed.arena.get(error.node.unwrap().node).unwrap();
+                assert_eq!(node.kind, SyntaxKind::Identifier);
+                assert_eq!(
+                    node.range.start.get() as usize,
+                    source.rfind("complete:").unwrap()
+                );
+                assert_eq!(
+                    &source[node.range.start.get() as usize..node.range.end.get() as usize],
+                    "complete"
+                );
+                assert!(error.range_override.is_none());
+                assert!(error.related_information.is_empty());
+            }
+            let warm = property_key_snapshot(&context, &parsed, file);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(context.get_type_from_type_node(rhs), Ok(result));
+                assert_eq!(context.get_type_from_type_node(plain_rhs), Ok(plain));
+                for (node, type_) in &seeds {
+                    assert_eq!(context.get_type_from_type_node(*node), Ok(*type_));
+                }
+                assert_eq!(property_key_snapshot(&context, &parsed, file), warm);
+            }
+        }
+    }
+}

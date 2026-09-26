@@ -2494,7 +2494,6 @@ pub(super) fn source_overload_compatibility_projection(
         || record
             .resolved_return_type()
             .is_some_and(|value| value != returned)
-        || cached.is_some() && record.resolved_return_type() != Some(returned)
     {
         return Err(invalid());
     }
@@ -2532,7 +2531,6 @@ pub(super) fn source_overload_compatibility_projection(
             || store.get_merged_symbol(*parameter) != Some(*parameter)
             || *links != expected
             || links.resolved_type.is_some_and(|value| value != *type_)
-            || cached.is_some() && links.resolved_type != Some(*type_)
         {
             return Err(invalid());
         }
@@ -2551,10 +2549,14 @@ pub(super) fn source_overload_compatibility_projection(
             return Err(invalid());
         }
     }
-    if cached.is_none()
-        && (!store.set_signature_resolved_return_type(erased, Some(returned))
-            || !store.set_source_overload_erased_signature(signature, erased))
+    // A relation can publish this shell before the implementation check.
+    // The mapped values above were replayed with this caller's session.
+    if store.signature(erased).is_some_and(|record| record.resolved_return_type().is_none())
+        && !store.set_signature_resolved_return_type(erased, Some(returned))
     {
+        return Err(invalid());
+    }
+    if cached.is_none() && !store.set_source_overload_erased_signature(signature, erased) {
         return Err(invalid());
     }
     Ok(ValidatedSingleCallable {

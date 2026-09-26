@@ -441,9 +441,6 @@ impl<'store, 'source> ConstraintSession<'store, 'source> {
     }
 
     fn validate_mapped_constraint(&self, type_: TypeId) -> Result<(), ConstraintError> {
-        self.store
-            .validate_deferred_mapped_type(type_)
-            .map_err(|_| ConstraintError::UnsupportedBaseType(type_))?;
         let Some(TypeData::Mapped(mapped)) = self.store.type_payload(type_).map(TypeRecord::data)
         else {
             return Err(ConstraintError::InvalidType(type_));
@@ -461,6 +458,9 @@ impl<'store, 'source> ConstraintSession<'store, 'source> {
         {
             return Err(ConstraintError::InvalidCachedConstraint(type_));
         }
+        self.store
+            .validate_deferred_mapped_type(type_)
+            .map_err(|_| ConstraintError::UnsupportedBaseType(type_))?;
         Ok(())
     }
 

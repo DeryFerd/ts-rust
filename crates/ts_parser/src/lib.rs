@@ -3627,18 +3627,22 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
-        let end = if recovered_at_statement {
+        let end = self.class_members_end(recovered_at_statement);
+        NodeList {
+            range: TextRange::new(start, end),
+            nodes: members,
+            has_trailing_comma: false,
+        }
+    }
+
+    fn class_members_end(&mut self, recovered_at_statement: bool) -> TextPos {
+        if recovered_at_statement {
             self.current.full_start
         } else if self.current.kind == SyntaxKind::CloseBraceToken {
             self.consume().range.end
         } else {
             self.error_current("Expected '}'.");
             self.current.range.start
-        };
-        NodeList {
-            range: TextRange::new(start, end),
-            nodes: members,
-            has_trailing_comma: false,
         }
     }
 

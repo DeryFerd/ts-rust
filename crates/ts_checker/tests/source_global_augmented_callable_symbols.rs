@@ -1003,3 +1003,168 @@ fn overload_namespace_property_relations_keep_the_callable_identity() {
 fn overload_callable_relations_do_not_skip_namespace_property_types() {
     check_overload_namespace_property_relation(true);
 }
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep real Array authority, both rest forms, and replay together.
+fn generic_overload_rest_erasure_keeps_fixed_tuple_elements_and_returns() {
+    let mut inputs = Inputs::with_augmentation_body(false, concat!(
+        "function spread<T extends string[]>(...values: T): number;\n",
+        "function spread(value: string, second: number, third: boolean): string;\n",
+    ));
+    inputs.source = parse_source_file(concat!(
+        "export {};\n",
+        "type Actual = typeof spread;\n",
+        "type Good = (first: boolean, second: number) => number;\n",
+        "type Wrong = (first: boolean, second: number) => boolean;\n",
+        "type GenericGood = <U extends boolean[]>(...values: [first: number, ...tail: U]) => number;\n",
+        "type GenericWrong = <U extends boolean[]>(...values: [first: number, ...tail: U]) => boolean;\n",
+    ));
+    let arena = &inputs.source.arena;
+    let provider_arena = &inputs.augmentation.arena;
+    let nodes = ["Actual", "Good", "Wrong", "GenericGood", "GenericWrong"].map(|expected| {
+        arena.iter().find_map(|(_, record)| {
+            let NodeData::TypeAliasDeclaration(alias) = &record.data else { return None };
+            let NodeData::Identifier(name) = &arena.get(alias.name)?.data else { return None };
+            (name.text == expected).then_some(NodeRef::new(arena.id(), SOURCE, alias.type_))
+        }).unwrap()
+    });
+    let mut declarations = provider_arena.iter().filter_map(|(id, record)| {
+        let NodeData::FunctionDeclaration(function) = &record.data else { return None };
+        let NodeData::Identifier(name) = &provider_arena.get(function.name?)?.data else { return None };
+        (name.text == "spread").then_some(NodeRef::new(provider_arena.id(), AUGMENTATION, id))
+    }).collect::<Vec<_>>();
+    declarations.sort_by_key(|node| provider_arena.get(node.node).unwrap().range.start);
+    assert_eq!(declarations.len(), 2);
+    let erased = |context: &CanonicalCheckerContext<'_>, original: SignatureId| {
+        let store = context.store();
+        let rows = store.signatures().filter_map(|(id, row)| {
+            (row.target() == Some(original) && row.type_parameters().is_empty()
+                && row.mapper().is_some()).then_some(id)
+        }).collect::<Vec<_>>();
+        let [id] = rows.as_slice() else { panic!("one erased rest row: {rows:?}") };
+        let row = store.signature(*id).unwrap();
+        let original = store.signature(original).unwrap();
+        assert_eq!(row.declaration(), original.declaration());
+        assert_eq!(row.min_argument_count(), original.min_argument_count());
+        assert!(row.has_rest_parameter());
+        assert!(!original.type_parameters().is_empty());
+        let mapper = row.mapper().unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        for &formal in original.type_parameters() {
+            assert_eq!(store.map_type(mapper, formal), Some(bootstrap.any_type));
+        }
+        assert_eq!(store.map_type(mapper, bootstrap.number_type), Some(bootstrap.number_type));
+        *id
+    };
+    let state = |context: &CanonicalCheckerContext<'_>| {
+        let store = context.store();
+        (
+            [store.type_len(), store.signature_len(), store.mapper_len(), store.symbol_len()],
+            context.diagnostics().clone(),
+            store.relation_state_snapshot(),
+            store.signatures().map(|(id, row)| (
+                id,
+                (row.flags(), row.min_argument_count(), row.resolved_min_argument_count(),
+                    row.declaration(), row.type_parameters().to_vec(), row.target(),
+                    row.mapper(), row.resolved_return_type(), row.resolved_type_predicate()),
+                (row.parameters().to_vec(), row.this_parameter(), row.isolated_signature_type()),
+            )).collect::<Vec<_>>(),
+            store.symbol_store().symbols().map(|(symbol, _)| {
+                (symbol, store.value_symbol_links(symbol).cloned())
+            }).collect::<Vec<_>>(),
+            [(SOURCE, arena), (AUGMENTATION, provider_arena)]
+                .into_iter()
+                .flat_map(|(file, arena)| arena.iter().map(move |(id, _)| {
+                    let node = NodeRef::new(arena.id(), file, id);
+                    (node, store.node_links(node).cloned(), store.type_node_links(node).cloned(),
+                        store.symbol_node_links(node).cloned(), store.signature_links(node).cloned())
+                }))
+                .collect::<Vec<_>>(),
+        )
+    };
+    for first in (1..5).map(Some).chain(std::iter::once(None)) {
+        let mut context = inputs.context();
+        if first.is_none() {
+            context.check_source_file(SOURCE).unwrap();
+        }
+        let types = nodes.map(|node| context.get_type_from_type_node(node).unwrap());
+        let actual = types[0];
+        let owner = symbol(&context, declarations[0]);
+        assert_eq!(value_type(&context, owner), actual);
+        assert_eq!(context.store().type_payload(actual).unwrap().symbol(), Some(owner));
+        let expected = [true, false, true, false];
+        if let Some(index) = first {
+            let TypeData::Object(object) = context.store().type_payload(actual).unwrap().data()
+            else { panic!("the source must remain a callable object") };
+            assert!(object.structured.signatures.is_none());
+            assert_eq!(context.is_type_assignable_to(actual, types[index]), Ok(expected[index - 1]));
+            assert!(!context.store().source_file_links(context.source_file(SOURCE).unwrap())
+                .is_some_and(|links| links.type_checked));
+            assert_providers_unchecked(&context);
+            assert!(context.diagnostics().is_empty());
+            assert!(context.store().type_resolution_is_empty());
+            let before = state(&context);
+            assert_eq!(context.is_type_assignable_to(actual, types[index]), Ok(expected[index - 1]));
+            assert_eq!(state(&context), before);
+        }
+        for (target, expected) in types[1..].iter().copied().zip(expected) {
+            assert_eq!(context.is_type_assignable_to(actual, target), Ok(expected));
+        }
+        let originals = declarations.iter().map(|&node| signature(&context, node))
+            .collect::<Vec<_>>();
+        let TypeData::Object(object) = context.store().type_payload(actual).unwrap().data()
+        else { unreachable!() };
+        assert_eq!(object.structured.signatures.as_deref(), Some(originals.as_slice()));
+        assert_eq!(object.structured.call_signature_count, 2);
+        let source_erased = erased(&context, originals[0]);
+        let source_rest = context.store().signature(source_erased).unwrap().parameters()[0];
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (any, number, boolean) = (bootstrap.any_type, bootstrap.number_type, bootstrap.boolean_type);
+        assert_eq!(value_type(&context, source_rest), any);
+        assert_eq!(context.store().signature(source_erased).unwrap().resolved_return_type(), Some(number));
+        for (index, expected_return) in [(3, number), (4, boolean)] {
+            let TypeData::Object(target) = context.store().type_payload(types[index]).unwrap().data()
+            else { panic!("one generic function target") };
+            let [original] = target.structured.signatures.as_deref().unwrap()
+            else { panic!("one generic target signature") };
+            let original = *original;
+            let target_erased = erased(&context, original);
+            let target_row = context.store().signature(target_erased).unwrap();
+            assert_eq!(target_row.resolved_return_type(), Some(expected_return));
+            let rest = value_type(&context, target_row.parameters()[0]);
+            let arguments = match context.store().type_payload(rest).unwrap().data() {
+                TypeData::TypeReference(reference) => reference.resolved_type_arguments.as_deref(),
+                TypeData::Tuple(tuple) => tuple.interface.reference.resolved_type_arguments.as_deref(),
+                other => panic!("the mapped target must retain its tuple: {other:?}"),
+            }.unwrap();
+            assert_eq!(arguments, [number, any].as_slice());
+            assert_eq!(context.store().signature(original).unwrap().type_parameters().len(), 1);
+        }
+        if first.is_some() {
+            assert!(!context.store().source_file_links(context.source_file(SOURCE).unwrap())
+                .is_some_and(|links| links.type_checked));
+        }
+        assert_providers_unchecked(&context);
+        assert!(context.diagnostics().is_empty());
+        assert!(context.store().type_resolution_is_empty());
+        context.check_source_file(SOURCE).unwrap();
+        for (target, expected) in types[1..].iter().copied().zip(expected) {
+            assert_eq!(context.is_type_assignable_to(actual, target), Ok(expected));
+        }
+        assert_providers_unchecked(&context);
+        let before = state(&context);
+        for _ in 0..2 {
+            context.recheck_source_file(SOURCE).unwrap();
+            assert_eq!(nodes.map(|node| context.get_type_from_type_node(node).unwrap()), types);
+            assert_eq!(value_type(&context, owner), actual);
+            assert_eq!(declarations.iter().map(|&node| signature(&context, node))
+                .collect::<Vec<_>>(), originals);
+            for (target, expected) in types[1..].iter().copied().zip(expected) {
+                assert_eq!(context.is_type_assignable_to(actual, target), Ok(expected));
+            }
+            assert_providers_unchecked(&context);
+            assert!(context.store().type_resolution_is_empty());
+            assert_eq!(state(&context), before);
+        }
+    }
+}

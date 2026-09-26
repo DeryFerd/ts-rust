@@ -2534,6 +2534,19 @@ enum SourcePropertyLookup {
     NamespaceValue,
 }
 
+enum SourcePropertyReadLookup {
+    Named(SourcePropertyLookup),
+    IndexRead,
+}
+
+enum SourcePropertyLookupValue {
+    Named(ResolvedOwnProperty),
+    IndexRead {
+        index: super::object_members::ResolvedSourceIndexRead,
+        type_: TypeId,
+    },
+}
+
 /// Proves property syntax and existing access caches before recursive receiver
 /// planning can publish semantic state.
 pub(super) fn plan_direct_source_property_syntax(
@@ -2899,13 +2912,10 @@ pub(super) fn check_source_property_with_reference_flow(
     let (mut checked, member) = check_direct_source_property_with_source_publication(
         store, host, global_types, options, plan, receiver_type, session, diagnostics, false, true,
     )?;
-    checked.type_ = flow.reference_read_type_with_relation(
+    checked.type_ = flow.reference_read_type_with_source(
         store, host, global_types, session, plan.node, checked.type_,
-        &mut |store, session, left, right| {
-            super::source::source_type_is_related_to(
-                store, host, global_types, options, session, diagnostics,
-                left, right, super::RelationKind::Comparable,
-            )
+        super::source_flow::SourceFlowContext {
+            host, globals: global_types, options, diagnostics,
         },
     ).map_err(SourcePropertyError::Flow)?;
     publish_property_links(store, plan.node, member, checked.type_)?;
@@ -3119,6 +3129,25 @@ pub(super) fn relate_source_types_with_global_this(
         .map(|result| result.related())
 }
 
+/// Uses the same query while retaining assignment-scoped native recovery data.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn relate_source_types_for_assignment(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    source: TypeId,
+    target: TypeId,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    assignment_mark: super::instantiate::InstantiationLimitEventMark,
+) -> Result<super::relater::SourceAssignmentRelationResult, SourceRelationError<DeclaredTypeError>> {
+    CanonicalTypeQuery::new_with_global_types_and_session(
+        store, host, global_types, options, session, diagnostics,
+    ).map_err(SourceRelationError::Source)?
+        .relate_source_types_for_assignment(source, target, assignment_mark)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn check_direct_source_property_with_source_mode(
     store: &mut CanonicalTypeMapperStore,
@@ -3255,14 +3284,30 @@ fn check_direct_source_property_with_source_publication(
             member,
         ));
     }
-    check_direct_source_property_worker(
+    check_direct_source_property_worker_with_index_reads(
         store,
         Some(global_types),
         plan,
         receiver_type,
         session,
         publish,
-        |store, receiver, name, lookup, session| {
+        |store, receiver, name, request, session| {
+            let lookup = match request {
+                SourcePropertyReadLookup::IndexRead => {
+                    let Some(index) = super::object_members::resolve_source_property_index_read(
+                        store, host, global_types, options, receiver,
+                        EscapedNameRef::source(name), session, diagnostics,
+                    ).map_err(SourcePropertyQueryError::Source)? else {
+                        return Ok(None);
+                    };
+                    let type_ = source_index_read_type_with_session(
+                        store, global_types, options, plan.node, index.value_type, session,
+                    ).map_err(SourcePropertyQueryError::Property)?;
+                    return Ok(Some(SourcePropertyLookupValue::IndexRead { index, type_ }));
+                }
+                SourcePropertyReadLookup::Named(lookup) => lookup,
+            };
+            let named: Result<Option<ResolvedOwnProperty>, SourcePropertyQueryError> = (|| {
             if matches!(lookup, SourcePropertyLookup::NamespaceValue) {
                 let (arena, _) = host
                     .source(plan.node)
@@ -3400,12 +3445,17 @@ fn check_direct_source_property_with_source_publication(
                         Some(TypeData::Conditional(_)))
                 }))
             });
+            let owned_mapped = matches!(
+                store.type_payload(receiver).map(TypeRecord::data),
+                Some(TypeData::Mapped(_))
+            ) && store.source_mapped_instance(receiver).is_some();
             if !property_alias
                 && !cold_interface
                 && !warm_generic_method
                 && !source_class_reference
                 && !completed_applied_class_origin
                 && !conditional_mapped
+                && !owned_mapped
                 && !target.is_some_and(|target| store.source_declared_member_names(target).is_some())
                 && store.source_interface_heritage_header(receiver).is_none()
                 && !is_cold_direct_nongeneric_interface(store, receiver)
@@ -3456,6 +3506,8 @@ fn check_direct_source_property_with_source_publication(
                 diagnostics,
             )
             .map_err(SourcePropertyQueryError::Source)
+            })();
+            named.map(|property| property.map(SourcePropertyLookupValue::Named))
         },
     )
     .inspect_err(|error| {
@@ -3839,6 +3891,57 @@ fn resolve_direct_source_own_property(
     .map_err(SourcePropertyError::from)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn resolve_named_source_property<E>(
+    store: &mut CanonicalTypeMapperStore,
+    receiver: TypeId,
+    name: &str,
+    lookup: SourcePropertyLookup,
+    session: &mut InstantiationSession,
+    node: NodeRef,
+    resolve: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore, TypeId, &str,
+        SourcePropertyReadLookup, &mut InstantiationSession,
+    ) -> Result<Option<SourcePropertyLookupValue>, E>,
+) -> Result<Option<ResolvedOwnProperty>, E>
+where
+    E: From<SourcePropertyError>,
+{
+    match resolve(store, receiver, name, SourcePropertyReadLookup::Named(lookup), session)? {
+        None => Ok(None),
+        Some(SourcePropertyLookupValue::Named(property)) => Ok(Some(property)),
+        Some(SourcePropertyLookupValue::IndexRead { .. }) => {
+            Err(SourcePropertyError::InvalidCache(node).into())
+        }
+    }
+}
+
+fn source_index_read_type_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    node: NodeRef,
+    type_: TypeId,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, SourcePropertyError> {
+    if !options.no_unchecked_indexed_access {
+        return Ok(type_);
+    }
+    let bootstrap = store.intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    if !bootstrap.options.strict_null_checks
+        || type_ == bootstrap.any_type
+        || type_ == bootstrap.error_type
+        || type_ == bootstrap.undefined_or_missing_type
+    {
+        return Ok(type_);
+    }
+    let undefined = bootstrap.undefined_or_missing_type;
+    property_union_type_with_session(
+        store, Some(global_types), node, &[type_, undefined], None, Some(session),
+    )
+}
+
 fn check_direct_source_property_worker<E>(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
@@ -3853,6 +3956,36 @@ fn check_direct_source_property_worker<E>(
         SourcePropertyLookup,
         &mut InstantiationSession,
     ) -> Result<Option<ResolvedOwnProperty>, E>,
+) -> Result<(CheckedSourceProperty, Option<SemanticSymbolId>), E>
+where
+    E: From<SourcePropertyError> + From<RelationUnavailable>,
+{
+    check_direct_source_property_worker_with_index_reads(
+        store, global_types, plan, receiver_type, session, publish,
+        |store, receiver, name, request, session| match request {
+            SourcePropertyReadLookup::Named(lookup) => {
+                resolve_own_property(store, receiver, name, lookup, session)
+                    .map(|property| property.map(SourcePropertyLookupValue::Named))
+            }
+            SourcePropertyReadLookup::IndexRead => Ok(None),
+        },
+    )
+}
+
+fn check_direct_source_property_worker_with_index_reads<E>(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+    session: &mut InstantiationSession,
+    publish: bool,
+    mut resolve_own_property: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        &str,
+        SourcePropertyReadLookup,
+        &mut InstantiationSession,
+    ) -> Result<Option<SourcePropertyLookupValue>, E>,
 ) -> Result<(CheckedSourceProperty, Option<SemanticSymbolId>), E>
 where
     E: From<SourcePropertyError> + From<RelationUnavailable>,
@@ -3967,16 +4100,20 @@ where
         Some(property) => Some(property),
         None => resolve_namespace_property(store, global_types, plan, receiver_type)?,
     };
+    let mut ordinary_lookup_missed = false;
+    let mut index_backed_read = false;
     let (type_, property, diagnostic) = if let Some(declared_property) = declared_property {
         let selected = match declared_property {
             NamespaceProperty::Present { symbol, type_ } => Some((symbol, type_)),
             NamespaceProperty::Missing => None,
-            NamespaceProperty::SourceOverload => resolve_own_property(
+            NamespaceProperty::SourceOverload => resolve_named_source_property(
                 store,
                 receiver_type,
                 &plan.name,
                 SourcePropertyLookup::NamespaceValue,
                 session,
+                plan.node,
+                &mut resolve_own_property,
             )?
             .map(|property| (property.symbol, property.type_)),
         };
@@ -4094,18 +4231,27 @@ where
                             plan,
                             receiver_type,
                             session,
-                            &mut resolve_own_property,
+                            &mut |store, receiver, name, lookup, session| {
+                                resolve_named_source_property(
+                                    store, receiver, name, lookup, session, plan.node,
+                                    &mut resolve_own_property,
+                                )
+                            },
                         )? {
                             Some(CanonicalArrayProperty::Present(property)) => Some(property),
                             Some(CanonicalArrayProperty::Missing) => None,
                             None => {
-                                resolve_own_property(
+                                let property = resolve_named_source_property(
                                     store,
                                     receiver_type,
                                     &plan.name,
                                     SourcePropertyLookup::Own,
                                     session,
-                                )?
+                                    plan.node,
+                                    &mut resolve_own_property,
+                                )?;
+                                ordinary_lookup_missed = property.is_none();
+                                property
                             }
                         },
                     },
@@ -4167,28 +4313,52 @@ where
             )
             .into());
         }
-        (
-            error_type,
-            None,
-            Some(SourcePropertyDiagnostic {
-                name_node: plan.name_node,
-                receiver_type,
-                missing_type: None,
-                suggestion: direct_property_spelling_suggestion(store, plan, receiver_type)?,
-                private_owner: None,
-                accessibility: None,
-            }),
-        )
+        let index = if ordinary_lookup_missed {
+            resolve_own_property(
+                store, receiver_type, &plan.name, SourcePropertyReadLookup::IndexRead, session,
+            )?
+        } else {
+            None
+        };
+        match index {
+            Some(SourcePropertyLookupValue::IndexRead { index, type_ }) => {
+                if index.receiver != receiver_type
+                    || store.type_payload(type_).is_none()
+                    || store.index_info(index.index).is_none_or(|info| {
+                        info.value_type() != index.value_type || info.is_readonly() != index.readonly
+                    })
+                {
+                    return Err(SourcePropertyError::InvalidCache(plan.node).into());
+                }
+                index_backed_read = true;
+                (type_, None, None)
+            }
+            Some(SourcePropertyLookupValue::Named(_)) => {
+                return Err(SourcePropertyError::InvalidCache(plan.node).into());
+            }
+            None => (
+                error_type,
+                None,
+                Some(SourcePropertyDiagnostic {
+                    name_node: plan.name_node,
+                    receiver_type,
+                    missing_type: None,
+                    suggestion: direct_property_spelling_suggestion(store, plan, receiver_type)?,
+                    private_owner: None,
+                    accessibility: None,
+                }),
+            ),
+        }
     };
 
     let type_ = if propagate_undefined && type_ != any && type_ != error_type {
-        property_union_type(
-            store,
-            global_types,
-            plan.node,
-            &[type_, undefined],
-            property,
-        )?
+        if index_backed_read {
+            property_union_type_with_session(
+                store, global_types, plan.node, &[type_, undefined], None, Some(session),
+            )?
+        } else {
+            property_union_type(store, global_types, plan.node, &[type_, undefined], property)?
+        }
     } else {
         type_
     };
@@ -4766,13 +4936,13 @@ pub(super) fn check_direct_source_property_with_class_context_and_session(
     session: &mut InstantiationSession,
     flow: Option<&mut ClassInitializationFrame<'_, '_>>,
 ) -> Result<CheckedSourceProperty, SourcePropertyError> {
-    check_direct_source_property_with_class_context_and_relation(
+    check_direct_source_property_with_class_context_and_source(
         store, host, globals, options, plan, receiver_type, session, flow, None,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn check_direct_source_property_with_class_context_and_relation(
+pub(super) fn check_direct_source_property_with_class_context_and_source(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     globals: Option<&CanonicalGlobalTypes>,
@@ -4781,7 +4951,7 @@ pub(super) fn check_direct_source_property_with_class_context_and_relation(
     receiver_type: TypeId,
     session: &mut InstantiationSession,
     flow: Option<&mut ClassInitializationFrame<'_, '_>>,
-    relate: Option<&mut super::source_flow::SourceFlowRelation<'_>>,
+    source_context: Option<super::source_flow::SourceFlowContext<'_, '_>>,
 ) -> Result<CheckedSourceProperty, SourcePropertyError> {
     if plan_class_access_context(store, host, plan.receiver.node)? != plan.class_access {
         return Err(SourcePropertyError::InvalidCache(plan.node));
@@ -4972,10 +5142,10 @@ pub(super) fn check_direct_source_property_with_class_context_and_relation(
     let mut type_ = declared_type;
     if !private_error && !matches!(member.origin, ClassMemberOrigin::Method) {
         if let Some(flow) = flow.filter(|_| !context.is_deferred()) {
-            let read = match relate {
-                Some(relate) => flow.property_read_with_relation(
+            let read = match source_context {
+                Some(source_context) => flow.property_read_with_source(
                     store, host, globals, &context, plan.node, &member,
-                    declared_type, options, session, relate,
+                    declared_type, options, session, source_context,
                 ),
                 None => flow.property_read_with_session(
                     store, host, globals, &context, plan.node, &member,

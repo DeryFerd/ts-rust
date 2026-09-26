@@ -6691,7 +6691,10 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
                 && bound.container(container) == Some(scope)
         }
         NodeData::VariableDeclaration(variable)
-            if matches!(&callee_record.data, NodeData::PropertyAccessExpression(_)) =>
+            if matches!(
+                &callee_record.data,
+                NodeData::Identifier(_) | NodeData::PropertyAccessExpression(_)
+            ) =>
         {
             let Some(SourceNodeParent::Parent(list)) = store.source_node_parent(container) else {
                 return Ok(false);
@@ -7627,6 +7630,80 @@ fn function_array_parameter_type_node(
         annotation
     };
     Some(annotation)
+}
+
+/// Authenticates one written root of an already published ordinary generic arrow.
+pub(super) fn published_arrow_artifact_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    root: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<(SourceCallablePlan, SignatureId, TypeId)>, SourceCallableError> {
+    let Some(plan) = plan_enclosing_source_callable_annotation(store, host, root, array_targets)?
+    else {
+        return Ok(None);
+    };
+    if plan.family != SourceCallableFamily::ArrowFunction {
+        return Ok(None);
+    }
+    let invalid = || invariant(SourceCallableInvariant::InvalidTypeCache(root));
+    let record = preflight_node(store, host, plan.declaration)?;
+    let NodeData::ArrowFunction(arrow) = &record.data else {
+        return Err(invalid());
+    };
+    let parameter_index = plan
+        .parameters
+        .iter()
+        .position(|parameter| parameter.explicit_type_node() == Some(root));
+    let returned = arrow.type_ == Some(root.node)
+        && plan.return_type.annotation_identity() == Some((root, false))
+        && preflight_node(store, host, root)?.parent == Some(plan.declaration.node);
+    if parameter_index.is_none() && !returned {
+        return Ok(None);
+    }
+    let signature = match source_callable_state(store, &plan, false)? {
+        SourceCallableState::Cold => return Ok(None),
+        SourceCallableState::Resolved { signature, .. } => signature,
+        _ => return Err(invalid()),
+    };
+    let definition = store.signature(signature).ok_or_else(invalid)?;
+    let return_type = definition.resolved_return_type().ok_or_else(invalid)?;
+    let expected = if let Some(index) = parameter_index {
+        let parameter = &plan.parameters[index];
+        let syntax = preflight_node(store, host, parameter.declaration)?;
+        let NodeData::ParameterDeclaration(syntax) = &syntax.data else {
+            return Err(invalid());
+        };
+        let name = NodeRef::new(root.arena, root.file, syntax.name);
+        if returned
+            || parameter.annotation_identity() != (root, false)
+            || parameter.optional
+            || parameter.rest
+            || parameter.initializer.is_some()
+            || syntax.type_ != Some(root.node)
+            || preflight_node(store, host, root)?.parent != Some(parameter.declaration.node)
+            || host.node(parameter.declaration).and_then(|node| node.parent)
+                != Some(plan.declaration.node)
+            || arrow.parameters.nodes.iter().filter(|node| **node == parameter.declaration.node).count() != 1
+            || preflight_node(store, host, name)?.kind != SyntaxKind::Identifier
+            || host.bound_file(parameter.declaration).and_then(|bound| bound.symbol(parameter.declaration))
+                .and_then(|symbol| store.get_merged_symbol(symbol)) != Some(parameter.symbol)
+            || definition.parameters().get(index) != Some(&parameter.symbol)
+        {
+            return Err(invalid());
+        }
+        let evidence = store.source_callable_type_query(signature).ok_or_else(invalid)?;
+        if !evidence.matches_plan(&plan) {
+            return Err(invalid());
+        }
+        evidence.parameter_type(store, parameter).ok_or_else(invalid)?
+    } else {
+        return_type
+    };
+    if cached_annotation_identity(store, root, false) != Some(expected) {
+        return Err(invalid());
+    }
+    Ok(Some((plan, signature, expected)))
 }
 
 /// Retains the separate parameter and leaf owners of a flat typed object pattern.

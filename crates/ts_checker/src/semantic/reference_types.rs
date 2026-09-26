@@ -159,19 +159,27 @@ fn direct_target_header(
     store: &CanonicalTypeMapperStore,
     target: TypeId,
 ) -> Result<DirectGenericTarget, DirectGenericReferenceError> {
-    let record = store
-        .type_payload(target)
+    let record = crate::semantic::relater::original_failure_payload!(target, store
+        .type_payload(target))
         .ok_or(DirectGenericReferenceError::InvalidTarget(target))?;
     let TypeData::Interface(interface) = record.data() else {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("reference_types.rs", line!() + 1);
         return Err(DirectGenericReferenceError::InvalidTarget(target));
     };
     let Some(type_parameters) = interface.reference.resolved_type_arguments.as_deref() else {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("reference_types.rs", line!() + 1);
         return Err(DirectGenericReferenceError::NonGenericTarget(target));
     };
-    if type_parameters.is_empty() {
+    if crate::semantic::relater::original_failure_bad!(concat!("direct_target_header.reject.1.0@", "reference_types.rs", ":", line!()), type_parameters.is_empty()) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("reference_types.rs", line!() + 1);
         return Err(DirectGenericReferenceError::NonGenericTarget(target));
     }
-    if interface.outer_type_parameter_count != 0 {
+    if crate::semantic::relater::original_failure_ne!(concat!("direct_target_header.reject.2.0@", "reference_types.rs", ":", line!()), interface.outer_type_parameter_count, 0) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("reference_types.rs", line!() + 1);
         return Err(DirectGenericReferenceError::OuterTypeParameters(target));
     }
     let symbol = record
@@ -816,7 +824,7 @@ pub(super) fn validate_direct_generic_reference(
     store: &CanonicalTypeMapperStore,
     reference: TypeId,
 ) -> Result<DirectGenericReference, DirectGenericReferenceError> {
-    let record = store.type_payload(reference).ok_or(
+    let record = crate::semantic::relater::original_failure_payload!(reference, store.type_payload(reference)).ok_or(
         DirectGenericReferenceError::InvalidCachedReference {
             target: reference,
             reference,
@@ -840,7 +848,9 @@ pub(super) fn validate_direct_generic_reference(
         .as_deref()
         .ok_or(DirectGenericReferenceError::InvalidCachedReference { target, reference })?;
     let shape = direct_target_header(store, target)?;
-    if arguments.len() != shape.type_parameters.len() {
+    if crate::semantic::relater::original_failure_bad!(concat!("validate_direct_generic_reference.reject.1.0@", "reference_types.rs", ":", line!()), arguments.len() != shape.type_parameters.len()) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("reference_types.rs", line!() + 1);
         return Err(DirectGenericReferenceError::TypeArgumentArity {
             target,
             expected: shape.type_parameters.len(),
@@ -860,11 +870,15 @@ pub(super) fn validate_direct_generic_reference(
     else {
         unreachable!("the direct target and cache were just validated")
     };
-    if instantiations.get(&key) != Some(&reference) {
+    if crate::semantic::relater::original_failure_bad!(concat!("validate_direct_generic_reference.reject.2.0@", "reference_types.rs", ":", line!()), instantiations.get(&key) != Some(&reference)) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("reference_types.rs", line!() + 1);
         return Err(DirectGenericReferenceError::InvalidCachedReference { target, reference });
     }
     let exact = validate_cached_reference_shell(store, &shape, key, reference)?;
-    if exact.as_slice() != arguments {
+    if crate::semantic::relater::original_failure_bad!(concat!("validate_direct_generic_reference.reject.3.0@", "reference_types.rs", ":", line!()), exact.as_slice() != arguments) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("reference_types.rs", line!() + 1);
         return Err(DirectGenericReferenceError::InvalidCachedReference { target, reference });
     }
     Ok(DirectGenericReference {

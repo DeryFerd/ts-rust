@@ -230,7 +230,7 @@ pub(super) enum DirectCallApplicability {
 }
 
 #[derive(Clone, Debug)]
-enum RestParameterShape {
+pub(super) enum RestParameterShape {
     Array {
         type_: TypeId,
         element: TypeId,
@@ -254,7 +254,7 @@ enum RestParameterShape {
 }
 
 impl RestParameterShape {
-    fn type_id(&self) -> TypeId {
+    pub(super) fn type_id(&self) -> TypeId {
         match self {
             Self::Array { type_, .. }
             | Self::MissingGlobalArray { type_, .. }
@@ -264,19 +264,33 @@ impl RestParameterShape {
         }
     }
 
-    fn has_effective_rest(&self) -> bool {
+    pub(super) fn has_effective_rest(&self) -> bool {
         match self {
             Self::Tuple { combined_flags, .. } => combined_flags.intersects(ElementFlags::VARIABLE),
             _ => true,
         }
     }
 
-    fn parameter_count(&self) -> usize {
+    pub(super) fn parameter_count(&self) -> usize {
         match self {
             Self::Tuple { fixed_length, .. } => {
                 *fixed_length + usize::from(self.has_effective_rest())
             }
             _ => 1,
+        }
+    }
+
+    pub(super) fn required_parameter_count(&self) -> usize {
+        match self {
+            Self::Tuple {
+                infos,
+                fixed_length,
+                ..
+            } => infos
+                .iter()
+                .position(|info| !info.flags().contains(ElementFlags::REQUIRED))
+                .unwrap_or(*fixed_length),
+            _ => 0,
         }
     }
 }
@@ -1804,6 +1818,16 @@ fn validate_signature_parameters<'store>(
     Ok(signature)
 }
 
+/// Validates one rest type without reading any fixed parameter.
+pub(super) fn raw_rest_parameter_shape(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    signature: SignatureId,
+    type_: TypeId,
+) -> Result<RestParameterShape, DirectCallError> {
+    rest_parameter_shape(store, array_targets, signature, type_, &mut HashSet::new())
+}
+
 fn rest_parameter_shape(
     store: &CanonicalTypeMapperStore,
     array_targets: Option<CanonicalArrayTargets>,
@@ -1947,15 +1971,7 @@ fn callable_rest_shape(
 ) -> Result<Option<RestParameterShape>, DirectCallError> {
     callable
         .rest_parameter
-        .map(|rest| {
-            rest_parameter_shape(
-                store,
-                array_targets,
-                callable.signature,
-                rest,
-                &mut HashSet::new(),
-            )
-        })
+        .map(|rest| raw_rest_parameter_shape(store, array_targets, callable.signature, rest))
         .transpose()
 }
 
@@ -2135,6 +2151,28 @@ fn collect_rest_position_types(
     Ok(())
 }
 
+/// Reads candidate types at a rest-relative position without creating a union.
+/// None reads all positions, including nested variadic tuple elements.
+pub(super) fn raw_rest_position_types(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    signature: SignatureId,
+    rest: &RestParameterShape,
+    position: Option<usize>,
+) -> Result<Vec<TypeId>, DirectCallError> {
+    let mut result = Vec::new();
+    collect_rest_position_types(
+        store,
+        array_targets,
+        signature,
+        rest,
+        position,
+        &mut result,
+        &mut HashSet::new(),
+    )?;
+    Ok(result)
+}
+
 fn position_types(
     store: &CanonicalTypeMapperStore,
     array_targets: Option<CanonicalArrayTargets>,
@@ -2145,19 +2183,37 @@ fn position_types(
     if let Some(&type_) = callable.parameters.get(position) {
         return Ok(vec![type_]);
     }
-    let mut result = Vec::new();
-    if let Some(rest) = rest {
-        collect_rest_position_types(
-            store,
-            array_targets,
-            callable.signature,
-            rest,
-            Some(position - callable.parameters.len()),
-            &mut result,
-            &mut HashSet::new(),
-        )?;
+    let Some(rest) = rest else {
+        return Ok(Vec::new());
+    };
+    raw_rest_position_types(
+        store,
+        array_targets,
+        callable.signature,
+        rest,
+        Some(position - callable.parameters.len()),
+    )
+}
+
+/// Computes the minimum before the trailing-void walk.
+/// The caller validates the signature metadata and supplies a checked rest shape.
+pub(super) fn initial_min_argument_count(
+    signature_flags: SignatureFlags,
+    stored_minimum: usize,
+    fixed_parameter_count: usize,
+    rest: Option<&RestParameterShape>,
+    flags: MinArgumentCountFlags,
+) -> usize {
+    let required_rest = rest.map_or(0, RestParameterShape::required_parameter_count);
+    if required_rest > 0 {
+        fixed_parameter_count + required_rest
+    } else if !flags.intersects(MinArgumentCountFlags::STRONG_ARITY_FOR_UNTYPED_JS)
+        && signature_flags.contains(SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE)
+    {
+        0
+    } else {
+        stored_minimum
     }
-    Ok(result)
 }
 
 /// Reads a provider-validated signature without publishing a resolved-minimum cache.
@@ -2185,31 +2241,13 @@ pub(super) fn get_min_argument_count_with_array_targets(
 ) -> Result<usize, DirectCallError> {
     let signature = validate_signature_parameters(store, callable)?;
     let rest = callable_rest_shape(store, array_targets, callable)?;
-    let required_rest = match rest.as_ref() {
-        Some(RestParameterShape::Tuple {
-            infos,
-            fixed_length,
-            ..
-        }) => {
-            let required = infos
-                .iter()
-                .position(|info| !info.flags().contains(ElementFlags::REQUIRED))
-                .unwrap_or(*fixed_length);
-            (required > 0).then_some(callable.parameters.len() + required)
-        }
-        _ => None,
-    };
-    let mut minimum = if let Some(minimum) = required_rest {
-        minimum
-    } else if !flags.intersects(MinArgumentCountFlags::STRONG_ARITY_FOR_UNTYPED_JS)
-        && signature
-            .flags()
-            .contains(SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE)
-    {
-        0
-    } else {
-        callable.min_argument_count
-    };
+    let mut minimum = initial_min_argument_count(
+        signature.flags(),
+        callable.min_argument_count,
+        callable.parameters.len(),
+        rest.as_ref(),
+        flags,
+    );
     if flags.intersects(MinArgumentCountFlags::VOID_IS_NON_OPTIONAL) {
         return Ok(minimum);
     }
@@ -2300,7 +2338,7 @@ fn parameter_position_union_error(
     }
 }
 
-fn parameter_position_union(
+pub(super) fn parameter_position_union(
     store: &mut CanonicalTypeMapperStore,
     array_targets: Option<CanonicalArrayTargets>,
     signature: SignatureId,
@@ -2972,7 +3010,7 @@ fn tuple_projection_error(signature: SignatureId, error: TupleTypeError) -> Dire
     }
 }
 
-fn type_contains_void(
+pub(super) fn type_contains_void(
     store: &CanonicalTypeMapperStore,
     signature: SignatureId,
     index: usize,

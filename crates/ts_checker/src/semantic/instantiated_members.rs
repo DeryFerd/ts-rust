@@ -15,6 +15,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+mod source_names;
+pub(super) use source_names::{
+    SourcePropertyObjectMemberNames, capture_source_property_object_member_names,
+};
+
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{
     CheckFlags, EscapedName, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolData,
@@ -391,6 +396,12 @@ type DeclaredTargetHeader = (
 
 type InheritedInterfaceMembers = (Vec<SemanticSymbolId>, Vec<IndexInfoId>);
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GenericMemberReplay {
+    Full,
+    Names,
+}
+
 pub(super) type CompletedSourceClassOriginMemberMapping = (TypeId, Vec<TypeId>, Vec<TypeId>);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -406,6 +417,23 @@ struct GenericInterfaceShape {
     inherited_properties: Vec<SemanticSymbolId>,
     inherited_index_infos: Vec<IndexInfoId>,
     inherited_members_ready: bool,
+}
+
+impl GenericInterfaceShape {
+    fn same_member_names(&self, other: &Self) -> bool {
+        self.reference == other.reference && self.target == other.target
+            && self.source_parameters == other.source_parameters && self.target_arguments == other.target_arguments
+            && self.index_infos == other.index_infos && self.call_signatures == other.call_signatures
+            && self.base_types == other.base_types && self.inherited_properties == other.inherited_properties
+            && self.inherited_index_infos == other.inherited_index_infos
+            && self.inherited_members_ready == other.inherited_members_ready
+            && self.properties.len() == other.properties.len()
+            && self.properties.iter().zip(&other.properties).all(|(left, right)| {
+                left.symbol == right.symbol && left.name == right.name
+                    && left.requires_proxy == right.requires_proxy && left.method == right.method
+                    && left.source_mapper == right.source_mapper
+            })
+    }
 }
 
 /// Evidence created only after this producer observes a real caller limit event.
@@ -1967,6 +1995,7 @@ pub(super) fn validate_property_object_alias_members_with_array_targets(
                         Some(cached),
                         validation_targets,
                     )
+                    .map_err(|error| property_object_alias_member_error(receiver, &error))?
                 {
                     return Err(invalid());
                 }
@@ -2090,6 +2119,15 @@ fn validate_source_property_object_cache_cycles(
     projection: &SourcePropertyObjectProjection,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), RelationUnavailable> {
+    validate_source_property_object_cache_cycles_with_replay(store, projection, array_targets, true)
+}
+
+fn validate_source_property_object_cache_cycles_with_replay(
+    store: &CanonicalTypeMapperStore,
+    projection: &SourcePropertyObjectProjection,
+    array_targets: Option<CanonicalArrayTargets>,
+    replay_named_values: bool,
+) -> Result<(), RelationUnavailable> {
     let receiver = projection.type_();
     let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
     let mut graph = HashMap::<TypeId, Vec<TypeId>>::new();
@@ -2160,7 +2198,9 @@ fn validate_source_property_object_cache_cycles(
                 );
             }
             if let Some(structured) = member_record.data().structured() {
-                properties.extend(structured.properties.as_deref().unwrap_or_default());
+                if replay_named_values {
+                    properties.extend(structured.properties.as_deref().unwrap_or_default());
+                }
                 signatures.extend(structured.signatures.as_deref().unwrap_or_default());
                 indexes.extend(structured.index_infos.as_deref().unwrap_or_default());
             }
@@ -2204,6 +2244,13 @@ fn validate_source_property_object_cache_cycles(
                         ) {
                             continue;
                         }
+                        if !replay_named_values && matches!(store.source_node_kind(source), Some(
+                            SyntaxKind::PropertySignature | SyntaxKind::PropertyDeclaration
+                                | SyntaxKind::MethodSignature | SyntaxKind::GetAccessor
+                                | SyntaxKind::SetAccessor
+                        )) {
+                            continue;
+                        }
                         source_nodes.push(source);
                     }
                 }
@@ -2212,12 +2259,9 @@ fn validate_source_property_object_cache_cycles(
         if type_ == receiver {
             aliases.insert(type_);
             children.extend(projection.arguments());
-            properties.extend(
-                projection
-                    .properties()
-                    .iter()
-                    .map(|property| property.symbol),
-            );
+            if replay_named_values {
+                properties.extend(projection.properties().iter().map(|property| property.symbol));
+            }
         } else if matches!(record.data(), TypeData::Object(_))
             && let Some(arguments) = cached_property_object_alias_physical_arguments(store, type_)
                 .map_err(|_| invalid())?
@@ -2903,13 +2947,15 @@ where
             identity,
         })
     } else {
-        if !cached_instantiated_property_type_matches(
+        if !cached_instantiated_property_type_matches_checked(
             store,
             template,
             instantiated,
             mapper,
             array_targets,
-        ) {
+        )
+        .map_err(|error| property_object_alias_member_error(receiver, &error))?
+        {
             return Err(invalid().into());
         }
         None
@@ -3542,7 +3588,7 @@ fn demand_instantiated_property_type_worker(
             mapper,
             Some(cached),
             array_targets,
-        ) {
+        )? {
             return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol).into());
         }
         return Ok(cached);
@@ -4068,7 +4114,7 @@ pub(super) fn instantiate_published_generic_array_property_callable(
                 &plan.mapper_targets,
             ) == Some(true)
         {
-            return match validate_instantiated_array_property_callable(store, type_) {
+            return match validate_instantiated_array_property_callable_checked(store, type_)? {
                 InstantiatedArrayPropertyCallableValidation::Valid(_) => Ok(type_),
                 InstantiatedArrayPropertyCallableValidation::NotCallable
                 | InstantiatedArrayPropertyCallableValidation::Malformed => {
@@ -4265,59 +4311,68 @@ pub(super) fn validate_instantiated_array_property_callable(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> InstantiatedArrayPropertyCallableValidation {
+    validate_instantiated_array_property_callable_checked(store, type_)
+        .unwrap_or(InstantiatedArrayPropertyCallableValidation::Malformed)
+}
+
+#[allow(clippy::too_many_lines)] // Keep exact callable checks and fallible operand replay together.
+fn validate_instantiated_array_property_callable_checked(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<InstantiatedArrayPropertyCallableValidation, GenericInterfaceMemberError> {
     let not_callable = InstantiatedArrayPropertyCallableValidation::NotCallable;
     let malformed = || InstantiatedArrayPropertyCallableValidation::Malformed;
     let Some(record) = store.type_payload(type_) else {
-        return not_callable;
+        return Ok(not_callable);
     };
     let TypeData::Object(object) = record.data() else {
-        return not_callable;
+        return Ok(not_callable);
     };
     let (Some(source), Some(mapper), Some(property)) =
         (object.target, object.mapper, record.symbol())
     else {
-        return not_callable;
+        return Ok(not_callable);
     };
     let Some(property_record) = store.symbol(property) else {
-        return malformed();
+        return Ok(malformed());
     };
     if !property_record.flags().contains(SymbolFlags::PROPERTY)
         || !store.type_has_function_type_provenance(source)
     {
-        return not_callable;
+        return Ok(not_callable);
     }
     let Some(owner) = property_record
         .parent()
         .and_then(|parent| store.get_merged_symbol(parent))
     else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(owner_record) = store.symbol(owner) else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(target) = store
         .declared_type_links(owner)
         .and_then(|links| links.declared_type)
     else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(TypeData::Interface(interface)) = store
         .type_payload(target)
         .map(super::type_records::TypeRecord::data)
     else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(parameters) = interface.reference.resolved_type_arguments.as_deref() else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(this_type) = interface.this_type else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(receiver) = store.map_type(mapper, this_type) else {
-        return malformed();
+        return Ok(malformed());
     };
     let Ok(reference) = validate_direct_generic_reference(store, receiver) else {
-        return malformed();
+        return Ok(malformed());
     };
     let mapper_sources = parameters
         .iter()
@@ -4331,31 +4386,31 @@ pub(super) fn validate_instantiated_array_property_callable(
         .chain(std::iter::once(receiver))
         .collect::<Vec<_>>();
     let Some([signature]) = object.structured.signatures.as_deref() else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(instantiated) = store.signature(*signature) else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(original_id) = instantiated.target() else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(original) = store.signature(original_id) else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(source_record) = store.type_payload(source) else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(source_structured) = source_record.data().structured() else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(original_types) = store.callable_signature_parameter_types(original_id) else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(return_type) = instantiated.resolved_return_type() else {
-        return malformed();
+        return Ok(malformed());
     };
     let Some(original_return) = original.resolved_return_type() else {
-        return malformed();
+        return Ok(malformed());
     };
     let targets = CanonicalArrayTargets::for_single_target_validation(target);
     let global_owner = store
@@ -4388,15 +4443,15 @@ pub(super) fn validate_instantiated_array_property_callable(
         || instantiated.declaration() != original.declaration()
         || instantiated.parameters().len() != original.parameters().len()
         || original.parameters().len() != original_types.len()
-        || !cached_instantiated_property_type_matches(
+        || !cached_instantiated_property_type_matches_checked(
             store,
             original_return,
             return_type,
             mapper,
             Some(targets),
-        )
+        )?
     {
-        return malformed();
+        return Ok(malformed());
     }
     let mut edges = Vec::with_capacity(original_types.len() + 1);
     for ((parameter, original_parameter), template) in instantiated
@@ -4406,10 +4461,10 @@ pub(super) fn validate_instantiated_array_property_callable(
         .zip(original_types)
     {
         let Some(links) = store.value_symbol_links(*parameter) else {
-            return malformed();
+            return Ok(malformed());
         };
         let Some(type_) = links.resolved_type else {
-            return malformed();
+            return Ok(malformed());
         };
         let valid_links = if parameter == original_parameter {
             links
@@ -4431,20 +4486,20 @@ pub(super) fn validate_instantiated_array_property_callable(
                 })
         };
         if !valid_links
-            || !cached_instantiated_property_type_matches(
+            || !cached_instantiated_property_type_matches_checked(
                 store,
                 *template,
                 type_,
                 mapper,
                 Some(targets),
-            )
+            )?
         {
-            return malformed();
+            return Ok(malformed());
         }
         edges.push(type_);
     }
     edges.push(return_type);
-    InstantiatedArrayPropertyCallableValidation::Valid(edges)
+    Ok(InstantiatedArrayPropertyCallableValidation::Valid(edges))
 }
 
 fn plan_published_interface_method(
@@ -5862,6 +5917,15 @@ fn instantiate_generic_member_type_inner(
     let name = indexed_property_escaped_name(store, index);
     if validate_direct_generic_reference(store, object).is_ok() {
         resolve_members_with_array_targets_and_session(store, object, array_targets, session)?;
+    } else {
+        super::object_members::demand_primitive_interface_members(store, object).map_err(
+            |error| match error {
+                super::object_members::PropertyObjectError::Capacity(_) => {
+                    GenericInterfaceMemberError::Capacity(object)
+                }
+                _ => GenericInterfaceMemberError::InvalidCachedMembers(object),
+            },
+        )?;
     }
     let symbol = name.as_ref().and_then(|name| {
         store
@@ -9281,6 +9345,15 @@ fn cached_inherited_properties(
     shape: &GenericInterfaceShape,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<InheritedInterfaceMembers>, GenericInterfaceMemberError> {
+    cached_inherited_properties_with_replay(store, shape, array_targets, GenericMemberReplay::Full)
+}
+
+fn cached_inherited_properties_with_replay(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    array_targets: Option<CanonicalArrayTargets>,
+    replay: GenericMemberReplay,
+) -> Result<Option<InheritedInterfaceMembers>, GenericInterfaceMemberError> {
     let mut inherited = Vec::new();
     let mut inherited_indexes = Vec::new();
     let mut names = shape
@@ -9302,8 +9375,9 @@ fn cached_inherited_properties(
         let Some(base) = mapped_inherited_type(store, shape, *base, array_targets)? else {
             return Ok(None);
         };
-        let (properties, indexes) = if source_member_reference(store, base).is_ok() {
-            let Some(members) = validate_generic_interface_members(store, base, array_targets)?
+        let (properties, indexes) = if source_member_reference_with_replay(store, base, replay).is_ok() {
+            let shape = validate_shape_with_replay(store, base, array_targets, replay)?;
+            let Some(members) = validate_warm_members_with_replay(store, &shape, array_targets, replay)?
             else {
                 return Ok(None);
             };
@@ -9421,6 +9495,14 @@ pub(super) fn source_member_reference(
     store: &CanonicalTypeMapperStore,
     reference: TypeId,
 ) -> Result<DirectGenericReference, GenericInterfaceMemberError> {
+    source_member_reference_with_replay(store, reference, GenericMemberReplay::Full)
+}
+
+fn source_member_reference_with_replay(
+    store: &CanonicalTypeMapperStore,
+    reference: TypeId,
+    replay: GenericMemberReplay,
+) -> Result<DirectGenericReference, GenericInterfaceMemberError> {
     let direct_error = match validate_direct_generic_reference(store, reference) {
         Ok(direct) => return Ok(direct),
         Err(error) => error,
@@ -9436,7 +9518,11 @@ pub(super) fn source_member_reference(
     if interface.reference.resolved_type_arguments.as_deref().is_some_and(|args| !args.is_empty()) {
         return Err(direct_error.into());
     }
-    if !names.validates_target(store, reference)
+    let target_is_valid = match replay {
+        GenericMemberReplay::Full => names.validates_target(store, reference),
+        GenericMemberReplay::Names => names.validates_target_for_names(store, reference),
+    };
+    if !target_is_valid
         || record.object_flags().contains(ObjectFlags::CLASS)
         || super::declared::cached_interface_type(store, names.owner()).map_err(|_| invalid())? != Some(reference)
     {
@@ -9450,6 +9536,15 @@ fn validate_shape(
     reference: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<GenericInterfaceShape, GenericInterfaceMemberError> {
+    validate_shape_with_replay(store, reference, array_targets, GenericMemberReplay::Full)
+}
+
+fn validate_shape_with_replay(
+    store: &CanonicalTypeMapperStore,
+    reference: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    replay: GenericMemberReplay,
+) -> Result<GenericInterfaceShape, GenericInterfaceMemberError> {
     // Check produced recovery graphs before an invalid nested reference can
     // make the declared member domain appear merely unsupported.
     for index in store
@@ -9462,22 +9557,25 @@ fn validate_shape(
             && recovery.shape.reference == reference
             && !recovery.matches_cached_identity(store, recovery.array_targets)
         {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(reference));
         }
     }
-    let direct = source_member_reference(store, reference)?;
+    let direct = source_member_reference_with_replay(store, reference, replay)?;
     let class_target = store
         .type_payload(direct.target)
         .is_some_and(|record| record.object_flags().contains(ObjectFlags::CLASS));
     let mut active = Vec::new();
     let mut validated = HashSet::new();
-    let (_, source_parameters, _, properties, index_infos) = validate_declared_target(
+    let (_, source_parameters, _, properties, index_infos) = validate_declared_target_with_replay(
         store,
         direct.target,
         array_targets,
         &mut active,
         0,
         &mut validated,
+        replay,
     )?;
     let mut base_types = store
         .type_payload(direct.target)
@@ -9523,7 +9621,10 @@ fn validate_shape(
             property.requires_proxy = false;
         }
     }
-    if let Some((properties, indexes)) = cached_inherited_properties(store, &shape, array_targets)?
+    if replay == GenericMemberReplay::Names {
+        retain_published_property_choices(store, &mut shape)?;
+    }
+    if let Some((properties, indexes)) = cached_inherited_properties_with_replay(store, &shape, array_targets, replay)?
     {
         shape.inherited_properties = properties;
         shape.inherited_index_infos = indexes;
@@ -9549,15 +9650,38 @@ fn validate_shape(
             }
         }
         if let Some((properties, indexes)) =
-            cached_inherited_properties(store, &target_shape, array_targets)?
+            cached_inherited_properties_with_replay(store, &target_shape, array_targets, replay)?
         {
             target_shape.inherited_properties = properties;
             target_shape.inherited_index_infos = indexes;
             target_shape.inherited_members_ready = true;
         }
-        validate_warm_members(store, &target_shape, array_targets)?;
+        if replay == GenericMemberReplay::Names {
+            retain_published_property_choices(store, &mut target_shape)?;
+        }
+        validate_warm_members_with_replay(store, &target_shape, array_targets, replay)?;
     }
     Ok(shape)
+}
+
+fn retain_published_property_choices(
+    store: &CanonicalTypeMapperStore,
+    shape: &mut GenericInterfaceShape,
+) -> Result<(), GenericInterfaceMemberError> {
+    let record = store.type_payload(shape.reference)
+        .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(shape.reference))?;
+    if !record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED) {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(shape.reference));
+    }
+    let properties = record.data().structured()
+        .and_then(|structured| structured.properties.as_deref()).unwrap_or_default();
+    if properties.len() < shape.properties.len() {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(shape.reference));
+    }
+    for (property, actual) in shape.properties.iter_mut().zip(properties) {
+        property.requires_proxy = *actual != property.symbol;
+    }
+    Ok(())
 }
 
 fn validate_declared_target(
@@ -9568,14 +9692,26 @@ fn validate_declared_target(
     heritage_start: usize,
     validated: &mut HashSet<TypeId>,
 ) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
+    validate_declared_target_with_replay(store, target, array_targets, active, heritage_start, validated, GenericMemberReplay::Full)
+}
+
+fn validate_declared_target_with_replay(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    active: &mut Vec<TypeId>,
+    heritage_start: usize,
+    validated: &mut HashSet<TypeId>,
+    replay: GenericMemberReplay,
+) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
     if validated.contains(&target) {
-        return declared_target_header(store, target, array_targets);
+        return declared_target_header_with_replay(store, target, array_targets, replay);
     }
     if active.contains(&target) {
-        return declared_target_header(store, target, array_targets);
+        return declared_target_header_with_replay(store, target, array_targets, replay);
     }
     let (owner, source_parameters, declared_members, mut properties, index_infos) =
-        declared_target_header(store, target, array_targets)?;
+        declared_target_header_with_replay(store, target, array_targets, replay)?;
     let owner_record = store
         .symbol(owner)
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
@@ -9638,13 +9774,14 @@ fn validate_declared_target(
                     &signature_parameters,
                     array_targets,
                 )?;
-                validate_nested_reference_targets(
+                validate_nested_reference_targets_with_replay(
                     store,
                     type_,
                     array_targets,
                     active,
                     validated,
                     &mut HashSet::new(),
+                    replay,
                 )?;
             }
         }
@@ -9666,18 +9803,19 @@ fn validate_declared_target(
         base_types.clear();
     }
     for base in base_types {
-        if let Ok(reference) = source_member_reference(store, base) {
+        if let Ok(reference) = source_member_reference_with_replay(store, base, replay) {
             if active[heritage_start..].contains(&reference.target) {
                 return Err(GenericInterfaceMemberError::InvalidTarget(target));
             }
             member_type_requires_instantiation(store, base, &mapper_parameters, array_targets)?;
-            validate_declared_target(
+            validate_declared_target_with_replay(
                 store,
                 reference.target,
                 array_targets,
                 active,
                 heritage_start,
                 validated,
+                replay,
             )?;
         } else if !matches!(
             validate_resolved_declared_property_object(store, base),
@@ -9692,6 +9830,9 @@ fn validate_declared_target(
         }
     }
     for property in &mut properties {
+        if replay == GenericMemberReplay::Names {
+            continue;
+        }
         let Some(type_) = property.value.resolved() else {
             // The source-name proof fixes this policy before any value is read.
             property.requires_proxy = true;
@@ -9789,13 +9930,14 @@ fn validate_declared_target(
             .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?
             .value_type();
         member_type_requires_instantiation(store, value, &mapper_parameters, array_targets)?;
-        validate_nested_reference_targets(
+        validate_nested_reference_targets_with_replay(
             store,
             value,
             array_targets,
             active,
             validated,
             &mut HashSet::new(),
+            replay,
         )?;
     }
     let popped = active
@@ -10056,16 +10198,27 @@ fn declared_target_header(
     target: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
+    declared_target_header_with_replay(store, target, array_targets, GenericMemberReplay::Full)
+}
+
+fn declared_target_header_with_replay(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    replay: GenericMemberReplay,
+) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
     if let Some(names) = store.source_declared_member_names(target) {
-        return source_declared_target_header(store, target, names);
+        return source_declared_target_header_with_replay(store, target, names, replay);
     }
-    let record = store
-        .type_payload(target)
+    let record = crate::semantic::relater::original_failure_payload!(target, store
+        .type_payload(target))
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
     if record.object_flags().contains(ObjectFlags::CLASS) {
         return declared_class_field_target_header(store, target, array_targets);
     }
     let TypeData::Interface(interface) = record.data() else {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     };
     let owner = record
@@ -10122,43 +10275,43 @@ fn declared_target_header(
     } else {
         None
     };
-    if record.flags() != TypeFlags::OBJECT
-        || record.object_flags().contains(ObjectFlags::CLASS)
-        || record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK
-            != (ObjectFlags::INTERFACE | ObjectFlags::REFERENCE)
-        || !(record.object_flags() & !allowed_target_flags).is_empty()
-        || record.alias().is_some()
-        || !owner_record.flags().contains(SymbolFlags::INTERFACE)
-        || (owner_record
+    if crate::semantic::relater::original_failure_ne!(concat!("declared_target_header_with_replay.reject.1.0@", "instantiated_members.rs", ":", line!()), record.flags(), TypeFlags::OBJECT)
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.1@", "instantiated_members.rs", ":", line!()), record.object_flags().contains(ObjectFlags::CLASS))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.2@", "instantiated_members.rs", ":", line!()), record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK
+            != (ObjectFlags::INTERFACE | ObjectFlags::REFERENCE))
+         ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.1.3@", "instantiated_members.rs", ":", line!()), (record.object_flags() & !allowed_target_flags).is_empty())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.4@", "instantiated_members.rs", ":", line!()), record.alias().is_some())
+         ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.1.5@", "instantiated_members.rs", ":", line!()), owner_record.flags().contains(SymbolFlags::INTERFACE))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.6@", "instantiated_members.rs", ":", line!()), (owner_record
             .flags()
             .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
             != SymbolFlags::NONE
-            && mixed_owner.is_none())
-        || owner_record.check_flags() != CheckFlags::NONE
-        || owner_record.value_declaration().is_some() && mixed_owner.is_none()
-        || owner_record.exports().is_some()
-        || owner_record.export_symbol().is_some()
-        || store.get_merged_symbol(owner) != Some(owner)
-        || store
+            && mixed_owner.is_none()))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.7@", "instantiated_members.rs", ":", line!()), owner_record.check_flags() != CheckFlags::NONE)
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.8@", "instantiated_members.rs", ":", line!()), owner_record.value_declaration().is_some() && mixed_owner.is_none())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.9@", "instantiated_members.rs", ":", line!()), owner_record.exports().is_some())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.10@", "instantiated_members.rs", ":", line!()), owner_record.export_symbol().is_some())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.11@", "instantiated_members.rs", ":", line!()), store.get_merged_symbol(owner) != Some(owner))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.12@", "instantiated_members.rs", ":", line!()), store
             .declared_type_links(owner)
             .and_then(|links| links.declared_type)
-            != Some(target)
-        || all_parameters.len() != source_parameters.len() + 1
-        || &all_parameters[..source_parameters.len()] != source_parameters.as_slice()
-        || all_parameters.last().copied() != Some(this_type)
-        || interface.outer_type_parameter_count != 0
-        || interface.resolved_base_constructor_type.is_some()
-        || interface
+            != Some(target))
+         ||  crate::semantic::relater::original_failure_ne!(concat!("declared_target_header_with_replay.reject.1.13@", "instantiated_members.rs", ":", line!()), all_parameters.len(), source_parameters.len() + 1)
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.14@", "instantiated_members.rs", ":", line!()), &all_parameters[..source_parameters.len()] != source_parameters.as_slice())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.15@", "instantiated_members.rs", ":", line!()), all_parameters.last().copied() != Some(this_type))
+         ||  crate::semantic::relater::original_failure_ne!(concat!("declared_target_header_with_replay.reject.1.16@", "instantiated_members.rs", ":", line!()), interface.outer_type_parameter_count, 0)
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.17@", "instantiated_members.rs", ":", line!()), interface.resolved_base_constructor_type.is_some())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.18@", "instantiated_members.rs", ":", line!()), interface
             .resolved_base_types
             .as_ref()
-            .is_some_and(Vec::is_empty)
-        || !interface.declared_members_resolved && interface.declared_call_signatures.is_some()
-        || interface.declared_construct_signatures.is_some()
-        || (!record
+            .is_some_and(Vec::is_empty))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.19@", "instantiated_members.rs", ":", line!()), !interface.declared_members_resolved && interface.declared_call_signatures.is_some())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.20@", "instantiated_members.rs", ":", line!()), interface.declared_construct_signatures.is_some())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.21@", "instantiated_members.rs", ":", line!()), (!record
             .object_flags()
             .contains(ObjectFlags::MEMBERS_RESOLVED)
-            && structured != &StructuredTypeData::default())
-        || record
+            && structured != &StructuredTypeData::default()))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.22@", "instantiated_members.rs", ":", line!()), record
             .object_flags()
             .contains(ObjectFlags::MEMBERS_RESOLVED)
             && (structured.signatures.as_deref() != interface.declared_call_signatures.as_deref()
@@ -10166,35 +10319,41 @@ fn declared_target_header(
                     != interface
                         .declared_call_signatures
                         .as_ref()
-                        .map_or(0, Vec::len))
-        || structured.constrained != ConstrainedTypeData::default()
-        || structured
+                        .map_or(0, Vec::len)))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.23@", "instantiated_members.rs", ":", line!()), structured.constrained != ConstrainedTypeData::default())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.24@", "instantiated_members.rs", ":", line!()), structured
             .object_type_without_abstract_construct_signatures
-            .is_some()
-        || source_parameters
+            .is_some())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.1.25@", "instantiated_members.rs", ":", line!()), source_parameters
             .iter()
             .copied()
             .collect::<HashSet<_>>()
             .len()
-            != source_parameters.len()
+            != source_parameters.len())
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     let Some(this_record) = store.type_payload(this_type) else {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     };
-    if this_record.flags() != TypeFlags::TYPE_PARAMETER
-        || this_record.symbol() != Some(owner)
-        || this_record.alias().is_some()
-        || !matches!(
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.2.0@", "instantiated_members.rs", ":", line!()), this_record.flags() != TypeFlags::TYPE_PARAMETER)
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.2.1@", "instantiated_members.rs", ":", line!()), this_record.symbol() != Some(owner))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.2.2@", "instantiated_members.rs", ":", line!()), this_record.alias().is_some())
+         ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.2.3@", "instantiated_members.rs", ":", line!()), matches!(
             this_record.data(),
             TypeData::TypeParameter(data)
                 if data.is_this_type
                     && data.constraint == Some(target)
                     && data.target.is_none()
                     && data.mapper.is_none()
-        )
+        ))
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
 
@@ -10202,20 +10361,26 @@ fn declared_target_header(
         .declarations()
         .filter(|declarations| !declarations.is_empty())
     else {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     };
     let interface_declarations = if let Some(mixed) = &mixed_owner {
-        if mixed.declarations() != owner_declarations {
+        if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.3.0@", "instantiated_members.rs", ":", line!()), mixed.declarations() != owner_declarations) {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidTarget(target));
         }
         mixed.interfaces()
     } else {
         owner_declarations
     };
-    if interface_declarations
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.4.0@", "instantiated_members.rs", ":", line!()), interface_declarations
         .iter()
-        .any(|declaration| !valid_generic_interface_declaration_owner(store, owner, *declaration))
+        .any(|declaration| !valid_generic_interface_declaration_owner(store, owner, *declaration)))
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     }
     let mut parameter_symbols = HashSet::with_capacity(source_parameters.len());
@@ -10225,18 +10390,20 @@ fn declared_target_header(
         let parameter_record = store
             .symbol(parameter_symbol)
             .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
-        if store.get_parent_of_symbol(parameter_symbol) != Some(owner)
-            || raw_table
+        if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.5.0@", "instantiated_members.rs", ":", line!()), store.get_parent_of_symbol(parameter_symbol) != Some(owner))
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.5.1@", "instantiated_members.rs", ":", line!()), raw_table
                 .get(parameter_record.name())
                 .and_then(|symbol| store.get_merged_symbol(symbol))
-                != Some(parameter_symbol)
-            || !parameter_symbols.insert(parameter_symbol)
+                != Some(parameter_symbol))
+             ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.5.2@", "instantiated_members.rs", ":", line!()), parameter_symbols.insert(parameter_symbol))
         {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidTarget(target));
         }
     }
-    if !interface.base_types_resolved || !interface.declared_members_resolved {
-        if !interface.base_types_resolved
+    if crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.6.0@", "instantiated_members.rs", ":", line!()), interface.base_types_resolved)  ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.6.1@", "instantiated_members.rs", ":", line!()), interface.declared_members_resolved) {
+        if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.7.0@", "instantiated_members.rs", ":", line!()), !interface.base_types_resolved
             && !interface.declared_members_resolved
             && interface.resolved_base_types.is_none()
             && declared_members.is_none()
@@ -10250,10 +10417,14 @@ fn declared_target_header(
                 owner_declarations,
                 raw_members,
                 &parameter_symbols,
-            )
+            ))
         {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
         }
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     let index_infos = interface
@@ -10261,20 +10432,24 @@ fn declared_target_header(
         .as_deref()
         .unwrap_or_default()
         .to_vec();
-    if super::object_members::generic_declared_call_signature_edges(store, target).is_none() {
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.8.0@", "instantiated_members.rs", ":", line!()), super::object_members::generic_declared_call_signature_edges(store, target).is_none()) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     let call_symbol = raw_table.get(InternalSymbolName::Call.as_ref());
     let index_symbol = raw_table.get(InternalSymbolName::Index.as_ref());
-    if index_infos.is_empty() != index_symbol.is_none()
-        || interface
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.9.0@", "instantiated_members.rs", ":", line!()), index_infos.is_empty() != index_symbol.is_none())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.9.1@", "instantiated_members.rs", ":", line!()), interface
             .declared_index_infos
             .as_ref()
-            .is_some_and(Vec::is_empty)
-        || index_symbol.is_some_and(|symbol| {
+            .is_some_and(Vec::is_empty))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.9.2@", "instantiated_members.rs", ":", line!()), index_symbol.is_some_and(|symbol| {
             !valid_index_symbol(store, owner, owner_declarations, symbol, &index_infos)
-        })
+        }))
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     let declared_count = declared_table.map_or(0, ts_binder::semantic::SymbolTable::len);
@@ -10297,7 +10472,9 @@ fn declared_target_header(
         .into_iter()
         .flat_map(ts_binder::semantic::SymbolTable::iter)
     {
-        if !seen.insert(symbol) {
+        if crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.10.0@", "instantiated_members.rs", ":", line!()), seen.insert(symbol)) {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidMember(symbol));
         }
         let property = store
@@ -10307,6 +10484,8 @@ fn declared_target_header(
             .declarations()
             .filter(|declarations| !declarations.is_empty())
         else {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidMember(symbol));
         };
         let mut earliest = None;
@@ -10314,24 +10493,30 @@ fn declared_target_header(
         for declaration in declarations {
             let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(*declaration)
             else {
+                #[cfg(test)]
+                crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
                 return Err(GenericInterfaceMemberError::InvalidMember(symbol));
             };
             let Some(owner_index) = owner_declarations
                 .iter()
                 .position(|owner_declaration| *owner_declaration == parent)
             else {
+                #[cfg(test)]
+                crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
                 return Err(GenericInterfaceMemberError::InvalidMember(symbol));
             };
-            if !(if method {
+            if crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.11.0@", "instantiated_members.rs", ":", line!()), (if method {
                 store.source_node_kind(*declaration) == Some(SyntaxKind::MethodSignature)
             } else {
                 matches!(
                     store.source_node_kind(*declaration),
                     Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
                 )
-            }) || !declaration.is_for(parent.arena, parent.file)
-                || !seen_declarations.insert(*declaration)
+            }))  ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.11.1@", "instantiated_members.rs", ":", line!()), declaration.is_for(parent.arena, parent.file))
+                 ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.11.2@", "instantiated_members.rs", ":", line!()), seen_declarations.insert(*declaration))
             {
+                #[cfg(test)]
+                crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
                 return Err(GenericInterfaceMemberError::InvalidMember(symbol));
             }
             let position = (owner_index, *declaration);
@@ -10347,7 +10532,7 @@ fn declared_target_header(
         let type_ = links
             .resolved_type
             .ok_or(GenericInterfaceMemberError::InvalidMember(symbol))?;
-        let optional_type_is_valid = optional_member_type_is_normalized(
+        let optional_type_is_valid = replay == GenericMemberReplay::Names || optional_member_type_is_normalized(
             store,
             type_,
             property.flags().contains(SymbolFlags::OPTIONAL),
@@ -10365,7 +10550,7 @@ fn declared_target_header(
                 declarations,
                 links,
                 resolved_table,
-            ) && (!method || valid_interface_method_value(store, symbol, type_).is_some())
+            ) && (replay == GenericMemberReplay::Names || !method || valid_interface_method_value(store, symbol, type_).is_some())
         } else if method {
             property.flags().contains(SymbolFlags::METHOD)
                 && property.flags().without(
@@ -10387,7 +10572,7 @@ fn declared_target_header(
                         resolved_type: Some(type_),
                         ..ValueSymbolLinks::default()
                     })
-                && valid_interface_method_value(store, symbol, type_).is_some()
+                && (replay == GenericMemberReplay::Names || valid_interface_method_value(store, symbol, type_).is_some())
         } else {
             let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
             property.flags().contains(SymbolFlags::PROPERTY)
@@ -10404,21 +10589,23 @@ fn declared_target_header(
                         ..ValueSymbolLinks::default()
                     })
         };
-        if !valid_identity
-            || property.name() != name
-            || property.name().is_reserved_member_name()
-            || property.name().is_private_identifier()
-            || property
+        if crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.12.0@", "instantiated_members.rs", ":", line!()), valid_identity)
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.1@", "instantiated_members.rs", ":", line!()), property.name() != name)
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.2@", "instantiated_members.rs", ":", line!()), property.name().is_reserved_member_name())
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.3@", "instantiated_members.rs", ":", line!()), property.name().is_private_identifier())
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.4@", "instantiated_members.rs", ":", line!()), property
                 .value_declaration()
-                .is_none_or(|value| !declarations.contains(&value))
-            || store.get_parent_of_symbol(symbol) != Some(owner)
-            || property.members().is_some()
-            || property.exports().is_some()
-            || property.export_symbol().is_some()
-            || store.get_merged_symbol(symbol) != Some(symbol)
-            || store.type_payload(type_).is_none()
-            || !optional_type_is_valid
+                .is_none_or(|value| !declarations.contains(&value)))
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.5@", "instantiated_members.rs", ":", line!()), store.get_parent_of_symbol(symbol) != Some(owner))
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.6@", "instantiated_members.rs", ":", line!()), property.members().is_some())
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.7@", "instantiated_members.rs", ":", line!()), property.exports().is_some())
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.8@", "instantiated_members.rs", ":", line!()), property.export_symbol().is_some())
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.9@", "instantiated_members.rs", ":", line!()), store.get_merged_symbol(symbol) != Some(symbol))
+             ||  crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.12.10@", "instantiated_members.rs", ":", line!()), store.type_payload(type_).is_none())
+             ||  crate::semantic::relater::original_failure_neg!(concat!("declared_target_header_with_replay.reject.12.11@", "instantiated_members.rs", ":", line!()), optional_type_is_valid)
         {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidMember(symbol));
         }
         if late {
@@ -10445,19 +10632,23 @@ fn declared_target_header(
     let early_count = declared_count
         .checked_sub(late_count)
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
-    if store.source_computed_member_count(owner) != Some(late_declaration_count) {
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.13.0@", "instantiated_members.rs", ":", line!()), store.source_computed_member_count(owner) != Some(late_declaration_count)) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
-    if raw_table.len()
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.14.0@", "instantiated_members.rs", ":", line!()), raw_table.len()
         != early_count
             .checked_add(parameter_symbols.len())
             .and_then(|count| count.checked_add(usize::from(index_symbol.is_some())))
             .and_then(|count| count.checked_add(usize::from(call_symbol.is_some())))
-            .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?
+            .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?)
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
-    if late_count != 0
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.15.0@", "instantiated_members.rs", ":", line!()), late_count != 0
         && resolved_table.is_none_or(|resolved| {
             resolved.len() != raw_table.len() + late_count
                 || raw_table.iter().any(|(name, symbol)| {
@@ -10466,8 +10657,10 @@ fn declared_target_header(
                         .and_then(|member| store.get_merged_symbol(member))
                         != store.get_merged_symbol(symbol)
                 })
-        })
+        }))
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     if raw_table.iter().any(|(name, symbol)| {
@@ -10482,13 +10675,17 @@ fn declared_target_header(
                 .symbol(symbol)
                 .is_none_or(|record| record.name() != name)
     }) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     properties.sort_unstable_by_key(|(owner_index, declaration, _)| (*owner_index, *declaration));
-    if properties
+    if crate::semantic::relater::original_failure_bad!(concat!("declared_target_header_with_replay.reject.16.0@", "instantiated_members.rs", ":", line!()), properties
         .windows(2)
-        .any(|pair| (pair[0].0, pair[0].1) >= (pair[1].0, pair[1].1))
+        .any(|pair| (pair[0].0, pair[0].1) >= (pair[1].0, pair[1].1)))
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     let properties = properties
@@ -10509,19 +10706,40 @@ fn source_declared_target_header(
     target: TypeId,
     names: &super::object_members::SourceDeclaredMemberNames,
 ) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
+    source_declared_target_header_with_replay(store, target, names, GenericMemberReplay::Full)
+}
+
+fn source_declared_target_header_with_replay(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    names: &super::object_members::SourceDeclaredMemberNames,
+    replay: GenericMemberReplay,
+) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
     let invalid = || GenericInterfaceMemberError::InvalidTarget(target);
-    if !names.validates_target(store, target) {
+    let target_is_valid = match replay {
+        GenericMemberReplay::Full => names.validates_target(store, target),
+        GenericMemberReplay::Names => names.validates_target_for_names(store, target),
+    };
+    if crate::semantic::relater::original_failure_neg!(concat!("source_declared_target_header_with_replay.reject.1.0@", "instantiated_members.rs", ":", line!()), target_is_valid) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(invalid());
     }
-    let direct = source_member_reference(store, target).map_err(|_| invalid())?;
-    if direct.target != target {
+    let direct = source_member_reference_with_replay(store, target, replay).map_err(|_| invalid())?;
+    if crate::semantic::relater::original_failure_bad!(concat!("source_declared_target_header_with_replay.reject.2.0@", "instantiated_members.rs", ":", line!()), direct.target != target) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(invalid());
     }
     let TypeData::Interface(interface) = store.type_payload(target).ok_or_else(invalid)?.data()
     else {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(invalid());
     };
-    if !interface.base_types_resolved || !interface.declared_members_resolved {
+    if crate::semantic::relater::original_failure_neg!(concat!("source_declared_target_header_with_replay.reject.3.0@", "instantiated_members.rs", ":", line!()), interface.base_types_resolved)  ||  crate::semantic::relater::original_failure_neg!(concat!("source_declared_target_header_with_replay.reject.3.1@", "instantiated_members.rs", ":", line!()), interface.declared_members_resolved) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(invalid());
     }
     let owner = names.owner();
@@ -10530,18 +10748,19 @@ fn source_declared_target_header(
         .and_then(ts_binder::semantic::Symbol::declarations)
         .ok_or_else(invalid)?;
     let index_infos = interface.declared_index_infos.clone().unwrap_or_default();
-    let raw = store
-        .symbol(owner)
-        .and_then(ts_binder::semantic::Symbol::members)
-        .and_then(|table| store.symbol_table(table))
-        .ok_or_else(invalid)?;
-    let index_symbol = raw.get(InternalSymbolName::Index.as_ref());
-    if index_symbol.is_some() != !index_infos.is_empty()
-        || index_symbol.is_some_and(|symbol| {
+    let index_symbol = match replay {
+        GenericMemberReplay::Full => names.raw_member_symbol(store, InternalSymbolName::Index.as_ref()),
+        GenericMemberReplay::Names => names.raw_member_symbol_for_names(store, InternalSymbolName::Index.as_ref()),
+    }
+        .map_err(|()| invalid())?;
+    if crate::semantic::relater::original_failure_bad!(concat!("source_declared_target_header_with_replay.reject.4.0@", "instantiated_members.rs", ":", line!()), index_symbol.is_some() != !index_infos.is_empty())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("source_declared_target_header_with_replay.reject.4.1@", "instantiated_members.rs", ":", line!()), index_symbol.is_some_and(|symbol| {
             !valid_index_symbol(store, owner, declarations, symbol, &index_infos)
-        })
-        || super::object_members::generic_declared_call_signature_edges(store, target).is_none()
+        }))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("source_declared_target_header_with_replay.reject.4.2@", "instantiated_members.rs", ":", line!()), super::object_members::generic_declared_call_signature_edges(store, target).is_none())
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(invalid());
     }
     let mut properties = Vec::new();
@@ -10554,13 +10773,19 @@ fn source_declared_target_header(
                 let type_ = links
                     .resolved_type
                     .expect("the value branch checked the type");
-                if !super::structured_members::valid_property_symbol(store, symbol)
+                if crate::semantic::relater::original_failure_bad!(concat!("source_declared_target_header_with_replay.reject.5.0@", "instantiated_members.rs", ":", line!()), store.type_payload(type_).is_none())
+                     ||  crate::semantic::relater::original_failure_bad!(concat!("source_declared_target_header_with_replay.reject.5.1@", "instantiated_members.rs", ":", line!()), replay == GenericMemberReplay::Names && links != &(ValueSymbolLinks {
+                        resolved_type: Some(type_), ..ValueSymbolLinks::default()
+                    }))
+                     ||  crate::semantic::relater::original_failure_bad!(concat!("source_declared_target_header_with_replay.reject.5.2@", "instantiated_members.rs", ":", line!()), replay == GenericMemberReplay::Full && (!super::structured_members::valid_property_symbol(store, symbol)
                     || !optional_member_type_is_normalized(
                         store,
                         type_,
                         member.flags().contains(SymbolFlags::OPTIONAL),
-                    )
+                    )))
                 {
+                    #[cfg(test)]
+                    crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
                     return Err(GenericInterfaceMemberError::InvalidMember(symbol));
                 }
                 DeclaredPropertyValue::Resolved(type_)
@@ -11007,18 +11232,18 @@ fn cached_instantiated_property_value_matches(
     mapper: TypeMapperId,
     cached: Option<TypeId>,
     array_targets: Option<CanonicalArrayTargets>,
-) -> bool {
+) -> Result<bool, GenericInterfaceMemberError> {
     if let Some(recovery) = store.instantiated_property_recovery(symbol) {
         let Some(cached) = cached else {
-            return false;
+            return Ok(false);
         };
         let Some(target) = store
             .value_symbol_links(symbol)
             .and_then(|links| links.target)
         else {
-            return false;
+            return Ok(false);
         };
-        return recovery.matches(
+        return Ok(recovery.matches(
             store,
             symbol,
             target,
@@ -11026,14 +11251,71 @@ fn cached_instantiated_property_value_matches(
             mapper,
             cached,
             array_targets,
-        );
+        ));
     }
-    cached.is_none_or(|cached| {
-        cached_instantiated_property_type_matches(store, template, cached, mapper, array_targets)
-    })
+    match cached {
+        None => Ok(true),
+        Some(cached) => cached_instantiated_property_type_matches_checked(
+            store,
+            template,
+            cached,
+            mapper,
+            array_targets,
+        ),
+    }
 }
 
+#[cfg(test)]
 fn cached_instantiated_property_type_matches(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    cached: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> bool {
+    cached_instantiated_property_type_matches_checked(
+        store,
+        template,
+        cached,
+        mapper,
+        array_targets,
+    )
+    .unwrap_or(false)
+}
+
+// Fallible proxy reads retain capacity failures from bounded source validation.
+fn cached_instantiated_property_type_matches_checked(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    cached: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, GenericInterfaceMemberError> {
+    if let Some(TypeData::IndexedAccess(indexed)) = store
+        .type_payload(template)
+        .map(super::type_records::TypeRecord::data)
+        && indexed.access_flags == AccessFlags::NONE
+        && let Some(object) = mapped_index_component(store, indexed.object_type, mapper)
+    {
+        super::object_members::validate_primitive_interface_members(store, object).map_err(
+            |error| match error {
+                super::object_members::PropertyObjectError::Capacity(_) => {
+                    GenericInterfaceMemberError::Capacity(object)
+                }
+                _ => GenericInterfaceMemberError::InvalidCachedMembers(object),
+            },
+        )?;
+    }
+    Ok(cached_instantiated_property_type_matches_inner(
+        store,
+        template,
+        cached,
+        mapper,
+        array_targets,
+    ))
+}
+
+fn cached_instantiated_property_type_matches_inner(
     store: &CanonicalTypeMapperStore,
     template: TypeId,
     cached: TypeId,
@@ -11276,6 +11558,18 @@ fn validate_nested_reference_targets(
     validated_targets: &mut HashSet<TypeId>,
     visited_types: &mut HashSet<TypeId>,
 ) -> Result<(), GenericInterfaceMemberError> {
+    validate_nested_reference_targets_with_replay(store, type_, array_targets, active_targets, validated_targets, visited_types, GenericMemberReplay::Full)
+}
+
+fn validate_nested_reference_targets_with_replay(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    active_targets: &mut Vec<TypeId>,
+    validated_targets: &mut HashSet<TypeId>,
+    visited_types: &mut HashSet<TypeId>,
+    replay: GenericMemberReplay,
+) -> Result<(), GenericInterfaceMemberError> {
     if !visited_types.insert(type_) {
         return Ok(());
     }
@@ -11284,13 +11578,14 @@ fn validate_nested_reference_targets(
         .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?
     {
         for element in tuple.element_types() {
-            validate_nested_reference_targets(
+            validate_nested_reference_targets_with_replay(
                 store,
                 *element,
                 array_targets,
                 active_targets,
                 validated_targets,
                 visited_types,
+                replay,
             )?;
         }
         visited_types.remove(&type_);
@@ -11302,32 +11597,35 @@ fn validate_nested_reference_targets(
     match record.data() {
         TypeData::Union(data) => {
             for constituent in &data.union.types {
-                validate_nested_reference_targets(
+                validate_nested_reference_targets_with_replay(
                     store,
                     *constituent,
                     array_targets,
                     active_targets,
                     validated_targets,
                     visited_types,
+                    replay,
                 )?;
             }
         }
         TypeData::IndexedAccess(indexed) => {
-            validate_nested_reference_targets(
+            validate_nested_reference_targets_with_replay(
                 store,
                 indexed.object_type,
                 array_targets,
                 active_targets,
                 validated_targets,
                 visited_types,
+                replay,
             )?;
-            validate_nested_reference_targets(
+            validate_nested_reference_targets_with_replay(
                 store,
                 indexed.index_type,
                 array_targets,
                 active_targets,
                 validated_targets,
                 visited_types,
+                replay,
             )?;
         }
         TypeData::TypeReference(_) | TypeData::Interface(_) => {
@@ -11336,32 +11634,35 @@ fn validate_nested_reference_targets(
                     .canonical_array_reference_with_targets(targets, type_)
                     .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?
             {
-                validate_nested_reference_targets(
+                validate_nested_reference_targets_with_replay(
                     store,
                     array.element_type,
                     array_targets,
                     active_targets,
                     validated_targets,
                     visited_types,
+                    replay,
                 )?;
             } else if let Ok(reference) = validate_direct_generic_reference(store, type_) {
                 let heritage_start = active_targets.len();
-                validate_declared_target(
+                validate_declared_target_with_replay(
                     store,
                     reference.target,
                     array_targets,
                     active_targets,
                     heritage_start,
                     validated_targets,
+                    replay,
                 )?;
                 for argument in reference.type_arguments {
-                    validate_nested_reference_targets(
+                    validate_nested_reference_targets_with_replay(
                         store,
                         argument,
                         array_targets,
                         active_targets,
                         validated_targets,
                         visited_types,
+                        replay,
                     )?;
                 }
             }
@@ -11540,7 +11841,16 @@ fn validate_warm_members(
     shape: &GenericInterfaceShape,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<InstantiatedInterfaceMembers>, GenericInterfaceMemberError> {
-    let record = store.type_payload(shape.reference).ok_or(
+    validate_warm_members_with_replay(store, shape, array_targets, GenericMemberReplay::Full)
+}
+
+fn validate_warm_members_with_replay(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    array_targets: Option<CanonicalArrayTargets>,
+    replay: GenericMemberReplay,
+) -> Result<Option<InstantiatedInterfaceMembers>, GenericInterfaceMemberError> {
+    let record = crate::semantic::relater::original_failure_payload!(shape.reference, store.type_payload(shape.reference)).ok_or(
         GenericInterfaceMemberError::InvalidCachedMembers(shape.reference),
     )?;
     let structured =
@@ -11554,14 +11864,18 @@ fn validate_warm_members(
         .object_flags()
         .contains(ObjectFlags::MEMBERS_RESOLVED)
     {
-        if structured != &StructuredTypeData::default() {
+        if crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.1.0@", "instantiated_members.rs", ":", line!()), structured != &StructuredTypeData::default()) {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(
                 shape.reference,
             ));
         }
         return Ok(None);
     }
-    if !shape.inherited_members_ready {
+    if crate::semantic::relater::original_failure_neg!(concat!("validate_warm_members_with_replay.reject.2.0@", "instantiated_members.rs", ":", line!()), shape.inherited_members_ready) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(
             shape.reference,
         ));
@@ -11579,6 +11893,8 @@ fn validate_warm_members(
             properties
         }
         _ => {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(
                 shape.reference,
             ));
@@ -11595,19 +11911,23 @@ fn validate_warm_members(
                 ))?,
         ),
         _ => {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(
                 shape.reference,
             ));
         }
     };
-    if structured.call_signature_count != shape.call_signatures.len()
-        || structured.signatures.as_ref().map_or(0, Vec::len) != shape.call_signatures.len()
-        || structured.signatures.as_ref().is_some_and(Vec::is_empty)
-        || structured.constrained != ConstrainedTypeData::default()
-        || structured
+    if crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.3.0@", "instantiated_members.rs", ":", line!()), structured.call_signature_count != shape.call_signatures.len())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.3.1@", "instantiated_members.rs", ":", line!()), structured.signatures.as_ref().map_or(0, Vec::len) != shape.call_signatures.len())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.3.2@", "instantiated_members.rs", ":", line!()), structured.signatures.as_ref().is_some_and(Vec::is_empty))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.3.3@", "instantiated_members.rs", ":", line!()), structured.constrained != ConstrainedTypeData::default())
+         ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.3.4@", "instantiated_members.rs", ":", line!()), structured
             .object_type_without_abstract_construct_signatures
-            .is_some()
+            .is_some())
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(
             shape.reference,
         ));
@@ -11642,23 +11962,25 @@ fn validate_warm_members(
                     generic_interface_call_owner_mapper(store, original, callable.signature)
                 })
         });
-    if mapper.is_none()
+    if crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.4.0@", "instantiated_members.rs", ":", line!()), mapper.is_none()
         && shape
             .properties
             .iter()
-            .any(|property| property.requires_proxy)
-        || mapper.is_some_and(|mapper| {
+            .any(|property| property.requires_proxy))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.4.1@", "instantiated_members.rs", ":", line!()), mapper.is_some_and(|mapper| {
             store.type_mapper_has_exact_endpoints(mapper, &all_parameters, &mapper_targets)
                 != Some(true)
-        })
-        || callables
+        }))
+         ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.4.2@", "instantiated_members.rs", ":", line!()), callables
             .iter()
             .zip(&shape.call_signatures)
             .any(|(callable, &original)| {
                 generic_interface_call_owner_mapper(store, original, callable.signature)
                     .is_some_and(|call_mapper| Some(call_mapper) != mapper)
-            })
+            }))
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(
             shape.reference,
         ));
@@ -11674,23 +11996,37 @@ fn validate_warm_members(
         None if expected_index_count == 0 => &[][..],
         Some(indexes) if indexes.len() == expected_index_count && !indexes.is_empty() => indexes,
         _ => {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(
                 shape.reference,
             ));
         }
     };
     let (own_indexes, inherited_indexes) = indexes.split_at(shape.index_infos.len());
-    if own_indexes
-        .iter()
-        .zip(&shape.index_infos)
-        .any(|(actual, source)| {
-            !valid_instantiated_index_info(store, shape, *source, *actual, mapper, array_targets)
-        })
-        || inherited_indexes != shape.inherited_index_infos.as_slice()
-    {
+    if crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.5.0@", "instantiated_members.rs", ":", line!()), inherited_indexes != shape.inherited_index_infos.as_slice()) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(
             shape.reference,
         ));
+    }
+    for (actual, source) in own_indexes.iter().zip(&shape.index_infos) {
+        if crate::semantic::relater::original_failure_neg!(concat!("validate_warm_members_with_replay.reject.6.0@", "instantiated_members.rs", ":", line!()), valid_instantiated_index_info_with_replay(
+            store,
+            shape,
+            *source,
+            *actual,
+            mapper,
+            array_targets,
+            replay,
+        )?) {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                shape.reference,
+            ));
+        }
     }
     for (property, source) in own_properties.iter().zip(&shape.properties) {
         let symbol =
@@ -11703,9 +12039,11 @@ fn validate_warm_members(
             .symbol(source.symbol)
             .ok_or(GenericInterfaceMemberError::InvalidMember(source.symbol))?;
         if !source.requires_proxy {
-            if *property != source.symbol
-                || table.and_then(|table| table.get(symbol.name())) != Some(source.symbol)
+            if crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.8.0@", "instantiated_members.rs", ":", line!()), *property != source.symbol)
+                 ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.8.1@", "instantiated_members.rs", ":", line!()), table.and_then(|table| table.get(symbol.name())) != Some(source.symbol))
             {
+                #[cfg(test)]
+                crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
                 return Err(GenericInterfaceMemberError::InvalidCachedProperty(
                     *property,
                 ));
@@ -11754,23 +12092,26 @@ fn validate_warm_members(
             || links
                 .resolved_type
                 .is_some_and(|type_| store.type_payload(type_).is_none())
-            || match source.value {
-                DeclaredPropertyValue::Pending => {
-                    links.resolved_type.is_some()
-                        || store.instantiated_property_recovery(*property).is_some()
+            || replay == GenericMemberReplay::Full
+                && match source.value {
+                    DeclaredPropertyValue::Pending => {
+                        links.resolved_type.is_some()
+                            || store.instantiated_property_recovery(*property).is_some()
+                    }
+                    DeclaredPropertyValue::Resolved(type_) => {
+                        !cached_instantiated_property_value_matches(
+                            store,
+                            *property,
+                            type_,
+                            property_mapper,
+                            links.resolved_type,
+                            array_targets,
+                        )?
+                    }
                 }
-                DeclaredPropertyValue::Resolved(type_) => {
-                    !cached_instantiated_property_value_matches(
-                        store,
-                        *property,
-                        type_,
-                        property_mapper,
-                        links.resolved_type,
-                        array_targets,
-                    )
-                }
-            }
         {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidCachedProperty(
                 *property,
             ));
@@ -11780,7 +12121,9 @@ fn validate_warm_members(
         let record = store
             .symbol(*actual)
             .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(*actual))?;
-        if actual != expected || table.and_then(|table| table.get(record.name())) != Some(*actual) {
+        if crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.9.0@", "instantiated_members.rs", ":", line!()), actual != expected)  ||  crate::semantic::relater::original_failure_bad!(concat!("validate_warm_members_with_replay.reject.9.1@", "instantiated_members.rs", ":", line!()), table.and_then(|table| table.get(record.name())) != Some(*actual)) {
+            #[cfg(test)]
+            crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
             return Err(GenericInterfaceMemberError::InvalidCachedProperty(*actual));
         }
     }
@@ -11801,11 +12144,32 @@ fn valid_instantiated_index_info(
     mapper: Option<TypeMapperId>,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
+    valid_instantiated_index_info_with_replay(
+        store,
+        shape,
+        source,
+        actual,
+        mapper,
+        array_targets,
+        GenericMemberReplay::Full,
+    )
+    .unwrap_or(false)
+}
+
+fn valid_instantiated_index_info_with_replay(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    source: IndexInfoId,
+    actual: IndexInfoId,
+    mapper: Option<TypeMapperId>,
+    array_targets: Option<CanonicalArrayTargets>,
+    replay: GenericMemberReplay,
+) -> Result<bool, GenericInterfaceMemberError> {
     let Some(source_info) = store.index_info(source) else {
-        return false;
+        return Ok(false);
     };
     let Some(actual_info) = store.index_info(actual) else {
-        return false;
+        return Ok(false);
     };
     if source_info.key_type() != actual_info.key_type()
         || source_info.is_readonly() != actual_info.is_readonly()
@@ -11814,24 +12178,40 @@ fn valid_instantiated_index_info(
         || source_info.index_symbol().is_some()
         || actual_info.index_symbol().is_some()
     {
-        return false;
+        return Ok(false);
     }
     if let Some(recovery) = store.instantiated_index_recovery(actual) {
-        return recovery.matches(store, shape, source, actual, mapper, array_targets);
+        return Ok(match replay {
+            GenericMemberReplay::Full => {
+                recovery.matches(store, shape, source, actual, mapper, array_targets)
+            }
+            GenericMemberReplay::Names => {
+                recovery.source == source
+                    && recovery.index == actual
+                    && recovery.shape.same_member_names(shape)
+                    && recovery.mapper == mapper
+                    && recovery.matches_cached_identity(store, array_targets)
+                    && mapper_parameters_for_target(store, shape.target, &shape.source_parameters)
+                        .ok()
+                        .as_deref()
+                        == Some(recovery.mapper_sources.as_slice())
+                    && recovery.mapper_targets == member_mapper_arguments(store, shape)
+            }
+        });
     }
     let value_matches = if let Some(mapper) = mapper {
-        cached_instantiated_property_type_matches(
+        cached_instantiated_property_type_matches_checked(
             store,
             source_info.value_type(),
             actual_info.value_type(),
             mapper,
             array_targets,
-        )
+        )?
     } else {
         let Ok(sources) =
             mapper_parameters_for_target(store, shape.target, &shape.source_parameters)
         else {
-            return false;
+            return Ok(false);
         };
         let targets = member_mapper_arguments(store, shape);
         cached_instantiation_with_vector(
@@ -11846,7 +12226,8 @@ fn valid_instantiated_index_info(
         .flatten()
             == Some(actual_info.value_type())
     };
-    value_matches && (source == actual) == (source_info.value_type() == actual_info.value_type())
+    Ok(value_matches
+        && (source == actual) == (source_info.value_type() == actual_info.value_type()))
 }
 
 fn prepare_cold_property_proxy(
@@ -11901,9 +12282,11 @@ fn prepare_cold_members(
     } else {
         Some(prepare_member_table(shape.reference, count)?)
     };
-    if !store.try_reserve_checker_symbol_allocations(proxy_count, usize::from(count != 0))
-        || !store.try_reserve_value_symbol_links(proxy_count)
+    if crate::semantic::relater::original_failure_neg!(concat!("prepare_cold_members.reject.1.0@", "instantiated_members.rs", ":", line!()), store.try_reserve_checker_symbol_allocations(proxy_count, usize::from(count != 0)))
+         ||  crate::semantic::relater::original_failure_neg!(concat!("prepare_cold_members.reject.1.1@", "instantiated_members.rs", ":", line!()), store.try_reserve_value_symbol_links(proxy_count))
     {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::Capacity(shape.reference));
     }
     let mut properties = Vec::with_capacity(count);
@@ -12005,7 +12388,9 @@ fn prepare_cold_member_values(
                 .properties
                 .iter()
                 .any(|property| property.requires_proxy);
-    if !store.try_reserve_mappers(usize::from(requires_mapper)) {
+    if crate::semantic::relater::original_failure_neg!(concat!("prepare_cold_member_values.reject.1.0@", "instantiated_members.rs", ":", line!()), store.try_reserve_mappers(usize::from(requires_mapper))) {
+        #[cfg(test)]
+        crate::semantic::relater::original_failure_witness::terminal_site("instantiated_members.rs", line!() + 1);
         return Err(GenericInterfaceMemberError::Capacity(shape.reference));
     }
     let mapper = requires_mapper.then(|| {
@@ -26005,6 +26390,959 @@ mod tests {
             warm,
         );
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PrimitiveInterfaceMemberRecipeForm {
+        Property,
+        StringIndex,
+    }
+
+    fn primitive_interface_member_recipe_fixture(
+        parsed: &ParseResult,
+        file: FileId,
+        form: PrimitiveInterfaceMemberRecipeForm,
+    ) -> (CanonicalCheckerContext<'_>, TypeId, TypeId, TypeId) {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(parsed, file, CanonicalCheckerOptions::default());
+        let shape_symbol = source_symbol(parsed, file, &context, "Shape");
+        let pick_symbol = source_symbol(parsed, file, &context, "Pick");
+        let shape = context.get_declared_type_of_symbol(shape_symbol).unwrap();
+        let target = context.get_declared_type_of_symbol(pick_symbol).unwrap();
+        let parameter = match context.store().type_payload(target).unwrap().data() {
+            TypeData::Interface(interface) => interface
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .unwrap()[0],
+            _ => panic!("Pick must retain its generic interface target"),
+        };
+        match form {
+            PrimitiveInterfaceMemberRecipeForm::Property => {
+                let key = context
+                    .store_mut_for_test()
+                    .regular_string_literal_type("value".to_owned())
+                    .unwrap();
+                let template = context
+                    .store_mut_for_test()
+                    .alloc_indexed_access_type(parameter, key, AccessFlags::NONE)
+                    .unwrap();
+                publish_generic_target_for_test(
+                    &mut context,
+                    target,
+                    &[("selected", template)],
+                    None,
+                );
+            }
+            PrimitiveInterfaceMemberRecipeForm::StringIndex => {
+                let key = context
+                    .store_mut_for_test()
+                    .regular_string_literal_type("missing".to_owned())
+                    .unwrap();
+                let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+                let named = context
+                    .store_mut_for_test()
+                    .alloc_indexed_access_type(parameter, key, AccessFlags::NONE)
+                    .unwrap();
+                let broad = context
+                    .store_mut_for_test()
+                    .alloc_indexed_access_type(parameter, string, AccessFlags::NONE)
+                    .unwrap();
+                publish_generic_target_for_test(
+                    &mut context,
+                    target,
+                    &[("named", named), ("broad", broad)],
+                    None,
+                );
+            }
+        }
+        let reference = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target, &[shape])
+            .unwrap();
+        let TypeData::Interface(interface) = context.store().type_payload(shape).unwrap().data()
+        else {
+            panic!("Shape must retain its interface identity");
+        };
+        assert!(!interface.declared_members_resolved);
+        assert!(!interface.base_types_resolved);
+        assert_eq!(
+            interface.reference.object.structured,
+            StructuredTypeData::default()
+        );
+        (context, shape, target, reference)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Source and raw reads must preserve the published identity.
+    fn primitive_interface_member_recipes_replay_source_reads_after_raw_publication() {
+        use crate::semantic::object_members::{
+            PropertyObjectState, interface_state, plan_interface,
+            validate_resolved_declared_member_types,
+        };
+
+        for (form, source) in [
+            (
+                PrimitiveInterfaceMemberRecipeForm::Property,
+                concat!(
+                    "interface Shape { value: string }\n",
+                    "interface Pick<T> { selected: T[\"value\"] }\n",
+                    "type Probe = Shape[\"value\"];\n",
+                ),
+            ),
+            (
+                PrimitiveInterfaceMemberRecipeForm::StringIndex,
+                concat!(
+                    "interface Shape { [name: string]: number }\n",
+                    "interface Pick<T> { named: T[\"missing\"]; broad: T[string] }\n",
+                    "type NamedProbe = Shape[\"missing\"];\n",
+                    "type BroadProbe = Shape[string];\n",
+                ),
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(6_320);
+            let (mut context, shape, _, reference) =
+                primitive_interface_member_recipe_fixture(&parsed, file, form);
+            let owner = source_symbol(&parsed, file, &context, "Shape");
+            let probes = parsed
+                .arena
+                .iter()
+                .filter_map(|(_, node)| match &node.data {
+                    NodeData::TypeAliasDeclaration(alias) => {
+                        Some(NodeRef::new(parsed.arena.id(), file, alias.type_))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for probe in &probes {
+                assert_eq!(
+                    context.store().source_node_kind(*probe),
+                    Some(SyntaxKind::IndexedAccessType),
+                );
+                assert!(
+                    context
+                        .store()
+                        .type_node_links(*probe)
+                        .is_none_or(|links| { links == &TypeNodeLinks::default() })
+                );
+            }
+            let names: &[&str] = match form {
+                PrimitiveInterfaceMemberRecipeForm::Property => &["selected"],
+                PrimitiveInterfaceMemberRecipeForm::StringIndex => &["named", "broad"],
+            };
+            assert_eq!(probes.len(), names.len());
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+            let expected = match form {
+                PrimitiveInterfaceMemberRecipeForm::Property => string,
+                PrimitiveInterfaceMemberRecipeForm::StringIndex => number,
+            };
+            let selected = names
+                .iter()
+                .map(|name| {
+                    let property = context
+                        .store_mut_for_test()
+                        .resolve_generic_interface_property(reference, name, None)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(property.type_id(), expected);
+                    property
+                })
+                .collect::<Vec<_>>();
+            let plan = {
+                let host = context.declared_type_host().unwrap();
+                plan_interface(context.store(), &host, owner).unwrap()
+            };
+            let property_types =
+                (form == PrimitiveInterfaceMemberRecipeForm::Property).then_some(string);
+            let index_types = (form == PrimitiveInterfaceMemberRecipeForm::StringIndex)
+                .then_some((string, number));
+            assert_eq!(
+                interface_state(context.store(), &plan, shape),
+                Ok(PropertyObjectState::Resolved(shape)),
+            );
+            assert_eq!(
+                validate_resolved_declared_member_types(
+                    context.store(),
+                    &plan,
+                    property_types.as_slice(),
+                    index_types.as_slice(),
+                    &[],
+                ),
+                Ok(()),
+            );
+            let TypeData::Interface(published) =
+                context.store().type_payload(shape).unwrap().data()
+            else {
+                panic!("Shape must retain its published interface");
+            };
+            let published = published.clone();
+            assert!(published.base_types_resolved);
+            assert!(published.resolved_base_types.is_none());
+            assert!(published.resolved_base_constructor_type.is_none());
+            assert_eq!(published.declared_members, plan.members);
+            assert_eq!(published.reference.object.structured.members, plan.members);
+            assert_eq!(
+                published.declared_index_infos,
+                published.reference.object.structured.index_infos,
+            );
+            let member = plan
+                .properties
+                .first()
+                .map(|property| property.symbol)
+                .or_else(|| plan.indexes.first().map(|index| index.symbol))
+                .unwrap();
+            let member_links = context.store().value_symbol_links(member).cloned();
+            let mut warm_counts = None;
+            for _ in 0..2 {
+                for probe in &probes {
+                    assert_eq!(context.get_type_from_type_node(*probe).unwrap(), expected);
+                }
+                assert_eq!(context.get_declared_type_of_symbol(owner).unwrap(), shape);
+                for (name, property) in names.iter().zip(&selected) {
+                    assert_eq!(
+                        context
+                            .store_mut_for_test()
+                            .resolve_generic_interface_property(reference, name, None),
+                        Ok(Some(*property)),
+                    );
+                }
+                assert_eq!(
+                    context.store().type_payload(shape).unwrap().data(),
+                    &TypeData::Interface(published.clone()),
+                );
+                assert_eq!(
+                    context.store().value_symbol_links(member).cloned(),
+                    member_links
+                );
+                assert_eq!(
+                    interface_state(context.store(), &plan, shape),
+                    Ok(PropertyObjectState::Resolved(shape)),
+                );
+                assert_eq!(
+                    validate_resolved_declared_member_types(
+                        context.store(),
+                        &plan,
+                        property_types.as_slice(),
+                        index_types.as_slice(),
+                        &[],
+                    ),
+                    Ok(()),
+                );
+                let counts = property_recovery_store_counts(context.store());
+                if let Some(warm) = warm_counts {
+                    assert_eq!(counts, warm);
+                }
+                warm_counts = Some(counts);
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Read damage twice, then restore the exact records.
+    fn primitive_interface_member_recipes_reject_and_restore_warm_source_and_cache_damage() {
+        use crate::semantic::object_members::{
+            PropertyObjectState, interface_state, plan_interface,
+            validate_resolved_declared_member_types,
+        };
+
+        for (form, source, name) in [
+            (
+                PrimitiveInterfaceMemberRecipeForm::Property,
+                "interface Shape { value: string } interface Pick<T> { selected: T[\"value\"] }",
+                "selected",
+            ),
+            (
+                PrimitiveInterfaceMemberRecipeForm::StringIndex,
+                concat!(
+                    "interface Shape { [name: string]: number } ",
+                    "interface Pick<T> { named: T[\"missing\"]; broad: T[string] }",
+                ),
+                "named",
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(6_321);
+            let (mut context, shape, _, reference) =
+                primitive_interface_member_recipe_fixture(&parsed, file, form);
+            let selected = context
+                .store_mut_for_test()
+                .resolve_generic_interface_property(reference, name, None)
+                .unwrap()
+                .unwrap();
+            if form == PrimitiveInterfaceMemberRecipeForm::StringIndex {
+                assert_eq!(
+                    context
+                        .store_mut_for_test()
+                        .resolve_generic_interface_property(reference, "broad", None)
+                        .unwrap()
+                        .unwrap()
+                        .type_id(),
+                    selected.type_id(),
+                );
+            }
+            let owner = source_symbol(&parsed, file, &context, "Shape");
+            let plan = {
+                let host = context.declared_type_host().unwrap();
+                plan_interface(context.store(), &host, owner).unwrap()
+            };
+            let (member, annotation) = match form {
+                PrimitiveInterfaceMemberRecipeForm::Property => {
+                    (plan.properties[0].symbol, plan.properties[0].type_node)
+                }
+                PrimitiveInterfaceMemberRecipeForm::StringIndex => {
+                    (plan.indexes[0].symbol, plan.indexes[0].value_type_node)
+                }
+            };
+            assert_eq!(
+                context.get_type_from_type_node(annotation).unwrap(),
+                selected.type_id(),
+            );
+            assert!(context.store_mut_for_test().set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(selected.type_id()),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            let annotation_links = context
+                .store()
+                .type_node_links(annotation)
+                .cloned()
+                .unwrap();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+            let wrong = if selected.type_id() == string {
+                number
+            } else {
+                string
+            };
+            let reject_twice = |context: &mut CanonicalCheckerContext<'_>| {
+                let TypeData::Interface(publication) =
+                    context.store().type_payload(shape).unwrap().data()
+                else {
+                    panic!("Shape must keep its damaged publication");
+                };
+                let publication = publication.clone();
+                let annotation_before = context.store().type_node_links(annotation).cloned();
+                let bound = context.store().symbol(member).unwrap();
+                let declarations_before = bound.declarations().map(<[NodeRef]>::to_vec);
+                let value_declaration_before = bound.value_declaration();
+                let member_before = context.store().value_symbol_links(member).cloned();
+                let proxy_before = context
+                    .store()
+                    .value_symbol_links(selected.symbol())
+                    .cloned();
+                let counts_before = property_recovery_store_counts(context.store());
+                for _ in 0..2 {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .resolve_generic_interface_property(reference, name, None)
+                            .is_err()
+                    );
+                    assert_eq!(
+                        context.store().type_payload(shape).unwrap().data(),
+                        &TypeData::Interface(publication.clone()),
+                    );
+                    assert_eq!(
+                        context.store().type_node_links(annotation).cloned(),
+                        annotation_before,
+                    );
+                    let bound = context.store().symbol(member).unwrap();
+                    assert_eq!(bound.declarations(), declarations_before.as_deref());
+                    assert_eq!(bound.value_declaration(), value_declaration_before);
+                    assert_eq!(
+                        context.store().value_symbol_links(member).cloned(),
+                        member_before
+                    );
+                    assert_eq!(
+                        context
+                            .store()
+                            .value_symbol_links(selected.symbol())
+                            .cloned(),
+                        proxy_before,
+                    );
+                    assert_eq!(
+                        property_recovery_store_counts(context.store()),
+                        counts_before
+                    );
+                }
+            };
+            assert!(context.store_mut_for_test().set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..annotation_links.clone()
+                },
+            ));
+            reject_twice(&mut context);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(annotation, annotation_links)
+            );
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_property(reference, name, None),
+                Ok(Some(selected)),
+            );
+
+            let bound = context.store().symbol(member).unwrap();
+            let declarations = bound.declarations().unwrap().to_vec();
+            let value_declaration = bound.value_declaration();
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                member,
+                Some(Vec::new()),
+                None,
+            ));
+            reject_twice(&mut context);
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                member,
+                Some(declarations),
+                value_declaration,
+            ));
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_property(reference, name, None),
+                Ok(Some(selected)),
+            );
+            let TypeData::Interface(published) =
+                context.store().type_payload(shape).unwrap().data()
+            else {
+                panic!("Shape must retain its complete publication");
+            };
+            let published = published.clone();
+            match form {
+                PrimitiveInterfaceMemberRecipeForm::Property => {
+                    let links = context.store().value_symbol_links(member).cloned().unwrap();
+                    assert!(context.store_mut_for_test().set_value_symbol_links(
+                        member,
+                        ValueSymbolLinks {
+                            resolved_type: Some(wrong),
+                            ..links.clone()
+                        },
+                    ));
+                    reject_twice(&mut context);
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(member, links)
+                    );
+                }
+                PrimitiveInterfaceMemberRecipeForm::StringIndex => {
+                    let original = published.declared_index_infos.as_ref().unwrap()[0];
+                    let info = context.store().index_info(original).unwrap();
+                    let (key, readonly, declaration, components) = (
+                        info.key_type(),
+                        info.is_readonly(),
+                        info.declaration(),
+                        info.components().to_vec(),
+                    );
+                    let wrong_index = context
+                        .store_mut_for_test()
+                        .alloc_index_info(key, wrong, readonly, declaration, components)
+                        .unwrap();
+                    let structured = &published.reference.object.structured;
+                    for replace_structured in [true, false] {
+                        assert!(context.store_mut_for_test().set_interface_declared_members(
+                            shape,
+                            true,
+                            published.declared_members,
+                            None,
+                            None,
+                            Some(vec![wrong_index]),
+                        ));
+                        if replace_structured {
+                            assert!(context.store_mut_for_test().set_structured_type_members(
+                                shape,
+                                structured.members,
+                                structured.properties.clone(),
+                                None,
+                                None,
+                                Some(vec![wrong_index]),
+                            ));
+                        }
+                        reject_twice(&mut context);
+                        assert!(context.store_mut_for_test().set_interface_declared_members(
+                            shape,
+                            true,
+                            published.declared_members,
+                            None,
+                            None,
+                            published.declared_index_infos.clone(),
+                        ));
+                        assert!(context.store_mut_for_test().set_structured_type_members(
+                            shape,
+                            structured.members,
+                            structured.properties.clone(),
+                            None,
+                            None,
+                            structured.index_infos.clone(),
+                        ));
+                        assert_eq!(
+                            context
+                                .store_mut_for_test()
+                                .resolve_generic_interface_property(reference, name, None),
+                            Ok(Some(selected)),
+                        );
+                        assert_eq!(
+                            context.store().index_info(original).unwrap().value_type(),
+                            number,
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_property(reference, name, None),
+                Ok(Some(selected)),
+            );
+            let replay_plan = {
+                let host = context.declared_type_host().unwrap();
+                plan_interface(context.store(), &host, owner).unwrap()
+            };
+            let property_types =
+                (form == PrimitiveInterfaceMemberRecipeForm::Property).then_some(string);
+            let index_types = (form == PrimitiveInterfaceMemberRecipeForm::StringIndex)
+                .then_some((string, number));
+            assert_eq!(
+                interface_state(context.store(), &replay_plan, shape),
+                Ok(PropertyObjectState::Resolved(shape)),
+            );
+            assert_eq!(
+                validate_resolved_declared_member_types(
+                    context.store(),
+                    &replay_plan,
+                    property_types.as_slice(),
+                    index_types.as_slice(),
+                    &[],
+                ),
+                Ok(()),
+            );
+            assert_eq!(
+                context.store().type_payload(shape).unwrap().data(),
+                &TypeData::Interface(published),
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep budget failure and malformed publication separate.
+    fn primitive_interface_member_recipes_keep_shells_on_failed_budgeted_publication() {
+        for (form, source, name) in [
+            (
+                PrimitiveInterfaceMemberRecipeForm::Property,
+                "interface Shape { value: string } interface Pick<T> { selected: T[\"value\"] }",
+                "selected",
+            ),
+            (
+                PrimitiveInterfaceMemberRecipeForm::StringIndex,
+                concat!(
+                    "interface Shape { [name: string]: number } ",
+                    "interface Pick<T> { named: T[\"missing\"]; broad: T[string] }",
+                ),
+                "named",
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(6_322);
+            let (mut context, shape, _, reference) =
+                primitive_interface_member_recipe_fixture(&parsed, file, form);
+            let TypeData::Interface(shell) = context.store().type_payload(shape).unwrap().data()
+            else {
+                panic!("Shape must retain its cold interface");
+            };
+            let shell = shell.clone();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+            let expected = if form == PrimitiveInterfaceMemberRecipeForm::Property {
+                string
+            } else {
+                number
+            };
+            let mut limited = InstantiationSession::new(InstantiationLimits {
+                max_depth: 0,
+                max_count: 0,
+            });
+            let mark = limited.limit_event_mark();
+            assert!(
+                resolve_property_with_array_targets_and_session(
+                    context.store_mut_for_test(),
+                    reference,
+                    EscapedNameRef::source(name),
+                    None,
+                    &mut limited,
+                )
+                .is_err()
+            );
+            assert!(limited.limit_event_occurred_since(mark));
+            assert_eq!(
+                context.store().type_payload(shape).unwrap().data(),
+                &TypeData::Interface(shell),
+            );
+            let proxies = context
+                .store()
+                .type_payload(reference)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .properties
+                .as_deref()
+                .unwrap_or_default();
+            assert!(proxies.iter().all(|proxy| {
+                context
+                    .store()
+                    .value_symbol_links(*proxy)
+                    .is_none_or(|links| {
+                        links
+                            .resolved_type
+                            .is_none_or(|cached| cached != string && cached != number)
+                    })
+            }));
+            let mut normal = InstantiationSession::new(InstantiationLimits::default());
+            let selected = resolve_property_with_array_targets_and_session(
+                context.store_mut_for_test(),
+                reference,
+                EscapedNameRef::source(name),
+                None,
+                &mut normal,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(selected.type_id(), expected);
+
+            let (mut context, shape, _, reference) =
+                primitive_interface_member_recipe_fixture(&parsed, file, form);
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let expected = match form {
+                PrimitiveInterfaceMemberRecipeForm::Property => bootstrap.string_type,
+                PrimitiveInterfaceMemberRecipeForm::StringIndex => bootstrap.number_type,
+            };
+            let owner = source_symbol(&parsed, file, &context, "Shape");
+            let raw = context.store().symbol(owner).unwrap().members().unwrap();
+            let table = context.store().symbol_table(raw).unwrap();
+            let member = match form {
+                PrimitiveInterfaceMemberRecipeForm::Property => table.get_source("value").unwrap(),
+                PrimitiveInterfaceMemberRecipeForm::StringIndex => {
+                    table.get(InternalSymbolName::Index.as_ref()).unwrap()
+                }
+            };
+            let bound = context.store().symbol(member).unwrap();
+            let declarations = bound.declarations().unwrap().to_vec();
+            let value_declaration = bound.value_declaration();
+            let TypeData::Interface(shell) = context.store().type_payload(shape).unwrap().data()
+            else {
+                panic!("Shape must retain its cold interface");
+            };
+            let shell = shell.clone();
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                member,
+                Some(Vec::new()),
+                None,
+            ));
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_property(reference, name, None)
+                    .is_err()
+            );
+            assert_eq!(
+                context.store().type_payload(shape).unwrap().data(),
+                &TypeData::Interface(shell),
+            );
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                member,
+                Some(declarations),
+                value_declaration,
+            ));
+            let selected = context
+                .store_mut_for_test()
+                .resolve_generic_interface_property(reference, name, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected.type_id(), expected);
+            let TypeData::Interface(published) =
+                context.store().type_payload(shape).unwrap().data()
+            else {
+                panic!("Shape must retain its complete interface");
+            };
+            assert!(published.declared_members_resolved);
+            assert!(published.base_types_resolved);
+            assert_eq!(
+                published.declared_index_infos,
+                published.reference.object.structured.index_infos,
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep missing keys, index fallback and rejected access together.
+    fn primitive_interface_member_recipes_preserve_missing_keys_and_index_fallback() {
+        use crate::semantic::object_members::{
+            PropertyObjectState, interface_state, plan_interface,
+            validate_resolved_declared_member_types,
+        };
+
+        for (form, source, name) in [
+            (
+                PrimitiveInterfaceMemberRecipeForm::Property,
+                "interface Shape { value: string } interface Pick<T> { selected: T[\"value\"] }",
+                "selected",
+            ),
+            (
+                PrimitiveInterfaceMemberRecipeForm::StringIndex,
+                concat!(
+                    "interface Shape { [name: string]: number } ",
+                    "interface Pick<T> { named: T[\"missing\"]; broad: T[string] }",
+                ),
+                "named",
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(6_323);
+            let (mut context, shape, _, reference) =
+                primitive_interface_member_recipe_fixture(&parsed, file, form);
+            let TypeData::Interface(shell) = context.store().type_payload(shape).unwrap().data()
+            else {
+                panic!("Shape must retain its cold interface");
+            };
+            let shell = shell.clone();
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_property(reference, "absent", None),
+                Ok(None),
+            );
+            assert_eq!(
+                context.store().type_payload(shape).unwrap().data(),
+                &TypeData::Interface(shell),
+            );
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            match form {
+                PrimitiveInterfaceMemberRecipeForm::Property => {
+                    let (mut context, shape, target, reference) =
+                        primitive_interface_member_recipe_fixture(&parsed, file, form);
+                    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                    let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+                    let parameter = match context.store().type_payload(target).unwrap().data() {
+                        TypeData::Interface(interface) => interface
+                            .reference
+                            .resolved_type_arguments
+                            .as_ref()
+                            .unwrap()[0],
+                        _ => panic!("Pick must retain its generic target"),
+                    };
+                    let owner = source_symbol(&parsed, file, &context, "Pick");
+                    let member = context
+                        .store()
+                        .symbol(owner)
+                        .unwrap()
+                        .members()
+                        .and_then(|raw| context.store().symbol_table(raw))
+                        .and_then(|table| table.get_source(name))
+                        .unwrap();
+                    let links = context.store().value_symbol_links(member).cloned().unwrap();
+                    let missing = context
+                        .store_mut_for_test()
+                        .regular_string_literal_type("missing".to_owned())
+                        .unwrap();
+                    let template = context
+                        .store_mut_for_test()
+                        .alloc_indexed_access_type(parameter, missing, AccessFlags::NONE)
+                        .unwrap();
+                    assert!(context.store_mut_for_test().set_value_symbol_links(
+                        member,
+                        ValueSymbolLinks {
+                            resolved_type: Some(template),
+                            ..links
+                        },
+                    ));
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .resolve_generic_interface_property(reference, name, None)
+                            .is_err()
+                    );
+                    let owner = source_symbol(&parsed, file, &context, "Shape");
+                    let plan = {
+                        let host = context.declared_type_host().unwrap();
+                        plan_interface(context.store(), &host, owner).unwrap()
+                    };
+                    assert_eq!(
+                        interface_state(context.store(), &plan, shape),
+                        Ok(PropertyObjectState::Resolved(shape)),
+                    );
+                    assert_eq!(
+                        validate_resolved_declared_member_types(
+                            context.store(),
+                            &plan,
+                            &[string],
+                            &[],
+                            &[],
+                        ),
+                        Ok(()),
+                    );
+                    let proxies = context
+                        .store()
+                        .type_payload(reference)
+                        .unwrap()
+                        .data()
+                        .structured()
+                        .unwrap()
+                        .properties
+                        .as_deref()
+                        .unwrap_or_default();
+                    assert!(proxies.iter().all(|proxy| {
+                        context
+                            .store()
+                            .value_symbol_links(*proxy)
+                            .is_none_or(|links| {
+                                links
+                                    .resolved_type
+                                    .is_none_or(|cached| cached != string && cached != number)
+                            })
+                    }));
+                }
+                PrimitiveInterfaceMemberRecipeForm::StringIndex => {
+                    let named = context
+                        .store_mut_for_test()
+                        .resolve_generic_interface_property(reference, "named", None)
+                        .unwrap()
+                        .unwrap();
+                    let broad = context
+                        .store_mut_for_test()
+                        .resolve_generic_interface_property(reference, "broad", None)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(named.type_id(), number);
+                    assert_eq!(broad.type_id(), number);
+                    let indexes = context
+                        .store()
+                        .type_payload(shape)
+                        .unwrap()
+                        .data()
+                        .structured()
+                        .unwrap()
+                        .index_infos
+                        .clone()
+                        .unwrap();
+                    assert_eq!(indexes.len(), 1);
+                    let warm = property_recovery_store_counts(context.store());
+                    for _ in 0..2 {
+                        for (name, selected) in [("named", named), ("broad", broad)] {
+                            assert_eq!(
+                                context
+                                    .store_mut_for_test()
+                                    .resolve_generic_interface_property(reference, name, None),
+                                Ok(Some(selected)),
+                            );
+                        }
+                        assert_eq!(
+                            context
+                                .store()
+                                .type_payload(shape)
+                                .unwrap()
+                                .data()
+                                .structured()
+                                .unwrap()
+                                .index_infos
+                                .as_ref(),
+                            Some(&indexes),
+                        );
+                        assert_eq!(property_recovery_store_counts(context.store()), warm);
+                    }
+                }
+            }
+            for flags in [AccessFlags::INCLUDE_UNDEFINED, AccessFlags::NONE] {
+                let (mut context, shape, target, reference) =
+                    primitive_interface_member_recipe_fixture(&parsed, file, form);
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+                let parameter = match context.store().type_payload(target).unwrap().data() {
+                    TypeData::Interface(interface) => interface
+                        .reference
+                        .resolved_type_arguments
+                        .as_ref()
+                        .unwrap()[0],
+                    _ => panic!("Pick must retain its generic target"),
+                };
+                let owner = source_symbol(&parsed, file, &context, "Pick");
+                let member = context
+                    .store()
+                    .symbol(owner)
+                    .unwrap()
+                    .members()
+                    .and_then(|raw| context.store().symbol_table(raw))
+                    .and_then(|table| table.get_source(name))
+                    .unwrap();
+                let links = context.store().value_symbol_links(member).cloned().unwrap();
+                let key = if flags == AccessFlags::NONE {
+                    context
+                        .store()
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .es_symbol_type
+                } else {
+                    context
+                        .store_mut_for_test()
+                        .regular_string_literal_type("missing".to_owned())
+                        .unwrap()
+                };
+                let template = context
+                    .store_mut_for_test()
+                    .alloc_indexed_access_type(parameter, key, flags)
+                    .unwrap();
+                assert!(context.store_mut_for_test().set_value_symbol_links(
+                    member,
+                    ValueSymbolLinks {
+                        resolved_type: Some(template),
+                        ..links
+                    },
+                ));
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .resolve_generic_interface_property(reference, name, None)
+                        .is_err()
+                );
+                let proxies = context
+                    .store()
+                    .type_payload(reference)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap()
+                    .properties
+                    .as_deref()
+                    .unwrap_or_default();
+                assert!(proxies.iter().all(|proxy| {
+                    context
+                        .store()
+                        .value_symbol_links(*proxy)
+                        .is_none_or(|links| {
+                            links
+                                .resolved_type
+                                .is_none_or(|cached| cached != string && cached != number)
+                        })
+                }));
+                if flags == AccessFlags::INCLUDE_UNDEFINED {
+                    let TypeData::Interface(interface) =
+                        context.store().type_payload(shape).unwrap().data()
+                    else {
+                        panic!("Shape must retain its cold interface");
+                    };
+                    assert!(!interface.declared_members_resolved);
+                    assert!(!interface.base_types_resolved);
+                }
+            }
+        }
     }
 
     #[test]

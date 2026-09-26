@@ -204,6 +204,458 @@ fn override_snapshot(
     )
 }
 
+#[derive(Clone, Copy, Debug)]
+enum InheritedIndexRead {
+    Mapped,
+    Own,
+    OwnNumber,
+    OwnOptional,
+    Missing,
+}
+
+#[allow(clippy::too_many_lines)] // Keep both read orders and exact replay checks together.
+fn check_inherited_index_property_read(source: &str, expected: InheritedIndexRead) {
+    let has_own = matches!(expected,
+        InheritedIndexRead::Own | InheritedIndexRead::OwnNumber | InheritedIndexRead::OwnOptional);
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(44);
+    let access = read_access(&parsed, file, "entry");
+    let NodeData::PropertyAccessExpression(property) = &parsed.arena.get(access.node).unwrap().data
+    else {
+        panic!("expected the fixture's property read")
+    };
+    let name = NodeRef::new(parsed.arena.id(), file, property.name);
+    let receiver = NodeRef::new(parsed.arena.id(), file, property.expression);
+    let result_name = variable_name(&parsed, file, "result");
+    let declarations = parsed.arena.iter().filter_map(|(node, record)| {
+        (record.kind == ts_ast::SyntaxKind::IndexSignature)
+            .then_some(NodeRef::new(parsed.arena.id(), file, node))
+    }).collect::<Vec<_>>();
+    let [index_declaration] = declarations.as_slice() else {
+        panic!("the fixture must keep one declared index")
+    };
+    for query_first in [false, true] {
+        let mut context = checker_context_with_options(
+            &parsed,
+            file,
+            "/project/inherited-index-property-read.ts",
+            CanonicalCheckerOptions {
+                intrinsic: ts_checker::semantic::IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..Default::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let derived_symbol = interface_symbol(&parsed, file, &context, "Derived");
+        let dictionary_symbol = interface_symbol(&parsed, file, &context, "Dictionary");
+        if !has_own {
+            assert_eq!(context.store().symbol(derived_symbol).unwrap().members(), None);
+        }
+        let source_file = context.source_file(file).unwrap();
+        assert!(context.store().source_file_links(source_file)
+            .is_none_or(|links| !links.type_checked));
+        if query_first {
+            context.get_type_at_location(access).unwrap();
+        }
+        context.check_source_file(file).unwrap_or_else(|error| {
+            panic!("{expected:?}, query_first={query_first}: {error:?}")
+        });
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (string, number, undefined, any, error) = (
+            bootstrap.string_type, bootstrap.number_type, bootstrap.undefined_type,
+            bootstrap.any_type, bootstrap.error_type,
+        );
+        let derived_type = declared_type(&context, derived_symbol);
+        let dictionary_type = declared_type(&context, dictionary_symbol);
+        let TypeData::Interface(derived) = context.store().type_payload(derived_type).unwrap().data()
+        else { panic!("Derived must keep its Interface record") };
+        assert!(derived.declared_members_resolved);
+        assert!(derived.base_types_resolved);
+        assert!(derived.declared_index_infos.is_none());
+        let [base] = derived.resolved_base_types.as_deref().unwrap() else {
+            panic!("Derived must keep one base")
+        };
+        let base = *base;
+        let [index] = derived.reference.object.structured.index_infos.as_deref().unwrap() else {
+            panic!("Derived must keep one inherited index")
+        };
+        let index = *index;
+        let derived_members = derived.reference.object.structured.members;
+        let TypeData::TypeReference(base_data) = context.store().type_payload(base).unwrap().data()
+        else { panic!("Dictionary<string> must keep its TypeReference record") };
+        assert_eq!(base_data.object.target, Some(dictionary_type));
+        assert_eq!(base_data.resolved_type_arguments.as_deref(), Some(&[string][..]));
+        assert_eq!(base_data.object.structured.index_infos.as_deref(), Some(&[index][..]));
+        let TypeData::Interface(dictionary) =
+            context.store().type_payload(dictionary_type).unwrap().data()
+        else { panic!("Dictionary must keep its Interface record") };
+        let [source_index] = dictionary.declared_index_infos.as_deref().unwrap() else {
+            panic!("Dictionary must keep one source index")
+        };
+        let source_index = *source_index;
+        assert_ne!(index, source_index);
+        let source_info = context.store().index_info(source_index).unwrap();
+        let info = context.store().index_info(index).unwrap();
+        let nullable = info.value_type();
+        let key = if matches!(expected, InheritedIndexRead::Missing) { number } else { string };
+        assert_eq!(source_info.key_type(), key);
+        assert_eq!(info.key_type(), key);
+        assert!(!source_info.is_readonly());
+        assert!(!info.is_readonly());
+        assert_eq!(source_info.declaration(), Some(*index_declaration));
+        assert_eq!(info.declaration(), Some(*index_declaration));
+        assert_eq!(info.index_symbol(), source_info.index_symbol());
+        assert_eq!(info.components(), source_info.components());
+        assert_ne!(source_info.value_type(), nullable);
+        let TypeData::Union(union) = context.store().type_payload(nullable).unwrap().data()
+        else { panic!("the mapped index must keep string | undefined") };
+        assert_eq!(union.union.types.len(), 2);
+        assert!(union.union.types.contains(&string));
+        assert!(union.union.types.contains(&undefined));
+        assert_ne!(nullable, any);
+        assert_ne!(nullable, error);
+        assert_eq!(context.type_to_string(nullable).unwrap(), "string | undefined");
+
+        let own_type = match expected {
+            InheritedIndexRead::OwnNumber => number,
+            InheritedIndexRead::OwnOptional => nullable,
+            _ => string,
+        };
+        let selected = if has_own {
+            let own = own_interface_property(&context, derived_type, "entry");
+            assert_eq!(interface_property_names(&context, derived_type),
+                (vec!["entry".to_owned()], vec!["entry".to_owned()]));
+            assert_eq!(context.store().value_symbol_links(own).unwrap().resolved_type, Some(own_type));
+            assert_eq!(context.store().symbol(own).unwrap().flags().contains(SymbolFlags::OPTIONAL),
+                matches!(expected, InheritedIndexRead::OwnOptional));
+            Some(own)
+        } else {
+            assert_eq!(context.store().symbol(derived_symbol).unwrap().members(), None);
+            assert_eq!(interface_property_names(&context, derived_type), (Vec::new(), Vec::new()));
+            None
+        };
+        let own_nodes = selected.map(|symbol| {
+            let declaration = context.store().symbol(symbol).unwrap().value_declaration().unwrap();
+            let NodeData::PropertyDeclaration(property) = &parsed.arena.get(declaration.node).unwrap().data
+            else { panic!("entry must retain its own property declaration") };
+            let name = NodeRef::new(parsed.arena.id(), file, property.name);
+            let annotation = NodeRef::new(parsed.arena.id(), file, property.type_.unwrap());
+            let expected_links = ts_checker::semantic::TypeNodeLinks {
+                resolved_type: Some(own_type),
+                ..Default::default()
+            };
+            let annotation_links = context.store().type_node_links(annotation).cloned();
+            match parsed.arena.get(annotation.node).unwrap().kind {
+                ts_ast::SyntaxKind::StringKeyword | ts_ast::SyntaxKind::NumberKeyword => {
+                    assert!(annotation_links.as_ref().is_none_or(|links| {
+                        links == &ts_checker::semantic::TypeNodeLinks::default()
+                            || links == &expected_links
+                    }));
+                }
+                ts_ast::SyntaxKind::UnionType => {
+                    assert_eq!(annotation_links.as_ref(), Some(&expected_links));
+                }
+                kind => panic!("unexpected own annotation kind: {kind:?}"),
+            }
+            assert_eq!(context.get_type_from_type_node(annotation), Ok(own_type));
+            assert_eq!(context.store().type_node_links(annotation), annotation_links.as_ref());
+            (declaration, name, annotation)
+        });
+        assert_eq!(derived_members.and_then(|members| {
+            context.store().symbol_table(members).unwrap().get_source("entry")
+        }), selected);
+        let read = match expected {
+            InheritedIndexRead::Mapped => nullable,
+            InheritedIndexRead::Own | InheritedIndexRead::OwnNumber | InheritedIndexRead::OwnOptional => own_type,
+            InheritedIndexRead::Missing => error,
+        };
+        assert_ne!(read, any);
+        let result_symbol = context.get_symbol_at_location(result_name).unwrap().unwrap();
+        for node in [access, name, result_name] {
+            assert_eq!(context.get_type_at_location(node), Ok(read));
+        }
+        for node in [access, name] {
+            assert_eq!(context.get_symbol_at_location(node), Ok(selected));
+        }
+        assert_eq!(context.store().type_node_links(access)
+            .and_then(|links| links.resolved_type), Some(read));
+        assert_eq!(context.store().symbol_node_links(access)
+            .and_then(|links| links.resolved_symbol), selected);
+        if let Some(cached) = context.store().type_node_links(name)
+            .and_then(|links| links.resolved_type)
+        {
+            assert_eq!(cached, read);
+        }
+        if let Some(cached) = context.store().symbol_node_links(name)
+            .and_then(|links| links.resolved_symbol)
+        {
+            assert_eq!(Some(cached), selected);
+        }
+        assert_eq!(context.store().value_symbol_links(result_symbol).unwrap().resolved_type, Some(read));
+        assert_eq!(context.get_type_at_location(receiver), Ok(derived_type));
+        let diagnostics = context.diagnostics().as_slice();
+        if matches!(expected, InheritedIndexRead::Missing) {
+            let [diagnostic] = diagnostics else { panic!("expected one missing-property diagnostic") };
+            assert_eq!(diagnostic.diagnostic.code(), 2339);
+            assert_eq!(diagnostic.node, Some(name));
+            assert_eq!(node_text(&parsed, name), "entry");
+            assert_eq!(diagnostic.diagnostic.arguments, ["entry", "Derived"]);
+            assert!(diagnostic.diagnostic.details.is_empty());
+            assert_eq!(diagnostic.range_override, None);
+            assert!(diagnostic.related_information.is_empty());
+        } else if matches!(expected, InheritedIndexRead::OwnNumber) {
+            let [diagnostic] = diagnostics else { panic!("expected one index-constraint diagnostic") };
+            let own_name = own_nodes.unwrap().1;
+            assert_eq!(diagnostic.diagnostic.code(), 2411);
+            assert_eq!(diagnostic.node, Some(own_name));
+            assert_eq!(node_text(&parsed, own_name), "entry");
+            assert_eq!(diagnostic.diagnostic.arguments, ["entry", "number", "string", "string | undefined"]);
+            assert!(diagnostic.diagnostic.details.is_empty());
+            assert_eq!(diagnostic.range_override, None);
+            assert!(diagnostic.related_information.is_empty());
+        } else {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+        let assert_relations = |context: &mut CanonicalCheckerContext<'_>| {
+            assert_eq!(context.is_type_assignable_to(nullable, string), Ok(false));
+            assert_eq!(context.is_type_assignable_to(nullable, number), Ok(false));
+            assert_eq!(context.is_type_assignable_to(string, nullable), Ok(true));
+            assert_eq!(context.is_type_assignable_to(undefined, nullable), Ok(true));
+            if matches!(expected, InheritedIndexRead::OwnNumber) {
+                assert_eq!(context.is_type_assignable_to(number, nullable), Ok(false));
+            }
+        };
+        assert_relations(&mut context);
+        assert!(context.store().type_resolution_is_empty());
+
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            let TypeData::Interface(derived) = store.type_payload(derived_type).unwrap().data()
+            else { unreachable!() };
+            let TypeData::TypeReference(base_data) = store.type_payload(base).unwrap().data()
+            else { unreachable!() };
+            let TypeData::Interface(dictionary) = store.type_payload(dictionary_type).unwrap().data()
+            else { unreachable!() };
+            (
+                override_snapshot(context),
+                [receiver, access, name, result_name].map(|node| (
+                    node, store.node_links(node).cloned(), store.type_node_links(node).cloned(),
+                    store.symbol_node_links(node).cloned(),
+                )),
+                store.source_file_links(source_file).cloned(),
+                (store.value_symbol_links(result_symbol).cloned(),
+                    selected.and_then(|symbol| store.value_symbol_links(symbol)).cloned(),
+                    selected.zip(own_nodes).map(|(symbol, (_, _, annotation))| (
+                        store.symbol(symbol).unwrap().flags(),
+                        store.symbol(symbol).unwrap().declarations().unwrap().to_vec(),
+                        store.type_node_links(annotation).cloned(),
+                    ))),
+                [source_index, index].map(|id| {
+                    let info = store.index_info(id).unwrap();
+                    (id, info.key_type(), info.value_type(), info.is_readonly(),
+                        info.declaration(), info.index_symbol(), info.components().to_vec())
+                }),
+                (
+                    declared_type(context, derived_symbol),
+                    store.symbol(derived_symbol).unwrap().members(),
+                    derived.declared_members, derived.declared_index_infos.clone(),
+                    derived.resolved_base_types.clone(),
+                    derived.reference.object.structured.members,
+                    derived.reference.object.structured.properties.clone(),
+                    derived.reference.object.structured.index_infos.clone(),
+                ),
+                (declared_type(context, dictionary_symbol), dictionary.declared_index_infos.clone(),
+                    base_data.object.target, base_data.resolved_type_arguments.clone(),
+                    base_data.object.structured.index_infos.clone()),
+                store.type_resolution_len(),
+            )
+        };
+        let before = snapshot(&context);
+        for _ in 0..2 {
+            context.check_source_file(file).unwrap();
+            context.recheck_source_file(file).unwrap();
+            if let Some((_, _, annotation)) = own_nodes {
+                assert_eq!(context.get_type_from_type_node(annotation), Ok(own_type));
+            }
+            for node in [result_name, name, access] {
+                assert_eq!(context.get_type_at_location(node), Ok(read));
+            }
+            for node in [name, access] {
+                assert_eq!(context.get_symbol_at_location(node), Ok(selected));
+            }
+            assert_eq!(context.get_type_at_location(receiver), Ok(derived_type));
+            assert_relations(&mut context);
+            assert!(context.store().type_resolution_is_empty());
+            assert_eq!(snapshot(&context), before, "{expected:?}, query_first={query_first}");
+        }
+    }
+}
+
+#[test]
+fn inherited_string_index_property_reads_keep_strict_union_and_identity() {
+    check_inherited_index_property_read(concat!(
+        "interface Dictionary<T> { [key: string]: T | undefined; }\n",
+        "interface Derived extends Dictionary<string> {}\n",
+        "declare const values: Derived;\n",
+        "const result = values.entry;\n",
+    ), InheritedIndexRead::Mapped);
+}
+
+#[test]
+fn own_named_property_precedes_inherited_string_index() {
+    check_inherited_index_property_read(concat!(
+        "interface Dictionary<T> { [key: string]: T | undefined; }\n",
+        "interface Derived extends Dictionary<string> { entry: string; }\n",
+        "declare const values: Derived;\n",
+        "const result = values.entry;\n",
+    ), InheritedIndexRead::Own);
+}
+
+#[test]
+fn number_only_inherited_index_rejects_nonnumeric_property_reads() {
+    check_inherited_index_property_read(concat!(
+        "interface Dictionary<T> { [key: number]: T | undefined; }\n",
+        "interface Derived extends Dictionary<string> {}\n",
+        "declare const values: Derived;\n",
+        "const result = values.entry;\n",
+    ), InheritedIndexRead::Missing);
+}
+
+#[test]
+fn inherited_string_index_constraint_keeps_incompatible_own_number_read() {
+    check_inherited_index_property_read(concat!(
+        "interface Dictionary<T> { [key: string]: T | undefined; }\n",
+        "interface Derived extends Dictionary<string> { entry: number; }\n",
+        "declare const values: Derived;\n",
+        "const result = values.entry;\n",
+    ), InheritedIndexRead::OwnNumber);
+}
+
+#[test]
+fn inherited_string_index_constraint_keeps_optional_explicit_undefined() {
+    check_inherited_index_property_read(concat!(
+        "interface Dictionary<T> { [key: string]: T | undefined; }\n",
+        "interface Derived extends Dictionary<string> { entry?: string | undefined; }\n",
+        "declare const values: Derived;\n",
+        "const result = values.entry;\n",
+    ), InheritedIndexRead::OwnOptional);
+}
+
+#[test]
+fn interface_index_constraints_check_owned_and_inherited_indexes() {
+    for (case, source, code, kind, anchor_text, message) in [
+        ("index-pair", "interface Mixed { [key: string]: string; [key: number]: number; }\n", 2413,
+            ts_ast::SyntaxKind::IndexSignature, "[key: number]: number;", "'number' index type 'number' is not assignable to 'string' index type 'string'."),
+        ("inherited-error-once", "interface Broken { [key: string]: string; entry: number; }\ninterface Derived extends Broken {}\ndeclare const values: Derived;\nconst result = values.entry;\n", 2411,
+            ts_ast::SyntaxKind::Identifier, "entry", "Property 'entry' of type 'number' is not assignable to 'string' index type 'string'."),
+        ("local-index-inherited-property", "interface Base { entry: number; }\ninterface Derived extends Base { [key: string]: string; }\ndeclare const values: Derived;\nconst result = values.entry;\n", 2411,
+            ts_ast::SyntaxKind::IndexSignature, "[key: string]: string;", "Property 'entry' of type 'number' is not assignable to 'string' index type 'string'."),
+        ("own-index-base-mismatch", "interface Base { [key: string]: string; }\ninterface Derived extends Base { [key: string]: number; }\n", 2430,
+            ts_ast::SyntaxKind::Identifier, "Derived", "Interface 'Derived' incorrectly extends interface 'Base'.\n  'string' index signatures are incompatible.\n    Type 'number' is not assignable to type 'string'."),
+    ] {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{case}: {:?}", parsed.diagnostics);
+        let file = FileId::new(45);
+        let mut context = checker_context_with_options(
+            &parsed, file, "/project/interface-index-constraints.ts",
+            CanonicalCheckerOptions {
+                intrinsic: ts_checker::semantic::IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..Default::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("{case}: expected one diagnostic, got {:?}", context.diagnostics())
+        };
+        assert_eq!(diagnostic.diagnostic.code(), code, "{case}");
+        assert_eq!(diagnostic.diagnostic.render().unwrap(), message, "{case}");
+        let anchor = diagnostic.node.unwrap();
+        assert_eq!(anchor.file, file);
+        assert_eq!(parsed.arena.get(anchor.node).unwrap().kind, kind, "{case}");
+        assert_eq!(node_text(&parsed, anchor), anchor_text, "{case}");
+        assert_eq!(diagnostic.range_override, None);
+        assert!(diagnostic.related_information.is_empty());
+        let read = if source.contains("values.entry") {
+            let access = read_access(&parsed, file, "entry");
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert_eq!(context.get_type_at_location(access), Ok(number), "{case}");
+            let symbol = context.get_symbol_at_location(access).unwrap().unwrap();
+            Some((access, symbol, number))
+        } else {
+            None
+        };
+        let before = override_snapshot(&context);
+        for _ in 0..2 {
+            context.check_source_file(file).unwrap();
+            context.recheck_source_file(file).unwrap();
+            if let Some((access, symbol, number)) = read {
+                assert_eq!(context.get_type_at_location(access), Ok(number));
+                assert_eq!(context.get_symbol_at_location(access), Ok(Some(symbol)));
+            }
+            assert!(context.store().type_resolution_is_empty());
+            assert_eq!(override_snapshot(&context), before, "{case}");
+        }
+    }
+}
+
+#[test]
+fn merged_class_interface_declarations_preserve_pure_interface_index_checks() {
+    for (source, has_error) in [
+        ("declare namespace Library {\n    interface Base {}\n    interface Merged extends Base {}\n    class Merged {}\n}\n", false),
+        ("declare namespace Library {\n    interface Base {}\n    class Merged {}\n    interface Merged extends Base {}\n}\n", false),
+        ("declare namespace Library {\n    interface Base {}\n    interface Merged extends Base {}\n    class Merged {}\n}\n\ninterface Broken {\n    [key: string]: string;\n    entry: number;\n}\ninterface Derived extends Broken {}\n", true),
+    ] {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(46);
+        let mut binder = CanonicalBinder::new();
+        binder.bind_source_file_with_facts(
+            &parsed.arena, parsed.source_file, file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/project/merged-interface-index.d.ts\""),
+                CanonicalSourceLanguage::TypeScript, true, CanonicalModuleState::Script,
+            ),
+        ).unwrap();
+        binder.bind_typescript_declaration_slice(&parsed.arena, file).unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(), [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        ).unwrap();
+        context.check_source_file(file).unwrap();
+        if has_error {
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected one pure interface index error")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2411);
+            assert_eq!(diagnostic.diagnostic.render().unwrap(),
+                "Property 'entry' of type 'number' is not assignable to 'string' index type 'string'.");
+            assert_eq!(node_text(&parsed, diagnostic.node.unwrap()), "entry");
+        } else {
+            assert!(context.diagnostics().is_empty());
+        }
+        let owner = interface_symbol(&parsed, file, &context, "Merged");
+        let type_ = declared_type(&context, owner);
+        assert!(context.store().symbol(owner).unwrap().flags()
+            .contains(SymbolFlags::CLASS | SymbolFlags::INTERFACE));
+        assert!(context.store().type_payload(type_).unwrap().object_flags()
+            .contains(ts_checker::semantic::types::ObjectFlags::CLASS));
+        let before = override_snapshot(&context);
+        for _ in 0..2 {
+            context.check_source_file(file).unwrap();
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(declared_type(&context, owner), type_);
+            assert!(context.store().type_resolution_is_empty());
+            assert_eq!(override_snapshot(&context), before);
+        }
+    }
+}
+
 #[test]
 #[allow(clippy::too_many_lines)] // Cold checks and forced replay share the source and proxy identities.
 fn generic_base_function_parameters_preserve_lazy_members_cold_and_warm() {
@@ -1474,14 +1926,6 @@ fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
             ),
         ),
         (
-            "base-index-signature",
-            concat!(
-                "interface Base { [key: string]: number }\n",
-                "interface Derived extends Base { own: number }\n",
-                "function read(value: Derived): number { return value.own; }\n",
-            ),
-        ),
-        (
             "alias-base",
             concat!(
                 "interface Base { value: number }\n",
@@ -1492,7 +1936,7 @@ fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
         ),
     ];
 
-    for (index, (name, source)) in [0, 2, 3, 4, 5, 6].into_iter().zip(cases) {
+    for (index, (name, source)) in [0, 2, 3, 4, 6].into_iter().zip(cases) {
         let parsed = parse_source_file(source);
         assert!(
             parsed.diagnostics.is_empty(),
@@ -1510,7 +1954,7 @@ fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
             context.store().symbol_store().symbol_table_len(),
         );
 
-        let first = context.check_source_file(file).unwrap_err();
+        let first = context.check_source_file(file).expect_err(name);
         assert!(
             matches!(first, SourceCheckError::Unsupported(_)),
             "{name}: {first:?}"
@@ -1524,6 +1968,36 @@ fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
             "{name} published semantic identities before rejecting the boundary",
         );
         assert_eq!(context.check_source_file(file), Err(first), "{name}");
+    }
+}
+
+#[test]
+fn indexed_interface_bases_check_and_replay_without_diagnostics() {
+    let parsed = parse_source_file(concat!(
+        "interface Base { [key: string]: number }\n",
+        "interface Derived extends Base { own: number }\n",
+        "function read(value: Derived): number { return value.own; }\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(15);
+    let mut context = checker_context(
+        &parsed, file, "/project/interface-heritage-base-index-signature.ts",
+    );
+    context.check_source_file(file).unwrap();
+    assert!(context.diagnostics().is_empty());
+    let access = read_access(&parsed, file, "own");
+    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+    assert_eq!(context.get_type_at_location(access), Ok(number));
+    let selected = context.get_symbol_at_location(access).unwrap().unwrap();
+    let before = override_snapshot(&context);
+    for _ in 0..2 {
+        context.check_source_file(file).unwrap();
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.get_type_at_location(access), Ok(number));
+        assert_eq!(context.get_symbol_at_location(access), Ok(Some(selected)));
+        assert!(context.diagnostics().is_empty());
+        assert!(context.store().type_resolution_is_empty());
+        assert_eq!(override_snapshot(&context), before);
     }
 }
 

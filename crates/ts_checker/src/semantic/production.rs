@@ -644,10 +644,11 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         )
         .map(|host| host.with_program_file_order(&self.file_order))
         .map_err(TypeDisplayUnavailable::SourceHost)?;
-        super::formatter::type_to_string_with_host_global_types_and_flags(
+        super::formatter::type_to_string_with_checker_options_and_flags(
             &self.store,
             &host,
             &self.global_types,
+            self.options,
             type_id,
             self.type_format_flags(CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT),
         )
@@ -729,10 +730,11 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         )
         .map(|host| host.with_program_file_order(&self.file_order))
         .map_err(TypeDisplayUnavailable::SourceHost)?;
-        super::formatter::type_to_string_with_host_global_types_and_flags(
+        super::formatter::type_to_string_with_checker_options_and_flags(
             &self.store,
             &host,
             &self.global_types,
+            self.options,
             type_id,
             self.type_format_flags(flags),
         )
@@ -966,10 +968,11 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         )
         .map(|host| host.with_program_file_order(&self.file_order))
         .map_err(TypeDisplayUnavailable::SourceHost)?;
-        super::formatter::get_type_names_for_assignability_error_with_host_global_types_and_flags(
+        super::formatter::get_type_names_for_assignability_error_with_checker_options_and_flags(
             &self.store,
             &host,
             &self.global_types,
+            self.options,
             source,
             target,
             self.type_format_flags(CanonicalTypeFormatFlags::NONE),
@@ -1199,7 +1202,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             &self.files,
             GlobalMergeCompletion::new(self.options.name_resolution),
         )
-        .map(|host| host.with_program_file_order(&self.file_order))?;
+        .map(|host| host.with_program_file_order(&self.file_order))?
+        .with_module_resolutions(&self.module_resolutions);
         CanonicalTypeQuery::new_with_global_types_and_session(
             &mut self.store,
             &host,
@@ -1208,7 +1212,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             &mut self.instantiation_session,
             &mut self.diagnostics,
         )?
-        .get_type_identity_from_type_reference(node)
+        .get_artifact_type_reference_identity(node)
     }
 
     pub(super) fn artifact_interface_method_type(
@@ -2516,6 +2520,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     /// provenance error when `file` is not retained by this context.
     pub fn recheck_source_file(&mut self, file: FileId) -> Result<(), SourceCheckError> {
         self.clear_source_file_completion(file)?;
+        let _observation = MixedRecheckMembersScope::enter();
         self.check_source_file(file)
     }
 
@@ -2608,6 +2613,102 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     pub fn id(&self) -> SemanticStoreId {
         self.store.id()
     }
+}
+
+type MixedRecheckMembersSite = (
+    super::type_nodes::SourceMappedReadRequest,
+    &'static std::panic::Location<'static>,
+);
+
+struct MixedRecheckMembersObservation {
+    seen: bool,
+    active: bool,
+    sites: [Option<MixedRecheckMembersSite>; 32],
+    len: usize,
+    truncated: bool,
+}
+
+std::thread_local! {
+    static MIXED_RECHECK_MEMBERS_OBSERVATION: RefCell<MixedRecheckMembersObservation> = const {
+        RefCell::new(MixedRecheckMembersObservation {
+            seen: false,
+            active: false,
+            sites: [None; 32],
+            len: 0,
+            truncated: false,
+        })
+    };
+}
+
+struct MixedRecheckMembersScope {
+    previous_active: bool,
+}
+
+impl MixedRecheckMembersScope {
+    fn enter() -> Option<Self> {
+        let enabled = std::env::var_os("TS_RUST_OBSERVE_MIXED_RECHECK_MEMBERS").is_some();
+        MIXED_RECHECK_MEMBERS_OBSERVATION.with(|observation| {
+            let mut observation = observation.borrow_mut();
+            if observation.seen {
+                return None;
+            }
+            observation.seen = true;
+            if !enabled {
+                return None;
+            }
+            let previous_active = observation.active;
+            observation.active = true;
+            Some(Self { previous_active })
+        })
+    }
+}
+
+impl Drop for MixedRecheckMembersScope {
+    fn drop(&mut self) {
+        use std::io::Write as _;
+
+        MIXED_RECHECK_MEMBERS_OBSERVATION.with(|observation| {
+            let mut observation = observation.borrow_mut();
+            observation.active = self.previous_active;
+            let mut output = std::io::stderr().lock();
+            for (index, record) in observation.sites[..observation.len].iter().enumerate() {
+                let Some((request, site)) = record else {
+                    continue;
+                };
+                let marker = if observation.truncated && index + 1 == observation.len {
+                    "R49_MIXED_RECHECK_MEMBERS_TRUNCATED"
+                } else {
+                    "R49_MIXED_RECHECK_MEMBERS"
+                };
+                let _ = writeln!(
+                    output,
+                    "{marker} site={}:{} request={request:?}",
+                    site.file(),
+                    site.line(),
+                );
+            }
+        });
+    }
+}
+
+/// Retains only static caller locations and existing Members requests.
+pub(in crate::semantic) fn observe_mixed_recheck_members(
+    request: super::type_nodes::SourceMappedReadRequest,
+    site: &'static std::panic::Location<'static>,
+) {
+    MIXED_RECHECK_MEMBERS_OBSERVATION.with(|observation| {
+        let mut observation = observation.borrow_mut();
+        if !observation.active {
+            return;
+        }
+        let index = observation.len;
+        if index == observation.sites.len() {
+            observation.truncated = true;
+            return;
+        }
+        observation.sites[index] = Some((request, site));
+        observation.len += 1;
+    });
 }
 
 #[derive(Debug)]

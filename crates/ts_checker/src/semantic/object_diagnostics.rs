@@ -34,8 +34,10 @@ use super::{
     derived_types::DerivedObjectLiteralValidation,
     formatter::{
         FunctionTypeDisplayUnavailable,
+        get_type_names_for_assignability_error_with_checker_options_and_flags,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
         get_type_names_for_effective_property_assignability_error_with_host_global_types_and_flags,
+        type_to_string_with_checker_options_and_flags,
         type_to_string_with_host_global_types_and_flags,
     },
     functions::{
@@ -192,6 +194,120 @@ pub(super) fn diagnostics_for_failed_assignment(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Adds native mapped-property detail using the selected read admitted by this assignment.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn diagnostics_for_failed_assignment_with_mapped_recovery(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    expression: &PlannedExpression,
+    checked: &CheckedExpressionTypes,
+    target_type: TypeId,
+    fallback_node: NodeRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    relation: &super::relater::SourceAssignmentRelationResult,
+) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    let completion_mark = relation.completion_mark().unwrap_or_else(|| session.limit_event_mark());
+    if session.limit_event_occurred_since(completion_mark) {
+        return Err(RelationUnavailable::UnsupportedStructuredType(checked.result).into());
+    }
+    if let Some(failure) = relation.index_failure()
+        && matches!(expression.unparenthesized().kind, PlannedExpressionKind::Identifier(_))
+        && matches!(checked.shape, CheckedExpressionShape::Leaf)
+    {
+        if relation.related() || failure.source != checked.result || failure.target != target_type {
+            return Err(RelationUnavailable::InvalidStructuredMembers(checked.result).into());
+        }
+        validate_checked_expression_shape(store, host, global_types, expression, checked)?;
+        let diagnostic = assignment_string_index_mismatch_diagnostic(
+            store, host, global_types, failure, fallback_node, options, session, completion_mark,
+        )?;
+        return Ok(vec![diagnostic]);
+    }
+    let mut diagnostics = diagnostics_for_failed_assignment(
+        store, host, global_types, expression, checked, target_type, fallback_node, options, session,
+    )?;
+    for proof in relation.recovered_reads() {
+        let super::type_nodes::SourceMappedReadRequest::Value { receiver, member } = proof.request() else {
+            return Err(RelationUnavailable::UnsupportedStructuredType(checked.result).into());
+        };
+        if receiver != checked.result {
+            return Err(RelationUnavailable::UnsupportedStructuredType(receiver).into());
+        }
+        let value = proof.value().ok_or(RelationUnavailable::UnsupportedProperty(member))?;
+        if store.value_symbol_links(member).and_then(|links| links.resolved_type) != Some(value) {
+            return Err(RelationUnavailable::UnsupportedProperty(member).into());
+        }
+        let name = store.symbol(member).ok_or(RelationUnavailable::UnsupportedProperty(member))?
+            .name().as_utf8().ok_or(RelationUnavailable::UnsupportedProperty(member))?.to_owned();
+        let target = store.resolved_declared_property_object_with_global_types_and_session(
+            host, target_type, global_types, Some(options.strict_function_types), session,
+        )?.ok_or(RelationUnavailable::UnsupportedStructuredType(target_type))?;
+        let Some(property) = target.properties().iter().find(|property| property.name.as_utf8() == Some(name.as_str()))
+        else {
+            continue;
+        };
+        let related = store.is_type_assignable_to_with_session(
+            value, property.type_, Some(global_types), Some(options.strict_function_types), session,
+        )?;
+        if session.limit_event_occurred_since(completion_mark) {
+            return Err(RelationUnavailable::UnsupportedStructuredType(receiver).into());
+        }
+        if !related {
+            for diagnostic in &mut diagnostics {
+                if diagnostic.node == Some(fallback_node)
+                    && diagnostic.diagnostic.code() == 2322
+                    && diagnostic.diagnostic.details.is_empty()
+                {
+                    diagnostic.diagnostic.details = scalar_property_mismatch_details(
+                        store, host, global_types, &name, value, property.type_, None, display_flags(options),
+                    )?;
+                }
+            }
+        }
+    }
+    if session.limit_event_occurred_since(completion_mark) {
+        return Err(RelationUnavailable::UnsupportedStructuredType(checked.result).into());
+    }
+    Ok(diagnostics)
+}
+
+/// Formats the actual failed index values and preserves the original target span.
+#[allow(clippy::too_many_arguments)]
+fn assignment_string_index_mismatch_diagnostic(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    failure: &super::relater::SourceIndexRelationFailure,
+    target_node: NodeRef,
+    options: CanonicalCheckerOptions,
+    session: &InstantiationSession,
+    completion_mark: super::instantiate::InstantiationLimitEventMark,
+) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
+    failure.validate_current_pair(store, host, globals, options.into(), session, completion_mark)?;
+    let flags = display_flags(options);
+    let AssignabilityErrorDisplay { source, target } =
+        get_type_names_for_assignability_error_with_checker_options_and_flags(
+            store, host, globals, options, failure.source, failure.target, flags,
+        )?;
+    let key = type_to_string_with_checker_options_and_flags(
+        store, host, globals, options, failure.key, flags,
+    )?;
+    let AssignabilityErrorDisplay { source: source_value, target: target_value } =
+        get_type_names_for_assignability_error_with_checker_options_and_flags(
+            store, host, globals, options, failure.source_value, failure.target_value, flags,
+        )?;
+    let details = render_detail_chain(vec![
+        detail_message(2634, vec![key])?,
+        detail_message(2322, vec![source_value, target_value])?,
+    ], 1);
+    let mut diagnostic = primary(2322, target_node, vec![source, target])?;
+    diagnostic.diagnostic.details = details;
+    failure.validate_current_pair(store, host, globals, options.into(), session, completion_mark)?;
+    Ok(diagnostic)
 }
 
 #[allow(clippy::too_many_arguments)] // Keeps one diagnostic retry immutable and explicit.
@@ -5654,5 +5770,166 @@ mod tests {
         let published = context.diagnostics().clone();
         context.check_source_file(file).unwrap();
         assert_eq!(context.diagnostics(), &published);
+    }
+
+    const RECOVERED_STRING_INDEX_FILE: FileId = FileId::new(5_184);
+
+    fn recovered_string_index_source(incompatible: bool) -> String {
+        let target_value = if incompatible { "number" } else { "Wrapper<unknown>" };
+        let template = format!("{}Model[Key]{}", "Wrapper<".repeat(101), ">".repeat(101));
+        format!(
+            "interface Wrapper<Value> {{ value: Value }} type Deep<Model> = {{ [Key in keyof Model]: {template} }}; type Mapped = Deep<any>; declare const source: Mapped; const target: {{ [key: string]: {target_value} }} = source;"
+        )
+    }
+
+    fn recovered_string_index_context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
+        assert!(parsed.diagnostics.is_empty());
+        let file = RECOVERED_STRING_INDEX_FILE;
+        let mut binder = CanonicalBinder::new();
+        binder.bind_source_file_with_facts(
+            &parsed.arena, parsed.source_file, file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/project/mapped-index-modifiers.ts\""),
+                CanonicalSourceLanguage::TypeScript, false, CanonicalModuleState::Script,
+            ),
+        ).unwrap();
+        binder.bind_typescript_declaration_slice(&parsed.arena, file).unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(), vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true, exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        ).unwrap()
+    }
+
+    fn recovered_string_index_ids(
+        parsed: &ParseResult,
+        checker: &CanonicalCheckerContext<'_>,
+    ) -> (TypeId, crate::semantic::IndexInfoId, Vec<TypeId>) {
+        let file = RECOVERED_STRING_INDEX_FILE;
+        let receiver = checked_diagnostic_variable_type(checker, parsed, file, "source");
+        let store = checker.store();
+        let wrapper_declaration = parsed.arena.iter().find_map(|(node, record)| {
+            let NodeData::InterfaceDeclaration(interface) = &record.data else { return None; };
+            let NodeData::Identifier(name) = &parsed.arena.get(interface.name)?.data else { return None; };
+            (name.text == "Wrapper").then_some(NodeRef::new(parsed.arena.id(), file, node))
+        }).unwrap();
+        let wrapper_symbol = checker.file(file).unwrap().1.symbol(wrapper_declaration).unwrap();
+        let wrapper_target = store.declared_type_links(wrapper_symbol).unwrap().declared_type.unwrap();
+        let TypeData::Mapped(owner) = store.type_payload(receiver).unwrap().data() else {
+            panic!("the source must retain its mapped owner");
+        };
+        let [index] = owner.object.structured.index_infos.as_deref().unwrap() else {
+            panic!("the recovered source must have one index");
+        };
+        let index = *index;
+        let info = store.index_info(index).unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        assert_eq!(info.key_type(), bootstrap.string_type);
+        assert!(!info.is_readonly());
+        let mut value = info.value_type();
+        let mut ids = Vec::new();
+        while let TypeData::TypeReference(reference) = store.type_payload(value).unwrap().data() {
+            assert!(ids.len() < 100);
+            assert!(!ids.contains(&value));
+            assert_eq!(reference.object.target, Some(wrapper_target));
+            let [argument] = reference.resolved_type_arguments.as_deref().unwrap() else {
+                panic!("each Wrapper must have one argument");
+            };
+            ids.push(value);
+            value = *argument;
+        }
+        assert_eq!(ids.len(), 100);
+        assert_eq!(value, bootstrap.error_type);
+        assert_ne!(value, bootstrap.any_type);
+        ids.push(value);
+        (receiver, index, ids)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Pinned messages and public repeats share one source witness.
+    fn recovered_mapped_string_indexes_keep_pinned_diagnostics_and_warm_identity() {
+        let file = RECOVERED_STRING_INDEX_FILE;
+        let counts = |checker: &CanonicalCheckerContext<'_>| {
+            let store = checker.store();
+            (store.type_len(), store.symbol_len(), store.mapper_len(), store.index_info_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len())
+        };
+        for incompatible in [false, true] {
+            let text = recovered_string_index_source(incompatible);
+            let parsed = parse_source_file(&text);
+            let target_name = parsed.arena.iter().find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else { return None; };
+                variable.initializer?;
+                Some(NodeRef::new(parsed.arena.id(), file, variable.name))
+            }).unwrap();
+            let mut checker = recovered_string_index_context(&parsed);
+            checker.check_source_file(file).unwrap();
+            // Exact child argument from pinned TypeScript-Go dc37b524.
+            let child = format!("{}Wrapp...", "Wrapper<".repeat(39));
+            assert_eq!(child.len(), 320);
+            let limit = (2589, "Type instantiation is excessively deep and possibly infinite.".to_owned(),
+                Vec::<String>::new(), Vec::<String>::new());
+            let expected = if incompatible {
+                vec![
+                    (2322,
+                        format!(concat!(
+                            "Type 'Deep<any>' is not assignable to type '{{ [key: string]: number; }}'.\n",
+                            "  'string' index signatures are incompatible.\n",
+                            "    Type '{}' is not assignable to type 'number'."
+                        ), child),
+                        vec!["Deep<any>".to_owned(), "{ [key: string]: number; }".to_owned()],
+                        vec!["  'string' index signatures are incompatible.".to_owned(),
+                            format!("    Type '{child}' is not assignable to type 'number'.")]),
+                    limit,
+                ]
+            } else { vec![limit] };
+            let mut actual = checker.diagnostics().as_slice().iter().map(|entry| {
+                assert_eq!(entry.node, Some(target_name));
+                let node = entry.node.unwrap();
+                assert_eq!(node.file, file);
+                assert_eq!(node.arena, parsed.arena.id());
+                let range = entry.range_override.map(|range| range.range())
+                    .unwrap_or_else(|| parsed.arena.get(node.node).unwrap().range);
+                assert_eq!((range.start.get(), range.end.get()), (1069, 1075));
+                assert_eq!(entry.diagnostic.category(), ts_diagnostics::Category::Error);
+                assert!(entry.related_information.is_empty());
+                (entry.diagnostic.code(), entry.diagnostic.render().unwrap(),
+                    entry.diagnostic.arguments.clone(), entry.diagnostic.details.clone())
+            }).collect::<Vec<_>>();
+            actual.sort_by_key(|entry| entry.0);
+            assert_eq!(actual, expected);
+            let ids = recovered_string_index_ids(&parsed, &checker);
+            let warm_counts = counts(&checker);
+            let diagnostics = checker.diagnostics().clone();
+            for _ in 0..2 {
+                checker.check_source_file(file).unwrap();
+                assert_eq!(counts(&checker), warm_counts);
+                assert_eq!(checker.diagnostics(), &diagnostics);
+                assert_eq!(recovered_string_index_ids(&parsed, &checker), ids);
+                checker.recheck_source_file(file).unwrap();
+                assert_eq!(counts(&checker), warm_counts);
+                assert_eq!(checker.diagnostics(), &diagnostics);
+                assert_eq!(recovered_string_index_ids(&parsed, &checker), ids);
+            }
+        }
+    }
+
+    #[test]
+    fn recovered_mapped_string_indexes_reject_revoked_index_authority() {
+        for incompatible in [false, true] {
+            let parsed = parse_source_file(&recovered_string_index_source(incompatible));
+            let mut checker = recovered_string_index_context(&parsed);
+            checker.check_source_file(RECOVERED_STRING_INDEX_FILE).unwrap();
+            let (receiver, index, _) = recovered_string_index_ids(&parsed, &checker);
+            let owner = checker.store().type_payload(receiver).unwrap().symbol().unwrap();
+            let diagnostics = checker.diagnostics().clone();
+            assert!(checker.store_mut_for_test().set_index_info_symbol(index, Some(owner)));
+            assert!(checker.recheck_source_file(RECOVERED_STRING_INDEX_FILE).is_err());
+            assert_eq!(checker.diagnostics(), &diagnostics);
+        }
     }
 }

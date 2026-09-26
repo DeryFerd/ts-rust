@@ -364,6 +364,7 @@ impl CanonicalCheckerContext<'_> {
         }
 
         if supports_type_location(&self.validated_artifact_node(node)?.2.data)
+            && kind != SyntaxKind::TypeReference
             && let Some(type_) = self.cached_artifact_type(node)?
         {
             return Ok(type_);

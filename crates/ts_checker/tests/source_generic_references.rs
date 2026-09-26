@@ -340,12 +340,12 @@ fn local_class_interface_reference_arity_diagnostics_are_pinned_and_idempotent()
         [
             (
                 2314,
-                vec!["Box<T>".to_owned(), "1".to_owned()],
+                vec!["Box<T>".to_owned(), "1".to_owned(), "1".to_owned()],
                 Some(aliases[0].1),
             ),
             (
                 2314,
-                vec!["Box<T>".to_owned(), "1".to_owned()],
+                vec!["Box<T>".to_owned(), "1".to_owned(), "1".to_owned()],
                 Some(aliases[1].1),
             ),
             (2315, vec!["Plain".to_owned()], Some(aliases[2].1),),

@@ -27,10 +27,10 @@ use super::{
     interface_heritage::SourceInterfaceHeritageQueryContext,
     links::TypeAliasLinks,
     mapper::CanonicalTypeMapperStore,
-    object_members::{StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
+    object_members::{PreparedGenericInterfaceHeader, StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
     relater::{
-        SourceInterfaceHeritageRequest, SourceRelationError, SourceSignatureReturnQuery,
-        SourceSignatureReturnRequest,
+        SourceInterfaceHeritageRequest, SourceRelationError, SourceSignatureInstantiationRequest,
+        SourceSignatureReturnQuery, SourceSignatureReturnRequest,
     },
     signatures::{ElementFlags, SignatureFlags, TupleElementInfo},
     store::SourceNodeParent,
@@ -40,7 +40,8 @@ use super::{
         CanonicalTypeQueryOptions, ConditionalAliasDeclarationProof,
         ConditionalAliasReferenceProof, GlobalThisMemberValueProof,
         SourceConditionalInputRecoveryProof, SourceConditionalRecoveryProof,
-        SourceSignatureReturnProof,
+        SourceMappedReadOutcome, SourceMappedReadProof, SourceMappedReadRequest, SourceOperationProof,
+        SourceSignatureInstantiationProof, SourceSignatureReturnProof,
     },
     type_records::{
         CacheHashKey, ConditionalTypeData, LiteralValue, TypeCacheState, TypeData, TypeRecord,
@@ -105,9 +106,36 @@ fn missing_source_query() -> DeclaredTypeError {
     super::TypeNodeUnavailable::InvalidPreparedTypeQuery.into()
 }
 
+/// Runs normal interface work with the caller's source state and budget.
+pub(super) trait DirectInterfaceQuery {
+    fn source(&self) -> &dyn ConditionalBranchSource;
+
+    fn plan_header(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        reference: TypeId,
+    ) -> Result<Option<PreparedGenericInterfaceHeader>, DeclaredTypeError>;
+
+    fn selected_property(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        receiver: TypeId,
+        property: SemanticSymbolId,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, SourceRelationError<DeclaredTypeError>>;
+}
+
 /// Supplies source branch types. The conditional evaluator owns the decision
 /// and applies its current mapper after the source query returns.
 pub(super) trait ConditionalBranchSource {
+    fn direct_interface_query(
+        &self,
+        _globals: &CanonicalGlobalTypes,
+        _strict_function_types: Option<bool>,
+    ) -> Result<Option<Box<dyn DirectInterfaceQuery + '_>>, DeclaredTypeError> {
+        Ok(None)
+    }
+
     fn preflight(
         &self,
         store: &CanonicalTypeMapperStore,
@@ -196,6 +224,24 @@ pub(super) trait ConditionalBranchSource {
         None
     }
 
+    fn source_indexed_diagnostic_is_present(
+        &self,
+        _store: &CanonicalTypeMapperStore,
+        _node: NodeRef,
+        _object: TypeId,
+        _index: TypeId,
+    ) -> Result<bool, DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn preflight_source_declared_value(
+        &self,
+        _store: &CanonicalTypeMapperStore,
+        _symbol: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
     fn resolve_source_property_object_member(
         &mut self,
         _store: &mut CanonicalTypeMapperStore,
@@ -282,6 +328,107 @@ pub(super) trait ConditionalBranchSource {
         Err(missing_source_query())
     }
 
+    fn resolve_source_signature_instantiation(
+        &mut self,
+        _store: &mut CanonicalTypeMapperStore,
+        _request: SourceSignatureInstantiationRequest,
+        _session: &mut InstantiationSession,
+    ) -> Result<SourceSignatureInstantiationProof, SourceRelationError<DeclaredTypeError>> {
+        Err(SourceRelationError::Source(missing_source_query()))
+    }
+
+    fn validate_source_signature_instantiation_proof(
+        &self,
+        _store: &CanonicalTypeMapperStore,
+        _proof: &SourceSignatureInstantiationProof,
+        _globals: &CanonicalGlobalTypes,
+        _strict_function_types: Option<bool>,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn retain_source_signature_instantiation_proof(
+        &mut self,
+        _proof: SourceSignatureInstantiationProof,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn prove_source_mapped_alias_request(
+        &self,
+        _store: &CanonicalTypeMapperStore,
+        _request: super::type_nodes::SourceMappedAliasRequestInput<'_>,
+    ) -> Result<super::type_nodes::SourceMappedAliasRequestProof, DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn validate_source_mapped_alias_request(
+        &self,
+        _store: &CanonicalTypeMapperStore,
+        _proof: &super::type_nodes::SourceMappedAliasRequestProof,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn resolve_source_mapped_read(
+        &mut self,
+        _store: &mut CanonicalTypeMapperStore,
+        request: SourceMappedReadRequest,
+        _session: &mut InstantiationSession,
+    ) -> Result<SourceMappedReadOutcome, super::mapped_types::MappedTypeError> {
+        Err(super::mapped_types::MappedTypeError::UnsupportedSource(request.receiver()))
+    }
+
+    fn validate_source_mapped_read_proof(
+        &self,
+        _store: &CanonicalTypeMapperStore,
+        _proof: &SourceMappedReadProof,
+        _globals: &CanonicalGlobalTypes,
+        _strict_function_types: Option<bool>,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn retain_source_mapped_read_proof(
+        &mut self,
+        _proof: SourceMappedReadProof,
+    ) -> Result<(), DeclaredTypeError> {
+        Err(missing_source_query())
+    }
+
+    fn completed_source_mapped_read(&self, _request: SourceMappedReadRequest) -> Option<SourceMappedReadProof> {
+        None
+    }
+
+    fn observe_source_mapped_read(&self, _proof: &SourceMappedReadProof) {}
+
+    fn validate_source_operation_proof(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        proof: &SourceOperationProof,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+    ) -> Result<(), DeclaredTypeError> {
+        match proof {
+            SourceOperationProof::SignatureInstantiation(proof) => {
+                self.validate_source_signature_instantiation_proof(store, proof, globals, strict_function_types)
+            }
+            SourceOperationProof::MappedRead(proof) => {
+                self.validate_source_mapped_read_proof(store, proof, globals, strict_function_types)
+            }
+        }
+    }
+
+    fn retain_source_operation_proof(
+        &mut self,
+        proof: SourceOperationProof,
+    ) -> Result<(), DeclaredTypeError> {
+        match proof {
+            SourceOperationProof::SignatureInstantiation(proof) => self.retain_source_signature_instantiation_proof(proof),
+            SourceOperationProof::MappedRead(proof) => self.retain_source_mapped_read_proof(proof),
+        }
+    }
+
     fn take_completed_source_conditionals(&mut self) -> Vec<ConditionalSourceResultProof> {
         Vec::new()
     }
@@ -299,6 +446,8 @@ pub(super) trait ConditionalBranchSource {
     ) -> Option<&ConditionalSourceResultProof> {
         None
     }
+
+    fn observe_completed_source_conditional(&self, _proof: &ConditionalSourceResultProof) {}
 
     fn source_interface_heritage_query_context(
         &self,
@@ -318,6 +467,31 @@ pub(super) trait ConditionalBranchSource {
 
 impl<T: ConditionalBranchSource + ?Sized> super::relater::GlobalThisRelationSource for T {
     type Error = DeclaredTypeError;
+
+    fn resolve_source_mapped_read(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        request: SourceMappedReadRequest,
+        session: &mut InstantiationSession,
+    ) -> Result<SourceMappedReadOutcome, SourceRelationError<Self::Error>> {
+        ConditionalBranchSource::resolve_source_mapped_read(self, store, request, session)
+            .map_err(|error| match error {
+                super::mapped_types::MappedTypeError::Declared(error) => SourceRelationError::Source(error),
+                error => SourceRelationError::Relation(super::relater::mapped_relation_error(request.receiver(), error)),
+            })
+    }
+
+    fn validate_source_mapped_read_proof(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        proof: &SourceMappedReadProof,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+    ) -> Result<(), SourceRelationError<Self::Error>> {
+        ConditionalBranchSource::validate_source_mapped_read_proof(
+            self, store, proof, globals, strict_function_types,
+        ).map_err(SourceRelationError::Source)
+    }
 
     fn source_interface_heritage_query_context(
         &self,
@@ -384,6 +558,34 @@ impl<T: ConditionalBranchSource + ?Sized> super::relater::GlobalThisRelationSour
             globals,
             strict_function_types,
         )
+    }
+
+    fn resolve_source_signature_instantiation(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        request: SourceSignatureInstantiationRequest,
+        session: &mut InstantiationSession,
+    ) -> Result<SourceSignatureInstantiationProof, SourceRelationError<Self::Error>> {
+        ConditionalBranchSource::resolve_source_signature_instantiation(
+            self, store, request, session,
+        )
+    }
+
+    fn validate_source_signature_instantiation_proof(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        proof: &SourceSignatureInstantiationProof,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+    ) -> Result<(), SourceRelationError<Self::Error>> {
+        ConditionalBranchSource::validate_source_signature_instantiation_proof(
+            self,
+            store,
+            proof,
+            globals,
+            strict_function_types,
+        )
+        .map_err(SourceRelationError::Source)
     }
 
     fn source_signature_return_query(&self) -> Option<&dyn SourceSignatureReturnQuery> {
@@ -831,6 +1033,7 @@ pub(super) struct ConditionalSourceResultProof {
     branch_reads: Vec<ConditionalSourceBranchRead>,
     member_values: Vec<GlobalThisMemberValueProof>,
     signature_returns: Vec<SourceSignatureReturnProof>,
+    signature_instantiations: Vec<SourceOperationProof>,
     nested: Vec<ConditionalSourceResultProof>,
 }
 
@@ -911,6 +1114,7 @@ struct RecordingConditionalSource<'a> {
     branch_reads: Vec<ConditionalSourceBranchRead>,
     member_values: Vec<GlobalThisMemberValueProof>,
     signature_returns: Vec<SourceSignatureReturnProof>,
+    signature_instantiations: std::cell::RefCell<Vec<SourceOperationProof>>,
     nested: Vec<ConditionalSourceResultProof>,
     recoveries: Vec<SourceConditionalRecoveryProof>,
     semantic_dependencies: Vec<ConditionalSourceSemanticRecovery>,
@@ -976,6 +1180,14 @@ impl RecordingConditionalSource<'_> {
                 self.options.strict_function_types,
             )?;
         }
+        for proof in self.signature_instantiations.borrow().iter() {
+            self.source.validate_source_operation_proof(
+                store,
+                proof,
+                self.globals,
+                self.options.strict_function_types,
+            )?;
+        }
         for nested in &self.nested {
             validate_source_conditional_result(store, nested, self.globals, self.source).map_err(
                 |error| match error {
@@ -1006,6 +1218,25 @@ impl RecordingConditionalSource<'_> {
 }
 
 impl ConditionalBranchSource for RecordingConditionalSource<'_> {
+    fn direct_interface_query(
+        &self,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+    ) -> Result<Option<Box<dyn DirectInterfaceQuery + '_>>, DeclaredTypeError> {
+        self.source.direct_interface_query(globals, strict_function_types)
+    }
+
+    fn source_indexed_diagnostic_is_present(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        node: NodeRef,
+        object: TypeId,
+        index: TypeId,
+    ) -> Result<bool, DeclaredTypeError> {
+        self.validate_options()?;
+        self.source.source_indexed_diagnostic_is_present(store, node, object, index)
+    }
+
     fn source_branch_recoveries(&self) -> &[SourceConditionalRecoveryProof] {
         &self.recoveries
     }
@@ -1056,11 +1287,16 @@ impl ConditionalBranchSource for RecordingConditionalSource<'_> {
             .or_else(|| self.source.completed_source_conditional(key))
     }
 
+    fn observe_completed_source_conditional(&self, proof: &ConditionalSourceResultProof) {
+        self.source.observe_completed_source_conditional(proof);
+    }
+
     fn retain_completed_source_conditional(
         &mut self,
         proof: ConditionalSourceResultProof,
     ) -> Result<(), DeclaredTypeError> {
         self.validate_options()?;
+        self.source.observe_completed_source_conditional(&proof);
         if let Some(previous) = self
             .nested
             .iter_mut()
@@ -1209,6 +1445,15 @@ impl ConditionalBranchSource for RecordingConditionalSource<'_> {
 
     fn source_query_options(&self) -> Option<CanonicalTypeQueryOptions> {
         self.source.source_query_options()
+    }
+
+    fn preflight_source_declared_value(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        symbol: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        self.source.preflight_source_declared_value(store, symbol)
     }
 
     fn resolve_source_property_object_member(
@@ -1366,6 +1611,185 @@ impl ConditionalBranchSource for RecordingConditionalSource<'_> {
             globals,
             strict_function_types,
         )
+    }
+
+    fn resolve_source_signature_instantiation(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        request: SourceSignatureInstantiationRequest,
+        session: &mut InstantiationSession,
+    ) -> Result<SourceSignatureInstantiationProof, SourceRelationError<DeclaredTypeError>> {
+        self.validate_options().map_err(SourceRelationError::Source)?;
+        let proof = self
+            .source
+            .resolve_source_signature_instantiation(store, request, session)?;
+        self.validate_reads(store, session)
+            .map_err(SourceRelationError::Source)?;
+        if proof.request() != request || !proof.matches_context(self.globals, self.options) {
+            return Err(SourceRelationError::Source(missing_source_query()));
+        }
+        self.source
+            .validate_source_signature_instantiation_proof(
+                store,
+                &proof,
+                self.globals,
+                self.options.strict_function_types,
+            )
+            .map_err(SourceRelationError::Source)?;
+        self.retain_source_signature_instantiation_proof(proof.clone())
+            .map_err(SourceRelationError::Source)?;
+        Ok(proof)
+    }
+
+    fn validate_source_signature_instantiation_proof(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        proof: &SourceSignatureInstantiationProof,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        if globals != self.globals
+            || strict_function_types != self.options.strict_function_types
+            || !proof.matches_context(self.globals, self.options)
+        {
+            return Err(missing_source_query());
+        }
+        self.source.validate_source_signature_instantiation_proof(
+            store,
+            proof,
+            globals,
+            strict_function_types,
+        )
+    }
+
+    fn retain_source_signature_instantiation_proof(
+        &mut self,
+        proof: SourceSignatureInstantiationProof,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        if !proof.matches_context(self.globals, self.options) {
+            return Err(missing_source_query());
+        }
+        let retained = if let Some(previous) = self
+            .signature_instantiations
+            .borrow()
+            .iter()
+            .filter_map(SourceOperationProof::as_signature_instantiation)
+            .find(|previous| previous.request() == proof.request())
+        {
+            if previous.type_id() != proof.type_id() {
+                return Err(missing_source_query());
+            }
+            true
+        } else {
+            false
+        };
+        // The source records every reached read for enclosing query captures.
+        self.source
+            .retain_source_signature_instantiation_proof(proof.clone())?;
+        self.validate_options()?;
+        if !retained {
+            self.signature_instantiations.get_mut().push(SourceOperationProof::SignatureInstantiation(proof));
+        }
+        Ok(())
+    }
+
+    fn resolve_source_mapped_read(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        request: SourceMappedReadRequest,
+        session: &mut InstantiationSession,
+    ) -> Result<SourceMappedReadOutcome, super::mapped_types::MappedTypeError> {
+        self.validate_options()?;
+        let outcome = self.source.resolve_source_mapped_read(store, request, session)?;
+        if let SourceMappedReadOutcome::Complete(proof) = &outcome {
+            if proof.request() != request {
+                return Err(super::mapped_types::MappedTypeError::InvalidMappedType(request.receiver()));
+            }
+            self.validate_source_mapped_read_proof(store, proof, self.globals, self.options.strict_function_types)?;
+            self.validate_reads(store, session)?;
+            self.retain_source_mapped_read_proof(proof.clone())?;
+        }
+        Ok(match outcome {
+            SourceMappedReadOutcome::RecoveredValue(value) => SourceMappedReadOutcome::LimitRecovery(value.recovery_type()),
+            SourceMappedReadOutcome::RecoveredMembers(_) => {
+                return Err(super::mapped_types::MappedTypeError::Declared(
+                    missing_source_query(),
+                ));
+            }
+            outcome => outcome,
+        })
+    }
+
+    fn validate_source_mapped_read_proof(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        proof: &SourceMappedReadProof,
+        globals: &CanonicalGlobalTypes,
+        strict_function_types: Option<bool>,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        if globals != self.globals
+            || strict_function_types != self.options.strict_function_types
+            || !proof.matches_context(self.globals, self.options)
+        {
+            return Err(missing_source_query());
+        }
+        self.source.validate_source_mapped_read_proof(store, proof, globals, strict_function_types)
+    }
+
+    fn retain_source_mapped_read_proof(
+        &mut self,
+        proof: SourceMappedReadProof,
+    ) -> Result<(), DeclaredTypeError> {
+        self.validate_options()?;
+        if !proof.matches_context(self.globals, self.options) {
+            return Err(missing_source_query());
+        }
+        let previous = self.signature_instantiations.borrow().iter().find_map(|operation| match operation {
+            SourceOperationProof::MappedRead(previous) if previous.request() == proof.request() => Some(previous.clone()),
+            _ => None,
+        });
+        if previous.as_ref().is_some_and(|previous| !previous.same_result(&proof)) {
+            return Err(missing_source_query());
+        }
+        let retained = previous.is_some();
+        self.source.retain_source_mapped_read_proof(proof.clone())?;
+        self.validate_options()?;
+        if !retained {
+            self.signature_instantiations.get_mut().push(SourceOperationProof::MappedRead(proof));
+        }
+        Ok(())
+    }
+
+    fn completed_source_mapped_read(&self, request: SourceMappedReadRequest) -> Option<SourceMappedReadProof> {
+        self.signature_instantiations.borrow().iter().rev().find_map(|operation| match operation {
+            SourceOperationProof::MappedRead(proof) if proof.request() == request => Some(proof.clone()),
+            _ => None,
+        }).or_else(|| self.source.completed_source_mapped_read(request))
+    }
+
+    fn observe_source_mapped_read(&self, proof: &SourceMappedReadProof) {
+        self.signature_instantiations.borrow_mut().push(SourceOperationProof::MappedRead(proof.clone()));
+        self.source.observe_source_mapped_read(proof);
+    }
+
+    fn prove_source_mapped_alias_request(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        request: super::type_nodes::SourceMappedAliasRequestInput<'_>,
+    ) -> Result<super::type_nodes::SourceMappedAliasRequestProof, DeclaredTypeError> {
+        self.validate_options()?;
+        self.source.prove_source_mapped_alias_request(store, request)
+    }
+
+    fn validate_source_mapped_alias_request(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        proof: &super::type_nodes::SourceMappedAliasRequestProof,
+    ) -> Result<(), DeclaredTypeError> {
+        self.source.validate_source_mapped_alias_request(store, proof)
     }
 
     fn take_completed_source_conditionals(&mut self) -> Vec<ConditionalSourceResultProof> {
@@ -1682,6 +2106,7 @@ pub(super) fn get_type_from_conditional_type_with_source(
         branch_reads: Vec::new(),
         member_values: Vec::new(),
         signature_returns: Vec::new(),
+        signature_instantiations: Default::default(),
         nested,
         recoveries,
         semantic_dependencies: Vec::new(),
@@ -1738,6 +2163,7 @@ pub(super) fn get_type_from_conditional_type_with_source(
         branch_reads: recorded.branch_reads,
         member_values: recorded.member_values,
         signature_returns: recorded.signature_returns,
+        signature_instantiations: recorded.signature_instantiations.into_inner(),
         nested: recorded.nested,
     };
     if semantically_recovered {
@@ -1936,6 +2362,16 @@ fn validate_source_result_dependencies(
             .validate_source_signature_return_proof(
                 store,
                 return_proof,
+                globals,
+                proof.options.strict_function_types,
+            )
+            .map_err(ConditionalTypeError::Declared)?;
+    }
+    for instantiation in &proof.signature_instantiations {
+        source
+            .validate_source_operation_proof(
+                store,
+                instantiation,
                 globals,
                 proof.options.strict_function_types,
             )
@@ -2569,6 +3005,7 @@ pub(super) fn get_conditional_type_instantiation_with_source(
         branch_reads: Vec::new(),
         member_values: Vec::new(),
         signature_returns: Vec::new(),
+        signature_instantiations: Default::default(),
         nested,
         recoveries,
         semantic_dependencies: Vec::new(),
@@ -2645,6 +3082,7 @@ pub(super) fn get_conditional_type_instantiation_with_source(
         branch_reads: recorded.branch_reads,
         member_values: recorded.member_values,
         signature_returns: recorded.signature_returns,
+        signature_instantiations: recorded.signature_instantiations.into_inner(),
         nested: recorded.nested,
     };
     if semantically_recovered {
@@ -3733,6 +4171,7 @@ pub(super) fn cached_conditional_remap_with_source_lookup(
                 projection.production.definition.root,
             ));
         }
+        source.observe_completed_source_conditional(proof);
         return Ok(SourceConditionalRemapLookup::Hit(cached));
     }
     if cached.is_some() {
@@ -3828,6 +4267,7 @@ fn remap_source_conditional_result(
         branch_reads: Vec::new(),
         member_values: Vec::new(),
         signature_returns: Vec::new(),
+        signature_instantiations: std::cell::RefCell::new(Vec::new()),
         nested,
         recoveries,
         semantic_dependencies: Vec::new(),
@@ -3884,6 +4324,7 @@ fn remap_source_conditional_result(
                 branch_reads: recorded.branch_reads,
                 member_values: recorded.member_values,
                 signature_returns: recorded.signature_returns,
+                signature_instantiations: recorded.signature_instantiations.into_inner(),
                 nested: recorded.nested,
             },
             recoveries: recorded.recoveries[semantic_mark..].to_vec(),
@@ -3916,6 +4357,7 @@ fn remap_source_conditional_result(
         branch_reads: recorded.branch_reads,
         member_values: recorded.member_values,
         signature_returns: recorded.signature_returns,
+        signature_instantiations: recorded.signature_instantiations.into_inner(),
         nested: recorded.nested,
     };
     validate_source_conditional_result(store, &proof, globals, recorded.source)?;
@@ -10227,7 +10669,7 @@ pub(super) fn source_query_is_assignable(
         return Err(ConditionalTypeError::Declared(missing_source_query()));
     }
     let related = result.related();
-    let (member_values, signature_returns) = result.into_proofs();
+    let (member_values, signature_returns, signature_instantiations) = result.into_complete_proofs();
     for proof in &member_values {
         query
             .validate_global_this_member_value_proof(
@@ -10246,6 +10688,19 @@ pub(super) fn source_query_is_assignable(
                 globals,
                 options.strict_function_types,
             )
+            .map_err(ConditionalTypeError::Declared)?;
+    }
+    for proof in signature_instantiations {
+        query
+            .validate_source_operation_proof(
+                store,
+                &proof,
+                globals,
+                options.strict_function_types,
+            )
+            .map_err(ConditionalTypeError::Declared)?;
+        query
+            .retain_source_operation_proof(proof)
             .map_err(ConditionalTypeError::Declared)?;
     }
     Ok(related)

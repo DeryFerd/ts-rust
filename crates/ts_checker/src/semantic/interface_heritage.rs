@@ -1604,7 +1604,23 @@ pub(super) fn source_interface_alias_base_state(
         let Some(type_) = cached else {
             return Ok(SourceInterfaceAliasBaseState::Pending { edges, conditional });
         };
-        if !interface_base_has_statically_known_members(store, type_)? {
+        if !{
+            let _query_observation = super::store::CurrentQueryRequestScope::enter(
+                "static_members.alias_state",
+                || super::store::CurrentQueryFrame {
+                    request: request.reference(),
+                    receiver: Some(type_),
+                    context: super::store::CurrentQueryContext {
+                        globals: Some(query.is_some()),
+                        source: Some(query.is_some()),
+                        array_targets: Some(array_targets.is_some()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            interface_base_has_statically_known_members(store, type_)?
+        } {
             return Err(TypeNodeUnavailable::UnsupportedSyntax {
                 node: request.root,
                 kind: SyntaxKind::ExpressionWithTypeArguments,
@@ -1967,7 +1983,23 @@ pub(super) fn source_interface_alias_base_is_ignored_with_query_context(
     }
     match cached_interface_alias_reference_with_query_context(store, request, array_targets, query)?
     {
-        Some(type_) => interface_alias_result_is_ignored(store, type_),
+        Some(type_) => {
+            let _query_observation = super::store::CurrentQueryRequestScope::enter(
+                "static_members.alias_reference_ignore",
+                || super::store::CurrentQueryFrame {
+                    request: request.reference(),
+                    receiver: Some(type_),
+                    context: super::store::CurrentQueryContext {
+                        globals: Some(query.is_some()),
+                        source: Some(query.is_some()),
+                        array_targets: Some(array_targets.is_some()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            interface_alias_result_is_ignored(store, type_)
+        },
         None => Ok(false),
     }
 }
@@ -2050,18 +2082,22 @@ pub(super) fn interface_base_has_statically_known_members(
         type_: TypeId,
         active: &mut HashSet<TypeId>,
     ) -> Result<bool, DeclaredTypeError> {
-        let invalid = || {
+        let invalid = |store: &CanonicalTypeMapperStore, branch: &'static str| {
+            super::store::observe_current_query_event(
+                "factory", "heritage.static_members", branch, Some(type_), None,
+                || super::store::current_query_type_snapshot(store, type_),
+            );
             DeclaredTypeError::from(TypeNodeUnavailable::UnsupportedIntersectionConstituentType(
                 type_,
             ))
         };
         if active.len() >= MAX_INTERFACE_HERITAGE_DEPTH || !active.insert(type_) {
-            return Err(invalid());
+            return Err(invalid(store, "depth_or_cycle"));
         }
-        let record = store.type_payload(type_).ok_or_else(invalid)?;
+        let record = store.type_payload(type_).ok_or_else(|| invalid(store, "record_missing"))?;
         let valid = match record.data() {
             TypeData::TypeParameter(parameter) => {
-                let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+                let bootstrap = store.intrinsic_bootstrap().ok_or_else(|| invalid(store, "bootstrap_missing"))?;
                 if let Some(constraint) = parameter.constraint.filter(|constraint| {
                     *constraint != type_
                         && *constraint != bootstrap.no_constraint_type
@@ -2082,7 +2118,7 @@ pub(super) fn interface_base_has_statically_known_members(
                 valid
             }
             TypeData::Mapped(mapped) => {
-                let constraint = mapped.constraint_type.ok_or_else(invalid)?;
+                let constraint = mapped.constraint_type.ok_or_else(|| invalid(store, "mapped.constraint_missing"))?;
                 let mut keys = vec![constraint];
                 let mut seen = HashSet::new();
                 let mut generic = false;
@@ -2090,7 +2126,7 @@ pub(super) fn interface_base_has_statically_known_members(
                     if !seen.insert(key) {
                         continue;
                     }
-                    let key = store.type_payload(key).ok_or_else(invalid)?;
+                    let key = store.type_payload(key).ok_or_else(|| invalid(store, "mapped.key_record_missing"))?;
                     generic |= key
                         .flags()
                         .intersects(TypeFlags::INSTANTIABLE_NON_PRIMITIVE | TypeFlags::INDEX);
@@ -2108,7 +2144,7 @@ pub(super) fn interface_base_has_statically_known_members(
                 }
                 if !generic && mapped.name_type.is_some() {
                     super::mapped_types::plan_mapped_type_keys(store, type_)
-                        .map_err(|_| invalid())?;
+                        .map_err(|_| invalid(store, "mapped.key_plan"))?;
                 }
                 !generic
             }
@@ -2163,12 +2199,16 @@ pub(super) fn interface_alias_base_members_with_query_context(
     array_targets: Option<CanonicalArrayTargets>,
     query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
 ) -> Result<Option<InterfaceAliasBaseMembers>, DeclaredTypeError> {
-    let invalid = || {
+    let invalid = |store: &CanonicalTypeMapperStore, branch: &'static str| {
+        super::store::observe_current_query_event(
+            "factory", "heritage.base_members", branch, Some(type_), None,
+            || super::store::current_query_type_snapshot(store, type_),
+        );
         DeclaredTypeError::from(TypeNodeUnavailable::UnsupportedIntersectionConstituentType(
             type_,
         ))
     };
-    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let record = store.type_payload(type_).ok_or_else(|| invalid(store, "record_missing"))?;
     let properties = match record.data() {
         TypeData::Mapped(_) => {
             let Some(members) = store
@@ -2177,7 +2217,7 @@ pub(super) fn interface_alias_base_members_with_query_context(
                     array_targets,
                     query.map(|query| (query.globals, query.source)),
                 )
-                .map_err(|_| invalid())?
+                .map_err(|_| invalid(store, "mapped.endpoint"))?
             else {
                 return Ok(None);
             };
@@ -2190,24 +2230,24 @@ pub(super) fn interface_alias_base_members_with_query_context(
             {
                 store
                     .validate_deferred_intersection_type_with_array_targets(type_, array_targets)
-                    .map_err(|_| invalid())?;
+                    .map_err(|_| invalid(store, "intersection.deferred_validation"))?;
                 return Ok(None);
             }
             let projection = store
                 .validate_intersection_type_with_array_targets(type_, array_targets)
-                .map_err(|_| invalid())?;
+                .map_err(|_| invalid(store, "intersection.validation"))?;
             if projection.reduced_to_never {
-                return Err(invalid());
+                return Err(invalid(store, "intersection.reduced_to_never"));
             }
             projection.properties
         }
         _ if super::object_aliases::source_property_object_projection(store, type_)
-            .map_err(|_| invalid())?
+            .map_err(|_| invalid(store, "object.projection"))?
             .is_some() =>
         {
             let Some(members) = super::instantiated_members::validate_property_object_alias_members_with_array_targets(
                 store, type_, array_targets,
-            ).map_err(|_| invalid())? else { return Ok(None); };
+            ).map_err(|_| invalid(store, "object.members"))? else { return Ok(None); };
             members.properties
         }
         _ if super::reference_types::validate_direct_generic_reference(store, type_).is_ok() => {
@@ -2216,7 +2256,7 @@ pub(super) fn interface_alias_base_members_with_query_context(
                 type_,
                 array_targets,
             )
-            .map_err(|_| invalid())?
+            .map_err(|_| invalid(store, "generic.members"))?
             else {
                 return Ok(None);
             };
@@ -2230,21 +2270,21 @@ pub(super) fn interface_alias_base_members_with_query_context(
             record
                 .data()
                 .structured()
-                .ok_or_else(invalid)?
+                .ok_or_else(|| invalid(store, "object.structured_missing"))?
                 .properties
                 .clone()
                 .unwrap_or_default()
         }
-        _ => return Err(invalid()),
+        _ => return Err(invalid(store, "provider_missing")),
     };
-    let structured = record.data().structured().ok_or_else(invalid)?;
+    let structured = record.data().structured().ok_or_else(|| invalid(store, "structured_missing"))?;
     if structured.call_signature_count != 0
         || structured
             .signatures
             .as_ref()
             .is_some_and(|signatures| !signatures.is_empty())
     {
-        return Err(invalid());
+        return Err(invalid(store, "signatures_present"));
     }
     Ok(Some(InterfaceAliasBaseMembers {
         properties,
@@ -2283,15 +2323,19 @@ pub(super) fn resolve_interface_alias_base_members_with_query_context(
         active: &mut HashSet<TypeId>,
         query: Option<&SourceInterfaceHeritageQueryContext<'_>>,
     ) -> Result<(), DeclaredTypeError> {
-        let invalid = || {
+        let invalid = |store: &CanonicalTypeMapperStore, branch: &'static str| {
+            super::store::observe_current_query_event(
+                "factory", "heritage.resolve_members", branch, Some(type_), None,
+                || super::store::current_query_type_snapshot(store, type_),
+            );
             DeclaredTypeError::from(TypeNodeUnavailable::UnsupportedIntersectionConstituentType(
                 type_,
             ))
         };
         if active.len() >= MAX_INTERFACE_HERITAGE_DEPTH || !active.insert(type_) {
-            return Err(invalid());
+            return Err(invalid(store, "depth_or_cycle"));
         }
-        let record = store.type_payload(type_).ok_or_else(invalid)?;
+        let record = store.type_payload(type_).ok_or_else(|| invalid(store, "record_missing"))?;
         if let TypeData::Intersection(intersection) = record.data() {
             let types = intersection.intersection.types.clone();
             for part in types {
@@ -2299,7 +2343,7 @@ pub(super) fn resolve_interface_alias_base_members_with_query_context(
             }
             store
                 .materialize_deferred_intersection_type_with_array_targets(type_, array_targets)
-                .map_err(|_| invalid())?;
+                .map_err(|_| invalid(store, "intersection.materialize"))?;
         } else if matches!(record.data(), TypeData::Mapped(_)) {
             let members = store
                 .resolve_mapped_type_members_with_session(
@@ -2307,14 +2351,14 @@ pub(super) fn resolve_interface_alias_base_members_with_query_context(
                     super::mapped_types::MappedTypeModifiers::NONE,
                     session,
                 )
-                .map_err(|_| invalid())?;
+                .map_err(|_| invalid(store, "mapped.members"))?;
             for &property in members.properties() {
                 store
                     .resolve_mapped_symbol_type_with_session(property, session)
-                    .map_err(|_| invalid())?;
+                    .map_err(|_| invalid(store, "mapped.property"))?;
             }
         } else if super::object_aliases::source_property_object_projection(store, type_)
-            .map_err(|_| invalid())?
+            .map_err(|_| invalid(store, "object.projection"))?
             .is_some()
         {
             super::instantiated_members::resolve_property_object_alias_members_with_array_targets(
@@ -2322,7 +2366,7 @@ pub(super) fn resolve_interface_alias_base_members_with_query_context(
                 type_,
                 array_targets,
             )
-            .map_err(|_| invalid())?;
+            .map_err(|_| invalid(store, "object.members"))?;
         } else if super::reference_types::validate_direct_generic_reference(store, type_).is_ok() {
             let members =
                 super::instantiated_members::resolve_members_with_array_targets_and_session(
@@ -2331,7 +2375,7 @@ pub(super) fn resolve_interface_alias_base_members_with_query_context(
                     array_targets,
                     session,
                 )
-                .map_err(|_| invalid())?;
+                .map_err(|_| invalid(store, "generic.members"))?;
             for &property in members.properties() {
                 super::instantiated_members::demand_instantiated_property_type(
                     store,
@@ -2340,11 +2384,11 @@ pub(super) fn resolve_interface_alias_base_members_with_query_context(
                     array_targets,
                     session,
                 )
-                .map_err(|_| invalid())?;
+                .map_err(|_| invalid(store, "generic.property"))?;
             }
         }
         interface_alias_base_members_with_query_context(store, type_, array_targets, query)?
-            .ok_or_else(invalid)?;
+            .ok_or_else(|| invalid(store, "base_members_missing"))?;
         assert!(active.remove(&type_));
         Ok(())
     }
@@ -2357,7 +2401,13 @@ pub(super) fn resolve_interface_alias_base_members_with_query_context(
         query,
     )?;
     interface_alias_base_members_with_query_context(store, type_, array_targets, query)?
-        .ok_or_else(|| TypeNodeUnavailable::UnsupportedIntersectionConstituentType(type_).into())
+        .ok_or_else(|| {
+            super::store::observe_current_query_event(
+                "factory", "heritage.resolved_missing", "final_members_missing", Some(type_), None,
+                || super::store::current_query_type_snapshot(store, type_),
+            );
+            TypeNodeUnavailable::UnsupportedIntersectionConstituentType(type_).into()
+        })
 }
 
 /// Rechecks source and all populated cache metadata, without completing a base.
@@ -2547,7 +2597,26 @@ fn validate_source_interface_heritage_header_worker(
             .as_ref()
             .is_some_and(|alias| alias.reference.is_some())
             && let Some(type_) = cached
-            && interface_alias_result_is_ignored(store, type_)?
+            && {
+                let _query_observation = super::store::CurrentQueryRequestScope::enter(
+                    "static_members.header_cache_ignore",
+                    || super::store::CurrentQueryFrame {
+                        request: Some(base.node),
+                        owner: Some(base.declaration),
+                        expression: Some(base.expression),
+                        receiver: Some(type_),
+                        context: super::store::CurrentQueryContext {
+                            globals: Some(query.is_some()),
+                            source: Some(query.is_some()),
+                            array_targets: Some(array_targets.is_some()),
+                            source_pending_allowed: Some(allow_source_pending),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
+                interface_alias_result_is_ignored(store, type_)?
+            }
         {
             continue;
         }

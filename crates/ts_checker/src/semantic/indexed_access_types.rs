@@ -10,8 +10,10 @@
 //! type-parameter pairs have a separate deferred constructor. Recursive named
 //! operands retain an authenticated, allocation-free syntax proof so the
 //! type-node owner can issue the pinned generic and tuple cycle diagnostics.
-//! Other named operands, optional properties, overlapping non-string indexes,
-//! general union keys, tuples, and apparent types remain explicit boundaries.
+//! The source type query uses the shared operand syntax proof for other named
+//! operands, then resolves their selected value with its actual source context.
+//! Overlapping non-string indexes, general union keys, tuples, and apparent
+//! types remain boundaries of this concrete planner.
 //!
 //! Planning chooses the exact property symbol or index-info slot before any
 //! semantic child executes. Finishing only validates the already-resolved
@@ -54,6 +56,13 @@ use super::{
 };
 
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
+
+/// Checked source operands for the shared indexed-type operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct IndexedAccessTypePlan {
+    pub object: NodeRef,
+    pub index: NodeRef,
+}
 
 /// Concrete key forms for which applicable index selection is allocation-free.
 #[derive(Clone, Debug, PartialEq)]
@@ -1117,17 +1126,12 @@ pub(super) fn plan_recursive_indexed_access(
     }
 }
 
-/// Preflights one complete concrete indexed-access dependency closure.
-///
-/// The returned plan has already selected one required property or one exact
-/// source-declared index-signature slot. A warm parent is accepted only when
-/// its fully resolved object and canonical literal key reproduce the cached
-/// result exactly.
-pub(super) fn plan_concrete_indexed_access(
+/// Checks the indexed type node and its two operand edges without reading values.
+pub(super) fn plan_indexed_access_type(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
-) -> Result<ConcreteIndexedAccessPlan, ConcreteIndexedAccessError> {
+) -> Result<IndexedAccessTypePlan, ConcreteIndexedAccessError> {
     let record = preflight_node(store, host, node)?;
     let NodeData::IndexedAccessTypeNode(indexed) = &record.data else {
         return Err(ConcreteIndexedAccessError::InvalidSyntax(node));
@@ -1150,6 +1154,16 @@ pub(super) fn plan_concrete_indexed_access(
         return Err(ConcreteIndexedAccessError::InvalidSyntax(node));
     }
 
+    Ok(IndexedAccessTypePlan { object, index })
+}
+
+/// Selects one required property or exact source index from a concrete type literal.
+pub(super) fn plan_concrete_indexed_access(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<ConcreteIndexedAccessPlan, ConcreteIndexedAccessError> {
+    let IndexedAccessTypePlan { object, index } = plan_indexed_access_type(store, host, node)?;
     let (object_literal, object_wrappers) =
         direct_type_literal(store, host, object).map_err(|error| match error {
             DirectTypeLiteralError::Declared(error) => {

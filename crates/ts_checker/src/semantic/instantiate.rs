@@ -85,7 +85,8 @@ use super::{
     store::{CachedSignatureLookup, SourceNodeParent},
     template_types::TemplateTypeError,
     tuple_types::{CanonicalTupleTypeRequest, TupleShape, TupleTypeError},
-    type_nodes::type_alias_instantiation_cache_key,
+    type_nodes::{SourceMappedReadOutcome, SourceMappedReadProof, SourceMappedReadRequest,
+        type_alias_instantiation_cache_key},
     type_records::{StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{AccessFlags, ObjectFlags, TypeFlags},
 };
@@ -1463,6 +1464,19 @@ pub(super) fn instantiate_type_with_vector_and_source(
     session: &mut InstantiationSession,
     source: &mut dyn ConditionalBranchSource,
 ) -> Result<TypeId, InstantiationError> {
+    instantiate_type_with_vector_and_alias_and_source(store, type_, sources, targets, None, globals, session, source)
+}
+
+pub(super) fn instantiate_type_with_vector_and_alias_and_source(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<TypeId, InstantiationError> {
     if sources.len() != targets.len() {
         return Err(InstantiationError::InvalidType(type_));
     }
@@ -1476,7 +1490,7 @@ pub(super) fn instantiate_type_with_vector_and_source(
         type_,
         InstantiationMapping::Vector { sources, targets },
         Some(CanonicalArrayTargets::from_global_types(globals)),
-        None,
+        alias_override.map(|(symbol, arguments)| InstantiationAliasInput::Borrowed(symbol, arguments)),
         session,
         None,
         Some(&mut InstantiationSource {
@@ -1753,6 +1767,78 @@ pub(super) fn instantiate_ordinary_intersection_with_vector_and_alias_and_sessio
     Ok((result, builder.receipt))
 }
 
+/// Uses the ordinary alias frame for a source-proved mapped constructor.
+pub(super) fn with_source_mapped_alias_frame<E>(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    alias: (SemanticSymbolId, &[TypeId]),
+    session: &mut InstantiationSession,
+    validate_cached: impl FnOnce(&CanonicalTypeMapperStore, TypeId) -> Result<(), InstantiationError>,
+    map_error: impl Fn(InstantiationError) -> E,
+    work: impl FnOnce(&mut CanonicalTypeMapperStore, &mut InstantiationSession) -> Result<TypeId, E>,
+) -> Result<TypeId, E> {
+    if sources.len() != targets.len() {
+        return Err(map_error(InstantiationError::InvalidType(type_)));
+    }
+    for endpoint in sources.iter().chain(targets) {
+        if store.type_payload(*endpoint).is_none() {
+            return Err(map_error(InstantiationError::InvalidType(*endpoint)));
+        }
+    }
+    if !could_contain_installed_type_variables(store, type_, array_targets).map_err(&map_error)? {
+        return Ok(type_);
+    }
+    with_instantiation_frame(
+        store,
+        InstantiationMapping::Vector { sources, targets },
+        session,
+        |store| {
+            instantiation_cache_key_for_input(
+                store,
+                type_,
+                Some(InstantiationAliasInput::Borrowed(alias.0, alias.1)),
+            )
+        },
+        |store, _, cached| validate_cached(store, cached),
+        map_error,
+        |store, session, _| work(store, session),
+    )
+}
+
+/// Runs the complete any branch with the caller's normal frame and cache key.
+pub(super) fn instantiate_complete_source_homomorphic_any_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    projection: &SupportedMappedAliasProjection,
+    proof: std::sync::Arc<super::type_nodes::SourceMappedAliasRequestProof>,
+    identity: (SemanticSymbolId, &[TypeId]),
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &dyn ConditionalBranchSource,
+) -> Result<TypeId, InstantiationError> {
+    let arrays = Some(CanonicalArrayTargets::from_global_types(globals));
+    with_source_mapped_alias_frame(store, projection.declared_type,
+        &projection.type_parameters, &projection.arguments, arrays, identity, session,
+        |store, cached| {
+            let original = super::mapped_types::supported_mapped_alias_projection_with_source(
+                store, projection.declared_type, arrays, Some((globals, source)))
+                .map_err(|error| mapped_indexed_access_error(projection.declared_type, error))?
+                .ok_or(InstantiationError::InvalidType(projection.declared_type))?;
+            let expected = super::mapped_types::cached_supported_mapped_alias_instance_with_source(
+                store, &original, &projection.arguments, identity, arrays, Some((globals, source)))
+                .map_err(|error| mapped_indexed_access_error(projection.declared_type, error))?;
+            if expected != Some(cached) { return Err(InstantiationError::InvalidType(cached)); }
+            Ok(())
+        },
+        |error| error,
+        |store, session| super::mapped_types::instantiate_complete_source_homomorphic_any_instance(
+            store, projection, proof, identity, globals, session, source)
+            .map_err(|error| mapped_indexed_access_error(projection.declared_type, error)),
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MappedTemplateFrame {
     Optional { template: TypeId, sentinel: TypeId },
@@ -2021,7 +2107,7 @@ fn instantiate_type_with_alias_input_and_operand(
             if operand.is_none()
                 && !matches!(
                     store.type_payload(type_).map(TypeRecord::data),
-                    Some(TypeData::Conditional(_))
+                    Some(TypeData::Conditional(_) | TypeData::Index(_))
                 )
                 && source_callable_function_type_owner(store, type_).is_none()
                 && !store.type_has_function_type_provenance(type_)
@@ -4283,6 +4369,18 @@ pub(super) fn cached_instantiation_with_vector_and_source(
     globals: &CanonicalGlobalTypes,
     source: &dyn ConditionalBranchSource,
 ) -> Result<Option<TypeId>, InstantiationError> {
+    cached_instantiation_with_vector_and_alias_and_source(store, template, sources, targets, None, globals, source)
+}
+
+pub(super) fn cached_instantiation_with_vector_and_alias_and_source(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<Option<TypeId>, InstantiationError> {
     if sources.len() != targets.len() {
         return Err(InstantiationError::InvalidType(template));
     }
@@ -4296,7 +4394,7 @@ pub(super) fn cached_instantiation_with_vector_and_source(
         template,
         InstantiationMapping::Vector { sources, targets },
         Some(CanonicalArrayTargets::from_global_types(globals)),
-        None,
+        alias_override,
         &mut HashSet::new(),
         Some((globals, source)),
     )
@@ -4515,86 +4613,10 @@ fn cached_instantiated_type_with_operand_worker(
                 source,
             )
         }
-        TypeData::IndexedAccess(indexed) => {
-            let object = cached_instantiated_type_with_source_worker(
-                store,
-                indexed.object_type,
-                mapping,
-                array_targets,
-                None,
-                active,
-                source,
-            )?;
-            let index = cached_instantiated_type_with_source_worker(
-                store,
-                indexed.index_type,
-                mapping,
-                array_targets,
-                None,
-                active,
-                source,
-            )?;
-            let (Some(object), Some(index)) = (object, index) else {
-                return Ok(None);
-            };
-            match indexed_access_resolution(
-                store,
-                object,
-                index,
-                indexed.access_flags,
-                array_targets,
-            )? {
-                IndexedAccessResolution::Type(type_) => Ok(Some(type_)),
-                IndexedAccessResolution::TypeWithSentinel(type_, sentinel) => store
-                    .cached_literal_union_type_with_alias(&[type_, sentinel], None, array_targets)
-                    .map_err(Into::into),
-                IndexedAccessResolution::Deferred => {
-                    cached_deferred_indexed_access_type(store, object, index, indexed.access_flags)
-                        .map_err(InstantiationError::InvalidType)
-                }
-                IndexedAccessResolution::Property(name) => {
-                    let Some(structured) =
-                        resolved_indexed_access_members(store, object, array_targets)?
-                    else {
-                        return Ok(None);
-                    };
-                    let property = structured
-                        .members
-                        .and_then(|members| store.symbol_table(members))
-                        .and_then(|members| members.get(name.as_ref()));
-                    let Some(property) = property else {
-                        return Ok(None);
-                    };
-                    if !structured
-                        .properties
-                        .as_deref()
-                        .unwrap_or_default()
-                        .contains(&property)
-                    {
-                        return Err(InstantiationError::InvalidType(object));
-                    }
-                    let Some(value) = store
-                        .value_symbol_links(property)
-                        .and_then(|links| links.resolved_type)
-                    else {
-                        return Ok(None);
-                    };
-                    store
-                        .type_payload(value)
-                        .ok_or(InstantiationError::InvalidType(value))?;
-                    match indexed_access_property_optional_sentinel(store, property, value)? {
-                        Some(sentinel) => store
-                            .cached_literal_union_type_with_alias(
-                                &[value, sentinel],
-                                None,
-                                array_targets,
-                            )
-                            .map_err(Into::into),
-                        None => Ok(Some(value)),
-                    }
-                }
-            }
-        }
+        TypeData::IndexedAccess(indexed) => cached_instantiated_indexed_access(
+            store, indexed, mapping, array_targets, active, source,
+        )
+        .map(|result| result.and_then(IndexedAccessOutcome::type_id)),
         TypeData::TemplateLiteral(data) => {
             let mut types = Vec::with_capacity(data.types.len());
             for type_ in &data.types {
@@ -5117,14 +5139,29 @@ fn cached_instantiated_mapped_alias(
     active: &mut HashSet<TypeId>,
     source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<Option<TypeId>, InstantiationError> {
+    if let Some((owner, key_arguments)) = store.validated_complete_any_cache_identity(
+        projection, array_targets, source,
+    ).map_err(|error| mapped_indexed_access_error(projection.type_, error))? {
+        if let Some((symbol, arguments)) = alias_override {
+            validate_borrowed_alias_input(store, projection.type_, symbol, arguments)?;
+            if symbol != owner || arguments != key_arguments {
+                return Err(InstantiationError::InvalidType(projection.type_));
+            }
+        }
+        for argument in key_arguments.iter().chain(&projection.arguments).chain(&projection.identity_arguments) {
+            if cached_instantiated_type_with_source_worker(store, *argument, mapping,
+                array_targets, None, active, source)? != Some(*argument)
+            {
+                return Err(InstantiationError::InvalidType(projection.type_));
+            }
+        }
+        return Ok(Some(projection.type_));
+    }
     if !could_contain_installed_type_variables(store, projection.type_, array_targets)? {
         return Ok(Some(projection.type_));
     }
     if let Some((symbol, arguments)) = alias_override {
         validate_borrowed_alias_input(store, projection.type_, symbol, arguments)?;
-        if symbol != projection.identity_symbol {
-            return Err(InstantiationError::UnsupportedType(projection.type_));
-        }
     }
     let mut arguments = Vec::with_capacity(projection.arguments.len());
     for argument in &projection.arguments {
@@ -6133,8 +6170,12 @@ fn instantiate_type_worker(
             {
                 return Ok(target);
             }
-            let plan = plan_nongeneric_keyof_type_with_array_targets(store, target, array_targets)
-                .map_err(|error| instantiated_keyof_error(type_, error))?;
+            let plan = super::keyof_types::prepare_keyof_type_with_array_targets(
+                store,
+                target,
+                array_targets,
+            )
+            .map_err(|error| instantiated_keyof_error(type_, error))?;
             resolve_nongeneric_keyof_type_with_session(store, &plan, session)
                 .map_err(|error| instantiated_keyof_error(type_, error))
         }
@@ -6173,6 +6214,7 @@ fn instantiate_type_worker(
                 session,
                 source,
             )
+            .and_then(|outcome| outcome.type_id().ok_or(InstantiationError::UnsupportedType(type_)))
         }
         InstantiationWork::TypeParameter => {
             apply_mapping_with_source(store, type_, mapping, array_targets, session, source)
@@ -6297,6 +6339,178 @@ fn instantiate_type_worker(
 }
 
 /// Performs an explicit one-key demand without an empty-mapper identity shortcut.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IndexedAccessOutcome {
+    Type(TypeId),
+    Property(TypeId),
+    MissingProperty { object: TypeId, index: TypeId },
+}
+
+impl IndexedAccessOutcome {
+    fn type_id(self) -> Option<TypeId> {
+        match self {
+            Self::Type(type_) | Self::Property(type_) => Some(type_),
+            Self::MissingProperty { .. } => None,
+        }
+    }
+}
+
+fn cached_instantiated_indexed_access(
+    store: &CanonicalTypeMapperStore,
+    indexed: &super::type_records::IndexedAccessTypeData,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    active: &mut HashSet<TypeId>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+) -> Result<Option<IndexedAccessOutcome>, InstantiationError> {
+    let object = cached_instantiated_type_with_source_worker(
+        store,
+        indexed.object_type,
+        mapping,
+        array_targets,
+        None,
+        active,
+        source,
+    )?;
+    let index = cached_instantiated_type_with_source_worker(
+        store,
+        indexed.index_type,
+        mapping,
+        array_targets,
+        None,
+        active,
+        source,
+    )?;
+    let (Some(object), Some(index)) = (object, index) else {
+        return Ok(None);
+    };
+    let mapped_members = if matches!(store.type_payload(object).map(TypeRecord::data), Some(TypeData::Mapped(_)))
+        && !store.type_payload(index).is_some_and(|record| record.flags().intersects(TypeFlags::NEVER | TypeFlags::INSTANTIABLE))
+    {
+        if let Some((globals, source)) = source {
+            if !store.type_payload(object).is_some_and(|record| record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)) {
+                return Ok(None);
+            }
+            store.validate_source_mapped_read_request(object, globals, source)
+                .map_err(|error| mapped_indexed_access_error(object, error))?;
+            let request = SourceMappedReadRequest::Members { receiver: object };
+            let proof = source.completed_source_mapped_read(request)
+                .ok_or_else(|| InstantiationError::Declared(request.missing_proof()))?;
+            if proof.request() != request {
+                return Err(InstantiationError::InvalidType(object));
+            }
+            source.validate_source_mapped_read_proof(store, &proof, globals,
+                source.source_query_options().and_then(|options| options.strict_function_types))
+                .map_err(InstantiationError::Declared)?;
+            source.observe_source_mapped_read(&proof);
+            Some(proof)
+        } else { None }
+    } else { None };
+    match indexed_access_resolution_with_mapped_members(
+        store,
+        object,
+        index,
+        indexed.access_flags,
+        array_targets,
+        mapped_members.as_ref(),
+    )? {
+        IndexedAccessResolution::Type(type_) => Ok(Some(IndexedAccessOutcome::Type(type_))),
+        IndexedAccessResolution::PropertyType(type_) => Ok(Some(IndexedAccessOutcome::Property(type_))),
+        IndexedAccessResolution::MissingProperty => Ok(Some(IndexedAccessOutcome::MissingProperty { object, index })),
+        IndexedAccessResolution::TypeWithSentinel(type_, sentinel) => store
+            .cached_literal_union_type_with_alias(&[type_, sentinel], None, array_targets)
+            .map(|value| value.map(IndexedAccessOutcome::Type))
+            .map_err(Into::into),
+        IndexedAccessResolution::PropertyTypeWithSentinel(type_, sentinel) => store
+            .cached_literal_union_type_with_alias(&[type_, sentinel], None, array_targets)
+            .map(|value| value.map(IndexedAccessOutcome::Property))
+            .map_err(Into::into),
+        IndexedAccessResolution::Deferred => {
+            cached_deferred_indexed_access_type(store, object, index, indexed.access_flags)
+                .map(|value| value.map(IndexedAccessOutcome::Type))
+                .map_err(InstantiationError::InvalidType)
+        }
+        IndexedAccessResolution::Property(name) => {
+            let Some(structured) =
+                resolved_indexed_access_members_with_mapped_members(store, object, array_targets, mapped_members.as_ref())?
+            else {
+                return Ok(None);
+            };
+            let property = structured
+                .members
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get(name.as_ref()));
+            let Some(property) = property else {
+                return Ok(None);
+            };
+            if !structured
+                .properties
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&property)
+            {
+                return Err(InstantiationError::InvalidType(object));
+            }
+            let Some(value) = store
+                .value_symbol_links(property)
+                .and_then(|links| links.resolved_type)
+            else {
+                return Ok(None);
+            };
+            store
+                .type_payload(value)
+                .ok_or(InstantiationError::InvalidType(value))?;
+            if mapped_members.is_some() {
+                let (globals, source) = source.ok_or(InstantiationError::InvalidType(object))?;
+                let request = SourceMappedReadRequest::Value { receiver: object, member: property };
+                let proof = source.completed_source_mapped_read(request)
+                    .ok_or_else(|| InstantiationError::Declared(request.missing_proof()))?;
+                if proof.request() != request || proof.value() != Some(value) {
+                    return Err(InstantiationError::InvalidType(object));
+                }
+                source.validate_source_mapped_read_proof(store, &proof, globals,
+                    source.source_query_options().and_then(|options| options.strict_function_types))
+                    .map_err(InstantiationError::Declared)?;
+                source.observe_source_mapped_read(&proof);
+            }
+            match indexed_access_property_optional_sentinel(store, property, value)? {
+                Some(sentinel) => store
+                    .cached_literal_union_type_with_alias(
+                        &[value, sentinel],
+                        None,
+                        array_targets,
+                    )
+                    .map(|value| value.map(IndexedAccessOutcome::Property))
+                    .map_err(Into::into),
+                None => Ok(Some(IndexedAccessOutcome::Property(value))),
+            }
+        }
+    }
+}
+
+pub(super) fn cached_indexed_access_with_source(
+    store: &CanonicalTypeMapperStore,
+    lookup: TypeId,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<Option<IndexedAccessOutcome>, InstantiationError> {
+    let Some(TypeData::IndexedAccess(indexed)) = store.type_payload(lookup).map(TypeRecord::data)
+    else {
+        return Err(InstantiationError::InvalidType(lookup));
+    };
+    if cached_deferred_indexed_access_type(store, indexed.object_type, indexed.index_type, indexed.access_flags)
+        .map_err(InstantiationError::InvalidType)? != Some(lookup)
+    {
+        return Err(InstantiationError::InvalidType(lookup));
+    }
+    cached_instantiated_indexed_access(
+        store, indexed,
+        InstantiationMapping::Vector { sources: &[], targets: &[] },
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+        &mut HashSet::from([lookup]), Some((globals, source)),
+    )
+}
+
 pub(super) fn resolve_indexed_access_with_source(
     store: &mut CanonicalTypeMapperStore,
     lookup: TypeId,
@@ -6304,6 +6518,17 @@ pub(super) fn resolve_indexed_access_with_source(
     session: &mut InstantiationSession,
     source: &mut dyn ConditionalBranchSource,
 ) -> Result<TypeId, InstantiationError> {
+    resolve_indexed_access_outcome_with_source(store, lookup, globals, session, source)
+        .and_then(|outcome| outcome.type_id().ok_or(InstantiationError::UnsupportedType(lookup)))
+}
+
+pub(super) fn resolve_indexed_access_outcome_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    lookup: TypeId,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<IndexedAccessOutcome, InstantiationError> {
     let Some(TypeData::IndexedAccess(indexed)) = store.type_payload(lookup).map(TypeRecord::data)
     else {
         return Err(InstantiationError::InvalidType(lookup));
@@ -6343,10 +6568,40 @@ fn resolve_instantiated_indexed_access(
     flags: AccessFlags,
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut InstantiationSession,
-    source: Option<&mut InstantiationSource<'_>>,
-) -> Result<TypeId, InstantiationError> {
-    match indexed_access_resolution(store, object, index, flags, array_targets)? {
-        IndexedAccessResolution::Type(type_) => Ok(type_),
+    mut source: Option<&mut InstantiationSource<'_>>,
+) -> Result<IndexedAccessOutcome, InstantiationError> {
+    let mapped_members = if matches!(store.type_payload(object).map(TypeRecord::data), Some(TypeData::Mapped(_)))
+        && !store.type_payload(index).ok_or(InstantiationError::InvalidType(index))?.flags()
+            .intersects(TypeFlags::NEVER | TypeFlags::INSTANTIABLE)
+        && let Some(source) = source.as_deref_mut()
+    {
+        let request = SourceMappedReadRequest::Members { receiver: object };
+        let proof = match source.branches.resolve_source_mapped_read(store, request, session)
+            .map_err(|error| mapped_indexed_access_error(object, error))?
+        {
+            SourceMappedReadOutcome::Complete(proof) => proof,
+            SourceMappedReadOutcome::LimitRecovery(type_) => return Ok(IndexedAccessOutcome::Type(type_)),
+            SourceMappedReadOutcome::RecoveredValue(value) => return Ok(IndexedAccessOutcome::Type(value.recovery_type())),
+            SourceMappedReadOutcome::RecoveredMembers(_) => {
+                return Err(InstantiationError::Declared(
+                    super::TypeNodeUnavailable::InvalidPreparedTypeQuery.into(),
+                ));
+            }
+        };
+        if proof.request() != request {
+            return Err(InstantiationError::InvalidType(object));
+        }
+        let options = source.branches.source_query_options().ok_or(InstantiationError::UnsupportedType(object))?;
+        source.branches.validate_source_mapped_read_proof(store, &proof, source.globals, options.strict_function_types)
+            .map_err(InstantiationError::Declared)?;
+        Some(proof)
+    } else {
+        None
+    };
+    match indexed_access_resolution_with_mapped_members(store, object, index, flags, array_targets, mapped_members.as_ref())? {
+        IndexedAccessResolution::Type(type_) => Ok(IndexedAccessOutcome::Type(type_)),
+        IndexedAccessResolution::PropertyType(type_) => Ok(IndexedAccessOutcome::Property(type_)),
+        IndexedAccessResolution::MissingProperty => Ok(IndexedAccessOutcome::MissingProperty { object, index }),
         IndexedAccessResolution::TypeWithSentinel(type_, sentinel) => store
             .literal_union_type_with_alias_and_array_targets_and_session(
                 &[type_, sentinel],
@@ -6354,9 +6609,17 @@ fn resolve_instantiated_indexed_access(
                 array_targets,
                 session,
             )
+            .map(IndexedAccessOutcome::Type)
+            .map_err(Into::into),
+        IndexedAccessResolution::PropertyTypeWithSentinel(type_, sentinel) => store
+            .literal_union_type_with_alias_and_array_targets_and_session(
+                &[type_, sentinel], None, array_targets, session,
+            )
+            .map(IndexedAccessOutcome::Property)
             .map_err(Into::into),
         IndexedAccessResolution::Deferred => {
             get_instantiated_indexed_access_type(store, object, index, flags)
+                .map(IndexedAccessOutcome::Type)
                 .ok_or(InstantiationError::InvalidType(type_))
         }
         IndexedAccessResolution::Property(name) => {
@@ -6365,6 +6628,33 @@ fn resolve_instantiated_indexed_access(
                 Some(TypeData::Mapped(_))
             ) {
                 if let Some(source) = source {
+                    if let Some(members) = mapped_members {
+                        let symbol = store.symbol_table(members.members().members())
+                            .and_then(|table| table.get(name.as_ref()))
+                            .filter(|symbol| members.members().properties().contains(symbol))
+                            .ok_or(InstantiationError::UnsupportedType(type_))?;
+                        let request = SourceMappedReadRequest::Value { receiver: object, member: symbol };
+                        let proof = match source.branches.resolve_source_mapped_read(store, request, session)
+                            .map_err(|error| mapped_indexed_access_error(object, error))?
+                        {
+                            SourceMappedReadOutcome::Complete(proof) => proof,
+                            SourceMappedReadOutcome::LimitRecovery(type_) => return Ok(IndexedAccessOutcome::Type(type_)),
+                            SourceMappedReadOutcome::RecoveredValue(value) => return Ok(IndexedAccessOutcome::Type(value.recovery_type())),
+                            SourceMappedReadOutcome::RecoveredMembers(_) => {
+                                return Err(InstantiationError::Declared(
+                                    super::TypeNodeUnavailable::InvalidPreparedTypeQuery.into(),
+                                ));
+                            }
+                        };
+                        if proof.request() != request {
+                            return Err(InstantiationError::InvalidType(object));
+                        }
+                        let options = source.branches.source_query_options().ok_or(InstantiationError::UnsupportedType(object))?;
+                        source.branches.validate_source_mapped_read_proof(store, &proof, source.globals, options.strict_function_types)
+                            .map_err(InstantiationError::Declared)?;
+                        return proof.value().map(IndexedAccessOutcome::Property)
+                            .ok_or(InstantiationError::InvalidType(object));
+                    }
                     return store
                         .resolve_mapped_type_property_with_source(
                             object,
@@ -6376,6 +6666,7 @@ fn resolve_instantiated_indexed_access(
                         )
                         .map_err(|error| mapped_indexed_access_error(object, error))?
                         .map(super::mapped_types::ResolvedMappedProperty::type_id)
+                        .map(IndexedAccessOutcome::Property)
                         .ok_or(InstantiationError::UnsupportedType(type_));
                 }
                 store
@@ -6397,6 +6688,7 @@ fn resolve_instantiated_indexed_access(
                 }
                 return store
                     .resolve_mapped_symbol_type_with_session(symbol, session)
+                    .map(IndexedAccessOutcome::Property)
                     .map_err(|error| mapped_indexed_access_error(object, error));
             }
             let property = super::object_members::resolve_object_property_by_key(
@@ -6417,8 +6709,9 @@ fn resolve_instantiated_indexed_access(
                         array_targets,
                         session,
                     )
+                    .map(IndexedAccessOutcome::Property)
                     .map_err(Into::into),
-                None => Ok(property.type_),
+                None => Ok(IndexedAccessOutcome::Property(property.type_)),
             }
         }
     }
@@ -6650,9 +6943,6 @@ fn instantiate_supported_mapped_alias(
 ) -> Result<TypeId, InstantiationError> {
     if let Some((symbol, arguments)) = alias_override {
         validate_borrowed_alias_input(store, projection.type_, symbol, arguments)?;
-        if symbol != projection.identity_symbol {
-            return Err(InstantiationError::UnsupportedType(projection.type_));
-        }
     }
     let mut arguments = Vec::with_capacity(projection.arguments.len());
     for argument in &projection.arguments {
@@ -6718,8 +7008,11 @@ fn instantiate_supported_mapped_alias(
 }
 
 enum IndexedAccessResolution {
+    MissingProperty,
     Type(TypeId),
     TypeWithSentinel(TypeId, TypeId),
+    PropertyType(TypeId),
+    PropertyTypeWithSentinel(TypeId, TypeId),
     Deferred,
     Property(EscapedName),
 }
@@ -6730,6 +7023,17 @@ fn indexed_access_resolution(
     index: TypeId,
     access_flags: AccessFlags,
     array_targets: Option<CanonicalArrayTargets>,
+) -> Result<IndexedAccessResolution, InstantiationError> {
+    indexed_access_resolution_with_mapped_members(store, object, index, access_flags, array_targets, None)
+}
+
+fn indexed_access_resolution_with_mapped_members(
+    store: &CanonicalTypeMapperStore,
+    object: TypeId,
+    index: TypeId,
+    access_flags: AccessFlags,
+    array_targets: Option<CanonicalArrayTargets>,
+    mapped_members: Option<&SourceMappedReadProof>,
 ) -> Result<IndexedAccessResolution, InstantiationError> {
     let object_record = store
         .type_payload(object)
@@ -6779,11 +7083,31 @@ fn indexed_access_resolution(
             .and_then(|structured| structured.index_infos.as_ref())
             .is_some_and(|indexes| !indexes.is_empty());
     if !has_resolved_indexes {
+        if let Some(name) = name.as_ref()
+            && object_record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
+            && object_record.data().structured()
+                .and_then(|structured| structured.members)
+                .and_then(|table| store.symbol_table(table))
+                .and_then(|table| table.get(name.as_ref())).is_none()
+        {
+            if let Some(structured) = resolved_indexed_access_members_with_mapped_members(
+                store, object, array_targets, mapped_members,
+            )? {
+                let property = match structured.members {
+                    Some(table) => store.symbol_table(table)
+                        .ok_or(InstantiationError::InvalidType(object))?.get(name.as_ref()),
+                    None => None,
+                };
+                if property.is_none() {
+                    return Ok(IndexedAccessResolution::MissingProperty);
+                }
+            }
+        }
         return name
             .map(IndexedAccessResolution::Property)
             .ok_or(InstantiationError::UnsupportedType(index));
     }
-    let structured = resolved_indexed_access_members(store, object, array_targets)?
+    let structured = resolved_indexed_access_members_with_mapped_members(store, object, array_targets, mapped_members)?
         .ok_or(InstantiationError::UnsupportedType(object))?;
     if let Some(name) = name.as_ref()
         && let Some(property) = structured
@@ -6799,6 +7123,9 @@ fn indexed_access_resolution(
         {
             return Err(InstantiationError::InvalidType(object));
         }
+        if mapped_members.is_some() {
+            return Ok(IndexedAccessResolution::Property(name.clone()));
+        }
         return match store
             .value_symbol_links(property)
             .and_then(|links| links.resolved_type)
@@ -6810,9 +7137,9 @@ fn indexed_access_resolution(
                 Ok(
                     match indexed_access_property_optional_sentinel(store, property, value)? {
                         Some(sentinel) => {
-                            IndexedAccessResolution::TypeWithSentinel(value, sentinel)
+                            IndexedAccessResolution::PropertyTypeWithSentinel(value, sentinel)
                         }
-                        None => IndexedAccessResolution::Type(value),
+                        None => IndexedAccessResolution::PropertyType(value),
                     },
                 )
             }
@@ -6861,8 +7188,14 @@ fn indexed_access_resolution(
     let value = numeric
         .then_some(number_value)
         .flatten()
-        .or(string_value)
-        .ok_or(InstantiationError::UnsupportedType(index))?;
+        .or(string_value);
+    let Some(value) = value else {
+        return if name.is_some() {
+            Ok(IndexedAccessResolution::MissingProperty)
+        } else {
+            Err(InstantiationError::UnsupportedType(index))
+        };
+    };
     Ok(if access_flags.contains(AccessFlags::INCLUDE_UNDEFINED) {
         IndexedAccessResolution::TypeWithSentinel(value, bootstrap.missing_type)
     } else {
@@ -6875,10 +7208,31 @@ fn resolved_indexed_access_members(
     object: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<&StructuredTypeData>, InstantiationError> {
+    resolved_indexed_access_members_with_mapped_members(store, object, array_targets, None)
+}
+
+fn resolved_indexed_access_members_with_mapped_members<'store>(
+    store: &'store CanonicalTypeMapperStore,
+    object: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    mapped_members: Option<&SourceMappedReadProof>,
+) -> Result<Option<&'store StructuredTypeData>, InstantiationError> {
     let record = store
         .type_payload(object)
         .ok_or(InstantiationError::InvalidType(object))?;
     if matches!(record.data(), TypeData::Mapped(_)) {
+        if let Some(proof) = mapped_members {
+            let structure = record.data().structured().ok_or(InstantiationError::InvalidType(object))?;
+            let properties = (!proof.members().properties().is_empty()).then_some(proof.members().properties());
+            if proof.request() != (SourceMappedReadRequest::Members { receiver: object })
+                || !record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
+                || structure.members != Some(proof.members().members())
+                || structure.properties.as_deref() != properties
+            {
+                return Err(InstantiationError::InvalidType(object));
+            }
+            return Ok(Some(structure));
+        }
         return match store
             .validate_mapped_type_relation_endpoint(object)
             .map_err(|error| mapped_indexed_access_error(object, error))?
@@ -6994,6 +7348,7 @@ fn instantiated_keyof_error(source: TypeId, error: NongenericKeyofError) -> Inst
     }
 }
 
+#[track_caller]
 fn mapped_indexed_access_error(object: TypeId, error: MappedTypeError) -> InstantiationError {
     match error {
         MappedTypeError::Declared(error) => InstantiationError::Declared(error),
@@ -7013,7 +7368,65 @@ fn mapped_indexed_access_error(object: TypeId, error: MappedTypeError) -> Instan
         | MappedTypeError::CrossProductTooLarge { .. } => {
             InstantiationError::UnsupportedType(object)
         }
-        _ => InstantiationError::InvalidType(object),
+        error => {
+            if std::env::var_os("TS_R37_HOMOMORPHIC_ANY_OBSERVE").is_some() {
+                use std::io::Write as _;
+
+                static OBSERVATION_TAGS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if OBSERVATION_TAGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+                    let (family, error_type) = match &error {
+                        MappedTypeError::Declared(_) => ("Declared", None),
+                        MappedTypeError::BootstrapUninitialized => {
+                            ("BootstrapUninitialized", None)
+                        }
+                        MappedTypeError::InvalidDeclaration(_) => ("InvalidDeclaration", None),
+                        MappedTypeError::InvalidSymbol(_) => ("InvalidSymbol", None),
+                        MappedTypeError::InvalidTypeParameter(type_) => {
+                            ("InvalidTypeParameter", Some(*type_))
+                        }
+                        MappedTypeError::InvalidMappedType(type_) => {
+                            ("InvalidMappedType", Some(*type_))
+                        }
+                        MappedTypeError::InvalidModifiers => ("InvalidModifiers", None),
+                        MappedTypeError::InvalidSource(type_) => ("InvalidSource", Some(*type_)),
+                        MappedTypeError::UnsupportedSource(_) => ("UnsupportedSource", None),
+                        MappedTypeError::UnsupportedConstraint(_) => {
+                            ("UnsupportedConstraint", None)
+                        }
+                        MappedTypeError::UnsupportedNameType(_) => ("UnsupportedNameType", None),
+                        MappedTypeError::UnsupportedTemplate(_) => ("UnsupportedTemplate", None),
+                        MappedTypeError::InvalidCachedMembers(type_) => {
+                            ("InvalidCachedMembers", Some(*type_))
+                        }
+                        MappedTypeError::InvalidCachedProperty(_) => {
+                            ("InvalidCachedProperty", None)
+                        }
+                        MappedTypeError::RecursiveMembers(_) => ("RecursiveMembers", None),
+                        MappedTypeError::CircularProperty(_) => ("CircularProperty", None),
+                        MappedTypeError::CrossProductTooLarge { .. } => {
+                            ("CrossProductTooLarge", None)
+                        }
+                        MappedTypeError::InstantiationDepthLimit { .. } => {
+                            ("InstantiationDepthLimit", None)
+                        }
+                        MappedTypeError::InstantiationCountLimit { .. } => {
+                            ("InstantiationCountLimit", None)
+                        }
+                        MappedTypeError::Capacity => ("Capacity", None),
+                    };
+                    let caller = std::panic::Location::caller();
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "R40_HOMOMORPHIC_ANY_MAPPED_INVALID_TYPE file={} line={} column={} object={object:?} family={family} error_type={error_type:?}",
+                        caller.file(),
+                        caller.line(),
+                        caller.column(),
+                    );
+                }
+            }
+            InstantiationError::InvalidType(object)
+        }
     }
 }
 

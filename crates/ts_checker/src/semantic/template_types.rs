@@ -1319,7 +1319,7 @@ impl CanonicalTypeMapperStore {
         self.is_template_pattern_literal_type(type_, visiting)
     }
 
-    fn is_template_pattern_literal_type(
+    pub(super) fn is_template_pattern_literal_type(
         &self,
         type_: TypeId,
         visiting: &mut HashSet<TypeId>,

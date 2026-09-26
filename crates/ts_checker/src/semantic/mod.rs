@@ -32,6 +32,7 @@ pub mod formatter;
 mod functions;
 mod generic_calls;
 mod generic_method_calls;
+mod generic_types;
 mod global_types;
 mod helper_signatures;
 pub mod ids;
@@ -178,7 +179,7 @@ pub use production::{
     CanonicalCheckerOptions, CanonicalGlobalInitializationError, CanonicalImportCallMode,
 };
 pub use reference_types::DirectGenericReferenceError;
-pub use relater::RelationUnavailable;
+pub use relater::{RelationSignatureEdge, RelationUnavailable, SourceSignatureInstantiationRequest};
 pub use relation::{
     ExpandingFlags, IntersectionState, MinArgumentCountFlags, RecursionFlags,
     RelationCacheSnapshot, RelationComparisonResult, RelationKind, RelationStateSnapshot,

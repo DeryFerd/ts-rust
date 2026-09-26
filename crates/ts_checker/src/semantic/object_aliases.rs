@@ -251,6 +251,18 @@ impl SourceAliasOperandGraph {
         &self.source
     }
 
+    pub(super) fn matches_operand(
+        &self,
+        source: &SourceAliasOperandSource,
+        node: NodeRef,
+        type_: TypeId,
+    ) -> bool {
+        self.source == *source
+            && source.root() == node
+            && self.node == node
+            && self.type_ == type_
+    }
+
     pub(super) fn validate_retained(
         &self,
         store: &CanonicalTypeMapperStore,
@@ -3009,6 +3021,16 @@ fn source_symbols<M>(
     }
     validate_alias_binding(store, syntax.alias_declaration, alias_symbol)?;
     Ok(Some((source_symbol, alias_symbol)))
+}
+
+/// Selects the declaration's primary symbol and checks its local/export binding.
+pub(super) fn source_alias_declaration_symbol<M>(
+    store: &SemanticStore<TypeRecord, M>,
+    declaration: NodeRef,
+) -> Option<SemanticSymbolId> {
+    let alias = bound_declaration_symbol(store, declaration)?;
+    validate_source_alias_binding(store, declaration, alias).ok()?;
+    Some(alias)
 }
 
 /// Checks the primary source binding and its complete local/export relation.

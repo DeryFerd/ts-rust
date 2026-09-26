@@ -23,6 +23,10 @@ use super::{
     alias_provider::{ProductionAliasSourceRegistry, SourceFileNamespaceWrapper},
     array_types::CanonicalArrayTargets,
     bootstrap::{CanonicalUnionCreationProof, IntrinsicBootstrap},
+    callable_sets::{
+        StoredCallableSetValidation, validate_stored_callable_set_with_array_targets,
+    },
+    callables::ValidatedSingleCallable,
     classes::{
         ClassInstanceSuperMember, ClassInstanceSuperView, SourceClassAnnotationScope,
         SourceClassProvenance,
@@ -62,13 +66,16 @@ use super::{
         TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
     },
     mapped_types::{
-        MappedIndexRecovery, MappedPropertyRecovery, MappedTypeModifiers, SourceMappedLookupRequest,
+        MappedIndexRecovery, MappedPropertyRecovery, MappedTypeModifiers, SourceMappedInstance,
+        SourceMappedLookupRequest,
     },
+    object_aliases::SourceAliasOperandGraph,
     object_members::{
         ObjectLiteralGetterOrigin, ObjectLiteralGetterReturnProof,
         ObjectLiteralPropertyCloneOrigin, SourceDeclaredMemberNames,
     },
     relation::{RelationCaches, RelationComparisonResult, RelationKind, RelationStateSnapshot},
+    relater::RelationUnavailable,
     signatures::{
         CompositeSignature, ElementFlags, IndexFlags, IndexInfo, IndexInfoArena, Signature,
         SignatureArena, SignatureFlags, TupleElementInfo, TupleMetadata, TypePredicate,
@@ -99,6 +106,540 @@ use super::{
     },
     types::{ObjectFlags, TypeFlags},
 };
+
+// Reuses the R54 bounded collector for stored rejection facts only.
+#[derive(Clone, Copy, Default)]
+pub(in crate::semantic) struct CurrentQueryContext {
+    pub host: Option<bool>,
+    pub globals: Option<bool>,
+    pub options: Option<bool>,
+    pub diagnostics: Option<bool>,
+    pub session: Option<bool>,
+    pub source: Option<bool>,
+    pub query_depth: Option<usize>,
+    pub array_targets: Option<bool>,
+    pub source_pending_allowed: Option<bool>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(in crate::semantic) struct CurrentQueryFrame {
+    pub request: Option<NodeRef>,
+    pub owner: Option<NodeRef>,
+    pub expression: Option<NodeRef>,
+    pub receiver: Option<TypeId>,
+    pub context: CurrentQueryContext,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::semantic) struct CurrentQueryTypeSnapshot {
+    kind: Option<super::type_records::TypeDataKind>,
+    record_present: Option<bool>,
+    type_flags_bits: Option<u64>,
+    object_flags_bits: Option<u64>,
+    symbol: Option<SemanticSymbolId>,
+    alias: Option<TypeAliasId>,
+    declaration: Option<NodeRef>,
+    mapped_declaration: Option<NodeRef>,
+    source_origin_kind: Option<&'static str>,
+    declaration_count: Option<usize>,
+    structured_present: Option<bool>,
+    members_resolved: Option<bool>,
+    members_slot_present: Option<bool>,
+    properties_slot_present: Option<bool>,
+    properties_count: Option<usize>,
+    signatures_slot_present: Option<bool>,
+    signature_count: Option<usize>,
+    call_signature_count: Option<usize>,
+    indexes_slot_present: Option<bool>,
+    index_count: Option<usize>,
+    constraint: Option<bool>,
+    mapped_template_present: Option<bool>,
+    mapped_modifiers_present: Option<bool>,
+    mapped_name_present: Option<bool>,
+    mapped_target_present: Option<bool>,
+    mapped_mapper_present: Option<bool>,
+    receipt_present: Option<bool>,
+    operands_ready: Option<bool>,
+    stored_selection: Option<bool>,
+    stored_argument_count: Option<usize>,
+    stored_selection_key: Option<TypeId>,
+    stored_key_record_present: Option<bool>,
+    stored_key_kind: Option<super::type_records::TypeDataKind>,
+    stored_key_type_flags_bits: Option<u64>,
+    stored_key_object_flags_bits: Option<u64>,
+    node_cache_node: Option<NodeRef>,
+    node_cache_present: Option<bool>,
+    node_resolved_slot_present: Option<bool>,
+    node_resolved_matches_type: Option<bool>,
+    declared_cache_symbol: Option<SemanticSymbolId>,
+    declared_cache_present: Option<bool>,
+    declared_resolved_slot_present: Option<bool>,
+    declared_resolved_matches_type: Option<bool>,
+    declared_in_progress: Option<bool>,
+    single_signature_present: Option<bool>,
+    generic_count: Option<usize>,
+    this_present: Option<bool>,
+    return_slot_present: Option<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct CurrentQueryFrameRecord {
+    id: usize,
+    site: &'static str,
+    frame: CurrentQueryFrame,
+    request_inherited: bool,
+    owner_inherited: bool,
+    expression_inherited: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CurrentQueryEvent {
+    sequence: usize,
+    kind: &'static str,
+    reason: &'static str,
+    producer: &'static str,
+    location: &'static std::panic::Location<'static>,
+    receiver: Option<TypeId>,
+    node: Option<NodeRef>,
+    frame: Option<CurrentQueryFrameRecord>,
+    snapshot: CurrentQueryTypeSnapshot,
+    resolution_call: Option<bool>,
+}
+
+struct CurrentQueryObservation {
+    active: bool,
+    frames: [Option<CurrentQueryFrameRecord>; 16],
+    frame_len: usize,
+    next_frame: usize,
+    frames_truncated: bool,
+    events: [Option<CurrentQueryEvent>; 32],
+    event_len: usize,
+    events_truncated: bool,
+}
+
+std::thread_local! {
+    static CURRENT_QUERY_OBSERVATION: std::cell::RefCell<CurrentQueryObservation> = const {
+        std::cell::RefCell::new(CurrentQueryObservation {
+            active: false,
+            frames: [None; 16],
+            frame_len: 0,
+            next_frame: 0,
+            frames_truncated: false,
+            events: [None; 32],
+            event_len: 0,
+            events_truncated: false,
+        })
+    };
+}
+
+static CURRENT_QUERY_PRODUCER_SEEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Only direct storage reads are allowed here. Public getters can record dependencies.
+pub(in crate::semantic) fn current_query_type_snapshot(
+    store: &super::CanonicalTypeMapperStore,
+    receiver: TypeId,
+) -> CurrentQueryTypeSnapshot {
+    let can_sample = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+        state.try_borrow().is_ok_and(|state| state.active && state.event_len < state.events.len())
+    }).unwrap_or(false);
+    if !can_sample {
+        return CurrentQueryTypeSnapshot::default();
+    }
+    let mut snapshot = CurrentQueryTypeSnapshot {
+        record_present: Some(false),
+        ..CurrentQueryTypeSnapshot::default()
+    };
+    let Some(record) = store.types.get(receiver) else { return snapshot; };
+    snapshot.record_present = Some(true);
+    snapshot.kind = Some(record.data().kind());
+    snapshot.type_flags_bits = Some(u64::from(record.flags().bits()));
+    snapshot.object_flags_bits = Some(u64::from(record.object_flags().bits()));
+    snapshot.symbol = record.symbol();
+    snapshot.alias = record.alias();
+    snapshot.members_resolved = Some(record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED));
+    let structured = record.data().structured();
+    snapshot.structured_present = Some(structured.is_some());
+    if let Some(structured) = structured {
+        snapshot.members_slot_present = Some(structured.members.is_some());
+        snapshot.properties_slot_present = Some(structured.properties.is_some());
+        snapshot.properties_count = structured.properties.as_ref().map(Vec::len);
+        snapshot.signatures_slot_present = Some(structured.signatures.is_some());
+        snapshot.signature_count = structured.signatures.as_ref().map(Vec::len);
+        snapshot.call_signature_count = Some(structured.call_signature_count);
+        snapshot.indexes_slot_present = Some(structured.index_infos.is_some());
+        snapshot.index_count = structured.index_infos.as_ref().map(Vec::len);
+        if let Some([signature]) = structured.signatures.as_deref() {
+            let signature = store.signatures.get(*signature);
+            snapshot.single_signature_present = Some(signature.is_some());
+            if let Some(signature) = signature {
+                snapshot.generic_count = Some(signature.type_parameters().len());
+                snapshot.this_present = Some(signature.this_parameter().is_some());
+                snapshot.return_slot_present = Some(signature.resolved_return_type().is_some());
+            }
+        }
+    }
+    if let TypeData::Mapped(mapped) = record.data() {
+        snapshot.constraint = Some(mapped.constraint_type.is_some());
+        snapshot.mapped_template_present = Some(mapped.template_type.is_some());
+        snapshot.mapped_modifiers_present = Some(mapped.modifiers_type.is_some());
+        snapshot.mapped_name_present = Some(mapped.name_type.is_some());
+        snapshot.mapped_target_present = Some(mapped.object.target.is_some());
+        snapshot.mapped_mapper_present = Some(mapped.object.mapper.is_some());
+        snapshot.mapped_declaration = mapped.declaration;
+        snapshot.declaration = mapped.declaration;
+        snapshot.source_origin_kind = mapped.declaration.map(|_| "mapped.declaration");
+        let receipt = store.source_mapped_instances.get(&receiver);
+        snapshot.receipt_present = Some(receipt.is_some());
+        snapshot.operands_ready = receipt.map(SourceMappedInstance::current_query_operands_ready);
+        // Stored slot metadata only. No projection proof or generic status is computed.
+        if let Some(receipt) = receipt {
+            let (selection, count, key) = receipt.current_query_stored_selection_key();
+            snapshot.stored_selection = Some(selection);
+            snapshot.stored_argument_count = Some(count);
+            snapshot.stored_selection_key = key;
+            if let Some(key) = key {
+                let record = store.types.get(key);
+                snapshot.stored_key_record_present = Some(record.is_some());
+                if let Some(record) = record {
+                    snapshot.stored_key_kind = Some(record.data().kind());
+                    snapshot.stored_key_type_flags_bits = Some(u64::from(record.flags().bits()));
+                    snapshot.stored_key_object_flags_bits = Some(u64::from(record.object_flags().bits()));
+                }
+            }
+        }
+    }
+    let mut native_symbol = record.symbol();
+    if snapshot.declaration.is_none() {
+        let origin = if let Some(symbol) = native_symbol {
+            Some((symbol, "record.symbol"))
+        } else {
+            record.alias().and_then(|alias| store.type_aliases.get(alias))
+                .and_then(TypeAlias::symbol).map(|symbol| {
+                    native_symbol = Some(symbol);
+                    (symbol, "record.alias.symbol")
+                })
+        };
+        if let Some((symbol, origin)) = origin {
+            if let Some(declarations) = store.symbols.symbol(symbol).and_then(Symbol::declarations) {
+                snapshot.declaration_count = Some(declarations.len());
+                snapshot.declaration = declarations.first().copied();
+                snapshot.source_origin_kind = Some(origin);
+            }
+        }
+    }
+    if let Some(node) = snapshot.declaration {
+        let links = store.links.type_node.try_get(&node);
+        snapshot.node_cache_node = Some(node);
+        snapshot.node_cache_present = Some(links.is_some());
+        snapshot.node_resolved_slot_present = links.map(|links| links.resolved_type.is_some());
+        snapshot.node_resolved_matches_type = links.and_then(|links| links.resolved_type)
+            .map(|resolved| resolved == receiver);
+    }
+    if let Some(symbol) = native_symbol {
+        let links = store.links.declared_type.try_get(&symbol);
+        snapshot.declared_cache_symbol = Some(symbol);
+        snapshot.declared_cache_present = Some(links.is_some());
+        snapshot.declared_resolved_slot_present = links.map(|links| links.declared_type.is_some());
+        snapshot.declared_resolved_matches_type = links.and_then(|links| links.declared_type)
+            .map(|resolved| resolved == receiver);
+        snapshot.declared_in_progress = Some(store.declared_types_in_progress.contains(&symbol));
+    }
+    snapshot
+}
+
+pub(in crate::semantic) struct CurrentQueryRequestScope {
+    index: usize,
+    id: usize,
+}
+
+impl CurrentQueryRequestScope {
+    pub fn enter(site: &'static str, capture: impl FnOnce() -> CurrentQueryFrame) -> Option<Self> {
+        let can_capture = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+            let Ok(mut state) = state.try_borrow_mut() else { return false; };
+            if !state.active || state.event_len == state.events.len() { return false; }
+            if state.frame_len == state.frames.len() {
+                state.frames_truncated = true;
+                return false;
+            }
+            true
+        }).unwrap_or(false);
+        if !can_capture {
+            return None;
+        }
+        let mut frame = capture();
+        CURRENT_QUERY_OBSERVATION.try_with(|state| {
+            let mut state = state.try_borrow_mut().ok()?;
+            if !state.active {
+                return None;
+            }
+            if state.frame_len == state.frames.len() {
+                state.frames_truncated = true;
+                return None;
+            }
+            let mut request_inherited = false;
+            let mut owner_inherited = false;
+            let mut expression_inherited = false;
+            if let Some(previous) = state.frames[..state.frame_len].last().copied().flatten() {
+                request_inherited = frame.request.is_none() && previous.frame.request.is_some();
+                owner_inherited = frame.owner.is_none() && previous.frame.owner.is_some();
+                expression_inherited = frame.expression.is_none() && previous.frame.expression.is_some();
+                frame.request = frame.request.or(previous.frame.request);
+                frame.owner = frame.owner.or(previous.frame.owner);
+                frame.expression = frame.expression.or(previous.frame.expression);
+            }
+            let index = state.frame_len;
+            let id = state.next_frame;
+            state.next_frame += 1;
+            state.frames[index] = Some(CurrentQueryFrameRecord {
+                id, site, frame, request_inherited, owner_inherited, expression_inherited,
+            });
+            state.frame_len += 1;
+            Some(Self { index, id })
+        }).ok().flatten()
+    }
+
+    pub fn receiver(&self, receiver: TypeId) {
+        let _ = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+            let Ok(mut state) = state.try_borrow_mut() else { return; };
+            if let Some(frame) = state.frames[self.index].as_mut().filter(|frame| frame.id == self.id) {
+                frame.frame.receiver = Some(receiver);
+            }
+        });
+    }
+}
+
+impl Drop for CurrentQueryRequestScope {
+    fn drop(&mut self) {
+        let _ = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+            let Ok(mut state) = state.try_borrow_mut() else { return; };
+            if state.frames[self.index].is_some_and(|frame| frame.id == self.id) {
+                state.frames[self.index] = None;
+                state.frame_len = self.index;
+            }
+        });
+    }
+}
+
+#[track_caller]
+pub(in crate::semantic) fn observe_current_query_event(
+    kind: &'static str,
+    reason: &'static str,
+    producer: &'static str,
+    receiver: Option<TypeId>,
+    node: Option<NodeRef>,
+    capture: impl FnOnce() -> CurrentQueryTypeSnapshot,
+) {
+    let can_capture = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+        let Ok(mut state) = state.try_borrow_mut() else { return false; };
+        if !state.active { return false; }
+        if state.event_len == state.events.len() {
+            state.events_truncated = true;
+            return false;
+        }
+        true
+    }).unwrap_or(false);
+    if !can_capture {
+        return;
+    }
+    let snapshot = capture();
+    let location = std::panic::Location::caller();
+    let _ = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+        let Ok(mut state) = state.try_borrow_mut() else { return; };
+        if !state.active { return; }
+        if state.event_len == state.events.len() {
+            state.events_truncated = true;
+            return;
+        }
+        let frame = if state.frames_truncated {
+            None
+        } else {
+            state.frames[..state.frame_len].last().copied().flatten()
+        };
+        let resolution_call = None; // Resolver activity is not observed by this trial.
+        let index = state.event_len;
+        state.events[index] = Some(CurrentQueryEvent {
+            sequence: index,
+            kind,
+            reason,
+            producer,
+            location,
+            receiver,
+            node,
+            frame,
+            snapshot,
+            resolution_call,
+        });
+        state.event_len += 1;
+    });
+}
+
+/// Observes only the first cold check of the saved ordinary Query failure file.
+pub struct CurrentQueryProducerScope<'a, F>
+where
+    F: Fn(NodeRef) -> Option<(&'a str, SyntaxKind, TextRange)>,
+{
+    file_name: CurrentQueryFilename,
+    source: NodeRef,
+    _source_lifetime: std::marker::PhantomData<&'a str>,
+    metadata: F,
+}
+
+impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    /// Returns a scope only when ordinary Query observation is enabled.
+    pub fn current_query_producer_scope<'a, F>(file_name: &'a str, source: impl FnOnce() -> NodeRef, metadata: F) -> Option<CurrentQueryProducerScope<'a, F>>
+    where
+        F: Fn(NodeRef) -> Option<(&'a str, SyntaxKind, TextRange)>,
+    {
+        if std::env::var_os("TS_RUST_OBSERVE_QUERY_CURRENT_PRODUCER")
+            .as_deref() != Some(std::ffi::OsStr::new("1"))
+            || file_name != "/home/theo/Code/sandbox/ts-rust/target/project-inputs/query/source/packages/query-core/src/timeoutManager.ts"
+        {
+            return None;
+        }
+        if CURRENT_QUERY_PRODUCER_SEEN.compare_exchange(
+            false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed,
+        ).is_err() {
+            return None;
+        }
+        let entered = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+            let Ok(mut state) = state.try_borrow_mut() else { return false; };
+            if state.active { return false; }
+            state.active = true;
+            true
+        }).unwrap_or(false);
+        if !entered { return None; }
+        let source = source();
+        observe_current_query_event(
+            "scope_begin", "cold_source", "compiler", None, Some(source),
+            CurrentQueryTypeSnapshot::default,
+        );
+        Some(CurrentQueryProducerScope { file_name: CurrentQueryFilename::new(file_name), source, metadata, _source_lifetime: std::marker::PhantomData })
+    }
+
+}
+
+impl<'a, F> CurrentQueryProducerScope<'a, F>
+where
+    F: Fn(NodeRef) -> Option<(&'a str, SyntaxKind, TextRange)>,
+{
+    /// Records the original escaping intersection error without changing it.
+    pub fn escaping(&self, error: &super::SourceCheckError, store: &super::CanonicalTypeMapperStore) {
+        if let super::SourceCheckError::DeclaredType(super::DeclaredTypeError::TypeNodeUnavailable(
+            super::type_nodes::TypeNodeUnavailable::UnsupportedIntersectionConstituentType(receiver),
+        )) = error {
+            observe_current_query_event(
+                "escaping", "T06.TYPE_NODE", "compiler", Some(*receiver), None,
+                || current_query_type_snapshot(store, *receiver),
+            );
+        }
+    }
+}
+
+struct CurrentQueryFilename {
+    text: String,
+    truncated: bool,
+}
+
+impl CurrentQueryFilename {
+    fn new(text: &str) -> Self {
+        let mut end = text.len().min(256);
+        while !text.is_char_boundary(end) { end -= 1; }
+        Self { text: text[..end].to_owned(), truncated: end < text.len() }
+    }
+}
+
+impl std::fmt::Display for CurrentQueryFilename {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(output, "{:?} filename_truncated={}", self.text, self.truncated)
+    }
+}
+
+struct CurrentQueryNodeDisplay {
+    node: Option<NodeRef>,
+    metadata: Option<(CurrentQueryFilename, SyntaxKind, TextRange)>,
+}
+
+impl std::fmt::Display for CurrentQueryNodeDisplay {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some(node) = self.node else { return output.write_str("unavailable"); };
+        write!(output, "{node:?} ")?;
+        if let Some((file_name, kind, range)) = &self.metadata {
+            write!(output, "filename={} kind={:?} start={} end={} units=utf8_bytes",
+                file_name, kind, range.start.get(), range.end.get())
+        } else {
+            output.write_str("filename=unavailable start=unavailable end=unavailable")
+        }
+    }
+}
+
+impl<'a, F> Drop for CurrentQueryProducerScope<'a, F>
+where
+    F: Fn(NodeRef) -> Option<(&'a str, SyntaxKind, TextRange)>,
+{
+    fn drop(&mut self) {
+        use std::io::Write as _;
+        use std::fmt::Write as _;
+        observe_current_query_event(
+            "scope_end", "cold_source", "compiler", None, Some(self.source),
+            CurrentQueryTypeSnapshot::default,
+        );
+        let records = CURRENT_QUERY_OBSERVATION.try_with(|state| {
+            let mut state = state.try_borrow_mut().ok()?;
+            state.active = false;
+            state.frames = [None; 16];
+            state.frame_len = 0;
+            Some((state.events, state.event_len, state.events_truncated, state.frames_truncated))
+        }).ok().flatten();
+        let Some((records, len, truncated, frames_truncated)) = records else { return; };
+        let mut output = std::io::stderr().lock();
+        for (index, record) in records[..len].iter().enumerate() {
+            let Some(event) = record else { continue; };
+            if truncated && index + 1 == len {
+                let _ = writeln!(output,
+                    "R54_QUERY_CURRENT_PRODUCER_TRUNCATED events_limit=32 frames_truncated={frames_truncated}");
+                continue;
+            }
+            let frame = event.frame.map(|record| record.frame).unwrap_or_default();
+            let node = |node: Option<NodeRef>| CurrentQueryNodeDisplay {
+                node,
+                metadata: node.and_then(|node| (self.metadata)(node))
+                    .map(|(file, kind, range)| (CurrentQueryFilename::new(file), kind, range)),
+            };
+            let constraint = match event.snapshot.constraint {
+                Some(true) => "present", Some(false) => "absent", None => "unavailable",
+            };
+            let operands = match event.snapshot.operands_ready {
+                Some(true) => "ready", Some(false) => "deferred", None => "unavailable",
+            };
+            let resolution = match event.resolution_call {
+                Some(true) => "active", Some(false) => "inactive", None => "unavailable",
+            };
+            let mut record = String::new();
+            let _ = writeln!(record,
+                "R54_QUERY_CURRENT_PRODUCER kind={} sequence={} reason={} producer={} site_file={} site_line={} site_column={} type={:?} frame_id={:?} frame_site={:?} frames_truncated={} scope_filename={} node=[{}] request=[{}] owner=[{}] expression=[{}] mapped_declaration=[{}] caller_receiver={:?} caller_host={:?} caller_globals={:?} caller_options={:?} caller_diagnostics={:?} caller_session={:?} caller_source_context={:?} caller_query_depth={:?} payload_kind={:?} constraint={} operands={} receipt_state_only=1 resolution_call={} resolution_coverage=unavailable type_source=[{}] request_inherited={:?} owner_inherited={:?} expression_inherited={:?} caller_array_targets={:?} caller_allow_source_pending={:?} stored_key_authenticated=0 stored_key_generic_status=unavailable shallow={:?}",
+                event.kind, event.sequence, event.reason, event.producer,
+                CurrentQueryFilename::new(event.location.file()), event.location.line(), event.location.column(),
+                event.receiver, event.frame.map(|frame| frame.id), event.frame.map(|frame| frame.site),
+                frames_truncated, &self.file_name, node(event.node),
+                node(frame.request), node(frame.owner), node(frame.expression), node(event.snapshot.mapped_declaration),
+                frame.receiver, frame.context.host, frame.context.globals, frame.context.options,
+                frame.context.diagnostics, frame.context.session, frame.context.source, frame.context.query_depth,
+                event.snapshot.kind, constraint, operands, resolution, node(event.snapshot.declaration),
+                event.frame.map(|frame| frame.request_inherited),
+                event.frame.map(|frame| frame.owner_inherited),
+                event.frame.map(|frame| frame.expression_inherited),
+                frame.context.array_targets, frame.context.source_pending_allowed, event.snapshot,
+            );
+            if record.len() > 65_536 {
+                let _ = writeln!(output,
+                    "R54_QUERY_CURRENT_PRODUCER_TRUNCATED record_byte_limit=65536 sequence={}", event.sequence);
+                continue;
+            }
+            let _ = output.write_all(record.as_bytes());
+        }
+    }
+}
 
 #[derive(Debug)]
 enum PreparedEntityName {
@@ -134,8 +675,28 @@ struct SourceNodeFacts {
     alias_type_parameter: Option<Box<AliasTypeParameterSyntaxFacts>>,
     mapped_type: Option<Box<MappedTypeSyntaxFacts>>,
     plain_interface_heritage: Option<Box<PlainInterfaceHeritageFacts>>,
+    primitive_interface_member: Option<Box<SourcePrimitiveInterfaceMember>>,
     exported: bool,
     signature_links_eligible: bool,
+}
+
+/// Actual annotation roles for the two admitted primitive interface forms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourcePrimitiveInterfaceMember {
+    Property {
+        interface_name: NodeId,
+        member: NodeId,
+        name: NodeId,
+        annotation: NodeId,
+    },
+    StringIndex {
+        interface_name: NodeId,
+        member: NodeId,
+        parameter: NodeId,
+        name: NodeId,
+        key: NodeId,
+        value: NodeId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -904,6 +1465,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     mapped_property_recoveries: HashMap<SemanticSymbolId, MappedPropertyRecovery>,
     mapped_index_recoveries: HashMap<IndexInfoId, MappedIndexRecovery>,
     source_mapped_lookup_requests: HashMap<TypeId, SourceMappedLookupRequest>,
+    source_mapped_instances: HashMap<TypeId, SourceMappedInstance>,
     source_class_provenance: HashMap<TypeId, SourceClassProvenance>,
     source_class_annotation_scopes: HashMap<TypeId, SourceClassAnnotationScope>,
     source_classes_by_symbol: HashMap<SemanticSymbolId, TypeId>,
@@ -930,6 +1492,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_callable_type_parameters:
         HashMap<SignatureId, Box<[SourceCallableTypeParameterProvenance]>>,
     source_callable_type_queries: HashMap<SignatureId, Arc<SourceCallableTypeQueryEvidence>>,
+    source_alias_default_graphs: HashMap<NodeRef, SourceAliasOperandGraph>,
     module_value_identities: HashMap<SemanticSymbolId, ModuleValueIdentity>,
     object_literal_property_clone_origins:
         HashMap<SemanticSymbolId, ObjectLiteralPropertyCloneOrigin>,
@@ -953,7 +1516,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     /// Pinned checker `cachedSignatures`, keyed by generic target and the
     /// ordered type-argument hash.
     cached_signatures: HashMap<(SignatureId, CacheHashKey), CachedSignatureEntry>,
-    /// Pinned `SignatureKeyErased` entries used only for implementation checks.
+    /// Pinned `SignatureKeyErased` entries. Mapped signature edges can stay lazy.
     source_overload_erased_signatures: HashMap<SignatureId, SignatureId>,
     unresolved_symbols: HashMap<UnresolvedSymbolKey, SemanticSymbolId>,
     unresolved_symbol_keys: HashMap<SemanticSymbolId, UnresolvedSymbolKey>,
@@ -970,6 +1533,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     pub(super) intersection_keys_by_type: HashMap<TypeId, IntersectionTypeCacheKey>,
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
+    relation_mapped_reads: HashMap<(RelationKind, CacheHashKey), Vec<super::type_nodes::SourceMappedReadProof>>,
     relation_inputs_generation: u64,
     relation_cache_generation: u64,
     relation_observable_types: HashSet<TypeId>,
@@ -1138,6 +1702,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             mapped_property_recoveries: HashMap::new(),
             mapped_index_recoveries: HashMap::new(),
             source_mapped_lookup_requests: HashMap::new(),
+            source_mapped_instances: HashMap::new(),
             source_class_provenance: HashMap::new(),
             source_class_annotation_scopes: HashMap::new(),
             source_classes_by_symbol: HashMap::new(),
@@ -1156,6 +1721,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_callable_types_by_signature: HashMap::new(),
             source_callable_type_parameters: HashMap::new(),
             source_callable_type_queries: HashMap::new(),
+            source_alias_default_graphs: HashMap::new(),
             module_value_identities: HashMap::new(),
             object_literal_property_clone_origins: HashMap::new(),
             synthetic_namespace_property_origins: HashMap::new(),
@@ -1188,6 +1754,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             intersection_keys_by_type: HashMap::new(),
             type_resolutions: TypeResolutionStack::new(id),
             relations: RelationCaches::default(),
+            relation_mapped_reads: HashMap::new(),
             relation_inputs_generation: 0,
             relation_cache_generation: 0,
             relation_observable_types: HashSet::new(),
@@ -1682,6 +2249,42 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .get(&symbol)
             .zip(self.symbol(symbol))
             .is_some_and(|(source, record)| source.exports == record.exports())
+    }
+
+    pub(super) fn source_mapped_instance(&self, type_: TypeId) -> Option<&SourceMappedInstance> {
+        self.source_mapped_instances.get(&type_)
+    }
+
+    #[cfg(test)]
+    pub(super) fn remove_source_mapped_instance_for_test(
+        &mut self,
+        type_: TypeId,
+    ) -> Option<SourceMappedInstance> {
+        self.source_mapped_instances.remove(&type_)
+    }
+
+    pub(super) fn try_reserve_source_mapped_instances(&mut self) -> bool {
+        self.source_mapped_instances.try_reserve(1).is_ok()
+    }
+
+    pub(super) fn publish_source_mapped_instance(&mut self, proof: SourceMappedInstance) -> bool {
+        let type_ = proof.type_id();
+        if self.types.get(type_).is_none() || self.source_mapped_instances.contains_key(&type_) {
+            return false;
+        }
+        self.source_mapped_instances.insert(type_, proof);
+        true
+    }
+
+    pub(super) fn complete_source_mapped_operands(&mut self, proof: SourceMappedInstance) -> bool {
+        let Some(previous) = self.source_mapped_instances.get_mut(&proof.type_id()) else {
+            return false;
+        };
+        if !previous.permits_operand_completion(&proof) {
+            return false;
+        }
+        *previous = proof;
+        true
     }
 
     /// Reads original binder flags after canonical symbol merges.
@@ -3683,6 +4286,24 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     pub(super) fn try_reserve_types(&mut self, additional: usize) -> bool {
         self.types.try_reserve(additional)
+    }
+
+    pub(super) fn try_reserve_source_alias_default_graph(&mut self, node: NodeRef) -> bool {
+        self.source_alias_default_graphs.contains_key(&node)
+            || self.source_alias_default_graphs.try_reserve(1).is_ok()
+    }
+
+    pub(super) fn source_alias_default_graph(
+        &self,
+        node: NodeRef,
+    ) -> Option<&SourceAliasOperandGraph> {
+        self.observe_relation_node_read(node);
+        self.source_alias_default_graphs.get(&node)
+    }
+
+    /// Source proofs retained after successful alias-default mapping.
+    pub fn source_alias_default_graph_count(&self) -> usize {
+        self.source_alias_default_graphs.len()
     }
 
     pub(super) fn try_reserve_source_jsdoc_typedefs(&mut self, additional: usize) -> bool {
@@ -9506,6 +10127,21 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .load(Ordering::Relaxed)
     }
 
+    /// Member readers can share a coherent recorder while its owner remains live.
+    pub(super) fn active_relation_read_observation_token(&mut self) -> Option<RelationObservationToken> {
+        if !self
+            .relation_read_observation_active
+            .load(Ordering::Acquire)
+        {
+            return None;
+        }
+        self.active_relation_read_observations
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|active| active.token)
+    }
+
     pub(super) fn begin_relation_read_observation(&mut self) -> Option<RelationObservationToken> {
         let active = self
             .active_relation_read_observations
@@ -9782,6 +10418,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     fn prepare_relation_cache_write(&mut self) {
         if !self.relation_cache_is_current() {
             self.relations = RelationCaches::default();
+            self.relation_mapped_reads.clear();
             self.clear_relation_observations();
             self.relation_cache_generation = self.relation_inputs_generation;
         }
@@ -9835,6 +10472,37 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.prepare_relation_cache_write();
         for (key, result) in writes {
             self.relations.set(relation, key, result);
+            self.relation_mapped_reads.remove(&(relation, key));
+        }
+        self.mark_relation_inputs_observable(observed);
+        true
+    }
+
+    pub(super) fn relation_mapped_reads(
+        &self,
+        relation: RelationKind,
+        key: CacheHashKey,
+    ) -> Option<&[super::type_nodes::SourceMappedReadProof]> {
+        self.relation_cache_is_current().then(|| self.relation_mapped_reads.get(&(relation, key)))
+            .flatten().map(Vec::as_slice)
+    }
+
+    pub(super) fn commit_relation_cache_writes_with_mapped_reads(
+        &mut self,
+        observation: RelationObservationToken,
+        relation: RelationKind,
+        writes: Vec<(CacheHashKey, RelationComparisonResult, Vec<super::type_nodes::SourceMappedReadProof>)>,
+    ) -> bool {
+        if writes.is_empty() {
+            return false;
+        }
+        let Some(observed) = self.take_relation_read_observations(observation) else {
+            return false;
+        };
+        self.prepare_relation_cache_write();
+        for (key, result, proofs) in writes {
+            self.relations.set(relation, key, result);
+            self.relation_mapped_reads.insert((relation, key), proofs);
         }
         self.mark_relation_inputs_observable(observed);
         true
@@ -10203,6 +10871,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
         self.source_overload_erased_signatures
             .insert(target, erased);
+        if self.relation_signature_is_observable(target) {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -10228,6 +10899,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// symbol, mapper, and instantiated signature.
     pub(super) fn try_reserve_value_symbol_links(&mut self, additional: usize) -> bool {
         self.links.value_symbol.try_reserve(additional)
+    }
+
+    pub(super) fn try_reserve_deferred_symbol_links(&mut self, additional: usize) -> bool {
+        self.links.deferred_symbol.try_reserve(additional)
     }
 
     pub(super) fn try_reserve_declared_value_provenance(&mut self, additional: usize) -> bool {
@@ -11580,6 +12255,145 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .and_then(Option::as_ref)
     }
 
+    pub(super) fn source_primitive_interface_member(
+        &self,
+        declaration: NodeRef,
+    ) -> Option<SourcePrimitiveInterfaceMember> {
+        self.source_node_fact(declaration)?
+            .primitive_interface_member
+            .as_deref()
+            .copied()
+    }
+
+    pub(super) fn source_primitive_interface_declaration(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<NodeRef> {
+        let source = self.source_symbol_declarations.get(&symbol)?;
+        let [declaration] = source.declarations.as_ref() else {
+            return None;
+        };
+        if !self.source_is_typescript_script(*declaration) {
+            return None;
+        }
+        self.source_primitive_interface_member(*declaration)?;
+        Some(*declaration)
+    }
+
+    #[allow(clippy::too_many_lines)] // Capture both primitive forms from their actual syntax fields.
+    fn primitive_interface_member_facts(
+        arena: &NodeArena,
+        declaration: NodeId,
+    ) -> Option<SourcePrimitiveInterfaceMember> {
+        let declaration_node = arena.get(declaration)?;
+        let NodeData::InterfaceDeclaration(interface) = &declaration_node.data else {
+            return None;
+        };
+        if declaration_node
+            .parent
+            .and_then(|parent| arena.get(parent))
+            .is_none_or(|parent| parent.kind != SyntaxKind::SourceFile)
+            || declaration_node.kind != SyntaxKind::InterfaceDeclaration
+            || declaration_node.flags.0 != 0
+            || interface.flow_node.is_some()
+            || interface.local_symbol.is_some()
+            || interface.symbol.is_some()
+            || interface.members.nodes.len() != 1
+            || interface.members.has_trailing_comma
+            || interface.members.range.start < declaration_node.range.start
+            || interface.members.range.end != declaration_node.range.end
+            || interface.type_parameters.is_some()
+            || interface.heritage_clauses.is_some()
+            || interface.modifiers.is_some()
+        {
+            return None;
+        }
+        let member = interface.members.nodes[0];
+        let node = arena.get(member)?;
+        if node.parent != Some(declaration) || node.flags.0 != 0 {
+            return None;
+        }
+        let child = |id, parent, kind| {
+            arena.get(id).is_some_and(|node| {
+                node.parent == Some(parent) && node.kind == kind && node.flags.0 == 0
+            })
+        };
+        if !child(interface.name, declaration, SyntaxKind::Identifier) {
+            return None;
+        }
+        match &node.data {
+            NodeData::PropertyDeclaration(property)
+                if node.kind == SyntaxKind::PropertyDeclaration
+                    && property.initializer.is_none()
+                    && property.postfix_token.is_none()
+                    && property.symbol.is_none()
+                    && property.modifiers.is_none()
+                    && property.facts == 0
+                    && child(property.name, member, SyntaxKind::Identifier)
+                    && property.type_.is_some_and(|annotation| {
+                        child(annotation, member, SyntaxKind::StringKeyword)
+                    }) =>
+            {
+                Some(SourcePrimitiveInterfaceMember::Property {
+                    interface_name: interface.name,
+                    member,
+                    name: property.name,
+                    annotation: property.type_?,
+                })
+            }
+            NodeData::IndexSignatureDeclaration(index)
+                if node.kind == SyntaxKind::IndexSignature
+                    && index.parameters.nodes.len() == 1
+                    && !index.parameters.has_trailing_comma
+                    && index.parameters.range.start >= node.range.start
+                    && index.parameters.range.end <= node.range.end
+                    && index.full_signature.is_none()
+                    && index.next_container.is_none()
+                    && index.symbol.is_none()
+                    && index.type_parameters.is_none()
+                    && index.modifiers.is_none()
+                    && child(index.type_, member, SyntaxKind::NumberKeyword) =>
+            {
+                let parameter = index.parameters.nodes[0];
+                let parameter_node = arena.get(parameter)?;
+                let NodeData::ParameterDeclaration(data) = &parameter_node.data else {
+                    return None;
+                };
+                let key = data.type_?;
+                if parameter_node.kind != SyntaxKind::Parameter
+                    || parameter_node.flags.0 != 0
+                    || parameter_node.parent != Some(member)
+                    || parameter_node.range.start < index.parameters.range.start
+                    || parameter_node.range.end > index.parameters.range.end
+                    || data.dot_dot_dot_token.is_some()
+                    || data.initializer.is_some()
+                    || data.question_token.is_some()
+                    || data.symbol.is_some()
+                    || data.facts != 0
+                    || data.modifiers.is_some()
+                    || !child(data.name, parameter, SyntaxKind::Identifier)
+                    || !child(key, parameter, SyntaxKind::StringKeyword)
+                    || matches!(
+                        &arena.get(data.name)?.data,
+                        NodeData::Identifier(identifier)
+                            if identifier.text.is_empty() || identifier.text == "this"
+                    )
+                {
+                    return None;
+                }
+                Some(SourcePrimitiveInterfaceMember::StringIndex {
+                    interface_name: interface.name,
+                    member,
+                    parameter,
+                    name: data.name,
+                    key,
+                    value: index.type_,
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn validated_source_node_facts(
         arena: &NodeArena,
         source_file: NodeId,
@@ -11696,6 +12510,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                                 .unwrap_or(PlainInterfaceHeritageFacts::Unsupported),
                         )
                     }),
+                primitive_interface_member: Self::primitive_interface_member_facts(arena, node_id)
+                    .map(Box::new),
                 exported: match &node.data {
                     NodeData::TypeAliasDeclaration(declaration) => {
                         declaration.modifiers.as_ref().is_some_and(|modifiers| {
@@ -12635,6 +13451,30 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
 }
 
 impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    pub(super) fn record_source_alias_default_graph(
+        &mut self,
+        node: NodeRef,
+        raw_type: TypeId,
+        graph: SourceAliasOperandGraph,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> bool {
+        if !graph.source().is_default()
+            || !graph.matches_operand(graph.source(), node, raw_type)
+            || graph.validate_retained(self, raw_type, array_targets).is_err()
+        {
+            return false;
+        }
+        if let Some(existing) = self.source_alias_default_graphs.get(&node) {
+            return existing.matches_operand(graph.source(), node, raw_type)
+                && existing.validate_retained(self, raw_type, array_targets).is_ok();
+        }
+        self.source_alias_default_graphs.insert(node, graph);
+        if self.relation_observable_nodes.contains(&node) {
+            self.mark_relation_inputs_dirty();
+        }
+        true
+    }
+
     fn signature_owns_callable_type(&self, signature: SignatureId) -> bool {
         if let Some(type_) = self.source_jsdoc_callback_type_for_signature(signature) {
             return self.type_has_function_type_provenance(type_)
@@ -13446,6 +14286,183 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             published.push((type_, signature_ids.into_boxed_slice()));
         }
         Some(published)
+    }
+}
+
+impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    fn relation_erasure_parameters(
+        &self,
+        original: &ValidatedSingleCallable,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<Vec<TypeId>, RelationUnavailable> {
+        let invalid = || RelationUnavailable::MalformedFunctionType(original.owner);
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set_with_array_targets(self, original.owner, array_targets)
+        else {
+            return Err(invalid());
+        };
+        let mut rows = projection.call_signatures.iter()
+            .filter(|row| row.signature == original.signature);
+        let row = rows.next().ok_or_else(invalid)?;
+        if projection.owner != original.owner
+            || rows.next().is_some()
+            || row.owner != original.owner
+            || row.parameters != original.parameters
+            || row.rest_parameter != original.rest_parameter
+            || row.min_argument_count != original.min_argument_count
+            || row.strict_variance_exempt != original.strict_variance_exempt
+            || original.return_type.is_some_and(|type_| row.return_type != Some(type_))
+        {
+            return Err(invalid());
+        }
+        // A row retained by the relation can predate normal lazy return demand.
+        // None claims no return value. A claimed value must still match.
+        let source = self.signature(original.signature).ok_or_else(invalid)?;
+        if usize::try_from(source.min_argument_count()).ok() != Some(original.min_argument_count)
+            || source.parameters().len()
+                != original.parameters.len() + usize::from(original.rest_parameter.is_some())
+            || source.has_rest_parameter() != original.rest_parameter.is_some()
+        {
+            return Err(invalid());
+        }
+        let mut seen = HashSet::new();
+        for &parameter in source.type_parameters() {
+            if !seen.insert(parameter)
+                || self.type_payload(parameter).is_none_or(|record| {
+                    record.flags() != TypeFlags::TYPE_PARAMETER
+                        || !matches!(record.data(), TypeData::TypeParameter(_))
+                })
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(source.type_parameters().to_vec())
+    }
+
+    fn relation_erased_signature_shape(
+        &self,
+        original: &ValidatedSingleCallable,
+        erased: SignatureId,
+        parameters: &[TypeId],
+        any: TypeId,
+    ) -> Result<TypeMapperId, RelationUnavailable> {
+        let invalid = || RelationUnavailable::MalformedFunctionType(original.owner);
+        let source = self.signature(original.signature).ok_or_else(invalid)?;
+        let signature = self.signature(erased).ok_or_else(invalid)?;
+        let mapper = signature.mapper().ok_or_else(invalid)?;
+        let arguments = vec![any; parameters.len()];
+        if parameters.is_empty()
+            || erased == original.signature
+            || signature.target() != Some(original.signature)
+            || signature.declaration() != source.declaration()
+            || signature.flags() != source.flags() & SignatureFlags::PROPAGATING_FLAGS
+            || signature.min_argument_count() != source.min_argument_count()
+            || signature.resolved_min_argument_count() < -1
+            || !signature.type_parameters().is_empty()
+            || signature.parameters().len() != source.parameters().len()
+            || signature.this_parameter().is_some() != source.this_parameter().is_some()
+            || signature.resolved_type_predicate().is_some()
+            || signature.isolated_signature_type().is_some()
+            || signature.composite().is_some()
+            || signature.resolved_return_type()
+                .is_some_and(|type_| self.type_payload(type_).is_none())
+            || self.type_mapper_has_exact_endpoints(mapper, parameters, &arguments) != Some(true)
+            || self.callable_signature_parameter_types(erased).is_some()
+        {
+            return Err(invalid());
+        }
+        let mut symbols = HashSet::new();
+        for (&source_symbol, &erased_symbol) in source.parameters().iter()
+            .zip(signature.parameters())
+        {
+            if !symbols.insert(erased_symbol)
+                || !self.instantiated_signature_symbol_matches(source_symbol, erased_symbol, mapper)
+                || self.value_symbol_links(erased_symbol)
+                    .and_then(|links| links.resolved_type)
+                    .is_some_and(|type_| self.type_payload(type_).is_none())
+            {
+                return Err(invalid());
+            }
+        }
+        if let (Some(source_symbol), Some(erased_symbol)) =
+            (source.this_parameter(), signature.this_parameter())
+        {
+            if !symbols.insert(erased_symbol)
+                || !self.instantiated_signature_symbol_matches(source_symbol, erased_symbol, mapper)
+                || self.value_symbol_links(erased_symbol)
+                    .and_then(|links| links.resolved_type)
+                    .is_some_and(|type_| self.type_payload(type_).is_none())
+            {
+                return Err(invalid());
+            }
+        }
+        // Slot values and the resolved minimum need selected-edge replay.
+        // This check proves their owner and shape, not their mapped result.
+        Ok(mapper)
+    }
+
+    pub(super) fn validate_relation_erased_signature(
+        &self,
+        original: &ValidatedSingleCallable,
+        erased: SignatureId,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<TypeMapperId, RelationUnavailable> {
+        let invalid = || RelationUnavailable::MalformedFunctionType(original.owner);
+        let parameters = self.relation_erasure_parameters(original, array_targets)?;
+        let any = self.intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?.any_type;
+        if self.source_overload_erased_signature(original.signature) != Some(erased)
+            || self.source_overload_erased_signatures.iter().any(|(&target, &value)| {
+                value == erased && target != original.signature
+            })
+            || self.cached_signatures.values().any(|entry| entry.instantiated == erased)
+        {
+            return Err(invalid());
+        }
+        self.relation_erased_signature_shape(original, erased, &parameters, any)
+    }
+
+    pub(super) fn get_or_create_relation_erased_signature(
+        &mut self,
+        original: &ValidatedSingleCallable,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<SignatureId, RelationUnavailable> {
+        let invalid = || RelationUnavailable::MalformedFunctionType(original.owner);
+        let parameters = self.relation_erasure_parameters(original, array_targets)?;
+        if parameters.is_empty() {
+            return Ok(original.signature);
+        }
+        if let Some(erased) = self.source_overload_erased_signature(original.signature) {
+            self.validate_relation_erased_signature(original, erased, array_targets)?;
+            return Ok(erased);
+        }
+        let any = self.intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?.any_type;
+        if !self.try_reserve_source_overload_erased_signatures(1)
+            || !self.try_reserve_mappers(1)
+        {
+            return Err(RelationUnavailable::UnionValidationCapacity(original.owner));
+        }
+        let arguments = vec![any; parameters.len()];
+        let mapper = self.new_type_mapper(parameters.clone(), arguments).ok_or_else(invalid)?;
+        let erased = self.instantiate_signature_ex(original.signature, mapper, true)
+            .map_err(|error| match error {
+                super::signatures::SignatureInstantiationError::Capacity(_) => {
+                    RelationUnavailable::UnionValidationCapacity(original.owner)
+                }
+                _ => invalid(),
+            })?;
+        self.relation_erased_signature_shape(original, erased, &parameters, any)?;
+        if self.cached_signatures_contain(erased) != Some(false) {
+            return Err(invalid());
+        }
+        // Publish the shell only after its header, mapper, and symbols are proven.
+        self.source_overload_erased_signatures.insert(original.signature, erased);
+        if self.relation_signature_is_observable(original.signature) {
+            self.mark_relation_inputs_dirty();
+        }
+        self.validate_relation_erased_signature(original, erased, array_targets)?;
+        Ok(erased)
     }
 }
 

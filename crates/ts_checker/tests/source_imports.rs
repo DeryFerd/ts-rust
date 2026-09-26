@@ -642,7 +642,7 @@ fn imported_generic_interfaces_report_missing_type_arguments() {
     assert_eq!(diagnostic.diagnostic.code(), 2314);
     assert_eq!(
         diagnostic.diagnostic.arguments,
-        ["Model<T>".to_owned(), "1".to_owned()]
+        ["Model<T>".to_owned(), "1".to_owned(), "1".to_owned()]
     );
     assert!(source_is_checked(&context, importer_file));
     assert!(!source_is_checked(&context, target_file));

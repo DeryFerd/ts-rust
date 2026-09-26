@@ -596,18 +596,47 @@ fn named_method_array_alias_returns_keep_the_real_array_target() {
             .unwrap()
             .declarations()
             .unwrap();
-        assert!(!declarations.is_empty());
+        let expected_declarations = [
+            (SyntaxKind::InterfaceDeclaration, 57_645, 70_566),
+            (SyntaxKind::VariableDeclaration, 70_890, 70_913),
+        ]
+        .map(|(kind, start, end)| {
+            let (node, _) = library
+                .arena
+                .iter()
+                .find(|(_, record)| {
+                    record.kind == kind
+                        && record.range.start.get() == start
+                        && record.range.end.get() == end
+                })
+                .expect("the original ES5 must retain the exact Array declaration");
+            NodeRef::new(library.arena.id(), LIBRARY_FILE, node)
+        });
+        assert_eq!(declarations, &expected_declarations[..]);
         for &declaration in declarations {
             assert_eq!(declaration.file, LIBRARY_FILE);
-            let NodeData::InterfaceDeclaration(data) =
-                &library.arena.get(declaration.node).unwrap().data
-            else {
-                panic!("Array must come from its actual bundled interface")
+            assert_eq!(declaration.arena, library.arena.id());
+            let record = library.arena.get(declaration.node).unwrap();
+            let name = match (record.kind, &record.data) {
+                (SyntaxKind::InterfaceDeclaration, NodeData::InterfaceDeclaration(data)) => {
+                    data.name
+                }
+                (SyntaxKind::VariableDeclaration, NodeData::VariableDeclaration(data)) => {
+                    data.name
+                }
+                _ => panic!("Array must retain its exact original interface and variable"),
             };
-            let NodeData::Identifier(name) = &library.arena.get(data.name).unwrap().data else {
+            let NodeData::Identifier(name) = &library.arena.get(name).unwrap().data else {
                 unreachable!()
             };
             assert_eq!(name.text, "Array");
+            let bound = context.file(LIBRARY_FILE).unwrap().1;
+            assert_eq!(
+                context
+                    .store()
+                    .get_merged_symbol(bound.symbol(declaration).unwrap()),
+                Some(owner)
+            );
         }
         assert_eq!(context.get_declared_type_of_symbol(owner).unwrap(), target);
         for method in &methods {

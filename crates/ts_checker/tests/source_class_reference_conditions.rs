@@ -79,6 +79,288 @@ fn snapshot(
     )
 }
 
+#[derive(Clone, Copy)]
+struct DiscriminantVariable {
+    name: NodeRef,
+    annotation: NodeRef,
+    initializer: Option<NodeRef>,
+}
+
+fn discriminant_variable(parsed: &ParseResult, name: &str, occurrence: usize) -> DiscriminantVariable {
+    let mut matches = parsed.arena.iter().filter_map(|(_, record)| {
+        let NodeData::VariableDeclaration(variable) = &record.data else { return None; };
+        let NodeData::Identifier(identifier) = &parsed.arena.get(variable.name)?.data else { return None; };
+        if identifier.text != name { return None; }
+        let node = |id| NodeRef::new(parsed.arena.id(), FILE, id);
+        Some((record.range.start, DiscriminantVariable {
+            name: node(variable.name),
+            annotation: node(variable.type_.unwrap()),
+            initializer: variable.initializer.map(node),
+        }))
+    }).collect::<Vec<_>>();
+    matches.sort_by_key(|(start, _)| *start);
+    matches[occurrence].1
+}
+
+fn expect_discriminant_diagnostics(
+    checker: &CanonicalCheckerContext<'_>,
+    expected: &[(u32, NodeRef, [&str; 2])],
+) {
+    let actual = checker.diagnostics().as_slice();
+    assert_eq!(actual.len(), expected.len(), "{actual:?}");
+    for (actual, (code, node, arguments)) in actual.iter().zip(expected) {
+        assert_eq!(actual.diagnostic.code(), *code);
+        assert_eq!(actual.diagnostic.arguments, *arguments);
+        assert_eq!(actual.node, Some(*node));
+        assert!(actual.range_override.is_none());
+        assert!(actual.related_information.is_empty());
+    }
+}
+
+fn check_discriminant_case(
+    source: &str,
+    cold_variable: &str,
+    assertions: impl Fn(&mut CanonicalCheckerContext<'_>, &ParseResult),
+) {
+    for query_first in [false, true] {
+        let parsed = parse_source_file(source);
+        let mut checker = context(&parsed);
+        let cold = discriminant_variable(&parsed, cold_variable, 0).initializer.unwrap();
+        let cold_type = query_first.then(|| checker.get_type_at_location(cold).unwrap());
+        checker.check_source_file(FILE).unwrap();
+        assertions(&mut checker, &parsed);
+        if let Some(cold_type) = cold_type {
+            assert_eq!(checker.get_type_at_location(cold), Ok(cold_type));
+        }
+        let mut initializers = parsed.arena.iter().filter_map(|(_, record)| {
+            let NodeData::VariableDeclaration(variable) = &record.data else { return None; };
+            variable.initializer.map(|id| (record.range.start, NodeRef::new(parsed.arena.id(), FILE, id)))
+        }).collect::<Vec<_>>();
+        initializers.sort_by_key(|(start, _)| *start);
+        let reads = initializers.into_iter().map(|(_, node)| (
+            node,
+            checker.get_type_at_location(node).unwrap(),
+            checker.get_symbol_at_location(node).unwrap(),
+        )).collect::<Vec<_>>();
+        let mut parent_symbol = None;
+        for (node, _, symbol) in &reads {
+            if matches!(parsed.arena.get(node.node).unwrap().data, NodeData::Identifier(_)) {
+                let symbol = symbol.expect("the parent reference resolves");
+                if let Some(expected) = parent_symbol { assert_eq!(symbol, expected); }
+                parent_symbol = Some(symbol);
+            }
+        }
+        let warm = snapshot(&checker, &parsed);
+        for _ in 0..2 {
+            checker.recheck_source_file(FILE).unwrap();
+            assertions(&mut checker, &parsed);
+            for &(node, type_, symbol) in &reads {
+                assert_eq!(checker.get_type_at_location(node), Ok(type_));
+                assert_eq!(checker.get_symbol_at_location(node), Ok(symbol));
+            }
+            assert_eq!(snapshot(&checker, &parsed), warm);
+            assert!(checker.store().type_resolution_is_empty());
+            assert!(checker.store().source_file_links(checker.source_file(FILE).unwrap()).unwrap().type_checked);
+        }
+    }
+}
+
+// These exact sources are measured separately from the top-level Go controls.
+const CLASS_DECLARED_DISCRIMINANT: &str = r#"interface Left { kind: "left"; }
+interface Right { kind: "right"; }
+declare const item: Left | Right;
+class Reader {
+  read(): void {
+    if (item.kind === "left") {
+      const before: Left = item;
+      if (item.kind === "left") {
+        const kept: Left = item;
+      } else {
+        const removed: never = item;
+      }
+    }
+  }
+}
+"#;
+
+const CLASS_STANDALONE_DISCRIMINANT: &str = r#"interface Whole { kind: "left" | "right"; }
+interface LeftView { kind: "left"; }
+declare const item: Whole;
+class Reader {
+  read(): void {
+    if (item.kind === "left") {
+      const property: "left" = item.kind;
+      const parent: Whole = item;
+    } else {
+      const property: "right" = item.kind;
+      const parent: Whole = item;
+    }
+  }
+}
+"#;
+
+#[test]
+fn class_declared_union_discriminants_keep_former_constituents() {
+    for negative in [false, true] {
+        let source = if negative {
+            CLASS_DECLARED_DISCRIMINANT.replacen("const kept: Left = item;", "const kept: Right = item;", 1)
+        } else { CLASS_DECLARED_DISCRIMINANT.to_owned() };
+        check_discriminant_case(&source, "removed", |checker, parsed| {
+            let before = discriminant_variable(parsed, "before", 0);
+            let kept = discriminant_variable(parsed, "kept", 0);
+            let removed = discriminant_variable(parsed, "removed", 0);
+            if negative {
+                expect_discriminant_diagnostics(checker, &[(2322, kept.name, ["Left", "Right"])]);
+            } else { expect_discriminant_diagnostics(checker, &[]); }
+            let left = checker.get_type_from_type_node(before.annotation).unwrap();
+            let never = checker.store().intrinsic_bootstrap().unwrap().never_type;
+            assert_ne!(left, never);
+            assert_eq!(checker.get_type_at_location(before.initializer.unwrap()), Ok(left));
+            assert_eq!(checker.get_type_at_location(kept.initializer.unwrap()), Ok(left));
+            assert_eq!(checker.get_type_at_location(removed.initializer.unwrap()), Ok(never));
+        });
+    }
+}
+
+#[test]
+fn class_standalone_properties_do_not_rewrite_parents() {
+    for negative in [false, true] {
+        let source = if negative {
+            CLASS_STANDALONE_DISCRIMINANT.replacen("const parent: Whole = item;", "const parent: LeftView = item;", 1)
+        } else { CLASS_STANDALONE_DISCRIMINANT.to_owned() };
+        check_discriminant_case(&source, "parent", |checker, parsed| {
+            let item = discriminant_variable(parsed, "item", 0);
+            let first_parent = discriminant_variable(parsed, "parent", 0);
+            if negative {
+                expect_discriminant_diagnostics(checker, &[(2322, first_parent.name, ["Whole", "LeftView"])]);
+            } else { expect_discriminant_diagnostics(checker, &[]); }
+            let whole = checker.get_type_from_type_node(item.annotation).unwrap();
+            for occurrence in 0..2 {
+                let parent = discriminant_variable(parsed, "parent", occurrence);
+                let property = discriminant_variable(parsed, "property", occurrence);
+                let expected_property = checker.get_type_from_type_node(property.annotation).unwrap();
+                assert_eq!(checker.get_type_at_location(parent.initializer.unwrap()), Ok(whole));
+                assert_eq!(checker.get_type_at_location(property.initializer.unwrap()), Ok(expected_property));
+            }
+        });
+    }
+}
+
+const CLASS_IDENTICAL_REFERENCE_JOIN: &str = r#"interface NumberTable { [name: string]: number; }
+interface Holder { table: NumberTable; }
+declare const holder: Holder;
+declare const condition: boolean;
+class Reader {
+  flag: boolean = false;
+  read(): void {
+    if (condition === true) {
+      this.flag = true;
+    }
+    const later: NumberTable = holder.table;
+  }
+}
+"#;
+
+#[test]
+fn class_reference_joins_keep_unchanged_indexed_types() {
+    for branched in [false, true] {
+        for negative in [false, true] {
+            let mut source = CLASS_IDENTICAL_REFERENCE_JOIN.to_owned();
+            if !branched {
+                source = source.replacen(
+                    "    if (condition === true) {\n      this.flag = true;\n    }",
+                    "    this.flag = true;",
+                    1,
+                );
+            }
+            if negative {
+                source = source.replacen("const later: NumberTable", "const later: number", 1);
+            }
+            check_discriminant_case(&source, "later", |checker, parsed| {
+                let later = discriminant_variable(parsed, "later", 0);
+                let (property_name, annotation) = parsed.arena.iter().find_map(|(_, record)| {
+                    let NodeData::PropertyDeclaration(property) = &record.data else { return None; };
+                    let NodeData::Identifier(name) = &parsed.arena.get(property.name)?.data else { return None; };
+                    if name.text != "table" { return None; }
+                    Some((
+                        NodeRef::new(parsed.arena.id(), FILE, property.name),
+                        NodeRef::new(parsed.arena.id(), FILE, property.type_.unwrap()),
+                    ))
+                }).expect("the table property has its declared annotation");
+                let expected = checker.get_type_from_type_node(annotation).unwrap();
+                assert_eq!(checker.get_type_at_location(later.initializer.unwrap()), Ok(expected));
+                let property_symbol = checker.get_symbol_at_location(property_name).unwrap().unwrap();
+                assert_eq!(checker.get_symbol_at_location(later.initializer.unwrap()), Ok(Some(property_symbol)));
+                if negative {
+                    expect_discriminant_diagnostics(checker, &[(2322, later.name, ["NumberTable", "number"])]);
+                } else {
+                    expect_discriminant_diagnostics(checker, &[]);
+                }
+            });
+        }
+    }
+}
+
+const CLASS_VALUE_CALLS: &str = r#"declare function value(): number;
+class Reader {
+  flag: boolean = false;
+  read(): number {
+    if (this.flag === true) {
+      this.flag = false;
+    }
+    const later: number = value();
+    return value();
+  }
+}
+"#;
+
+#[test]
+fn class_value_calls_keep_types_without_statement_effects() {
+    for statement_call in [false, true] {
+        for negative in [false, true] {
+            let mut source = CLASS_VALUE_CALLS.to_owned();
+            if statement_call {
+                source = source.replacen("    const later:", "    value();\n    const later:", 1);
+            }
+            if negative {
+                source = source.replacen("  read(): number {", "  read(): string {", 1);
+            }
+            check_discriminant_case(&source, "later", |checker, parsed| {
+                let node = |id| NodeRef::new(parsed.arena.id(), FILE, id);
+                let (declaration, name) = parsed.arena.iter().find_map(|(id, record)| {
+                    let NodeData::FunctionDeclaration(function) = &record.data else { return None; };
+                    let name = function.name?;
+                    let NodeData::Identifier(identifier) = &parsed.arena.get(name)?.data else { return None; };
+                    (identifier.text == "value").then_some((node(id), node(name)))
+                }).expect("the ambient value function exists");
+                let symbol = checker.get_symbol_at_location(name).unwrap().unwrap();
+                let signature = checker.store().signature_links(declaration).unwrap()
+                    .resolved_signature.signature().unwrap();
+                let number = checker.store().intrinsic_bootstrap().unwrap().number_type;
+                let calls = parsed.arena.iter().filter_map(|(id, record)| {
+                    let NodeData::CallExpression(call) = &record.data else { return None; };
+                    Some((node(id), node(call.expression)))
+                }).collect::<Vec<_>>();
+                assert_eq!(calls.len(), if statement_call { 3 } else { 2 });
+                for (call, callee) in calls {
+                    assert_eq!(checker.get_type_at_location(call), Ok(number));
+                    assert_eq!(checker.get_symbol_at_location(callee), Ok(Some(symbol)));
+                    assert_eq!(checker.store().signature_links(call).unwrap()
+                        .resolved_signature.signature(), Some(signature));
+                }
+                if negative {
+                    let returned = parsed.arena.iter().find_map(|(id, record)| {
+                        matches!(record.data, NodeData::ReturnStatement(_)).then_some(node(id))
+                    }).expect("the method has one return statement");
+                    expect_discriminant_diagnostics(checker, &[(2322, returned, ["number", "string"])]);
+                } else {
+                    expect_discriminant_diagnostics(checker, &[]);
+                }
+            });
+        }
+    }
+}
+
 fn type_parts(checker: &CanonicalCheckerContext<'_>, type_: TypeId) -> Vec<String> {
     let mut parts = match checker.store().type_payload(type_).unwrap().data() {
         TypeData::Intrinsic(intrinsic) => vec![intrinsic.intrinsic_name.clone()],
