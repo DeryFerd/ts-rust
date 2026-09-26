@@ -4,6 +4,9 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
+use crate::frontend::json::{
+    JsonDecoder, JsonError, JsonToken, MarshalerTo, json_unmarshal_decode,
+};
 use crate::prelude::*;
 
 use super::compile::CompileTimes;
@@ -218,6 +221,121 @@ impl Statistics {
     }
 }
 
+// PORT: a build worker (execute/build/worker.rs) runs a project's
+// `EmitAndReportStatistics` in its own process. It sends the statistics to
+// the orchestrator for `Aggregate` (build/buildtask.go:102) in this JSON
+// form: the fields that `statisticsFromProgram` sets, with durations in
+// nanoseconds. Go has no such form.
+impl MarshalerTo for Statistics {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        let _ = write!(
+            enc,
+            "{{\"files\":{},\"lines\":{},\"identifiers\":{},\"symbols\":{},\"types\":{},\
+             \"instantiations\":{},\"memoryUsed\":{},\"memoryAllocs\":{},\"compileTimes\":",
+            self.files,
+            self.lines,
+            self.identifiers,
+            self.symbols,
+            self.types,
+            self.instantiations,
+            self.memory_used,
+            self.memory_allocs,
+        );
+        match self.compile_times {
+            Some(mut times) => {
+                enc.push('{');
+                for (i, (name, value)) in compile_times_fields(&mut times).into_iter().enumerate() {
+                    if i > 0 {
+                        enc.push(',');
+                    }
+                    let _ = write!(enc, "\"{name}\":{}", value.as_nanos());
+                }
+                enc.push('}');
+            }
+            None => enc.push_str("null"),
+        }
+        enc.push('}');
+        Ok(())
+    }
+}
+
+/// Reads the build worker form of `Statistics` back (see its `MarshalerTo`).
+/// Unknown members are skipped.
+pub fn decode_statistics(dec: &mut JsonDecoder<'_>) -> Result<Statistics, JsonError> {
+    let mut stat = Statistics::default();
+    if dec.read_token()? != JsonToken::BeginObject {
+        return Err(invalid_statistics());
+    }
+    while dec.peek_kind() != b'}' {
+        let mut key = String::new();
+        json_unmarshal_decode(dec, &mut key)?;
+        match key.as_str() {
+            "files" => stat.files = decode_integer(dec)?,
+            "lines" => stat.lines = decode_integer(dec)?,
+            "identifiers" => stat.identifiers = decode_integer(dec)?,
+            "symbols" => stat.symbols = decode_integer(dec)?,
+            "types" => stat.types = decode_integer(dec)?,
+            "instantiations" => stat.instantiations = decode_integer(dec)?,
+            "memoryUsed" => stat.memory_used = decode_integer(dec)?,
+            "memoryAllocs" => stat.memory_allocs = decode_integer(dec)?,
+            "compileTimes" => stat.compile_times = decode_compile_times(dec)?,
+            _ => dec.skip_value()?,
+        }
+    }
+    dec.read_token()?;
+    Ok(stat)
+}
+
+fn decode_compile_times(dec: &mut JsonDecoder<'_>) -> Result<Option<CompileTimes>, JsonError> {
+    match dec.read_token()? {
+        JsonToken::Null => return Ok(None),
+        JsonToken::BeginObject => {}
+        _ => return Err(invalid_statistics()),
+    }
+    let mut times = CompileTimes::default();
+    while dec.peek_kind() != b'}' {
+        let mut name = String::new();
+        json_unmarshal_decode(dec, &mut name)?;
+        match compile_times_fields(&mut times)
+            .into_iter()
+            .find(|(field, _)| *field == name)
+        {
+            Some((_, value)) => *value = Duration::from_nanos(decode_integer(dec)?),
+            None => dec.skip_value()?,
+        }
+    }
+    dec.read_token()?;
+    Ok(Some(times))
+}
+
+/// The `CompileTimes` fields by their name in the build worker form.
+fn compile_times_fields(times: &mut CompileTimes) -> [(&'static str, &mut Duration); 8] {
+    [
+        ("configTime", &mut times.config_time),
+        ("parseTime", &mut times.parse_time),
+        ("bindTime", &mut times.bind_time),
+        ("checkTime", &mut times.check_time),
+        ("totalTime", &mut times.total_time),
+        ("emitTime", &mut times.emit_time),
+        ("buildInfoReadTime", &mut times.build_info_read_time),
+        ("changesComputeTime", &mut times.changes_compute_time),
+    ]
+}
+
+/// A JSON number that must be an integer of type `T`.
+fn decode_integer<T: std::str::FromStr>(dec: &mut JsonDecoder<'_>) -> Result<T, JsonError> {
+    match dec.read_token()? {
+        JsonToken::Number(raw) => raw.parse().map_err(|_| invalid_statistics()),
+        _ => Err(invalid_statistics()),
+    }
+}
+
+fn invalid_statistics() -> JsonError {
+    JsonError {
+        message: "invalid build worker statistics".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +356,40 @@ mod tests {
              Memory used:          165135K\n\
              Changes compute time:  0.033s\n"
         );
+    }
+
+    // The build worker form keeps every field that the report reads.
+    #[test]
+    fn worker_form_round_trips() {
+        let stat = Statistics {
+            files: 83,
+            lines: 58434,
+            identifiers: 49724,
+            symbols: 59777,
+            types: 35331,
+            instantiations: 34231,
+            memory_used: 62_549 * 1024,
+            memory_allocs: 297_406,
+            compile_times: Some(CompileTimes {
+                config_time: Duration::from_nanos(1),
+                parse_time: Duration::from_micros(24_000),
+                check_time: Duration::from_nanos(214_000_123),
+                total_time: Duration::from_millis(256),
+                emit_time: Duration::from_micros(1_000),
+                changes_compute_time: Duration::from_micros(16_000),
+                ..CompileTimes::default()
+            }),
+            ..Statistics::default()
+        };
+        let mut json = String::new();
+        stat.marshal_json_to(&mut json).unwrap();
+        let mut dec = crate::frontend::json::json_new_decoder(json.as_bytes());
+        let back = decode_statistics(&mut dec).unwrap();
+        dec.check_eof().unwrap();
+        let (mut want, mut got) = (String::new(), String::new());
+        stat.report(&mut want);
+        back.report(&mut got);
+        assert_eq!(got, want);
+        assert_eq!(format!("{back:?}"), format!("{stat:?}"));
     }
 }

@@ -1472,30 +1472,34 @@ impl Checker {
 
     // Go: checker/checker.go:13812 getResolvedSymbol
     pub fn get_resolved_symbol(&mut self, node: Node) -> SymbolId {
-        if self.symbol_node_links.get(node).resolved_symbol.is_nil() {
-            let mut symbol = SymbolId::NIL;
-            if !node_is_missing(node) {
-                let text = node.text();
-                let message = self.get_cannot_find_name_diagnostic_for_name(node);
-                let resolve_name = self.resolve_name.clone();
-                symbol = resolve_name(
-                    self,
-                    node,
-                    &text,
-                    SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
-                    Some(message),
-                    !is_write_only_access(node),
-                    false, /*excludeGlobals*/
-                );
-            }
-            let resolved = if symbol.is_some() {
-                symbol
-            } else {
-                self.unknown_symbol
-            };
-            self.symbol_node_links.get(node).resolved_symbol = resolved;
+        // One link lookup on the cached hit. The miss returns the value it
+        // just stored, as Go returns links.resolvedSymbol.
+        let cached = self.symbol_node_links.get(node).resolved_symbol;
+        if cached.is_some() {
+            return cached;
         }
-        self.symbol_node_links.get(node).resolved_symbol
+        let mut symbol = SymbolId::NIL;
+        if !node_is_missing(node) {
+            let text = node.text();
+            let message = self.get_cannot_find_name_diagnostic_for_name(node);
+            let resolve_name = self.resolve_name.clone();
+            symbol = resolve_name(
+                self,
+                node,
+                &text,
+                SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+                Some(message),
+                !is_write_only_access(node),
+                false, /*excludeGlobals*/
+            );
+        }
+        let resolved = if symbol.is_some() {
+            symbol
+        } else {
+            self.unknown_symbol
+        };
+        self.symbol_node_links.get(node).resolved_symbol = resolved;
+        resolved
     }
 
     // Go: checker/checker.go:13825 getResolvedSymbolOrNil

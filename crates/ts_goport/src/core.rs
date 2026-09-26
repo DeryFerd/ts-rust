@@ -195,6 +195,13 @@ impl Name {
     pub fn as_str(&self) -> &'static str {
         intern::text(self.0)
     }
+
+    /// `table_hash` of the text. The interner keeps it, so this reads one
+    /// number and does not touch the text.
+    #[inline]
+    fn table_hash(&self) -> u32 {
+        intern::table_hash(self.0)
+    }
 }
 
 // PORT: not `Copy`, so existing `.clone()` calls stay clean for clippy.
@@ -353,6 +360,10 @@ mod intern {
 
     type Slots = Box<[OnceLock<&'static str>]>;
     static TEXTS: [OnceLock<Slots>; CHUNKS] = [const { OnceLock::new() }; CHUNKS];
+    /// The table hash (`super::fold_hash`) of each id's text, in the same
+    /// chunks as `TEXTS`. A table lookup by `Name` reads it instead of
+    /// reading and hashing the text again.
+    static HASHES: [OnceLock<Box<[AtomicU32]>>; CHUNKS] = [const { OnceLock::new() }; CHUNKS];
     static NEXT: AtomicU32 = AtomicU32::new(1);
 
     /// Hasher for `u64` keys that already are a `hash_str` hash, so a
@@ -428,6 +439,19 @@ mod intern {
             .expect("unknown name id")
     }
 
+    /// The table hash of the text of name id `id`.
+    #[inline]
+    pub(super) fn table_hash(id: u32) -> u32 {
+        if id == 0 {
+            return super::fold_hash(hash_str(""));
+        }
+        let (chunk, index) = slot(id);
+        // Relaxed is enough: a thread gets `id` from `intern_shared` under
+        // the shard lock or through a later handoff, and both order the
+        // store in `intern_shared` before this load.
+        HASHES[chunk].get().expect("unknown name id")[index].load(Ordering::Relaxed)
+    }
+
     /// The name for `s`, created on first use.
     pub(super) fn intern(s: &str) -> Name {
         if s.is_empty() {
@@ -482,11 +506,11 @@ mod intern {
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         assert!(id != u32::MAX, "name id overflow");
         let (chunk, index) = slot(id);
-        let slots = TEXTS[chunk].get_or_init(|| {
-            (0..(1usize << (FIRST_CHUNK_SHIFT as usize + chunk)))
-                .map(|_| OnceLock::new())
-                .collect()
-        });
+        let chunk_len = 1usize << (FIRST_CHUNK_SHIFT as usize + chunk);
+        let hashes =
+            HASHES[chunk].get_or_init(|| (0..chunk_len).map(|_| AtomicU32::new(0)).collect());
+        hashes[index].store(super::fold_hash(hash), Ordering::Relaxed);
+        let slots = TEXTS[chunk].get_or_init(|| (0..chunk_len).map(|_| OnceLock::new()).collect());
         let _ = slots[index].set(stored);
         if hash_taken {
             shard.collisions.insert(stored, id);
@@ -799,10 +823,90 @@ struct Table {
 
 const INDEX_MOD: usize = u16::MAX as usize;
 
+/// The table hash of `name`. `Name::table_hash` gives the same value
+/// without hashing.
 #[inline]
 fn table_hash(name: &str) -> u32 {
-    let hash = intern::hash_str(name);
+    fold_hash(intern::hash_str(name))
+}
+
+/// Folds an `intern::hash_str` hash to the 32-bit table hash.
+#[inline]
+fn fold_hash(hash: u64) -> u32 {
     (hash ^ (hash >> 32)) as u32
+}
+
+thread_local! {
+    /// (address, length, table hash) of the text of the innermost
+    /// `with_text_hash` call on this thread. Zeros when there is none: a
+    /// `str` address is never 0.
+    static TEXT_HASH: std::cell::Cell<(usize, usize, u32)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// Runs `f`. While it runs, `SymbolArena::get` reuses one hash of `text`
+/// for lookups of this same `text` (same address and length). It is for
+/// code that looks one text up in many tables through APIs that take
+/// `&str`, such as `NameResolver::resolve` (one table per scope, through a
+/// lookup callback).
+///
+/// This is exact: `text` stays borrowed until `f` returns, so any `str` with
+/// the same address and length that is alive during `f` has the same bytes.
+/// Calls nest; each one restores the outer text when it returns or unwinds.
+pub fn with_text_hash<R>(text: &str, f: impl FnOnce() -> R) -> R {
+    struct Restore((usize, usize, u32));
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEXT_HASH.set(self.0);
+        }
+    }
+    let entry = (text.as_ptr().addr(), text.len(), table_hash(text));
+    let _restore = Restore(TEXT_HASH.replace(entry));
+    f()
+}
+
+/// The table hash of `text`, from the innermost `with_text_hash` when it
+/// covers this exact text.
+#[inline]
+fn lookup_hash(text: &str) -> u32 {
+    let (address, len, hash) = TEXT_HASH.get();
+    if address == text.as_ptr().addr() && len == text.len() {
+        hash
+    } else {
+        table_hash(text)
+    }
+}
+
+/// A symbol table key for code that is called with either a `&Name` or a
+/// `&str`. A `Name` finds its entry by id with the hash the interner keeps,
+/// so it needs no hashing and no text compare.
+#[derive(Clone, Copy, Debug)]
+pub enum TableKey<'a> {
+    Text(&'a str),
+    Name(&'a Name),
+}
+
+impl<'a> TableKey<'a> {
+    /// The key text.
+    #[must_use]
+    pub fn text(self) -> &'a str {
+        match self {
+            TableKey::Text(text) => text,
+            TableKey::Name(name) => name.as_str(),
+        }
+    }
+}
+
+impl<'a> From<&'a str> for TableKey<'a> {
+    fn from(text: &'a str) -> Self {
+        TableKey::Text(text)
+    }
+}
+
+impl<'a> From<&'a Name> for TableKey<'a> {
+    fn from(name: &'a Name) -> Self {
+        TableKey::Name(name)
+    }
 }
 
 impl Table {
@@ -880,16 +984,16 @@ impl Table {
 
     /// Go `table[name] = symbol`. A new name goes last, like `IndexMap`.
     fn insert(&mut self, name: &Name, symbol: SymbolId) {
-        let hash = table_hash(name);
-        if let Some(position) = self.find_id(hash, name.0) {
-            self.entries[position].symbol = symbol;
-            return;
+        let hash = name.table_hash();
+        match self.find_id(hash, name.0) {
+            Some(position) => self.entries[position].symbol = symbol,
+            None => self.push(hash, name.0, symbol),
         }
-        self.entries.push(TableEntry {
-            hash,
-            name: name.0,
-            symbol,
-        });
+    }
+
+    /// Appends an entry for name id `name`, which is not in the table.
+    fn push(&mut self, hash: u32, name: u32, symbol: SymbolId) {
+        self.entries.push(TableEntry { hash, name, symbol });
         let len = self.entries.len();
         if len <= TABLE_LINEAR_MAX {
             return;
@@ -1071,7 +1175,7 @@ impl SymbolArena {
                         if name.0 != entry.name {
                             renamed = true;
                             entry.name = name.0;
-                            entry.hash = table_hash(&name);
+                            entry.hash = name.table_hash();
                         }
                     }
                     entry.symbol = offsets.symbol(entry.symbol);
@@ -1118,12 +1222,12 @@ impl SymbolArena {
             return SymbolId::NIL;
         }
         table
-            .find(table_hash(name), name)
+            .find(lookup_hash(name), name)
             .map_or(SymbolId::NIL, |position| table.entries[position].symbol)
     }
 
     /// Go `table[name]` for a caller that has a `Name`. It compares ids
-    /// instead of texts.
+    /// instead of texts, with the hash the interner keeps.
     #[must_use]
     pub fn get_name(&self, table: SymbolTable, name: &Name) -> SymbolId {
         if table.is_nil() {
@@ -1134,8 +1238,18 @@ impl SymbolArena {
             return SymbolId::NIL;
         }
         table
-            .find_id(table_hash(name), name.0)
+            .find_id(name.table_hash(), name.0)
             .map_or(SymbolId::NIL, |position| table.entries[position].symbol)
+    }
+
+    /// Go `table[name]` by `get` or `get_name`, whichever `key` holds.
+    #[inline]
+    #[must_use]
+    pub fn get_key(&self, table: SymbolTable, key: TableKey<'_>) -> SymbolId {
+        match key {
+            TableKey::Text(text) => self.get(table, text),
+            TableKey::Name(name) => self.get_name(table, name),
+        }
     }
 
     /// Go `table[name] = symbol`. Panics on a nil table, like Go.
@@ -1143,6 +1257,45 @@ impl SymbolArena {
         assert!(table.is_some(), "assignment to entry in nil map");
         let name = name.into();
         self.tables.get_mut(table.index()).insert(&name, symbol);
+    }
+
+    /// Go `if table[name] == nil { table[name] = symbol }` with one lookup.
+    /// Returns true when it stored `symbol`. Panics on a nil table, like Go.
+    pub fn set_if_absent(&mut self, table: SymbolTable, name: &Name, symbol: SymbolId) -> bool {
+        self.set_if_absent_or(table, name, symbol, |_| false)
+    }
+
+    /// Like `set_if_absent`, but it also replaces a stored symbol that
+    /// `replace` accepts: Go
+    /// `if s := table[name]; s == nil || replace(s) { table[name] = symbol }`.
+    /// One lookup. A replaced entry keeps its position.
+    pub fn set_if_absent_or(
+        &mut self,
+        table: SymbolTable,
+        name: &Name,
+        symbol: SymbolId,
+        replace: impl FnOnce(&Symbol) -> bool,
+    ) -> bool {
+        assert!(table.is_some(), "assignment to entry in nil map");
+        let hash = name.table_hash();
+        let found = {
+            let current = self.tables.get(table.index());
+            current
+                .find_id(hash, name.0)
+                .map(|position| (position, current.entries[position].symbol))
+        };
+        if let Some((_, old)) = found {
+            if old.is_some() && !replace(self.sym(old)) {
+                return false;
+            }
+        }
+        // Only a write takes a shared table chunk back, like `set`.
+        let current = self.tables.get_mut(table.index());
+        match found {
+            Some((position, _)) => current.entries[position].symbol = symbol,
+            None => current.push(hash, name.0, symbol),
+        }
+        true
     }
 
     /// Go `delete(table, name)`.
@@ -1411,27 +1564,39 @@ macro_rules! args {
     ($($arg:expr),* $(,)?) => { vec![$(::std::string::ToString::to_string(&$arg)),*] };
 }
 
+/// Where a `LinkStore` keeps the record of a key.
+#[derive(Clone, Copy, Debug)]
+pub enum LinkSlot {
+    /// An arena handle (`TypeId`, `SymbolId`, ...): an index into one page
+    /// table for the whole arena.
+    Arena(usize),
+    /// A node or flow node handle: (file, local index + 1). Each file has
+    /// its own page table.
+    File(usize, usize),
+    /// Any other key (a synthetic node): the hash map.
+    Map,
+}
+
 /// A `LinkStore` key. Arena handles are dense small indexes, and node and
 /// flow node handles are dense small indexes within a file, so their links
 /// live in paged slot arrays instead of a hash map.
 pub trait LinkKey: Copy + Eq + std::hash::Hash {
-    /// The (group, index) of a key with paged slots, or `None` for a key
-    /// that lives in the hash map.
-    fn dense_key(self) -> Option<(usize, usize)>;
+    /// Where the record of this key lives.
+    fn link_slot(self) -> LinkSlot;
 }
 
-macro_rules! dense_link_key {
+macro_rules! arena_link_key {
     ($($name:ident),*) => {$(
         impl LinkKey for $name {
             #[inline]
-            fn dense_key(self) -> Option<(usize, usize)> {
-                Some((0, self.index()))
+            fn link_slot(self) -> LinkSlot {
+                LinkSlot::Arena(self.index())
             }
         }
     )*};
 }
 
-dense_link_key!(
+arena_link_key!(
     TypeId,
     SymbolId,
     SignatureId,
@@ -1444,42 +1609,72 @@ dense_link_key!(
 
 /// Files with an index below this get paged node slots. Synthetic nodes
 /// (a file index near `u32::MAX`) use the hash map.
-const LINK_MAX_GROUPS: u64 = 1 << 20;
+const LINK_MAX_FILES: u64 = 1 << 20;
 
-/// Splits a (file << 32 | local + 1) handle into (file, local + 1).
+/// The slot of a (file << 32 | local + 1) handle.
 #[inline]
-fn file_dense_key(handle: u64) -> Option<(usize, usize)> {
+fn file_link_slot(handle: u64) -> LinkSlot {
     let file = handle >> 32;
-    (file < LINK_MAX_GROUPS).then_some((file as usize, (handle & 0xffff_ffff) as usize))
+    if file < LINK_MAX_FILES {
+        LinkSlot::File(file as usize, (handle & 0xffff_ffff) as usize)
+    } else {
+        LinkSlot::Map
+    }
 }
 
 impl LinkKey for Node {
     #[inline]
-    fn dense_key(self) -> Option<(usize, usize)> {
-        file_dense_key(self.0)
+    fn link_slot(self) -> LinkSlot {
+        file_link_slot(self.0)
     }
 }
 
 impl LinkKey for FlowNodeId {
     #[inline]
-    fn dense_key(self) -> Option<(usize, usize)> {
-        file_dense_key(self.0)
+    fn link_slot(self) -> LinkSlot {
+        file_link_slot(self.0)
     }
 }
 
-/// Slots per page of a `LinkStore`. Small pages keep sparse stores small.
-const LINK_PAGE_BITS: usize = 6;
-const LINK_PAGE_SIZE: usize = 1 << LINK_PAGE_BITS;
+/// Slots per page for arena keys. Pages are allocated on first use, so a
+/// store that few keys use stays small. Larger pages make the page table
+/// smaller, but cost memory in sparse stores (check query peak RSS).
+const ARENA_PAGE_SIZE: usize = 1 << 6;
+/// Slots per page for file keys. Small pages keep sparse stores small.
+const FILE_PAGE_SIZE: usize = 1 << 6;
 
-type LinkPages = Vec<Option<Box<[u32; LINK_PAGE_SIZE]>>>;
+/// A page table: pages of `N` slots, allocated on first use. A slot holds
+/// the value index + 1; zero is absent.
+type SlotPages<const N: usize> = Vec<Option<Box<[u32; N]>>>;
+
+/// The slot of `index` in `pages`, or zero when its page is absent.
+#[inline]
+fn page_slot<const N: usize>(pages: &[Option<Box<[u32; N]>>], index: usize) -> u32 {
+    match pages.get(index / N) {
+        Some(Some(page)) => page[index % N],
+        _ => 0,
+    }
+}
+
+/// The slot of `index` in `pages`. Adds the page if it is absent.
+fn page_slot_mut<const N: usize>(pages: &mut SlotPages<N>, index: usize) -> &mut u32 {
+    let page = index / N;
+    if page >= pages.len() {
+        pages.resize_with(page + 1, || None);
+    }
+    &mut pages[page].get_or_insert_with(|| Box::new([0; N]))[index % N]
+}
 
 /// Go `core.LinkStore[K, V]`: lazily created per-key link records.
-/// Dense keys map through paged slots (value index + 1, zero is absent) into
-/// `values`. Other keys use a hash map.
+/// Dense keys map through paged slots into `values`. Other keys use a hash
+/// map. `get` reads an existing record inline and adds a new one out of line.
 #[derive(Clone, Debug)]
 pub struct LinkStore<K: LinkKey, V: Default> {
-    /// Slot pages by key group (the file for node keys).
-    groups: Vec<LinkPages>,
+    /// Slot pages of arena keys. One flat table, so a hit reads the page
+    /// pointer, the slot and the value, with no per-group hop.
+    arena: SlotPages<ARENA_PAGE_SIZE>,
+    /// Slot pages of file keys, by file.
+    files: Vec<SlotPages<FILE_PAGE_SIZE>>,
     /// Dense values in fixed-size chunks, so growth never copies or
     /// over-allocates a large block.
     values: Vec<Vec<V>>,
@@ -1488,13 +1683,13 @@ pub struct LinkStore<K: LinkKey, V: Default> {
 }
 
 /// Values per chunk of a dense `LinkStore`.
-const LINK_CHUNK_BITS: usize = 12;
-const LINK_CHUNK_SIZE: usize = 1 << LINK_CHUNK_BITS;
+const LINK_CHUNK_SIZE: usize = 1 << 12;
 
 impl<K: LinkKey, V: Default> Default for LinkStore<K, V> {
     fn default() -> Self {
         Self {
-            groups: Vec::new(),
+            arena: Vec::new(),
+            files: Vec::new(),
             values: Vec::new(),
             len: 0,
             map: FxHashMap::default(),
@@ -1503,73 +1698,93 @@ impl<K: LinkKey, V: Default> Default for LinkStore<K, V> {
 }
 
 impl<K: LinkKey, V: Default> LinkStore<K, V> {
-    /// The value index for a dense key, if it has a record.
+    /// The value index of a key with slots, if it has a record.
     #[inline]
-    fn dense_slot(&self, group: usize, index: usize) -> Option<usize> {
-        let page = self
-            .groups
-            .get(group)?
-            .get(index >> LINK_PAGE_BITS)?
-            .as_ref()?;
-        let slot = page[index & (LINK_PAGE_SIZE - 1)];
-        (slot != 0).then(|| slot as usize - 1)
+    fn slot_value(&self, slot: LinkSlot) -> Option<usize> {
+        let stored = match slot {
+            LinkSlot::Arena(index) => page_slot(&self.arena, index),
+            LinkSlot::File(file, index) => self
+                .files
+                .get(file)
+                .map_or(0, |pages| page_slot(pages, index)),
+            LinkSlot::Map => 0,
+        };
+        (stored as usize).checked_sub(1)
     }
 
     #[inline]
     fn value(&self, value: usize) -> &V {
-        &self.values[value >> LINK_CHUNK_BITS][value & (LINK_CHUNK_SIZE - 1)]
+        &self.values[value / LINK_CHUNK_SIZE][value % LINK_CHUNK_SIZE]
     }
 
     /// Go `store.Get(key)`: creates the record on first use.
+    #[inline]
     pub fn get(&mut self, key: K) -> &mut V {
-        let Some((group, index)) = key.dense_key() else {
-            return self.map.entry(key).or_default();
+        let slot = key.link_slot();
+        if matches!(slot, LinkSlot::Map) {
+            return self.map_get(key);
+        }
+        let value = match self.slot_value(slot) {
+            Some(value) => value,
+            None => self.create(slot),
         };
-        if group >= self.groups.len() {
-            self.groups.resize_with(group + 1, Vec::new);
-        }
-        let pages = &mut self.groups[group];
-        let page_index = index >> LINK_PAGE_BITS;
-        if page_index >= pages.len() {
-            pages.resize_with(page_index + 1, || None);
-        }
-        let page = pages[page_index].get_or_insert_with(|| Box::new([0; LINK_PAGE_SIZE]));
-        let slot = &mut page[index & (LINK_PAGE_SIZE - 1)];
-        if *slot == 0 {
-            if self.len & (LINK_CHUNK_SIZE - 1) == 0 {
-                // The first chunk grows on demand; small stores stay small.
-                self.values.push(if self.len == 0 {
-                    Vec::new()
-                } else {
-                    Vec::with_capacity(LINK_CHUNK_SIZE)
-                });
+        &mut self.values[value / LINK_CHUNK_SIZE][value % LINK_CHUNK_SIZE]
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn map_get(&mut self, key: K) -> &mut V {
+        self.map.entry(key).or_default()
+    }
+
+    /// Adds the record of a key with slots, which has none, and returns its
+    /// value index. Records get value indexes in creation order.
+    #[cold]
+    #[inline(never)]
+    fn create(&mut self, slot: LinkSlot) -> usize {
+        let stored = match slot {
+            LinkSlot::Arena(index) => page_slot_mut(&mut self.arena, index),
+            LinkSlot::File(file, index) => {
+                if file >= self.files.len() {
+                    self.files.resize_with(file + 1, Vec::new);
+                }
+                page_slot_mut(&mut self.files[file], index)
             }
-            self.values
-                .last_mut()
-                .expect("link chunk")
-                .push(V::default());
-            self.len += 1;
-            *slot = u32::try_from(self.len).expect("link store overflow");
+            LinkSlot::Map => unreachable!("map keys have no slot"),
+        };
+        if self.len % LINK_CHUNK_SIZE == 0 {
+            // The first chunk grows on demand; small stores stay small.
+            self.values.push(if self.len == 0 {
+                Vec::new()
+            } else {
+                Vec::with_capacity(LINK_CHUNK_SIZE)
+            });
         }
-        let value = *slot as usize - 1;
-        &mut self.values[value >> LINK_CHUNK_BITS][value & (LINK_CHUNK_SIZE - 1)]
+        self.values
+            .last_mut()
+            .expect("link chunk")
+            .push(V::default());
+        let value = self.len;
+        self.len += 1;
+        *stored = u32::try_from(self.len).expect("link store overflow");
+        value
     }
 
     /// Go `store.Has(key)`.
     #[must_use]
     pub fn has(&self, key: K) -> bool {
-        match key.dense_key() {
-            Some((group, index)) => self.dense_slot(group, index).is_some(),
-            None => self.map.contains_key(&key),
+        match key.link_slot() {
+            LinkSlot::Map => self.map.contains_key(&key),
+            slot => self.slot_value(slot).is_some(),
         }
     }
 
     /// Go `store.TryGet(key)`.
     #[must_use]
     pub fn try_get(&self, key: K) -> Option<&V> {
-        match key.dense_key() {
-            Some((group, index)) => self.dense_slot(group, index).map(|value| self.value(value)),
-            None => self.map.get(&key),
+        match key.link_slot() {
+            LinkSlot::Map => self.map.get(&key),
+            slot => self.slot_value(slot).map(|value| self.value(value)),
         }
     }
 }
@@ -1613,6 +1828,57 @@ macro_rules! unported {
         $crate::core::record_unported($go_name);
         panic!("unported Go code: {}", $go_name)
     }};
+}
+
+/// The panic payload of `go_panic`.
+pub struct GoPanic {
+    /// The Go panic value as the Go runtime prints it (port form).
+    pub message: String,
+    /// The port site, for the stderr report.
+    pub location: &'static std::panic::Location<'static>,
+}
+
+/// Go `panic(message)` at a site where the pinned Go panics on the same
+/// input. It is not a port gap, so the run ends as the Go runtime ends it:
+/// guards that keep a run going after a port gap pass it on
+/// (`resume_go_panic`), and the bins write the output so far, print it with
+/// `print_go_panic` and exit `EXIT_GO_PANIC`. Other panics stay port gaps
+/// (`execute::tsc::EXIT_UNPORTED`).
+#[track_caller]
+pub fn go_panic(message: String) -> ! {
+    std::panic::panic_any(GoPanic {
+        message,
+        location: std::panic::Location::caller(),
+    })
+}
+
+/// The Go runtime exit code after a panic that nothing recovers.
+pub const EXIT_GO_PANIC: i32 = 2;
+
+/// Continues a caught `go_panic`. Returns any other payload.
+pub fn resume_go_panic(payload: Box<dyn std::any::Any + Send>) -> Box<dyn std::any::Any + Send> {
+    if payload.is::<GoPanic>() {
+        std::panic::resume_unwind(payload);
+    }
+    payload
+}
+
+/// Prints a caught `go_panic` to stderr and returns true. The first line is
+/// the Go runtime one (`panic: <message>`). The port site takes the place of
+/// the goroutine trace. False for any other payload.
+pub fn print_go_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    let Some(panic) = payload.downcast_ref::<GoPanic>() else {
+        return false;
+    };
+    let text = format!(
+        "panic: {}\n\n\t{}:{}\n",
+        panic.message,
+        panic.location.file(),
+        panic.location.line()
+    );
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(&crate::scanner_util::go_string_bytes(&text));
+    true
 }
 
 /// One loaded source file. Parser data is ready when the program is

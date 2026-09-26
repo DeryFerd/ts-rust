@@ -588,9 +588,9 @@ fn nil_iteration_types_resolver() -> Rc<IterationTypesResolver> {
 // - `symbolArena`, `signatureArena`, `indexInfoArena` are replaced by the
 //   arenas at the end (`symbols`, `types`, `signatures`, `index_infos`,
 //   `type_predicates`, `mappers`, `inference_contexts`), see `PORTING.md`.
-// - `regExpScanner` (Go scanner), `ctx`, `mu` and `tracer` are out of
-//   scope (scanner object, cancellation, concurrency, tracing) and are not
-//   fields. `emitResolver` plus `emitResolverOnce` is the
+// - `regExpScanner` (Go scanner), `ctx` and `mu` are out of scope
+//   (scanner object, cancellation, concurrency) and are not fields.
+//   `tracer` is the last field (see `crate::tracing`). `emitResolver` plus `emitResolverOnce` is the
 //   `Option<Rc<EmitResolver>>` field `emit_resolver`.
 // - `sync.Once` fields become `bool` "done" flags.
 // - `*T` pools and shared structs (`*Relation`, `*Relater`, `*FlowState`,
@@ -920,6 +920,8 @@ pub struct Checker {
     pub deferred_diagnostic_callbacks: Vec<Rc<dyn Fn(&mut Checker)>>,
     /// Go `typeToStringNodeBuilder` (`getNodeBuilder` caches it).
     pub type_to_string_nodebuilder: Option<Rc<RefCell<NodeBuilder>>>,
+    /// PORT: not in Go. Reusable buffers of `get_named_members`.
+    pub(crate) named_members_scratch: crate::checker::checker_p24::NamedMembersScratch,
 
     // Arenas (PORTING.md "Checker data"). Index 0 of each is a dummy entry
     // so handle value 0 stays nil.
@@ -930,6 +932,10 @@ pub struct Checker {
     pub type_predicates: Vec<TypePredicate>,
     pub mappers: ChunkedArena<TypeMapper>,
     pub inference_contexts: Vec<InferenceContext>,
+
+    /// Go `tracer *Tracer` (checker.go:897): optional tracer for trace
+    /// events and type recording (for --generateTrace). None is Go nil.
+    pub tracer: Option<crate::tracing::Tracer>,
 }
 
 // Arena accessors (PORTING.md "Checker data"). Handles index their arena
@@ -1019,7 +1025,8 @@ impl Checker {
 // Go: checker/checker.go:902 NewChecker
 // PORT: Go `NewChecker(program) (*Checker, *sync.Mutex)` becomes
 // `Checker::new(checker_index)`. The program is the installed `prog()`; the
-// mutex and tracer are dropped. Go `c.id = nextCheckerID.Add(1)` numbers
+// mutex is dropped, and the tracer comes from the process tracing session
+// (`crate::tracing::new_checker_tracer`). Go `c.id = nextCheckerID.Add(1)` numbers
 // checkers from 1 in creation order; the pool creates them in index order,
 // so `id = checker_index + 1`.
 // PORT: Go binds every file (`program.BindSourceFiles`) before it creates
@@ -1359,6 +1366,7 @@ impl Checker {
             non_existent_properties: FxHashSet::default(),
             deferred_diagnostic_callbacks: Vec::new(),
             type_to_string_nodebuilder: None,
+            named_members_scratch: Default::default(),
             symbols: bound_symbols,
             types: ChunkedArena::with_nil(Type::default()),
             signatures: vec![Signature::default()],
@@ -1366,6 +1374,9 @@ impl Checker {
             type_predicates: vec![TypePredicate::default()],
             mappers: ChunkedArena::with_nil(TypeMapper::default()),
             inference_contexts: vec![InferenceContext::default()],
+            // Go: compiler/checkerpool.go:104 makes the tracer when the pool
+            // has a tracing session; NewChecker stores it (checker.go:905).
+            tracer: crate::tracing::new_checker_tracer(checker_index),
         };
         // Closure optimization
         c.compare_symbols = Rc::new(|c: &mut Checker, s1: SymbolId, s2: SymbolId| -> i32 {

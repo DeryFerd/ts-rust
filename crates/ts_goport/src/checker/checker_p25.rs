@@ -35,7 +35,7 @@ impl Checker {
         // list is a `SharedList`, so the clone copies no elements.
         let links = self.type_node_links.get(declaration);
         let resolved_type = links.resolved_type;
-        let mut outer_type_parameters = links.outer_type_parameters.clone();
+        let cached_outer_type_parameters = links.outer_type_parameters.clone();
         if t_object_flags.intersects(ObjectFlags::REFERENCE) {
             // Deferred type reference
             target = resolved_type;
@@ -45,10 +45,12 @@ impl Checker {
             target = t;
         }
         // PORT: Go tells a nil `outerTypeParameters` (not computed) from an
-        // empty one (computed, none in scope). `TypeNodeLinks` stores a
-        // `SharedList`, so an empty list is computed again. The computation
-        // only reads cached checker state, so the result is the same.
-        if outer_type_parameters.is_empty() {
+        // empty one (computed, none in scope). `None` is Go nil, so an empty
+        // list is also cached and the scope and reference walk runs once per
+        // declaration, as in Go.
+        let outer_type_parameters = if let Some(list) = cached_outer_type_parameters {
+            list
+        } else {
             // The first time an anonymous type is instantiated we compute and store a list of the type
             // parameters that are in scope (and therefore potentially referenced). For type literals that
             // aren't the right hand side of a generic type alias declaration we optimize by reducing the
@@ -83,10 +85,10 @@ impl Checker {
                     }
                 }
             }
-            outer_type_parameters = type_parameters.into();
-            self.type_node_links.get(declaration).outer_type_parameters =
-                outer_type_parameters.clone();
-        }
+            let list: SharedList<TypeId> = type_parameters.into();
+            self.type_node_links.get(declaration).outer_type_parameters = Some(list.clone());
+            list
+        };
         if outer_type_parameters.is_empty() {
             return t;
         }
@@ -1222,7 +1224,10 @@ impl Checker {
 
     // Go: checker/checker.go:22903 getTypeFromTypeReference
     pub fn get_type_from_type_reference(&mut self, node: Node) -> TypeId {
-        if self.type_node_links.get(node).resolved_type.is_nil() {
+        // PORT: a cache hit reads the links once. The miss path stores the
+        // result and returns it, which is what Go reads back from the links.
+        let cached = self.type_node_links.get(node).resolved_type;
+        if cached.is_nil() {
             // Cache both the resolved symbol and the resolved type. The resolved symbol is needed when we check the
             // type reference in checkTypeReferenceNode.
             // handle LS queries on the `const` in `x as const` by resolving to the type of `x`
@@ -1239,8 +1244,9 @@ impl Checker {
                     }
                 };
             self.type_node_links.get(node).resolved_type = resolved;
+            return resolved;
         }
-        self.type_node_links.get(node).resolved_type
+        cached
     }
 
     // Go: checker/checker.go:22920 getIntendedTypeFromJSDocTypeReference

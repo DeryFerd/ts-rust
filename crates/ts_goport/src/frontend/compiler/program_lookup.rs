@@ -117,12 +117,11 @@ impl NewProgram {
     }
 
     // Go: program.go:1841 (*Program).ExplainFiles
-    // PORT: Go writes to an `io.Writer`; this appends to a `String`. The
-    // locale parameter is dropped (the port has only English messages).
+    // PORT: Go writes to an `io.Writer`; this appends to a `String`.
     // Go `fmt.Fprintln(w, "  ", x)` puts one more space between the operands.
     // PORT: the Go `explainFile` closure increments `filesExplained`; here
     // the callers do it, so the loop condition can read the counter.
-    pub fn explain_files(&self, w: &mut String) {
+    pub fn explain_files(&self, w: &mut String, locale: &crate::locale::Locale) {
         let to_relative_file_name = |file_name: &str| {
             get_relative_path_from_directory(
                 &self.get_current_directory(),
@@ -139,7 +138,11 @@ impl NewProgram {
                 .get(&file.path())
             {
                 for reason in reasons {
-                    let _ = writeln!(w, "   {}", reason.to_diagnostic(self, true).localize());
+                    let _ = writeln!(
+                        w,
+                        "   {}",
+                        reason.to_diagnostic(self, true).localize(locale)
+                    );
                 }
             }
             for diag in self
@@ -147,7 +150,7 @@ impl NewProgram {
                 .include_processor
                 .explain_redirect_and_implied_format(self, &file.path(), to_relative_file_name)
             {
-                let _ = writeln!(w, "   {}", diag.localize());
+                let _ = writeln!(w, "   {}", diag.localize(locale));
             }
         };
         let mut files_explained: i32 = 0;

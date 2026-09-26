@@ -191,9 +191,11 @@ impl Checker {
         self.ty_mut(t).object_flags |= ObjectFlags::MEMBERS_RESOLVED;
         self.ty_mut(t).as_structured_type_mut().members = members;
         let t_symbol = self.ty(t).symbol;
+        // `get_named_members` returns the final list (one exact-size
+        // allocation), so it is stored without a copy.
         let properties = self.get_named_members(members, t_symbol);
         let data = self.ty_mut(t).as_structured_type_mut();
-        data.properties = properties.into();
+        data.properties = properties;
         if !call_signatures.is_empty() {
             if !construct_signatures.is_empty() {
                 let mut signatures = call_signatures.to_vec();
@@ -371,6 +373,31 @@ impl Checker {
         resolved_type_predicate: TypePredicateId,
         min_argument_count: i32,
     ) -> SignatureId {
+        self.new_signature_owned(
+            flags,
+            declaration,
+            type_parameters.to_vec(),
+            this_parameter,
+            parameters.to_vec(),
+            resolved_return_type,
+            resolved_type_predicate,
+            min_argument_count,
+        )
+    }
+
+    /// `new_signature` for a caller that owns the lists, so the signature
+    /// takes them without a copy.
+    pub fn new_signature_owned(
+        &mut self,
+        flags: SignatureFlags,
+        declaration: Node,
+        type_parameters: Vec<TypeId>,
+        this_parameter: SymbolId,
+        parameters: Vec<SymbolId>,
+        resolved_return_type: TypeId,
+        resolved_type_predicate: TypePredicateId,
+        min_argument_count: i32,
+    ) -> SignatureId {
         self.signature_count += 1;
         let id = SignatureId(u32::try_from(self.signatures.len()).expect("signature overflow"));
         debug_assert_eq!(id.0, self.signature_count);
@@ -378,8 +405,8 @@ impl Checker {
             id,
             flags,
             declaration,
-            type_parameters: type_parameters.to_vec(),
-            parameters: parameters.to_vec(),
+            type_parameters,
+            parameters,
             this_parameter,
             resolved_return_type,
             resolved_type_predicate,
@@ -1505,7 +1532,6 @@ impl Checker {
 
     // Go: checker/checker.go:25822 removeSubtypes
     // PORT: Go returns nil when the union is too complex; Rust returns None.
-    // The tracer instant event in Go is not ported (the checker has no tracer).
     pub fn remove_subtypes(
         &mut self,
         types: Vec<TypeId>,
@@ -1600,6 +1626,13 @@ impl Checker {
                             // caps union types at 1000 unique object types.
                             let estimated_count = (count / (length - i)) * length;
                             if estimated_count > 1000000 {
+                                if let Some(tr) = self.tracer {
+                                    tr.instant(
+                                        crate::tracing::Phase::CheckTypes,
+                                        "removeSubtypes_DepthLimit",
+                                        vec![("estimatedCount", estimated_count.into())],
+                                    );
+                                }
                                 let node = self.current_node;
                                 self.error(node, diag::Expression_produces_a_union_type_that_is_too_complex_to_represent, args![]);
                                 return None;

@@ -744,6 +744,19 @@ pub fn frozen_store_parent(n: Node) -> Option<Node> {
     frozen_header(n).map(|h| h.read(n.file_index()).parent)
 }
 
+/// The ts_ast node of a store node after freeze: the inlined fast path of
+/// `ast_node_of`. `None` before freeze and for nil, synthetic and legacy
+/// nodes. Panics like `try_store_ast_node` on a nil or alias slot.
+#[inline]
+#[must_use]
+pub fn frozen_store_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
+    if n.is_nil() {
+        return None;
+    }
+    let nodes = FROZEN.get()?.nodes.get(n.file_index())?;
+    Some(nodes[slot_index(n)].expect("store handle does not name a node slot"))
+}
+
 /// `store_ast_node(n)` when `n` is a store node, in one lookup (see
 /// `try_store_header`). `None` for nil, synthetic and legacy nodes.
 #[inline]

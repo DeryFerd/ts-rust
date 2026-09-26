@@ -4,6 +4,7 @@
 
 use crate::prelude::*;
 
+use smallvec::SmallVec;
 use std::hash::Hasher as _;
 
 impl Checker {
@@ -954,14 +955,14 @@ impl Checker {
 // PORT: Go is generic over `~int32 | ~uint32`; callers pass the value as
 // `u32` (`TypeId.0`, flag `.0`, or `as u32`).
 pub fn hash_write32(h: &mut KeyHasher, value: u32) {
-    h.write(&value.to_le_bytes());
+    h.write_u32(value);
 }
 
 // Go: checker/checker.go:17293 hashWrite64
 // PORT: Go is generic over `~int | ~uint | ~int64 | ~uint64`; callers pass
 // the value as `u64` (Go `uint64(value)` conversion, so negative ints wrap).
 pub fn hash_write64(h: &mut KeyHasher, value: u64) {
-    h.write(&value.to_le_bytes());
+    h.write_u64(value);
 }
 
 // Go: checker/checker.go:17307 CacheHashKey
@@ -996,54 +997,52 @@ impl CacheHashKey {
 /// PORT: the crate has no xxh3 dependency and the contract forbids new ones,
 /// so `xxh3_hash128` below is a hand port of `zeebo/xxh3` `Hash128` (seed 0).
 /// Go's streaming `Hasher` buffers the bytes and gives the same result as
-/// `Hash128` over all written bytes, so this hasher buffers them too: short
-/// keys stay in an inline buffer, longer keys spill to the heap. Split writes
-/// hash the same as one write, like Go.
-#[derive(Clone, Debug)]
+/// `Hash128` over all written bytes, so this hasher buffers them too. Split
+/// writes hash the same as one write, like Go.
+///
+/// PERF: `SmallVec::new` leaves the inline storage uninitialized, so a new
+/// hasher costs no zero fill. Keys up to 512 bytes (type lists, generic
+/// relation keys, conditional keys) stay inline; longer keys spill to the heap.
+#[derive(Clone, Debug, Default)]
 pub struct KeyHasher {
-    len: usize,
-    inline: [u8; KEY_HASHER_INLINE],
-    // Holds every byte once the key is longer than the inline buffer.
-    spill: Vec<u8>,
+    buf: SmallVec<[u8; KEY_HASHER_INLINE]>,
 }
 
-const KEY_HASHER_INLINE: usize = 120;
-
-impl Default for KeyHasher {
-    fn default() -> Self {
-        Self {
-            len: 0,
-            inline: [0; KEY_HASHER_INLINE],
-            spill: Vec::new(),
-        }
-    }
-}
+const KEY_HASHER_INLINE: usize = 512;
 
 impl KeyHasher {
     /// Go `h.Write(bytes)`.
     #[inline]
     pub fn write(&mut self, bytes: &[u8]) {
-        let end = self.len + bytes.len();
-        if end <= KEY_HASHER_INLINE {
-            self.inline[self.len..end].copy_from_slice(bytes);
-        } else {
-            if self.len <= KEY_HASHER_INLINE {
-                self.spill.reserve(end.max(2 * KEY_HASHER_INLINE));
-                self.spill.extend_from_slice(&self.inline[..self.len]);
-            }
-            self.spill.extend_from_slice(bytes);
-        }
-        self.len = end;
+        self.buf.extend_from_slice(bytes);
+    }
+
+    // PERF: the fixed-size writes below append the same bytes as `write`.
+    // `extend_from_slice` goes through `insert_from_slice`, which calls
+    // memmove and memcpy for every write. `push` and `extend` over a
+    // fixed-size array inline to a capacity check and byte stores.
+
+    /// Go `h.Write([]byte{c})` (`keyBuilder.writeByte`).
+    #[inline]
+    pub fn write_byte(&mut self, c: u8) {
+        self.buf.push(c);
+    }
+
+    /// Go `hashWrite32`: the 4 little-endian bytes of `value`.
+    #[inline]
+    pub fn write_u32(&mut self, value: u32) {
+        self.buf.extend(value.to_le_bytes());
+    }
+
+    /// Go `hashWrite64`: the 8 little-endian bytes of `value`.
+    #[inline]
+    pub fn write_u64(&mut self, value: u64) {
+        self.buf.extend(value.to_le_bytes());
     }
 
     /// Go `h.Sum128()`.
     pub fn sum128(&self) -> CacheHashKey {
-        let bytes = if self.len <= KEY_HASHER_INLINE {
-            &self.inline[..self.len]
-        } else {
-            &self.spill[..]
-        };
-        let (hi, lo) = xxh3_hash128(bytes);
+        let (hi, lo) = xxh3_hash128(&self.buf);
         CacheHashKey { hi, lo }
     }
 }
@@ -1314,7 +1313,7 @@ impl KeyBuilder {
 
     // Go: checker/checker.go:17321 keyBuilder.writeByte
     pub fn write_byte(&mut self, c: u8) {
-        self.h.write(&[c]);
+        self.h.write_byte(c);
     }
 
     // Go: checker/checker.go:17325 keyBuilder.writeString

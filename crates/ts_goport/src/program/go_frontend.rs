@@ -205,7 +205,13 @@ pub(super) fn try_load_with(
         // Go reports these unrecoverable errors and exits.
         let messages: Vec<String> = errors
             .iter()
-            .map(|d| format!("error TS{}: {}", d.code, d.localize()))
+            .map(|d| {
+                format!(
+                    "error TS{}: {}",
+                    d.code,
+                    d.localize(&crate::locale::DEFAULT)
+                )
+            })
             .collect();
         return Err(messages.join("\n"));
     }
@@ -214,6 +220,12 @@ pub(super) fn try_load_with(
     // Go: tsc.go:293 NewCachedFSCompilerHost, tsc.go:301 NewProgram.
     let host =
         new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, Some(trace_from_sys()));
+    // Go: tsc.go:298 startTracingIfNeeded. PORT: the warning goes to stdout
+    // (Go `sys.Writer()`) as Go bytes, like `trace_from_sys`.
+    if let Some(warning) = crate::tracing::start_tracing_if_needed(&config, false) {
+        let _ =
+            crate::execute::tsc::write_go_output(&mut std::io::stdout().lock(), warning.as_bytes());
+    }
     // Go: tsc.go:305 times `NewProgram`. PORT: the port's `NewProgram` is
     // `install_new_program`, which also builds the Go files, as the build
     // worker times it.

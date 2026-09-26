@@ -72,6 +72,8 @@ pub fn emit_with(
     options: EmitOptions,
     wrap: fn(&dyn Fn() -> EmitResult) -> EmitResult,
 ) -> EmitResult {
+    let _trace = crate::tracing::get()
+        .map(|tr| tr.push(crate::tracing::Phase::Emit, "emit", Vec::new(), true));
     if options.emit_only != EmitOnly::ForcedDts {
         if let Some(result) = handle_no_emit_on_error(options.target_source_file) {
             return result;

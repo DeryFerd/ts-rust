@@ -34,7 +34,8 @@ pub enum EmitOnly {
 }
 
 // Go: compiler/emitter.go:33 emitter
-// PORT: Go `tr *tracing.Tracing` is left out (tracing is skipped).
+// PORT: Go `tr *tracing.Tracing` is the process session
+// (`crate::tracing::get`), so it is not a field.
 pub struct Emitter {
     pub host: Rc<crate::program::EmitHost>,
     pub emit_only: EmitOnly,
@@ -53,6 +54,17 @@ impl Emitter {
 
     // Go: compiler/emitter.go:45 emitter.emit
     pub fn emit(&mut self) {
+        let _trace = crate::tracing::get().map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Emit,
+                "emit",
+                vec![(
+                    "path",
+                    source_file_info(self.source_file).path.clone().into(),
+                )],
+                true,
+            )
+        });
         let js_file_path = self.paths.js_file_path().to_string();
         let source_map_file_path = self.paths.source_map_file_path().to_string();
         let declaration_file_path = self.paths.declaration_file_path().to_string();
@@ -89,6 +101,14 @@ impl Emitter {
         emit_context: &Rc<EmitContext>,
         mut source_file: Node,
     ) -> Node {
+        let _trace = crate::tracing::get().map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Emit,
+                "transformNodes",
+                vec![("path", source_file_info(source_file).path.clone().into())],
+                false,
+            )
+        });
         for mut transformer in get_script_transformers(emit_context, &self.host, source_file) {
             source_file = transformer.transform_source_file(source_file);
         }
@@ -103,6 +123,14 @@ impl Emitter {
         declaration_file_path: &str,
         declaration_map_path: &str,
     ) -> (Node, Vec<Diagnostic>) {
+        let _trace = crate::tracing::get().map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Emit,
+                "transformNodes",
+                vec![("path", source_file_info(source_file).path.clone().into())],
+                false,
+            )
+        });
         let mut diags = Vec::new();
         for mut transformer in self.get_declaration_transformers(
             emit_context,
@@ -132,6 +160,15 @@ impl Emitter {
             self.emit_result.emit_skipped = true;
             return;
         }
+
+        let _trace = crate::tracing::get().map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Emit,
+                "emitJsFileOrBundle",
+                vec![("jsFilePath", js_file_path.to_string().into())],
+                true,
+            )
+        });
 
         let (emit_context, put_emit_context) = get_emit_context();
 
@@ -186,6 +223,18 @@ impl Emitter {
         {
             return;
         }
+
+        let _trace = crate::tracing::get().map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Emit,
+                "emitDeclarationFileOrBundle",
+                vec![(
+                    "declarationFilePath",
+                    declaration_file_path.to_string().into(),
+                )],
+                true,
+            )
+        });
 
         let (emit_context, put_emit_context) = get_emit_context();
         let (source_file, diags) = self.run_declaration_transformers(

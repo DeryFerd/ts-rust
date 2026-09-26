@@ -419,7 +419,7 @@ pub struct SymbolNodeLinks {
 #[derive(Clone, Debug, Default)]
 pub struct TypeNodeLinks {
     pub resolved_type: TypeId, // Resolved type associated with node
-    pub outer_type_parameters: SharedList<TypeId>, // Outer type parameters of anonymous object type
+    pub outer_type_parameters: Option<SharedList<TypeId>>, // Outer type parameters of anonymous object type. None until computed, like Go nil.
 }
 
 // Links for enum members
@@ -597,8 +597,13 @@ impl TypeAliasExt for Option<Rc<TypeAlias>> {
 // PORT: Go `Type.checker` is dropped; every type lives in the arena of the
 // checker that created it. Go `TypeBase` (the embedded `Type` inside each data
 // struct) disappears: `Type` owns its `data`.
+// PORT: layout only. `repr(C)` keeps the hot header (flags, ids, alias) in
+// front of `data`, and `align(64)` starts each arena type on a cache line, so
+// a flags test and the `TypeData` tag read share one line. The header is 24
+// bytes and `TypeData` 168, so the size stays 192 (3 lines).
 // Go: checker/types.go:666 Type
 #[derive(Clone, Default)]
+#[repr(C, align(64))]
 pub struct Type {
     pub flags: TypeFlags,
     pub object_flags: ObjectFlags,
@@ -607,6 +612,9 @@ pub struct Type {
     pub alias: Option<Rc<TypeAlias>>,
     pub data: TypeData, // Type specific data
 }
+
+// The alignment must not grow a type past 3 cache lines.
+const _: () = assert!(std::mem::size_of::<Type>() <= 192);
 
 #[cold]
 #[inline(never)]

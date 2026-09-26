@@ -8,7 +8,7 @@ use std::cell::OnceCell;
 
 /// Go `compiler.ProgramOptions`.
 // PORT: `CreateCheckerPool` is dropped. The checker pool stays in
-// program.rs. `Tracing` is dropped (no tracing in this port).
+// program.rs. `Tracing` is the process session (`crate::tracing::get`).
 #[derive(Clone)]
 pub struct ProgramOptions {
     pub host: Rc<dyn CompilerHost>,
@@ -342,7 +342,21 @@ impl NewProgram {
 
 // Go: program.go:269 NewProgram
 pub fn new_program(opts: ProgramOptions) -> NewProgram {
-    // PORT: Go tracing is dropped.
+    let _trace = crate::tracing::get().map(|tr| {
+        tr.push(
+            crate::tracing::Phase::Program,
+            "createProgram",
+            vec![(
+                "configFilePath",
+                opts.config
+                    .compiler_options()
+                    .config_file_path
+                    .clone()
+                    .into(),
+            )],
+            true,
+        )
+    });
     // PORT: Go builds `p` with a zero `processedFiles` and then calls
     // `p.SingleThreaded()`. `ProcessedFiles` has no zero value, so the files
     // are processed first. `SingleThreaded` reads only `opts`.
@@ -592,7 +606,7 @@ impl NewProgram {
     }
 
     // Go: program.go:402 (*Program).Tracing
-    // PORT: tracing is dropped.
+    // PORT: the session is the process global `crate::tracing::get`.
 
     // Go: program.go:403 (*Program).GetConfigFileParsingDiagnostics
     pub fn get_config_file_parsing_diagnostics(&self) -> Vec<Diagnostic> {

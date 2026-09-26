@@ -79,10 +79,10 @@ pub fn parse_build_options(
 // PORT: Go `*core.CompilerOptions` is `Rc<CompilerOptions>`, as in
 // `ParsedCommandLine`. Go `Raw any` holds the parser's
 // `*collections.OrderedMap`, which is `CompilerOptionsValue::Map`.
-// `sync.Once` plus the cached field is a `OnceCell`.
-// PORT: Go also has `WatchOptions` and `Locale()`. Watch mode is out of
-// scope and the crate has no `WatchOptions` or `locale` package, so both are
-// left out. Neither changes build output for the default locale.
+// `sync.Once` plus the cached field is a `OnceCell` (for both
+// `resolvedProjectPaths` and `locale`).
+// PORT: Go also has `WatchOptions`. Watch mode is out of scope and the crate
+// has no `WatchOptions`, so it is left out. It does not change build output.
 pub struct ParsedBuildCommandLine {
     pub build_options: BuildOptions,
     pub compiler_options: Rc<CompilerOptions>,
@@ -93,6 +93,8 @@ pub struct ParsedBuildCommandLine {
     pub compare_paths_options: ComparePathsOptions,
 
     pub resolved_project_paths: OnceCell<Vec<String>>,
+
+    pub locale: OnceCell<crate::locale::Locale>,
 }
 
 impl ParsedBuildCommandLine {
@@ -109,6 +111,18 @@ impl ParsedBuildCommandLine {
                 })
                 .collect()
         })
+    }
+
+    // Go: tsoptions/parsedbuildcommandline.go:40 (*ParsedBuildCommandLine).Locale
+    // PORT: Go returns the `Locale` value; this returns a clone of the
+    // cached value.
+    pub fn locale(&self) -> crate::locale::Locale {
+        self.locale
+            .get_or_init(|| {
+                let (locale, _) = crate::locale::parse(&self.compiler_options.locale);
+                locale
+            })
+            .clone()
     }
 }
 
@@ -155,6 +169,7 @@ pub fn parse_build_command_line(
             current_directory: host.get_current_directory(),
         },
         resolved_project_paths: OnceCell::new(),
+        locale: OnceCell::new(),
     };
 
     if result.projects.is_empty() {

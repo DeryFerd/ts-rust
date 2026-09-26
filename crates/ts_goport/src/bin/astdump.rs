@@ -12,6 +12,8 @@
 
 use std::fmt::Write as _;
 
+use ts_goport::execute::tsc::write_go_output;
+use ts_goport::frontend::vfs::{os_args, os_path};
 use ts_goport::prelude::*;
 
 fn list_str(prefix: &str, l: NodeList) -> String {
@@ -67,17 +69,23 @@ fn run(project: &str, out_dir: &str) {
         eprintln!("astdump: {message}");
         std::process::exit(1);
     }
-    std::fs::create_dir_all(out_dir).expect("create output directory");
+    // Names are port forms of Go strings (see
+    // `scanner_util::GO_STRING_MARKER`); the OS and stdout get the Go bytes.
+    std::fs::create_dir_all(os_path(out_dir)).expect("create output directory");
     for file in source_files() {
         let mut out = String::new();
         dump(&mut out, file, file, 0, "");
-        std::fs::write(format!("{out_dir}/{}", out_name(file)), out).expect("write dump");
-        println!("{}", source_file_file_name(file));
+        let path = format!("{out_dir}/{}", out_name(file));
+        std::fs::write(os_path(&path), go_string_bytes(&out)).expect("write dump");
+        let _ = write_go_output(
+            &mut std::io::stdout().lock(),
+            format!("{}\n", source_file_file_name(file)).as_bytes(),
+        );
     }
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = os_args();
     let (mut project, mut out_dir) = (None, None);
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {

@@ -101,15 +101,19 @@ fn select_diagnostic_based_on_module_name_no_name_check(
 }
 
 // Go: transformers/declarations/diagnostics.go:81 createGetSymbolAccessibilityDiagnosticForNodeName
+// PERF: the Go `ast.Is*` tests are pure kind compares, so one match on the kind
+// picks the same branch.
 pub fn create_get_symbol_accessibility_diagnostic_for_node_name(
     node: Node,
 ) -> GetSymbolAccessibilityDiagnostic {
-    if is_set_accessor_declaration(node) || is_get_accessor_declaration(node) {
-        wrap_simple_diagnostic_selector(node, get_accessor_name_visibility_diagnostic_message)
-    } else if is_method_declaration(node) || is_method_signature_declaration(node) {
-        wrap_simple_diagnostic_selector(node, get_method_name_visibility_diagnostic_message)
-    } else {
-        create_get_symbol_accessibility_diagnostic_for_node(node)
+    match node.kind() {
+        SyntaxKind::SetAccessor | SyntaxKind::GetAccessor => {
+            wrap_simple_diagnostic_selector(node, get_accessor_name_visibility_diagnostic_message)
+        }
+        SyntaxKind::MethodDeclaration | SyntaxKind::MethodSignature => {
+            wrap_simple_diagnostic_selector(node, get_method_name_visibility_diagnostic_message)
+        }
+        _ => create_get_symbol_accessibility_diagnostic_for_node(node),
     }
 }
 
@@ -170,123 +174,125 @@ fn get_method_name_visibility_diagnostic_message(
 }
 
 // Go: transformers/declarations/diagnostics.go:139 createGetSymbolAccessibilityDiagnosticForNode
+// PERF: Go chains up to 23 `ast.Is*` tests. Each one is a pure kind compare
+// and the branches test disjoint kinds, so one match on the kind picks the same
+// branch. The arms keep the Go order.
 pub fn create_get_symbol_accessibility_diagnostic_for_node(
     node: Node,
 ) -> GetSymbolAccessibilityDiagnostic {
-    if is_variable_declaration(node)
-        || is_property_declaration(node)
-        || is_property_signature_declaration(node)
-        || is_property_access_expression(node)
-        || is_element_access_expression(node)
-        || is_binary_expression(node)
-        || is_binding_element(node)
-        || is_constructor_declaration(node)
-    {
-        wrap_simple_diagnostic_selector(
+    match node.kind() {
+        SyntaxKind::VariableDeclaration
+        | SyntaxKind::PropertyDeclaration
+        | SyntaxKind::PropertySignature
+        | SyntaxKind::PropertyAccessExpression
+        | SyntaxKind::ElementAccessExpression
+        | SyntaxKind::BinaryExpression
+        | SyntaxKind::BindingElement
+        | SyntaxKind::Constructor => wrap_simple_diagnostic_selector(
             node,
             get_variable_declaration_type_visibility_diagnostic_message,
-        )
-    } else if is_set_accessor_declaration(node) || is_get_accessor_declaration(node) {
-        wrap_named_diagnostic_selector(
+        ),
+        SyntaxKind::SetAccessor | SyntaxKind::GetAccessor => wrap_named_diagnostic_selector(
             node,
             get_accessor_declaration_type_visibility_diagnostic_message,
-        )
-    } else if is_construct_signature_declaration(node)
-        || is_call_signature_declaration(node)
-        || is_method_declaration(node)
-        || is_method_signature_declaration(node)
-        || is_function_declaration(node)
-        || is_index_signature_declaration(node)
-    {
-        wrap_fallback_error_diagnostic_selector(node, get_return_type_visibility_diagnostic_message)
-    } else if is_parameter_declaration(node) {
-        if is_parameter_property_declaration(node, node.parent())
-            && has_syntactic_modifier(node.parent(), ModifierFlags::PRIVATE)
-        {
-            return wrap_simple_diagnostic_selector(
-                node,
-                get_variable_declaration_type_visibility_diagnostic_message,
-            );
-        }
-        wrap_simple_diagnostic_selector(
+        ),
+        SyntaxKind::ConstructSignature
+        | SyntaxKind::CallSignature
+        | SyntaxKind::MethodDeclaration
+        | SyntaxKind::MethodSignature
+        | SyntaxKind::FunctionDeclaration
+        | SyntaxKind::IndexSignature => wrap_fallback_error_diagnostic_selector(
             node,
-            get_parameter_declaration_type_visibility_diagnostic_message,
-        )
-    } else if is_type_parameter_declaration(node) {
-        wrap_simple_diagnostic_selector(
+            get_return_type_visibility_diagnostic_message,
+        ),
+        SyntaxKind::Parameter => {
+            if is_parameter_property_declaration(node, node.parent())
+                && has_syntactic_modifier(node.parent(), ModifierFlags::PRIVATE)
+            {
+                return wrap_simple_diagnostic_selector(
+                    node,
+                    get_variable_declaration_type_visibility_diagnostic_message,
+                );
+            }
+            wrap_simple_diagnostic_selector(
+                node,
+                get_parameter_declaration_type_visibility_diagnostic_message,
+            )
+        }
+        SyntaxKind::TypeParameter => wrap_simple_diagnostic_selector(
             node,
             get_type_parameter_constraint_visibility_diagnostic_message,
-        )
-    } else if is_expression_with_type_arguments(node) {
-        // unique node selection behavior, inline closure
-        Rc::new(move |_symbol_accessibility_result| {
-            let diagnostic_message;
-            // Heritage clause is written by user so it can always be named
-            if is_class_declaration(node.parent().parent()) {
-                // Class or Interface implemented/extended is inaccessible
-                if is_heritage_clause(node.parent())
-                    && node.parent().token() == SyntaxKind::ImplementsKeyword
-                {
-                    diagnostic_message =
-                        diag::Implements_clause_of_exported_class_0_has_or_is_using_private_name_1;
-                } else if node.parent().parent().name().is_some() {
-                    diagnostic_message =
-                        diag::X_extends_clause_of_exported_class_0_has_or_is_using_private_name_1;
+        ),
+        SyntaxKind::ExpressionWithTypeArguments => {
+            // unique node selection behavior, inline closure
+            Rc::new(move |_symbol_accessibility_result| {
+                let diagnostic_message;
+                // Heritage clause is written by user so it can always be named
+                if is_class_declaration(node.parent().parent()) {
+                    // Class or Interface implemented/extended is inaccessible
+                    if is_heritage_clause(node.parent())
+                        && node.parent().token() == SyntaxKind::ImplementsKeyword
+                    {
+                        diagnostic_message =
+                            diag::Implements_clause_of_exported_class_0_has_or_is_using_private_name_1;
+                    } else if node.parent().parent().name().is_some() {
+                        diagnostic_message =
+                            diag::X_extends_clause_of_exported_class_0_has_or_is_using_private_name_1;
+                    } else {
+                        diagnostic_message =
+                            diag::X_extends_clause_of_exported_class_has_or_is_using_private_name_0;
+                    }
                 } else {
+                    // interface is inaccessible
                     diagnostic_message =
-                        diag::X_extends_clause_of_exported_class_has_or_is_using_private_name_0;
+                        diag::X_extends_clause_of_exported_interface_0_has_or_is_using_private_name_1;
                 }
-            } else {
-                // interface is inaccessible
-                diagnostic_message =
-                    diag::X_extends_clause_of_exported_interface_0_has_or_is_using_private_name_1;
-            }
-            Some(SymbolAccessibilityDiagnostic {
-                diagnostic_message,
-                error_node: node,
-                type_name: get_name_of_declaration(node.parent().parent()),
+                Some(SymbolAccessibilityDiagnostic {
+                    diagnostic_message,
+                    error_node: node,
+                    type_name: get_name_of_declaration(node.parent().parent()),
+                })
             })
-        })
-    } else if is_import_equals_declaration(node) {
-        wrap_simple_diagnostic_selector(node, |_, _| {
+        }
+        SyntaxKind::ImportEqualsDeclaration => wrap_simple_diagnostic_selector(node, |_, _| {
             Some(diag::Import_declaration_0_is_using_private_name_1)
-        })
-    } else if is_type_alias_declaration(node) || is_js_type_alias_declaration(node) {
-        // unique node selection behavior, inline closure
-        Rc::new(move |symbol_accessibility_result| {
-            let diagnostic_message = select_diagnostic_based_on_module_name_no_name_check(
-                symbol_accessibility_result,
-                diag::Exported_type_alias_0_has_or_is_using_private_name_1_from_module_2,
-                diag::Exported_type_alias_0_has_or_is_using_private_name_1,
-            )?;
-            Some(SymbolAccessibilityDiagnostic {
-                error_node: node.type_(),
-                diagnostic_message,
-                type_name: node.name(),
+        }),
+        SyntaxKind::TypeAliasDeclaration | SyntaxKind::JsTypeAliasDeclaration => {
+            // unique node selection behavior, inline closure
+            Rc::new(move |symbol_accessibility_result| {
+                let diagnostic_message = select_diagnostic_based_on_module_name_no_name_check(
+                    symbol_accessibility_result,
+                    diag::Exported_type_alias_0_has_or_is_using_private_name_1_from_module_2,
+                    diag::Exported_type_alias_0_has_or_is_using_private_name_1,
+                )?;
+                Some(SymbolAccessibilityDiagnostic {
+                    error_node: node.type_(),
+                    diagnostic_message,
+                    type_name: node.name(),
+                })
             })
-        })
-    } else if is_call_expression(node) {
-        // JS object.defineProperty call
-        // unique node selection behavior, inline closure
-        Rc::new(move |symbol_accessibility_result| {
-            let diagnostic_message = select_diagnostic_based_on_module_name(
-                symbol_accessibility_result,
-                diag::Exported_variable_0_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named,
-                diag::Exported_variable_0_has_or_is_using_name_1_from_private_module_2,
-                diag::Exported_variable_0_has_or_is_using_private_name_1,
-            )?;
-            let argument = node.arguments().get(1);
-            Some(SymbolAccessibilityDiagnostic {
-                error_node: argument,
-                diagnostic_message,
-                type_name: argument,
+        }
+        SyntaxKind::CallExpression => {
+            // JS object.defineProperty call
+            // unique node selection behavior, inline closure
+            Rc::new(move |symbol_accessibility_result| {
+                let diagnostic_message = select_diagnostic_based_on_module_name(
+                    symbol_accessibility_result,
+                    diag::Exported_variable_0_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named,
+                    diag::Exported_variable_0_has_or_is_using_name_1_from_private_module_2,
+                    diag::Exported_variable_0_has_or_is_using_private_name_1,
+                )?;
+                let argument = node.arguments().get(1);
+                Some(SymbolAccessibilityDiagnostic {
+                    error_node: argument,
+                    diagnostic_message,
+                    type_name: argument,
+                })
             })
-        })
-    } else {
-        panic!(
-            "Attempted to set a declaration diagnostic context for unhandled node kind: {:?}",
-            node.kind()
-        );
+        }
+        kind => panic!(
+            "Attempted to set a declaration diagnostic context for unhandled node kind: {kind:?}"
+        ),
     }
 }
 

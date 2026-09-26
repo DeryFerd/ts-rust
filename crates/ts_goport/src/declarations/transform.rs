@@ -665,10 +665,15 @@ impl DeclarationTransformer {
     ) -> (bool, CleanupDiagnosticContext) {
         let can_prodice_diagnostic = can_produce_diagnostics(input);
         let old_within_object_literal_type = self.suppress_new_diagnostic_contexts;
-        let should_enter_suppress_new_diagnostics_context_context =
-            (input.kind() == SyntaxKind::TypeLiteral || input.kind() == SyntaxKind::MappedType)
-                && !(input.parent().kind() == SyntaxKind::TypeAliasDeclaration
-                    || input.parent().kind() == SyntaxKind::JsTypeAliasDeclaration);
+        // PERF: pure kind tests; read each kind once. The parent kind is still
+        // read only for a type literal or mapped type, as in Go.
+        let should_enter_suppress_new_diagnostics_context_context = matches!(
+            input.kind(),
+            SyntaxKind::TypeLiteral | SyntaxKind::MappedType
+        ) && !matches!(
+            input.parent().kind(),
+            SyntaxKind::TypeAliasDeclaration | SyntaxKind::JsTypeAliasDeclaration
+        );
 
         let old_diag = self
             .state

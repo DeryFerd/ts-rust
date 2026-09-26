@@ -18,17 +18,20 @@
 //! Unported Go code that a run reaches is listed on stderr as
 //! `unported: <name> <count>`. Such a run, a panic and a failed build
 //! worker exit with `EXIT_UNPORTED` (70), a code tsgo never returns (Go
-//! uses 0 to 5), like `goport` and `goport_emit`.
+//! uses 0 to 5), like `goport` and `goport_emit`. A Go panic that the port
+//! keeps (`core::go_panic`), in the orchestrator or in a worker, ends the
+//! build as in Go: the output so far, `panic: <message>` on stderr and
+//! exit 2.
 
 use std::any::Any;
 use std::io::{IsTerminal, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use ts_goport::execute::build::orchestrator::tsc_build_compilation;
 use ts_goport::execute::build::worker::{
     BUILD_WORKER_FLAG, compile_and_emit_worker, marshal_worker_compile_result,
     marshal_worker_program_fs_cache, read_worker_fs_cache,
 };
+use ts_goport::execute::execute_tsc::tsc_build_compilation;
 use ts_goport::execute::tsc::compile::{EXIT_UNPORTED, ExitStatus, System, new_os_system};
 use ts_goport::frontend::vfs::CachedFsState;
 use ts_goport::prelude::*;
@@ -88,14 +91,15 @@ fn run(args: &[String]) -> i32 {
         tsc_build_compilation(sys.clone(), args)
     }));
     let _ = sys.writer().borrow_mut().flush();
-    let status = match result {
-        Ok(result) => result.status,
+    let code = match result {
+        Ok(result) => result.status.code(),
+        Err(payload) if print_go_panic(payload.as_ref()) => EXIT_GO_PANIC,
         Err(payload) => {
             note_panic(payload.as_ref());
-            ExitStatus::NotImplemented
+            ExitStatus::NotImplemented.code()
         }
     };
-    finish(status)
+    finish(code)
 }
 
 /// `--build-worker <config> [command line...]`
@@ -149,8 +153,17 @@ fn run_worker(sys: &Rc<dyn System>, args: &[String]) -> i32 {
                 ExitStatus::Success.code()
             }
         }
+        // No result line. After a Go panic the orchestrator ends as Go does
+        // (see `WorkerLauncher::run`); after any other panic it reports the
+        // failed worker.
+        Err(payload) if print_go_panic(payload.as_ref()) => {
+            if report_unported() {
+                EXIT_UNPORTED
+            } else {
+                EXIT_GO_PANIC
+            }
+        }
         Err(payload) => {
-            // No result line: the orchestrator reports the failed worker.
             note_panic(payload.as_ref());
             report_unported();
             EXIT_UNPORTED
@@ -158,13 +171,13 @@ fn run_worker(sys: &Rc<dyn System>, args: &[String]) -> i32 {
     }
 }
 
-/// Prints the unported counts and returns the exit code for `status`, or
-/// `EXIT_UNPORTED` when the run reached unported code.
-fn finish(status: ExitStatus) -> i32 {
+/// Prints the unported counts and returns `code`, or `EXIT_UNPORTED` when
+/// the run reached unported code.
+fn finish(code: i32) -> i32 {
     if report_unported() {
         return EXIT_UNPORTED;
     }
-    status.code()
+    code
 }
 
 /// Prints `unported: <name> <count>` lines to stderr. True when any.
@@ -177,8 +190,13 @@ fn report_unported() -> bool {
     !unported.is_empty()
 }
 
+/// Keeps unported panics quiet (they are counted) and prints other panics.
+/// The run prints a Go panic.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
+        if info.payload().is::<GoPanic>() {
+            return;
+        }
         let message = payload_message(info.payload());
         if message.starts_with(UNPORTED_PREFIX) {
             if std::env::var_os("GOPORT_TRACE").is_some() {

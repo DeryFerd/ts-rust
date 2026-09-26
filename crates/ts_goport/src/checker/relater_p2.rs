@@ -187,7 +187,7 @@ impl Checker {
                 || !target_prop_flags.intersects(SymbolFlags::OPTIONAL)
                     && !target_prop_check_flags.intersects(CheckFlags::PARTIAL)
             {
-                let source_prop = self.get_property_of_type(source, &target_prop_name);
+                let source_prop = self.get_property_of_type_name(source, &target_prop_name);
                 if source_prop.is_nil() {
                     match props_out.as_deref_mut() {
                         None => return target_prop,
@@ -741,6 +741,17 @@ impl Checker {
         type_parameters: &[TypeId],
     ) -> SharedList<VarianceFlags> {
         if !self.variance_links.has(symbol) {
+            // Go defers the end of the event to the function return and adds
+            // the final variances to its args first (see the end of this block).
+            let mut trace = self.tracer.map(|tr| {
+                let id = self.get_declared_type_of_symbol(symbol);
+                tr.push(
+                    crate::tracing::Phase::CheckTypes,
+                    "getVariancesWorker",
+                    vec![("arity", type_parameters.len().into()), ("id", id.into())],
+                    true,
+                )
+            });
             let old_variance_computation = self.in_variance_computation;
             let save_resolution_start = self.resolution_start;
             if !self.in_variance_computation {
@@ -813,6 +824,17 @@ impl Checker {
                 self.resolution_start = save_resolution_start;
             }
             self.variance_links.get(symbol).variances = variances.into();
+            if let Some(args) = trace.as_mut().and_then(crate::tracing::Pop::args_mut) {
+                let formatted: Vec<String> = self
+                    .variance_links
+                    .get(symbol)
+                    .variances
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+                args.push(("variances", formatted.into()));
+            }
+            drop(trace);
         }
         self.variance_links.get(symbol).variances.clone()
     }

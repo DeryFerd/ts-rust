@@ -27,10 +27,10 @@
 //! `opts.Testing` is always nil.
 
 use crate::execute::build::build_task::*;
-use crate::execute::build::command_line::{ParsedBuildCommandLine, parse_build_command_line};
+use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::host::BuildHost;
 use crate::execute::build::worker::{
-    SystemParseConfigHost, WorkerLauncher, compare_paths_options_of_sys, marshal_worker_fs_cache,
+    WorkerLauncher, compare_paths_options_of_sys, marshal_worker_fs_cache,
 };
 use crate::execute::incremental::build_info::BuildInfo;
 use crate::execute::incremental::incremental::new_build_info_reader;
@@ -38,7 +38,6 @@ use crate::execute::tsc::compile::{CommandLineResult, ExitStatus, System, Writer
 use crate::execute::tsc::diagnostics::{
     DiagnosticReporter, DiagnosticsReporter, create_builder_status_reporter,
     create_diagnostic_reporter, create_report_error_summary, create_watch_status_reporter,
-    print_build_help, print_version,
 };
 use crate::execute::tsc::statistics::Statistics;
 use crate::frontend::prelude::*;
@@ -504,15 +503,8 @@ impl Orchestrator {
         if result.exit_status.code() > build_result.result.status.code() {
             build_result.result.status = result.exit_status;
         }
-        // PORT: Go aggregates `t.result.statistics` here. A task has them
-        // when it built a program, but the worker does not send them back
-        // (see top). Without them the aggregate is only wrong when it is
-        // reported, so stop only then.
-        let options = &self.opts.command.compiler_options;
-        if result.build_kind == BuildKind::Program
-            && (options.diagnostics.is_true() || options.extended_diagnostics.is_true())
-        {
-            unported!("Statistics.Aggregate of a build worker's statistics");
+        if let Some(statistics) = &result.statistics {
+            build_result.statistics.aggregate(statistics);
         }
         // If we built the program, or updated timestamps, or had errors, we need to
         // delete files that are no longer needed
@@ -534,6 +526,7 @@ impl Orchestrator {
         create_builder_status_reporter(
             self.opts.sys.clone(),
             self.writer(),
+            &self.opts.command.locale(),
             &self.opts.command.compiler_options,
         )
     }
@@ -543,6 +536,7 @@ impl Orchestrator {
         create_diagnostic_reporter(
             &*self.opts.sys,
             self.writer(),
+            &self.opts.command.locale(),
             &self.opts.command.compiler_options,
         )
     }
@@ -553,6 +547,7 @@ impl Orchestrator {
             create_builder_status_reporter(
                 self.opts.sys.clone(),
                 w,
+                &self.opts.command.locale(),
                 &self.opts.command.compiler_options,
             )
         })
@@ -561,7 +556,12 @@ impl Orchestrator {
     // Go: build/orchestrator.go:595 (*Orchestrator).createDiagnosticReporter(task)
     fn create_task_diagnostic_reporter(&self) -> TaskDiagnosticReporter {
         task_reporter(|w| {
-            create_diagnostic_reporter(&*self.opts.sys, w, &self.opts.command.compiler_options)
+            create_diagnostic_reporter(
+                &*self.opts.sys,
+                w,
+                &self.opts.command.locale(),
+                &self.opts.command.compiler_options,
+            )
         })
     }
 }
@@ -654,58 +654,15 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
     if orchestrator.opts.command.compiler_options.watch.is_true() {
         orchestrator.watch_status_reporter = Some(create_watch_status_reporter(
             orchestrator.opts.sys.clone(),
+            &orchestrator.opts.command.locale(),
             orchestrator.opts.command.compiler_options.clone(),
         ));
     } else {
         orchestrator.error_summary_reporter = Some(create_report_error_summary(
             &*orchestrator.opts.sys,
+            &orchestrator.opts.command.locale(),
             Some(&orchestrator.opts.command.compiler_options),
         ));
     }
     orchestrator
-}
-
-// Go: execute/tsc.go:90 tscBuildCompilation
-// PORT: the locale is dropped (see command_line.rs). The pprof session is
-// not ported: Go `runtime/pprof` writes Go runtime CPU and allocation
-// profiles, which a Rust process does not have.
-// `command_line_args` is the full command line (Go `commandLineArgs`); the
-// build workers get the same arguments.
-pub fn tsc_build_compilation(
-    sys: Rc<dyn System>,
-    command_line_args: &[String],
-) -> CommandLineResult {
-    let build_command = parse_build_command_line(command_line_args, &SystemParseConfigHost(&*sys));
-    let report_diagnostic =
-        create_diagnostic_reporter(&*sys, sys.writer(), &build_command.compiler_options);
-
-    if !build_command.errors.is_empty() {
-        for err in &build_command.errors {
-            report_diagnostic(err);
-        }
-        return CommandLineResult {
-            status: ExitStatus::DiagnosticsPresentOutputsSkipped,
-            watcher: None,
-        };
-    }
-
-    if !build_command.compiler_options.pprof_dir.is_empty() {
-        unported!("pprof.BeginProfiling");
-    }
-
-    if build_command.compiler_options.help.is_true() {
-        print_version(&*sys);
-        print_build_help(&*sys, BUILD_OPTS.as_slice());
-        return CommandLineResult {
-            status: ExitStatus::Success,
-            watcher: None,
-        };
-    }
-
-    let mut orchestrator = new_orchestrator(Options {
-        sys,
-        command: Rc::new(build_command),
-        worker: WorkerLauncher::current(command_line_args.to_vec()),
-    });
-    orchestrator.start()
 }

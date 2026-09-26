@@ -1,34 +1,51 @@
-//! `goport -p <tsconfig>`: type checks a project with the Go port and prints
-//! the diagnostics like `tsgo --noEmit --pretty false`.
+//! `goport [tsc options]`: type checks a project with the Go port, like
+//! `tsgo --noEmit`, and without `--pretty` like `tsgo --noEmit --pretty
+//! false` (see `CheckBin`).
 //!
-//! Go: execute/tsc.go `performCompilation`, which reports through
-//! execute/tsc/emit.go `EmitAndReportStatistics` (the non-pretty path). The
-//! report is the shared `execute::tsc` one, as for `goport_emit` and
-//! `goport_build`.
+//! Go: execute/tsc.go `CommandLine` and `tscCompilation`
+//! (`execute::execute_tsc`): the Go command line parser, the Go
+//! branches for errors, `--init`, `--version`, `--help`, `-p`, the config
+//! search and `--showConfig`, then `performCompilation`, which reports
+//! through execute/tsc/emit.go `EmitAndReportStatistics`. All output goes
+//! to stdout, as in Go. The report is the shared `execute::tsc` one, as for
+//! `goport_emit` and `goport_build`.
+//!
+//! goport never writes an output file: its compile step sets noEmit (see
+//! `CheckBin`). `--init` writes a `tsconfig.json`, `--pprofDir` writes two
+//! empty profile files (see `ts_goport::pprof`), and `--generateTrace` (or a
+//! config `generateTrace`) writes the trace directory (see
+//! `ts_goport::tracing`), as in Go.
 //!
 //! Each Go-ported stage runs under `catch_unwind`, so one unported path does
 //! not hide the other diagnostics. Unported hits are printed to stderr as
 //! `unported: <name> <count>` lines.
 //!
-//! Exit codes are the tsc ones (Go: execute/tsc/emit.go:65): 0, 1 when there
-//! are diagnostics and the emit was skipped, 2 when there are diagnostics and
-//! the emit was not skipped. Under noEmit, only a program with no emittable
-//! file (no inputs, or only `.d.ts` files) has diagnostics with exit 2.
-//! A run that hit unported code (or another panic) exits
-//! `execute::tsc::EXIT_UNPORTED` (70), a code tsgo never returns (Go uses
-//! 0 to 5).
+//! Exit codes are the tsc ones (Go: execute/tsc/compile.go:30): 0, 1 when
+//! there are diagnostics and the emit was skipped (also command line and
+//! project errors), 2 when there are diagnostics and the emit was not
+//! skipped (also config file read errors). Under noEmit, only a program
+//! with no emittable file (no inputs, or only `.d.ts` files) has
+//! diagnostics with exit 2. A run that hit unported code (or another
+//! panic) exits `execute::tsc::EXIT_UNPORTED` (70), a code tsgo never
+//! returns (Go uses 0 to 5). A Go panic that the port keeps
+//! (`core::go_panic`) ends the run as in Go: the output so far, `panic:
+//! <message>` on stderr and exit 2.
+//!
+//! `GOPORT_FRONTEND=legacy` has no effect here: the Go config parser and
+//! program loader always run (`execute::execute_tsc`). No script uses
+//! the legacy loader with this bin.
 
 use std::any::Any;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
 
-use ts_goport::emitter::program_emit::{EmitOptions, EmitResult, emit_with};
+use ts_goport::emitter::program_emit::{EmitOptions, EmitResult, WriteFile, emit_with};
+use ts_goport::execute::execute_tsc::{TscCompilationHooks, command_line};
 use ts_goport::execute::tsc::{
-    CompileTimes, EXIT_UNPORTED, EmitInput, ExitStatus, ProgramLike, Writer,
-    create_diagnostic_reporter, create_report_error_summary, emit_and_report_statistics,
-    new_os_system, write_go_output,
+    EXIT_UNPORTED, ExitStatus, ProgramLike, System, Writer, new_os_system, write_go_output,
 };
+use ts_goport::frontend::tsoptions::ParsedCommandLine;
 use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
@@ -48,21 +65,14 @@ fn main() {
     // Go: `System.SinceStart` counts from the process start. The tunables
     // step above may exec the binary again, so the clock starts after it.
     let start = Instant::now();
-    let config = match parse_args(ts_goport::frontend::vfs::os_args()) {
-        Ok(config) => config,
-        Err(message) => {
-            eprintln!("goport: {message}");
-            eprintln!("usage: goport -p <tsconfig.json | project dir>");
-            std::process::exit(1);
-        }
-    };
+    let args: Vec<String> = ts_goport::frontend::vfs::os_args();
     install_panic_hook();
     // The loading thread keeps the frontend program and the checker pool, so
     // the whole run stays on it. The checkers run on their own threads.
     let worker = std::thread::Builder::new()
         .name("goport".to_string())
         .stack_size(STACK_SIZE)
-        .spawn(move || run(&config, start));
+        .spawn(move || run(&args, start));
     let code = if let Ok(Ok(code)) = worker.map(std::thread::JoinHandle::join) {
         code
     } else {
@@ -124,36 +134,13 @@ fn set_malloc_tunables() {
     }
 }
 
-/// Reads `-p <path>`, `--project <path>` and their `=` forms. Without one,
-/// the project is the current directory (like tsc).
-fn parse_args(args: Vec<String>) -> Result<String, String> {
-    let mut project = None;
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
-        if arg == "-p" || arg == "--project" {
-            project = Some(iter.next().ok_or_else(|| format!("{arg} needs a path"))?);
-        } else if let Some(value) = arg
-            .strip_prefix("-p=")
-            .or_else(|| arg.strip_prefix("--project="))
-        {
-            project = Some(value.to_string());
-        } else if arg == "--noEmit"
-            || arg == "--pretty"
-            || arg == "false"
-            || arg == "--pretty=false"
-        {
-            // Accepted for tsgo command-line parity; this is always the mode.
-        } else {
-            return Err(format!("unknown argument {arg}"));
-        }
-    }
-    Ok(project.unwrap_or_else(|| ".".to_string()))
-}
-
 /// Keeps panics from unported code quiet (they are counted instead) and
-/// prints all other panics to stderr.
+/// prints all other panics to stderr. `run` prints a Go panic.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
+        if info.payload().is::<GoPanic>() {
+            return;
+        }
         let message = payload_message(info.payload());
         if message.starts_with(UNPORTED_PREFIX) {
             // GOPORT_TRACE=1 prints where each unported hit came from.
@@ -191,85 +178,49 @@ fn note_panic(payload: &(dyn Any + Send)) {
     }
 }
 
-/// Runs `f`, or returns the default value when it panics.
+/// Runs `f`, or returns the default value when it panics. A Go panic goes
+/// on.
 fn guard<T: Default>(f: impl FnOnce() -> T) -> T {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(value) => value,
         Err(payload) => {
-            note_panic(payload.as_ref());
+            note_panic(resume_go_panic(payload).as_ref());
             T::default()
         }
     }
 }
 
-// Go: execute/tsc.go:289 performCompilation (the non-incremental path) and
-// execute/tsc.go:244 (the incremental one), with the command line
-// `--noEmit --pretty false`.
-// PORT: noEmit is forced, so the emit step writes no files. It still runs,
-// because Go reports the declaration transformer diagnostics during emit
-// (see `GuardedProgram::emit`). The report goes to a buffer that is
-// written to stdout at the end, also when a step panics.
-fn run(config: &str, start: Instant) -> i32 {
+// Go: cmd/tsgo/main.go runMain: `execute.CommandLine` with the process
+// system and arguments, then `os.Exit` with the status.
+// PORT: the report goes to a buffer that is written to stdout at the end,
+// also when a step panics. A panic ends the run; the steps inside
+// `GuardedProgram` are guarded on their own. A Go panic (`go_panic`) ends
+// the run with the Go runtime exit code.
+fn run(args: &[String], start: Instant) -> i32 {
     let sys = match new_os_system() {
         Ok(sys) => sys,
         Err(status) => return status.code(),
     };
     let buffer: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
     let writer: Writer = buffer.clone();
-    let sys = sys.with_start(start).with_writer(writer.clone());
+    let sys: Rc<dyn System> = Rc::new(sys.with_start(start).with_writer(writer));
 
-    let mut compile_times = CompileTimes::default();
-    let loaded = catch_unwind(AssertUnwindSafe(|| {
-        try_load_timed(
-            config,
-            |options| {
-                options.no_emit = Tristate::True;
-                options.pretty = Tristate::False;
-            },
-            &mut compile_times,
-        )
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        command_line(sys.clone(), args, &CheckBin)
     }));
-    let mut status = ExitStatus::Success;
-    match loaded {
-        Ok(Ok(_)) => {
-            // Go: execute/tsc.go:294 and :308 time the build info read and
-            // the incremental program. PORT: goport reads no build info and
-            // makes no incremental program, so both steps are empty. They
-            // are still timed, so the table has the same rows as Go.
-            if options().is_incremental() {
-                let build_info_read_start = Instant::now();
-                compile_times.build_info_read_time = build_info_read_start.elapsed();
-                let changes_compute_start = Instant::now();
-                compile_times.changes_compute_time = changes_compute_start.elapsed();
-            }
-            let reported = catch_unwind(AssertUnwindSafe(|| {
-                let options = options();
-                emit_and_report_statistics(&EmitInput {
-                    sys: &sys,
-                    program_like: &GuardedProgram,
-                    config: None,
-                    report_diagnostic: create_diagnostic_reporter(&sys, writer.clone(), options),
-                    report_error_summary: create_report_error_summary(&sys, Some(options)),
-                    writer: writer.clone(),
-                    write_file: None,
-                    compile_times: Rc::new(RefCell::new(compile_times)),
-                })
-            }));
-            match reported {
-                Ok((result, _statistics)) => status = result.status,
-                Err(payload) => note_panic(payload.as_ref()),
-            }
-        }
-        Ok(Err(message)) => {
-            eprintln!("goport: {message}");
-            return 1;
-        }
-        Err(payload) => note_panic(payload.as_ref()),
-    }
 
     let mut stdout = std::io::stdout().lock();
     let _ = write_go_output(&mut stdout, &buffer.borrow());
     let _ = stdout.flush();
+
+    let code = match result {
+        Ok(result) => result.status.code(),
+        Err(payload) if print_go_panic(payload.as_ref()) => EXIT_GO_PANIC,
+        Err(payload) => {
+            note_panic(payload.as_ref());
+            ExitStatus::Success.code()
+        }
+    };
 
     let unported = unported_report();
     let mut stderr = std::io::stderr().lock();
@@ -280,7 +231,61 @@ fn run(config: &str, start: Instant) -> i32 {
     if !unported.is_empty() {
         return EXIT_UNPORTED;
     }
-    status.code()
+    code
+}
+
+/// The goport part of the compile step (see `TscCompilationHooks`).
+struct CheckBin;
+
+impl TscCompilationHooks for CheckBin {
+    // PORT: `-b` is unported here: goport never writes an output, and the
+    // build workers re-run the bin. `goport_build` runs build mode.
+    fn build_mode(&self) -> bool {
+        false
+    }
+
+    // PORT: without `--pretty` on the command line, goport runs as with
+    // `--pretty false`, the tsgo command line that the regression gate and
+    // the measure scripts compare it with. The command line value also
+    // overrides a config `pretty`, so the diagnostics are plain and there is
+    // no error summary, on a TTY too. `--showConfig` keeps the unset value,
+    // so it shows the options as Go does.
+    fn command_line_parsed(&self, command_line: &mut ParsedCommandLine) {
+        let options = command_line.compiler_options();
+        if options.pretty.is_unknown() && !options.show_config.is_true() {
+            let mut options = (**options).clone();
+            options.pretty = Tristate::False;
+            command_line.set_compiler_options(Rc::new(options));
+        }
+    }
+
+    // PORT: goport runs on read-only project inputs and never writes an
+    // output, so its compile step sets noEmit on the config, the options
+    // the program gets with `--noEmit`. The init, version, help and
+    // showConfig branches run before this, so `--showConfig` shows no
+    // forced noEmit. Without `--noEmit`, tsgo emits the outputs and goport
+    // does not (emit-modes check-without-noEmit-flag, a known divergence).
+    fn prepare_compilation(
+        &self,
+        _sys: &dyn System,
+        _command_line_options: &CompilerOptions,
+        _config_file_name: &str,
+        config: &mut ParsedCommandLine,
+    ) -> Result<(), ExitStatus> {
+        let mut options = (**config.compiler_options()).clone();
+        options.no_emit = Tristate::True;
+        config.set_compiler_options(Rc::new(options));
+        Ok(())
+    }
+
+    fn program_like(&self) -> Option<&dyn ProgramLike> {
+        Some(&GuardedProgram)
+    }
+
+    // PORT: tsc passes no `WriteFile`. Under noEmit nothing is written.
+    fn write_file(&self) -> Option<WriteFile> {
+        None
+    }
 }
 
 /// The installed program as a Go `ProgramLike`, with each step guarded on
@@ -311,27 +316,31 @@ impl ProgramLike for GuardedProgram {
         // `incremental.Program`. Its Emit under noEmit
         // (execute/incremental/program.go:205) skips the file emit and only
         // writes the build info.
-        // PORT: the build info is not written, so this adds no diagnostics.
+        // PORT: the build info is not written, so this adds no diagnostics
+        // (see `perform_incremental_compilation` in
+        // `execute::execute_tsc`).
         if options().is_incremental() {
             return EmitResult {
                 emit_skipped: true,
                 ..EmitResult::default()
             };
         }
-        // PORT: tsc passes no `WriteFile`. Under noEmit nothing is written.
+        // PORT: tsc passes no `WriteFile` (`CheckBin::write_file`). Under
+        // noEmit nothing is written.
         guard(|| emit_with(emit_options, |emit_file| guard(emit_file)))
     }
 }
 
 /// Semantic diagnostics for one file. A panic drops that file's results and
-/// replaces the checker, whose caches may be half written.
+/// replaces the checker, whose caches may be half written. A Go panic goes
+/// on.
 fn check_file_guarded(checker: &mut Checker, file: Node) -> Vec<Diagnostic> {
     match catch_unwind(AssertUnwindSafe(|| {
         get_semantic_diagnostics_with_checker(checker, file)
     })) {
         Ok(diagnostics) => diagnostics,
         Err(payload) => {
-            note_panic(payload.as_ref());
+            note_panic(resume_go_panic(payload).as_ref());
             let index = (checker.id - 1) as usize;
             *checker = Checker::new(index);
             Vec::new()

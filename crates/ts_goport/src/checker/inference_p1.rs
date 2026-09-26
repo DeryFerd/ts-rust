@@ -40,6 +40,10 @@ pub struct InferenceState {
     pub visited: Option<FxHashMap<InferenceKey, InferencePriority>>,
     pub source_stack: Vec<TypeId>,
     pub target_stack: Vec<TypeId>,
+    // PORT: perf. `stack_recursion_id` of each `source_stack` and
+    // `target_stack` entry, for `is_deeply_nested_type_with_ids`. Not in Go.
+    pub source_ids: Vec<Option<RecursionId>>,
+    pub target_ids: Vec<Option<RecursionId>>,
     pub next: Option<Rc<RefCell<InferenceState>>>,
 }
 
@@ -72,6 +76,10 @@ impl Checker {
             source_stack.clear();
             let mut target_stack = std::mem::take(&mut s.target_stack);
             target_stack.clear();
+            let mut source_ids = std::mem::take(&mut s.source_ids);
+            source_ids.clear();
+            let mut target_ids = std::mem::take(&mut s.target_ids);
+            target_ids.clear();
             // PORT: Go `inferences: n.inferences[:0]` keeps only the slice
             // capacity; the context id has none, so it becomes nil.
             *s = InferenceState {
@@ -79,6 +87,8 @@ impl Checker {
                 visited,
                 source_stack,
                 target_stack,
+                source_ids,
+                target_ids,
                 next: self.freeinference_state.take(),
                 ..InferenceState::default()
             };
@@ -633,6 +643,11 @@ impl Checker {
         }
         let save_inference_priority;
         let save_expanding_flags;
+        // PORT: perf. Each stack entry keeps its recursion id, so the deeply
+        // nested checks below compare ids instead of reading every entry's
+        // type again (see `is_deeply_nested_type_with_ids`).
+        let source_id = self.stack_recursion_id(source);
+        let target_id = self.stack_recursion_id(target);
         {
             let mut s = n.borrow_mut();
             s.visited
@@ -644,16 +659,24 @@ impl Checker {
             // the source side and the target side.
             save_expanding_flags = s.expanding_flags;
             s.source_stack.push(source);
+            s.source_ids.push(source_id);
             s.target_stack.push(target);
+            s.target_ids.push(target_id);
         }
         // PORT: the stacks are read through a shared borrow of `n`, instead
         // of cloned. Nothing reached from isDeeplyNestedType can use `n`; if
         // that changes, the borrow check panics.
-        let source_nested = self.is_deeply_nested_type(source, &n.borrow().source_stack, 2);
+        let source_nested = {
+            let s = n.borrow();
+            self.is_deeply_nested_type_with_ids(source, &s.source_stack, &s.source_ids, 2)
+        };
         if source_nested {
             n.borrow_mut().expanding_flags |= ExpandingFlags::SOURCE;
         }
-        let target_nested = self.is_deeply_nested_type(target, &n.borrow().target_stack, 2);
+        let target_nested = {
+            let s = n.borrow();
+            self.is_deeply_nested_type_with_ids(target, &s.target_stack, &s.target_ids, 2)
+        };
         if target_nested {
             n.borrow_mut().expanding_flags |= ExpandingFlags::TARGET;
         }
@@ -666,7 +689,9 @@ impl Checker {
         {
             let mut s = n.borrow_mut();
             s.target_stack.pop();
+            s.target_ids.pop();
             s.source_stack.pop();
+            s.source_ids.pop();
             s.expanding_flags = save_expanding_flags;
             let inference_priority = s.inference_priority;
             s.visited

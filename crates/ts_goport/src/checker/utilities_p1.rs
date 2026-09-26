@@ -487,15 +487,27 @@ impl Checker {
             .iter()
             .map(|&s| self.symbol_sort_key(s, &mut last_file))
             .collect();
-        keys.sort_by(|a, b| self.compare_symbol_sort_keys(a, b).cmp(&0));
+        self.sort_symbol_sort_keys(&mut keys);
         for (slot, key) in symbols.iter_mut().zip(&keys) {
             *slot = key.symbol;
         }
     }
 
+    /// `sort_symbols` on keys that are already built. `get_named_members`
+    /// uses it with its reusable key buffer. The sort and the comparator are
+    /// the ones `sort_symbols` uses, so the comparisons (and the lazy
+    /// `get_symbol_id` calls in them) happen in the same order.
+    pub(crate) fn sort_symbol_sort_keys(&self, keys: &mut [SymbolSortKey]) {
+        keys.sort_by(|a, b| self.compare_symbol_sort_keys(a, b).cmp(&0));
+    }
+
     /// The `compareSymbolsWorker` inputs of one symbol.
     /// `last_file` caches the last `(file, file_index_map[file])` lookup.
-    fn symbol_sort_key(&self, symbol: SymbolId, last_file: &mut (Node, i32)) -> SymbolSortKey {
+    pub(crate) fn symbol_sort_key(
+        &self,
+        symbol: SymbolId,
+        last_file: &mut (Node, i32),
+    ) -> SymbolSortKey {
         if symbol.is_nil() {
             return SymbolSortKey {
                 symbol,
@@ -634,8 +646,8 @@ impl Checker {
 }
 
 /// Cached `compareSymbolsWorker` inputs for `sort_symbols`.
-struct SymbolSortKey {
-    symbol: SymbolId,
+pub(crate) struct SymbolSortKey {
+    pub(crate) symbol: SymbolId,
     has_declaration: bool,
     /// First declaration, or nil.
     declaration: Node,

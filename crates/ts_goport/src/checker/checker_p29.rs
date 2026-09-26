@@ -964,7 +964,13 @@ impl Checker {
     pub fn check_cross_product_union(&mut self, types: &[TypeId]) -> bool {
         let size = self.get_cross_product_union_size(types);
         if size >= 100_000 {
-            // PORT: Go also emits a tracer instant here. The port has no tracer.
+            if let Some(tr) = self.tracer {
+                tr.instant(
+                    crate::tracing::Phase::CheckTypes,
+                    "checkCrossProductUnion_DepthLimit",
+                    vec![("size", size.into())],
+                );
+            }
             let current_node = self.current_node;
             self.error(
                 current_node,
