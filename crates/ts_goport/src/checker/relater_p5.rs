@@ -244,7 +244,17 @@ impl Checker {
             let t = self.get_non_missing_type_of_symbol(source_property);
             num_combinations *= self.count_types(t);
             if num_combinations > 25 {
-                // PORT: tracing skipped.
+                if let Some(tr) = self.tracer {
+                    tr.instant(
+                        crate::tracing::Phase::CheckTypes,
+                        "typeRelatedToDiscriminatedType_DepthLimit",
+                        vec![
+                            ("sourceId", source.into()),
+                            ("targetId", target.into()),
+                            ("numCombinations", num_combinations.into()),
+                        ],
+                    );
+                }
                 return Ternary::FALSE;
             }
             if num_combinations == 0 {
@@ -286,7 +296,7 @@ impl Checker {
                 for i in 0..source_properties_filtered.len() {
                     let source_property = source_properties_filtered[i];
                     let name = self.sym(source_property).name.clone();
-                    let target_property = self.get_property_of_type(t, &name);
+                    let target_property = self.get_property_of_type_name(t, &name);
                     if target_property.is_nil() {
                         continue 'outer;
                     }
@@ -643,7 +653,7 @@ impl Checker {
                 && (!numeric_names_only || is_numeric_literal_name(&name) || name == "length")
                 && (!optionals_only || target_prop_flags.intersects(SymbolFlags::OPTIONAL))
             {
-                let source_prop = self.get_property_of_type(source, &name);
+                let source_prop = self.get_property_of_type_name(source, &name);
                 if source_prop.is_some() && source_prop != target_prop {
                     let skip_optional = Rc::ptr_eq(&relation, &self.comparable_relation);
                     let related = self.property_related_to(
@@ -2129,15 +2139,45 @@ impl Checker {
                 || self.is_type_parameter_possibly_referenced(check_type, node.false_type()))
     }
 
-    // PORT: the Go body only emits a tracing event when `c.tracer` is set.
-    // This port has no tracer, so the Go `tr == nil` early return always
-    // applies.
     // Go: checker/relater.go:4990 traceUnionsOrIntersectionsTooLarge
     pub fn trace_unions_or_intersections_too_large(
         &mut self,
         _r: &Rc<RefCell<Relater>>,
-        _source: TypeId,
-        _target: TypeId,
+        source: TypeId,
+        target: TypeId,
     ) {
+        let Some(tr) = self.tracer else {
+            return;
+        };
+        if self
+            .ty(source)
+            .flags
+            .intersects(TypeFlags::UNION_OR_INTERSECTION)
+            && self
+                .ty(target)
+                .flags
+                .intersects(TypeFlags::UNION_OR_INTERSECTION)
+        {
+            if (self.ty(source).object_flags & self.ty(target).object_flags)
+                .intersects(ObjectFlags::PRIMITIVE_UNION)
+            {
+                // There's a fast path for comparing primitive unions
+                return;
+            }
+            let source_size = self.ty(source).types().len();
+            let target_size = self.ty(target).types().len();
+            if source_size * target_size > 1_000_000 {
+                tr.instant(
+                    crate::tracing::Phase::CheckTypes,
+                    "traceUnionsOrIntersectionsTooLarge_DepthLimit",
+                    vec![
+                        ("sourceId", source.into()),
+                        ("sourceSize", source_size.into()),
+                        ("targetId", target.into()),
+                        ("targetSize", target_size.into()),
+                    ],
+                );
+            }
+        }
     }
 }

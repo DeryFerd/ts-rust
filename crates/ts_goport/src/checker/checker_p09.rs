@@ -18,6 +18,14 @@ impl Checker {
 
     // Go: checker/checker.go:7532 checkExpressionEx
     pub fn check_expression_ex(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
+        let _trace = self.tracer.map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Check,
+                "checkExpression",
+                crate::tracing::node_args(node),
+                false,
+            )
+        });
         let save_current_node = self.current_node;
         self.current_node = node;
         self.instantiation_count = 0;

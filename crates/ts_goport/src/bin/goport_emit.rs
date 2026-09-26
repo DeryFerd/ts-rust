@@ -1,43 +1,60 @@
-//! `goport_emit -p <tsconfig> --outDir <dir>`: compiles a project with the Go
-//! port and writes the `.js`, `.d.ts` and `.map` outputs like `tsgo`.
+//! `goport_emit -p <tsconfig> --outDir <dir> [tsc options]`: compiles a
+//! project with the Go port and writes the `.js`, `.d.ts` and `.map`
+//! outputs like `tsgo`.
 //!
-//! Go: execute/tsc.go `performCompilation`, which reports through
-//! execute/tsc/emit.go `EmitAndReportStatistics` (the non-pretty path). The
-//! report is the shared `execute::tsc` one, as for `goport` and
-//! `goport_build`.
+//! Go: execute/tsc.go `CommandLine` and `tscCompilation`
+//! (`execute::execute_tsc`): the Go command line parser, the Go
+//! branches for errors, `--init`, `--version`, `--help`, `-p`, the config
+//! search and `--showConfig`, then `performCompilation`, which reports
+//! through execute/tsc/emit.go `EmitAndReportStatistics`. All output goes
+//! to stdout, as in Go. The report is the shared `execute::tsc` one, as for
+//! `goport` and `goport_build`.
 //!
 //! Output paths are the Go paths. A config `declarationDir`, or a `.js`
 //! file of a source outside the common source directory, can put an output
 //! outside `--outDir`.
 //!
-//! Safety: every write must be under the write root, and no write may
-//! replace a program source file. By default the write root is `--outDir`,
-//! and the run stops before it writes anything when `--outDir` is inside the
-//! project directory or a source directory. A write outside the root is
-//! refused and reported as TS5033, so the project inputs are never written.
+//! Safety (not in Go; see `EmitBin`): every write must be under the write
+//! root, and no write may replace a program source file. By default the
+//! write root is `--outDir`, and the compile step stops before it writes
+//! anything when `--outDir` is inside the project directory or a source
+//! directory. A write outside the root is refused and reported as TS5033,
+//! so the project inputs are never written. The emit guard does not cover
+//! `--init` (a `tsconfig.json`), `--pprofDir` (two empty profile files,
+//! see `ts_goport::pprof`) and `--generateTrace` (the trace directory, see
+//! `ts_goport::tracing`), which write as in Go.
 //!
 //! Options:
-//! - `--outDir <dir>` (required) replaces the config `outDir`.
-//! - `--writeRoot <dir>` sets the write root. Use it when Go writes outside
-//!   `--outDir` (for example a config `declarationDir`) and every such path
-//!   is in a scratch copy under `<dir>`. The `--outDir` location checks are
-//!   then skipped.
-//! - `--declarationDir <dir>` replaces the config `declarationDir`, as in tsgo.
+//! - `--outDir <dir>` (required for a compile) replaces the config
+//!   `outDir`, as in tsgo.
+//! - `--writeRoot <dir>` (`goport_emit` only) sets the write root. Use it
+//!   when Go writes outside `--outDir` (for example a config
+//!   `declarationDir`) and every such path is in a scratch copy under
+//!   `<dir>`. The `--outDir` location checks are then skipped. It is taken
+//!   out of the command line before the Go parser reads it.
+//! - Every other argument goes to the Go command line parser, as in tsgo
+//!   (`--declaration`, `--sourceMap`, `--noEmit false`, `--outFile`,
+//!   `--listEmittedFiles`, `--noEmitOnError`, `--pretty`, ...). An unknown
+//!   option is TS5023 on stdout, exit 1.
 //!
-//! - `--declaration`, `--declarationMap`, `--emitDeclarationOnly`,
-//!   `--sourceMap`, `--inlineSourceMap`, `--inlineSources`,
-//!   `--removeComments` and `--noEmit` set those options, as in tsgo. Each
-//!   takes an optional `true` or `false` (`--noEmit false`).
-//!
-//! `.tsbuildinfo` is not written.
+//! `.tsbuildinfo` is not written (see `perform_incremental_compilation` in
+//! `execute::execute_tsc`).
 //!
 //! Exit codes are the tsc ones: 0, 1 when there are diagnostics and the
-//! emit was skipped, 2 when there are diagnostics and outputs were written.
-//! A run that hit unported code (or another panic) exits
-//! `execute::tsc::EXIT_UNPORTED` (70), a code tsgo never returns (Go uses 0
-//! to 5), and says so on stderr.
+//! emit was skipped (also command line and project errors, and a refused
+//! `--outDir`), 2 when there are diagnostics and outputs were written (also
+//! config file read errors). A run that hit unported code (or another
+//! panic) exits `execute::tsc::EXIT_UNPORTED` (70), a code tsgo never
+//! returns (Go uses 0 to 5), and says so on stderr. A Go panic that the
+//! port keeps (`core::go_panic`) ends the run as in Go: the output so far,
+//! `panic: <message>` on stderr and exit 2.
+//!
+//! `GOPORT_FRONTEND=legacy` has no effect here: the Go config parser and
+//! program loader always run. No script uses the legacy loader with this
+//! bin.
 
 use std::any::Any;
+use std::cell::{Cell, OnceCell};
 use std::collections::HashSet;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -45,15 +62,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ts_goport::emitter::program_emit::{EmitOptions, EmitResult, WriteFile, WriteFileData, emit};
+use ts_goport::execute::execute_tsc::{TscCompilationHooks, command_line};
 use ts_goport::execute::tsc::{
-    CompileTimes, EXIT_UNPORTED, EmitInput, ExitStatus, ProgramLike, Writer,
-    create_diagnostic_reporter, create_report_error_summary, emit_and_report_statistics,
-    new_os_system, write_go_output,
+    EXIT_UNPORTED, ExitStatus, ProgramLike, System, Writer, new_os_system, write_go_output,
 };
+use ts_goport::frontend::tsoptions::ParsedCommandLine;
 use ts_goport::prelude::*;
 use ts_goport::scanner_util::go_string_bytes;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
+
+const USAGE: &str = "usage: goport_emit -p <tsconfig.json | project dir> --outDir <dir> [--writeRoot <dir>] [tsc options]";
 
 /// Stack size for the worker thread. The checker recurses deeply on large
 /// projects.
@@ -65,59 +84,14 @@ const STACK_SIZE: usize = 1 << 30;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-struct Config {
-    project: String,
-    out_dir: String,
-    /// `--writeRoot`, or `None` for the default root `out_dir`.
-    write_root: Option<String>,
-    declaration_dir: Option<String>,
-    /// Boolean compiler options set on the command line, like tsgo `--flag`
-    /// or `--flag false`.
-    flags: Vec<(String, bool)>,
-}
-
-/// The boolean compiler options the command line can set (tsgo names).
-const BOOLEAN_FLAGS: &[&str] = &[
-    "--declaration",
-    "--declarationMap",
-    "--emitDeclarationOnly",
-    "--sourceMap",
-    "--inlineSourceMap",
-    "--inlineSources",
-    "--removeComments",
-    "--noEmit",
-];
-
-/// Sets one of `BOOLEAN_FLAGS` on `options`.
-fn apply_flag(options: &mut CompilerOptions, flag: &str, value: bool) {
-    let value = if value {
-        Tristate::True
-    } else {
-        Tristate::False
-    };
-    match flag {
-        "--declaration" => options.declaration = value,
-        "--declarationMap" => options.declaration_map = value,
-        "--emitDeclarationOnly" => options.emit_declaration_only = value,
-        "--sourceMap" => options.source_map = value,
-        "--inlineSourceMap" => options.inline_source_map = value,
-        "--inlineSources" => options.inline_sources = value,
-        "--removeComments" => options.remove_comments = value,
-        "--noEmit" => options.no_emit = value,
-        _ => {}
-    }
-}
-
 fn main() {
     // Go: `System.SinceStart` counts from the process start.
     let start = Instant::now();
-    let config = match parse_args(ts_goport::frontend::vfs::os_args()) {
-        Ok(config) => config,
+    let (args, write_root) = match take_write_root(ts_goport::frontend::vfs::os_args()) {
+        Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("goport_emit: {message}");
-            eprintln!(
-                "usage: goport_emit -p <tsconfig.json | project dir> --outDir <dir> [--writeRoot <dir>] [--declarationDir <dir>] [--declaration ...]"
-            );
+            eprintln!("{USAGE}");
             std::process::exit(1);
         }
     };
@@ -125,7 +99,7 @@ fn main() {
     let worker = std::thread::Builder::new()
         .name("goport_emit".to_string())
         .stack_size(STACK_SIZE)
-        .spawn(move || run(&config, start));
+        .spawn(move || run(&args, write_root, start));
     let code = if let Ok(Ok(code)) = worker.map(std::thread::JoinHandle::join) {
         code
     } else {
@@ -135,59 +109,26 @@ fn main() {
     std::process::exit(code);
 }
 
-fn parse_args(args: Vec<String>) -> Result<Config, String> {
-    let mut project = None;
-    let mut out_dir = None;
+/// Takes `--writeRoot <dir>` (or `--writeRoot=<dir>`) out of `args` and
+/// returns the other arguments, for the Go parser, and the absolute write
+/// root.
+fn take_write_root(args: Vec<String>) -> Result<(Vec<String>, Option<String>), String> {
+    let mut rest = Vec::with_capacity(args.len());
     let mut write_root = None;
-    let mut declaration_dir = None;
-    let mut flags = Vec::new();
-    let mut iter = args.into_iter().peekable();
+    let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
-        let (name, inline) = match arg.split_once('=') {
-            Some((name, value)) if name.starts_with('-') => {
-                (name.to_string(), Some(value.to_string()))
-            }
-            _ => (arg.clone(), None),
-        };
-        let mut value = |name: &str| -> Result<String, String> {
-            match inline.clone() {
-                Some(value) => Ok(value),
-                None => iter.next().ok_or_else(|| format!("{name} needs a value")),
-            }
-        };
-        match name.as_str() {
-            "-p" | "--project" => project = Some(value(&name)?),
-            "--outDir" => out_dir = Some(value(&name)?),
-            "--writeRoot" => write_root = Some(value(&name)?),
-            "--declarationDir" => declaration_dir = Some(value(&name)?),
-            "--pretty" => {
-                if inline.is_none() {
-                    // `--pretty false` for tsgo command-line parity.
-                    let _ = value(&name)?;
-                }
-            }
-            flag if BOOLEAN_FLAGS.contains(&flag) => {
-                // tsgo reads an optional `true` or `false` after a boolean flag.
-                let value = match inline.as_deref() {
-                    Some(value) => value != "false",
-                    None => match iter.peek().map(String::as_str) {
-                        Some("true" | "false") => iter.next().is_some_and(|v| v == "true"),
-                        _ => true,
-                    },
-                };
-                flags.push((name.clone(), value));
-            }
-            _ => return Err(format!("unknown argument {arg}")),
+        if arg == "--writeRoot" {
+            let dir = iter
+                .next()
+                .ok_or_else(|| "--writeRoot needs a value".to_string())?;
+            write_root = Some(absolute(&dir));
+        } else if let Some(dir) = arg.strip_prefix("--writeRoot=") {
+            write_root = Some(absolute(dir));
+        } else {
+            rest.push(arg);
         }
     }
-    let out_dir = out_dir.ok_or_else(|| "--outDir is required".to_string())?;
-    Ok(Config {
-        project: project.unwrap_or_else(|| ".".to_string()),
-        out_dir: absolute(&out_dir),
-        write_root: write_root.map(|d| absolute(&d)),
-        declaration_dir: declaration_dir.map(|d| absolute(&d)),
-        flags,
-    })
+    Ok((rest, write_root))
 }
 
 /// `path` made absolute against the current directory and normalized.
@@ -204,8 +145,13 @@ fn is_inside(path: &str, dir: &str) -> bool {
     path == dir || path.starts_with(&format!("{dir}/"))
 }
 
+/// Keeps unported panics quiet (they are counted) and prints other panics.
+/// `run` prints a Go panic.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
+        if info.payload().is::<GoPanic>() {
+            return;
+        }
         let message = payload_message(info.payload());
         if message.starts_with(UNPORTED_PREFIX) {
             if std::env::var_os("GOPORT_TRACE").is_some() {
@@ -243,123 +189,152 @@ fn note_panic(payload: &(dyn Any + Send)) {
     }
 }
 
+/// Runs `f`, or returns the default value when it panics. A Go panic goes
+/// on.
 fn guard<T: Default>(f: impl FnOnce() -> T) -> T {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(value) => value,
         Err(payload) => {
-            note_panic(payload.as_ref());
+            note_panic(resume_go_panic(payload).as_ref());
             T::default()
         }
     }
 }
 
-/// The config directory of `project` (a tsconfig path or a directory).
-fn config_directory(project: &str) -> String {
-    let path = absolute(project);
-    if std::path::Path::new(&path).is_dir() {
-        path
-    } else {
-        ts_path::directory_path(&path).clone()
-    }
-}
-
-// Go: execute/tsc.go:289 performCompilation with the command line
-// `--pretty false` and the emit options above.
+// Go: cmd/tsgo/main.go runMain: `execute.CommandLine` with the process
+// system and arguments, then `os.Exit` with the status.
 // PORT: the report goes to a buffer that is written to stdout at the end,
-// also when a step panics.
-fn run(config: &Config, start: Instant) -> i32 {
-    let config_dir = config_directory(&config.project);
-    if config.write_root.is_none() && is_inside(&config.out_dir, &config_dir) {
-        eprintln!(
-            "goport_emit: refusing --outDir {} inside the project directory {config_dir}",
-            config.out_dir
-        );
-        return 1;
-    }
+// also when a step panics. A panic ends the run; the steps inside
+// `GuardedProgram` are guarded on their own. A Go panic (`go_panic`) ends
+// the run with the Go runtime exit code.
+fn run(args: &[String], write_root: Option<String>, start: Instant) -> i32 {
     let sys = match new_os_system() {
         Ok(sys) => sys,
         Err(status) => return status.code(),
     };
     let buffer: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
     let writer: Writer = buffer.clone();
-    let sys = sys.with_start(start).with_writer(writer.clone());
+    let sys: Rc<dyn System> = Rc::new(sys.with_start(start).with_writer(writer));
 
-    let mut compile_times = CompileTimes::default();
-    let loaded = catch_unwind(AssertUnwindSafe(|| {
-        // `options` are the command line options, applied over the config.
-        try_load_timed(
-            &config.project,
-            |options| {
-                if let Some(dir) = &config.declaration_dir {
-                    options.declaration_dir.clone_from(dir);
-                }
-                options.out_dir.clone_from(&config.out_dir);
-                for (flag, value) in &config.flags {
-                    apply_flag(options, flag, *value);
-                }
-                options.pretty = Tristate::False;
-            },
-            &mut compile_times,
-        )
-    }));
-    match loaded {
-        Ok(Ok(_)) => {}
-        Ok(Err(message)) => {
-            eprintln!("goport_emit: {message}");
-            return 1;
-        }
-        Err(payload) => {
-            note_panic(payload.as_ref());
-            return finish(&buffer, &[], "", ExitStatus::Success);
-        }
-    }
-
-    // Refuse before any write when the out dir is inside a source directory.
-    let inputs: HashSet<String> = source_files()
-        .into_iter()
-        .map(|file| ts_path::normalize_path(source_file_file_name(file)))
-        .collect();
-    for file in source_files() {
-        let dir = ts_path::directory_path(source_file_file_name(file)).clone();
-        if config.write_root.is_none()
-            && !source_file_info(file).is_declaration_file
-            && is_inside(&config.out_dir, &dir)
-        {
-            eprintln!(
-                "goport_emit: refusing --outDir {} inside the source directory {dir}",
-                config.out_dir
-            );
-            return 1;
-        }
-    }
-
-    let refused: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let write_root = config.write_root.as_ref().unwrap_or(&config.out_dir);
-    let write_file = new_write_file(write_root.clone(), inputs, refused.clone());
-    let reported = catch_unwind(AssertUnwindSafe(|| {
-        let options = options();
-        emit_and_report_statistics(&EmitInput {
-            sys: &sys,
-            program_like: &GuardedProgram,
-            config: None,
-            report_diagnostic: create_diagnostic_reporter(&sys, writer.clone(), options),
-            report_error_summary: create_report_error_summary(&sys, Some(options)),
-            writer: writer.clone(),
-            write_file: Some(write_file),
-            compile_times: Rc::new(RefCell::new(compile_times)),
-        })
-    }));
-    let status = match reported {
-        Ok((result, _statistics)) => result.status,
-        Err(payload) => {
-            note_panic(payload.as_ref());
-            ExitStatus::Success
-        }
+    let bin = EmitBin {
+        write_root,
+        check_out_dir: Cell::new(true),
+        out_dir: OnceCell::new(),
+        root: OnceCell::new(),
+        write_file: OnceCell::new(),
+        refused: Arc::new(Mutex::new(Vec::new())),
     };
+    let result = catch_unwind(AssertUnwindSafe(|| command_line(sys.clone(), args, &bin)));
 
-    let refused = refused.lock().map(|r| r.clone()).unwrap_or_default();
+    let refused = bin.refused.lock().map(|r| r.clone()).unwrap_or_default();
     // A refused write is also a TS5033 diagnostic, so the status is the tsc one.
-    finish(&buffer, &refused, write_root, status)
+    finish(
+        &buffer,
+        &refused,
+        bin.root.get().map_or("", String::as_str),
+        result.map(|result| result.status),
+    )
+}
+
+/// The `goport_emit` part of the compile step (see `TscCompilationHooks`):
+/// the `--outDir` rules and the guarded `WriteFile`.
+// PORT: not in Go. tsgo writes any output path; goport_emit requires
+// `--outDir`, refuses an out dir in the project or a source directory,
+// and refuses writes outside the write root (emit-modes D2 and D3, equal
+// with `--writeRoot`). The out dir location checks are skipped under
+// `--writeRoot` and under `listFilesOnly`: Go does not call `Emit` then
+// (execute/tsc/emit.go:106), so nothing is written.
+struct EmitBin {
+    /// `--writeRoot`, or `None` for the default root, the `--outDir`.
+    write_root: Option<String>,
+    /// Whether the out dir location checks run (see above).
+    check_out_dir: Cell<bool>,
+    /// The command line `--outDir`, absolute (Go makes it absolute in
+    /// `ParseCommandLine`).
+    out_dir: OnceCell<String>,
+    /// The write root in use.
+    root: OnceCell<String>,
+    write_file: OnceCell<WriteFile>,
+    refused: Arc<Mutex<Vec<String>>>,
+}
+
+impl TscCompilationHooks for EmitBin {
+    // PORT: `-b` is unported here: the build writes outputs without the
+    // write guard, and the build workers re-run the bin. `goport_build` runs
+    // build mode.
+    fn build_mode(&self) -> bool {
+        false
+    }
+
+    fn prepare_compilation(
+        &self,
+        sys: &dyn System,
+        command_line_options: &CompilerOptions,
+        config_file_name: &str,
+        config: &mut ParsedCommandLine,
+    ) -> Result<(), ExitStatus> {
+        let out_dir = &command_line_options.out_dir;
+        if out_dir.is_empty() {
+            eprintln!("goport_emit: --outDir is required");
+            eprintln!("{USAGE}");
+            return Err(ExitStatus::DiagnosticsPresentOutputsSkipped);
+        }
+        self.check_out_dir
+            .set(self.write_root.is_none() && !config.compiler_options().list_files_only.is_true());
+        // The project directory: the config directory, or the current
+        // directory for source files on the command line.
+        let project_dir = if config_file_name.is_empty() {
+            sys.get_current_directory()
+        } else {
+            ts_path::directory_path(config_file_name)
+        };
+        if self.check_out_dir.get() && is_inside(out_dir, &project_dir) {
+            eprintln!(
+                "goport_emit: refusing --outDir {out_dir} inside the project directory {project_dir}"
+            );
+            return Err(ExitStatus::DiagnosticsPresentOutputsSkipped);
+        }
+        let _ = self.out_dir.set(out_dir.clone());
+        let _ = self
+            .root
+            .set(self.write_root.clone().unwrap_or_else(|| out_dir.clone()));
+        Ok(())
+    }
+
+    /// Refuses before any write when the out dir is inside a source
+    /// directory, and makes the guarded `WriteFile`.
+    fn program_created(&self) -> Result<(), ExitStatus> {
+        let out_dir = self.out_dir.get().expect("prepare_compilation ran");
+        let inputs: HashSet<String> = source_files()
+            .into_iter()
+            .map(|file| ts_path::normalize_path(source_file_file_name(file)))
+            .collect();
+        for file in source_files() {
+            let dir = ts_path::directory_path(source_file_file_name(file));
+            if self.check_out_dir.get()
+                && !source_file_info(file).is_declaration_file
+                && is_inside(out_dir, &dir)
+            {
+                eprintln!(
+                    "goport_emit: refusing --outDir {out_dir} inside the source directory {dir}"
+                );
+                return Err(ExitStatus::DiagnosticsPresentOutputsSkipped);
+            }
+        }
+        let root = self.root.get().expect("prepare_compilation ran").clone();
+        let _ = self
+            .write_file
+            .set(new_write_file(root, inputs, self.refused.clone()));
+        Ok(())
+    }
+
+    fn program_like(&self) -> Option<&dyn ProgramLike> {
+        Some(&GuardedProgram)
+    }
+
+    fn write_file(&self) -> Option<WriteFile> {
+        self.write_file.get().cloned()
+    }
 }
 
 /// The Go `WriteFile` callback: writes only under `root`, and never over a
@@ -393,19 +368,28 @@ fn new_write_file(
     )
 }
 
-/// Writes the report to stdout, then the refused writes and the unported
-/// counts to stderr, and returns the exit code: the tsc `status`, or
-/// `EXIT_UNPORTED` when something was unported.
+/// Writes the report to stdout, then a Go panic, the refused writes and the
+/// unported counts to stderr, and returns the exit code: the tsc status,
+/// `EXIT_GO_PANIC` after a Go panic, or `EXIT_UNPORTED` when something was
+/// unported or another panic ended the run.
 fn finish(
     buffer: &RefCell<Vec<u8>>,
     refused: &[String],
     write_root: &str,
-    status: ExitStatus,
+    result: std::thread::Result<ExitStatus>,
 ) -> i32 {
     let mut stdout = std::io::stdout().lock();
     let _ = write_go_output(&mut stdout, &buffer.borrow());
     let _ = stdout.flush();
 
+    let code = match result {
+        Ok(status) => status.code(),
+        Err(payload) if print_go_panic(payload.as_ref()) => EXIT_GO_PANIC,
+        Err(payload) => {
+            note_panic(payload.as_ref());
+            ExitStatus::Success.code()
+        }
+    };
     for path in refused {
         eprintln!("goport_emit: refused to write {path} (outside {write_root} or an input file)");
     }
@@ -418,7 +402,7 @@ fn finish(
     if !unported.is_empty() {
         return EXIT_UNPORTED;
     }
-    status.code()
+    code
 }
 
 /// The installed program as a Go `ProgramLike`, with each step guarded on
@@ -448,14 +432,15 @@ impl ProgramLike for GuardedProgram {
 }
 
 /// Semantic diagnostics for one file. A panic drops that file's results and
-/// replaces the checker, whose caches may be half written.
+/// replaces the checker, whose caches may be half written. A Go panic goes
+/// on.
 fn check_file_guarded(checker: &mut Checker, file: Node) -> Vec<Diagnostic> {
     match catch_unwind(AssertUnwindSafe(|| {
         get_semantic_diagnostics_with_checker(checker, file)
     })) {
         Ok(diagnostics) => diagnostics,
         Err(payload) => {
-            note_panic(payload.as_ref());
+            note_panic(resume_go_panic(payload).as_ref());
             let index = (checker.id - 1) as usize;
             *checker = Checker::new(index);
             Vec::new()

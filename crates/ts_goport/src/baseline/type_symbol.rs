@@ -244,7 +244,8 @@ impl TypeWriterWalker {
     /// Rust-only: `write_type_or_symbol` under `catch_unwind`. The checker is
     /// kept after a panic, because a new checker would change the type ids
     /// of every later node. Panics that are not unported hits are recorded
-    /// as `panic` in the unported report.
+    /// as `panic` in the unported report. A Go panic (`go_panic`) goes on,
+    /// as Go has no recover here.
     fn write_type_or_symbol_guarded(
         &mut self,
         node: Node,
@@ -255,6 +256,7 @@ impl TypeWriterWalker {
         })) {
             Ok(result) => result,
             Err(payload) => {
+                let payload = resume_go_panic(payload);
                 let message = payload_message(payload.as_ref());
                 if !message.starts_with(UNPORTED_PREFIX) {
                     record_unported("panic");

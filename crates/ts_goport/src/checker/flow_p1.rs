@@ -176,6 +176,14 @@ impl Checker {
         if f.borrow().depth == 2000 {
             // We have made 2000 recursive invocations. To avoid overflowing the call stack we report an error
             // and disable further control flow analysis in the containing function or module body.
+            if let Some(tr) = self.tracer {
+                let depth = f.borrow().depth;
+                tr.instant(
+                    crate::tracing::Phase::CheckTypes,
+                    "getTypeAtFlowNode_DepthLimit",
+                    vec![("depth", depth.into())],
+                );
+            }
             self.flow_analysis_disabled = true;
             let reference = f.borrow().reference;
             self.report_flow_control_error(reference);

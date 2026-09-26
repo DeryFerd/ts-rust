@@ -153,9 +153,7 @@ pub struct CompileAndEmitResult {
 }
 
 // Go: cmd/tsgo/sys.go:17 osSys
-// PORT: added here so the library and the bins share one system. Go reads
-// the terminal size with `golang.org/x/term`; the port has no terminal API,
-// so the width is 0 (the Go result when the size cannot be read).
+// PORT: added here so the library and the bins share one system.
 pub struct OsSystem {
     writer: Writer,
     fs: Rc<dyn Fs>,
@@ -202,40 +200,49 @@ impl OsSystem {
 }
 
 impl System for OsSystem {
-    // Go: cmd/tsgo/sys.go:47 Writer
+    // Go: cmd/tsgo/sys.go:45 Writer
     fn writer(&self) -> Writer {
         self.writer.clone()
     }
-    // Go: cmd/tsgo/sys.go:35 FS
+    // Go: cmd/tsgo/sys.go:33 FS
     fn fs(&self) -> Rc<dyn Fs> {
         self.fs.clone()
     }
-    // Go: cmd/tsgo/sys.go:39 DefaultLibraryPath
+    // Go: cmd/tsgo/sys.go:37 DefaultLibraryPath
     fn default_library_path(&self) -> String {
         self.default_library_path.clone()
     }
-    // Go: cmd/tsgo/sys.go:43 GetCurrentDirectory
+    // Go: cmd/tsgo/sys.go:41 GetCurrentDirectory
     fn get_current_directory(&self) -> String {
         self.cwd.clone()
     }
-    // Go: cmd/tsgo/sys.go:51 WriteOutputIsTTY
+    // Go: cmd/tsgo/sys.go:49 WriteOutputIsTTY
     fn write_output_is_tty(&self) -> bool {
         use std::io::IsTerminal;
         std::io::stdout().is_terminal()
     }
-    // Go: cmd/tsgo/sys.go:55 GetWidthOfTerminal
+    // Go: cmd/tsgo/sys.go:53 GetWidthOfTerminal
+    // Go `term.GetSize(int(os.Stdout.Fd()))` is the TIOCGWINSZ ioctl on
+    // stdout, and gives width 0 on error (golang.org/x/term v0.44.0
+    // term_unix.go:59 getSize).
+    // PORT: `rustix::termios::tcgetwinsize` makes the same ioctl, so this
+    // crate needs no unsafe code. This is the Unix path; the port targets
+    // Linux.
     fn get_width_of_terminal(&self) -> i32 {
-        0
+        match rustix::termios::tcgetwinsize(std::io::stdout()) {
+            Ok(ws) => i32::from(ws.ws_col),
+            Err(_) => 0,
+        }
     }
-    // Go: cmd/tsgo/sys.go:60 GetEnvironmentVariable
+    // Go: cmd/tsgo/sys.go:58 GetEnvironmentVariable
     fn get_environment_variable(&self, name: &str) -> String {
         std::env::var(name).unwrap_or_default()
     }
-    // Go: cmd/tsgo/sys.go:31 Now
+    // Go: cmd/tsgo/sys.go:29 Now
     fn now(&self) -> SystemTime {
         SystemTime::now()
     }
-    // Go: cmd/tsgo/sys.go:27 SinceStart
+    // Go: cmd/tsgo/sys.go:25 SinceStart
     fn since_start(&self) -> Duration {
         self.start.elapsed()
     }

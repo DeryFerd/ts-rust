@@ -64,7 +64,34 @@ impl NameResolver {
     // Go: binder/nameresolver.go:25 Resolve
     // PORT: Go `nameNotFoundMessage *diagnostics.Message` may be nil, so it is
     // `Option<&'static Message>`.
+    // PORT: the body is `resolve_scopes`. It looks `name` up once per scope,
+    // through `lookup` (a callback that takes `&str`). `with_text_hash`
+    // makes those lookups hash `name` once per resolve, not once per scope.
     pub fn resolve(
+        &self,
+        c: &mut Checker,
+        location: Node,
+        name: &str,
+        meaning: SymbolFlags,
+        name_not_found_message: Option<&'static Message>,
+        is_use: bool,
+        exclude_globals: bool,
+    ) -> SymbolId {
+        with_text_hash(name, || {
+            self.resolve_scopes(
+                c,
+                location,
+                name,
+                meaning,
+                name_not_found_message,
+                is_use,
+                exclude_globals,
+            )
+        })
+    }
+
+    // PORT: the Go `Resolve` body (see `resolve`).
+    fn resolve_scopes(
         &self,
         c: &mut Checker,
         location: Node,

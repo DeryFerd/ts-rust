@@ -131,13 +131,15 @@ impl Checker {
         for &base in base_symbols {
             if !self.is_static_private_identifier_property(base) {
                 let base_name = self.sym(base).name.clone();
-                let s = self.symbols.get_name(symbols, &base_name);
-                if s.is_nil() || !self.sym(s).flags.intersects(SymbolFlags::VALUE) {
-                    if symbols.is_nil() {
-                        symbols = self.symbols.new_table();
-                    }
-                    self.symbols.set(symbols, base_name, base);
+                // PORT: one table lookup for the Go read and write. A nil
+                // table has no entry, so Go always writes; make it first.
+                if symbols.is_nil() {
+                    symbols = self.symbols.new_table();
                 }
+                self.symbols
+                    .set_if_absent_or(symbols, &base_name, base, |s| {
+                        !s.flags.intersects(SymbolFlags::VALUE)
+                    });
             }
         }
         symbols

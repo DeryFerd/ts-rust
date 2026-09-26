@@ -493,7 +493,7 @@ pub fn parse_config(
 }
 
 // Go: tsoptions/tsconfigparsing.go:1169 defaultIncludeSpec
-const DEFAULT_INCLUDE_SPEC: &str = "**/*";
+pub const DEFAULT_INCLUDE_SPEC: &str = "**/*";
 
 // Go: tsoptions/tsconfigparsing.go:1171 propOfRaw
 // PORT: Go nil `sliceValue` is `None`.

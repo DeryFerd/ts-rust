@@ -28,32 +28,35 @@ pub(crate) fn can_have_literal_initializer(host: &dyn DeclarationEmitHost, node:
 }
 
 // Go: transformers/declarations/util.go:25 canProduceDiagnostics
+// PERF: Go chains 23 `ast.Is*` tests. Each one is a pure kind compare, so one
+// kind read and one match give the same result. The arms keep the Go order.
 pub(crate) fn can_produce_diagnostics(node: Node) -> bool {
-    is_variable_declaration(node)
-        || is_property_declaration(node)
-        || is_property_signature_declaration(node)
-        || is_binding_element(node)
-        || is_set_accessor_declaration(node)
-        || is_get_accessor_declaration(node)
-        || is_construct_signature_declaration(node)
-        || is_call_signature_declaration(node)
-        || is_method_declaration(node)
-        || is_method_signature_declaration(node)
-        || is_function_declaration(node)
-        || is_parameter_declaration(node)
-        || is_type_parameter_declaration(node)
-        || is_expression_with_type_arguments(node)
-        || is_import_equals_declaration(node)
-        || is_type_alias_declaration(node)
-        || is_js_type_alias_declaration(node)
-        || is_constructor_declaration(node)
-        || is_index_signature_declaration(node)
-        || is_property_access_expression(node)
-        || is_element_access_expression(node)
-        || is_binary_expression(node)
-        || is_call_expression(node) // || // !!! TODO: JSDoc support
-
-    /* ast.IsJSDocTypeAlias(node); */
+    matches!(
+        node.kind(),
+        SyntaxKind::VariableDeclaration
+            | SyntaxKind::PropertyDeclaration
+            | SyntaxKind::PropertySignature
+            | SyntaxKind::BindingElement
+            | SyntaxKind::SetAccessor
+            | SyntaxKind::GetAccessor
+            | SyntaxKind::ConstructSignature
+            | SyntaxKind::CallSignature
+            | SyntaxKind::MethodDeclaration
+            | SyntaxKind::MethodSignature
+            | SyntaxKind::FunctionDeclaration
+            | SyntaxKind::Parameter
+            | SyntaxKind::TypeParameter
+            | SyntaxKind::ExpressionWithTypeArguments
+            | SyntaxKind::ImportEqualsDeclaration
+            | SyntaxKind::TypeAliasDeclaration
+            | SyntaxKind::JsTypeAliasDeclaration
+            | SyntaxKind::Constructor
+            | SyntaxKind::IndexSignature
+            | SyntaxKind::PropertyAccessExpression
+            | SyntaxKind::ElementAccessExpression
+            | SyntaxKind::BinaryExpression
+            | SyntaxKind::CallExpression // !!! TODO: JSDoc support (ast.IsJSDocTypeAlias)
+    )
 }
 
 // Go: transformers/declarations/util.go:52 canReuseModifierNodes

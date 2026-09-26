@@ -9,8 +9,10 @@
 
 use crate::prelude::*;
 
+use crate::diagnostics_loc::message_localize;
 use crate::emitter::program_emit::{EmitOptions, EmitResult, WriteFile, emit};
 use crate::frontend::tsoptions::ParsedCommandLine;
+use crate::locale::Locale;
 
 use super::compile::{CompileAndEmitResult, CompileTimes, ExitStatus, System, Writer, write_str};
 use super::diagnostics::{DiagnosticReporter, DiagnosticsReporter};
@@ -65,22 +67,23 @@ impl ProgramLike for CompilerProgram {
 }
 
 // Go: execute/tsc/emit.go:20 GetTraceWithWriterFromSys
-// PORT: the locale and the testing hook are dropped (see compile.rs).
+// PORT: the testing hook is dropped (see compile.rs).
 pub fn get_trace_with_writer_from_sys(
     w: Writer,
+    locale: Locale,
 ) -> Rc<dyn Fn(&'static ts_diagnostics::Message, Vec<String>)> {
     Rc::new(
         move |msg: &'static ts_diagnostics::Message, args: Vec<String>| {
-            let text = format_message(msg, &args);
-            write_str(&w, &format!("{text}\n"));
+            write_str(&w, &format!("{}\n", message_localize(msg, &locale, &args)));
         },
     )
 }
 
 // Go: execute/tsc/emit.go:30 EmitInput
 // PORT: `Program` is the installed program (see the module comment).
-// `Testing`, `TestingMTimesCache` and `Tracing` are dropped: they are nil
-// outside Go tests and tracing runs. Go `Config` is optional here: without
+// `Testing` and `TestingMTimesCache` are dropped: they are nil outside Go
+// tests. `Tracing` is the process session (`crate::tracing::get`). Go
+// `Config` is optional here: without
 // it, the program options are used, which are the config options with the
 // command line applied.
 pub struct EmitInput<'a> {
@@ -100,6 +103,15 @@ impl EmitInput<'_> {
         match self.config {
             Some(config) => config.compiler_options(),
             None => self.program_like.options(),
+        }
+    }
+
+    /// Go `input.Config.Locale()`. Without a config, it is parsed from the
+    /// program options as Go `(*ParsedCommandLine).Locale` does.
+    fn config_locale(&self) -> Locale {
+        match self.config {
+            Some(config) => config.locale(),
+            None => crate::locale::parse(&self.program_like.options().locale).0,
         }
     }
 }
@@ -151,12 +163,28 @@ pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
             // Options diagnostics include global diagnostics (even though we collect them separately),
             // and global diagnostics create checkers, which then bind all of the files. Do this binding
             // early so we can track the time.
+            let _trace = crate::tracing::get().map(|tr| {
+                tr.push(
+                    crate::tracing::Phase::Bind,
+                    "bindSourceFiles",
+                    Vec::new(),
+                    true,
+                )
+            });
             let bind_start = std::time::Instant::now();
             let diags = program_like.get_bind_diagnostics(file);
             times.borrow_mut().bind_time = bind_start.elapsed();
             diags
         },
         &mut |file| {
+            let _trace = crate::tracing::get().map(|tr| {
+                tr.push(
+                    crate::tracing::Phase::Check,
+                    "checkSourceFiles",
+                    Vec::new(),
+                    true,
+                )
+            });
             let check_start = std::time::Instant::now();
             let diags = program_like.get_semantic_diagnostics(file);
             times.borrow_mut().check_time = check_start.elapsed();
@@ -215,7 +243,7 @@ fn list_files(input: &EmitInput, emit_result: &EmitResult) {
     }
     if options.explain_files.is_true() {
         let mut text = String::new();
-        crate::program::explain_files(&mut text);
+        crate::program::explain_files(&mut text, &input.config_locale());
         write_str(&input.writer, &text);
     } else if options.list_files.is_true() || options.list_files_only.is_true() {
         for file in source_files() {

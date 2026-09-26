@@ -216,8 +216,19 @@ impl Checker {
     // dropped (cancellation is concurrency plumbing). `is_canceled` is still called
     // in the same places.
     pub fn check_source_file(&mut self, source_file: Node, check_unused: bool) {
+        // Go `defer tr.Push(...)()` inside the block: the event ends when the
+        // function returns.
+        let mut _trace: Option<crate::tracing::Pop> = None;
         if !self.source_file_links.get(source_file).type_checked {
             self.save_deferred_diagnostics = true;
+            _trace = self.tracer.map(|tr| {
+                tr.push(
+                    crate::tracing::Phase::Check,
+                    "checkSourceFile",
+                    vec![("path", source_file_file_name(source_file).into())],
+                    true,
+                )
+            });
             // Grammar checking
             self.check_grammar_source_file(source_file);
             self.renamed_binding_elements_in_types = Vec::new();
@@ -608,6 +619,14 @@ impl Checker {
 
     // Go: checker/checker.go:2489 checkDeferredNode
     pub fn check_deferred_node(&mut self, node: Node) {
+        let _trace = self.tracer.map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Check,
+                "checkDeferredNode",
+                crate::tracing::node_args(node),
+                false,
+            )
+        });
         let save_current_node = self.current_node;
         self.current_node = node;
         self.instantiation_count = 0;
@@ -826,6 +845,18 @@ impl Checker {
                         args![],
                     );
                 } else if modifiers == ModifierFlags::IN || modifiers == ModifierFlags::OUT {
+                    let _trace = self.tracer.map(|tr| {
+                        let parent_type = self.get_declared_type_of_symbol(symbol);
+                        tr.push(
+                            crate::tracing::Phase::CheckTypes,
+                            "checkTypeParameterDeferred",
+                            vec![
+                                ("parent", parent_type.into()),
+                                ("id", type_parameter.into()),
+                            ],
+                            false,
+                        )
+                    });
                     let source_marker = if modifiers == ModifierFlags::OUT {
                         self.marker_sub_type_for_check
                     } else {

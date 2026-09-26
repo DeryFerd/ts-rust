@@ -288,11 +288,12 @@ impl Diagnostic {
     // in place after cloning, so a deep clone behaves the same.
 
     // Go: ast/diagnostic.go:101 Localize
-    // PORT: the port has no locale data; only the default (English) messages
-    // exist, so the locale parameter is dropped.
+    // PORT: the port resolves the message when it makes the diagnostic (see
+    // NewDiagnosticFromSerialized below), so the Go `d.messageKey` is never
+    // read and the key is "".
     #[must_use]
-    pub fn localize(&self) -> String {
-        format_message(self.message, &self.message_args)
+    pub fn localize(&self, locale: &crate::locale::Locale) -> String {
+        crate::diagnostics_loc::localize(locale, Some(self.message), "", &self.message_args)
     }
 
     // Go: ast/diagnostic.go:106 String

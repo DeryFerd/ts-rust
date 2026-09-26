@@ -1,7 +1,8 @@
 //! Go: compiler/fileloader.go (the file loader that finds, parses and
 //! resolves every program file).
 //!
-//! PORT: Go `opts.Tracing` spans are not ported. They do not change results.
+//! PORT: Go `opts.Tracing` is the process tracing session
+//! (`crate::tracing::get`).
 
 use crate::frontend::prelude::*;
 use std::cell::Cell;
@@ -192,6 +193,14 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         &loader.opts.typings_location,
         &loader.opts.project_name,
     )));
+    let _trace = crate::tracing::get().map(|tr| {
+        tr.push(
+            crate::tracing::Phase::Program,
+            "processRootFiles",
+            vec![("count", root_files.len().into())],
+            false,
+        )
+    });
     for (index, root_file) in root_files.iter().enumerate() {
         loader.add_root_file_task(
             root_file,
@@ -371,6 +380,21 @@ impl FileLoader {
                     resolution_mode,
                     None,
                 );
+                let trace_done = crate::tracing::get().map(|tr| {
+                    tr.push(
+                        crate::tracing::Phase::Program,
+                        "processTypeReferenceDirective",
+                        vec![
+                            ("directive", name.clone().into()),
+                            ("hasResolved", resolved.is_resolved().into()),
+                            (
+                                "refKind",
+                                FileIncludeKind::AUTOMATIC_TYPE_DIRECTIVE_FILE.0.into(),
+                            ),
+                        ],
+                        false,
+                    )
+                });
                 type_resolutions_in_file.insert(
                     ModeAwareCacheKey {
                         name: name.clone(),
@@ -410,6 +434,7 @@ impl FileLoader {
                         args![name],
                     ));
                 }
+                drop(trace_done);
             }
         }
         (
@@ -514,6 +539,14 @@ impl FileLoader {
 
     // Go: fileloader.go:364 (*fileLoader).parseSourceFile
     pub fn parse_source_file(&self, t: &ParseTask) -> Option<Rc<ParsedSourceFile>> {
+        let _trace = crate::tracing::get().map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Parse,
+                "createSourceFile",
+                vec![("path", t.normalized_file_path.clone().into())],
+                true,
+            )
+        });
         let path = self.to_path(&t.normalized_file_path);
         let options = self
             .project_reference_file_mapper
@@ -699,6 +732,14 @@ impl FileLoader {
         if file.type_reference_directives.is_empty() {
             return;
         }
+        let _trace = crate::tracing::get().map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Program,
+                "resolveTypeReferenceDirectiveNamesWorker",
+                vec![("containingFileName", file.file_name().to_string().into())],
+                false,
+            )
+        });
         let meta = t.metadata.clone();
 
         let mut type_resolutions_in_file: ModeAwareCache<Rc<ResolvedTypeReferenceDirective>> =
@@ -728,6 +769,22 @@ impl FileLoader {
                 resolution_mode,
                 redirect_ref,
             );
+            let trace_done = crate::tracing::get().map(|tr| {
+                tr.push(
+                    crate::tracing::Phase::Program,
+                    "processTypeReferenceDirective",
+                    vec![
+                        ("directive", ref_.file_name.clone().into()),
+                        ("hasResolved", resolved.is_resolved().into()),
+                        (
+                            "refKind",
+                            FileIncludeKind::TYPE_REFERENCE_DIRECTIVE.0.into(),
+                        ),
+                        ("refPath", t.path.0.clone().into()),
+                    ],
+                    false,
+                )
+            });
             type_resolutions_in_file.insert(
                 ModeAwareCacheKey {
                     name: ref_.file_name.clone(),
@@ -760,6 +817,7 @@ impl FileLoader {
                 t.processing_diagnostics
                     .push(new_unknown_reference_processing_diagnostic(include_reason));
             }
+            drop(trace_done);
         }
 
         t.type_resolutions_in_file = type_resolutions_in_file;
@@ -772,6 +830,20 @@ impl FileLoader {
 
     // Go: fileloader.go:528 (*fileLoader).resolveImportsAndModuleAugmentations
     pub fn resolve_imports_and_module_augmentations(&self, t: &mut ParseTask) {
+        let _trace = crate::tracing::get().map(|tr| {
+            let containing_file_name = t
+                .file
+                .as_ref()
+                .expect("resolveImportsAndModuleAugmentations runs on a parsed file")
+                .file_name()
+                .to_string();
+            tr.push(
+                crate::tracing::Phase::Program,
+                "resolveModuleNamesWorker",
+                vec![("containingFileName", containing_file_name.into())],
+                false,
+            )
+        });
         let file = t
             .file
             .clone()
@@ -1007,6 +1079,14 @@ impl FileLoader {
         library_name: &str,
         resolve_from: &str,
     ) -> (Rc<ResolvedModule>, Vec<DiagAndArgs>) {
+        let _trace = crate::tracing::get().map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Program,
+                "resolveLibrary",
+                vec![("resolveFrom", resolve_from.to_string().into())],
+                false,
+            )
+        });
         self.resolver()
             .resolve_module_name(library_name, resolve_from, ModuleKind::COMMON_JS, None)
     }

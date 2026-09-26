@@ -851,8 +851,23 @@ pub fn json_marshal<T: MarshalerTo + ?Sized>(
 }
 
 // Go: json/json.go:23 MarshalEncode
+// PORT: not ported. Only the LSP, API and build-info writers use it.
+
 // Go: json/json.go:32 MarshalWrite
-// PORT: not ported. Only the LSP, API and build-info writers use them.
+// PORT: Go writes through a streaming `jsontext.Encoder` that flushes as it
+// goes, so a marshal error can leave partial output. This marshals the whole
+// value first (`json_marshal`) and writes nothing on a marshal error. Like Go
+// (`jsonflags.OmitTopLevelNewline` in v2 `MarshalWrite`), the output has no
+// trailing newline. A write error is returned as a `JsonError`.
+pub fn json_marshal_write<T: MarshalerTo + ?Sized>(
+    out: &mut dyn std::io::Write,
+    input: &T,
+    opts: &[JsonOption],
+) -> Result<(), JsonError> {
+    let b = json_marshal(input, opts)?;
+    out.write_all(b.as_bytes())
+        .map_err(|err| JsonError::new(err.to_string()))
+}
 
 // Go: json/json.go:41 MarshalIndent
 // PORT: the Rust marshalers write compact output. Go passes
@@ -1114,7 +1129,23 @@ fn json_append_multiline(compact: &str, prefix: &str, indent: &str) -> Result<St
 }
 
 // Go: json/json.go:49 MarshalIndentWrite
-// PORT: not ported. Only test baselines use it.
+// Used by execute/tsc.go:375 showConfig (prefix "", indent four spaces).
+// PORT: the indented output comes from `json_marshal_indent` (see the
+// PORT notes there and on `json_marshal_write`). There is no trailing newline.
+pub fn json_marshal_indent_write<T: MarshalerTo + ?Sized>(
+    out: &mut dyn std::io::Write,
+    input: &T,
+    prefix: &str,
+    indent: &str,
+) -> Result<(), JsonError> {
+    if prefix.is_empty() && indent.is_empty() {
+        // WithIndentPrefix and WithIndent imply multiline output, so skip them.
+        return json_marshal_write(out, input, &[]);
+    }
+    let b = json_marshal_indent(input, prefix, indent)?;
+    out.write_all(b.as_bytes())
+        .map_err(|err| JsonError::new(err.to_string()))
+}
 
 // Go: json/json.go:57 Unmarshal
 // PORT: `out` implements `UnmarshalerFrom` in place of Go reflection. Like

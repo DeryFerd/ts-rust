@@ -2,7 +2,21 @@
 //! intersection properties, apparent and reduced types, type arguments and
 //! defaults, named members, and the core of type instantiation.
 
+use crate::checker::utilities_p1::SymbolSortKey;
 use crate::prelude::*;
+
+/// Reusable buffers of `get_named_members` (the `Checker` field
+/// `named_members_scratch`), so a call allocates only its result.
+#[derive(Default)]
+pub(crate) struct NamedMembersScratch {
+    /// Candidate members, then the sorted result.
+    symbols: Vec<SymbolId>,
+    /// Sort keys: contained members first when the container is a class or
+    /// interface, else all members.
+    keys: Vec<SymbolSortKey>,
+    /// Sort keys of the members that are not contained.
+    other_keys: Vec<SymbolSortKey>,
+}
 
 impl Checker {
     // Go: checker/checker.go:21264 findMixins
@@ -1239,63 +1253,83 @@ impl Checker {
     }
 
     // Go: checker/checker.go:21948 getNamedMembers
+    // PORT: returns the final `SharedList` that `set_structured_type_members`
+    // stores (Go stores the returned slice), so the result is one exact-size
+    // allocation. Go returns nil for an empty table; the empty list is nil.
     pub fn get_named_members(
         &mut self,
         members: SymbolTable,
         container: SymbolId,
-    ) -> Vec<SymbolId> {
+    ) -> SharedList<SymbolId> {
         if self.symbols.len(members) == 0 {
-            return Vec::new();
+            return SharedList::default();
         }
         // For classes and interfaces, we store explicitly declared members ahead of inherited members. This ensures we process
         // explicitly declared members first in type relations, which is beneficial because explicitly declared members are more
         // likely to contain discriminating differences. See for example https://github.com/microsoft/typescript-go/issues/1968.
-        // PORT: `is_named_member` is `!is_reserved_member_name(id)` and then
+        //
+        // PORT: one pass over the table in table order does all the Go
+        // tests. `is_named_member` is `!is_reserved_member_name(id)` and then
         // `symbol_is_value`. The first test only reads the table, so it runs
-        // while the snapshot is built. The second can resolve aliases, so it
-        // runs on the snapshot, in table order as in Go.
-        let mut result: Vec<SymbolId> = Vec::with_capacity(self.symbols.len(members));
-        result.extend(
+        // while the snapshot of candidates is built. `symbol_is_value` can
+        // resolve aliases, so it runs on the snapshot, in table order as in
+        // Go, and the containment test follows it as in the Go first loop.
+        // The Go second loop repeats both tests and gets the same answers
+        // (alias resolution is cached, containment only reads), so each
+        // symbol is tested once and its sort key goes to the contained or
+        // the other list. Both lists keep table order and get the stable
+        // sort and comparator of `sort_symbols`, so the lazy
+        // `get_symbol_id` calls in the comparisons happen in the same order.
+        //
+        // The buffers are reused across calls. They are taken out of the
+        // checker so the loop can call `&mut self` methods; a nested call
+        // (through alias resolution) finds them empty and uses its own.
+        let mut scratch = std::mem::take(&mut self.named_members_scratch);
+        let NamedMembersScratch {
+            symbols: candidates,
+            keys,
+            other_keys,
+        } = &mut scratch;
+        candidates.clear();
+        keys.clear();
+        other_keys.clear();
+        candidates.extend(
             self.symbols
                 .iter(members)
                 .filter(|(id, _)| !is_reserved_member_name(id))
                 .map(|(_, symbol)| symbol),
         );
-        result.retain(|&symbol| self.symbol_is_value(symbol));
-        let mut contained_count = 0usize;
         let is_class_or_interface_container = container.is_some()
             && self
                 .sym(container)
                 .flags
                 .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE);
-        if is_class_or_interface_container {
-            // PORT: Go runs isNamedMember and isDeclarationContainedBy again
-            // in the second pass. Both are pure here, so one stable partition
-            // keeps the contained members first.
-            let member_count = result.len();
-            let mut others: Vec<SymbolId> = Vec::new();
-            result.retain(|&symbol| {
-                let declaration = self.sym(symbol).value_declaration;
-                let contained = declaration.is_some() && {
-                    let loc = declaration.loc();
-                    self.sym(container)
-                        .declarations
-                        .iter()
-                        .any(|d| loc.contained_by(d.loc()))
-                };
-                if !contained {
-                    if others.capacity() == 0 {
-                        others.reserve_exact(member_count);
-                    }
-                    others.push(symbol);
-                }
-                contained
-            });
-            contained_count = result.len();
-            result.extend_from_slice(&others);
+        let mut last_file = (Node::NIL, 0);
+        for &symbol in candidates.iter() {
+            if !self.symbol_is_value(symbol) {
+                continue;
+            }
+            let key = self.symbol_sort_key(symbol, &mut last_file);
+            if is_class_or_interface_container
+                && !self.is_declaration_contained_by(symbol, container)
+            {
+                other_keys.push(key);
+            } else {
+                keys.push(key);
+            }
         }
-        self.sort_symbols(&mut result[..contained_count]);
-        self.sort_symbols(&mut result[contained_count..]);
+        let contained_count = if is_class_or_interface_container {
+            keys.len()
+        } else {
+            0
+        };
+        keys.append(other_keys);
+        self.sort_symbol_sort_keys(&mut keys[..contained_count]);
+        self.sort_symbol_sort_keys(&mut keys[contained_count..]);
+        candidates.clear();
+        candidates.extend(keys.iter().map(|key| key.symbol));
+        let result = SharedList::from(candidates.as_slice());
+        self.named_members_scratch = scratch;
         result
     }
 
@@ -1376,6 +1410,17 @@ impl Checker {
             // We have reached 100 recursive type instantiations, or 5M type instantiations caused by the same statement
             // or expression. There is a very high likelihood we're dealing with a combination of infinite generic types
             // that perpetually generate new type identities, so we stop the recursion here by yielding the error type.
+            if let Some(tr) = self.tracer {
+                tr.instant(
+                    crate::tracing::Phase::CheckTypes,
+                    "instantiateType_DepthLimit",
+                    vec![
+                        ("typeId", t.into()),
+                        ("instantiationDepth", self.instantiation_depth.into()),
+                        ("instantiationCount", self.instantiation_count.into()),
+                    ],
+                );
+            }
             let current_node = self.current_node;
             self.error(
                 current_node,

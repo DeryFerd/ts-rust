@@ -23,9 +23,16 @@ pub struct ProjectReferenceParseTask {
 
 impl ProjectReferenceParseTask {
     // Go: projectreferenceparser.go:19 (*projectReferenceParseTask).parse
-    // PORT: tracing is skipped.
     pub fn parse(&mut self, project_reference_parser: &ProjectReferenceParser<'_>) {
         let loader = &*project_reference_parser.loader;
+        let _trace = crate::tracing::get().map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Parse,
+                "parseJsonSourceFileConfigFileContent",
+                vec![("path", self.config_name.clone().into())],
+                false,
+            )
+        });
         self.resolved = loader
             .opts
             .host

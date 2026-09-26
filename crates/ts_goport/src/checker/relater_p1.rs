@@ -704,6 +704,22 @@ impl Checker {
                         RelationComparisonResult::STACK_DEPTH_OVERFLOW
                     },
             );
+            if let Some(tr) = self.tracer {
+                let (depth, target_depth) = {
+                    let rb = r.borrow();
+                    (rb.source_stack.len(), rb.target_stack.len())
+                };
+                tr.instant(
+                    crate::tracing::Phase::CheckTypes,
+                    "checkTypeRelatedTo_DepthLimit",
+                    vec![
+                        ("sourceId", source.into()),
+                        ("targetId", target.into()),
+                        ("depth", depth.into()),
+                        ("targetDepth", target_depth.into()),
+                    ],
+                );
+            }
             let message = if relation_count <= 0 {
                 diag::Excessive_complexity_comparing_types_0_and_1
             } else {
@@ -1666,6 +1682,83 @@ impl Checker {
             let mut last_type_id = TypeId(0);
             for &t in stack {
                 if self.has_matching_recursion_identity(t, identity) {
+                    // We only count occurrences with a higher type id than the previous occurrence, since higher
+                    // type ids are an indicator of newer instantiations caused by recursion.
+                    let id = t;
+                    if id >= last_type_id {
+                        count += 1;
+                        if count >= max_depth {
+                            return true;
+                        }
+                    }
+                    last_type_id = id;
+                }
+            }
+        }
+        false
+    }
+
+    // PORT: perf. The recursion id that `invoke_once` keeps for each entry of
+    // the inference stacks. `None` marks an entry that still needs
+    // `has_matching_recursion_identity`: an instantiated mapped type (its
+    // mapped target can make types) or an intersection (its parts can be
+    // mapped types). For any other type that function is
+    // `get_recursion_identity(t) == identity`, and `get_recursion_identity`
+    // reads only type data that is fixed at type creation.
+    pub fn stack_recursion_id(&self, t: TypeId) -> Option<RecursionId> {
+        let ty = self.ty(t);
+        if ty.object_flags.contains(ObjectFlags::INSTANTIATED_MAPPED)
+            || ty.flags.intersects(TypeFlags::INTERSECTION)
+        {
+            return None;
+        }
+        Some(self.get_recursion_identity(t))
+    }
+
+    // PORT: perf. `is_deeply_nested_type` for the inference stacks. `ids[i]`
+    // is `stack_recursion_id(stack[i])`. An entry with an id is compared
+    // directly. The probe type and the `None` entries run the Go code, so
+    // `get_mapped_target_with_symbol` runs for the same types in Go order.
+    // The relater stacks keep `is_deeply_nested_type`.
+    // Go: checker/relater.go:773 isDeeplyNestedType
+    pub fn is_deeply_nested_type_with_ids(
+        &mut self,
+        t: TypeId,
+        stack: &[TypeId],
+        ids: &[Option<RecursionId>],
+        max_depth: i32,
+    ) -> bool {
+        debug_assert_eq!(stack.len(), ids.len());
+        let mut t = t;
+        if stack.len() as i32 >= max_depth {
+            if self
+                .ty(t)
+                .object_flags
+                .contains(ObjectFlags::INSTANTIATED_MAPPED)
+            {
+                t = self.get_mapped_target_with_symbol(t);
+            }
+            if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
+                for i in 0..self.ty(t).types().len() {
+                    if self.is_deeply_nested_type_with_ids(
+                        self.type_at(t, i),
+                        stack,
+                        ids,
+                        max_depth,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            let identity = self.get_recursion_identity(t);
+            let mut count: i32 = 0;
+            let mut last_type_id = TypeId(0);
+            for (&t, &id) in stack.iter().zip(ids) {
+                let matching = match id {
+                    Some(id) => id == identity,
+                    None => self.has_matching_recursion_identity(t, identity),
+                };
+                if matching {
                     // We only count occurrences with a higher type id than the previous occurrence, since higher
                     // type ids are an indicator of newer instantiations caused by recursion.
                     let id = t;

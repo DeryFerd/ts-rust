@@ -1452,9 +1452,9 @@ pub fn is_unary_tuple_type_node(node: Node) -> bool {
 }
 
 impl Checker {
-    // PORT: Go sets `t.checker = c` and records the type with the tracer; the
-    // checker back pointer and tracer are out of scope. Go `t.id = TypeId(c.TypeCount)`
-    // equals the arena index, so the new entry is pushed at that index.
+    // PORT: Go sets `t.checker = c`; the checker back pointer is out of scope.
+    // Go `t.id = TypeId(c.TypeCount)` equals the arena index, so the new entry
+    // is pushed at that index.
     // Go: checker/checker.go:24905 newType
     pub fn new_type(
         &mut self,
@@ -1477,6 +1477,9 @@ impl Checker {
             alias: None,
             data,
         });
+        if let Some(tracer) = self.tracer {
+            tracer.record_type(id);
+        }
         id
     }
 

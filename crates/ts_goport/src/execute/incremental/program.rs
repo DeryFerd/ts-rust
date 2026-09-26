@@ -361,6 +361,14 @@ impl Program {
 
     // Go: incremental/program.go:278 emitBuildInfo
     pub(crate) fn emit_build_info(&self, options: &EmitOptions) -> Option<EmitResult> {
+        let _trace = crate::tracing::get().map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Emit,
+                "emitBuildInfo",
+                Vec::new(),
+                true,
+            )
+        });
         let build_info_file_name = get_build_info_file_name(
             self.snapshot.borrow().options,
             &ComparePathsOptions {

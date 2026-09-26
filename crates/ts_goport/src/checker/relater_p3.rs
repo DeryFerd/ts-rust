@@ -1,6 +1,7 @@
 //! Port of typescript-go `checker/relater.go` lines 1827-2795.
 
 use crate::prelude::*;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use ts_diagnostics::Message;
 
@@ -869,17 +870,40 @@ impl Checker {
     }
 
     // Go: checker/relater.go:2345 inferTypesFromTemplateLiteralType
-    // PORT: returns an empty Vec where Go returns nil. Go never returns a
+    // PORT: returns an empty list where Go returns nil. Go never returns a
     // non-nil empty slice here (a match always records at least one type).
     pub fn infer_types_from_template_literal_type(
         &mut self,
         source: TypeId,
         target: &TemplateLiteralType,
-    ) -> Vec<TypeId> {
+    ) -> TemplateLiteralInferences {
         let flags = self.ty(source).flags;
         if flags.intersects(TypeFlags::STRING_LITERAL) {
-            let value = self.get_string_literal_value(source);
-            return self.infer_from_literal_parts_to_template_literal(&[value], &[], target);
+            // PORT: perf. Go passes `[]string{getStringLiteralValue(source)}`.
+            // Here the text is matched in place and read again from the type
+            // for each match, so the literal is not cloned. The types are
+            // made in the same order as Go `addMatch` makes them.
+            // The texts are matched on their Go bytes (see
+            // `infer_from_literal_parts_to_template_literal`).
+            let mut spans = LiteralPartMatches::new();
+            let matched = match_literal_parts_to_template_literal(
+                &[go_string_bytes(self.get_string_literal_value_ref(source))],
+                &go_string_bytes_list(&target.texts),
+                &mut spans,
+            );
+            let mut result = TemplateLiteralInferences::with_capacity(spans.len());
+            for m in &spans {
+                // A string literal is one text part, so every match is inside it.
+                debug_assert!(m.seg == 0 && m.s == 0);
+                let text = combine_surrogate_pairs(&go_value_from_bytes(
+                    &go_string_bytes(self.get_string_literal_value_ref(source))[m.pos..m.p],
+                ));
+                result.push(self.get_string_literal_type(&text));
+            }
+            if !matched {
+                return TemplateLiteralInferences::new();
+            }
+            return result;
         }
         if flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
             let (source_texts, source_types) = {
@@ -887,7 +911,7 @@ impl Checker {
                 (tl.texts.clone(), tl.types.clone())
             };
             if source_texts == target.texts {
-                let mut result: Vec<TypeId> = Vec::with_capacity(source_types.len());
+                let mut result = TemplateLiteralInferences::with_capacity(source_types.len());
                 for (i, &s) in source_types.iter().enumerate() {
                     let source_constraint = self.get_base_constraint_or_type(s);
                     let target_constraint = self.get_base_constraint_or_type(target.types[i]);
@@ -905,7 +929,7 @@ impl Checker {
                 target,
             );
         }
-        Vec::new()
+        TemplateLiteralInferences::new()
     }
 
     // This function infers from the text parts and type parts of a source literal to a target template literal. The number
@@ -930,7 +954,10 @@ impl Checker {
     // the first inference is the template literal type `<${string}>`. The remainder of the source makes up the second
     // inference, the template literal type `<${number}-${number}>`.
     // Go: checker/relater.go:2385 inferFromLiteralPartsToTemplateLiteral
-    // PORT: returns an empty Vec where Go returns nil (a match is never empty).
+    // PORT: returns an empty list where Go returns nil (a match is never
+    // empty). `match_literal_parts_to_template_literal` does the text
+    // matching first, then the types are made in Go `addMatch` order. The
+    // matching makes no types, so the order of type creation is the same.
     // Go matches and slices the bytes of the texts. The texts are port forms
     // (see `scanner_util::GO_STRING_MARKER`), so this works on their Go
     // bytes, and each match is the value form of its bytes
@@ -940,127 +967,33 @@ impl Checker {
         source_texts: &[String],
         source_types: &[TypeId],
         target: &TemplateLiteralType,
-    ) -> Vec<TypeId> {
-        let source_bytes: Vec<Cow<'_, [u8]>> = source_texts
-            .iter()
-            .map(|text| go_string_bytes(text))
-            .collect();
-        let target_bytes: Vec<Cow<'_, [u8]>> = target
-            .texts
-            .iter()
-            .map(|text| go_string_bytes(text))
-            .collect();
-        let last_source_index = source_bytes.len() - 1;
-        let source_start_text: &[u8] = &source_bytes[0];
-        let source_end_text: &[u8] = &source_bytes[last_source_index];
-        let last_target_index = target_bytes.len() - 1;
-        let target_start_text: &[u8] = &target_bytes[0];
-        let target_end_text: &[u8] = &target_bytes[last_target_index];
-        if last_source_index == 0
-            && source_start_text.len() < target_start_text.len() + target_end_text.len()
-            || !source_start_text.starts_with(target_start_text)
-            || !source_end_text.ends_with(target_end_text)
-        {
-            return Vec::new();
-        }
-        let remaining_end_text = &source_end_text[..source_end_text.len() - target_end_text.len()];
-        let mut seg: usize = 0;
-        let mut pos: usize = target_start_text.len();
-        let mut matches: Vec<TypeId> = Vec::new();
-        // Go closure `getSourceText`.
-        fn source_text_at<'a>(
-            source_bytes: &'a [Cow<'a, [u8]>],
-            remaining_end_text: &'a [u8],
-            last_source_index: usize,
-            index: usize,
-        ) -> &'a [u8] {
-            if index < last_source_index {
-                return &source_bytes[index];
-            }
-            remaining_end_text
-        }
-        let get_source_text = |index: usize| {
-            source_text_at(&source_bytes, remaining_end_text, last_source_index, index)
-        };
-        // PORT: Go `addMatch` closes over `seg`, `pos` and `matches`; here they
-        // are passed explicitly so the checker can be borrowed mutably.
-        let add_match = |c: &mut Checker,
-                         seg: &mut usize,
-                         pos: &mut usize,
-                         matches: &mut Vec<TypeId>,
-                         s: usize,
-                         p: usize| {
-            let match_type = if s == *seg {
-                c.get_string_literal_type(&combine_surrogate_pairs(&go_value_from_bytes(
-                    &get_source_text(s)[*pos..p],
+    ) -> TemplateLiteralInferences {
+        let source_bytes = go_string_bytes_list(source_texts);
+        let target_bytes = go_string_bytes_list(&target.texts);
+        let mut spans = LiteralPartMatches::new();
+        let matched =
+            match_literal_parts_to_template_literal(&source_bytes, &target_bytes, &mut spans);
+        let mut result = TemplateLiteralInferences::with_capacity(spans.len());
+        for m in &spans {
+            // Go reads `getSourceText(s)`. That text is a prefix of
+            // `sourceTexts[s]` and `p` is inside it, so the slices are equal.
+            let match_type = if m.s == m.seg {
+                self.get_string_literal_type(&combine_surrogate_pairs(&go_value_from_bytes(
+                    &source_bytes[m.s][m.pos..m.p],
                 )))
             } else {
-                let mut match_texts: Vec<String> = Vec::with_capacity(s - *seg + 1);
-                match_texts.push(go_value_from_bytes(&source_bytes[*seg][*pos..]).into_owned());
-                match_texts.extend(source_texts[*seg + 1..s].iter().cloned());
-                match_texts.push(go_value_from_bytes(&get_source_text(s)[..p]).into_owned());
-                c.get_template_literal_type(&match_texts, &source_types[*seg..s])
+                let mut match_texts: Vec<String> = Vec::with_capacity(m.s - m.seg + 1);
+                match_texts.push(go_value_from_bytes(&source_bytes[m.seg][m.pos..]).into_owned());
+                match_texts.extend(source_texts[m.seg + 1..m.s].iter().cloned());
+                match_texts.push(go_value_from_bytes(&source_bytes[m.s][..m.p]).into_owned());
+                self.get_template_literal_type(&match_texts, &source_types[m.seg..m.s])
             };
-            matches.push(match_type);
-            *seg = s;
-            *pos = p;
-        };
-        for i in 1..last_target_index {
-            let delim: &[u8] = &target_bytes[i];
-            if !delim.is_empty() {
-                let mut s = seg;
-                let mut p = pos;
-                loop {
-                    if let Some(d) = memchr::memmem::find(&get_source_text(s)[p..], delim) {
-                        p += d;
-                        break;
-                    }
-                    s += 1;
-                    if s == source_texts.len() {
-                        return Vec::new();
-                    }
-                    p = 0;
-                }
-                add_match(self, &mut seg, &mut pos, &mut matches, s, p);
-                pos += delim.len();
-            } else if pos < get_source_text(seg).len() {
-                let source_text = get_source_text(seg);
-                // Consume one code point at a time, matching the string iterator
-                // (`[x, ..._] = s`) rather than UTF-16 code-unit indexing (`s[0]`).
-                // DecodeJSStringRune is required rather than utf8.DecodeRuneInString
-                // because a lone surrogate is stored as an invalid-UTF-8 sentinel;
-                // utf8 would treat that as an error and advance a single byte,
-                // breaking the sentinel into stray bytes, whereas DecodeJSStringRune
-                // pulls the whole sentinel off as one code point.
-                //
-                // This intentionally diverges from Strada, which advances one UTF-16
-                // code unit at a time (`s[0]` semantics) and therefore splits a
-                // supplementary code point such as an emoji into its surrogate
-                // halves. If we ever need to match that, expand sourceTexts and
-                // targetTexts into code-unit space up front with a SplitSurrogatePairs
-                // helper (the inverse of CombineSurrogatePairs) and decode by code
-                // unit here; the CombineSurrogatePairs call in addMatch already
-                // recombines captured halves back into canonical form.
-                let (_, size) = go_decode_js_string_rune_bytes(&source_text[pos..]);
-                let (s0, p0) = (seg, pos + size);
-                add_match(self, &mut seg, &mut pos, &mut matches, s0, p0);
-            } else if seg < last_source_index {
-                let s0 = seg + 1;
-                add_match(self, &mut seg, &mut pos, &mut matches, s0, 0);
-            } else {
-                return Vec::new();
-            }
+            result.push(match_type);
         }
-        let end = get_source_text(last_source_index).len();
-        add_match(
-            self,
-            &mut seg,
-            &mut pos,
-            &mut matches,
-            last_source_index,
-            end,
-        );
-        matches
+        if !matched {
+            return TemplateLiteralInferences::new();
+        }
+        result
     }
 
     // Go: checker/relater.go:2469 getStringLikeTypeForType
@@ -1414,7 +1347,7 @@ impl Checker {
             if self.ty(source).flags.intersects(TypeFlags::SINGLETON) {
                 return Ternary::TRUE;
             }
-            // PORT: Go calls r.traceUnionsOrIntersectionsTooLarge here. Tracing is skipped.
+            self.trace_unions_or_intersections_too_large(r, source, target);
             return self.recursive_type_related_to(
                 r,
                 source,
@@ -1578,7 +1511,7 @@ impl Checker {
                 }
                 return Ternary::FALSE;
             }
-            // PORT: Go calls r.traceUnionsOrIntersectionsTooLarge here. Tracing is skipped.
+            self.trace_unions_or_intersections_too_large(r, source, target);
             let skip_caching = self.ty(source).flags.intersects(TypeFlags::UNION)
                 && self.ty(source).types().len() < 4
                 && !self.ty(target).flags.intersects(TypeFlags::UNION)
@@ -1807,4 +1740,131 @@ impl Checker {
         }
         false
     }
+}
+
+/// One Go `addMatch(s, p)` call of `inferFromLiteralPartsToTemplateLiteral`:
+/// the source text from part `seg` at byte `pos` to part `s` at byte `p`.
+/// The byte offsets are in the Go bytes of the texts.
+#[derive(Clone, Copy)]
+struct LiteralPartMatch {
+    seg: usize,
+    pos: usize,
+    s: usize,
+    p: usize,
+}
+
+type LiteralPartMatches = SmallVec<[LiteralPartMatch; 4]>;
+
+/// The placeholder types that `infer_types_from_template_literal_type` infers.
+pub type TemplateLiteralInferences = SmallVec<[TypeId; 4]>;
+
+/// The Go bytes of each port form text (see `scanner_util::GO_STRING_MARKER`).
+/// A text without a marker is borrowed.
+fn go_string_bytes_list(texts: &[String]) -> SmallVec<[Cow<'_, [u8]>; 4]> {
+    texts.iter().map(|text| go_string_bytes(text)).collect()
+}
+
+// PORT: perf. The text matching of Go `inferFromLiteralPartsToTemplateLiteral`
+// without the type creation. It records each `addMatch` call in `matches`, so
+// the caller can keep the source text borrowed from the checker while it
+// matches and make the types after. It returns false where Go returns nil.
+// The matches recorded before a failure stay in `matches`, because Go has
+// already made their types at that point. Go matches the bytes of the
+// strings, so the texts are the Go bytes of the port forms.
+fn match_literal_parts_to_template_literal<S: AsRef<[u8]>, T: AsRef<[u8]>>(
+    source_texts: &[S],
+    target_texts: &[T],
+    matches: &mut LiteralPartMatches,
+) -> bool {
+    let last_source_index = source_texts.len() - 1;
+    let source_start_text = source_texts[0].as_ref();
+    let source_end_text = source_texts[last_source_index].as_ref();
+    let last_target_index = target_texts.len() - 1;
+    let target_start_text = target_texts[0].as_ref();
+    let target_end_text = target_texts[last_target_index].as_ref();
+    if last_source_index == 0
+        && source_start_text.len() < target_start_text.len() + target_end_text.len()
+        || !source_start_text.starts_with(target_start_text)
+        || !source_end_text.ends_with(target_end_text)
+    {
+        return false;
+    }
+    let remaining_end_text = &source_end_text[..source_end_text.len() - target_end_text.len()];
+    let mut seg: usize = 0;
+    let mut pos: usize = target_start_text.len();
+    // Go closure `getSourceText`.
+    fn source_text_at<'a, S: AsRef<[u8]>>(
+        source_texts: &'a [S],
+        remaining_end_text: &'a [u8],
+        last_source_index: usize,
+        index: usize,
+    ) -> &'a [u8] {
+        if index < last_source_index {
+            return source_texts[index].as_ref();
+        }
+        remaining_end_text
+    }
+    let get_source_text =
+        |index: usize| source_text_at(source_texts, remaining_end_text, last_source_index, index);
+    // Go closure `addMatch`, without the type creation. `seg` and `pos` are
+    // passed explicitly so the loop below can read them.
+    let mut add_match = |seg: &mut usize, pos: &mut usize, s: usize, p: usize| {
+        matches.push(LiteralPartMatch {
+            seg: *seg,
+            pos: *pos,
+            s,
+            p,
+        });
+        *seg = s;
+        *pos = p;
+    };
+    for i in 1..last_target_index {
+        let delim = target_texts[i].as_ref();
+        if !delim.is_empty() {
+            let mut s = seg;
+            let mut p = pos;
+            loop {
+                if let Some(d) = memchr::memmem::find(&get_source_text(s)[p..], delim) {
+                    p += d;
+                    break;
+                }
+                s += 1;
+                if s == source_texts.len() {
+                    return false;
+                }
+                p = 0;
+            }
+            add_match(&mut seg, &mut pos, s, p);
+            pos += delim.len();
+        } else if pos < get_source_text(seg).len() {
+            let source_text = get_source_text(seg);
+            // Consume one code point at a time, matching the string iterator
+            // (`[x, ..._] = s`) rather than UTF-16 code-unit indexing (`s[0]`).
+            // DecodeJSStringRune is required rather than utf8.DecodeRuneInString
+            // because a lone surrogate is stored as an invalid-UTF-8 sentinel;
+            // utf8 would treat that as an error and advance a single byte,
+            // breaking the sentinel into stray bytes, whereas DecodeJSStringRune
+            // pulls the whole sentinel off as one code point.
+            //
+            // This intentionally diverges from Strada, which advances one UTF-16
+            // code unit at a time (`s[0]` semantics) and therefore splits a
+            // supplementary code point such as an emoji into its surrogate
+            // halves. If we ever need to match that, expand sourceTexts and
+            // targetTexts into code-unit space up front with a SplitSurrogatePairs
+            // helper (the inverse of CombineSurrogatePairs) and decode by code
+            // unit here; the CombineSurrogatePairs call in addMatch already
+            // recombines captured halves back into canonical form.
+            let (_, size) = go_decode_js_string_rune_bytes(&source_text[pos..]);
+            let (s0, p0) = (seg, pos + size);
+            add_match(&mut seg, &mut pos, s0, p0);
+        } else if seg < last_source_index {
+            let s0 = seg + 1;
+            add_match(&mut seg, &mut pos, s0, 0);
+        } else {
+            return false;
+        }
+    }
+    let end = get_source_text(last_source_index).len();
+    add_match(&mut seg, &mut pos, last_source_index, end);
+    true
 }

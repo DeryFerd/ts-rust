@@ -93,6 +93,14 @@ impl Checker {
 
     // Go: checker/checker.go:5758 checkVariableDeclaration
     pub fn check_variable_declaration(&mut self, node: Node) {
+        let _trace = self.tracer.map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Check,
+                "checkVariableDeclaration",
+                crate::tracing::node_args(node),
+                false,
+            )
+        });
         self.check_grammar_variable_declaration(node);
         self.check_variable_like_declaration(node);
     }

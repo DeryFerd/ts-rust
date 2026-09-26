@@ -1,7 +1,7 @@
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::up_to_date_status::*;
 use crate::execute::incremental::{BuildInfo, compute_hash};
-use crate::execute::tsc::ExitStatus;
+use crate::execute::tsc::{ExitStatus, Statistics};
 use crate::frontend::prelude::*;
 use std::time::SystemTime;
 
@@ -28,8 +28,9 @@ use std::time::SystemTime;
 // `updateDownstream` are kept because `buildProject` uses them.
 //
 // PORT: each worker reports its own project statistics
-// (`tsc.EmitAndReportStatistics`), but the task keeps none, so the build
-// aggregate is not collected. `opts.Testing` is always nil.
+// (`tsc.EmitAndReportStatistics`) and sends them back in its result, so
+// the task keeps them for the build aggregate. `opts.Testing` is always
+// nil.
 //
 // PORT: Go `time.Time` is `Option<SystemTime>` (`None` = zero), as in
 // up_to_date_status.rs.
@@ -73,12 +74,14 @@ pub type TaskDiagnosticReporter = Box<dyn Fn(&mut String, &Diagnostic)>;
 // Go: build/buildtask.go:39 taskResult
 // PORT: Go `program *incremental.Program` is only read for
 // `HasChangedDtsFile()` (and `Testing.OnProgram`), so only that bool is
-// kept; the program lives in the worker. `statistics` is dropped (see top).
+// kept; the program lives in the worker. Go `*tsc.Statistics` is an
+// `Option` (nil = `None`).
 pub struct TaskResult {
     pub builder: String,
     pub report_status: TaskDiagnosticReporter,
     pub diagnostic_reporter: TaskDiagnosticReporter,
     pub exit_status: ExitStatus,
+    pub statistics: Option<Statistics>,
     pub has_changed_dts_file: bool,
     pub build_kind: BuildKind,
     pub files_to_delete: Vec<String>,
@@ -96,6 +99,7 @@ impl TaskResult {
             report_status,
             diagnostic_reporter,
             exit_status: ExitStatus::Success,
+            statistics: None,
             has_changed_dts_file: false,
             build_kind: BuildKind::None,
             files_to_delete: Vec::new(),
@@ -108,22 +112,148 @@ impl TaskResult {
 // - `exit_status`: `result.Status` of `tsc.EmitAndReportStatistics`.
 // - `output`: everything the worker wrote to the task writer (diagnostics
 //   through the task diagnostic reporter, listFiles, traces), in order.
-// - `diagnostics_count`: `len(result.Diagnostics)`.
+// - `diagnostics`: `result.Diagnostics`, the diagnostics that went through
+//   Go `t.reportDiagnostic` (see `WorkerDiagnostic`).
+// - `diagnostic_file_texts`: the file name and text of each file that
+//   `diagnostics` names, in first use order.
 // - `emitted_files`: `result.EmitResult.EmittedFiles`.
 // - `has_changed_dts_file`: `incremental.Program.HasChangedDtsFile()`.
 // - `build_info_file_name`: the file name that `writeFile` wrote with
 //   `data.BuildInfo != nil`, or `None` when no build info was written.
+// - `statistics`: the statistics of `tsc.EmitAndReportStatistics` (`None`
+//   when Go returns nil).
 // - `fs_cache`: the cached file system entries the worker added (see
 //   shared_fs.rs). The orchestrator merges them into its cache.
 #[derive(Clone, Debug)]
 pub struct WorkerCompileResult {
     pub exit_status: ExitStatus,
     pub output: String,
-    pub diagnostics_count: usize,
+    pub diagnostics: Vec<WorkerDiagnostic>,
+    pub diagnostic_file_texts: Vec<(String, String)>,
     pub emitted_files: Vec<String>,
     pub has_changed_dts_file: bool,
     pub build_info_file_name: Option<String>,
+    pub statistics: Option<Statistics>,
     pub fs_cache: CachedFsState,
+}
+
+// One diagnostic of the worker's `result.Diagnostics` (Go `*ast.Diagnostic`),
+// as it goes back to the orchestrator for Go `t.errors`.
+// - `file_name`: the file name of Go `File()`, or `None` when it is nil.
+// - `pos`, `end`, `code`, `category`, `message_args`: Go `Pos()`, `End()`,
+//   `Code()`, `Category()` and the message arguments.
+// PORT: the message chain and the related information are not sent. Go
+// reads `t.errors` only for the error summary (`WriteErrorSummaryText`
+// reads the category, the file and the line of `Pos()`) and in watch mode,
+// which is not ported.
+#[derive(Clone, Debug)]
+pub struct WorkerDiagnostic {
+    pub file_name: Option<String>,
+    pub pos: i32,
+    pub end: i32,
+    pub code: i32,
+    pub category: ts_diagnostics::Category,
+    pub message_args: Vec<String>,
+}
+
+thread_local! {
+    // The file node of each file name in the orchestrator's `t.errors` (see
+    // `error_file`).
+    static ERROR_FILES: RefCell<FxHashMap<String, Node>> = RefCell::new(FxHashMap::default());
+}
+
+// The one file node of `file_name` in the orchestrator's `t.errors`: the
+// first node that was seen for that name, else `make()`.
+// PORT: Go keys the error summary by the file object, and a build shares
+// one object per file: the programs get their files from the build host's
+// parse cache, and a program's config diagnostics are those of `t.resolved`
+// and its cached extended configs, which the orchestrator also reports.
+// So errors of two projects in one file count as one file (for example,
+// the reference error in `lib/tsconfig.json` that the programs of `lib`
+// and `app` both report). The port's worker diagnostics come from another
+// process (`worker_errors`), so the orchestrator shares one node per file
+// name instead, for the worker diagnostics and its own
+// (`report_diagnostic`). Go parses a file again for a program with other
+// parse options, which then counts as another file; the port counts it as
+// the same file.
+fn error_file(file_name: &str, make: impl FnOnce() -> Node) -> Node {
+    ERROR_FILES.with(|files| {
+        *files
+            .borrow_mut()
+            .entry(file_name.to_string())
+            .or_insert_with(make)
+    })
+}
+
+// The Go `t.errors` entries of the diagnostics that the worker reported
+// through `t.reportDiagnostic` (buildtask.go:86), in the same order.
+// PORT: the worker's source files are in the worker process. A file that
+// the orchestrator has no node for gets a node with the text that the
+// worker sent and no statements: the error summary reads only the file
+// name and the line of a position (see `error_file`).
+fn worker_errors(
+    orchestrator: &dyn BuildTaskOrchestrator,
+    result: &WorkerCompileResult,
+) -> Vec<Diagnostic> {
+    result
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let file = match &diagnostic.file_name {
+                None => Node::NIL,
+                Some(file_name) => error_file(file_name, || {
+                    let text = result
+                        .diagnostic_file_texts
+                        .iter()
+                        .find(|(name, _)| name == file_name)
+                        .map_or("", |(_, text)| text.as_str());
+                    new_worker_diagnostic_file(orchestrator, file_name, text)
+                }),
+            };
+            let message =
+                ts_diagnostics::message_by_code(diagnostic.code as u32).unwrap_or_else(|| {
+                    panic!("build worker: unknown diagnostic code {}", diagnostic.code)
+                });
+            Diagnostic {
+                file,
+                pos: diagnostic.pos,
+                end: diagnostic.end,
+                code: diagnostic.code,
+                category: diagnostic.category,
+                message,
+                message_args: diagnostic.message_args.clone(),
+                message_chain: Vec::new(),
+                related_information: Vec::new(),
+                reports_unnecessary: message.reports_unnecessary(),
+                reports_deprecated: message.reports_deprecated(),
+                skipped_on_no_emit: false,
+                repopulate_info: None,
+            }
+        })
+        .collect()
+}
+
+// A source file node named `file_name` with `text` and no statements (see
+// `worker_errors`). It is made like the node of an empty config file
+// (tsoptions `getTsconfigSourceFile`).
+fn new_worker_diagnostic_file(
+    orchestrator: &dyn BuildTaskOrchestrator,
+    file_name: &str,
+    text: &str,
+) -> Node {
+    let file_name: &'static str = Box::leak(file_name.to_string().into_boxed_str());
+    let text: &'static str = Box::leak(text.to_string().into_boxed_str());
+    let factory = NodeFactory::for_file(new_file_store(file_name, text));
+    factory.new_parsed_source_file(
+        &SourceFileParseOptions {
+            file_name: file_name.to_string(),
+            path: orchestrator.to_path(file_name),
+            ..Default::default()
+        },
+        text,
+        factory.new_node_list(&[]),
+        factory.new_token(SyntaxKind::EndOfFile),
+    )
 }
 
 // The parts of Go `*Orchestrator` (and its `host`) that a build task uses.
@@ -226,8 +356,15 @@ impl BuildTask {
     }
 
     // Go: build/buildtask.go:85 (*BuildTask).reportDiagnostic
+    // PORT: the `t.errors` entry names the file node that the build's errors
+    // share for that file (see `error_file`).
     pub fn report_diagnostic(&mut self, err: Diagnostic) {
-        self.errors.push(err.clone());
+        let mut error = err.clone();
+        if error.file.is_some() {
+            let file = error.file;
+            error.file = error_file(source_file_file_name(file), || file);
+        }
+        self.errors.push(error);
         let result = self.result_mut();
         (result.diagnostic_reporter)(&mut result.builder, &err);
     }
@@ -240,6 +377,7 @@ impl BuildTask {
     //   - append `errors` to `buildResult.errors` when not empty,
     //   - write `result.builder` to the writer,
     //   - raise `buildResult.result.Status` to `result.exit_status` if higher,
+    //   - aggregate `result.statistics` into `buildResult.statistics` when set,
     //   - count `result.build_kind` (ProjectsBuilt / TimestampUpdates),
     //   - append `result.files_to_delete` to `buildResult.filesToDelete`.
     pub fn report(&mut self) -> (TaskResult, Vec<Diagnostic>) {
@@ -390,14 +528,16 @@ impl BuildTask {
 
     // Go: build/buildtask.go:179 compileAndEmit, from `t.result.exitStatus =
     // result.Status` on.
-    // PORT: worker diagnostics reach the output through `output`, but are
-    // not added to `t.errors`. `t.errors` only feeds the pretty error
-    // summary and watch mode, which are out of scope.
+    // PORT: the worker wrote the reported diagnostics to `output`. The
+    // `t.errors` part of Go `t.reportDiagnostic` is done here, first, as
+    // Go appends them while `EmitAndReportStatistics` runs.
     pub fn compile_and_emit_finish(
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
         worker_result: WorkerCompileResult,
     ) {
+        let errors = worker_errors(orchestrator, &worker_result);
+        self.errors.extend(errors);
         {
             let result = self.result_mut();
             result.builder.push_str(&worker_result.output);
@@ -418,12 +558,13 @@ impl BuildTask {
         }
 
         self.result_mut().exit_status = worker_result.exit_status;
+        self.result_mut().statistics = worker_result.statistics;
         if (!self
             .resolved()
             .compiler_options()
             .no_emit_on_error
             .is_true()
-            || worker_result.diagnostics_count == 0)
+            || worker_result.diagnostics.is_empty())
             && (!worker_result.emitted_files.is_empty()
                 || self.status().kind != UpToDateStatusType::OutOfDateBuildInfoWithErrors)
         {

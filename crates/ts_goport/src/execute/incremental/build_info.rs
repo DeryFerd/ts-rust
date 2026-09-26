@@ -300,7 +300,7 @@ fn marshal_float(enc: &mut String, v: f64) -> Result<(), JsonError> {
 // Go v2 marshaler for the `any` values stored in `BuildInfo.Options`: the
 // values read back from JSON, and the typed `core.CompilerOptions` field
 // values that `snapshotToBuildInfo` stores.
-fn marshal_any(enc: &mut String, v: &CompilerOptionsValue) -> Result<(), JsonError> {
+pub fn marshal_any(enc: &mut String, v: &CompilerOptionsValue) -> Result<(), JsonError> {
     match v {
         CompilerOptionsValue::Nil | CompilerOptionsValue::IntPtr(None) => enc.push_str("null"),
         CompilerOptionsValue::Bool(b) => b.marshal_json_to(enc)?,

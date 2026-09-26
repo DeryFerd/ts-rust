@@ -60,7 +60,14 @@ impl ParseTask {
             self.load_automatic_type_directives(loader);
             return;
         }
-        // PORT: tracing is skipped.
+        let _trace = crate::tracing::get().map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Program,
+                "findSourceFile",
+                vec![("fileName", self.normalized_file_path.clone().into())],
+                false,
+            )
+        });
         let redirect = loader
             .project_reference_file_mapper
             .borrow()
@@ -192,7 +199,14 @@ impl ParseTask {
 
     // Go: filesparser.go:171 (*parseTask).loadAutomaticTypeDirectives
     pub fn load_automatic_type_directives(&mut self, loader: &FileLoader) {
-        // PORT: tracing is skipped.
+        let _trace = crate::tracing::get().map(|tr| {
+            tr.push(
+                crate::tracing::Phase::Program,
+                "processTypeReferences",
+                Vec::new(),
+                false,
+            )
+        });
         let (to_parse_type_refs, type_resolutions_in_file, type_resolutions_trace, p_diagnostics) =
             loader.resolve_automatic_type_directives(&self.normalized_file_path);
         self.type_resolutions_in_file = type_resolutions_in_file;

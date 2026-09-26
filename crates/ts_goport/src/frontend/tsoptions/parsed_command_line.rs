@@ -417,8 +417,7 @@ pub struct SourceAndOutputMaps {
 // tsconfig parser) writes the unexported fields.
 // PORT: Go `ConfigFile *TsConfigSourceFile` is `Option<Rc<...>>`, because
 // `ReloadFileNamesOfParsedCommandLine` shares it with the new value.
-// PORT: `locale` and its `Once` are left out (`internal/locale` is out of
-// scope); see `locale`.
+// PORT: Go `locale` and `localeOnce` are one `OnceCell` (`locale`).
 #[derive(Debug, Default)]
 pub struct ParsedCommandLine {
     pub parsed_config: ParsedOptions,
@@ -446,6 +445,8 @@ pub struct ParsedCommandLine {
     pub literal_file_names_len: i32,
     /// maps file names to their paths, used for quick lookups
     pub file_names_by_path: OnceCell<FxHashMap<Path, String>>,
+
+    pub locale: OnceCell<crate::locale::Locale>,
 }
 
 // Go: tsoptions/parsedcommandline.go:60 NewParsedCommandLine
@@ -945,13 +946,15 @@ impl ParsedCommandLine {
     }
 
     // Go: tsoptions/parsedcommandline.go:418 (*ParsedCommandLine).Locale
-    // PORT: `internal/locale` is out of scope. `locale.Parse` is
-    // `golang.org/x/text/language.Parse`: a BCP 47 parser, canonicalizer and
-    // subtag lookup (about 1,500 Go lines) over generated registry tables
-    // (about 4,500 lines). No Rust caller reads the locale.
-    pub fn locale(&self) -> ! {
-        let _ = &self.parsed_config.compiler_options.locale;
-        unported!("locale.Parse")
+    // PORT: Go returns the `Locale` value; this returns a clone of the
+    // cached value.
+    pub fn locale(&self) -> crate::locale::Locale {
+        self.locale
+            .get_or_init(|| {
+                let (locale, _) = crate::locale::parse(&self.compiler_options().locale);
+                locale
+            })
+            .clone()
     }
 }
 

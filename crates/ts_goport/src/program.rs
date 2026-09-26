@@ -484,10 +484,30 @@ pub fn bind_all() {
         let mut symbols = SymbolArena::new();
         bind_files_parallel(&mut symbols);
         for file in program.source_files() {
+            // Go: program.go:450 traces the files that are not bound yet.
+            let _trace = if file.file_bind.get().is_none() {
+                trace_bind_source_file(file.root)
+            } else {
+                None
+            };
             bind_source_file(file.root, &mut symbols);
         }
         symbols
     });
+}
+
+/// Go program.go:450: the "bindSourceFile" event of one file, when tracing.
+/// PORT: a file whose parallel bind is dropped (see `bind_files_parallel`)
+/// is bound again serially and gets a second event.
+fn trace_bind_source_file(file: Node) -> Option<crate::tracing::Pop> {
+    crate::tracing::get().map(|tr| {
+        tr.push(
+            crate::tracing::Phase::Bind,
+            "bindSourceFile",
+            vec![("path", source_file_info(file).path.clone().into())],
+            true,
+        )
+    })
 }
 
 /// The state of this thread that binding must not change: synthetic nodes,
@@ -559,6 +579,7 @@ fn bind_files_parallel(symbols: &mut SymbolArena) {
                         let Some(&file) = files.get(i) else { break };
                         let before = bind_thread_fingerprint();
                         let result = std::panic::catch_unwind(|| {
+                            let _trace = trace_bind_source_file(file);
                             let mut file_symbols = SymbolArena::new();
                             let bound = bind_source_file_detached(file, &mut file_symbols);
                             (bound, file_symbols)
@@ -1918,9 +1939,9 @@ pub fn go_frontend_program() -> Option<&'static crate::frontend::compiler::NewPr
 
 // Go: compiler/program.go:1841 ExplainFiles
 // PORT: the legacy path has no Go frontend program and writes nothing.
-pub fn explain_files(w: &mut String) {
+pub fn explain_files(w: &mut String, locale: &crate::locale::Locale) {
     if let Some(go) = go_frontend() {
-        go.program.explain_files(w);
+        go.program.explain_files(w, locale);
     }
 }
 
@@ -2038,21 +2059,39 @@ pub fn get_resolved_module_from_module_specifier(
 }
 
 // Go: compiler/program.go:511 GetResolvedModules
-// PORT: built on first use from each file's imports and module
-// augmentations, keyed by file path, then (name, mode).
+// Go: compiler/fileloader.go:528 resolveImportsAndModuleAugmentations (the
+// module names of each file's map)
+// PORT: Go returns the map the file loader filled. It is rebuilt here on
+// first use, keyed by file path, then (name, mode), from the same module
+// names in the same order: the import helpers and JSX runtime synthetic
+// imports, then the imports, then the string literal module augmentations.
+// Only the Go frontend records the synthetic imports, so the legacy loader
+// skips them. Go also keeps the `libReplacement` lib resolutions, keyed by
+// the path they resolve from (filesparser.go:505). They are not in this map,
+// because the checker copy of the Go frontend data looks up resolutions by
+// program file only.
 pub fn get_resolved_modules()
 -> &'static IndexMap<String, IndexMap<(String, ResolutionMode), ResolvedModule>> {
     state().resolved_modules.get_or_init(|| {
         let mut result = IndexMap::new();
         for file in prog().source_files() {
             let mut in_file = IndexMap::new();
+            let mut synthetic_imports = Vec::new();
+            if state().go.is_some() {
+                synthetic_imports.push(get_import_helpers_import_specifier(&file.info.path));
+                synthetic_imports.push(get_jsx_runtime_import_specifier(&file.info.path).1);
+            }
+            let synthetic_imports = synthetic_imports.into_iter().filter(|n| n.is_some());
             let augmentations = file
                 .info
                 .module_augmentations
                 .iter()
                 .copied()
                 .filter(|n| is_string_literal(*n));
-            for specifier in file.info.imports.iter().copied().chain(augmentations) {
+            for specifier in synthetic_imports
+                .chain(file.info.imports.iter().copied())
+                .chain(augmentations)
+            {
                 let name = specifier.text().to_string();
                 let mode = get_mode_for_usage_location(file.root, specifier);
                 if in_file.contains_key(&(name.clone(), mode)) {
@@ -2385,19 +2424,33 @@ pub fn get_source_file_by_path(path: &str) -> Node {
         .map_or(Node::NIL, |&index| prog().files[index].root)
 }
 
+thread_local! {
+    /// Memo of `get_source_file_for_resolved_module` by file name.
+    static RESOLVED_MODULE_FILES: RefCell<FxHashMap<String, Node>> =
+        const { RefCell::new(FxHashMap::with_hasher(rustc_hash::FxBuildHasher)) };
+}
+
 // Go: compiler/program.go:1797 GetSourceFileForResolvedModule
 // PORT: the legacy loader has no parse-file redirects, so only the Go
 // frontend program has the redirect fallback.
+// PORT: the answer is memoized per thread. The files, their paths and the
+// redirects do not change after load, so a name always gives the same
+// file. The checker asks again on each alias and default-import check, and
+// each lookup canonicalizes the path.
 pub fn get_source_file_for_resolved_module(file_name: &str) -> Node {
-    let file = get_source_file(file_name);
+    if let Some(file) = RESOLVED_MODULE_FILES.with_borrow(|memo| memo.get(file_name).copied()) {
+        return file;
+    }
+    let mut file = get_source_file(file_name);
     if file.is_nil()
         && let Some(redirect) = state()
             .go
             .as_ref()
             .and_then(|go| go.get_parse_file_redirect(file_name))
     {
-        return get_source_file(redirect);
+        file = get_source_file(redirect);
     }
+    RESOLVED_MODULE_FILES.with_borrow_mut(|memo| memo.insert(file_name.to_string(), file));
     file
 }
 
@@ -2708,6 +2761,14 @@ fn create_checkers() -> CheckerPool {
                     for job in receiver {
                         job();
                     }
+                    // The queue closes only when the loading thread ends,
+                    // after every job sent its result. A process makes one
+                    // program and one pool (`set_state`, `file_associations`),
+                    // so this runs once per checker, at the end of the
+                    // process. Like Go, which never frees a checker, the
+                    // checker is not dropped: freeing its arenas at thread
+                    // exit cost 0.83% of query CPU.
+                    std::mem::forget(WORKER_CHECKER.with(|slot| slot.borrow_mut().take()));
                 })
                 .expect("cannot start a checker thread");
             sender
@@ -2765,6 +2826,14 @@ fn wait_jobs<R>(receivers: Vec<std::sync::mpsc::Receiver<JobResult<R>>>) -> Vec<
         .into_iter()
         .map(|result| result.unwrap_or_else(|payload| std::panic::resume_unwind(payload)))
         .collect()
+}
+
+/// True once the checker pool exists. `crate::tracing` dumps the checkers'
+/// types only then, so that stopping a trace does not make the pool.
+pub fn checker_pool_created() -> bool {
+    STATE
+        .get()
+        .is_some_and(|program_state| program_state.file_associations.get().is_some())
 }
 
 /// The pool index of this thread's checker, or None off the worker threads.
@@ -3791,8 +3860,11 @@ pub fn write_format_diagnostics(output: &mut String, diagnostics: &[Diagnostic])
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:263 WriteFlattenedDiagnosticMessage
+// PORT: this legacy writer has no Go `FormattingOptions`, so the locale is
+// Go `locale.Default` and the text is English (see execute/tsc/diagnostics.rs
+// `write_format_diagnostic`).
 fn write_flattened_diagnostic_message(writer: &mut String, diagnostic: &Diagnostic, newline: &str) {
-    writer.push_str(&diagnostic.localize());
+    writer.push_str(&diagnostic.localize(&crate::locale::DEFAULT));
     for chain in &diagnostic.message_chain {
         flatten_diagnostic_message_chain(writer, chain, newline, 1);
     }
@@ -3809,7 +3881,7 @@ fn flatten_diagnostic_message_chain(
     for _ in 0..level {
         writer.push_str("  ");
     }
-    writer.push_str(&chain.localize());
+    writer.push_str(&chain.localize(&crate::locale::DEFAULT));
     for child in &chain.message_chain {
         flatten_diagnostic_message_chain(writer, child, new_line, level + 1);
     }

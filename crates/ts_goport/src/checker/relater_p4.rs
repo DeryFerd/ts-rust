@@ -721,9 +721,36 @@ impl Checker {
         };
         let save_reliability_flags = self.reliability_flags;
         self.reliability_flags = RelationComparisonResult::NONE;
+        // Go `defer tr.Push(...)()` in the else branch: the event ends when
+        // the function returns.
+        let mut _trace: Option<crate::tracing::Pop> = None;
         let result = if r.borrow().expanding_flags == ExpandingFlags::BOTH {
+            if let Some(tr) = self.tracer {
+                let (depth, target_depth) = {
+                    let rb = r.borrow();
+                    (rb.source_stack.len(), rb.target_stack.len())
+                };
+                tr.instant(
+                    crate::tracing::Phase::CheckTypes,
+                    "recursiveTypeRelatedTo_DepthLimit",
+                    vec![
+                        ("sourceId", source.into()),
+                        ("targetId", target.into()),
+                        ("depth", depth.into()),
+                        ("targetDepth", target_depth.into()),
+                    ],
+                );
+            }
             Ternary::MAYBE
         } else {
+            _trace = self.tracer.map(|tr| {
+                tr.push(
+                    crate::tracing::Phase::CheckTypes,
+                    "structuredTypeRelatedTo",
+                    vec![("sourceId", source.into()), ("targetId", target.into())],
+                    false,
+                )
+            });
             self.structured_type_related_to(r, source, target, report_errors, intersection_state)
         };
         let propagating_variance_flags = self.reliability_flags;

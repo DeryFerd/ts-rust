@@ -432,6 +432,15 @@ impl Checker {
         )
     }
 
+    // PORT: `get_property_of_type` for a caller that holds the `Name`. The
+    // member lookup compares name ids and hashes nothing.
+    pub fn get_property_of_type_name(&mut self, t: TypeId, name: &Name) -> SymbolId {
+        self.get_property_of_type_ex(
+            t, name, false, /*skipObjectFunctionPropertyAugment*/
+            false, /*includeTypeOnlyMembers*/
+        )
+    }
+
     // Go: checker/checker.go:18798 getPropertyOfTypeEx
     /// Return the symbol for the property with the given name in the given type. Creates synthetic union properties when
     /// necessary, maps primitive types and type parameters are to their apparent types, and augments with properties from
@@ -439,19 +448,22 @@ impl Checker {
     ///
     /// t: a type to look up property from
     /// name: a name of property to look up in a given type
-    pub fn get_property_of_type_ex(
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`). With a `Name`, the
+    // members lookup compares ids instead of hashing and comparing text.
+    pub fn get_property_of_type_ex<'a>(
         &mut self,
         t: TypeId,
-        name: &str,
+        name: impl Into<TableKey<'a>>,
         skip_object_function_property_augment: bool,
         include_type_only_members: bool,
     ) -> SymbolId {
+        let name: TableKey<'a> = name.into();
         let t = self.get_reduced_apparent_type(t);
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::OBJECT) {
             self.resolve_structured_type_members(t);
             let members = self.ty(t).as_structured_type().members;
-            let mut symbol = self.symbols.get(members, name);
+            let mut symbol = self.symbols.get_key(members, name);
             if symbol.is_some() {
                 let t_symbol = self.ty(t).symbol;
                 if !include_type_only_members
@@ -464,7 +476,7 @@ impl Checker {
                         .module_symbol_links
                         .get(t_symbol)
                         .type_only_export_star_map
-                        .get(name)
+                        .get(name.text())
                         .is_some_and(|n| n.is_some())
                 {
                     // If this is the type of a module, `resolved.members.get(name)` might have effectively skipped over
@@ -492,16 +504,18 @@ impl Checker {
                 TypeId::NIL
             };
             if function_type.is_some() {
-                symbol = self.get_property_of_object_type(function_type, name);
+                symbol = self.get_property_of_object_type(function_type, name.text());
                 if symbol.is_some() {
                     return symbol;
                 }
             }
             let global_object_type = self.global_object_type;
-            return self.get_property_of_object_type(global_object_type, name);
+            return self.get_property_of_object_type(global_object_type, name.text());
         } else if flags.intersects(TypeFlags::INTERSECTION) {
             let prop = self.get_property_of_union_or_intersection_type(
-                t, name, true, /*skipObjectFunctionPropertyAugment*/
+                t,
+                name.text(),
+                true, /*skipObjectFunctionPropertyAugment*/
             );
             if prop.is_some() {
                 return prop;
@@ -509,7 +523,7 @@ impl Checker {
             if !skip_object_function_property_augment {
                 return self.get_property_of_union_or_intersection_type(
                     t,
-                    name,
+                    name.text(),
                     skip_object_function_property_augment,
                 );
             }
@@ -517,7 +531,7 @@ impl Checker {
         } else if flags.intersects(TypeFlags::UNION) {
             return self.get_property_of_union_or_intersection_type(
                 t,
-                name,
+                name.text(),
                 skip_object_function_property_augment,
             );
         }

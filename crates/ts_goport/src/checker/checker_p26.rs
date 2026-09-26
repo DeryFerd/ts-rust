@@ -1016,11 +1016,15 @@ impl Checker {
 
     // Go: checker/checker.go:23731 getDeclaredTypeOfTypeParameter
     pub fn get_declared_type_of_type_parameter(&mut self, symbol: SymbolId) -> TypeId {
-        if self.declared_type_links.get(symbol).declared_type.is_nil() {
-            let t = self.new_type_parameter(symbol);
-            self.declared_type_links.get(symbol).declared_type = t;
+        // One link lookup on the cached hit. The miss returns the type it
+        // just stored, as Go returns links.declaredType.
+        let cached = self.declared_type_links.get(symbol).declared_type;
+        if cached.is_some() {
+            return cached;
         }
-        self.declared_type_links.get(symbol).declared_type
+        let t = self.new_type_parameter(symbol);
+        self.declared_type_links.get(symbol).declared_type = t;
+        t
     }
 
     // Go: checker/checker.go:23739 getDeclaredTypeOfTypeAlias

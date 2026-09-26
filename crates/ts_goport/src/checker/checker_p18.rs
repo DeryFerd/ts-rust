@@ -641,8 +641,9 @@ impl Checker {
             let declarations = self.sym(export_stars).declarations.clone();
             for &node in declarations.iter() {
                 // PORT: Go `node.ModuleSpecifier()` panics for other kinds,
-                // and the port returns nil. An export specifier named with the
-                // byte 0xFE + "export" declares this symbol too.
+                // and the port `module_specifier()` returns nil. An export
+                // specifier named with the byte 0xFE + "export" declares this
+                // symbol too, and Go panics on it, so the port does too.
                 if !matches!(
                     node.kind(),
                     SyntaxKind::ImportDeclaration
@@ -650,10 +651,10 @@ impl Checker {
                         | SyntaxKind::ExportDeclaration
                         | SyntaxKind::JsDocImportTag
                 ) {
-                    panic!(
+                    go_panic(format!(
                         "Unhandled case in Node.ModuleSpecifier: Kind{:?}",
                         node.kind()
-                    );
+                    ));
                 }
                 let resolved_module = self.resolve_external_module_name(
                     node,
@@ -953,18 +954,22 @@ impl Checker {
 
     // Go: checker/checker.go:16308 getTypeOfSymbolWithDeferredType
     pub fn get_type_of_symbol_with_deferred_type(&mut self, symbol: SymbolId) -> TypeId {
-        if self.value_symbol_links.get(symbol).resolved_type.is_nil() {
-            let deferred = self.deferred_symbol_links.get(symbol);
-            let parent = deferred.parent;
-            let constituents = deferred.constituents.clone();
-            let resolved_type = if self.ty(parent).flags.intersects(TypeFlags::UNION) {
-                self.get_union_type(&constituents)
-            } else {
-                self.get_intersection_type(&constituents)
-            };
-            self.value_symbol_links.get(symbol).resolved_type = resolved_type;
+        // One link lookup on the cached hit. The miss returns the value it
+        // just stored, as Go returns links.resolvedType.
+        let cached = self.value_symbol_links.get(symbol).resolved_type;
+        if cached.is_some() {
+            return cached;
         }
-        self.value_symbol_links.get(symbol).resolved_type
+        let deferred = self.deferred_symbol_links.get(symbol);
+        let parent = deferred.parent;
+        let constituents = deferred.constituents.clone();
+        let resolved_type = if self.ty(parent).flags.intersects(TypeFlags::UNION) {
+            self.get_union_type(&constituents)
+        } else {
+            self.get_intersection_type(&constituents)
+        };
+        self.value_symbol_links.get(symbol).resolved_type = resolved_type;
+        resolved_type
     }
 
     // Go: checker/checker.go:16321 getWriteTypeOfSymbolWithDeferredType
@@ -1078,8 +1083,8 @@ impl Checker {
 
     // Go: checker/checker.go:16400 getTypeOfSymbol
     pub fn get_type_of_symbol(&mut self, symbol: SymbolId) -> TypeId {
-        let check_flags = self.sym(symbol).check_flags;
-        let flags = self.sym(symbol).flags;
+        let s = self.sym(symbol);
+        let (check_flags, flags) = (s.check_flags, s.flags);
         if check_flags.intersects(CheckFlags::DEFERRED_TYPE) {
             return self.get_type_of_symbol_with_deferred_type(symbol);
         }
@@ -1125,50 +1130,56 @@ impl Checker {
 
     // Go: checker/checker.go:16435 getTypeOfInstantiatedSymbol
     pub fn get_type_of_instantiated_symbol(&mut self, symbol: SymbolId) -> TypeId {
-        if self.value_symbol_links.get(symbol).resolved_type.is_nil() {
-            let links = self.value_symbol_links.get(symbol);
-            let target = links.target;
-            let mapper = links.mapper;
-            let t = self.get_type_of_symbol(target);
-            let resolved_type = self.instantiate_type(t, mapper);
-            self.value_symbol_links.get(symbol).resolved_type = resolved_type;
+        // One link lookup on the cached hit. The miss returns the value it
+        // just stored, as Go returns links.resolvedType.
+        let links = self.value_symbol_links.get(symbol);
+        if links.resolved_type.is_some() {
+            return links.resolved_type;
         }
-        self.value_symbol_links.get(symbol).resolved_type
+        let (target, mapper) = (links.target, links.mapper);
+        let t = self.get_type_of_symbol(target);
+        let resolved_type = self.instantiate_type(t, mapper);
+        self.value_symbol_links.get(symbol).resolved_type = resolved_type;
+        resolved_type
     }
 
     // Go: checker/checker.go:16443 getWriteTypeOfInstantiatedSymbol
     pub fn get_write_type_of_instantiated_symbol(&mut self, symbol: SymbolId) -> TypeId {
-        if self.value_symbol_links.get(symbol).write_type.is_nil() {
-            let links = self.value_symbol_links.get(symbol);
-            let target = links.target;
-            let mapper = links.mapper;
-            let t = self.get_write_type_of_symbol(target);
-            let write_type = self.instantiate_type(t, mapper);
-            self.value_symbol_links.get(symbol).write_type = write_type;
+        // One link lookup on the cached hit, as in get_type_of_instantiated_symbol.
+        let links = self.value_symbol_links.get(symbol);
+        if links.write_type.is_some() {
+            return links.write_type;
         }
-        self.value_symbol_links.get(symbol).write_type
+        let (target, mapper) = (links.target, links.mapper);
+        let t = self.get_write_type_of_symbol(target);
+        let write_type = self.instantiate_type(t, mapper);
+        self.value_symbol_links.get(symbol).write_type = write_type;
+        write_type
     }
 
     // Go: checker/checker.go:16451 getTypeOfVariableOrParameterOrProperty
     pub fn get_type_of_variable_or_parameter_or_property(&mut self, symbol: SymbolId) -> TypeId {
-        if self.value_symbol_links.get(symbol).resolved_type.is_nil() {
-            let t = self.get_type_of_variable_or_parameter_or_property_worker(symbol);
-            if t.is_nil() {
-                panic!("Unexpected nil type");
-            }
-            // For a contextually typed parameter it is possible that a type has already
-            // been assigned (in assignTypeToParameterAndFixTypeParameters), and we want
-            // to preserve this type. In fact, we need to _prefer_ that type, but it won't
-            // be assigned until contextual typing is complete, so we need to defer in
-            // cases where contextual typing may take place.
-            if self.value_symbol_links.get(symbol).resolved_type.is_nil()
-                && !self.is_parameter_of_context_sensitive_signature(symbol)
-            {
-                self.value_symbol_links.get(symbol).resolved_type = t;
-            }
-            return t;
+        // One link lookup on the cached hit.
+        let cached = self.value_symbol_links.get(symbol).resolved_type;
+        if cached.is_some() {
+            return cached;
         }
-        self.value_symbol_links.get(symbol).resolved_type
+        let t = self.get_type_of_variable_or_parameter_or_property_worker(symbol);
+        if t.is_nil() {
+            panic!("Unexpected nil type");
+        }
+        // For a contextually typed parameter it is possible that a type has already
+        // been assigned (in assignTypeToParameterAndFixTypeParameters), and we want
+        // to preserve this type. In fact, we need to _prefer_ that type, but it won't
+        // be assigned until contextual typing is complete, so we need to defer in
+        // cases where contextual typing may take place.
+        // The worker can set resolved_type, so read the links again here.
+        if self.value_symbol_links.get(symbol).resolved_type.is_nil()
+            && !self.is_parameter_of_context_sensitive_signature(symbol)
+        {
+            self.value_symbol_links.get(symbol).resolved_type = t;
+        }
+        t
     }
 
     // Go: checker/checker.go:16471 isParameterOfContextSensitiveSignature

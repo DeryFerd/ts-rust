@@ -16,6 +16,11 @@
 //! `<<goport panic: MESSAGE>>` as its type or symbol text; the checker is
 //! kept so later type ids do not shift. stderr gets `unported: <name>
 //! <count>` lines and the frontend setting. Exit 2 when anything panicked.
+//!
+//! A Go panic that the port keeps (`core::go_panic`) ends the run as the
+//! Go dumper ends it: `panic: <message>` on stderr, exit 2 and no output
+//! written after it. A config that cannot be read is one: the Go dumper
+//! makes a program from the nil config and panics.
 
 use std::any::Any;
 use std::io::Write;
@@ -46,7 +51,7 @@ fn main() {
             "-p" => project = iter.next(),
             "-o" => out_dir = iter.next(),
             _ => {
-                eprintln!("goport_typesyms: unknown argument {arg}");
+                eprint_go(&format!("goport_typesyms: unknown argument {arg}\n"));
                 std::process::exit(1);
             }
         }
@@ -62,18 +67,35 @@ fn main() {
         .name("goport_typesyms".to_string())
         .stack_size(STACK_SIZE)
         .spawn(move || run(&project, &out_dir));
-    let code = if let Ok(Ok(code)) = worker.map(std::thread::JoinHandle::join) {
-        code
-    } else {
-        eprintln!("goport_typesyms: worker thread failed");
-        2
+    let code = match worker.map(std::thread::JoinHandle::join) {
+        Ok(Ok(code)) => code,
+        Ok(Err(payload)) if print_go_panic(payload.as_ref()) => {
+            for (name, count) in unported_report() {
+                eprintln!("unported: {name} {count}");
+            }
+            EXIT_GO_PANIC
+        }
+        _ => {
+            eprintln!("goport_typesyms: worker thread failed");
+            2
+        }
     };
     std::process::exit(code);
 }
 
+/// Writes the Go bytes of the port form `text` to stderr (see
+/// `scanner_util::GO_STRING_MARKER`).
+fn eprint_go(text: &str) {
+    let _ = std::io::stderr().write_all(&go_string_bytes(text));
+}
+
 /// Keeps unported panics quiet (they are counted) and prints other panics.
+/// `main` prints a Go panic.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
+        if info.payload().is::<GoPanic>() {
+            return;
+        }
         let message = payload_message(info.payload());
         if message.starts_with(UNPORTED_PREFIX) {
             if std::env::var_os("GOPORT_TRACE").is_some() {
@@ -108,12 +130,13 @@ fn note_panic(payload: &(dyn Any + Send)) {
     }
 }
 
-/// Runs `f`, or returns the default value when it panics.
+/// Runs `f`, or returns the default value when it panics. A Go panic goes
+/// on.
 fn guard<T: Default>(f: impl FnOnce() -> T) -> T {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(value) => value,
         Err(payload) => {
-            note_panic(payload.as_ref());
+            note_panic(resume_go_panic(payload).as_ref());
             T::default()
         }
     }
@@ -140,7 +163,7 @@ fn check_file_guarded(checker: &mut Checker, file: Node) -> Vec<Diagnostic> {
     })) {
         Ok(diagnostics) => diagnostics,
         Err(payload) => {
-            note_panic(payload.as_ref());
+            note_panic(resume_go_panic(payload).as_ref());
             let index = (checker.id - 1) as usize;
             *checker = Checker::new(index);
             Vec::new()
@@ -204,11 +227,16 @@ fn run(project: &str, out_dir: &str) -> i32 {
     match catch_unwind(AssertUnwindSafe(|| try_load(project))) {
         Ok(Ok(_)) => {}
         Ok(Err(message)) => {
-            eprintln!("goport_typesyms: {message}");
-            return 1;
+            // Go: the dumper prints the count of config read errors, and
+            // `compiler.NewProgram` with the nil config panics.
+            // PORT: the error text takes the place of the count.
+            eprint_go(&format!("goport_typesyms: {message}\n"));
+            go_panic(
+                "runtime error: invalid memory address or nil pointer dereference".to_string(),
+            );
         }
         Err(payload) => {
-            note_panic(payload.as_ref());
+            note_panic(resume_go_panic(payload).as_ref());
             eprintln!("goport_typesyms: load panicked");
             return 2;
         }

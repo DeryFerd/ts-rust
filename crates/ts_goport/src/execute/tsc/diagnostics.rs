@@ -1,39 +1,39 @@
 //! Go: execute/tsc/diagnostics.go (diagnostic, error summary and status
-//! reporters), with the `diagnosticwriter` pieces they call, and
-//! execute/tsc/help.go (`PrintVersion`, `PrintBuildHelp` and the helpers
-//! they call).
+//! reporters), with the `diagnosticwriter` pieces they call. The help and
+//! version printers (execute/tsc/help.go) are in help.rs.
 //!
-//! PORT: the locale parameters are dropped: the port has only English
-//! messages. Go `diagnosticwriter.FileLike` is the diagnostic's source file
-//! node.
+//! PORT: Go `diagnosticwriter.FileLike` is the diagnostic's source file
+//! node, and Go `diagnosticwriter.Diagnostic` is the `*ast.Diagnostic` itself
+//! (Go `WrapASTDiagnostic` and `FromASTDiagnostics` add nothing).
 
 use crate::prelude::*;
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use super::compile::{System, Writer, write_str};
-use crate::frontend::tsoptions::{
-    CommandLineOption, CommandLineOptionKind, CompilerOptionsValue, TSC_BUILD_OPTION,
-};
+use crate::diagnostics_loc::{localize, message_localize};
 use crate::frontend::tspath::{ComparePathsOptions, convert_to_relative_path, path_is_absolute};
-use ts_diagnostics::{Category, Message};
+use crate::locale::Locale;
+use ts_diagnostics::Category;
 
-// Go: diagnosticwriter/diagnosticwriter.go:24 FormattingOptions
-// PORT: the Go `Locale` field is dropped.
+// Go: diagnosticwriter/diagnosticwriter.go:101 FormattingOptions
 #[derive(Clone, Debug, Default)]
 pub struct FormattingOptions {
     pub new_line: String,
     pub compare_paths_options: ComparePathsOptions,
+    pub locale: Locale,
 }
 
 // Go: execute/tsc/diagnostics.go:15 getFormatOptsOfSys
-fn get_format_opts_of_sys(sys: &dyn System) -> FormattingOptions {
+fn get_format_opts_of_sys(sys: &dyn System, locale: &Locale) -> FormattingOptions {
     FormattingOptions {
         new_line: "\n".to_string(),
         compare_paths_options: ComparePathsOptions {
             current_directory: sys.get_current_directory(),
             use_case_sensitive_file_names: sys.fs().use_case_sensitive_file_names(),
         },
+        locale: locale.clone(),
     }
 }
 
@@ -49,12 +49,13 @@ pub fn quiet_diagnostic_reporter() -> DiagnosticReporter {
 pub fn create_diagnostic_reporter(
     sys: &dyn System,
     w: Writer,
+    locale: &Locale,
     options: &CompilerOptions,
 ) -> DiagnosticReporter {
     if options.quiet.is_true() {
         return quiet_diagnostic_reporter();
     }
-    let format_opts = get_format_opts_of_sys(sys);
+    let format_opts = get_format_opts_of_sys(sys, locale);
     if should_be_pretty(sys, Some(options)) {
         return Rc::new(move |diagnostic: &Diagnostic| {
             format_diagnostic_with_color_and_context(&w, diagnostic, &format_opts);
@@ -173,16 +174,17 @@ pub fn quiet_diagnostics_reporter() -> DiagnosticsReporter {
     Rc::new(|_diagnostics: &[Diagnostic]| {})
 }
 
-// Go: execute/tsc/diagnostics.go:135 CreateReportErrorSummary
+// Go: execute/tsc/diagnostics.go:134 CreateReportErrorSummary
 // PORT: Go reads `sys.Writer()` on each report. The reporter cannot keep
 // `sys`, so it reads the writer when it is made. A system's writer does
 // not change after the system is made.
 pub fn create_report_error_summary(
     sys: &dyn System,
+    locale: &Locale,
     options: Option<&CompilerOptions>,
 ) -> DiagnosticsReporter {
     if should_be_pretty(sys, options) {
-        let format_opts = get_format_opts_of_sys(sys);
+        let format_opts = get_format_opts_of_sys(sys, locale);
         let writer = sys.writer();
         return Rc::new(move |diagnostics: &[Diagnostic]| {
             write_error_summary_text(&writer, diagnostics, &format_opts);
@@ -191,19 +193,20 @@ pub fn create_report_error_summary(
     quiet_diagnostics_reporter()
 }
 
-// Go: execute/tsc/diagnostics.go:145 CreateBuilderStatusReporter
+// Go: execute/tsc/diagnostics.go:144 CreateBuilderStatusReporter
 // PORT: Go `options` can be nil only through `shouldBePretty`; the quiet
 // check reads it, so it is required here.
 pub fn create_builder_status_reporter(
     sys: Rc<dyn System>,
     w: Writer,
+    locale: &Locale,
     options: &CompilerOptions,
 ) -> DiagnosticReporter {
     if options.quiet.is_true() {
         return quiet_diagnostic_reporter();
     }
 
-    let format_opts = get_format_opts_of_sys(sys.as_ref());
+    let format_opts = get_format_opts_of_sys(sys.as_ref(), locale);
     let write_status: fn(&Writer, &str, &Diagnostic, &FormattingOptions) =
         if should_be_pretty(sys.as_ref(), Some(options)) {
             format_diagnostics_status_with_color_and_time
@@ -219,12 +222,13 @@ pub fn create_builder_status_reporter(
     })
 }
 
-// Go: execute/tsc/diagnostics.go:161 CreateWatchStatusReporter
+// Go: execute/tsc/diagnostics.go:162 CreateWatchStatusReporter
 pub fn create_watch_status_reporter(
     sys: Rc<dyn System>,
+    locale: &Locale,
     options: Rc<CompilerOptions>,
 ) -> DiagnosticReporter {
-    let format_opts = get_format_opts_of_sys(sys.as_ref());
+    let format_opts = get_format_opts_of_sys(sys.as_ref(), locale);
     let write_status: fn(&Writer, &str, &Diagnostic, &FormattingOptions) =
         if should_be_pretty(sys.as_ref(), Some(&options)) {
             format_diagnostics_status_with_color_and_time
@@ -247,21 +251,143 @@ pub fn create_watch_status_reporter(
     })
 }
 
-/// Go `sys.Now().Format("03:04:05 PM")`.
-/// PORT: Go formats the local time. The port has no time zone data, so this
-/// formats UTC. Compare status lines with the time masked.
+/// Go `sys.Now().Format("03:04:05 PM")`. Go `time.Now()` is in `time.Local`.
+// Go (go1.26, the oracle toolchain): time/format.go:667
+// (Time).appendFormat, the stdZeroHour12 (:756), stdZeroMinute (:765),
+// stdZeroSecond (:769) and stdPM (:771) cases.
+// PORT: jiff converts the time to the zone's civil time (Go
+// `Time.locabs`). A time outside the jiff range (years -9999 to 9999) is
+// not ported.
 pub fn format_status_time(now: SystemTime) -> String {
-    let seconds = now
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default()
-        % 86_400;
-    let hour = seconds / 3600;
-    let minute = seconds % 3600 / 60;
-    let second = seconds % 60;
-    let hour12 = if hour % 12 == 0 { 12 } else { hour % 12 };
-    let meridiem = if hour >= 12 { "PM" } else { "AM" };
-    format!("{hour12:02}:{minute:02}:{second:02} {meridiem}")
+    let Ok(timestamp) = jiff::Timestamp::try_from(now) else {
+        unported!("Time.Format of a time outside years -9999 to 9999");
+    };
+    let datetime = local_location().to_datetime(timestamp);
+    let hour = datetime.hour();
+    // Noon is 12PM, midnight is 12AM.
+    let mut hr = hour % 12;
+    if hr == 0 {
+        hr = 12;
+    }
+    let pm = if hour >= 12 { "PM" } else { "AM" };
+    format!(
+        "{hr:02}:{:02}:{:02} {pm}",
+        datetime.minute(),
+        datetime.second()
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Go time.Local (go1.26 time/zoneinfo_unix.go), for the status clock
+// ---------------------------------------------------------------------------
+// PORT: Go `time.Location` is a `jiff::tz::TimeZone`. Go parses zone files
+// with `LoadLocationFromTZData`; jiff parses the same TZif data (the
+// transitions and the POSIX TZ footer) with `TimeZone::tzif`. This is the
+// Unix path (zoneinfo_unix.go); the port targets Linux.
+
+// Go: time/zoneinfo.go:88 localLoc, :89 localOnce, :91 (*Location).get
+static LOCAL_LOC: OnceLock<jiff::tz::TimeZone> = OnceLock::new();
+
+/// Go `time.Local`.
+fn local_location() -> &'static jiff::tz::TimeZone {
+    LOCAL_LOC.get_or_init(init_local)
+}
+
+// Go: time/zoneinfo_unix.go:21 platformZoneSources
+// Many systems use /usr/share/zoneinfo, Solaris 2 has
+// /usr/share/lib/zoneinfo, IRIX 6 has /usr/lib/locale/TZ,
+// NixOS has /etc/zoneinfo.
+const PLATFORM_ZONE_SOURCES: &[&str] = &[
+    "/usr/share/zoneinfo/",
+    "/usr/share/lib/zoneinfo/",
+    "/usr/lib/locale/TZ/",
+    "/etc/zoneinfo",
+];
+
+// Go: time/zoneinfo_unix.go:28 initLocal
+// PORT: Go `syscall.Getenv` gives the raw bytes of the value; so does
+// `as_encoded_bytes` on Unix.
+fn init_local() -> jiff::tz::TimeZone {
+    // consult $TZ to find the time zone to use.
+    // no $TZ means use the system default /etc/localtime.
+    // $TZ="" means use UTC.
+    // $TZ="foo" or $TZ=":foo" if foo is an absolute path, then the file pointed
+    // by foo will be used to initialize timezone; otherwise, file
+    // /usr/share/zoneinfo/foo will be used.
+
+    let tz = std::env::var_os("TZ");
+    match tz.as_ref().map(|tz| tz.as_encoded_bytes()) {
+        None => {
+            if let Some(z) = load_location(b"localtime", &["/etc"]) {
+                return z;
+            }
+        }
+        Some(tz) if !tz.is_empty() => {
+            let tz = tz.strip_prefix(b":").unwrap_or(tz);
+            if tz.first() == Some(&b'/') {
+                if let Some(z) = load_location(tz, &[""]) {
+                    return z;
+                }
+            } else if !tz.is_empty() && tz != b"UTC" {
+                if let Some(z) = load_location(tz, PLATFORM_ZONE_SOURCES) {
+                    return z;
+                }
+            }
+        }
+        Some(_) => {}
+    }
+
+    // Fall back to UTC.
+    jiff::tz::TimeZone::UTC
+}
+
+// Go: time/zoneinfo_read.go:531 loadLocation
+// PORT: `initLocal` reads only whether it failed, so the Go first-error
+// bookkeeping is dropped. After the sources Go tries the embedded
+// `time/tzdata`, which tsgo does not import, and
+// `runtime.GOROOT()/lib/time/zoneinfo.zip`. The port has no Go root, so
+// that zip is not ported. It changes the result only for a zone name that
+// no system source has.
+fn load_location(name: &[u8], sources: &[&str]) -> Option<jiff::tz::TimeZone> {
+    for source in sources {
+        if let Some(zone_data) = load_tzinfo(name, source) {
+            // Go: time/zoneinfo_read.go:118 LoadLocationFromTZData
+            if let Ok(z) = jiff::tz::TimeZone::tzif(&String::from_utf8_lossy(name), &zone_data) {
+                return Some(z);
+            }
+        }
+    }
+    None
+}
+
+// Go: time/zoneinfo_read.go:520 loadTzinfo
+// Go: time/zoneinfo_read.go:367 loadTzinfoFromDirOrZip
+// PORT: Go reads a source that ends in "tzdata" (Android) or ".zip" as an
+// archive. No source in `initLocal` does, so only the directory case is
+// ported.
+fn load_tzinfo(name: &[u8], source: &str) -> Option<Vec<u8>> {
+    let mut path = Vec::new();
+    if !source.is_empty() {
+        path.extend_from_slice(source.as_bytes());
+        path.push(b'/');
+    }
+    path.extend_from_slice(name);
+    read_file(&path)
+}
+
+// Go: time/zoneinfo_read.go:37 maxFileSize
+const MAX_FILE_SIZE: usize = 10 << 20;
+
+// Go: time/zoneinfo_read.go:575 readFile
+// PORT: the path is raw bytes, as in Go. Go stops reading past
+// `maxFileSize` and fails; this reads the file and then checks the size.
+fn read_file(name: &[u8]) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let data = std::fs::read(std::ffi::OsStr::from_bytes(name)).ok()?;
+    if data.len() > MAX_FILE_SIZE {
+        return None;
+    }
+    Some(data)
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +456,12 @@ pub fn format_diagnostic_with_color_and_context(
             diagnostic.code
         ),
     );
-    write_flattened_diagnostic_message(output, diagnostic, &format_opts.new_line);
+    write_flattened_diagnostic_message(
+        output,
+        diagnostic,
+        &format_opts.new_line,
+        &format_opts.locale,
+    );
 
     if diagnostic.file.is_some() && diagnostic.code != diag::File_appears_to_be_binary.code() as i32
     {
@@ -366,6 +497,7 @@ pub fn format_diagnostic_with_color_and_context(
                     output,
                     related_information,
                     &format_opts.new_line,
+                    &format_opts.locale,
                 );
                 write_code_snippet(
                     output,
@@ -490,11 +622,16 @@ fn write_code_snippet(
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:263 WriteFlattenedDiagnosticMessage
-pub fn write_flattened_diagnostic_message(writer: &Writer, diagnostic: &Diagnostic, newline: &str) {
-    write_str(writer, &diagnostic.localize());
+pub fn write_flattened_diagnostic_message(
+    writer: &Writer,
+    diagnostic: &Diagnostic,
+    newline: &str,
+    locale: &Locale,
+) {
+    write_str(writer, &diagnostic_localize(diagnostic, locale));
 
     for chain in &diagnostic.message_chain {
-        flatten_diagnostic_message_chain(writer, chain, newline, 1);
+        flatten_diagnostic_message_chain(writer, chain, newline, locale, 1);
     }
 }
 
@@ -503,6 +640,7 @@ fn flatten_diagnostic_message_chain(
     writer: &Writer,
     chain: &Diagnostic,
     new_line: &str,
+    locale: &Locale,
     level: usize,
 ) {
     write_str(writer, new_line);
@@ -510,10 +648,25 @@ fn flatten_diagnostic_message_chain(
         write_str(writer, "  ");
     }
 
-    write_str(writer, &chain.localize());
+    write_str(writer, &diagnostic_localize(chain, locale));
     for child in &chain.message_chain {
-        flatten_diagnostic_message_chain(writer, child, new_line, level + 1);
+        flatten_diagnostic_message_chain(writer, child, new_line, locale, level + 1);
     }
+}
+
+// Go: ast/diagnostic.go:101 (*Diagnostic).Localize, which the writer calls
+// through the Go `diagnosticwriter.Diagnostic` interface.
+// PORT: the Rust `Diagnostic::localize` (ast/misc.rs) takes no locale and
+// writes English, so the writer calls Go `diagnostics.Localize` here. The
+// port resolves the message when it makes the diagnostic, so the Go
+// `messageKey` is never read.
+fn diagnostic_localize(diagnostic: &Diagnostic, locale: &Locale) -> String {
+    localize(
+        locale,
+        Some(diagnostic.message),
+        "",
+        &diagnostic.message_args,
+    )
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:283 getCategoryFormat
@@ -611,25 +764,28 @@ pub fn write_error_summary_text(
     );
     let num_erroring_files = error_summary.errors_by_file.len();
 
+    let locale = &format_opts.locale;
     let message = if total_error_count == 1 {
         // Special-case a single error.
         if !error_summary.global_errors.is_empty() || first_file_name.is_empty() {
-            localize(diag::Found_1_error, &[])
+            message_localize(diag::Found_1_error, locale, &[])
         } else {
-            localize(diag::Found_1_error_in_0, &args![first_file_name])
+            message_localize(diag::Found_1_error_in_0, locale, &args![first_file_name])
         }
     } else {
         match num_erroring_files {
             // No file-specific errors.
-            0 => localize(diag::Found_0_errors, &args![total_error_count]),
+            0 => message_localize(diag::Found_0_errors, locale, &args![total_error_count]),
             // One file with errors.
-            1 => localize(
+            1 => message_localize(
                 diag::Found_0_errors_in_the_same_file_starting_at_Colon_1,
+                locale,
                 &args![total_error_count, first_file_name],
             ),
             // Multiple files with errors.
-            _ => localize(
+            _ => message_localize(
                 diag::Found_0_errors_in_1_files,
+                locale,
                 &args![total_error_count, num_erroring_files],
             ),
         }
@@ -700,7 +856,7 @@ fn write_tabular_errors_display(
     // !!!
     // TODO (drosen): This was never localized.
     // Should make this better.
-    let header_row = localize(diag::Errors_Files, &[]);
+    let header_row = message_localize(diag::Errors_Files, &format_opts.locale, &[]);
     let left_column_heading_length = header_row.split(' ').next().unwrap_or_default().len() as i32;
     let length_of_biggest_error_count = max_errors.to_string().len() as i32;
     let left_padding_goal = left_column_heading_length.max(length_of_biggest_error_count);
@@ -758,16 +914,18 @@ fn pretty_path_for_file_error(
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:467 WriteFormatDiagnostic
-// PORT: with a program installed, a diagnostic goes through
-// `program::format_diagnostic`: on the legacy frontend a config diagnostic
-// has a nil file and its location is in the program's side table. That
-// uses the program's current directory, which is the system one.
+// PORT: on the legacy frontend (`GOPORT_FRONTEND=legacy`) a diagnostic goes
+// through `program::format_diagnostic`: a config diagnostic there has a nil
+// file and its location is in the program's side table. That writer uses
+// the program's current directory, which is the system one, and writes
+// English. The execute paths install the Go frontend program, so they
+// always take the Go code below.
 pub fn write_format_diagnostic(
     output: &Writer,
     diagnostic: &Diagnostic,
     format_opts: &FormattingOptions,
 ) {
-    if try_prog().is_some() {
+    if try_prog().is_some() && go_frontend_program().is_none() {
         write_str(output, &format_diagnostic(diagnostic));
         return;
     }
@@ -787,7 +945,12 @@ pub fn write_format_diagnostic(
         output,
         &format!("{} TS{}: ", diagnostic.category.name(), diagnostic.code),
     );
-    write_flattened_diagnostic_message(output, diagnostic, &format_opts.new_line);
+    write_flattened_diagnostic_message(
+        output,
+        diagnostic,
+        &format_opts.new_line,
+        &format_opts.locale,
+    );
     write_str(output, &format_opts.new_line);
 }
 
@@ -812,7 +975,7 @@ pub fn format_diagnostics_status_with_color_and_time(
     write_str(output, "[");
     write_with_style_and_reset(output, time, FOREGROUND_COLOR_ESCAPE_GREY);
     write_str(output, "] ");
-    write_flattened_diagnostic_message(output, diag, &format_opts.new_line);
+    write_flattened_diagnostic_message(output, diag, &format_opts.new_line, &format_opts.locale);
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:487 FormatDiagnosticsStatusAndTime
@@ -823,7 +986,7 @@ pub fn format_diagnostics_status_and_time(
     format_opts: &FormattingOptions,
 ) {
     write_str(output, &format!("{time} - "));
-    write_flattened_diagnostic_message(output, diag, &format_opts.new_line);
+    write_flattened_diagnostic_message(output, diag, &format_opts.new_line, &format_opts.locale);
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:497 TryClearScreen
@@ -845,19 +1008,12 @@ pub fn try_clear_screen(output: &Writer, diag: &Diagnostic, options: &CompilerOp
 }
 
 // ---------------------------------------------------------------------------
-// Go standard library and `diagnostics` helpers used above and below
+// Go standard library helpers used above and in help.rs
 // ---------------------------------------------------------------------------
-
-// Go: diagnostics/diagnostics.go:67 (*Message).Localize
-// PORT: the port has only the default (English) messages, so the locale is
-// dropped and this is Go `Format` (`format_message`).
-fn localize(message: &'static Message, args: &[String]) -> String {
-    format_message(message, args)
-}
 
 /// Go `fmt.Sprintf("%*s", width, s)`, or `"%-*s"` when `left` is true. Go
 /// pads to `width` runes, and a negative width pads on the right.
-fn go_pad(s: &str, width: i32, left: bool) -> String {
+pub(super) fn go_pad(s: &str, width: i32, left: bool) -> String {
     let left = left || width < 0;
     let width = width.unsigned_abs() as usize;
     if left {
@@ -868,505 +1024,9 @@ fn go_pad(s: &str, width: i32, left: bool) -> String {
 }
 
 /// Go `strings.Repeat`, which panics on a negative count.
-fn go_repeat(s: &str, count: i32) -> String {
+pub(super) fn go_repeat(s: &str, count: i32) -> String {
     match usize::try_from(count) {
         Ok(count) => s.repeat(count),
         Err(_) => panic!("strings: negative Repeat count"),
     }
-}
-
-// ---------------------------------------------------------------------------
-// Go execute/tsc/help.go (PrintVersion, PrintBuildHelp and the helpers they
-// call)
-// ---------------------------------------------------------------------------
-// PORT: Go `PrintHelp`, `getOptionsForHelp`, `printEasyHelp` and
-// `printAllHelp` (the `tsc --help` path) are not ported here: no port
-// caller uses them yet.
-
-// Go: execute/tsc/help.go:15 PrintVersion
-pub fn print_version(sys: &dyn System) {
-    write_str(
-        &sys.writer(),
-        &format!("{}\n", localize(diag::Version_0, &args![version()])),
-    );
-}
-
-// Go: execute/tsc/help.go:44 getHeader
-fn get_header(sys: &dyn System, message: &str) -> Vec<String> {
-    let colors = create_colors(sys);
-    let mut header = Vec::with_capacity(3);
-    let terminal_width = sys.get_width_of_terminal();
-    const TS_ICON: &str = "     ";
-    const TS_ICON_TS: &str = "  TS ";
-    const TS_ICON_LENGTH: i32 = TS_ICON.len() as i32;
-
-    let ts_icon_first_line = colors.blue_background(TS_ICON);
-    let ts_icon_second_line = colors.blue_background(&colors.bright_white(TS_ICON_TS));
-    // If we have enough space, print TS icon.
-    if terminal_width >= message.len() as i32 + TS_ICON_LENGTH {
-        // right align of the icon is 120 at most.
-        let right_align = if terminal_width > 120 {
-            120
-        } else {
-            terminal_width
-        };
-        let left_align = right_align - TS_ICON_LENGTH;
-        header.extend([
-            go_pad(message, left_align, true),
-            ts_icon_first_line,
-            "\n".to_string(),
-        ]);
-        header.extend([
-            go_repeat(" ", left_align),
-            ts_icon_second_line,
-            "\n".to_string(),
-        ]);
-    } else {
-        header.extend([message.to_string(), "\n".to_string(), "\n".to_string()]);
-    }
-    header
-}
-
-// Go: execute/tsc/help.go:135 PrintBuildHelp
-pub fn print_build_help(sys: &dyn System, build_options: &[&'static CommandLineOption]) {
-    let mut output: Vec<String> = Vec::new();
-    output.extend(get_header(
-        sys,
-        &format!(
-            "{} - {}",
-            localize(diag::X_tsc_Colon_The_TypeScript_Compiler, &[]),
-            localize(diag::Version_0, &args![version()])
-        ),
-    ));
-    let before = localize(
-        diag::Using_build_b_will_make_tsc_behave_more_like_a_build_orchestrator_than_a_compiler_This_is_used_to_trigger_building_composite_projects_which_you_can_learn_more_about_at_0,
-        &args!["https://aka.ms/tsc-composite-builds"],
-    );
-    let options: Vec<&'static CommandLineOption> = build_options
-        .iter()
-        .copied()
-        .filter(|option| !std::ptr::eq(*option, &*TSC_BUILD_OPTION))
-        .collect();
-    output.extend(generate_section_options_output(
-        sys,
-        &localize(diag::BUILD_OPTIONS, &[]),
-        &options,
-        false,
-        Some(&before),
-        None,
-    ));
-
-    let writer = sys.writer();
-    for chunk in &output {
-        write_str(&writer, chunk);
-    }
-}
-
-// Go: execute/tsc/help.go:149 generateSectionOptionsOutput
-fn generate_section_options_output(
-    sys: &dyn System,
-    section_name: &str,
-    options: &[&'static CommandLineOption],
-    sub_category: bool,
-    before_options_description: Option<&str>,
-    after_options_description: Option<&str>,
-) -> Vec<String> {
-    let mut output = vec![
-        create_colors(sys).bold(section_name),
-        "\n".to_string(),
-        "\n".to_string(),
-    ];
-
-    if let Some(before_options_description) = before_options_description {
-        output.extend([
-            before_options_description.to_string(),
-            "\n".to_string(),
-            "\n".to_string(),
-        ]);
-    }
-    if !sub_category {
-        output.extend(generate_group_option_output(sys, options));
-        if let Some(after_options_description) = after_options_description {
-            output.extend([
-                after_options_description.to_string(),
-                "\n".to_string(),
-                "\n".to_string(),
-            ]);
-        }
-        return output;
-    }
-    // PORT: Go keeps a map and a separate `categoryOrder` slice. An
-    // `IndexMap` keeps both.
-    let mut category_map: IndexMap<String, Vec<&'static CommandLineOption>> = IndexMap::new();
-    for &option in options {
-        let Some(category) = option.category else {
-            continue;
-        };
-        let cur_category = localize(category, &[]);
-        category_map.entry(cur_category).or_default().push(option);
-    }
-    for (key, value) in &category_map {
-        output.extend([
-            "### ".to_string(),
-            key.clone(),
-            "\n".to_string(),
-            "\n".to_string(),
-        ]);
-        output.extend(generate_group_option_output(sys, value));
-    }
-    if let Some(after_options_description) = after_options_description {
-        output.extend([
-            after_options_description.to_string(),
-            "\n".to_string(),
-            "\n".to_string(),
-        ]);
-    }
-
-    output
-}
-
-// Go: execute/tsc/help.go:194 generateGroupOptionOutput
-fn generate_group_option_output(
-    sys: &dyn System,
-    options_list: &[&'static CommandLineOption],
-) -> Vec<String> {
-    let mut max_length = 0;
-    for option in options_list {
-        let cur_lenght = get_display_name_text_of_option(option).len() as i32;
-        max_length = max_length.max(cur_lenght);
-    }
-
-    // left part should be right align, right part should be left align
-
-    // assume 2 space between left margin and left part.
-    let right_align_of_left_part = max_length + 2;
-    // assume 2 space between left and right part
-    let left_align_of_right_part = right_align_of_left_part + 2;
-
-    let mut lines = Vec::new();
-    for option in options_list {
-        let tmp = generate_option_output(
-            sys,
-            option,
-            right_align_of_left_part,
-            left_align_of_right_part,
-        );
-        lines.extend(tmp);
-    }
-
-    // make sure always a blank line in the end.
-    if lines.len() < 2 || lines[lines.len() - 2] != "\n" {
-        lines.push("\n".to_string());
-    }
-
-    lines
-}
-
-// Go: execute/tsc/help.go:222 generateOptionOutput
-fn generate_option_output(
-    sys: &dyn System,
-    option: &CommandLineOption,
-    right_align_of_left: i32,
-    left_align_of_right: i32,
-) -> Vec<String> {
-    let mut text: Vec<String> = Vec::new();
-    let colors = create_colors(sys);
-
-    // name and description
-    let name = get_display_name_text_of_option(option);
-
-    // value type and possible value
-    let value_candidates = get_value_candidate(option);
-
-    let default_value_description =
-        if let CompilerOptionsValue::Message(msg) = option.default_value_description {
-            localize(msg, &[])
-        } else {
-            // Go evaluates both `core.IfElse` arguments.
-            let elements = option.elements();
-            format_default_value(
-                &option.default_value_description,
-                if option.kind == CommandLineOptionKind::LIST
-                    || option.kind == CommandLineOptionKind::LIST_OR_ELEMENT
-                {
-                    elements
-                } else {
-                    Some(option)
-                },
-            )
-        };
-
-    let terminal_width = sys.get_width_of_terminal();
-
-    if terminal_width >= 80 {
-        let description = match option.description {
-            Some(description) => localize(description, &[]),
-            None => String::new(),
-        };
-        text.extend(get_pretty_output(
-            &colors,
-            &name,
-            &description,
-            right_align_of_left,
-            left_align_of_right,
-            terminal_width,
-            true, /*colorLeft*/
-        ));
-        text.push("\n".to_string());
-        if show_additional_info_output(value_candidates.as_ref(), option) {
-            if let Some(value_candidates) = &value_candidates {
-                text.extend(get_pretty_output(
-                    &colors,
-                    &value_candidates.value_type,
-                    &value_candidates.possible_values,
-                    right_align_of_left,
-                    left_align_of_right,
-                    terminal_width,
-                    false, /*colorLeft*/
-                ));
-                text.push("\n".to_string());
-            }
-            if !default_value_description.is_empty() {
-                text.extend(get_pretty_output(
-                    &colors,
-                    &localize(diag::X_default_Colon, &[]),
-                    &default_value_description,
-                    right_align_of_left,
-                    left_align_of_right,
-                    terminal_width,
-                    false, /*colorLeft*/
-                ));
-                text.push("\n".to_string());
-            }
-        }
-        text.push("\n".to_string());
-    } else {
-        text.extend([colors.blue(&name), "\n".to_string()]);
-        if let Some(description) = option.description {
-            text.push(localize(description, &[]));
-        }
-        text.push("\n".to_string());
-        if show_additional_info_output(value_candidates.as_ref(), option) {
-            if let Some(value_candidates) = &value_candidates {
-                text.extend([
-                    value_candidates.value_type.clone(),
-                    " ".to_string(),
-                    value_candidates.possible_values.clone(),
-                ]);
-            }
-            if !default_value_description.is_empty() {
-                if value_candidates.is_some() {
-                    text.push("\n".to_string());
-                }
-                text.extend([
-                    localize(diag::X_default_Colon, &[]),
-                    " ".to_string(),
-                    default_value_description,
-                ]);
-            }
-
-            text.push("\n".to_string());
-        }
-        text.push("\n".to_string());
-    }
-
-    text
-}
-
-// Go: execute/tsc/help.go:295 formatDefaultValue
-// PORT: Go `option` is a pointer that can be nil (`Elements()` of a list
-// without elements); Go dereferences it after the nil value check.
-fn format_default_value(
-    default_value: &CompilerOptionsValue,
-    option: Option<&CommandLineOption>,
-) -> String {
-    if default_value.is_nil() || *default_value == CompilerOptionsValue::Tristate(Tristate::Unknown)
-    {
-        return "undefined".to_string();
-    }
-
-    let option = option.expect("nil option dereference");
-    if option.kind == CommandLineOptionKind::ENUM {
-        // e.g. ScriptTarget.ES2015 -> "es6/es2015"
-        let mut names: Vec<&str> = Vec::new();
-        for (name, value) in option.enum_map().expect("nil enum map dereference") {
-            if value == default_value {
-                names.push(name.as_str());
-            }
-        }
-        return names.join("/");
-    }
-    // Go `fmt.Sprintf("%v", defaultValue)`.
-    // PORT: only the dynamic types that the option declarations use as a
-    // non-enum default value are formatted. Others need Go `%v` rules.
-    match default_value {
-        CompilerOptionsValue::Bool(value) => value.to_string(),
-        CompilerOptionsValue::Int(value) => value.to_string(),
-        CompilerOptionsValue::String(value) => value.clone(),
-        _ => unported!("formatDefaultValue: fmt %v of this default value type"),
-    }
-}
-
-// Go: execute/tsc/help.go:313 valueCandidate
-struct ValueCandidate {
-    // "one or more" or "any of"
-    value_type: String,
-    possible_values: String,
-}
-
-// Go: execute/tsc/help.go:319 showAdditionalInfoOutput
-fn show_additional_info_output(
-    value_candidates: Option<&ValueCandidate>,
-    option: &CommandLineOption,
-) -> bool {
-    if option
-        .category
-        .is_some_and(|category| std::ptr::eq(category, diag::Command_line_Options))
-    {
-        return false;
-    }
-    if let Some(value_candidates) = value_candidates
-        && value_candidates.possible_values == "string"
-        && (option.default_value_description.is_nil()
-            || matches!(
-                &option.default_value_description,
-                CompilerOptionsValue::String(value) if value == "false" || value == "n/a"
-            ))
-    {
-        return false;
-    }
-    true
-}
-
-// Go: execute/tsc/help.go:332 getValueCandidate
-// PORT: Go also takes `sys`, which it does not read.
-fn get_value_candidate(option: &CommandLineOption) -> Option<ValueCandidate> {
-    // option.type might be "string" | "number" | "boolean" | "object" | "list" | Map<string, number | string>
-    // string -- any of: string
-    // number -- any of: number
-    // boolean -- any of: boolean
-    // object -- null
-    // list -- one or more: , content depends on `option.element.type`, the same as others
-    // Map<string, number | string> -- any of: key1, key2, ....
-    if option.kind == CommandLineOptionKind::OBJECT {
-        return None;
-    }
-
-    if option.kind == CommandLineOptionKind::LIST_OR_ELEMENT {
-        // assert(option.type !== "listOrElement")
-        panic!("no value candidate for list or element");
-    }
-
-    let value_type = if option.kind == CommandLineOptionKind::STRING
-        || option.kind == CommandLineOptionKind::NUMBER
-        || option.kind == CommandLineOptionKind::BOOLEAN
-    {
-        localize(diag::X_type_Colon, &[])
-    } else if option.kind == CommandLineOptionKind::LIST {
-        localize(diag::X_one_or_more_Colon, &[])
-    } else {
-        localize(diag::X_one_of_Colon, &[])
-    };
-
-    Some(ValueCandidate {
-        value_type,
-        possible_values: get_possible_values(option),
-    })
-}
-
-// Go: execute/tsc/help.go:366 getPossibleValues
-fn get_possible_values(option: &CommandLineOption) -> String {
-    if option.kind == CommandLineOptionKind::STRING
-        || option.kind == CommandLineOptionKind::NUMBER
-        || option.kind == CommandLineOptionKind::BOOLEAN
-    {
-        return option.kind.0.to_string();
-    }
-    if option.kind == CommandLineOptionKind::LIST
-        || option.kind == CommandLineOptionKind::LIST_OR_ELEMENT
-    {
-        return get_possible_values(option.elements().expect("nil option dereference"));
-    }
-    if option.kind == CommandLineOptionKind::OBJECT {
-        return String::new();
-    }
-    // Map<string, number | string>
-    // Group synonyms: es6/es2015
-    let enum_map = option.enum_map().expect("nil enum map dereference");
-    // PORT: Go uses an ordered map keyed by the `any` value. The values are
-    // not hashable here, so this is a list in insertion order.
-    let mut inverted: Vec<(&CompilerOptionsValue, Vec<&str>)> = Vec::with_capacity(enum_map.len());
-    let deprecated_keys = option.deprecated_keys();
-
-    for (name, value) in enum_map {
-        if !deprecated_keys.is_some_and(|keys| keys.contains(name)) {
-            match inverted.iter_mut().find(|(key, _)| *key == value) {
-                Some((_, names)) => names.push(name.as_str()),
-                None => inverted.push((value, vec![name.as_str()])),
-            }
-        }
-    }
-    let syns: Vec<String> = inverted
-        .iter()
-        .map(|(_, synonyms)| synonyms.join("/"))
-        .collect();
-    syns.join(", ")
-}
-
-// Go: execute/tsc/help.go:397 getPrettyOutput
-// PORT: Go cuts `right` at a byte index. A cut inside a UTF-8 sequence
-// writes invalid UTF-8, which a Rust `String` cannot hold.
-fn get_pretty_output(
-    colors: &Colors,
-    left: &str,
-    right: &str,
-    right_align_of_left: i32,
-    left_align_of_right: i32,
-    terminal_width: i32,
-    color_left: bool,
-) -> Vec<String> {
-    // !!! How does terminalWidth interact with UTF-8 encoding? Strada just assumed UTF-16.
-    let mut res = Vec::with_capacity(4);
-    let mut is_first_line = true;
-    let mut remain_right = right;
-    let right_character_number = terminal_width - left_align_of_right;
-    while !remain_right.is_empty() {
-        let cur_left = if is_first_line {
-            let cur_left = go_pad(left, right_align_of_left, false);
-            let cur_left = go_pad(&cur_left, left_align_of_right, true);
-            if color_left {
-                colors.blue(&cur_left)
-            } else {
-                cur_left
-            }
-        } else {
-            go_repeat(" ", left_align_of_right)
-        };
-
-        let idx = right_character_number.min(remain_right.len() as i32);
-        let Ok(idx) = usize::try_from(idx) else {
-            panic!("slice bounds out of range [:{idx}]");
-        };
-        if !remain_right.is_char_boundary(idx) {
-            unported!("getPrettyOutput cut inside a UTF-8 sequence");
-        }
-        let (cur_right, rest) = remain_right.split_at(idx);
-        remain_right = rest;
-        res.extend([cur_left, cur_right.to_string(), "\n".to_string()]);
-        is_first_line = false;
-    }
-    res
-}
-
-// Go: execute/tsc/help.go:424 getDisplayNameTextOfOption
-fn get_display_name_text_of_option(option: &CommandLineOption) -> String {
-    format!(
-        "--{}{}",
-        option.name,
-        if !option.short_name.is_empty() {
-            format!(", -{}", option.short_name)
-        } else {
-            String::new()
-        }
-    )
 }

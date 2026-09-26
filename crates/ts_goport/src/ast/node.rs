@@ -75,24 +75,195 @@ fn mods(file: usize, m: &'static Option<ts_ast::ModifierList>) -> ModifierList {
     }
 }
 
-/// Matches `n`'s data against the listed `NodeData` variants. Each variant
-/// binds `$d` and evaluates `$e`; other variants give `$def`.
-macro_rules! by_data {
-    ($n:expr, |$file:ident, $d:ident| $e:expr, [$($v:ident),* $(,)?], $def:expr) => {{
-        let node: Node = $n;
-        by_data_of!(node, data(node), |$file, $d| $e, [$($v),*], $def)
-    }};
+/// True when data variant `$v` fits a node of kind `$k`. This mirrors
+/// `ts_ast::NodeData::matches_syntax_kind`: a variant named like a kind fits
+/// that kind, and the other variants are listed here. A variant that is not
+/// listed and is not named like a kind does not compile.
+macro_rules! variant_has_kind {
+    (Token, $k:expr) => {
+        $k.is_token()
+    };
+    (KeywordExpression, $k:expr) => {
+        $k.is_keyword_expression()
+    };
+    (KeywordTypeNode, $k:expr) => {
+        $k.is_keyword_type()
+    };
+    (ForInOrOfStatement, $k:expr) => {
+        matches!($k, SyntaxKind::ForInStatement | SyntaxKind::ForOfStatement)
+    };
+    (CaseOrDefaultClause, $k:expr) => {
+        matches!($k, SyntaxKind::CaseClause | SyntaxKind::DefaultClause)
+    };
+    (BindingPattern, $k:expr) => {
+        matches!(
+            $k,
+            SyntaxKind::ObjectBindingPattern | SyntaxKind::ArrayBindingPattern
+        )
+    };
+    (JsDocParameterOrPropertyTag, $k:expr) => {
+        matches!(
+            $k,
+            SyntaxKind::JsDocParameterTag | SyntaxKind::JsDocPropertyTag
+        )
+    };
+    // These three are named like a kind but also fit a second kind.
+    (TypeAliasDeclaration, $k:expr) => {
+        matches!(
+            $k,
+            SyntaxKind::TypeAliasDeclaration | SyntaxKind::JsTypeAliasDeclaration
+        )
+    };
+    (ImportDeclaration, $k:expr) => {
+        matches!(
+            $k,
+            SyntaxKind::ImportDeclaration | SyntaxKind::JsImportDeclaration
+        )
+    };
+    (JsxText, $k:expr) => {
+        matches!($k, SyntaxKind::JsxText | SyntaxKind::JsxTextAllWhiteSpaces)
+    };
+    (ParameterDeclaration, $k:expr) => {
+        $k == SyntaxKind::Parameter
+    };
+    (CallSignatureDeclaration, $k:expr) => {
+        $k == SyntaxKind::CallSignature
+    };
+    (ConstructSignatureDeclaration, $k:expr) => {
+        $k == SyntaxKind::ConstructSignature
+    };
+    (ConstructorDeclaration, $k:expr) => {
+        $k == SyntaxKind::Constructor
+    };
+    (GetAccessorDeclaration, $k:expr) => {
+        $k == SyntaxKind::GetAccessor
+    };
+    (SetAccessorDeclaration, $k:expr) => {
+        $k == SyntaxKind::SetAccessor
+    };
+    (IndexSignatureDeclaration, $k:expr) => {
+        $k == SyntaxKind::IndexSignature
+    };
+    (MethodSignatureDeclaration, $k:expr) => {
+        $k == SyntaxKind::MethodSignature
+    };
+    (PropertySignatureDeclaration, $k:expr) => {
+        $k == SyntaxKind::PropertySignature
+    };
+    (TypeParameterDeclaration, $k:expr) => {
+        $k == SyntaxKind::TypeParameter
+    };
+    (TypeAssertion, $k:expr) => {
+        $k == SyntaxKind::TypeAssertionExpression
+    };
+    (UnionTypeNode, $k:expr) => {
+        $k == SyntaxKind::UnionType
+    };
+    (IntersectionTypeNode, $k:expr) => {
+        $k == SyntaxKind::IntersectionType
+    };
+    (ConditionalTypeNode, $k:expr) => {
+        $k == SyntaxKind::ConditionalType
+    };
+    (TypeOperatorNode, $k:expr) => {
+        $k == SyntaxKind::TypeOperator
+    };
+    (InferTypeNode, $k:expr) => {
+        $k == SyntaxKind::InferType
+    };
+    (ArrayTypeNode, $k:expr) => {
+        $k == SyntaxKind::ArrayType
+    };
+    (IndexedAccessTypeNode, $k:expr) => {
+        $k == SyntaxKind::IndexedAccessType
+    };
+    (TypeReferenceNode, $k:expr) => {
+        $k == SyntaxKind::TypeReference
+    };
+    (LiteralTypeNode, $k:expr) => {
+        $k == SyntaxKind::LiteralType
+    };
+    (ThisTypeNode, $k:expr) => {
+        $k == SyntaxKind::ThisType
+    };
+    (TypePredicateNode, $k:expr) => {
+        $k == SyntaxKind::TypePredicate
+    };
+    (TypeQueryNode, $k:expr) => {
+        $k == SyntaxKind::TypeQuery
+    };
+    (MappedTypeNode, $k:expr) => {
+        $k == SyntaxKind::MappedType
+    };
+    (TypeLiteralNode, $k:expr) => {
+        $k == SyntaxKind::TypeLiteral
+    };
+    (TupleTypeNode, $k:expr) => {
+        $k == SyntaxKind::TupleType
+    };
+    (OptionalTypeNode, $k:expr) => {
+        $k == SyntaxKind::OptionalType
+    };
+    (RestTypeNode, $k:expr) => {
+        $k == SyntaxKind::RestType
+    };
+    (ParenthesizedTypeNode, $k:expr) => {
+        $k == SyntaxKind::ParenthesizedType
+    };
+    (FunctionTypeNode, $k:expr) => {
+        $k == SyntaxKind::FunctionType
+    };
+    (ConstructorTypeNode, $k:expr) => {
+        $k == SyntaxKind::ConstructorType
+    };
+    (TemplateLiteralTypeNode, $k:expr) => {
+        $k == SyntaxKind::TemplateLiteralType
+    };
+    (ImportTypeNode, $k:expr) => {
+        $k == SyntaxKind::ImportType
+    };
+    ($v:ident, $k:expr) => {
+        $k == SyntaxKind::$v
+    };
 }
 
-/// Like `by_data!`, but matches `$data`, the data of `$n` that the caller
-/// already read. Accessors with nested matches read the data once this way.
-macro_rules! by_data_of {
-    ($n:expr, $data:expr, |$file:ident, $d:ident| $e:expr, [$($v:ident),* $(,)?], $def:expr) => {{
-        #[allow(unused_variables)]
-        let $file = $n.file_index();
-        match $data {
-            $(NodeData::$v($d) => $e,)*
-            _ => $def,
+/// True when `n` is a frozen store node whose kind fits none of the listed
+/// data variants. Such a node cannot hold the field, so the accessor gives
+/// its default without loading the node data.
+// Store data always fits the header kind (`alloc_store_node`). `Unknown` is
+// also the kind of nil and alias slots, so it takes the data path, which
+// keeps its panics.
+macro_rules! kind_lacks_data {
+    ($n:expr, [$($v:ident),+]) => {
+        match frozen_store_kind($n) {
+            Some(kind) => kind != SyntaxKind::Unknown $(&& !variant_has_kind!($v, kind))+,
+            None => false,
+        }
+    };
+}
+
+/// Go field read by node data variant. Each arm lists `NodeData` variants,
+/// binds the variant data to `$d` and the node's file to `$file`, and
+/// evaluates `$e`. Other variants give `$def`.
+///
+/// PERF: a frozen store node whose kind fits no listed variant gives `$def`
+/// from the packed kind table (`kind_lacks_data!`), without the pointer
+/// chase to its ts_ast node and data.
+macro_rules! by_data {
+    ($n:expr, $def:expr, $([$($v:ident),+ $(,)?] => |$file:ident, $d:ident| $e:expr),+ $(,)?) => {{
+        let node: Node = $n;
+        if kind_lacks_data!(node, [$($($v),+),+]) {
+            debug_assert!(!matches!(data(node), $($(NodeData::$v(_))|+)|+));
+            $def
+        } else {
+            let file = node.file_index();
+            match data(node) {
+                $($(NodeData::$v($d) => {
+                    let $file = file;
+                    $e
+                })+)+
+                _ => $def,
+            }
         }
     }};
 }
@@ -661,15 +832,29 @@ impl ModifierList {
         self.node_list().loc()
     }
 
+    // Go: ast.go:155 ModifierList.ModifierFlags (set at ast.go:162)
     /// Go `modifiers.ModifierFlags`. NONE when nil.
-    // PORT: ts_ast stores its own flag type, so the Go flags are computed
-    // from the modifier nodes, like `modifiers_to_flags` (as the Go factory
-    // does when it builds the list), without copying the list.
+    // PERF: store and synthetic lists hold Go `ModifiersToFlags(nodes)`,
+    // stored when the factory made the list (`new_store_modifier_list`,
+    // `new_synthetic_modifier_list` and the `*_modifiers_value` copies), so
+    // they read it like Go does instead of walking the modifier nodes.
     #[must_use]
     pub fn modifier_flags(self) -> ModifierFlags {
-        if self.is_nil() {
+        let Some(list) = self.list else {
             return ModifierFlags::NONE;
+        };
+        let file = self.file as usize;
+        if file == SYNTHETIC_NODE_FILE || has_file_store(file) {
+            return ModifierFlags(list.flags.0);
         }
+        self.legacy_modifier_flags()
+    }
+
+    // PORT: lists of the legacy frontend (ts_parser) store ts_parser flag
+    // bits, so the Go flags are computed from the modifier nodes, like
+    // `modifiers_to_flags`, without copying the list.
+    #[inline(never)]
+    fn legacy_modifier_flags(self) -> ModifierFlags {
         let mut flags = ModifierFlags::NONE;
         for modifier in self.nodes() {
             flags |= modifier_to_flag(modifier.kind());
@@ -864,11 +1049,13 @@ impl Node {
     }
 
     /// Binder data for this node. Nil values before the file is bound.
+    // PERF: the program file path stays small enough to inline. The
+    // synthetic path (thread-local arena and `RefCell` borrow) is cold.
     #[inline]
     #[must_use]
     pub fn bind(self) -> &'static NodeBindData {
         if is_synthetic_node(self) {
-            return synthetic_bind(self);
+            return self.bind_synthetic();
         }
         match self.go_file().node_bind.get() {
             Some(v) => v.get(nid(self).index()),
@@ -876,20 +1063,24 @@ impl Node {
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn bind_synthetic(self) -> &'static NodeBindData {
+        synthetic_bind(self)
+    }
+
     // Go: ast.go:198 Name
     #[must_use]
     pub fn name(self) -> Node {
-        let node_data = data(self);
-        // PORT: a QualifiedName that Go parses as a PropertyAccessExpression.
-        if let NodeData::QualifiedName(d) = node_data
-            && self.kind() == SyntaxKind::PropertyAccessExpression
-        {
-            return req(self.file_index(), d.right);
-        }
-        by_data_of!(
+        by_data!(
             self,
-            node_data,
-            |f, d| opt(f, d.name),
+            Node::NIL,
+            // PORT: a QualifiedName that Go parses as a PropertyAccessExpression.
+            [QualifiedName] => |f, d| if self.kind() == SyntaxKind::PropertyAccessExpression {
+                req(f, d.right)
+            } else {
+                Node::NIL
+            },
             [
                 BindingElement,
                 ClassDeclaration,
@@ -902,45 +1093,39 @@ impl Node {
                 JsDocLinkCode,
                 JsDocLinkPlain,
                 JsDocTypedefTag,
-            ],
-            by_data_of!(
-                self,
-                node_data,
-                |f, d| req(f, d.name),
-                [
-                    EnumDeclaration,
-                    EnumMember,
-                    ExportSpecifier,
-                    GetAccessorDeclaration,
-                    SetAccessorDeclaration,
-                    ImportAttribute,
-                    ImportEqualsDeclaration,
-                    ImportSpecifier,
-                    InterfaceDeclaration,
-                    JsDocNameReference,
-                    JsDocParameterOrPropertyTag,
-                    JsxAttribute,
-                    JsxNamespacedName,
-                    MetaProperty,
-                    MethodDeclaration,
-                    MethodSignatureDeclaration,
-                    ModuleDeclaration,
-                    NamedTupleMember,
-                    NamespaceExport,
-                    NamespaceExportDeclaration,
-                    NamespaceImport,
-                    ParameterDeclaration,
-                    PropertyAccessExpression,
-                    PropertyAssignment,
-                    PropertyDeclaration,
-                    PropertySignatureDeclaration,
-                    ShorthandPropertyAssignment,
-                    TypeAliasDeclaration,
-                    TypeParameterDeclaration,
-                    VariableDeclaration,
-                ],
-                Node::NIL
-            )
+            ] => |f, d| opt(f, d.name),
+            [
+                EnumDeclaration,
+                EnumMember,
+                ExportSpecifier,
+                GetAccessorDeclaration,
+                SetAccessorDeclaration,
+                ImportAttribute,
+                ImportEqualsDeclaration,
+                ImportSpecifier,
+                InterfaceDeclaration,
+                JsDocNameReference,
+                JsDocParameterOrPropertyTag,
+                JsxAttribute,
+                JsxNamespacedName,
+                MetaProperty,
+                MethodDeclaration,
+                MethodSignatureDeclaration,
+                ModuleDeclaration,
+                NamedTupleMember,
+                NamespaceExport,
+                NamespaceExportDeclaration,
+                NamespaceImport,
+                ParameterDeclaration,
+                PropertyAccessExpression,
+                PropertyAssignment,
+                PropertyDeclaration,
+                PropertySignatureDeclaration,
+                ShorthandPropertyAssignment,
+                TypeAliasDeclaration,
+                TypeParameterDeclaration,
+                VariableDeclaration,
+            ] => |f, d| req(f, d.name),
         )
     }
 
@@ -949,7 +1134,7 @@ impl Node {
     pub fn modifiers(self) -> ModifierList {
         by_data!(
             self,
-            |f, d| mods(f, &d.modifiers),
+            ModifierList::NIL,
             [
                 ArrowFunction,
                 BinaryExpression,
@@ -984,8 +1169,7 @@ impl Node {
                 TypeAliasDeclaration,
                 TypeParameterDeclaration,
                 VariableStatement,
-            ],
-            ModifierList::NIL
+            ] => |f, d| mods(f, &d.modifiers),
         )
     }
 
@@ -996,7 +1180,7 @@ impl Node {
     pub fn parameter_list(self) -> NodeList {
         by_data!(
             self,
-            |f, d| list(f, &d.parameters),
+            NodeList::NIL,
             [
                 ArrowFunction,
                 CallSignatureDeclaration,
@@ -1012,8 +1196,7 @@ impl Node {
                 MethodSignatureDeclaration,
                 FunctionTypeNode,
                 ConstructorTypeNode,
-            ],
-            NodeList::NIL
+            ] => |f, d| list(f, &d.parameters),
         )
     }
 
@@ -1171,11 +1354,9 @@ impl Node {
     // has no generated accessor.
     #[must_use]
     pub fn body(self) -> Node {
-        let node_data = data(self);
-        by_data_of!(
+        by_data!(
             self,
-            node_data,
-            |f, d| opt(f, d.body),
+            Node::NIL,
             [
                 FunctionDeclaration,
                 MethodDeclaration,
@@ -1183,18 +1364,12 @@ impl Node {
                 SetAccessorDeclaration,
                 ConstructorDeclaration,
                 ModuleDeclaration,
-            ],
-            by_data_of!(
-                self,
-                node_data,
-                |f, d| req(f, d.body),
-                [
-                    FunctionExpression,
-                    ArrowFunction,
-                    ClassStaticBlockDeclaration,
-                ],
-                Node::NIL
-            )
+            ] => |f, d| opt(f, d.body),
+            [
+                FunctionExpression,
+                ArrowFunction,
+                ClassStaticBlockDeclaration,
+            ] => |f, d| req(f, d.body),
         )
     }
 
@@ -1240,20 +1415,16 @@ impl Node {
     // generated accessor.
     #[must_use]
     pub fn expression(self) -> Node {
-        let node_data = data(self);
-        if let NodeData::CaseOrDefaultClause(d) = node_data {
-            return case_expression(self, self.file_index(), d.expression);
-        }
-        // PORT: a QualifiedName that Go parses as a PropertyAccessExpression.
-        if let NodeData::QualifiedName(d) = node_data
-            && self.kind() == SyntaxKind::PropertyAccessExpression
-        {
-            return req(self.file_index(), d.left);
-        }
-        by_data_of!(
+        by_data!(
             self,
-            node_data,
-            |f, d| req(f, d.expression),
+            Node::NIL,
+            [CaseOrDefaultClause] => |f, d| case_expression(self, f, d.expression),
+            // PORT: a QualifiedName that Go parses as a PropertyAccessExpression.
+            [QualifiedName] => |f, d| if self.kind() == SyntaxKind::PropertyAccessExpression {
+                req(f, d.left)
+            } else {
+                Node::NIL
+            },
             [
                 PropertyAccessExpression,
                 ElementAccessExpression,
@@ -1287,19 +1458,13 @@ impl Node {
                 Decorator,
                 JsxSpreadAttribute,
                 SyntheticReferenceExpression,
-            ],
-            by_data_of!(
-                self,
-                node_data,
-                |f, d| opt(f, d.expression),
-                [
-                    YieldExpression,
-                    ReturnStatement,
-                    JsxExpression,
-                    TypeParameterDeclaration,
-                ],
-                Node::NIL
-            )
+            ] => |f, d| req(f, d.expression),
+            [
+                YieldExpression,
+                ReturnStatement,
+                JsxExpression,
+                TypeParameterDeclaration,
+            ] => |f, d| opt(f, d.expression),
         )
     }
 
@@ -1339,7 +1504,7 @@ impl Node {
     pub fn type_argument_list(self) -> NodeList {
         by_data!(
             self,
-            |f, d| opt_list(f, &d.type_arguments),
+            NodeList::NIL,
             [
                 CallExpression,
                 NewExpression,
@@ -1350,8 +1515,7 @@ impl Node {
                 TypeQueryNode,
                 JsxOpeningElement,
                 JsxSelfClosingElement,
-            ],
-            NodeList::NIL
+            ] => |f, d| opt_list(f, &d.type_arguments),
         )
     }
 
@@ -1364,14 +1528,10 @@ impl Node {
     // Go: ast.go:515 TypeParameterList
     #[must_use]
     pub fn type_parameter_list(self) -> NodeList {
-        let node_data = data(self);
-        if let NodeData::JsDocTemplateTag(d) = node_data {
-            return list(self.file_index(), &d.type_parameters);
-        }
-        by_data_of!(
+        by_data!(
             self,
-            node_data,
-            |f, d| opt_list(f, &d.type_parameters),
+            NodeList::NIL,
+            [JsDocTemplateTag] => |f, d| list(f, &d.type_parameters),
             [
                 ClassDeclaration,
                 ClassExpression,
@@ -1391,8 +1551,7 @@ impl Node {
                 MethodSignatureDeclaration,
                 FunctionTypeNode,
                 ConstructorTypeNode,
-            ],
-            NodeList::NIL
+            ] => |f, d| opt_list(f, &d.type_parameters),
         )
     }
 
@@ -1405,22 +1564,17 @@ impl Node {
     // Go: ast.go:544 MemberList
     #[must_use]
     pub fn member_list(self) -> NodeList {
-        let node_data = data(self);
-        if let NodeData::MappedTypeNode(_) = node_data {
-            return mapped_type_members(self);
-        }
-        by_data_of!(
+        by_data!(
             self,
-            node_data,
-            |f, d| list(f, &d.members),
+            NodeList::NIL,
+            [MappedTypeNode] => |_f, _d| mapped_type_members(self),
             [
                 ClassDeclaration,
                 ClassExpression,
                 InterfaceDeclaration,
                 EnumDeclaration,
                 TypeLiteralNode,
-            ],
-            NodeList::NIL
+            ] => |f, d| list(f, &d.members),
         )
     }
 
@@ -1435,9 +1589,8 @@ impl Node {
     pub fn statement_list(self) -> NodeList {
         by_data!(
             self,
-            |f, d| list(f, &d.statements),
-            [SourceFile, Block, ModuleBlock, CaseOrDefaultClause,],
-            NodeList::NIL
+            NodeList::NIL,
+            [SourceFile, Block, ModuleBlock, CaseOrDefaultClause] => |f, d| list(f, &d.statements),
         )
     }
 
@@ -1477,17 +1630,11 @@ impl Node {
     // generated accessor.
     #[must_use]
     pub fn type_(self) -> Node {
-        let node_data = data(self);
-        let f = self.file_index();
-        match node_data {
-            NodeData::JsDocParameterOrPropertyTag(d) => return opt(f, d.type_expression),
-            NodeData::IndexSignatureDeclaration(d) => return req(f, d.type_),
-            _ => {}
-        }
-        by_data_of!(
+        by_data!(
             self,
-            node_data,
-            |f, d| opt(f, d.type_),
+            Node::NIL,
+            [JsDocParameterOrPropertyTag] => |f, d| opt(f, d.type_expression),
+            [IndexSignatureDeclaration] => |f, d| req(f, d.type_),
             [
                 VariableDeclaration,
                 ParameterDeclaration,
@@ -1511,42 +1658,34 @@ impl Node {
                 MethodSignatureDeclaration,
                 FunctionTypeNode,
                 ConstructorTypeNode,
-            ],
-            by_data_of!(
-                self,
-                node_data,
-                |f, d| req(f, d.type_),
-                [
-                    PropertySignatureDeclaration,
-                    ParenthesizedTypeNode,
-                    TypeOperatorNode,
-                    TypeAssertion,
-                    AsExpression,
-                    SatisfiesExpression,
-                    TypeAliasDeclaration,
-                    NamedTupleMember,
-                    OptionalTypeNode,
-                    RestTypeNode,
-                    TemplateLiteralTypeSpan,
-                    JsDocTypeExpression,
-                    JsDocNullableType,
-                    JsDocNonNullableType,
-                    JsDocOptionalType,
-                    JsDocVariadicType,
-                ],
-                Node::NIL
-            )
+            ] => |f, d| opt(f, d.type_),
+            [
+                PropertySignatureDeclaration,
+                ParenthesizedTypeNode,
+                TypeOperatorNode,
+                TypeAssertion,
+                AsExpression,
+                SatisfiesExpression,
+                TypeAliasDeclaration,
+                NamedTupleMember,
+                OptionalTypeNode,
+                RestTypeNode,
+                TemplateLiteralTypeSpan,
+                JsDocTypeExpression,
+                JsDocNullableType,
+                JsDocNonNullableType,
+                JsDocOptionalType,
+                JsDocVariadicType,
+            ] => |f, d| req(f, d.type_),
         )
     }
 
     // Go: ast.go:739 Initializer
     #[must_use]
     pub fn initializer(self) -> Node {
-        let node_data = data(self);
-        by_data_of!(
+        by_data!(
             self,
-            node_data,
-            |f, d| opt(f, d.initializer),
+            Node::NIL,
             [
                 VariableDeclaration,
                 ParameterDeclaration,
@@ -1555,18 +1694,12 @@ impl Node {
                 EnumMember,
                 ForStatement,
                 JsxAttribute,
-            ],
-            by_data_of!(
-                self,
-                node_data,
-                |f, d| req(f, d.initializer),
-                [
-                    PropertySignatureDeclaration,
-                    PropertyAssignment,
-                    ForInOrOfStatement,
-                ],
-                Node::NIL
-            )
+            ] => |f, d| opt(f, d.initializer),
+            [
+                PropertySignatureDeclaration,
+                PropertyAssignment,
+                ForInOrOfStatement,
+            ] => |f, d| req(f, d.initializer),
         )
     }
 
@@ -1575,7 +1708,7 @@ impl Node {
     pub fn tag_name(self) -> Node {
         by_data!(
             self,
-            |f, d| req(f, d.tag_name),
+            Node::NIL,
             [
                 JsxOpeningElement,
                 JsxClosingElement,
@@ -1601,8 +1734,7 @@ impl Node {
                 JsDocSatisfiesTag,
                 JsDocThrowsTag,
                 JsDocImportTag,
-            ],
-            Node::NIL
+            ] => |f, d| req(f, d.tag_name),
         )
     }
 
@@ -1611,9 +1743,8 @@ impl Node {
     pub fn property_name(self) -> Node {
         by_data!(
             self,
-            |f, d| opt(f, d.property_name),
-            [ImportSpecifier, ExportSpecifier, BindingElement,],
-            Node::NIL
+            Node::NIL,
+            [ImportSpecifier, ExportSpecifier, BindingElement] => |f, d| opt(f, d.property_name),
         )
     }
 
@@ -1643,14 +1774,10 @@ impl Node {
     // Go: ast.go:884 CommentList
     #[must_use]
     pub fn comment_list(self) -> NodeList {
-        let node_data = data(self);
-        if let NodeData::JsDoc(d) = node_data {
-            return list(self.file_index(), &d.comment);
-        }
-        by_data_of!(
+        by_data!(
             self,
-            node_data,
-            |f, d| opt_list(f, &d.comment),
+            NodeList::NIL,
+            [JsDoc] => |f, d| list(f, &d.comment),
             [
                 JsDocUnknownTag,
                 JsDocAugmentsTag,
@@ -1673,8 +1800,7 @@ impl Node {
                 JsDocSatisfiesTag,
                 JsDocThrowsTag,
                 JsDocImportTag,
-            ],
-            NodeList::NIL
+            ] => |f, d| opt_list(f, &d.comment),
         )
     }
 
@@ -1702,24 +1828,16 @@ impl Node {
     // generated accessor.
     #[must_use]
     pub fn attributes(self) -> Node {
-        let node_data = data(self);
-        by_data_of!(
+        by_data!(
             self,
-            node_data,
-            |f, d| req(f, d.attributes),
-            [JsxOpeningElement, JsxSelfClosingElement,],
-            by_data_of!(
-                self,
-                node_data,
-                |f, d| opt(f, d.attributes),
-                [
-                    ImportDeclaration,
-                    ExportDeclaration,
-                    ImportTypeNode,
-                    JsDocImportTag,
-                ],
-                Node::NIL
-            )
+            Node::NIL,
+            [JsxOpeningElement, JsxSelfClosingElement] => |f, d| req(f, d.attributes),
+            [
+                ImportDeclaration,
+                ExportDeclaration,
+                ImportTypeNode,
+                JsDocImportTag,
+            ] => |f, d| opt(f, d.attributes),
         )
     }
 
@@ -1728,9 +1846,8 @@ impl Node {
     pub fn children(self) -> NodeList {
         by_data!(
             self,
-            |f, d| list(f, &d.children),
-            [JsxElement, JsxFragment],
-            NodeList::NIL
+            NodeList::NIL,
+            [JsxElement, JsxFragment] => |f, d| list(f, &d.children),
         )
     }
 
@@ -1751,9 +1868,8 @@ impl Node {
     pub fn import_clause(self) -> Node {
         by_data!(
             self,
-            |f, d| opt(f, d.import_clause),
-            [ImportDeclaration, JsDocImportTag],
-            Node::NIL
+            Node::NIL,
+            [ImportDeclaration, JsDocImportTag] => |f, d| opt(f, d.import_clause),
         )
     }
 
@@ -1762,7 +1878,7 @@ impl Node {
     pub fn statement(self) -> Node {
         by_data!(
             self,
-            |f, d| req(f, d.statement),
+            Node::NIL,
             [
                 DoStatement,
                 WhileStatement,
@@ -1770,8 +1886,7 @@ impl Node {
                 ForInOrOfStatement,
                 WithStatement,
                 LabeledStatement,
-            ],
-            Node::NIL
+            ] => |f, d| req(f, d.statement),
         )
     }
 
@@ -1780,9 +1895,8 @@ impl Node {
     pub fn property_list(self) -> NodeList {
         by_data!(
             self,
-            |f, d| list(f, &d.properties),
-            [ObjectLiteralExpression, JsxAttributes],
-            NodeList::NIL
+            NodeList::NIL,
+            [ObjectLiteralExpression, JsxAttributes] => |f, d| list(f, &d.properties),
         )
     }
 
@@ -1791,9 +1905,8 @@ impl Node {
     pub fn attribute_list(self) -> NodeList {
         by_data!(
             self,
-            |f, d| list(f, &d.attributes),
-            [ImportAttributes],
-            NodeList::NIL
+            NodeList::NIL,
+            [ImportAttributes] => |f, d| list(f, &d.attributes),
         )
     }
 
@@ -1808,15 +1921,14 @@ impl Node {
     pub fn element_list(self) -> NodeList {
         by_data!(
             self,
-            |f, d| list(f, &d.elements),
+            NodeList::NIL,
             [
                 NamedImports,
                 NamedExports,
                 BindingPattern,
                 ArrayLiteralExpression,
                 TupleTypeNode,
-            ],
-            NodeList::NIL
+            ] => |f, d| list(f, &d.elements),
         )
     }
 
@@ -1831,7 +1943,7 @@ impl Node {
     pub fn postfix_token(self) -> Node {
         by_data!(
             self,
-            |f, d| opt(f, d.postfix_token),
+            Node::NIL,
             [
                 MethodDeclaration,
                 ShorthandPropertyAssignment,
@@ -1842,21 +1954,25 @@ impl Node {
                 EnumMember,
                 GetAccessorDeclaration,
                 SetAccessorDeclaration,
-            ],
-            Node::NIL
+            ] => |f, d| opt(f, d.postfix_token),
         )
     }
 
     // Go: ast.go:1080 QuestionToken
     #[must_use]
     pub fn question_token(self) -> Node {
-        let f = self.file_index();
-        match data(self) {
-            NodeData::ParameterDeclaration(d) => return opt(f, d.question_token),
-            NodeData::ConditionalExpression(d) => return req(f, d.question_token),
-            NodeData::MappedTypeNode(d) => return opt(f, d.question_token),
-            NodeData::NamedTupleMember(d) => return opt(f, d.question_token),
-            _ => {}
+        let own = by_data!(
+            self,
+            None,
+            [
+                ParameterDeclaration,
+                MappedTypeNode,
+                NamedTupleMember,
+            ] => |f, d| Some(opt(f, d.question_token)),
+            [ConditionalExpression] => |f, d| Some(req(f, d.question_token)),
+        );
+        if let Some(token) = own {
+            return token;
         }
         let postfix = self.postfix_token();
         if postfix.is_some() && postfix.kind() == SyntaxKind::QuestionToken {
@@ -1870,14 +1986,13 @@ impl Node {
     pub fn question_dot_token(self) -> Node {
         by_data!(
             self,
-            |f, d| opt(f, d.question_dot_token),
+            Node::NIL,
             [
                 ElementAccessExpression,
                 PropertyAccessExpression,
                 CallExpression,
                 TaggedTemplateExpression,
-            ],
-            Node::NIL
+            ] => |f, d| opt(f, d.question_dot_token),
         )
     }
 
@@ -1886,30 +2001,22 @@ impl Node {
     // `TypeExpression` fields have no generated accessor.
     #[must_use]
     pub fn type_expression(self) -> Node {
-        let node_data = data(self);
-        by_data_of!(
+        by_data!(
             self,
-            node_data,
-            |f, d| opt(f, d.type_expression),
+            Node::NIL,
             [
                 JsDocParameterOrPropertyTag,
                 JsDocReturnTag,
                 JsDocTypedefTag,
                 JsDocThrowsTag,
-            ],
-            by_data_of!(
-                self,
-                node_data,
-                |f, d| req(f, d.type_expression),
-                [
-                    JsDocTypeTag,
-                    JsDocCallbackTag,
-                    JsDocSatisfiesTag,
-                    JsDocThisTag,
-                    JsDocOverloadTag,
-                ],
-                Node::NIL
-            )
+            ] => |f, d| opt(f, d.type_expression),
+            [
+                JsDocTypeTag,
+                JsDocCallbackTag,
+                JsDocSatisfiesTag,
+                JsDocThisTag,
+                JsDocOverloadTag,
+            ] => |f, d| req(f, d.type_expression),
         )
     }
 
@@ -1918,9 +2025,8 @@ impl Node {
     pub fn class_name(self) -> Node {
         by_data!(
             self,
-            |f, d| req(f, d.class_name),
-            [JsDocAugmentsTag, JsDocImplementsTag],
-            Node::NIL
+            Node::NIL,
+            [JsDocAugmentsTag, JsDocImplementsTag] => |f, d| req(f, d.class_name),
         )
     }
 

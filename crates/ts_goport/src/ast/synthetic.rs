@@ -216,9 +216,25 @@ pub fn synthetic_ast_node(n: Node) -> &'static ts_ast::Node {
 
 /// The ts_ast node of any node, parsed or synthetic. Go dereferences the
 /// pointer, so nil panics. `node.rs` reads node data through this (`raw`).
+// After freeze almost every read is a frozen store node, so only that path
+// is inlined into callers. The synthetic file index is never a frozen store
+// id, so checking the frozen table first gives the same result as the old
+// order (synthetic, store, legacy) that `ast_node_of_slow` keeps.
+#[inline]
 #[must_use]
 pub fn ast_node_of(n: Node) -> &'static ts_ast::Node {
     assert!(n.is_some(), "nil node dereference");
+    match frozen_store_ast_node(n) {
+        Some(node) => node,
+        None => ast_node_of_slow(n),
+    }
+}
+
+/// `ast_node_of` for a node that is not a frozen store node: a synthetic
+/// node, a store node before freeze (built or detached) or a legacy node.
+#[cold]
+#[inline(never)]
+fn ast_node_of_slow(n: Node) -> &'static ts_ast::Node {
     if n.file_index() == SYNTHETIC_NODE_FILE {
         return synthetic_ast_node(n);
     }
@@ -234,6 +250,7 @@ pub fn ast_node_of(n: Node) -> &'static ts_ast::Node {
 }
 
 /// The ts_ast data of any node, parsed or synthetic.
+#[inline]
 #[must_use]
 pub fn ast_data_of(n: Node) -> &'static NodeData {
     &ast_node_of(n).data

@@ -283,6 +283,9 @@ impl Checker {
     }
 
     // Go: checker/checker.go:20518 instantiateSignatureEx
+    // PORT: the source lists are read by index instead of cloned (no call
+    // below changes the lists of `sig`), and the new lists move into the
+    // signature through `new_signature_owned`.
     pub fn instantiate_signature_ex(
         &mut self,
         sig: SignatureId,
@@ -291,16 +294,29 @@ impl Checker {
     ) -> SignatureId {
         let mut m = m;
         let mut fresh_type_parameters: Vec<TypeId> = Vec::new();
-        let sig_type_parameters = self.sig(sig).type_parameters.clone();
-        if !sig_type_parameters.is_empty() && !erase_type_parameters {
+        let type_parameter_count = self.sig(sig).type_parameters.len();
+        if type_parameter_count != 0 && !erase_type_parameters {
             // First create a fresh set of type parameters, then include a mapping from the old to the
             // new type parameters in the mapper function. Finally store this mapper in the new type
             // parameters such that we can use it when instantiating constraints.
-            fresh_type_parameters = sig_type_parameters
-                .iter()
-                .map(|&tp| self.clone_type_parameter(tp))
-                .collect();
-            let fresh_mapper = self.new_type_mapper(&sig_type_parameters, &fresh_type_parameters);
+            fresh_type_parameters.reserve_exact(type_parameter_count);
+            for i in 0..type_parameter_count {
+                let tp = self.sig(sig).type_parameters[i];
+                let fresh = self.clone_type_parameter(tp);
+                fresh_type_parameters.push(fresh);
+            }
+            // PORT: `new_type_mapper(sig.type_parameters, fresh)` inlined,
+            // so the array form copies the source list straight from the
+            // signature into the mapper (the copy `new_array_type_mapper`
+            // makes) and the single form copies nothing.
+            let fresh_mapper = if type_parameter_count == 1 {
+                let source = self.sig(sig).type_parameters[0];
+                self.new_simple_type_mapper(source, fresh_type_parameters[0])
+            } else {
+                let sources: SharedList<TypeId> = self.sig(sig).type_parameters.as_slice().into();
+                let targets: SharedList<TypeId> = fresh_type_parameters.as_slice().into();
+                self.new_array_type_mapper_shared(sources, targets)
+            };
             m = self.combine_type_mappers(fresh_mapper, m);
             for &tp in &fresh_type_parameters {
                 self.ty_mut(tp).as_type_parameter_mut().mapper = m;
@@ -309,30 +325,32 @@ impl Checker {
         // Don't compute resolvedReturnType and resolvedTypePredicate now,
         // because using `mapper` now could trigger inferences to become fixed. (See `createInferenceContext`.)
         // See GH#17600.
-        let (
-            sig_flags,
-            sig_declaration,
-            sig_this_parameter,
-            sig_parameters,
-            sig_min_argument_count,
-        ) = {
+        let (sig_flags, sig_declaration, sig_this_parameter, sig_min_argument_count) = {
             let s = self.sig(sig);
             (
                 s.flags,
                 s.declaration,
                 s.this_parameter,
-                s.parameters.clone(),
                 s.min_argument_count,
             )
         };
         let this_parameter = self.instantiate_symbol(sig_this_parameter, m);
-        let parameters = self.instantiate_symbols(&sig_parameters, m);
-        let result = self.new_signature(
+        // PORT: `instantiate_symbols(sig.parameters, m)`: every parameter is
+        // instantiated once, in order. Go may return the input slice when
+        // nothing changes; the Rust signature owns its list either way.
+        let parameter_count = self.sig(sig).parameters.len();
+        let mut parameters: Vec<SymbolId> = Vec::with_capacity(parameter_count);
+        for i in 0..parameter_count {
+            let parameter = self.sig(sig).parameters[i];
+            let instantiated = self.instantiate_symbol(parameter, m);
+            parameters.push(instantiated);
+        }
+        let result = self.new_signature_owned(
             sig_flags & SignatureFlags::PROPAGATING_FLAGS,
             sig_declaration,
-            &fresh_type_parameters,
+            fresh_type_parameters,
             this_parameter,
-            &parameters,
+            parameters,
             TypeId::NIL,          /*resolvedReturnType*/
             TypePredicateId::NIL, /*resolvedTypePredicate*/
             sig_min_argument_count,
