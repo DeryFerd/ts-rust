@@ -37,6 +37,12 @@ const UNPORTED_PREFIX: &str = "unported Go code";
 /// projects.
 const STACK_SIZE: usize = 1 << 30;
 
+/// The opt-in `jemalloc` feature makes jemalloc the global allocator. See
+/// `set_malloc_tunables` for why it is not the default.
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() {
     set_malloc_tunables();
     // Go: `System.SinceStart` counts from the process start. The tunables
@@ -66,8 +72,9 @@ fn main() {
     std::process::exit(code);
 }
 
-/// Sets glibc malloc tunables for this process.
+/// Sets the malloc tunables for this process.
 ///
+/// glibc malloc (the default):
 /// - `hugetlb=1` grows each heap in transparent huge page steps. By default
 ///   the heaps grow in small steps, so the kernel maps 4 KiB pages and the
 ///   first touch of each page faults (effect: 260k faults, 0.4 s system
@@ -77,16 +84,31 @@ fn main() {
 ///   (query: 125 MB with no cap, 121 MB at 8, 117 MB at 6). At 5 or fewer
 ///   the threads wait on arena locks.
 ///
-/// glibc reads `GLIBC_TUNABLES` only at process start, so this runs the same
-/// binary again once with the tunables set. It does nothing when the caller
-/// already set `GLIBC_TUNABLES`, and the run continues without the tunables
-/// when the exec fails.
+/// jemalloc (feature `jemalloc`): `narenas:4` has the same speed as the
+/// default (4 arenas per CPU), with less RSS (query: 140 MB against 160 MB).
+/// Against glibc with the tunables above, jemalloc is about 10% faster on
+/// query, 5% on zod and effect and equal on hono, but query peak RSS is 15%
+/// more (140 MB against 123 MB, tsgo 122 MB). Only `thp:never` brings jemalloc
+/// under tsgo on query (119 MB), and that makes it slower than glibc on all
+/// projects. So glibc stays the default.
+///
+/// The allocator reads these settings only at process start, so this runs
+/// the same binary again once with them set. It does nothing when the caller
+/// already set the variable, and the run continues without the settings when
+/// the exec fails.
 fn set_malloc_tunables() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use std::os::unix::process::CommandExt;
-        const MALLOC_TUNABLES: &str = "glibc.malloc.hugetlb=1:glibc.malloc.arena_max=6";
-        if std::env::var_os("GLIBC_TUNABLES").is_some() {
+        #[cfg(not(feature = "jemalloc"))]
+        const TUNABLES: (&str, &str) = (
+            "GLIBC_TUNABLES",
+            "glibc.malloc.hugetlb=1:glibc.malloc.arena_max=6",
+        );
+        #[cfg(feature = "jemalloc")]
+        const TUNABLES: (&str, &str) = ("_RJEM_MALLOC_CONF", "narenas:4");
+        let (name, value) = TUNABLES;
+        if std::env::var_os(name).is_some() {
             return;
         }
         let Ok(exe) = std::env::current_exe() else {
@@ -98,10 +120,7 @@ fn set_malloc_tunables() {
             command.arg0(arg0);
         }
         // `exec` returns only when it fails.
-        let _ = command
-            .args(args)
-            .env("GLIBC_TUNABLES", MALLOC_TUNABLES)
-            .exec();
+        let _ = command.args(args).env(name, value).exec();
     }
 }
 

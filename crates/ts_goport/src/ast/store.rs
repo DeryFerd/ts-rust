@@ -932,16 +932,29 @@ pub fn replace_store_node_data(n: Node, data: NodeData) {
 // Allocation (used by factory.rs through `NodeFactory::for_file`)
 // ──────────────────────────────────────────────────────────────────────
 
+thread_local! {
+    /// AST nodes and lists live for the whole process. One leaked bump
+    /// arena per thread holds them, so each node costs a pointer bump, not
+    /// a malloc. The arena never drops, like the `Box::leak` it replaces.
+    static AST_ARENA: &'static bumpalo::Bump =
+        Box::leak(Box::new(bumpalo::Bump::with_capacity(1 << 20)));
+}
+
+/// Moves `value` into this thread's leaked AST arena.
+pub(crate) fn leak_in_ast_arena<T>(value: T) -> &'static T {
+    AST_ARENA.with(|arena| &*arena.alloc(value))
+}
+
 /// A leaked ts_ast node. Only kind and data are read for store and
 /// synthetic nodes; the header lives in the slot.
 fn leak_ast_node(kind: SyntaxKind, data: NodeData) -> &'static ts_ast::Node {
-    Box::leak(Box::new(ts_ast::Node {
+    leak_in_ast_arena(ts_ast::Node {
         kind,
         flags: ts_ast::NodeFlags(0),
         range: ts_range(TextRange::undefined()),
         parent: None,
         data,
-    }))
+    })
 }
 
 /// Go `newNode(kind, data, hooks)` in store `file`: `Loc =
@@ -1020,7 +1033,7 @@ fn ts_list(file: usize, nodes: &[Node], loc: TextRange) -> ts_ast::NodeList {
 /// Go `f.NewNodeList(nodes)` followed by `list.Loc = loc`, in store `file`.
 #[must_use]
 pub fn new_store_node_list(file: usize, nodes: &[Node], loc: TextRange) -> NodeList {
-    let list: &'static ts_ast::NodeList = Box::leak(Box::new(ts_list(file, nodes, loc)));
+    let list: &'static ts_ast::NodeList = leak_in_ast_arena(ts_list(file, nodes, loc));
     NodeList {
         file: file as u32,
         list: Some(list),
@@ -1031,10 +1044,10 @@ pub fn new_store_node_list(file: usize, nodes: &[Node], loc: TextRange) -> NodeL
 /// `file`. `ModifierFlags = ModifiersToFlags(nodes)` as in Go.
 #[must_use]
 pub fn new_store_modifier_list(file: usize, nodes: &[Node], loc: TextRange) -> ModifierList {
-    let list: &'static ts_ast::ModifierList = Box::leak(Box::new(ts_ast::ModifierList {
+    let list: &'static ts_ast::ModifierList = leak_in_ast_arena(ts_ast::ModifierList {
         list: ts_list(file, nodes, loc),
         flags: ts_ast::ModifierFlags(modifiers_to_flags(nodes).0 as u32),
-    }));
+    });
     ModifierList {
         file: file as u32,
         list: Some(list),

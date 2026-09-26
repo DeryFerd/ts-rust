@@ -314,13 +314,13 @@ pub fn replace_node_data(n: Node, data: NodeData) {
             data.matches_syntax_kind(kind),
             "{kind:?} does not fit its NodeData"
         );
-        s.node = Box::leak(Box::new(ts_ast::Node {
+        s.node = crate::ast::store::leak_in_ast_arena(ts_ast::Node {
             kind,
             flags: ts_ast::NodeFlags(0),
             range: undefined_ts_range(),
             parent: None,
             data,
-        }));
+        });
     });
 }
 
@@ -337,13 +337,13 @@ pub fn set_node_kind(n: Node, kind: SyntaxKind) {
             "{kind:?} does not fit the data of {:?}",
             s.node.kind
         );
-        s.node = Box::leak(Box::new(ts_ast::Node {
+        s.node = crate::ast::store::leak_in_ast_arena(ts_ast::Node {
             kind,
             flags: ts_ast::NodeFlags(0),
             range: undefined_ts_range(),
             parent: None,
             data,
-        }));
+        });
     });
 }
 
@@ -435,13 +435,13 @@ pub fn alloc_synthetic_node(kind: SyntaxKind, data: NodeData) -> Node {
         data.matches_syntax_kind(kind),
         "{kind:?} does not fit its NodeData"
     );
-    let node: &'static ts_ast::Node = Box::leak(Box::new(ts_ast::Node {
+    let node: &'static ts_ast::Node = crate::ast::store::leak_in_ast_arena(ts_ast::Node {
         kind,
         flags: ts_ast::NodeFlags(0),
         range: undefined_ts_range(),
         parent: None,
         data,
-    }));
+    });
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
         let index = a.slots.len() as u32;
@@ -631,7 +631,8 @@ fn ts_list(nodes: &[Node], loc: TextRange, has_trailing_comma: bool) -> ts_ast::
 // creation. Callers that set `list.Loc` later pass it here instead.
 #[must_use]
 pub fn new_synthetic_node_list(nodes: &[Node], loc: TextRange) -> NodeList {
-    let list: &'static ts_ast::NodeList = Box::leak(Box::new(ts_list(nodes, loc, false)));
+    let list: &'static ts_ast::NodeList =
+        crate::ast::store::leak_in_ast_arena(ts_list(nodes, loc, false));
     NodeList {
         file: SYNTHETIC_NODE_FILE as u32,
         list: Some(list),
@@ -642,10 +643,11 @@ pub fn new_synthetic_node_list(nodes: &[Node], loc: TextRange) -> NodeList {
 /// node.rs recomputes `ModifiersToFlags(nodes)`, as the Go factory does.
 #[must_use]
 pub fn new_synthetic_modifier_list(nodes: &[Node], loc: TextRange) -> ModifierList {
-    let list: &'static ts_ast::ModifierList = Box::leak(Box::new(ts_ast::ModifierList {
-        list: ts_list(nodes, loc, false),
-        flags: ts_ast::ModifierFlags(modifiers_to_flags(nodes).0 as u32),
-    }));
+    let list: &'static ts_ast::ModifierList =
+        crate::ast::store::leak_in_ast_arena(ts_ast::ModifierList {
+            list: ts_list(nodes, loc, false),
+            flags: ts_ast::ModifierFlags(modifiers_to_flags(nodes).0 as u32),
+        });
     ModifierList {
         file: SYNTHETIC_NODE_FILE as u32,
         list: Some(list),

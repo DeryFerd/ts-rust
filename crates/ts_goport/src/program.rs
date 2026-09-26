@@ -2077,10 +2077,13 @@ pub fn get_source_file_meta_data(path: &str) -> SourceFileMetaData {
 // Go: compiler/program.go:1523 GetEmitModuleFormatOfFile
 pub fn get_emit_module_format_of_file(source_file: Node) -> ModuleKind {
     let info = source_file_info(source_file);
+    // Borrow the metadata instead of cloning its strings for each call.
+    let missing = SourceFileMetaData::default();
+    let meta_data = file_info_by_path(&info.path).map_or(&missing, |info| &info.meta_data);
     get_emit_module_format_of_file_worker(
         &info.file_name,
         compiler_options_for_file(source_file),
-        &get_source_file_meta_data(&info.path),
+        meta_data,
     )
 }
 

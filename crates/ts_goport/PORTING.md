@@ -245,9 +245,33 @@ never as a tsgo status.
   because all synthetic nodes share one file index. Read fields that the
   transforms set with `source_file_parser_fields`.
 
+## Release builds
+
+- The release profile uses `lto = "fat"` and `codegen-units = 1`.
+- Allocator: glibc malloc is the default. `bin/goport.rs`
+  `set_malloc_tunables` re-execs once with `GLIBC_TUNABLES` set. The
+  `jemalloc` feature is faster (about 10% on query, 5% on zod and effect)
+  but puts query peak RSS about 15% over tsgo, so it is off. It can become
+  the default if query peak RSS drops by about 20 MB elsewhere (for example
+  fewer parse or bind threads). Then retest query RSS with `narenas:4`.
+- PGO: `scripts/build-pgo.sh [out-dir]` does an instrumented build
+  (`-Cprofile-generate`), trains on query, hono, zod, effect, elysia and
+  about 200 corpus cases (plus `goport_emit` on query and hono), merges with
+  `llvm-profdata` and builds with `-Cprofile-use`. Output must stay
+  byte-identical to the plain release; verify the PGO binary like any other.
+  Round 5 (1.95): 9% faster on query and 12 to 15% on hono, zod, effect and
+  elysia, with the same peak RSS.
+  Retrain when the allocator or hot code changes. `llvm-profdata` must not
+  be newer than the LLVM of the rustc in use: rustc 1.93 (LLVM 21) cannot
+  read the indexed format 13 that LLVM 22 writes, and it only warns and
+  builds without the profile. The script stops on that mismatch. Use
+  `rustup component add llvm-tools` for the toolchain, set `LLVM_PROFDATA`,
+  or use a toolchain whose LLVM matches (1.95 has LLVM 22).
+
 ## Style
 
-- No `unsafe`. No new dependencies. Lints are relaxed crate-wide; still write
-  clean Rust.
+- No `unsafe`. No new dependencies beyond these: `bumpalo` (the AST arena
+  in `ast/store.rs`) and the optional `tikv-jemallocator` (feature
+  `jemalloc`). Lints are relaxed crate-wide; still write clean Rust.
 - Keep a `// Go: file.go:LINE funcName` comment above each ported function.
 - Use `#[allow]` sparingly; do not add crate attributes.

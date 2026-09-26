@@ -141,45 +141,24 @@ impl EmitContext {
 
     // Go: printer/emitcontext.go:90 NewNodeVisitor
     // Creates a new NodeVisitor attached to this EmitContext
-    // PORT: `ctx` is the callback state (see `ast/visitor.rs`). The hooks
-    // borrow this context for `'a`, as Go closes over `c`. The visitor factory
-    // is `c.Factory.AsNodeFactory()`, the `ast` factory inside the printer one.
+    // PORT: `ctx` is the callback state (see `ast/visitor.rs`). Go sets five
+    // hooks that close over `c`. Here the visitor borrows this context for
+    // `'a` in `emit_context` and calls it when those hooks are unset, so no
+    // hook closure is allocated. The visitor factory is
+    // `c.Factory.AsNodeFactory()`, the `ast` factory inside the printer one.
     pub fn new_node_visitor<'a, C>(
         &'a self,
         visit: impl Fn(Node, &mut NodeVisitor<'a, C>) -> Node + 'a,
         ctx: C,
     ) -> NodeVisitor<'a, C> {
-        new_node_visitor(
+        let mut visitor = new_node_visitor(
             visit,
             Some(&self.factory().ast),
-            NodeVisitorHooks {
-                visit_parameters: Some(Rc::new(
-                    move |nodes: NodeList, v: &mut NodeVisitor<'a, C>| {
-                        self.visit_parameters(nodes, v)
-                    },
-                )),
-                visit_function_body: Some(Rc::new(
-                    move |node: Node, v: &mut NodeVisitor<'a, C>| self.visit_function_body(node, v),
-                )),
-                visit_iteration_body: Some(Rc::new(
-                    move |node: Node, v: &mut NodeVisitor<'a, C>| {
-                        self.visit_iteration_body(node, v)
-                    },
-                )),
-                visit_top_level_statements: Some(Rc::new(
-                    move |nodes: NodeList, v: &mut NodeVisitor<'a, C>| {
-                        self.visit_variable_environment(nodes, v)
-                    },
-                )),
-                visit_embedded_statement: Some(Rc::new(
-                    move |node: Node, v: &mut NodeVisitor<'a, C>| {
-                        self.visit_embedded_statement(node, v)
-                    },
-                )),
-                ..NodeVisitorHooks::default()
-            },
+            NodeVisitorHooks::default(),
             ctx,
-        )
+        );
+        visitor.emit_context = Some(self);
+        visitor
     }
 
     //

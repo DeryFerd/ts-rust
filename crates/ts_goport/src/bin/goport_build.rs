@@ -35,6 +35,12 @@ const UNPORTED_PREFIX: &str = "unported Go code";
 /// large projects.
 const STACK_SIZE: usize = 1 << 30;
 
+/// The opt-in `jemalloc` feature makes jemalloc the global allocator
+/// (see `goport.rs` `set_malloc_tunables`).
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     install_panic_hook();

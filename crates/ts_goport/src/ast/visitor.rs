@@ -99,6 +99,11 @@ pub struct NodeVisitor<'a, C = ()> {
     default_factory: NodeFactory,
     /// Hooks to be invoked when visiting a node.
     pub hooks: NodeVisitorHooks<'a, C>,
+    /// The emit context whose visit methods stand in for the parameters,
+    /// function body, iteration body, top-level statements and embedded
+    /// statement hooks when those hooks are unset. It replaces five `Rc`
+    /// closures that `EmitContext::new_node_visitor` allocated per visitor.
+    pub emit_context: Option<&'a crate::printer::EmitContext>,
     /// PORT: state that Go callbacks capture. See the module comment.
     pub ctx: C,
 }
@@ -120,6 +125,7 @@ pub fn new_node_visitor<'a, C>(
         factory,
         default_factory: NodeFactory::default(),
         hooks,
+        emit_context: None,
         ctx,
     }
 }
@@ -334,6 +340,9 @@ impl<'a, C> NodeVisitor<'a, C> {
         if let Some(hook) = self.hooks.visit_embedded_statement.clone() {
             return hook(node, self);
         }
+        if let Some(ec) = self.emit_context {
+            return ec.visit_embedded_statement(node, self);
+        }
         if let Some(hook) = self.hooks.visit_node.clone() {
             let visited = hook(node, self);
             return self.lift_to_block(visited);
@@ -346,6 +355,9 @@ impl<'a, C> NodeVisitor<'a, C> {
         if let Some(hook) = self.hooks.visit_iteration_body.clone() {
             return hook(node, self);
         }
+        if let Some(ec) = self.emit_context {
+            return ec.visit_iteration_body(node, self);
+        }
         self.visit_embedded_statement_hooked(node)
     }
 
@@ -353,6 +365,9 @@ impl<'a, C> NodeVisitor<'a, C> {
     pub(crate) fn visit_function_body(&mut self, node: Node) -> Node {
         if let Some(hook) = self.hooks.visit_function_body.clone() {
             return hook(node, self);
+        }
+        if let Some(ec) = self.emit_context {
+            return ec.visit_function_body(node, self);
         }
         self.visit_node_hooked(node)
     }
@@ -386,6 +401,9 @@ impl<'a, C> NodeVisitor<'a, C> {
         if let Some(hook) = self.hooks.visit_parameters.clone() {
             return hook(nodes, self);
         }
+        if let Some(ec) = self.emit_context {
+            return ec.visit_parameters(nodes, self);
+        }
         self.visit_nodes_hooked(nodes)
     }
 
@@ -393,6 +411,9 @@ impl<'a, C> NodeVisitor<'a, C> {
     pub(crate) fn visit_top_level_statements(&mut self, nodes: NodeList) -> NodeList {
         if let Some(hook) = self.hooks.visit_top_level_statements.clone() {
             return hook(nodes, self);
+        }
+        if let Some(ec) = self.emit_context {
+            return ec.visit_variable_environment(nodes, self);
         }
         self.visit_nodes_hooked(nodes)
     }
